@@ -174,18 +174,17 @@ type tunnelListener struct {
 	closeErr    error
 }
 
-// setupAndBridge sets up a connection with a specified timeout.
-// It will open the connection and handle decrementing the WaitGroup
-// and closing the net.Conn connection once it times out or
-// the brdiged connection closes.
+// setupAndBridge applies a setup-only timeout, then bridges the connection.
+// It owns the worker's WaitGroup entry and closes the local connection on exit.
 func (tl *tunnelListener) setupAndBridge(conn net.Conn) {
 	defer tl.wg.Done()
 	defer func() { _ = conn.Close() }()
 
-	// setup timer limit
+	// Keep the context alive for bridging; stop only its setup timer on success.
 	ctx, cancel := context.WithCancel(tl.ctx)
 	defer cancel()
 	timer := time.AfterFunc(tunnelSetupTimeout, cancel)
+	defer timer.Stop()
 
 	// Establish the tunnel to the sandbox.
 	var tunnel io.ReadWriteCloser
@@ -264,7 +263,7 @@ func (tl *tunnelListener) bridge(local net.Conn, tunnel io.ReadWriteCloser) {
 }
 
 // Close stops the listener from accepting new connections, cancels all
-// active tunnels, and blocks until all bridge goroutines finish.
+// pending setups and active tunnels, and waits for their workers to finish.
 func (tl *tunnelListener) Close() error {
 	tl.closeOnce.Do(func() {
 		tl.mu.Lock()

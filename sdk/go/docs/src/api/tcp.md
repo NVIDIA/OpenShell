@@ -37,6 +37,12 @@ Bind a local address that forwards every connection to a sandbox port. The
 returned `ForwardListener` owns its accept loop and all bridge goroutines; it is
 a lifecycle handle with `Addr` and `Close`, not a `net.Listener`.
 
+Each accepted connection sets up its tunnel independently, including when you
+use `WithSSHTunnel()`. Setup has a 30-second timeout. If setup fails or times out,
+the SDK closes that local connection without stopping the listener. The setup
+timeout does not limit an established tunnel's lifetime; canceling `ctx` or
+calling `Close()` still closes pending setups and active tunnels.
+
 ```go
 forward, err := client.TCP().Listen(ctx, "default", "sandbox-123", 8080, 0)
 if err != nil {

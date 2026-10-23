@@ -72,5 +72,9 @@ func WithListenServiceID(id string) ListenOption {
 // Methods accept a sandbox name and resolve it to an ID internally.
 type TCPInterface interface {
 	Forward(ctx context.Context, workspace, sandboxName string, port uint32, opts ...ForwardOption) (io.ReadWriteCloser, error)
+
+	// Listen forwards accepted local connections concurrently. Each connection
+	// has a 30-second tunnel setup timeout, including with [WithSSHTunnel].
+	// Established tunnels remain open until closed or ctx is canceled.
 	Listen(ctx context.Context, workspace, sandboxName string, remotePort uint32, localPort uint32, opts ...ListenOption) (ForwardListener, error)
 }
