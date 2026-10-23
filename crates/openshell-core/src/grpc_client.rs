@@ -1587,56 +1587,73 @@ pub async fn exchange_provider_subject_token(
 /// request reads the instance's current bearer, so renewal and revocation
 /// apply without reconnecting, and the gateway authorizes every request.
 pub struct SandboxProviderTokenClient {
-    gateway: GatewayEndpoint,
+    // The validated endpoint shares the instance's rotating credentials.
+    gateway: std::result::Result<(url::Url, GatewayEndpoint), TokenGrantFailure>,
     client: tokio::sync::OnceCell<OpenShellClient<AuthedChannel>>,
+    deadline: Duration,
 }
 
 impl SandboxProviderTokenClient {
     #[must_use]
     pub fn new(gateway: GatewayEndpoint) -> Self {
-        Self {
+        Self::with_deadline(
             gateway,
+            crate::token_grant_failure::BROKERED_TOKEN_CLIENT_DEADLINE,
+        )
+    }
+
+    fn with_deadline(gateway: GatewayEndpoint, deadline: Duration) -> Self {
+        Self {
+            gateway: token_grant_gateway_endpoint(gateway.url()).map(|endpoint| {
+                let gateway = gateway.with_url(endpoint.as_str());
+                (endpoint, gateway)
+            }),
             client: tokio::sync::OnceCell::new(),
+            deadline,
         }
     }
 
     /// Obtain only the final access token; the gateway selects and verifies
     /// the sandbox identity and resolves all grant parameters from its
     /// configuration.
+    ///
+    /// One deadline bounds waiting for and connecting the channel as well as
+    /// the call, so a failed connection cannot serialize later requests.
     #[tracing::instrument(name = "supervisor.gateway.get_provider_access_token", skip_all)]
     pub async fn get_access_token(
         &self,
         credential_key: &str,
         request_id: Option<&str>,
     ) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
-        let endpoint = token_grant_gateway_endpoint(self.gateway.url())?;
+        let (endpoint, gateway) = self.gateway.as_ref().map_err(|failure| *failure)?;
         // Like connect(), refuse locally revoked sandbox instance credentials
         // before the call; the response boundary rejects them again.
         let unavailable = || gateway_grant_failure(TokenGrantFailureKind::Unavailable);
-        if self.gateway.credentials().is_revoked() {
+        if gateway.credentials().is_revoked() {
             return Err(unavailable());
         }
-        let mut client = self
-            .client
-            .get_or_try_init(|| async { connect(&self.gateway.with_url(endpoint.as_str())).await })
-            .await
-            .map_err(|_| unavailable())?
-            .clone();
         let mut request = tonic::Request::new(crate::proto::GetSandboxProviderAccessTokenRequest {
             credential_key: credential_key.to_string(),
         });
         if let Some(value) = request_id.and_then(|value| value.parse().ok()) {
             request.metadata_mut().insert("x-request-id", value);
         }
-        let response = tokio::time::timeout(
-            Duration::from_mins(1),
-            client.get_sandbox_provider_access_token(request),
-        )
+        let response = tokio::time::timeout(self.deadline, async {
+            let mut client = self
+                .client
+                .get_or_try_init(|| connect(gateway))
+                .await
+                .map_err(|_| unavailable())?
+                .clone();
+            client
+                .get_sandbox_provider_access_token(request)
+                .await
+                .map_err(|status| provider_subject_token_exchange_status(&status, endpoint))
+        })
         .await
-        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Timeout))?
-        .map_err(|status| provider_subject_token_exchange_status(&status, &endpoint))?
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Timeout))??
         .into_inner();
-        if self.gateway.credentials().is_revoked() {
+        if gateway.credentials().is_revoked() {
             return Err(gateway_grant_failure(
                 TokenGrantFailureKind::WorkloadIdentityRejected,
             ));
@@ -1773,6 +1790,49 @@ mod token_grant_exchange_tests {
             assert_eq!(failure.kind(), TokenGrantFailureKind::Configuration);
         }
         assert!(token_grant_gateway_endpoint("https://localhost:8443").is_ok());
+    }
+
+    #[tokio::test]
+    async fn access_token_deadline_bounds_connection_and_call_for_each_request() {
+        // The gateway accepts connections but never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let (_connection, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let credentials = GatewayCredentials::new(
+            AsciiMetadataValue::from_static("Bearer test"),
+            TokenSource::Env,
+        );
+        let deadline = Duration::from_millis(300);
+        let client = SandboxProviderTokenClient::with_deadline(
+            GatewayEndpoint::new(format!("http://{address}"), credentials),
+            deadline,
+        );
+        let started = tokio::time::Instant::now();
+        let results: [_; 2] = tokio::join!(
+            client.get_access_token("key", None),
+            client.get_access_token("key", None),
+        )
+        .into();
+        for result in results {
+            let failure = result.err().expect("unanswered gateway times out");
+            assert_eq!(failure.kind(), TokenGrantFailureKind::Timeout);
+        }
+        // Concurrent requests share one budget rather than queueing behind it.
+        assert!(started.elapsed() < deadline * 3);
+        held.abort();
+
+        let invalid = SandboxProviderTokenClient::new(GatewayEndpoint::new(
+            "https://localhost/SECRET",
+            GatewayCredentials::new(
+                AsciiMetadataValue::from_static("Bearer test"),
+                TokenSource::Env,
+            ),
+        ));
+        let failure = invalid.get_access_token("key", None).await.err().unwrap();
+        assert_eq!(failure.kind(), TokenGrantFailureKind::Configuration);
     }
 
     #[test]

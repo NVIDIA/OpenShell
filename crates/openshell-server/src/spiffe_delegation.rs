@@ -6,11 +6,10 @@ use openshell_core::config::{Config, SpiffeDelegationConfig};
 use openshell_core::spiffe::SandboxSpiffeIdPrefix;
 use openshell_core::token_grant_failure::{
     TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
+    WORKLOAD_IDENTITY_CALL_TIMEOUT as AGENT_CALL_TIMEOUT,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
-const AGENT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Validated, immutable settings of gateway-owned SPIRE delegation.
 ///

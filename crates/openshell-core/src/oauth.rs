@@ -15,7 +15,8 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::token_grant_failure::{
-    REQUEST_ID_HEADER, TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
+    REQUEST_ID_HEADER, TOKEN_SERVICE_REQUEST_TIMEOUT, TokenGrantFailure, TokenGrantFailureKind,
+    TokenGrantStage,
 };
 
 pub const DEFAULT_CLIENT_ASSERTION_TYPE: &str =
@@ -57,8 +58,8 @@ impl TokenGrantClient {
         // idempotent for this caller and never relaxes peer authentication.
         openshell_crypto::tls::ensure_default_provider();
         reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(30))
+            .timeout(TOKEN_SERVICE_REQUEST_TIMEOUT)
+            .connect_timeout(TOKEN_SERVICE_REQUEST_TIMEOUT)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
     }

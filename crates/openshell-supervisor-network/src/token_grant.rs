@@ -91,7 +91,7 @@ impl TokenCache {
         }
     }
 
-    /// Forget every cached token.
+    /// Store a token with expiration time.
     fn set(&self, provider_name: String, access_token: String, expires_at_ms: i64) {
         if let Ok(mut tokens) = self.tokens.write() {
             tokens.insert(
