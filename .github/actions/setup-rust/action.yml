@@ -13,6 +13,11 @@ inputs:
     required: false
     default: "false"
 
+outputs:
+  cache-hit:
+    description: "true when the cache key matched exactly"
+    value: ${{ steps.cache.outputs.cache-hit }}
+
 runs:
   using: composite
   steps:
@@ -24,6 +29,7 @@ runs:
         echo "hash=$(nix hash file --type sha256 --base16 "$shell_drv")" >> "$GITHUB_OUTPUT"
 
     - name: Cache Rust target and registry
+      id: cache
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         shared-key: ${{ inputs.cache-key }}-${{ steps.dev-shell.outputs.hash }}

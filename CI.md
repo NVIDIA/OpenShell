@@ -618,6 +618,8 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/actions/setup-e2e-*` | Shared artifact, Podman, KVM, and kind setup used by the runtime lanes. |
 | `.github/workflows/helm-lint.yml` | Helm chart validation. PR mirror pushes skip lint jobs unless Helm inputs changed; merge groups always validate Helm because they represent the final integration state. |
 | `.github/actions/setup-nix/action.yml` | Installs Nix and configures the OpenShell Cachix cache, using read-only cache access when no authentication token is available. |
+| `.github/actions/setup-rust/action.yml` | Restores the Rust target and registry cache. Other branches can restore only their own caches and `main`'s, so per-binary release build caches are saved only on `main`. |
+| `.github/workflows/rust-cache.yml` | Builds the Branch Checks test targets on each push to `main` to save the `rust-checks` cache that PR mirrors and merge groups restore. Skips the build when the cache already matches. |
 | `.github/actions/pr-gate/action.yml` | Composite action that resolves PR metadata and verifies the required label is set for PR mirror pushes. Non-push events are allowed through. |
 | `.github/actions/pr-merge-base/action.yml` | Composite action that resolves and fetches the merge-base commit for `pull-request/<N>` push workflows. |
 | `.github/workflows/required-ci-gates.yml` | Posts required PR-head and merge-group statuses for gated CI workflows. This is what branch protection and merge queue should require. |
