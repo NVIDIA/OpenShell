@@ -63,16 +63,20 @@ pub const POOL_RECOVERY_TIMEOUT_SECS: u32 = 60;
 /// Interval at which both ends send heartbeats on an idle stream.
 pub const HOST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// Heartbeat interval of pool members, whose liveness drives failover.
-pub const POOL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+pub const POOL_HEARTBEAT_INTERVAL: Duration = crate::pool_timing::HEARTBEAT_INTERVAL;
 /// Silence after which the gateway closes a host stream.
 const HOST_SILENCE_TIMEOUT: Duration = Duration::from_mins(1);
 /// Silence after which the gateway closes a pool member's stream.
-const POOL_SILENCE_TIMEOUT: Duration = Duration::from_secs(15);
+const POOL_SILENCE_TIMEOUT: Duration = crate::pool_timing::GATEWAY_SILENCE_TIMEOUT;
 /// Bound on the host sending its hello.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound on queueing one gateway-to-host message; a host that cannot drain
 /// its stream this long is disconnected rather than stalling the session.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// [`SEND_TIMEOUT`] for pool members, whose served stream keeps their
+/// membership record alive: a member that stops reading is dropped as soon as
+/// one that stops writing.
+const POOL_SEND_TIMEOUT: Duration = crate::pool_timing::GATEWAY_SILENCE_TIMEOUT;
 /// Gateway-to-host messages queued before the stream applies backpressure.
 const OUTBOUND_QUEUE: usize = 16;
 /// How long a withdrawn pool instance stays on its owner's stop list.
@@ -210,12 +214,19 @@ impl std::fmt::Debug for PoolView {
     }
 }
 
-/// A report a host served here made of a route its process owns, for the
-/// gateway to record durably so other replicas can judge the instance.
+/// What a pool member's stream served here last reported of one instance,
+/// for the gateway to record durably under the ownership term it belongs to,
+/// so other replicas can judge the instance.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OwnedReport {
-    pub route: String,
-    pub owner: InstanceOwner,
+pub struct MemberReport {
+    pub member_id: String,
+    pub process_id: String,
+    /// Ownership term the reporting stream had applied for the route when it
+    /// reported: the term of the snapshot that last installed the route on
+    /// the stream, once the stream acknowledged it.
+    pub auth_epoch: u64,
+    /// When the reporting stream was accepted (Unix milliseconds).
+    pub connected_at_ms: i64,
     pub status: SandboxInstanceStatus,
 }
 
@@ -316,6 +327,20 @@ struct HostSession {
     /// Latest report of this session.
     status: Option<HostStatus>,
     connected_at_ms: i64,
+    /// Ownership term of each route the snapshots sent on this stream assign
+    /// or keep, with the revision that first installed that term.
+    terms: BTreeMap<String, (u64, u64)>,
+    /// Terms of the last snapshot built for this stream, committed to
+    /// `terms` once that snapshot is sent.
+    pending_terms: Option<PendingTerms>,
+}
+
+/// Terms of one snapshot: the revision, the routes it assigns, and the routes
+/// it keeps as they are.
+struct PendingTerms {
+    revision: u64,
+    assigned: BTreeMap<String, u64>,
+    kept: BTreeMap<String, u64>,
 }
 
 impl HostSession {
@@ -341,6 +366,9 @@ struct Inner {
     /// Current revision of everything snapshots are derived from; 0 while
     /// uninitialized.
     revision: watch::Sender<u64>,
+    /// Counts changes to the pool members this gateway serves: a member
+    /// stream attached or ended, or a member announced leaving.
+    membership: watch::Sender<u64>,
     observed: Mutex<Observed>,
 }
 
@@ -394,6 +422,7 @@ impl SupervisorHostController {
                 placement: Mutex::new(None),
                 credential: watch::Sender::new(None),
                 revision: watch::Sender::new(0),
+                membership: watch::Sender::new(0),
                 observed: Mutex::new(Observed::default()),
             }),
         }
@@ -791,35 +820,33 @@ impl SupervisorHostController {
             .map(|pool| pool.recovery_timeout_secs)
     }
 
-    /// What hosts served here last reported of the routes their processes
-    /// own, for the gateway to record for its other replicas.
+    /// What the pool members served here last reported of their instances.
+    /// The caller attributes each report to the owner term its own records
+    /// show, and drops reports of routes the reporting process does not own.
     #[must_use]
-    pub fn owned_reports(&self) -> Vec<OwnedReport> {
-        let pool = lock(&self.inner.pool);
-        let Some(pool) = pool.as_ref().filter(|pool| pool.loaded) else {
+    pub fn member_reports(&self) -> Vec<MemberReport> {
+        if !self.is_pool() {
             return Vec::new();
-        };
+        }
         let observed = lock(&self.inner.observed);
         let mut reports = Vec::new();
         for session in observed.sessions.values() {
             let (Some(member_id), Some(status)) = (session.member_id(), &session.status) else {
                 continue;
             };
-            for instance in &status.instances {
-                if let Some(owner) = pool.view.owners.get(&instance.route)
-                    && owner.member_id == member_id
-                    && owner.process_id == session.instance_id
-                {
-                    reports.push(OwnedReport {
-                        route: instance.route.clone(),
-                        owner: InstanceOwner {
-                            takeover: None,
-                            ..owner.clone()
-                        },
-                        status: instance.clone(),
-                    });
-                }
-            }
+            // A report counts only for a term the stream acknowledged; a
+            // status from before the term's snapshot describes an earlier
+            // term, even from the same process.
+            reports.extend(status.instances.iter().filter_map(|instance| {
+                let (auth_epoch, since) = session.terms.get(&instance.route)?;
+                (status.applied_revision >= *since).then(|| MemberReport {
+                    member_id: member_id.to_string(),
+                    process_id: session.instance_id.clone(),
+                    auth_epoch: *auth_epoch,
+                    connected_at_ms: session.connected_at_ms,
+                    status: instance.clone(),
+                })
+            }));
         }
         reports
     }
@@ -888,6 +915,19 @@ impl SupervisorHostController {
                 })
             })
             .collect()
+    }
+
+    /// Changes whenever [`Self::connected_members`] gains or loses a stream
+    /// or a member announces leaving, so membership records follow at once.
+    #[must_use]
+    pub fn membership_changes(&self) -> watch::Receiver<u64> {
+        self.inner.membership.subscribe()
+    }
+
+    fn membership_changed(&self) {
+        self.inner
+            .membership
+            .send_modify(|changes| *changes = changes.wrapping_add(1));
     }
 
     /// Whether a host session is currently connected.
@@ -1101,29 +1141,68 @@ impl SupervisorHostController {
                 sent_revision: 0,
                 status: None,
                 connected_at_ms: unix_millis(),
+                terms: BTreeMap::new(),
+                pending_terms: None,
             },
         );
+        drop(observed);
+        if member_id.is_some() {
+            self.membership_changed();
+        }
         Ok((id, watch))
     }
 
     fn end_session(&self, id: u64) {
         let mut observed = lock(&self.inner.observed);
-        if let Some(session) = observed.sessions.remove(&id) {
-            tracing::info!(
-                subject = %session.identity.subject,
-                instance_id = %session.instance_id,
-                member = session.member_id().unwrap_or_default(),
-                session = id,
-                "supervisor host detached; hosted instances keep running"
-            );
+        let Some(session) = observed.sessions.remove(&id) else {
+            return;
+        };
+        drop(observed);
+        tracing::info!(
+            subject = %session.identity.subject,
+            instance_id = %session.instance_id,
+            member = session.member_id().unwrap_or_default(),
+            session = id,
+            "supervisor host detached; hosted instances keep running"
+        );
+        if session.member.is_some() {
+            self.membership_changed();
         }
     }
 
-    /// Note that `revision` was sent on session `id`.
+    /// Note that `revision` was sent on session `id`. A route keeps the
+    /// revision that installed its term while snapshots repeat the term; a
+    /// new term is installed by `revision`; a kept route keeps only the term
+    /// it already had, and a route the snapshot omits has none.
     fn record_sent(&self, id: u64, revision: u64) {
         let mut observed = lock(&self.inner.observed);
         if let Some(session) = observed.sessions.get_mut(&id) {
             session.sent_revision = session.sent_revision.max(revision);
+            if let Some(pending) = session
+                .pending_terms
+                .take()
+                .filter(|pending| pending.revision == revision)
+            {
+                let previous = std::mem::take(&mut session.terms);
+                let installed = |route: &String, epoch: u64| {
+                    previous
+                        .get(route)
+                        .filter(|(installed, _)| *installed == epoch)
+                        .map(|(_, since)| *since)
+                };
+                session.terms = pending
+                    .assigned
+                    .iter()
+                    .map(|(route, epoch)| {
+                        let since = installed(route, *epoch).unwrap_or(revision);
+                        (route.clone(), (*epoch, since))
+                    })
+                    .chain(pending.kept.iter().filter_map(|(route, epoch)| {
+                        let since = installed(route, *epoch)?;
+                        Some((route.clone(), (*epoch, since)))
+                    }))
+                    .collect();
+            }
         }
     }
 
@@ -1157,6 +1236,7 @@ impl SupervisorHostController {
         drop(observed);
         if leaving {
             // Membership records follow the leaving flag at once.
+            self.membership_changed();
             let mut desired = lock(&self.inner.desired);
             self.bump(&mut desired);
         }
@@ -1186,20 +1266,24 @@ impl SupervisorHostController {
         if !pool.loaded {
             return None;
         }
-        let observed = lock(&self.inner.observed);
-        let session = observed.sessions.get(&id)?;
-        let member_id = session.member_id()?;
-        let owned_by_session = |owner: &InstanceOwner| {
-            owner.member_id == member_id && owner.process_id == session.instance_id
-        };
+        let mut observed = lock(&self.inner.observed);
+        let session = observed.sessions.get_mut(&id)?;
+        let member_id = session.member_id()?.to_string();
+        let instance_id = session.instance_id.clone();
+        let owned_by_session =
+            |owner: &InstanceOwner| owner.member_id == member_id && owner.process_id == instance_id;
+        let mut assigned_terms = BTreeMap::new();
         let instances = desired
             .assignments
             .values()
             .filter_map(|assigned| {
                 let owner = pool.view.owners.get(&assigned.assignment.route)?;
-                owned_by_session(owner).then(|| SandboxInstanceAssignment {
-                    takeover: owner.takeover_term(),
-                    ..assigned.assignment.clone()
+                owned_by_session(owner).then(|| {
+                    assigned_terms.insert(assigned.assignment.route.clone(), owner.auth_epoch);
+                    SandboxInstanceAssignment {
+                        takeover: owner.takeover_term(),
+                        ..assigned.assignment.clone()
+                    }
                 })
             })
             .collect();
@@ -1211,14 +1295,14 @@ impl SupervisorHostController {
         let stop_routes = desired
             .stopping
             .iter()
-            .filter(|(_, (owner, _))| owner.member_id == member_id)
+            .filter(|(_, (owner, _))| owner.member_id == *member_id)
             .map(|(route, _)| route.clone())
             .chain(
                 pool.view
                     .owners
                     .iter()
                     .filter(|(route, owner)| {
-                        owner.member_id == member_id
+                        owner.member_id == *member_id
                             && !pool.view.desired.contains(*route)
                             && !desired.stopping.contains_key(*route)
                     })
@@ -1246,7 +1330,7 @@ impl SupervisorHostController {
             .collect();
         // Owned desired instances whose launch material this gateway has not
         // loaded yet are kept as they are rather than released.
-        let keep_routes = pool
+        let kept_terms = pool
             .view
             .owners
             .iter()
@@ -1256,8 +1340,14 @@ impl SupervisorHostController {
                     && !desired.assignments.contains_key(*route)
                     && !desired.stopping.contains_key(*route)
             })
-            .map(|(route, _)| route.clone())
-            .collect();
+            .map(|(route, owner)| (route.clone(), owner.auth_epoch))
+            .collect::<BTreeMap<_, _>>();
+        let keep_routes = kept_terms.keys().cloned().collect();
+        session.pending_terms = Some(PendingTerms {
+            revision: desired.revision,
+            assigned: assigned_terms,
+            kept: kept_terms,
+        });
         Some(AssignmentSnapshot {
             revision: desired.revision,
             instances,
@@ -1285,10 +1375,14 @@ impl SupervisorHostController {
         // reconnects with the renewed token it has been delivered.
         let credential_expiry = tokio::time::sleep(credential_remaining(expires_at));
         tokio::pin!(credential_expiry);
-        let (heartbeat_interval, silence_timeout) = if self.is_pool() {
-            (POOL_HEARTBEAT_INTERVAL, POOL_SILENCE_TIMEOUT)
+        let (heartbeat_interval, silence_timeout, send_timeout) = if self.is_pool() {
+            (
+                POOL_HEARTBEAT_INTERVAL,
+                POOL_SILENCE_TIMEOUT,
+                POOL_SEND_TIMEOUT,
+            )
         } else {
-            (HOST_HEARTBEAT_INTERVAL, HOST_SILENCE_TIMEOUT)
+            (HOST_HEARTBEAT_INTERVAL, HOST_SILENCE_TIMEOUT, SEND_TIMEOUT)
         };
         let mut revision = self.inner.revision.subscribe();
         let mut last_snapshot: Option<AssignmentSnapshot> = None;
@@ -1305,7 +1399,7 @@ impl SupervisorHostController {
                     Ok(HostGatewayMessage {
                         payload: Some(message),
                     }),
-                    SEND_TIMEOUT,
+                    send_timeout,
                 )
                 .await
                 .is_ok()
@@ -1363,7 +1457,7 @@ impl SupervisorHostController {
                                 Err(Status::invalid_argument(
                                     "unexpected message on supervisor host stream",
                                 )),
-                                SEND_TIMEOUT,
+                                send_timeout,
                             )
                             .await;
                         return;
@@ -1676,6 +1770,40 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn membership_changes_follow_member_streams_and_leaving() {
+        let controller = SupervisorHostController::new();
+        controller.enable_pool(75);
+        let mut changes = controller.membership_changes();
+        changes.mark_unchanged();
+        let (first, _) = controller
+            .begin_session(identity(), &member_hello("m1", "p1", 1))
+            .unwrap();
+        assert!(changes.has_changed().unwrap(), "a member attached");
+        changes.mark_unchanged();
+        // A newer stream of the same member supersedes the first.
+        let (second, _) = controller
+            .begin_session(identity(), &member_hello("m1", "p1", 2))
+            .unwrap();
+        assert!(changes.has_changed().unwrap(), "a member reconnected");
+        changes.mark_unchanged();
+        // Ending the superseded stream changes nothing anyone serves.
+        controller.end_session(first);
+        assert!(!changes.has_changed().unwrap());
+        let status = |leaving| HostStatus {
+            applied_revision: 0,
+            instances: Vec::new(),
+            leaving,
+        };
+        controller.record_status(second, status(false)).unwrap();
+        assert!(!changes.has_changed().unwrap(), "an ordinary report");
+        controller.record_status(second, status(true)).unwrap();
+        assert!(changes.has_changed().unwrap(), "the member is leaving");
+        changes.mark_unchanged();
+        controller.end_session(second);
+        assert!(changes.has_changed().unwrap(), "the member's stream ended");
+    }
+
     #[tokio::test]
     async fn pool_members_receive_only_what_their_process_owns() {
         let controller = SupervisorHostController::new();
@@ -1799,6 +1927,57 @@ mod tests {
     }
 
     #[test]
+    fn reports_count_only_for_the_term_their_stream_acknowledged() {
+        let controller = SupervisorHostController::new();
+        controller.enable_pool(POOL_RECOVERY_TIMEOUT_SECS);
+        let (one, _) = controller
+            .begin_session(identity(), &member_hello("m1", "p1", 1))
+            .unwrap();
+        let members = || vec![member_view("m1", "p1"), member_view("m-2", "p2")];
+        let send = |owner: InstanceOwner| {
+            controller.update_pool(
+                loaded_view(members(), [("rt-a", owner)]),
+                tokio::time::Instant::now(),
+            );
+            let revision = controller.snapshot(one).unwrap().revision;
+            controller.record_sent(one, revision);
+            revision
+        };
+        let terms = || {
+            controller
+                .member_reports()
+                .into_iter()
+                .map(|report| (report.status.route, report.auth_epoch))
+                .collect::<Vec<_>>()
+        };
+        let first = send(owner("m1", "p1", 1));
+        controller
+            .record_status(one, status(first, &["rt-a"]))
+            .unwrap();
+        assert_eq!(terms(), [("rt-a".to_string(), 1)]);
+        // Another member takes rt-a over, then it returns to the same,
+        // still running process at a later term, before the process applied
+        // either snapshot.
+        send(owner("m-2", "p2", 2));
+        assert!(terms().is_empty());
+        let third = send(owner("m1", "p1", 3));
+        // Its status from term 1 still lists rt-a as ready; that is not term
+        // 3's readiness.
+        controller
+            .record_status(one, status(first, &["rt-a"]))
+            .unwrap();
+        assert!(terms().is_empty());
+        controller
+            .record_status(one, status(third, &["rt-a"]))
+            .unwrap();
+        assert_eq!(terms(), [("rt-a".to_string(), 3)]);
+        // A later snapshot that repeats the term keeps it installed.
+        let later = send(owner("m1", "p1", 3));
+        assert!(later >= third);
+        assert_eq!(terms(), [("rt-a".to_string(), 3)]);
+    }
+
+    #[test]
     fn pool_observations_follow_the_owning_process_through_a_takeover() {
         let controller = SupervisorHostController::new();
         controller.enable_pool(POOL_RECOVERY_TIMEOUT_SECS);
@@ -1817,7 +1996,7 @@ mod tests {
             ),
             tokio::time::Instant::now(),
         );
-        let revision = controller.revision();
+        let revision = controller.snapshot(two).unwrap().revision;
         controller.record_sent(two, revision);
         controller
             .record_status(two, status(revision, &["rt-b"]))
@@ -1842,7 +2021,7 @@ mod tests {
         );
         // The new owner has not reconciled to the takeover yet.
         assert_eq!(controller.observed("rt-b"), ObservedInstance::Pending);
-        let takeover = controller.revision();
+        let takeover = controller.snapshot(one).unwrap().revision;
         controller.record_sent(one, takeover);
         controller
             .record_status(one, status(takeover, &["rt-b"]))
@@ -1851,19 +2030,29 @@ mod tests {
             controller.observed("rt-b"),
             ObservedInstance::Reported(_)
         ));
-        // Its reports are recorded for the other gateway replicas, without
-        // the term's credentials.
-        let reports = controller.owned_reports();
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].route, "rt-b");
+        // Each stream's reports are offered for recording under the term it
+        // acknowledged: the new owner's under term 2, and the previous
+        // owner's, which has not applied its release yet, under term 1.
+        let mut reports = controller
+            .member_reports()
+            .into_iter()
+            .map(|report| {
+                (
+                    report.status.route,
+                    report.member_id,
+                    report.process_id,
+                    report.auth_epoch,
+                )
+            })
+            .collect::<Vec<_>>();
+        reports.sort();
         assert_eq!(
-            (
-                reports[0].owner.member_id.as_str(),
-                reports[0].owner.auth_epoch
-            ),
-            ("m1", 2)
+            reports,
+            [
+                ("rt-b".to_string(), "m-2".to_string(), "p2".to_string(), 1),
+                ("rt-b".to_string(), "m1".to_string(), "p1".to_string(), 2),
+            ]
         );
-        assert!(reports[0].owner.takeover.is_none());
 
         // An owner process this gateway does not serve gives no verdict of
         // its own; another replica's recorded report of the owner gives one.
@@ -1883,7 +2072,6 @@ mod tests {
             controller.observed("rt-b"),
             ObservedInstance::Reported(recorded)
         );
-        assert!(controller.owned_reports().is_empty());
     }
 
     #[tokio::test]

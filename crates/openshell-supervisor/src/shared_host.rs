@@ -35,8 +35,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use miette::Result;
 use openshell_core::proto::supervisor_host::v1::supervisor_host_client::SupervisorHostClient;
 use openshell_core::proto::supervisor_host::v1::{
-    AssignmentSnapshot, HostHeartbeat, HostHello, HostMessage, HostStatus, PoolMember,
-    SandboxInstanceAssignment, SandboxInstanceTakeover, host_gateway_message, host_message,
+    AssignmentSnapshot, HostGatewayMessage, HostHeartbeat, HostHello, HostMessage, HostStatus,
+    PoolMember, SandboxInstanceAssignment, SandboxInstanceTakeover, host_gateway_message,
+    host_message,
 };
 use openshell_extension_core::BearerTokenSlot;
 use openshell_sandbox_backend::BoundaryTakeover;
@@ -78,6 +79,105 @@ const MAX_GATEWAY_MESSAGE_BYTES: usize =
     MAX_ASSIGNED_INSTANCES * (openshell_supervisor_control::MAX_LAUNCH_MATERIAL_BYTES + 1024);
 /// Largest host message: a status report is a few hundred bytes per instance.
 const MAX_HOST_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// How a host notices a silent gateway and paces its reconnects.
+///
+/// A pool member must reach a responsive gateway replica well before its
+/// membership record expires (see [`openshell_supervisor_control::pool_timing`]);
+/// a lone shared supervisor keeps its long, quiet defaults.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StreamTimings {
+    /// Silence after which a stream is abandoned.
+    silence_timeout: Duration,
+    /// How often silence is checked; `None` checks on each heartbeat.
+    silence_check: Option<Duration>,
+    /// First reconnect backoff; it doubles up to `backoff_max`.
+    backoff_min: Duration,
+    backoff_max: Duration,
+    /// Most jitter added to a backoff, as a fraction of it.
+    jitter: f64,
+    /// Bound on connecting, attaching, and being accepted while no more than
+    /// this many attempts failed since the last accepted stream; later
+    /// attempts get [`CONNECT_TIMEOUT`].
+    quick_attempts: Option<(Duration, u32)>,
+}
+
+impl StreamTimings {
+    fn for_host(pool: bool) -> Self {
+        use openshell_supervisor_control::pool_timing;
+        if pool {
+            Self {
+                silence_timeout: pool_timing::HOST_SILENCE_TIMEOUT,
+                silence_check: Some(pool_timing::HOST_SILENCE_CHECK),
+                backoff_min: pool_timing::HOST_RECONNECT_BACKOFF_MIN,
+                backoff_max: pool_timing::HOST_RECONNECT_BACKOFF_MAX,
+                jitter: pool_timing::HOST_RECONNECT_JITTER,
+                quick_attempts: Some((
+                    pool_timing::HOST_ATTEMPT_TIMEOUT,
+                    pool_timing::COVERED_UNANSWERED_ATTEMPTS,
+                )),
+            }
+        } else {
+            Self {
+                silence_timeout: GATEWAY_SILENCE_TIMEOUT,
+                silence_check: None,
+                backoff_min: RECONNECT_BACKOFF_MIN,
+                backoff_max: RECONNECT_BACKOFF_MAX,
+                jitter: 0.0,
+                quick_attempts: None,
+            }
+        }
+    }
+
+    /// Bound on an attempt after `unanswered` attempts since the last
+    /// accepted stream that were never accepted.
+    fn attempt_timeout(&self, unanswered: u32) -> Duration {
+        match self.quick_attempts {
+            Some((timeout, covered)) if unanswered <= covered => timeout,
+            _ => CONNECT_TIMEOUT,
+        }
+    }
+
+    /// Backoff before the `failed`-th (1-based) attempt since the last
+    /// accepted stream; `sample` in `[0, 1)` scales the jitter.
+    fn backoff(&self, failed: u32, sample: f64) -> Duration {
+        let doubled = self
+            .backoff_min
+            .saturating_mul(1_u32 << failed.saturating_sub(1).min(16))
+            .min(self.backoff_max);
+        doubled.mul_f64(self.jitter.mul_add(sample.clamp(0.0, 1.0), 1.0))
+    }
+}
+
+/// What bounds the stages of one connection attempt: connecting, attaching,
+/// and being accepted.
+#[derive(Clone, Copy)]
+enum AttemptDeadline {
+    /// One deadline covers every stage, so a slow stage leaves less time for
+    /// the next; a pool member's reconnect budget counts on it.
+    Shared(tokio::time::Instant),
+    /// Each stage gets its own bound when it begins.
+    PerStage(Duration),
+}
+
+impl AttemptDeadline {
+    /// The deadline of a stage beginning now.
+    fn stage(self) -> tokio::time::Instant {
+        match self {
+            Self::Shared(deadline) => deadline,
+            Self::PerStage(bound) => tokio::time::Instant::now() + bound,
+        }
+    }
+}
+
+/// A scheduling jitter sample in `[0, 1)`; not security-relevant.
+fn jitter_sample() -> f64 {
+    use std::hash::BuildHasher as _;
+    let bits = std::collections::hash_map::RandomState::new().hash_one(SystemTime::now());
+    #[allow(clippy::cast_precision_loss)]
+    let sample = (bits >> 11) as f64 / (1_u64 << 53) as f64;
+    sample
+}
 
 /// Identity of a shared supervisor process in a supervisor pool.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,6 +240,46 @@ pub struct SharedHost {
     /// of instances this host starts or takes over; `None` keeps the runtime
     /// default.
     recovery_timeout_secs: Mutex<Option<u32>>,
+    /// Lets tests stall reconciliations and see how many run at once.
+    #[cfg(test)]
+    reconcile_probe: ReconcileProbe,
+}
+
+/// Stalls the next reconciliation until released, and records how many ran
+/// and how many run at once.
+#[cfg(test)]
+#[derive(Default)]
+struct ReconcileProbe {
+    gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    entered: std::sync::atomic::AtomicUsize,
+    running: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl ReconcileProbe {
+    async fn enter(&self) -> impl Drop + '_ {
+        use std::sync::atomic::Ordering;
+        struct Running<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        let gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let running = Running(&self.running);
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
+        running
+    }
 }
 
 /// A rejected sandbox instance assignment.
@@ -191,6 +331,8 @@ impl SharedHost {
             leaving: watch::Sender::new(false),
             gateway_connected: watch::Sender::new(false),
             recovery_timeout_secs: Mutex::new(None),
+            #[cfg(test)]
+            reconcile_probe: ReconcileProbe::default(),
         }))
     }
 
@@ -214,6 +356,10 @@ impl SharedHost {
         if self.pool.is_none() {
             return;
         }
+        tracing::info!(
+            hosted = self.host.list().len(),
+            "pool member is leaving; asking the gateway to move its sandbox instances"
+        );
         self.leaving.send_replace(true);
         let mut changes = self.host.changes();
         let mut connected = self.gateway_connected.subscribe();
@@ -382,17 +528,20 @@ impl SharedHost {
     /// every hosted instance it omits. Assignments that cannot be admitted are
     /// reported as failed instances; they never affect a running instance.
     ///
+    /// A snapshot that would run more than [`MAX_ASSIGNED_INSTANCES`]
+    /// instances still applies its stops, directory, and kept routes, and
+    /// keeps every hosted instance it assigns; only the new instances beyond
+    /// capacity are left unstarted, as kept routes are, until a later
+    /// snapshot fits.
+    ///
     /// # Errors
     ///
-    /// A malformed snapshot (too many instances, or one route assigned twice)
-    /// is refused as a whole before anything is admitted or removed.
+    /// A malformed snapshot (one route assigned twice, or the wrong kind for
+    /// this host) is refused as a whole before anything is admitted or
+    /// removed.
     pub async fn reconcile(&self, snapshot: &AssignmentSnapshot) -> Result<(), ControlError> {
-        if snapshot.instances.len() > MAX_ASSIGNED_INSTANCES {
-            return Err(ControlError::Invalid(format!(
-                "snapshot assigns {} instances; at most {MAX_ASSIGNED_INSTANCES} are supported",
-                snapshot.instances.len()
-            )));
-        }
+        #[cfg(test)]
+        let _running = self.reconcile_probe.enter().await;
         let mut routes = std::collections::BTreeSet::new();
         for assignment in &snapshot.instances {
             if !routes.insert(assignment.route.clone()) {
@@ -435,13 +584,27 @@ impl SharedHost {
         // Owned instances the gateway could not describe yet are kept as they
         // are: neither started, released, nor stopped.
         routes.extend(snapshot.keep_routes.iter().cloned());
+        let hosted = self
+            .host
+            .list()
+            .into_iter()
+            .map(|status| status.route)
+            .collect::<std::collections::BTreeSet<_>>();
+        let (admitted, unstarted) = within_capacity(snapshot, &hosted);
+        if !unstarted.is_empty() {
+            tracing::warn!(
+                assigned = snapshot.instances.len(),
+                unstarted = unstarted.len(),
+                "snapshot assigns more sandbox instances than this host runs; leaving the excess unstarted"
+            );
+        }
         *self
             .desired_routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(routes);
         let mut rejected = BTreeMap::new();
         let mut deferred = BTreeMap::new();
-        for assignment in &snapshot.instances {
+        for assignment in admitted {
             let outcome = if self.pool.is_some() {
                 self.admit_pool_assignment(assignment).await
             } else {
@@ -889,6 +1052,58 @@ enum StreamEnd {
     Lost { accepted: bool },
 }
 
+/// What a gateway sends a host on its assignment stream.
+type GatewayInbound = std::pin::Pin<
+    Box<dyn futures::Stream<Item = Result<HostGatewayMessage, tonic::Status>> + Send>,
+>;
+
+/// Opens a host's assignment stream: hands the gateway the host's outbound
+/// messages and returns the gateway's.
+trait GatewayConnector: Send + Sync {
+    /// Connect and attach, each stage bounded by `deadline`.
+    fn open(
+        &self,
+        outbound: tokio::sync::mpsc::Receiver<HostMessage>,
+        deadline: AttemptDeadline,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + '_>>;
+}
+
+impl GatewayConnector for GatewayLink {
+    fn open(
+        &self,
+        outbound: tokio::sync::mpsc::Receiver<HostMessage>,
+        deadline: AttemptDeadline,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + '_>> {
+        Box::pin(async move {
+            if !self.endpoint.starts_with("https://") {
+                return Err("the supervisor token requires an https gateway endpoint".to_string());
+            }
+            let token = self
+                .read_token()
+                .map_err(|error| format!("no usable supervisor token: {error}"))?;
+            let connect = openshell_core::grpc_client::connect_gateway_channel(&self.endpoint);
+            let channel = tokio::time::timeout_at(deadline.stage(), connect)
+                .await
+                .map_err(|_| "connecting to the gateway timed out".to_string())?
+                .map_err(|error| format!("could not connect to the gateway: {error}"))?;
+            let mut client = SupervisorHostClient::with_interceptor(channel, token.interceptor())
+                .max_decoding_message_size(MAX_GATEWAY_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_HOST_MESSAGE_BYTES);
+            let attach = client.attach(tokio_stream::wrappers::ReceiverStream::new(outbound));
+            let response = tokio::time::timeout_at(deadline.stage(), attach)
+                .await
+                .map_err(|_| {
+                    "gateway did not answer the supervisor host stream in time".to_string()
+                })?
+                .map_err(|status| {
+                    format!("gateway refused the supervisor host stream: {status}")
+                })?;
+            let inbound: GatewayInbound = Box::pin(response.into_inner());
+            Ok(inbound)
+        })
+    }
+}
+
 /// Keep one assignment stream open to the gateway until `shutdown`
 /// completes, reconnecting with backoff. Hosted instances run on across
 /// disconnects.
@@ -897,9 +1112,25 @@ pub async fn attach_to_gateway(
     link: GatewayLink,
     shutdown: impl Future<Output = ()>,
 ) {
+    attach_with(host, Arc::new(link), shutdown).await;
+}
+
+async fn attach_with(
+    host: Arc<SharedHost>,
+    connector: Arc<dyn GatewayConnector>,
+    shutdown: impl Future<Output = ()>,
+) {
     let instance_id = uuid::Uuid::new_v4().to_string();
     let mut connection_epoch = 0_u64;
-    let mut backoff = RECONNECT_BACKOFF_MIN;
+    let timings = StreamTimings::for_host(host.pool.is_some());
+    let reconciler = Reconciler::start(host.clone());
+    // Streams lost since the last accepted stream, counting its own loss;
+    // the backoff grows with it.
+    let mut failed = 0_u32;
+    // Attempts since the last accepted stream that were never accepted; the
+    // attempt bound depends on it, so the attempt after the covered
+    // unanswered ones is still quick.
+    let mut unanswered = 0_u32;
     tokio::pin!(shutdown);
     loop {
         connection_epoch += 1;
@@ -912,115 +1143,342 @@ pub async fn attach_to_gateway(
                 runtime_address: pool.runtime_address.to_string(),
             }),
         };
+        let attempt_timeout = timings.attempt_timeout(unanswered);
         let StreamEnd::Lost { accepted } = tokio::select! {
-            end = run_stream(&host, &link, hello) => end,
-            () = &mut shutdown => return,
+            end = run_stream(&host, connector.as_ref(), &reconciler, hello, &timings, attempt_timeout) => end,
+            () = &mut shutdown => return reconciler.shut_down().await,
         };
         if accepted {
-            backoff = RECONNECT_BACKOFF_MIN;
+            failed = 0;
+            unanswered = 0;
+        } else {
+            unanswered = unanswered.saturating_add(1);
         }
+        failed = failed.saturating_add(1);
+        let backoff = timings.backoff(failed, jitter_sample());
         tracing::info!(
-            retry_in_secs = backoff.as_secs(),
+            retry_in_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
             "gateway assignment stream lost; hosted sandbox instances keep running"
         );
         tokio::select! {
             () = tokio::time::sleep(backoff) => {}
-            () = &mut shutdown => return,
+            () = &mut shutdown => return reconciler.shut_down().await,
         }
-        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
     }
+}
+
+/// One unit of registry work.
+enum ReconcileJob {
+    Snapshot(AssignmentSnapshot),
+    /// Retry deferred admissions and withdrawals whose cleanup failed.
+    Retry,
+}
+
+/// A finished registry job of stream `stream`; `revision` is the snapshot
+/// revision it applied, if any.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Applied {
+    sequence: u64,
+    stream: u64,
+    revision: Option<u64>,
+    /// The job ran, rather than refusing a malformed snapshot.
+    ok: bool,
+}
+
+#[derive(Default)]
+struct ReconcilerState {
+    /// The stream that may queue work; older streams' work is dropped.
+    stream: u64,
+    queued: Option<(u64, ReconcileJob)>,
+    busy: bool,
+    closed: bool,
+}
+
+/// Applies assignment snapshots to the registry one at a time, across
+/// streams.
+///
+/// A stream hands the worker the newest snapshot it received; one still
+/// queued when a newer stream begins is dropped, since its session is gone.
+/// A reconciliation the worker began runs to completion even when its stream
+/// ends, so registry mutation stays serialized while a new stream connects,
+/// reports status, and queues its own snapshots without waiting for it.
+struct Reconciler {
+    state: Mutex<ReconcilerState>,
+    wake: tokio::sync::Notify,
+    done: watch::Sender<Applied>,
+}
+
+impl Reconciler {
+    /// Start the worker; it stops once the returned handle is shut down or
+    /// dropped and the job in flight, if any, has finished.
+    fn start(host: Arc<SharedHost>) -> ReconcilerHandle {
+        let reconciler = Arc::new(Self {
+            state: Mutex::new(ReconcilerState::default()),
+            wake: tokio::sync::Notify::new(),
+            done: watch::Sender::new(Applied::default()),
+        });
+        let worker = tokio::spawn(reconciler.clone().run(host));
+        ReconcilerHandle {
+            reconciler,
+            worker: Some(worker),
+        }
+    }
+
+    /// Accept no more work and drop what is queued; the job in flight, if
+    /// any, still finishes.
+    fn close(&self) {
+        let mut state = self.state();
+        state.closed = true;
+        state.queued = None;
+        drop(state);
+        self.wake.notify_one();
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, ReconcilerState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Begin a stream: work still queued for earlier streams is dropped.
+    fn begin_stream(&self) -> u64 {
+        let mut state = self.state();
+        state.stream += 1;
+        state.queued = None;
+        state.stream
+    }
+
+    /// Queue `snapshot` for `stream`, replacing whatever it queued before.
+    fn submit(&self, stream: u64, snapshot: AssignmentSnapshot) {
+        let mut state = self.state();
+        if state.stream == stream && !state.closed {
+            state.queued = Some((stream, ReconcileJob::Snapshot(snapshot)));
+            drop(state);
+            self.wake.notify_one();
+        }
+    }
+
+    /// Queue a retry for `stream` when the worker has nothing to do.
+    fn submit_retry(&self, stream: u64) {
+        let mut state = self.state();
+        if state.stream == stream && !state.closed && !state.busy && state.queued.is_none() {
+            state.queued = Some((stream, ReconcileJob::Retry));
+            drop(state);
+            self.wake.notify_one();
+        }
+    }
+
+    async fn run(self: Arc<Self>, host: Arc<SharedHost>) {
+        loop {
+            let job = {
+                let mut state = self.state();
+                match state.queued.take() {
+                    Some(job) => {
+                        state.busy = true;
+                        Some(job)
+                    }
+                    None if state.closed => return,
+                    None => None,
+                }
+            };
+            let Some((stream, job)) = job else {
+                self.wake.notified().await;
+                continue;
+            };
+            let (revision, ok) = match job {
+                ReconcileJob::Snapshot(snapshot) => match host.reconcile(&snapshot).await {
+                    Ok(()) => (Some(snapshot.revision), true),
+                    Err(error) => {
+                        tracing::warn!(%error, "refused a malformed assignment snapshot");
+                        (None, false)
+                    }
+                },
+                ReconcileJob::Retry => {
+                    host.retry_pending().await;
+                    (None, true)
+                }
+            };
+            self.state().busy = false;
+            self.done.send_modify(|applied| {
+                *applied = Applied {
+                    sequence: applied.sequence + 1,
+                    stream,
+                    revision,
+                    ok,
+                };
+            });
+        }
+    }
+}
+
+/// Owns the worker of an attach loop. Shutting it down waits for the job in
+/// flight, so nothing the worker admits outlives the attachment; dropping it
+/// lets the worker finish that job and stop on its own.
+struct ReconcilerHandle {
+    reconciler: Arc<Reconciler>,
+    worker: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ReconcilerHandle {
+    /// Stop the worker at process shutdown: queued work is dropped and the
+    /// reconciliation in flight, if any, finishes before this returns, so the
+    /// host's own shutdown sees every instance the worker admitted.
+    async fn shut_down(mut self) {
+        self.reconciler.close();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.await;
+        }
+    }
+}
+
+impl std::ops::Deref for ReconcilerHandle {
+    type Target = Reconciler;
+
+    fn deref(&self) -> &Reconciler {
+        &self.reconciler
+    }
+}
+
+impl Drop for ReconcilerHandle {
+    fn drop(&mut self) {
+        self.reconciler.close();
+    }
+}
+
+/// The assignments of `snapshot` a host admits, and the routes it leaves
+/// unstarted. Hosted instances the snapshot assigns or keeps stay; new ones
+/// are admitted in route order while fewer than [`MAX_ASSIGNED_INSTANCES`]
+/// would run.
+fn within_capacity<'a>(
+    snapshot: &'a AssignmentSnapshot,
+    hosted: &std::collections::BTreeSet<String>,
+) -> (Vec<&'a SandboxInstanceAssignment>, Vec<&'a str>) {
+    let assigned = snapshot
+        .instances
+        .iter()
+        .map(|assignment| assignment.route.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let staying = hosted
+        .iter()
+        .filter(|route| assigned.contains(route.as_str()) || snapshot.keep_routes.contains(*route))
+        .count();
+    let mut room = MAX_ASSIGNED_INSTANCES.saturating_sub(staying);
+    let mut fresh = snapshot
+        .instances
+        .iter()
+        .filter(|assignment| !hosted.contains(&assignment.route))
+        .collect::<Vec<_>>();
+    fresh.sort_by(|left, right| left.route.cmp(&right.route));
+    let mut admitted = snapshot
+        .instances
+        .iter()
+        .filter(|assignment| hosted.contains(&assignment.route))
+        .collect::<Vec<_>>();
+    let mut unstarted = Vec::new();
+    for assignment in fresh {
+        if room > 0 {
+            room -= 1;
+            admitted.push(assignment);
+        } else {
+            unstarted.push(assignment.route.as_str());
+        }
+    }
+    (admitted, unstarted)
 }
 
 /// One connection and stream to the gateway.
 ///
-/// Snapshots are reconciled on a separate task so heartbeats and status
-/// reports keep flowing while instances stop; at most one reconciliation runs
-/// at a time, only the newest unapplied snapshot is kept, and the stream does
-/// not end until a running reconciliation has finished.
-async fn run_stream(host: &Arc<SharedHost>, link: &GatewayLink, hello: HostHello) -> StreamEnd {
+/// One deadline bounds connecting, attaching, and being accepted. Snapshots
+/// go to the attach loop's reconcile worker, so heartbeats and status reports
+/// keep flowing while instances stop, and the stream ends without waiting for
+/// a reconciliation in flight. A pool member also bounds every send by its
+/// silence budget, so a gateway that stops reading is abandoned as promptly
+/// as one that stops writing.
+async fn run_stream(
+    host: &Arc<SharedHost>,
+    connector: &dyn GatewayConnector,
+    reconciler: &Reconciler,
+    hello: HostHello,
+    timings: &StreamTimings,
+    attempt_timeout: Duration,
+) -> StreamEnd {
     let lost = |accepted| StreamEnd::Lost { accepted };
-    if !link.endpoint.starts_with("https://") {
-        tracing::error!("the supervisor token requires an https gateway endpoint");
-        return lost(false);
-    }
-    let token = match link.read_token() {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::warn!(%error, "no usable supervisor token; will retry");
-            return lost(false);
-        }
+    let pool = timings.silence_check.is_some();
+    let deadline = if pool {
+        AttemptDeadline::Shared(tokio::time::Instant::now() + attempt_timeout)
+    } else {
+        AttemptDeadline::PerStage(attempt_timeout)
     };
-    let connect = openshell_core::grpc_client::connect_gateway_channel(&link.endpoint);
-    let channel = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
-        Ok(Ok(channel)) => channel,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "could not connect to the gateway");
-            return lost(false);
-        }
-        Err(_) => {
-            tracing::warn!("connecting to the gateway timed out");
-            return lost(false);
-        }
-    };
-    let mut client = SupervisorHostClient::with_interceptor(channel, token.interceptor())
-        .max_decoding_message_size(MAX_GATEWAY_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_HOST_MESSAGE_BYTES);
+    let stream = reconciler.begin_stream();
     let (tx, rx) = tokio::sync::mpsc::channel::<HostMessage>(OUTBOUND_QUEUE);
-    let send = |message: HostMessage| {
-        let tx = tx.clone();
-        async move { tx.send_timeout(message, SEND_TIMEOUT).await.is_ok() }
+    // A send gives up by the ordinary bound, and on a pool member once the
+    // stream has been silent for its whole silence budget.
+    let send_deadline = |last_heard: tokio::time::Instant| {
+        let bound = tokio::time::Instant::now() + SEND_TIMEOUT;
+        if pool {
+            bound.min(last_heard + timings.silence_timeout)
+        } else {
+            bound
+        }
     };
-    if !send(HostMessage {
-        payload: Some(host_message::Payload::Hello(hello)),
-    })
+    let send = |message: HostMessage, deadline: tokio::time::Instant| {
+        let tx = tx.clone();
+        async move {
+            tokio::time::timeout_at(deadline, tx.send(message))
+                .await
+                .is_ok_and(|sent| sent.is_ok())
+        }
+    };
+    let hello_deadline = match deadline {
+        AttemptDeadline::Shared(deadline) => deadline,
+        AttemptDeadline::PerStage(_) => tokio::time::Instant::now() + SEND_TIMEOUT,
+    };
+    if !send(
+        HostMessage {
+            payload: Some(host_message::Payload::Hello(hello)),
+        },
+        hello_deadline,
+    )
     .await
     {
         return lost(false);
     }
-    let attach = client.attach(tokio_stream::wrappers::ReceiverStream::new(rx));
-    let mut inbound = match tokio::time::timeout(CONNECT_TIMEOUT, attach).await {
-        Ok(Ok(response)) => response.into_inner(),
-        Ok(Err(status)) => {
-            tracing::warn!(%status, "gateway refused the supervisor host stream");
-            return lost(false);
-        }
-        Err(_) => {
-            tracing::warn!("gateway did not answer the supervisor host stream in time");
+    let opened = match deadline {
+        AttemptDeadline::Shared(deadline) => tokio::time::timeout_at(
+            deadline,
+            connector.open(rx, AttemptDeadline::Shared(deadline)),
+        )
+        .await
+        .unwrap_or_else(|_| Err("connecting to the gateway timed out".to_string())),
+        AttemptDeadline::PerStage(_) => connector.open(rx, deadline).await,
+    };
+    let mut inbound = match opened {
+        Ok(inbound) => inbound,
+        Err(error) => {
+            tracing::warn!(%error, "could not open the supervisor host stream");
             return lost(false);
         }
     };
+    let accept_deadline = deadline.stage();
     let mut changes = host.changes();
     changes.mark_unchanged();
     let mut leaving = host.leaving.subscribe();
     leaving.mark_unchanged();
+    let mut finished = reconciler.done.subscribe();
+    finished.mark_unchanged();
     let mut applied_revision = 0_u64;
     // Highest snapshot revision received on this stream, applied or not, so a
     // snapshot that arrives behind a newer in-flight one is never applied.
     let mut received_revision = 0_u64;
     let mut accepted = false;
-    let accept_deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
     let mut last_heard = tokio::time::Instant::now();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The reconciliation in flight and the newest snapshot waiting for it.
-    // A retry of withdrawals whose cleanup failed runs through the same slot,
-    // so at most one reconciliation touches the registry at a time.
-    let mut applying: Option<tokio::task::JoinHandle<Result<Option<u64>, ControlError>>> = None;
-    let mut queued: Option<AssignmentSnapshot> = None;
-    let start = |snapshot: AssignmentSnapshot| {
-        let host = host.clone();
-        tokio::spawn(async move {
-            host.reconcile(&snapshot).await?;
-            Ok(Some(snapshot.revision))
-        })
-    };
-    let retry_pending = || {
-        let host = host.clone();
-        tokio::spawn(async move {
-            host.retry_pending().await;
-            Ok(None)
-        })
-    };
+    // A pool member checks for silence and for acceptance on its own, short
+    // cadence; a lone host checks on each heartbeat.
+    let mut silence_check =
+        tokio::time::interval(timings.silence_check.unwrap_or(HEARTBEAT_INTERVAL));
+    silence_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let end = loop {
         tokio::select! {
             message = inbound.next() => {
@@ -1051,7 +1509,7 @@ async fn run_stream(host: &Arc<SharedHost>, link: &GatewayLink, hello: HostHello
                             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         }
                         // Report what runs before any snapshot arrives.
-                        if !send(status_message(host, applied_revision)).await {
+                        if !send(status_message(host, applied_revision), send_deadline(last_heard)).await {
                             break lost(accepted);
                         }
                     }
@@ -1069,49 +1527,51 @@ async fn run_stream(host: &Arc<SharedHost>, link: &GatewayLink, hello: HostHello
                             continue;
                         }
                         received_revision = snapshot.revision;
-                        if applying.is_some() {
-                            queued = Some(snapshot);
-                        } else {
-                            applying = Some(start(snapshot));
-                        }
+                        reconciler.submit(stream, snapshot);
                     }
                     Some(host_gateway_message::Payload::Heartbeat(_)) | None => {}
                 }
             }
-            applied = async { applying.as_mut().expect("polled only while applying").await }, if applying.is_some() => {
-                applying = None;
-                match applied {
-                    Ok(Ok(revision)) => {
-                        if let Some(revision) = revision {
-                            applied_revision = revision;
-                        }
-                        changes.mark_unchanged();
-                        if !send(status_message(host, applied_revision)).await {
-                            break lost(accepted);
-                        }
-                    }
-                    Ok(Err(error)) => {
-                        tracing::warn!(%error, "refused a malformed assignment snapshot");
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "assignment reconciliation task failed");
-                    }
+            worked = finished.changed() => {
+                if worked.is_err() {
+                    break lost(accepted);
                 }
-                if let Some(snapshot) = queued.take() {
-                    applying = Some(start(snapshot));
+                let applied = *finished.borrow_and_update();
+                if applied.stream == stream
+                    && let Some(revision) = applied.revision
+                {
+                    applied_revision = revision;
+                }
+                // A refused snapshot changes nothing to report.
+                if applied.ok {
+                    changes.mark_unchanged();
+                    if accepted && !send(status_message(host, applied_revision), send_deadline(last_heard)).await {
+                        break lost(accepted);
+                    }
                 }
             }
             notified = changes.changed() => {
                 if notified.is_err() {
                     break lost(accepted);
                 }
-                if accepted && !send(status_message(host, applied_revision)).await {
+                if accepted && !send(status_message(host, applied_revision), send_deadline(last_heard)).await {
                     break lost(accepted);
                 }
             }
             // The gateway moves a leaving member's instances at once.
             _ = leaving.changed() => {
-                if accepted && !send(status_message(host, applied_revision)).await {
+                if accepted && !send(status_message(host, applied_revision), send_deadline(last_heard)).await {
+                    break lost(accepted);
+                }
+            }
+            // A pool member gives up on acceptance exactly at its deadline.
+            () = tokio::time::sleep_until(accept_deadline), if pool && !accepted => {
+                tracing::warn!("gateway did not accept the supervisor host in time");
+                break lost(accepted);
+            }
+            _ = silence_check.tick(), if pool => {
+                if last_heard.elapsed() > timings.silence_timeout {
+                    tracing::warn!("gateway assignment stream went silent; reconnecting");
                     break lost(accepted);
                 }
             }
@@ -1120,29 +1580,24 @@ async fn run_stream(host: &Arc<SharedHost>, link: &GatewayLink, hello: HostHello
                     tracing::warn!("gateway did not accept the supervisor host in time");
                     break lost(accepted);
                 }
-                if last_heard.elapsed() > GATEWAY_SILENCE_TIMEOUT {
+                if !pool && last_heard.elapsed() > timings.silence_timeout {
                     tracing::warn!("gateway assignment stream went silent; reconnecting");
                     break lost(accepted);
                 }
                 let beat = HostMessage { payload: Some(host_message::Payload::Heartbeat(HostHeartbeat {})) };
-                if !send(beat).await {
+                if !send(beat, send_deadline(last_heard)).await {
                     break lost(accepted);
                 }
                 // Deferred admissions and withdrawn instances whose cleanup
                 // failed are retried at the heartbeat cadence, never
                 // concurrently with a snapshot.
-                if applying.is_none() && queued.is_none() && host.has_pending() {
-                    applying = Some(retry_pending());
+                if host.has_pending() {
+                    reconciler.submit_retry(stream);
                 }
             }
         }
     };
     host.gateway_connected.send_replace(false);
-    // Finish the reconciliation this stream started before another stream
-    // can begin one; the queued snapshot belongs to a session that is gone.
-    if let Some(applying) = applying {
-        let _ = applying.await;
-    }
     end
 }
 
@@ -1324,6 +1779,600 @@ mod tests {
             stops[0].try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected),
             "a pool member relinquishes what it still hosts at shutdown"
+        );
+    }
+
+    #[test]
+    fn pool_hosts_reconnect_inside_the_membership_budget_and_lone_hosts_do_not_change() {
+        use openshell_supervisor_control::pool_timing;
+        let pool = StreamTimings::for_host(true);
+        assert_eq!(pool.silence_timeout, pool_timing::HOST_SILENCE_TIMEOUT);
+        assert_eq!(pool.silence_check, Some(pool_timing::HOST_SILENCE_CHECK));
+        // The covered attempts after a lost stream are quick; later ones get
+        // the ordinary bound, so a slow but responsive gateway is reached.
+        for failed in 0..=pool_timing::COVERED_UNANSWERED_ATTEMPTS {
+            assert_eq!(
+                pool.attempt_timeout(failed),
+                pool_timing::HOST_ATTEMPT_TIMEOUT
+            );
+        }
+        assert_eq!(
+            pool.attempt_timeout(pool_timing::COVERED_UNANSWERED_ATTEMPTS + 1),
+            CONNECT_TIMEOUT
+        );
+        for failed in 1..=12 {
+            for sample in [0.0, 0.5, 0.999_999, jitter_sample()] {
+                let backoff = pool.backoff(failed, sample);
+                assert!(backoff >= pool_timing::HOST_RECONNECT_BACKOFF_MIN);
+                assert!(backoff <= pool_timing::host_backoff_bound(failed));
+            }
+        }
+        assert_eq!(
+            pool.backoff(1, 0.0),
+            pool_timing::HOST_RECONNECT_BACKOFF_MIN
+        );
+        assert_eq!(
+            pool.backoff(9, 0.0),
+            pool_timing::HOST_RECONNECT_BACKOFF_MAX
+        );
+        let sample = jitter_sample();
+        assert!((0.0..1.0).contains(&sample));
+
+        let lone = StreamTimings::for_host(false);
+        assert_eq!(lone.silence_timeout, GATEWAY_SILENCE_TIMEOUT);
+        assert_eq!(lone.silence_check, None);
+        assert_eq!(lone.attempt_timeout(0), CONNECT_TIMEOUT);
+        assert_eq!(lone.attempt_timeout(50), CONNECT_TIMEOUT);
+        let lone_backoffs = (1..=7)
+            .map(|failed| lone.backoff(failed, 0.9))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lone_backoffs,
+            [1, 2, 4, 8, 16, 30, 30].map(Duration::from_secs)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_oversized_snapshot_still_stops_redirects_and_keeps_within_capacity() {
+        let root = tempfile::tempdir().unwrap();
+        let host = SharedHost::start(SharedHostConfig {
+            gateway_endpoint: "https://gateway.invalid".to_string(),
+            instance_root: root.path().join("instances"),
+            runtime_listen: "127.0.0.1:0".parse().unwrap(),
+            removal_grace: Duration::from_secs(10),
+            pool: Some(PoolIdentity {
+                member_id: "member-1".to_string(),
+                member_uid: "uid-1".to_string(),
+                runtime_address: "127.0.0.1:5500".parse().unwrap(),
+            }),
+        })
+        .unwrap();
+        let (hosted_route, stopped_route) = ("rt-hosted-0123456789", "rt-stopped-0123456789");
+        let (stopped, mut stops) = tokio::sync::mpsc::channel(1);
+        let (kept, mut kept_stops) = tokio::sync::mpsc::channel(1);
+        admit_supervising(&host, hosted_route, kept);
+        admit_supervising(&host, stopped_route, stopped);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while host
+                .list()
+                .iter()
+                .filter(|status| status.phase == SandboxInstancePhaseReport::Supervising)
+                .count()
+                < 2
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("instances supervise");
+
+        // The hosted instance plus a full host's worth of new ones: one more
+        // than the host runs.
+        let assignment = |route: String| SandboxInstanceAssignment {
+            sandbox_id: route.clone(),
+            route,
+            generation: "generation".to_string(),
+            launch_material: b"{}".to_vec(),
+            takeover: None,
+        };
+        let mut instances = vec![assignment(hosted_route.to_string())];
+        instances.extend(
+            (0..MAX_ASSIGNED_INSTANCES)
+                .map(|index| assignment(format!("rt-new-{index:04}-0123456789"))),
+        );
+        let elsewhere = "rt-elsewhere-0123456789";
+        let owner: SocketAddr = "10.0.0.9:5500".parse().unwrap();
+        host.reconcile(&AssignmentSnapshot {
+            revision: 1,
+            pool: true,
+            instances,
+            stop_routes: vec![stopped_route.to_string()],
+            route_directory: vec![openshell_core::proto::supervisor_host::v1::RouteOwner {
+                route: elsewhere.to_string(),
+                runtime_address: owner.to_string(),
+            }],
+            ..AssignmentSnapshot::default()
+        })
+        .await
+        .expect("an oversized snapshot is applied, not refused");
+
+        // The listed stop ran, the hosted instance stays, and the directory
+        // redirects runtimes of routes owned elsewhere.
+        assert_eq!(stops.try_recv(), Ok(()));
+        assert!(host.status(stopped_route).is_none());
+        assert_eq!(
+            host.status(hosted_route).map(|status| status.phase),
+            Some(SandboxInstancePhaseReport::Supervising)
+        );
+        assert!(kept_stops.try_recv().is_err());
+        let mut stream = tokio::net::TcpStream::connect(host.router.local_addr())
+            .await
+            .unwrap();
+        assert_eq!(
+            openshell_sandbox_backend::runtime_routed::negotiate_route(&mut stream, elsewhere)
+                .await
+                .unwrap(),
+            openshell_sandbox_backend::runtime_routed::RouteReply::Redirect(owner)
+        );
+        // Only up to capacity was attempted: the hosted instance and all but
+        // the last new one in route order; the last stays unstarted.
+        let rejected = host.rejected.lock().unwrap().clone();
+        assert_eq!(rejected.len(), MAX_ASSIGNED_INSTANCES);
+        let last = format!("rt-new-{:04}-0123456789", MAX_ASSIGNED_INSTANCES - 1);
+        assert!(!rejected.contains_key(&last));
+        assert!(rejected.contains_key("rt-new-0000-0123456789"));
+        assert!(host.list().iter().all(|status| status.route != last));
+        host.shut_down().await;
+    }
+
+    /// How one connection attempt to a [`FakeGateway`] goes.
+    enum Attempt {
+        /// Never opens.
+        Hang,
+        /// Opens after a delay.
+        After(Duration),
+        /// Opens at once.
+        Now,
+    }
+
+    /// A stream the fake gateway opened, driven by the test.
+    struct Opened {
+        /// When the host asked for it.
+        at: tokio::time::Instant,
+        outbound: tokio::sync::mpsc::Receiver<HostMessage>,
+        inbound: tokio::sync::mpsc::Sender<Result<HostGatewayMessage, tonic::Status>>,
+    }
+
+    /// Gateway replicas behind one Service: each attempt goes as planned, and
+    /// every opened stream is handed to the test.
+    struct FakeGateway {
+        plan: Mutex<std::collections::VecDeque<Attempt>>,
+        calls: Mutex<Vec<tokio::time::Instant>>,
+        opened: tokio::sync::mpsc::UnboundedSender<Opened>,
+    }
+
+    impl GatewayConnector for FakeGateway {
+        fn open(
+            &self,
+            outbound: tokio::sync::mpsc::Receiver<HostMessage>,
+            _deadline: AttemptDeadline,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + '_>>
+        {
+            let at = tokio::time::Instant::now();
+            self.calls.lock().unwrap().push(at);
+            let attempt = self
+                .plan
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Attempt::Now);
+            Box::pin(async move {
+                match attempt {
+                    Attempt::Hang => std::future::pending::<()>().await,
+                    Attempt::After(delay) => tokio::time::sleep(delay).await,
+                    Attempt::Now => {}
+                }
+                let (inbound, stream) = tokio::sync::mpsc::channel(1);
+                let _ = self.opened.send(Opened {
+                    at,
+                    outbound,
+                    inbound,
+                });
+                let stream: GatewayInbound =
+                    Box::pin(tokio_stream::wrappers::ReceiverStream::new(stream));
+                Ok(stream)
+            })
+        }
+    }
+
+    fn gateway_message(payload: host_gateway_message::Payload) -> HostGatewayMessage {
+        HostGatewayMessage {
+            payload: Some(payload),
+        }
+    }
+
+    fn accepted() -> HostGatewayMessage {
+        gateway_message(host_gateway_message::Payload::Accepted(
+            openshell_core::proto::supervisor_host::v1::HostAccepted {
+                session_id: "session".to_string(),
+                heartbeat_interval: Some(prost_types::Duration {
+                    seconds: 1,
+                    nanos: 0,
+                }),
+            },
+        ))
+    }
+
+    fn gateway_heartbeat() -> HostGatewayMessage {
+        gateway_message(host_gateway_message::Payload::Heartbeat(
+            openshell_core::proto::supervisor_host::v1::HostGatewayHeartbeat {},
+        ))
+    }
+
+    fn pool_snapshot(revision: u64) -> HostGatewayMessage {
+        gateway_message(host_gateway_message::Payload::Assignments(
+            AssignmentSnapshot {
+                revision,
+                pool: true,
+                ..AssignmentSnapshot::default()
+            },
+        ))
+    }
+
+    /// A pool host attached to `plan`, and the streams it opens.
+    fn attach_pool_host(
+        plan: Vec<Attempt>,
+    ) -> (
+        Arc<SharedHost>,
+        Arc<FakeGateway>,
+        tokio::sync::mpsc::UnboundedReceiver<Opened>,
+        tempfile::TempDir,
+    ) {
+        let (host, gateway, streams, root, _attachment) =
+            attach_pool_host_until(plan, std::future::pending::<()>());
+        (host, gateway, streams, root)
+    }
+
+    /// A pool host attached to `plan` until `shutdown`, the streams it opens,
+    /// and the attachment.
+    fn attach_pool_host_until(
+        plan: Vec<Attempt>,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> (
+        Arc<SharedHost>,
+        Arc<FakeGateway>,
+        tokio::sync::mpsc::UnboundedReceiver<Opened>,
+        tempfile::TempDir,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let host = SharedHost::start(SharedHostConfig {
+            gateway_endpoint: "https://gateway.invalid".to_string(),
+            instance_root: root.path().join("instances"),
+            runtime_listen: "127.0.0.1:0".parse().unwrap(),
+            removal_grace: Duration::from_secs(10),
+            pool: Some(PoolIdentity {
+                member_id: "member-1".to_string(),
+                member_uid: "uid-1".to_string(),
+                runtime_address: "127.0.0.1:5500".parse().unwrap(),
+            }),
+        })
+        .unwrap();
+        let (opened, streams) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = Arc::new(FakeGateway {
+            plan: Mutex::new(plan.into()),
+            calls: Mutex::new(Vec::new()),
+            opened,
+        });
+        let attachment = tokio::spawn(attach_with(host.clone(), gateway.clone(), shutdown));
+        (host, gateway, streams, root, attachment)
+    }
+
+    fn is_hello(message: Option<HostMessage>) -> bool {
+        matches!(
+            message.and_then(|message| message.payload),
+            Some(host_message::Payload::Hello(_))
+        )
+    }
+
+    fn status_of(message: Option<HostMessage>) -> Option<HostStatus> {
+        match message.and_then(|message| message.payload) {
+            Some(host_message::Payload::Status(status)) => Some(status),
+            _ => None,
+        }
+    }
+
+    /// The next status the host reports, past its heartbeats.
+    async fn next_status(
+        outbound: &mut tokio::sync::mpsc::Receiver<HostMessage>,
+    ) -> Option<HostStatus> {
+        loop {
+            match outbound.recv().await?.payload {
+                Some(host_message::Payload::Status(status)) => return Some(status),
+                Some(host_message::Payload::Heartbeat(_)) => {}
+                _ => return None,
+            }
+        }
+    }
+
+    /// Accept a stream and keep it answering: heartbeats every second, and
+    /// every status the host reports forwarded to the test.
+    fn serve(
+        mut stream: Opened,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<HostStatus>,
+        tokio::sync::mpsc::Sender<Result<HostGatewayMessage, tonic::Status>>,
+    ) {
+        let (statuses, reported) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = stream.inbound.clone();
+        let inbound = stream.inbound.clone();
+        tokio::spawn(async move {
+            if inbound.send(Ok(accepted())).await.is_err() {
+                return;
+            }
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if inbound.send(Ok(gateway_heartbeat())).await.is_err() {
+                    return;
+                }
+            }
+        });
+        tokio::spawn(async move {
+            while let Some(message) = stream.outbound.recv().await {
+                if let Some(status) = status_of(Some(message))
+                    && statuses.send(status).is_err()
+                {
+                    return;
+                }
+            }
+        });
+        (reported, gateway)
+    }
+
+    /// The part of the reconnect budget the host itself spends: everything
+    /// but the gateway's record refresh age and its two refresh rounds.
+    fn host_budget(unanswered: u32) -> Duration {
+        use openshell_supervisor_control::pool_timing;
+        pool_timing::reconnect_budget(unanswered)
+            .saturating_sub(pool_timing::MEMBER_REFRESH_INTERVAL)
+            .saturating_sub(pool_timing::RECORD_WRITE_BOUND * 2)
+    }
+
+    /// A replica that accepted and then went silent is abandoned, and a
+    /// responsive replica is reached within the budget even when the covered
+    /// attempts reach the silent replica again; the new stream says hello and
+    /// reports status at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_gateway_is_left_for_a_responsive_one_within_the_budget() {
+        use openshell_supervisor_control::pool_timing;
+        let covered = pool_timing::COVERED_UNANSWERED_ATTEMPTS;
+        let mut plan = vec![Attempt::Now];
+        plan.extend((0..covered).map(|_| Attempt::Hang));
+        plan.push(Attempt::Now);
+        let (_host, gateway, mut streams, _root) = attach_pool_host(plan);
+        let mut silent = streams.recv().await.unwrap();
+        assert!(is_hello(silent.outbound.recv().await));
+        silent.inbound.send(Ok(accepted())).await.unwrap();
+        assert!(next_status(&mut silent.outbound).await.is_some());
+        let went_silent = tokio::time::Instant::now();
+
+        let mut responsive = streams.recv().await.unwrap();
+        let reconnected = responsive.at - went_silent;
+        assert!(
+            reconnected <= host_budget(covered),
+            "reached a responsive replica {reconnected:?} after the silence, over {:?}",
+            host_budget(covered)
+        );
+        assert_eq!(gateway.calls.lock().unwrap().len(), 2 + covered as usize);
+        assert!(is_hello(responsive.outbound.recv().await));
+        responsive.inbound.send(Ok(accepted())).await.unwrap();
+        let accepted_at = tokio::time::Instant::now();
+        assert!(next_status(&mut responsive.outbound).await.is_some());
+        assert_eq!(
+            tokio::time::Instant::now(),
+            accepted_at,
+            "status is reported at once"
+        );
+    }
+
+    /// After an accepted stream is lost, every attempt through the one after
+    /// the covered unanswered attempts, the one the budget counts on reaching
+    /// a responsive replica, gets the quick bound; only later ones get the
+    /// ordinary bound.
+    #[tokio::test(start_paused = true)]
+    async fn the_attempt_after_the_covered_unanswered_ones_is_still_quick() {
+        use openshell_supervisor_control::pool_timing;
+        let covered = pool_timing::COVERED_UNANSWERED_ATTEMPTS as usize;
+        let mut plan = vec![Attempt::Now];
+        // The covered unanswered attempts, the one after them, and one more.
+        plan.extend((0..covered + 2).map(|_| Attempt::Hang));
+        plan.push(Attempt::Now);
+        let (_host, gateway, mut streams, _root) = attach_pool_host(plan);
+        let mut silent = streams.recv().await.unwrap();
+        assert!(is_hello(silent.outbound.recv().await));
+        silent.inbound.send(Ok(accepted())).await.unwrap();
+        assert!(next_status(&mut silent.outbound).await.is_some());
+        streams.recv().await.unwrap();
+        let calls = gateway.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), covered + 4);
+        // Reconnect attempt `n` (1-based) runs from calls[n] to calls[n + 1].
+        for attempt in 1..=covered + 2 {
+            let took = calls[attempt + 1] - calls[attempt];
+            let backoff = pool_timing::host_backoff_bound(u32::try_from(attempt + 1).unwrap());
+            let bound = if attempt <= covered + 1 {
+                pool_timing::HOST_ATTEMPT_TIMEOUT
+            } else {
+                CONNECT_TIMEOUT
+            };
+            assert!(
+                took >= bound && took <= bound + backoff,
+                "reconnect attempt {attempt} took {took:?}, expected its {bound:?} bound"
+            );
+        }
+    }
+
+    /// Connecting, attaching, and being accepted share one deadline: a
+    /// stream that opens late and is never accepted is abandoned when the
+    /// attempt's deadline passes, not a full timeout after it opened.
+    #[tokio::test(start_paused = true)]
+    async fn one_deadline_bounds_connecting_and_being_accepted() {
+        use openshell_supervisor_control::pool_timing;
+        let late = pool_timing::HOST_ATTEMPT_TIMEOUT.mul_f64(0.7);
+        let (_host, gateway, mut streams, _root) =
+            attach_pool_host(vec![Attempt::After(late), Attempt::Now]);
+        let unaccepted = streams.recv().await.unwrap();
+        let next = streams.recv().await.unwrap();
+        let attempt = next.at - unaccepted.at;
+        assert!(
+            attempt <= pool_timing::HOST_ATTEMPT_TIMEOUT + pool_timing::host_backoff_bound(1),
+            "the unaccepted attempt took {attempt:?}"
+        );
+        assert!(attempt >= pool_timing::HOST_ATTEMPT_TIMEOUT);
+        assert_eq!(gateway.calls.lock().unwrap().len(), 2);
+    }
+
+    /// A replica that keeps writing but stops reading fills the host's
+    /// outbound queue; the blocked send gives up within the silence budget
+    /// rather than the ordinary send bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_gateway_that_stops_reading_is_left_within_the_silence_budget() {
+        use openshell_supervisor_control::pool_timing;
+        let (_host, _gateway, mut streams, _root) =
+            attach_pool_host(vec![Attempt::Now, Attempt::Now]);
+        let unread = streams.recv().await.unwrap();
+        let inbound = unread.inbound.clone();
+        tokio::spawn(async move {
+            if inbound.send(Ok(accepted())).await.is_err() {
+                return;
+            }
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if inbound.send(Ok(gateway_heartbeat())).await.is_err() {
+                    return;
+                }
+            }
+        });
+        // The host fills its queue to the replica that never reads it.
+        while unread.outbound.len() < OUTBOUND_QUEUE {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let full = tokio::time::Instant::now();
+        let next = streams.recv().await.unwrap();
+        let left = next.at - full;
+        assert!(
+            left <= pool_timing::HOST_SILENCE_TIMEOUT
+                + pool_timing::HEARTBEAT_INTERVAL
+                + pool_timing::host_backoff_bound(1),
+            "a blocked send held the host {left:?}"
+        );
+        assert!(left < SEND_TIMEOUT);
+    }
+
+    /// A reconciliation stalled past the membership TTL keeps neither a new
+    /// stream from connecting and reporting nor a second reconciliation from
+    /// waiting its turn: the new stream's snapshot is applied after it, never
+    /// beside it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_reconciliation_neither_delays_reconnecting_nor_runs_twice() {
+        use openshell_supervisor_control::pool_timing;
+        let (host, _gateway, mut streams, _root) =
+            attach_pool_host(vec![Attempt::Now, Attempt::Now]);
+        let (release, gate) = tokio::sync::oneshot::channel();
+        *host.reconcile_probe.gate.lock().unwrap() = Some(gate);
+        let mut stalled = streams.recv().await.unwrap();
+        assert!(is_hello(stalled.outbound.recv().await));
+        stalled.inbound.send(Ok(accepted())).await.unwrap();
+        assert!(next_status(&mut stalled.outbound).await.is_some());
+        stalled.inbound.send(Ok(pool_snapshot(7))).await.unwrap();
+        let went_silent = tokio::time::Instant::now();
+        // The worker takes the snapshot and stalls; the replica stays silent.
+        while host
+            .reconcile_probe
+            .running
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let responsive = tokio::time::timeout(pool_timing::MEMBER_TTL, streams.recv())
+            .await
+            .expect("reconnected while the reconciliation stalls")
+            .unwrap();
+        assert!(responsive.at - went_silent <= host_budget(0));
+        let accepted_at = tokio::time::Instant::now();
+        let (mut reported, gateway) = serve(responsive);
+        let first = reported.recv().await.unwrap();
+        assert_eq!(tokio::time::Instant::now(), accepted_at);
+        assert_eq!(first.applied_revision, 0);
+
+        // The new replica's snapshot waits for the stalled one, well past the
+        // TTL, while the stream stays up.
+        gateway.send(Ok(pool_snapshot(1))).await.unwrap();
+        tokio::time::sleep(pool_timing::MEMBER_TTL + Duration::from_secs(5)).await;
+        assert_eq!(
+            host.reconcile_probe
+                .peak
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        release.send(()).unwrap();
+        let applied = loop {
+            let status = reported.recv().await.unwrap();
+            if status.applied_revision == 1 {
+                break status;
+            }
+        };
+        assert_eq!(applied.applied_revision, 1);
+        assert_eq!(
+            host.reconcile_probe
+                .peak
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    /// Process shutdown ends the attachment only once the reconciliation in
+    /// flight has finished, so the host's own shutdown sees everything it
+    /// admitted; snapshots still queued behind it are dropped.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_the_reconciliation_in_flight_and_drops_queued_work() {
+        use std::sync::atomic::Ordering;
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let (host, _gateway, mut streams, _root, attachment) =
+            attach_pool_host_until(vec![Attempt::Now], async {
+                let _ = stopped.await;
+            });
+        let (release, gate) = tokio::sync::oneshot::channel();
+        *host.reconcile_probe.gate.lock().unwrap() = Some(gate);
+        let stream = streams.recv().await.unwrap();
+        let (mut reported, gateway) = serve(stream);
+        // Accepted: the host reports before any snapshot.
+        reported.recv().await.unwrap();
+        gateway.send(Ok(pool_snapshot(1))).await.unwrap();
+        while host.reconcile_probe.running.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // A newer snapshot waits behind the stalled one.
+        gateway.send(Ok(pool_snapshot(2))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        stop.send(()).unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(
+            !attachment.is_finished(),
+            "the attachment ended while a reconciliation was still admitting"
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), attachment)
+            .await
+            .expect("the attachment ends once the reconciliation finishes")
+            .unwrap();
+        assert_eq!(host.reconcile_probe.running.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            host.reconcile_probe.entered.load(Ordering::SeqCst),
+            1,
+            "the queued snapshot must not run after shutdown"
         );
     }
 

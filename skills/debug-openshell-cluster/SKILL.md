@@ -1172,7 +1172,10 @@ Each sandbox instance runs on one member, and a live owner keeps it. The
 gateway logs `shared supervisor pool enabled; reconciling pool membership and
 ownership` at startup. When an owner's process exits, its node is lost, or it
 leaves, the gateway logs `taking over a shared sandbox instance from a failed
-supervisor` with `from`, `to`, and `term`, revokes the previous owner's
+supervisor` with `from`, `to`, `term`, and `cause` (`expired`: the member's
+record expired; `leaving`: it announced leaving; `restarted`: its process
+changed, and a member whose process restarted re-adopts its own instances
+first), revokes the previous owner's
 credentials for that sandbox, and grants the instance to a live member.
 Runtimes dial the supervisor Service, and a member that does not own the
 instance redirects the runtime to the owner's Pod IP on the runtime port, so
@@ -1196,8 +1199,10 @@ In a pool, the recovery timeout is the gateway's
 supervisor offers it to a sandbox runtime when it attaches; one replica keeps
 the runtime default of 30 seconds. A graceful leave hands instances over at
 once.
-A lost node takes up to the 15-second membership TTL plus a 2-second
-reconcile pass to detect, before the replacement starts, so a short timeout
+A lost node takes up to about 22 seconds to detect, before the replacement
+starts: the gateway closes the member's silent stream after 5 seconds, the
+member's record expires 15 seconds after its last refresh, and a reconcile pass
+runs every 2 seconds. A short timeout
 terminates workloads that would have recovered. A gateway replica that just
 started waits 30 seconds before it takes over instances whose owner looks
 failed, so members cut off by a gateway restart reconnect first. With one
@@ -1206,13 +1211,20 @@ ends in `sandbox-supervisor-recovery-expired`.
 
 `supervisor pool reconciliation failed; retrying` means a gateway replica could
 not read or write the pool's store records: `supervisor_pool_member` (one per
-member, refreshed by the gateway replica serving its stream; older than 15
-seconds means dead), `supervisor_instance_assignment` (one per instance the pool
-must run, written by the replica that launched it; it holds the handle of the
-launch material, which the gateway's credential store keeps),
-`supervisor_instance_owner` (one per instance, written with compare-and-swap,
-naming the owner and its term), and `supervisor_instance_report` (the owner's
-latest report, recorded by the replica serving it). Every gateway replica
+member, refreshed every 2 seconds by the gateway replica serving its newest
+stream, independently of reconciliation; older than 15 seconds means dead),
+`supervisor_instance_assignment` (one per instance the pool must run, written by
+the replica that launched it; it holds the handle of the launch material, which
+the gateway's credential store keeps), `supervisor_instance_owner` (one per
+instance, written with compare-and-swap, naming the owner and its term),
+`supervisor_pool_capacity` (one per member, listing the routes whose owner
+record names it; changed in the same transaction as each owner record, so a
+member is never charged more than 256 instances across replicas), and
+`supervisor_instance_report` (one per instance and ownership term, the owner's
+latest report of that term, recorded by the replica serving it). `supervisor
+pool member refresh failed` or `did not finish in time` means the replica could
+not keep a member's record fresh; if it persists for 15 seconds the member's
+instances move. Every gateway replica
 serves the pool from these records, so a sandbox launched through one replica
 reaches a member connected to another. `could not load a supervisor pool
 instance's launch material` points at the credential store instead. Check the
@@ -1224,7 +1236,8 @@ SELECT object_type, id,
        convert_from(payload, 'UTF8') AS record
 FROM objects
 WHERE object_type IN ('supervisor_pool_member', 'supervisor_instance_assignment',
-                      'supervisor_instance_owner', 'supervisor_instance_report')
+                      'supervisor_instance_owner', 'supervisor_pool_capacity',
+                      'supervisor_instance_report')
 ORDER BY object_type, id;
 ```
 

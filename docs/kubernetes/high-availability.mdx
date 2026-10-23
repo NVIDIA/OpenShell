@@ -550,7 +550,7 @@ the failure break, and clients must reconnect.
 a pool. The pool's supervisors offer the limit to each sandbox runtime when
 they attach. If no replacement confirms the takeover in time, the sandbox
 runtime terminates the workload instead of letting it run unsupervised. When
-unset, the limit is 60 seconds. The gateway takes up to 17 seconds to detect a
+unset, the limit is 60 seconds. The gateway takes up to 22 seconds to detect a
 failed node, or 30 seconds right after a gateway replica starts, and the
 replacement then needs time to take over, so keep the limit well above that.
 A pool fails over only to a live member, so keep at least two members running.

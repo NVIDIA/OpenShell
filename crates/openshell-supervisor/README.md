@@ -184,10 +184,13 @@ control listener: it dials the gateway and receives its assignments from it.
   omits. An identical assignment is a no-op; one that cannot be admitted
   (invalid material, or a different fingerprint for a live route) is reported
   as a failed instance and never touches the running one. Snapshots are
-  reconciled one at a time on a separate task, so heartbeats and status keep
-  flowing while instances stop; only the newest unapplied snapshot is kept,
-  and a connection finishes the reconciliation it started before the next
-  connection begins. Private files live under `--session-root` (proxy CA,
+  reconciled one at a time by one worker that outlives connections, so
+  heartbeats and status keep flowing while instances start or stop, and a
+  lost connection is replaced without waiting for a slow reconciliation; only
+  the newest unapplied snapshot is kept, and work queued by an older
+  connection is dropped when a new one begins. On shutdown the worker drops
+  queued work and finishes the reconciliation in flight before the host
+  releases or removes its instances. Private files live under `--session-root` (proxy CA,
   trust directory, SSH socket); the registry owns removal and keeps the route
   reserved until the instance has ended and its files are deleted.
 - **Status.** After each reconciliation and whenever an instance is admitted,
@@ -197,7 +200,13 @@ control listener: it dials the gateway and receives its assignments from it.
 - **Disconnects.** Losing the gateway stream never stops an instance. The
   host reconnects with backoff, reports what it runs, and applies the first
   snapshot of the new session; only a snapshot that omits an instance, or
-  process shutdown, stops it.
+  process shutdown, stops it. A pool member uses the timings of
+  `openshell_supervisor_control::pool_timing`: it abandons a stream after 3 s
+  without hearing from the gateway, bounds sends by the same silence, gives
+  each early reconnect attempt one 1 s deadline across connecting, attaching,
+  and being accepted, and backs off 100 to 400 ms with jitter, so it reaches a
+  responsive gateway replica well before its membership record expires. A
+  lone shared supervisor keeps its longer timings.
 - **Runtime connections.** One routed listener (`--runtime-listen`) accepts every
   instance's runtime-initiated Sandbox Protocol connections; see
   `openshell-sandbox-backend` for the routing preface.

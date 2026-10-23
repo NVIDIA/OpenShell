@@ -27,6 +27,7 @@
 pub mod controller;
 pub mod coordinator;
 pub mod credential;
+pub mod pool_timing;
 pub mod registration;
 pub mod status;
 
@@ -38,8 +39,8 @@ pub mod proto {
 
 pub use controller::{
     AssignmentError, ConnectedMember, HOST_HEARTBEAT_INTERVAL, HostIdentity, InstanceOwner,
-    MAX_ASSIGNED_INSTANCES, MAX_POOL_INSTANCES, MAX_REPORTED_INSTANCES, MemberView,
-    ObservedInstance, OwnedReport, POOL_HEARTBEAT_INTERVAL, POOL_RECOVERY_TIMEOUT_SECS, PoolView,
+    MAX_ASSIGNED_INSTANCES, MAX_POOL_INSTANCES, MAX_REPORTED_INSTANCES, MemberReport, MemberView,
+    ObservedInstance, POOL_HEARTBEAT_INTERVAL, POOL_RECOVERY_TIMEOUT_SECS, PoolView,
     SupervisorCredential, SupervisorHostController,
 };
 pub use coordinator::{

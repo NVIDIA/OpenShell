@@ -41,7 +41,21 @@ re-implementing the control contracts.
   unless configured). Omission means release, never stop. Nothing is sent
   before the first view. An instance is judged by its owning process's
   session, or by that owner term's recorded report on other replicas.
-  Placement keeps each member at 256 instances.
+  Placement keeps each member at 256 instances. Each stream remembers the term
+  of every route its sent snapshots assigned and the revision that installed
+  it; `member_reports` attributes a reported status to that term only once the
+  stream acknowledged that revision, so the gateway never records an earlier
+  term's status under a later one. `membership_changes` changes when a member
+  stream attaches, ends, or announces leaving, so the gateway refreshes
+  membership records at once. The gateway closes a member's stream after
+  `pool_timing::GATEWAY_SILENCE_TIMEOUT` of silence, and drops a member that
+  stops reading as soon.
+- `pool_timing`: the timing contract between pool hosts and the gateway: the
+  15 s membership TTL, the 2 s record refresh, 1 s heartbeats, host silence
+  detection and bounded reconnect attempts, and `reconnect_budget`, the worst
+  case for a member to reconnect past an unresponsive replica and be refreshed
+  elsewhere, which a test keeps well inside the TTL. A lone shared supervisor
+  keeps its own longer timings.
 - `registration`: `SandboxInstanceRegistration` is the JSON launch material
   one assignment carries and the driver persists with the generation. It
   grants the supervisor exactly that generation's gateway and Sandbox Protocol

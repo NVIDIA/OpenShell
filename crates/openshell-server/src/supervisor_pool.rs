@@ -7,9 +7,12 @@
 //! sandbox instances:
 //!
 //! - **Membership.** The gateway replica serving a member's stream refreshes a
-//!   store record for it; a record older than [`MEMBER_TTL`] is dead. A member
-//!   that announces it is leaving is out of the pool at once, and a member
-//!   whose process changed lost every instance its previous process owned.
+//!   store record for it, from its own task and never behind a reconciliation
+//!   pass; a record older than [`MEMBER_TTL`] is dead. Only the member's
+//!   newest stream writes its record. A member that announces it is leaving
+//!   is out of the pool at once, and a member whose process changed lost
+//!   every instance its previous process owned. See
+//!   [`openshell_supervisor_control::pool_timing`].
 //! - **Placement.** A consistent-hash ring ([`GatewayRing`]) over live members
 //!   chooses the member a new instance launches on.
 //! - **Ownership.** A store record per instance, written only with
@@ -50,12 +53,14 @@ use openshell_core::jwt::{SandboxId, SupervisorTakeover};
 use openshell_core::proto::datamodel::v1::{CredentialHandle, ObjectMeta, Provider};
 use openshell_core::proto::{Sandbox, SandboxPhase};
 use openshell_core::time::now_ms;
+use openshell_supervisor_control::pool_timing::RECORD_WRITE_BOUND;
 use openshell_supervisor_control::proto::{
     SandboxInstanceAssignment, SandboxInstanceStatus, SandboxInstanceTakeover,
 };
 use openshell_supervisor_control::{
     ConnectedMember, InstanceOwner, InstancePlacement, MAX_ASSIGNED_INSTANCES, MAX_POOL_INSTANCES,
-    MemberView, PlacementFuture, PlacementRequest, PoolView, SupervisorHostController,
+    MemberReport, MemberView, PlacementFuture, PlacementRequest, PoolView,
+    SupervisorHostController,
 };
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
@@ -68,7 +73,9 @@ use crate::auth::sandbox_session::{
 };
 use crate::credentials::CredentialRuntime;
 use crate::gateway_ring::GatewayRing;
-use crate::persistence::{ObjectRecord, PersistenceError, Store, WriteCondition};
+use crate::persistence::{
+    AtomicWrite, ObjectCursor, ObjectRecord, PersistenceError, Store, WriteCondition,
+};
 
 const MEMBER_OBJECT_TYPE: &str = "supervisor_pool_member";
 const OWNER_OBJECT_TYPE: &str = "supervisor_instance_owner";
@@ -78,12 +85,20 @@ const ASSIGNMENT_OBJECT_TYPE: &str = "supervisor_instance_assignment";
 /// failed recording never loses the only handle.
 const MATERIAL_CANDIDATE_OBJECT_TYPE: &str = "supervisor_instance_material_candidate";
 const REPORT_OBJECT_TYPE: &str = "supervisor_instance_report";
+/// The routes one member is charged for: exactly the routes whose owner record,
+/// in any phase, names the member. Every owner change updates it in the same
+/// atomic write, so a member is never charged for more than
+/// [`MAX_ASSIGNED_INSTANCES`] routes across gateway replicas.
+const CAPACITY_OBJECT_TYPE: &str = "supervisor_pool_capacity";
+/// Attempts of one owner change against concurrent changes of the same
+/// members' capacity.
+const TRANSITION_ATTEMPTS: usize = 16;
 /// Credential key of an instance's launch material in the credential store.
 const LAUNCH_MATERIAL_KEY: &str = "SHARED_INSTANCE_LAUNCH_MATERIAL";
 
 /// How long a member's record stays live without a refresh.
-pub const MEMBER_TTL: Duration = Duration::from_secs(15);
-/// How often each gateway replica refreshes its members and reconciles.
+pub const MEMBER_TTL: Duration = openshell_supervisor_control::pool_timing::MEMBER_TTL;
+/// How often each gateway replica reconciles.
 pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 /// How long a desired instance may lack an owner record before a replica
 /// places it by takeover; a launch records its owner within this.
@@ -132,8 +147,18 @@ fn assignment_object_id(route: &str, writer: &str) -> String {
     format!("supervisor-instance-assignment:{route}:{writer}")
 }
 
-fn report_object_id(route: &str) -> String {
-    format!("supervisor-instance-report:{route}")
+fn capacity_object_id(member_id: &str) -> String {
+    format!("supervisor-pool-capacity:{member_id}")
+}
+
+/// One ownership term's report row of `route`. A writer of an older term
+/// can never overwrite a newer term's row.
+fn report_object_id(route: &str, auth_epoch: u64) -> String {
+    format!("supervisor-instance-report:{route}:{auth_epoch}")
+}
+
+fn report_object_name(route: &str, auth_epoch: u64) -> String {
+    format!("{route}:{auth_epoch}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,8 +260,8 @@ struct AssignmentRecord {
     updated_at_ms: i64,
 }
 
-/// What an owner reported of one instance, for gateway replicas that do not
-/// serve the owner. Error text is not recorded.
+/// What an owner reported of one instance in one ownership term, for gateway
+/// replicas that do not serve the owner. Error text is not recorded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ReportPayload {
     route: String,
@@ -247,6 +272,87 @@ struct ReportPayload {
     phase: i32,
     ready: bool,
     exit_code: i32,
+    /// When the reporting stream was accepted; within one term, a newer
+    /// stream's report wins.
+    #[serde(default)]
+    connected_at_ms: i64,
+}
+
+/// Listed report rows by object id, with their resource versions.
+type ReportRows = BTreeMap<String, (ReportPayload, u64)>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct CapacityPayload {
+    member_id: String,
+    routes: BTreeSet<String>,
+}
+
+/// A member's capacity row as read, or an empty one not yet written.
+#[derive(Debug, Clone)]
+struct Capacity {
+    payload: CapacityPayload,
+    resource_version: Option<u64>,
+}
+
+impl Capacity {
+    fn empty(member_id: &str) -> Self {
+        Self {
+            payload: CapacityPayload {
+                member_id: member_id.to_string(),
+                routes: BTreeSet::new(),
+            },
+            resource_version: None,
+        }
+    }
+
+    /// Whether `route` can be charged here: it already is, or a slot is free.
+    fn has_room_for(&self, route: &str) -> bool {
+        self.payload.routes.contains(route) || self.payload.routes.len() < MAX_ASSIGNED_INSTANCES
+    }
+
+    /// The write that makes this row charge exactly `routes`.
+    fn write(&self, routes: BTreeSet<String>) -> Result<AtomicWrite, PersistenceError> {
+        let payload = serde_json::to_vec(&CapacityPayload {
+            member_id: self.payload.member_id.clone(),
+            routes,
+        })
+        .map_err(|error| PersistenceError::Encode(error.to_string()))?;
+        let id = capacity_object_id(&self.payload.member_id);
+        Ok(match self.resource_version {
+            None => AtomicWrite::Create {
+                object_type: CAPACITY_OBJECT_TYPE.to_string(),
+                id,
+                name: self.payload.member_id.clone(),
+                workspace: String::new(),
+                payload,
+            },
+            Some(expected_version) => AtomicWrite::Update {
+                object_type: CAPACITY_OBJECT_TYPE.to_string(),
+                id,
+                payload,
+                expected_version,
+            },
+        })
+    }
+}
+
+fn decode_capacity(record: &ObjectRecord) -> Option<Capacity> {
+    let payload = serde_json::from_slice::<CapacityPayload>(&record.payload).ok()?;
+    (record.id == capacity_object_id(&payload.member_id)).then_some(Capacity {
+        payload,
+        resource_version: Some(record.resource_version),
+    })
+}
+
+/// How an owner change ended.
+#[derive(Debug)]
+enum Transition {
+    /// Applied; the owner record now reads as this, or is gone.
+    Applied(Option<Box<OwnerRecord>>),
+    /// The target member has no free slot for the route.
+    Full,
+    /// The owner record is not what the change was based on.
+    OwnerChanged,
 }
 
 /// What reconciling one route did to its owner record.
@@ -268,6 +374,8 @@ pub struct SupervisorPool {
     credentials: CredentialRuntime,
     replica_id: String,
     member_ttl: Duration,
+    /// How often the records of served members are refreshed.
+    member_refresh: Duration,
     unowned_grace: Duration,
     /// No takeover before this instant; see [`TAKEOVER_STARTUP_GRACE`].
     takeovers_from: tokio::time::Instant,
@@ -279,7 +387,6 @@ pub struct SupervisorPool {
     /// serves, or launched here.
     materials: Mutex<HashMap<String, SandboxInstanceAssignment>>,
     /// The last report this replica recorded of each route.
-    recorded_reports: Mutex<HashMap<String, ReportPayload>>,
     /// When each owner record of an instance that is no longer desired was
     /// first seen.
     withdrawn_since: Mutex<HashMap<String, tokio::time::Instant>>,
@@ -297,6 +404,46 @@ pub struct SupervisorPool {
             tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
+    #[cfg(test)]
+    hooks: TestHooks,
+}
+
+/// A pause one test sets and one task takes: it reports reaching the pause
+/// and waits to be resumed.
+#[cfg(test)]
+type Gate = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+/// A pause of owner changes: reports reaching it, if asked, and waits on a
+/// barrier shared with competing changes.
+#[cfg(test)]
+type TransitionGate = (
+    Option<tokio::sync::oneshot::Sender<()>>,
+    Arc<tokio::sync::Barrier>,
+);
+
+/// Points where tests pause or perturb a pass.
+#[cfg(test)]
+#[derive(Default)]
+struct TestHooks {
+    /// Pauses the next listing of an object type after its first page.
+    listing_gate: Mutex<Option<(String, Gate)>>,
+    /// Routes dropped from assignment and owner listings, as a listing that
+    /// is not a snapshot can miss rows.
+    listing_omits: Mutex<BTreeSet<String>>,
+    /// Pauses the next reconciliation pass before it does anything.
+    reconcile_gate: Mutex<Option<Gate>>,
+    /// Replaces the members whose streams the controller serves.
+    served_members: Mutex<Option<Vec<ConnectedMember>>>,
+    /// Replaces what served members report.
+    served_reports: Mutex<Option<Vec<MemberReport>>>,
+    /// Pauses the next report recording after it read what members report.
+    report_gate: Mutex<Option<Gate>>,
+    /// Pauses the next owner change after it read capacity, before it
+    /// writes: signals arrival, then waits on the barrier.
+    transition_gate: Mutex<Option<TransitionGate>>,
 }
 
 impl std::fmt::Debug for SupervisorPool {
@@ -324,39 +471,72 @@ fn ring_of(members: &[LiveMember]) -> GatewayRing {
     )
 }
 
-/// The member to place `sandbox_id`'s instance on: the ring's choice while
-/// it has room, else the least loaded live member that has. `load` counts
-/// the instances each member owns.
-fn choose<'a>(
+/// Members to place `route` (of `sandbox_id`) on, best first: `same`, the
+/// route's previous member, when its live process may re-adopt it; the
+/// ring's choice; then the others, least charged first. Only members that
+/// seem to have room for the route are listed; the owner change itself
+/// re-checks room atomically. `charges` counts the routes each member is
+/// charged for and lists them.
+fn candidates<'a>(
     ring: &GatewayRing,
     members: &'a [LiveMember],
     sandbox_id: &str,
-    load: &HashMap<String, usize>,
-) -> Option<&'a LiveMember> {
+    route: &str,
+    charges: &BTreeMap<String, BTreeSet<String>>,
+    same: Option<&str>,
+) -> Vec<&'a LiveMember> {
+    let routes_of = |member: &LiveMember| charges.get(&member.member_id);
     let has_room = |member: &&LiveMember| {
         !member.leaving
-            && load.get(&member.member_id).copied().unwrap_or(0) < MAX_ASSIGNED_INSTANCES
+            && routes_of(member).is_none_or(|routes| {
+                routes.contains(route) || routes.len() < MAX_ASSIGNED_INSTANCES
+            })
     };
+    let load = |member: &LiveMember| routes_of(member).map_or(0, BTreeSet::len);
     let preferred = ring.owner_for(sandbox_id);
-    members
-        .iter()
-        .find(|member| Some(member.member_id.as_str()) == preferred)
-        .filter(has_room)
-        .or_else(|| {
-            members
-                .iter()
-                .filter(has_room)
-                .min_by_key(|member| load.get(&member.member_id).copied().unwrap_or(0))
-        })
+    let mut ordered = members.iter().filter(has_room).collect::<Vec<_>>();
+    ordered.sort_by_key(|member| {
+        (
+            Some(member.member_id.as_str()) != same,
+            Some(member.member_id.as_str()) != preferred,
+            load(member),
+            member.member_id.clone(),
+        )
+    });
+    ordered
 }
 
-/// Instances each member owns, pending takeovers included.
-fn load_of<'a>(owners: impl IntoIterator<Item = &'a OwnerRecord>) -> HashMap<String, usize> {
-    let mut load = HashMap::new();
-    for record in owners {
-        *load.entry(record.payload.member_id.clone()).or_insert(0) += 1;
+/// The routes each member is charged for, from capacity rows.
+fn charges_of(capacities: &[Capacity]) -> BTreeMap<String, BTreeSet<String>> {
+    capacities
+        .iter()
+        .map(|capacity| {
+            (
+                capacity.payload.member_id.clone(),
+                capacity.payload.routes.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Move `route`'s charge in a local copy after an owner change.
+fn recharge(
+    charges: &mut BTreeMap<String, BTreeSet<String>>,
+    route: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+) {
+    if let Some(before) = before
+        && let Some(routes) = charges.get_mut(before)
+    {
+        routes.remove(route);
     }
-    load
+    if let Some(after) = after {
+        charges
+            .entry(after.to_string())
+            .or_default()
+            .insert(route.to_string());
+    }
 }
 
 /// Whether the process that owns `owner` still serves its member.
@@ -368,12 +548,57 @@ fn owner_alive(owner: &OwnerPayload, members: &[LiveMember]) -> bool {
     })
 }
 
+/// Why `owner`, which [`owner_alive`] rejects, loses its instance: its
+/// member is leaving, runs a new process, or has no live record.
+fn takeover_cause(owner: &OwnerPayload, members: &[LiveMember]) -> &'static str {
+    match members
+        .iter()
+        .find(|member| member.member_id == owner.member_id)
+    {
+        Some(member) if member.process_id != owner.process_id => "restarted",
+        Some(_) => "leaving",
+        None => "expired",
+    }
+}
+
 fn decode_owner(record: &ObjectRecord) -> Option<OwnerRecord> {
     let payload = serde_json::from_slice::<OwnerPayload>(&record.payload).ok()?;
     (record.id == owner_object_id(&payload.route)).then_some(OwnerRecord {
         payload,
         resource_version: record.resource_version,
     })
+}
+
+/// The report row of each route's current, granted owner term.
+fn reports_of_owners(
+    owners: &BTreeMap<String, OwnerRecord>,
+    rows: &ReportRows,
+) -> BTreeMap<String, SandboxInstanceStatus> {
+    owners
+        .values()
+        .filter(|owner| owner.payload.phase == OwnerPhase::Granted)
+        .filter_map(|owner| {
+            let (report, _) = rows.get(&report_object_id(
+                &owner.payload.route,
+                owner.payload.auth_epoch,
+            ))?;
+            (report.member_id == owner.payload.member_id
+                && report.process_id == owner.payload.process_id)
+                .then(|| {
+                    (
+                        report.route.clone(),
+                        SandboxInstanceStatus {
+                            route: report.route.clone(),
+                            sandbox_id: report.sandbox_id.clone(),
+                            phase: report.phase,
+                            ready: report.ready,
+                            exit_code: report.exit_code,
+                            error: String::new(),
+                        },
+                    )
+                })
+        })
+        .collect()
 }
 
 fn decode_assignment(record: &ObjectRecord) -> Option<AssignmentRecord> {
@@ -390,7 +615,7 @@ fn decode_assignment(record: &ObjectRecord) -> Option<AssignmentRecord> {
 
 fn decode_report(record: &ObjectRecord) -> Option<ReportPayload> {
     let payload = serde_json::from_slice::<ReportPayload>(&record.payload).ok()?;
-    (record.id == report_object_id(&payload.route)).then_some(payload)
+    (record.id == report_object_id(&payload.route, payload.auth_epoch)).then_some(payload)
 }
 
 /// The synthetic credential owner of one sandbox's launch material, scoped
@@ -434,19 +659,73 @@ impl SupervisorPool {
             credentials,
             replica_id,
             member_ttl: MEMBER_TTL,
+            member_refresh: openshell_supervisor_control::pool_timing::MEMBER_REFRESH_INTERVAL,
             unowned_grace: UNOWNED_GRACE,
             takeovers_from: tokio::time::Instant::now() + TAKEOVER_STARTUP_GRACE,
             unowned_since: Mutex::new(HashMap::new()),
             minted: Mutex::new(HashMap::new()),
             materials: Mutex::new(HashMap::new()),
-            recorded_reports: Mutex::new(HashMap::new()),
             withdrawn_since: Mutex::new(HashMap::new()),
             sweep_from: Mutex::new(0),
             candidate_grace: MATERIAL_CANDIDATE_GRACE,
             reservation_grace: RESERVATION_GRACE,
             #[cfg(test)]
             staged_gate: Mutex::new(None),
+            #[cfg(test)]
+            hooks: TestHooks::default(),
         })
+    }
+
+    /// Pause the next listing of `object_type` after its first page.
+    #[cfg(test)]
+    fn pause_listing_after_first_page(
+        &self,
+        object_type: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (paused, paused_rx) = tokio::sync::oneshot::channel();
+        let (resume, resume_rx) = tokio::sync::oneshot::channel();
+        *lock(&self.hooks.listing_gate) = Some((object_type.to_string(), (paused, resume_rx)));
+        (paused_rx, resume)
+    }
+
+    /// Pause the next owner change after it read capacity, until the
+    /// barrier releases it.
+    #[cfg(test)]
+    fn pause_next_transition(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *lock(&self.hooks.transition_gate) = Some((None, barrier));
+    }
+
+    /// Like [`Self::pause_next_transition`]; the receiver resolves once the
+    /// change read capacity and waits on the barrier.
+    #[cfg(test)]
+    fn pause_next_transition_reached(
+        &self,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let (reached, arrival) = tokio::sync::oneshot::channel();
+        *lock(&self.hooks.transition_gate) = Some((Some(reached), barrier));
+        arrival
+    }
+
+    /// The owner record of `route`.
+    #[cfg(test)]
+    async fn reload_owner(&self, route: &str) -> OwnerRecord {
+        self.store
+            .get(OWNER_OBJECT_TYPE, &owner_object_id(route))
+            .await
+            .unwrap()
+            .as_ref()
+            .and_then(decode_owner)
+            .unwrap()
+    }
+
+    /// Drop `route` from assignment and owner listings.
+    #[cfg(test)]
+    fn omit_from_listings(&self, route: &str) {
+        lock(&self.hooks.listing_omits).insert(route.to_string());
     }
 
     /// Pause the next recording once it has staged its material, until the
@@ -464,11 +743,65 @@ impl SupervisorPool {
         (staged_rx, publish)
     }
 
-    /// Install this pool as the controller's launch placement and keep the
-    /// pool reconciled until shutdown.
+    /// Report `reports` as if served members had made them.
+    #[cfg(test)]
+    fn serve_reports(&self, reports: Vec<MemberReport>) {
+        *lock(&self.hooks.served_reports) = Some(reports);
+    }
+
+    /// Pause the next report recording after it read what members report.
+    #[cfg(test)]
+    fn pause_next_report_recording(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (paused, paused_rx) = tokio::sync::oneshot::channel();
+        let (resume, resume_rx) = tokio::sync::oneshot::channel();
+        *lock(&self.hooks.report_gate) = Some((paused, resume_rx));
+        (paused_rx, resume)
+    }
+
+    /// Pause the next reconciliation pass before it starts.
+    #[cfg(test)]
+    fn pause_next_pass(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (paused, paused_rx) = tokio::sync::oneshot::channel();
+        let (resume, resume_rx) = tokio::sync::oneshot::channel();
+        *lock(&self.hooks.reconcile_gate) = Some((paused, resume_rx));
+        (paused_rx, resume)
+    }
+
+    /// Serve `members` as if their streams were connected here.
+    #[cfg(test)]
+    fn serve(&self, members: Vec<ConnectedMember>) {
+        *lock(&self.hooks.served_members) = Some(members);
+    }
+
+    /// Members whose streams this replica serves.
+    fn served_members(&self) -> Vec<ConnectedMember> {
+        #[cfg(test)]
+        {
+            let members = lock(&self.hooks.served_members).clone();
+            if let Some(members) = members {
+                return members;
+            }
+        }
+        self.controller.connected_members()
+    }
+
+    /// Install this pool as the controller's launch placement, keep the
+    /// records of served members fresh, and keep the pool reconciled until
+    /// shutdown.
     pub fn start(self: &Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         self.controller
             .install_placement(Arc::new(PoolPlacement(self.clone())));
+        self.start_membership_heartbeat(shutdown.clone());
         let pool = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
@@ -490,22 +823,65 @@ impl SupervisorPool {
         });
     }
 
-    /// Refresh the records of members this replica serves. A record written
-    /// for a newer stream of the member elsewhere is left alone.
-    async fn refresh_members(&self) {
-        for member in self.controller.connected_members() {
-            if let Err(error) = self.write_member(&member).await {
-                warn!(member = %member.member_id, %error, "supervisor pool member refresh failed");
+    /// Refresh served members' records every [`Self::member_refresh`], and
+    /// at once when a member attaches, leaves, or detaches. Independent of
+    /// reconciliation, so a slow pass never lets a served member expire.
+    fn start_membership_heartbeat(
+        self: &Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let pool = self.clone();
+        tokio::spawn(async move {
+            let mut membership = pool.controller.membership_changes();
+            let mut ticker = tokio::time::interval(pool.member_refresh);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    changed = membership.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                pool.refresh_members().await;
             }
-        }
+        });
+    }
+
+    /// Refresh the records of members this replica serves, all at once and
+    /// each within [`RECORD_WRITE_BOUND`]; a write that does not finish is
+    /// abandoned and the next round starts over. A record a newer stream of
+    /// the member wrote is left alone.
+    async fn refresh_members(&self) {
+        let members = self.served_members();
+        let writes = members.iter().map(|member| async move {
+            match tokio::time::timeout(RECORD_WRITE_BOUND, self.write_member(member)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!(member = %member.member_id, %error, "supervisor pool member refresh failed");
+                }
+                Err(_) => {
+                    warn!(member = %member.member_id, "supervisor pool member refresh did not finish in time");
+                }
+            }
+        });
+        futures::future::join_all(writes).await;
     }
 
     async fn write_member(&self, member: &ConnectedMember) -> Result<(), PersistenceError> {
         let id = member_object_id(&member.member_id);
         let existing = self.store.get(MEMBER_OBJECT_TYPE, &id).await?;
+        // A newer stream of the member, from its process or a new one, wrote
+        // the record; this replica's older stream is stale.
         if let Some(record) = &existing
             && let Ok(current) = serde_json::from_slice::<MemberPayload>(&record.payload)
-            && current.process_id != member.process_id
             && current.connected_at_ms > member.connected_at_ms
             && self.fresh(record)
         {
@@ -553,21 +929,100 @@ impl SupervisorPool {
         now_ms().saturating_sub(record.updated_at_ms).max(0) < ttl_ms
     }
 
-    /// Every record of `object_type`, page by page.
+    /// Every record of `object_type`, page by page after an immutable
+    /// cursor, so rows removed meanwhile cannot shift others out of the
+    /// listing. It is still not a snapshot: a row written meanwhile can be
+    /// missed, so a pass confirms an apparent disappearance before acting on
+    /// it (see [`Self::confirm_absences`]).
     async fn list_all(&self, object_type: &str) -> Result<Vec<ObjectRecord>, PersistenceError> {
         let mut records = Vec::new();
+        let mut after: Option<ObjectCursor> = None;
         loop {
-            let offset = u32::try_from(records.len()).unwrap_or(u32::MAX);
             let page = self
                 .store
-                .list_by_type(object_type, LIST_LIMIT, offset)
+                .list_by_type_after(object_type, after.as_ref(), LIST_LIMIT)
                 .await?;
             let complete = page.len() < LIST_LIMIT as usize;
+            after = page.last().map(ObjectCursor::from);
             records.extend(page);
             if complete {
-                return Ok(records);
+                break;
+            }
+            #[cfg(test)]
+            {
+                let gate = {
+                    let mut gate = lock(&self.hooks.listing_gate);
+                    if gate.as_ref().is_some_and(|(kind, _)| kind == object_type) {
+                        gate.take()
+                    } else {
+                        None
+                    }
+                };
+                if let Some((_, (paused, resume))) = gate {
+                    let _ = paused.send(());
+                    let _ = resume.await;
+                }
             }
         }
+        #[cfg(test)]
+        if object_type == ASSIGNMENT_OBJECT_TYPE || object_type == OWNER_OBJECT_TYPE {
+            let omits = lock(&self.hooks.listing_omits).clone();
+            records.retain(|record| !omits.contains(&record.name));
+        }
+        Ok(records)
+    }
+
+    /// Keep what a listing seems to have lost until a point read confirms it
+    /// is gone: owners the published view has, and instances it or an owner
+    /// record names. A route that disappears is stopped or released, which a
+    /// missed row must never cause. A failed read fails the pass, which then
+    /// publishes nothing.
+    async fn confirm_absences(
+        &self,
+        owners: &mut BTreeMap<String, OwnerRecord>,
+        desired: &mut BTreeMap<String, AssignmentRecord>,
+        withdrawals: &BTreeSet<String>,
+    ) -> Result<(), PersistenceError> {
+        let Some(previous) = self.controller.pool_view() else {
+            return Ok(());
+        };
+        for route in previous.owners.keys() {
+            if owners.contains_key(route) {
+                continue;
+            }
+            if let Some(record) = self
+                .store
+                .get(OWNER_OBJECT_TYPE, &owner_object_id(route))
+                .await?
+                .as_ref()
+                .and_then(decode_owner)
+            {
+                warn!(
+                    route,
+                    "a supervisor instance owner was missing from its listing"
+                );
+                owners.insert(route.clone(), record);
+            }
+        }
+        let suspects = previous
+            .desired
+            .iter()
+            .chain(owners.keys())
+            .filter(|route| !desired.contains_key(*route) && !withdrawals.contains(*route))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for route in suspects {
+            if let Some(record) = self.assignment(&route).await?
+                && record.payload.phase == RecordPhase::Published
+            {
+                warn!(
+                    route,
+                    "a supervisor pool instance was missing from its listing"
+                );
+                desired.insert(route, record);
+            }
+        }
+        Ok(())
     }
 
     /// Members whose records are live, in a stable order.
@@ -612,29 +1067,165 @@ impl SupervisorPool {
             .collect())
     }
 
+    /// Record a new owner as a test would find it written by another
+    /// replica, charging its member like every owner change.
+    #[cfg(test)]
     async fn write_owner(
         &self,
         payload: &OwnerPayload,
         condition: WriteCondition,
     ) -> Result<OwnerRecord, PersistenceError> {
-        let bytes = serde_json::to_vec(payload)
-            .map_err(|error| PersistenceError::Encode(error.to_string()))?;
-        let written = self
+        assert!(matches!(condition, WriteCondition::MustCreate));
+        match self.transition(&payload.route, None, Some(payload)).await? {
+            Transition::Applied(Some(record)) => Ok(*record),
+            _ => Err(PersistenceError::Conflict {
+                current_resource_version: None,
+            }),
+        }
+    }
+
+    async fn capacity(&self, member_id: &str) -> Result<Capacity, PersistenceError> {
+        Ok(self
             .store
-            .put_if(
-                OWNER_OBJECT_TYPE,
-                &owner_object_id(&payload.route),
-                &payload.route,
-                "",
-                &bytes,
-                None,
-                condition,
-            )
-            .await?;
-        Ok(OwnerRecord {
-            payload: payload.clone(),
-            resource_version: written.resource_version,
+            .get(CAPACITY_OBJECT_TYPE, &capacity_object_id(member_id))
+            .await?
+            .as_ref()
+            .and_then(decode_capacity)
+            .unwrap_or_else(|| Capacity::empty(member_id)))
+    }
+
+    async fn capacities(&self) -> Result<Vec<Capacity>, PersistenceError> {
+        Ok(self
+            .list_all(CAPACITY_OBJECT_TYPE)
+            .await?
+            .iter()
+            .filter_map(decode_capacity)
+            .collect())
+    }
+
+    /// Change `route`'s owner record from `before` (absent when `None`) to
+    /// `after` (removed when `None`), and move the route's capacity charge
+    /// from `before`'s member to `after`'s, in one atomic write. A target
+    /// member without a free slot refuses the change before anything is
+    /// written; a concurrent change of the same members' capacity is retried
+    /// on fresh rows while the owner record is still `before`.
+    async fn transition(
+        &self,
+        route: &str,
+        before: Option<&OwnerRecord>,
+        after: Option<&OwnerPayload>,
+    ) -> Result<Transition, PersistenceError> {
+        let from = before.map(|record| record.payload.member_id.as_str());
+        let to = after.map(|payload| payload.member_id.as_str());
+        let encode = |payload: &OwnerPayload| {
+            serde_json::to_vec(payload).map_err(|error| PersistenceError::Encode(error.to_string()))
+        };
+        for _ in 0..TRANSITION_ATTEMPTS {
+            let mut writes = Vec::new();
+            if let Some(to) = to {
+                let capacity = self.capacity(to).await?;
+                if !capacity.has_room_for(route) {
+                    return Ok(Transition::Full);
+                }
+                if !capacity.payload.routes.contains(route) {
+                    let mut routes = capacity.payload.routes.clone();
+                    routes.insert(route.to_string());
+                    writes.push(capacity.write(routes)?);
+                }
+            }
+            if let Some(from) = from
+                && Some(from) != to
+            {
+                let capacity = self.capacity(from).await?;
+                if capacity.payload.routes.contains(route) {
+                    let mut routes = capacity.payload.routes.clone();
+                    routes.remove(route);
+                    writes.push(capacity.write(routes)?);
+                }
+            }
+            #[cfg(test)]
+            {
+                let gate = lock(&self.hooks.transition_gate).take();
+                if let Some((reached, barrier)) = gate {
+                    if let Some(reached) = reached {
+                        let _ = reached.send(());
+                    }
+                    barrier.wait().await;
+                }
+            }
+            let owner_index = writes.len();
+            writes.push(match (before, after) {
+                (None, Some(payload)) => AtomicWrite::Create {
+                    object_type: OWNER_OBJECT_TYPE.to_string(),
+                    id: owner_object_id(route),
+                    name: route.to_string(),
+                    workspace: String::new(),
+                    payload: encode(payload)?,
+                },
+                (Some(record), Some(payload)) => AtomicWrite::Update {
+                    object_type: OWNER_OBJECT_TYPE.to_string(),
+                    id: owner_object_id(route),
+                    payload: encode(payload)?,
+                    expected_version: record.resource_version,
+                },
+                (Some(record), None) => AtomicWrite::Delete {
+                    object_type: OWNER_OBJECT_TYPE.to_string(),
+                    id: owner_object_id(route),
+                    expected_version: record.resource_version,
+                },
+                (None, None) => return Ok(Transition::Applied(None)),
+            });
+            match self.store.write_atomically(&writes).await {
+                Ok(results) => {
+                    return Ok(Transition::Applied(after.map(|payload| {
+                        Box::new(OwnerRecord {
+                            payload: payload.clone(),
+                            resource_version: results[owner_index]
+                                .as_ref()
+                                .map_or(0, |written| written.resource_version),
+                        })
+                    })));
+                }
+                Err(
+                    PersistenceError::Conflict { .. } | PersistenceError::UniqueViolation { .. },
+                ) => {
+                    let current = self
+                        .store
+                        .get(OWNER_OBJECT_TYPE, &owner_object_id(route))
+                        .await?
+                        .as_ref()
+                        .and_then(decode_owner);
+                    let unchanged = match (before, &current) {
+                        (None, None) => true,
+                        (Some(before), Some(current)) => {
+                            current.resource_version == before.resource_version
+                        }
+                        _ => false,
+                    };
+                    if !unchanged {
+                        return Ok(Transition::OwnerChanged);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(PersistenceError::Conflict {
+            current_resource_version: None,
         })
+    }
+
+    /// What an owner change did to `route`'s record.
+    async fn reconciled(
+        &self,
+        route: &str,
+        transition: Transition,
+    ) -> Result<Reconciled, PersistenceError> {
+        match transition {
+            Transition::Applied(Some(record)) => Ok(Reconciled::Changed(record)),
+            Transition::Applied(None) => Ok(Reconciled::Removed),
+            Transition::Full => Ok(Reconciled::Unchanged),
+            Transition::OwnerChanged => self.reload(route).await,
+        }
     }
 
     /// Every instance record and reservation, by route.
@@ -1116,50 +1707,73 @@ impl SupervisorPool {
         if owners.len() >= MAX_POOL_INSTANCES && !owners.contains_key(&assignment.route) {
             return Err("the supervisor pool runs as many sandbox instances as it can".to_string());
         }
+        let charges = charges_of(
+            &self
+                .capacities()
+                .await
+                .map_err(|error| format!("read supervisor pool capacity: {error}"))?,
+        );
         let ring = ring_of(&members);
-        let target = choose(
+        let targets = candidates(
             &ring,
             &members,
             &assignment.sandbox_id,
-            &load_of(owners.values()),
-        )
-        .ok_or_else(|| {
+            &assignment.route,
+            &charges,
+            None,
+        );
+        let no_room = || {
             "no shared supervisor replica is available with room for another sandbox".to_string()
-        })?;
+        };
+        if targets.is_empty() {
+            return Err(no_room());
+        }
         self.record_assignment(assignment).await?;
-        let payload = OwnerPayload {
-            route: assignment.route.clone(),
-            sandbox_id: assignment.sandbox_id.clone(),
-            generation: assignment.generation.clone(),
-            member_id: target.member_id.clone(),
-            process_id: target.process_id.clone(),
-            auth_epoch: request.auth_epoch,
-            supervisor_instance_id: None,
-            gateway_token_id: None,
-            phase: OwnerPhase::Granted,
-            previous_member_id: None,
-        };
-        let record = match self.write_owner(&payload, WriteCondition::MustCreate).await {
-            Ok(record) => record,
-            // A retried launch keeps the owner it already recorded.
-            Err(PersistenceError::UniqueViolation { .. }) => match self
-                .reload(&assignment.route)
+        let mut placed = None;
+        for target in targets {
+            let payload = OwnerPayload {
+                route: assignment.route.clone(),
+                sandbox_id: assignment.sandbox_id.clone(),
+                generation: assignment.generation.clone(),
+                member_id: target.member_id.clone(),
+                process_id: target.process_id.clone(),
+                auth_epoch: request.auth_epoch,
+                supervisor_instance_id: None,
+                gateway_token_id: None,
+                phase: OwnerPhase::Granted,
+                previous_member_id: None,
+            };
+            match self
+                .transition(&assignment.route, None, Some(&payload))
                 .await
-                .map_err(|error| format!("read supervisor instance owner: {error}"))?
+                .map_err(|error| format!("record supervisor instance owner: {error}"))?
             {
-                Reconciled::Changed(existing)
-                    if existing.payload.generation == assignment.generation =>
+                Transition::Applied(record) => {
+                    placed = record.map(|record| *record);
+                    break;
+                }
+                Transition::Full => {}
+                // A retried launch keeps the owner it already recorded.
+                Transition::OwnerChanged => match self
+                    .reload(&assignment.route)
+                    .await
+                    .map_err(|error| format!("read supervisor instance owner: {error}"))?
                 {
-                    *existing
-                }
-                _ => {
-                    return Err(
-                        "the sandbox instance route is owned by another generation".to_string()
-                    );
-                }
-            },
-            Err(error) => return Err(format!("record supervisor instance owner: {error}")),
-        };
+                    Reconciled::Changed(existing)
+                        if existing.payload.generation == assignment.generation =>
+                    {
+                        placed = Some(*existing);
+                        break;
+                    }
+                    _ => {
+                        return Err(
+                            "the sandbox instance route is owned by another generation".to_string()
+                        );
+                    }
+                },
+            }
+        }
+        let record = placed.ok_or_else(no_room)?;
         info!(
             sandbox_id = %assignment.sandbox_id,
             route = %assignment.route,
@@ -1183,16 +1797,28 @@ impl SupervisorPool {
         Ok(())
     }
 
-    /// One reconciliation pass: refresh served members and remove withdrawn
-    /// instances; then place, take over, complete, and clean up from the
-    /// records; record what served owners report; load the material served
-    /// members need; and publish the resulting view.
+    /// One reconciliation pass: remove withdrawn instances; then place, take
+    /// over, complete, and clean up from the records; record what served
+    /// owners report; load the material served members need; and publish the
+    /// resulting view.
     pub async fn reconcile_once(&self) -> Result<(), PersistenceError> {
-        self.refresh_members().await;
+        #[cfg(test)]
+        {
+            let gate = lock(&self.hooks.reconcile_gate).take();
+            if let Some((paused, resume)) = gate {
+                let _ = paused.send(());
+                let _ = resume.await;
+            }
+        }
         self.remove_withdrawn().await;
         let members = self.live_members().await?;
         let ring = ring_of(&members);
         let listed_at = tokio::time::Instant::now();
+        // Listed before the owners, so a report row of a term newer than the
+        // route's listed owner cannot exist among them, and cleanup, which
+        // removes only rows of older terms or of routes without an owner,
+        // never removes a row a new term wrote meanwhile.
+        let report_rows = self.report_rows().await?;
         let mut owners = self.owners().await?;
         // Listed after the owners: an instance is published before its owner
         // is recorded, so every owner listed has its instance listed unless
@@ -1205,13 +1831,15 @@ impl SupervisorPool {
         let records = self.all_assignments().await?;
         self.fence_stale_reservations(&records).await;
         self.remove_stale_candidates().await;
-        let desired = records
+        let mut desired = records
             .into_iter()
             .filter(|(route, record)| {
                 record.payload.phase == RecordPhase::Published && !withdrawals.contains(route)
             })
             .collect::<BTreeMap<_, _>>();
-        let mut load = load_of(owners.values());
+        self.confirm_absences(&mut owners, &mut desired, &withdrawals)
+            .await?;
+        let mut charges = charges_of(&self.capacities().await?);
         let stopping = self.controller.stopping_routes();
         self.forget_owned(&desired, &owners);
         for (route, instance) in &desired {
@@ -1221,7 +1849,7 @@ impl SupervisorPool {
             let takeovers_allowed = tokio::time::Instant::now() >= self.takeovers_from;
             let outcome = match owners.get(route) {
                 None if takeovers_allowed => {
-                    self.place_unowned(route, &instance.payload, &ring, &members, &load)
+                    self.place_unowned(route, &instance.payload, &ring, &members, &charges)
                         .await
                 }
                 // An intent recorded by any replica, including one that
@@ -1230,7 +1858,7 @@ impl SupervisorPool {
                     self.complete_takeover(record.clone()).await
                 }
                 Some(record) if takeovers_allowed && !owner_alive(&record.payload, &members) => {
-                    self.take_over(record, &ring, &members, &load).await
+                    self.take_over(record, &ring, &members, &charges).await
                 }
                 // A live owner keeps its instance; nothing is placed or
                 // taken over during the startup grace.
@@ -1238,20 +1866,26 @@ impl SupervisorPool {
             };
             match outcome {
                 Ok(Reconciled::Changed(record)) => {
-                    if let Some(previous) = owners.get(route)
-                        && let Some(count) = load.get_mut(&previous.payload.member_id)
-                    {
-                        *count = count.saturating_sub(1);
-                    }
-                    *load.entry(record.payload.member_id.clone()).or_insert(0) += 1;
+                    recharge(
+                        &mut charges,
+                        route,
+                        owners
+                            .get(route)
+                            .map(|previous| previous.payload.member_id.as_str()),
+                        Some(&record.payload.member_id),
+                    );
                     owners.insert(route.clone(), *record);
                 }
                 Ok(Reconciled::Removed) => {
-                    if let Some(previous) = owners.remove(route)
-                        && let Some(count) = load.get_mut(&previous.payload.member_id)
-                    {
-                        *count = count.saturating_sub(1);
-                    }
+                    let previous = owners.remove(route);
+                    recharge(
+                        &mut charges,
+                        route,
+                        previous
+                            .as_ref()
+                            .map(|previous| previous.payload.member_id.as_str()),
+                        None,
+                    );
                 }
                 Ok(Reconciled::Unchanged) => {}
                 Err(error) => {
@@ -1261,8 +1895,9 @@ impl SupervisorPool {
         }
         self.remove_withdrawn_owners(&desired, &mut owners).await;
         self.sweep_ended_instances(&desired).await;
-        self.record_reports().await;
-        let reports = self.reports(&owners).await?;
+        self.record_reports(&owners, &report_rows).await;
+        self.remove_stale_reports(&owners, &report_rows).await;
+        let reports = reports_of_owners(&owners, &report_rows);
         let materials = self.load_materials(&owners, &desired).await;
         // Only granted terms are served; pending intents stay recorded for
         // the next pass.
@@ -1307,13 +1942,10 @@ impl SupervisorPool {
                 Ok(Reconciled::Changed(current)) => {
                     owners.insert(record.payload.route.clone(), *current);
                 }
+                // Its report rows are removed with the other rows of routes
+                // without an owner.
                 Ok(Reconciled::Removed) => {
                     owners.remove(&record.payload.route);
-                    let _ = self
-                        .store
-                        .delete(REPORT_OBJECT_TYPE, &report_object_id(&record.payload.route))
-                        .await;
-                    lock(&self.recorded_reports).remove(&record.payload.route);
                 }
                 Ok(Reconciled::Unchanged) => {}
                 Err(error) => {
@@ -1367,80 +1999,127 @@ impl SupervisorPool {
         }
     }
 
-    /// Record what the owners this replica serves report of their instances.
-    async fn record_reports(&self) {
-        for report in self.controller.owned_reports() {
+    /// Every report row, by object id.
+    async fn report_rows(&self) -> Result<ReportRows, PersistenceError> {
+        Ok(self
+            .list_all(REPORT_OBJECT_TYPE)
+            .await?
+            .iter()
+            .filter_map(|record| {
+                decode_report(record)
+                    .map(|payload| (record.id.clone(), (payload, record.resource_version)))
+            })
+            .collect())
+    }
+
+    /// Reports of the members this replica serves.
+    fn served_reports(&self) -> Vec<MemberReport> {
+        #[cfg(test)]
+        {
+            let reports = lock(&self.hooks.served_reports).clone();
+            if let Some(reports) = reports {
+                return reports;
+            }
+        }
+        self.controller.member_reports()
+    }
+
+    /// Record what the owners this replica serves report of their instances,
+    /// each only if the term its stream acknowledged is the granted term this
+    /// pass's owner records show, so a status from an earlier term is never
+    /// relabelled as a later one, even from the same process. A row is
+    /// rewritten whenever it differs from the report, conditioned on the row
+    /// as listed, so a row another writer replaced or removed is repaired by
+    /// the next pass; a row a newer stream of the same term wrote is kept.
+    async fn record_reports(&self, owners: &BTreeMap<String, OwnerRecord>, rows: &ReportRows) {
+        let reports = self.served_reports();
+        #[cfg(test)]
+        {
+            let gate = lock(&self.hooks.report_gate).take();
+            if let Some((paused, resume)) = gate {
+                let _ = paused.send(());
+                let _ = resume.await;
+            }
+        }
+        for report in reports {
+            let route = report.status.route.clone();
+            if !owners.get(&route).is_some_and(|owner| {
+                owner.payload.phase == OwnerPhase::Granted
+                    && owner.payload.member_id == report.member_id
+                    && owner.payload.process_id == report.process_id
+                    && owner.payload.auth_epoch == report.auth_epoch
+            }) {
+                continue;
+            }
+            let auth_epoch = report.auth_epoch;
             let payload = ReportPayload {
-                route: report.route,
-                member_id: report.owner.member_id,
-                process_id: report.owner.process_id,
-                auth_epoch: report.owner.auth_epoch,
+                route: route.clone(),
+                member_id: report.member_id,
+                process_id: report.process_id,
+                auth_epoch,
                 sandbox_id: report.status.sandbox_id,
                 phase: report.status.phase,
                 ready: report.status.ready,
                 exit_code: report.status.exit_code,
+                connected_at_ms: report.connected_at_ms,
             };
-            if lock(&self.recorded_reports).get(&payload.route) == Some(&payload) {
+            let id = report_object_id(&route, auth_epoch);
+            let listed = rows.get(&id);
+            if listed.is_some_and(|(current, _)| {
+                current == &payload || current.connected_at_ms > payload.connected_at_ms
+            }) {
                 continue;
             }
             let Ok(bytes) = serde_json::to_vec(&payload) else {
                 continue;
             };
+            let condition = listed.map_or(WriteCondition::MustCreate, |(_, version)| {
+                WriteCondition::MatchResourceVersion(*version)
+            });
             match self
                 .store
                 .put_if(
                     REPORT_OBJECT_TYPE,
-                    &report_object_id(&payload.route),
-                    &payload.route,
+                    &id,
+                    &report_object_name(&route, auth_epoch),
                     "",
                     &bytes,
                     None,
-                    WriteCondition::Unconditional,
+                    condition,
                 )
                 .await
             {
-                Ok(_) => {
-                    lock(&self.recorded_reports).insert(payload.route.clone(), payload);
-                }
+                // Another writer changed the row since it was listed; the
+                // next pass compares against what it wrote.
+                Ok(_)
+                | Err(
+                    PersistenceError::Conflict { .. } | PersistenceError::UniqueViolation { .. },
+                ) => {}
                 Err(error) => {
-                    warn!(route = %payload.route, %error, "could not record a supervisor pool instance report");
+                    warn!(route, %error, "could not record a supervisor pool instance report");
                 }
             }
         }
     }
 
-    /// Recorded reports of each route's current, granted owner term.
-    async fn reports(
+    /// Remove listed report rows of terms older than their route's owner, or
+    /// of routes without one; a bounded number per pass, each only as listed.
+    async fn remove_stale_reports(
         &self,
         owners: &BTreeMap<String, OwnerRecord>,
-    ) -> Result<BTreeMap<String, SandboxInstanceStatus>, PersistenceError> {
-        Ok(self
-            .list_all(REPORT_OBJECT_TYPE)
-            .await?
+        rows: &ReportRows,
+    ) {
+        let stale = rows
             .iter()
-            .filter_map(decode_report)
-            .filter(|report| {
-                owners.get(&report.route).is_some_and(|owner| {
-                    owner.payload.phase == OwnerPhase::Granted
-                        && owner.payload.member_id == report.member_id
-                        && owner.payload.process_id == report.process_id
-                        && owner.payload.auth_epoch == report.auth_epoch
-                })
+            .filter(|(_, (report, _))| {
+                owners
+                    .get(&report.route)
+                    .is_none_or(|owner| owner.payload.auth_epoch > report.auth_epoch)
             })
-            .map(|report| {
-                (
-                    report.route.clone(),
-                    SandboxInstanceStatus {
-                        route: report.route,
-                        sandbox_id: report.sandbox_id,
-                        phase: report.phase,
-                        ready: report.ready,
-                        exit_code: report.exit_code,
-                        error: String::new(),
-                    },
-                )
-            })
-            .collect())
+            .take(CLEANUP_PER_PASS);
+        for (id, (_, version)) in stale {
+            let _ = self.store.delete_if(REPORT_OBJECT_TYPE, id, *version).await;
+        }
     }
 
     /// Launch material of the desired instances owned, or about to be taken
@@ -1546,7 +2225,7 @@ impl SupervisorPool {
         assignment: &AssignmentPayload,
         ring: &GatewayRing,
         members: &[LiveMember],
-        load: &HashMap<String, usize>,
+        charges: &BTreeMap<String, BTreeSet<String>>,
     ) -> Result<Reconciled, PersistenceError> {
         let unowned_for = lock(&self.unowned_since)
             .get(route)
@@ -1554,9 +2233,10 @@ impl SupervisorPool {
         if unowned_for.is_none_or(|elapsed| elapsed < self.unowned_grace) {
             return Ok(Reconciled::Unchanged);
         }
-        let Some(target) = choose(ring, members, &assignment.sandbox_id, load) else {
+        let targets = candidates(ring, members, &assignment.sandbox_id, route, charges, None);
+        if targets.is_empty() {
             return Ok(Reconciled::Unchanged);
-        };
+        }
         let Some(sandbox) = self
             .store
             .get_message::<Sandbox>(&assignment.sandbox_id)
@@ -1572,24 +2252,27 @@ impl SupervisorPool {
         else {
             return Ok(Reconciled::Unchanged);
         };
-        let intent = OwnerPayload {
-            route: route.to_string(),
-            sandbox_id: assignment.sandbox_id.clone(),
-            generation: assignment.generation.clone(),
-            member_id: target.member_id.clone(),
-            process_id: target.process_id.clone(),
-            auth_epoch: identity.auth_epoch.get().saturating_add(1),
-            supervisor_instance_id: Some(Uuid::new_v4().to_string()),
-            gateway_token_id: Some(Uuid::new_v4().to_string()),
-            phase: OwnerPhase::Granting,
-            previous_member_id: None,
-        };
-        match self.write_owner(&intent, WriteCondition::MustCreate).await {
-            Ok(record) => self.complete_takeover(record).await,
-            // A launch or another replica recorded it first.
-            Err(PersistenceError::UniqueViolation { .. }) => self.reload(route).await,
-            Err(error) => Err(error),
+        for target in targets {
+            let intent = OwnerPayload {
+                route: route.to_string(),
+                sandbox_id: assignment.sandbox_id.clone(),
+                generation: assignment.generation.clone(),
+                member_id: target.member_id.clone(),
+                process_id: target.process_id.clone(),
+                auth_epoch: identity.auth_epoch.get().saturating_add(1),
+                supervisor_instance_id: Some(Uuid::new_v4().to_string()),
+                gateway_token_id: Some(Uuid::new_v4().to_string()),
+                phase: OwnerPhase::Granting,
+                previous_member_id: None,
+            };
+            match self.transition(route, None, Some(&intent)).await? {
+                Transition::Applied(Some(record)) => return self.complete_takeover(*record).await,
+                Transition::Full => {}
+                // A launch or another replica recorded it first.
+                transition => return self.reconciled(route, transition).await,
+            }
         }
+        Ok(Reconciled::Unchanged)
     }
 
     /// Move an instance whose owner failed or left to the ring's choice.
@@ -1598,43 +2281,51 @@ impl SupervisorPool {
         record: &OwnerRecord,
         ring: &GatewayRing,
         members: &[LiveMember],
-        load: &HashMap<String, usize>,
+        charges: &BTreeMap<String, BTreeSet<String>>,
     ) -> Result<Reconciled, PersistenceError> {
-        let Some(target) = choose(ring, members, &record.payload.sandbox_id, load) else {
-            return Ok(Reconciled::Unchanged);
-        };
-        let intent = OwnerPayload {
-            member_id: target.member_id.clone(),
-            process_id: target.process_id.clone(),
-            auth_epoch: record.payload.auth_epoch.saturating_add(1),
-            supervisor_instance_id: Some(Uuid::new_v4().to_string()),
-            gateway_token_id: Some(Uuid::new_v4().to_string()),
-            phase: OwnerPhase::Granting,
-            previous_member_id: Some(record.payload.member_id.clone()),
-            ..record.payload.clone()
-        };
-        match self
-            .write_owner(
-                &intent,
-                WriteCondition::MatchResourceVersion(record.resource_version),
-            )
-            .await
-        {
-            Ok(intent) => {
-                info!(
-                    sandbox_id = %intent.payload.sandbox_id,
-                    route = %intent.payload.route,
-                    from = %record.payload.member_id,
-                    to = %intent.payload.member_id,
-                    term = intent.payload.auth_epoch,
-                    "taking over a shared sandbox instance from a failed supervisor"
-                );
-                self.complete_takeover(intent).await
+        // A member whose process restarted re-adopts its routes first: their
+        // slots are already charged to it, so this needs no free capacity.
+        let targets = candidates(
+            ring,
+            members,
+            &record.payload.sandbox_id,
+            &record.payload.route,
+            charges,
+            Some(&record.payload.member_id),
+        );
+        for target in targets {
+            let intent = OwnerPayload {
+                member_id: target.member_id.clone(),
+                process_id: target.process_id.clone(),
+                auth_epoch: record.payload.auth_epoch.saturating_add(1),
+                supervisor_instance_id: Some(Uuid::new_v4().to_string()),
+                gateway_token_id: Some(Uuid::new_v4().to_string()),
+                phase: OwnerPhase::Granting,
+                previous_member_id: Some(record.payload.member_id.clone()),
+                ..record.payload.clone()
+            };
+            match self
+                .transition(&record.payload.route, Some(record), Some(&intent))
+                .await?
+            {
+                Transition::Applied(Some(intent)) => {
+                    info!(
+                        sandbox_id = %intent.payload.sandbox_id,
+                        route = %intent.payload.route,
+                        from = %record.payload.member_id,
+                        to = %intent.payload.member_id,
+                        term = intent.payload.auth_epoch,
+                        cause = %takeover_cause(&record.payload, members),
+                        "taking over a shared sandbox instance from a failed supervisor"
+                    );
+                    return self.complete_takeover(*intent).await;
+                }
+                Transition::Full => {}
+                // Another replica moved it first.
+                transition => return self.reconciled(&record.payload.route, transition).await,
             }
-            // Another replica moved it first.
-            Err(PersistenceError::Conflict { .. }) => self.reload(&record.payload.route).await,
-            Err(error) => Err(error),
         }
+        Ok(Reconciled::Unchanged)
     }
 
     /// Advance the sandbox's credential epoch to the intent's term and grant
@@ -1664,19 +2355,10 @@ impl SupervisorPool {
                     phase: OwnerPhase::Granted,
                     ..record.payload.clone()
                 };
-                match self
-                    .write_owner(
-                        &granted,
-                        WriteCondition::MatchResourceVersion(record.resource_version),
-                    )
-                    .await
-                {
-                    Ok(granted) => Ok(Reconciled::Changed(Box::new(granted))),
-                    Err(PersistenceError::Conflict { .. }) => {
-                        self.reload(&record.payload.route).await
-                    }
-                    Err(error) => Err(error),
-                }
+                let transition = self
+                    .transition(&record.payload.route, Some(&record), Some(&granted))
+                    .await?;
+                self.reconciled(&record.payload.route, transition).await
             }
             TakeoverIdentity::Refused(reason) => {
                 info!(
@@ -1685,21 +2367,10 @@ impl SupervisorPool {
                     reason,
                     "cancelled a shared sandbox instance takeover"
                 );
-                match self
-                    .store
-                    .delete_if(
-                        OWNER_OBJECT_TYPE,
-                        &owner_object_id(&record.payload.route),
-                        record.resource_version,
-                    )
-                    .await
-                {
-                    Ok(_) => Ok(Reconciled::Removed),
-                    Err(PersistenceError::Conflict { .. }) => {
-                        self.reload(&record.payload.route).await
-                    }
-                    Err(error) => Err(error),
-                }
+                let transition = self
+                    .transition(&record.payload.route, Some(&record), None)
+                    .await?;
+                self.reconciled(&record.payload.route, transition).await
             }
         }
     }
@@ -1719,19 +2390,10 @@ impl SupervisorPool {
     }
 
     async fn remove_owner(&self, record: &OwnerRecord) -> Result<Reconciled, PersistenceError> {
-        match self
-            .store
-            .delete_if(
-                OWNER_OBJECT_TYPE,
-                &owner_object_id(&record.payload.route),
-                record.resource_version,
-            )
-            .await
-        {
-            Ok(_) => Ok(Reconciled::Removed),
-            Err(PersistenceError::Conflict { .. }) => self.reload(&record.payload.route).await,
-            Err(error) => Err(error),
-        }
+        let transition = self
+            .transition(&record.payload.route, Some(record), None)
+            .await?;
+        self.reconciled(&record.payload.route, transition).await
     }
 
     /// The pool view to serve: live members and the granted owners, with
@@ -1922,6 +2584,7 @@ impl InstancePlacement for PoolPlacement {
 mod tests {
     use super::*;
     use crate::auth::sandbox_session::PersistedSandboxIdentity;
+    use crate::persistence::test_postgres::TestSchema;
     use openshell_core::jwt::{AuthenticatedSandboxSession, CredentialEpoch};
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{SandboxPhase, SandboxStatus};
@@ -1936,8 +2599,13 @@ mod tests {
 
     impl Fixture {
         async fn new() -> Self {
+            Self::with_store(crate::persistence::test_store().await)
+        }
+
+        /// A fixture over `store`, such as one connected to `PostgreSQL`.
+        fn with_store(store: Store) -> Self {
             let material = openshell_bootstrap::jwt::generate_jwt_key().expect("jwt key");
-            let store = Arc::new(crate::persistence::test_store().await);
+            let store = Arc::new(store);
             let config = crate::Config::new(None)
                 .with_credential_drivers(["test-static"])
                 .with_default_credential_driver(Some("test-static"));
@@ -1973,6 +2641,21 @@ mod tests {
             unique.unowned_grace = Duration::ZERO;
             unique.candidate_grace = Duration::ZERO;
             unique.takeovers_from = tokio::time::Instant::now();
+            pool
+        }
+
+        /// A replica whose member records expire after `ttl` and are
+        /// refreshed every `refresh`.
+        fn timed_replica(
+            &self,
+            replica_id: &str,
+            ttl: Duration,
+            refresh: Duration,
+        ) -> Arc<SupervisorPool> {
+            let mut pool = self.replica(replica_id);
+            let unique = Arc::get_mut(&mut pool).expect("unique");
+            unique.member_ttl = ttl;
+            unique.member_refresh = refresh;
             pool
         }
 
@@ -2049,6 +2732,13 @@ mod tests {
             .unwrap();
         }
 
+        async fn remove_owner_record(&self, route: &str) {
+            self.store
+                .delete(OWNER_OBJECT_TYPE, &owner_object_id(route))
+                .await
+                .unwrap();
+        }
+
         async fn remove_member(&self, member_id: &str) {
             self.store
                 .delete(MEMBER_OBJECT_TYPE, &member_object_id(member_id))
@@ -2071,6 +2761,119 @@ mod tests {
                 .await
                 .unwrap()
                 .len()
+        }
+
+        /// A published instance record written directly, as another replica
+        /// would.
+        async fn publish(&self, route: &str, sandbox_id: &str, generation: &str) {
+            let payload = AssignmentPayload {
+                route: route.to_string(),
+                sandbox_id: sandbox_id.to_string(),
+                generation: generation.to_string(),
+                workspace: "default".to_string(),
+                phase: RecordPhase::Published,
+                writer: Uuid::new_v4().to_string(),
+                material_handle: b"handle".to_vec(),
+            };
+            self.store
+                .put_if(
+                    ASSIGNMENT_OBJECT_TYPE,
+                    &assignment_object_id(route, &payload.writer),
+                    route,
+                    "",
+                    &serde_json::to_vec(&payload).unwrap(),
+                    None,
+                    WriteCondition::MustCreate,
+                )
+                .await
+                .unwrap();
+        }
+
+        /// The launch-term owner of `route`, written directly.
+        async fn own(&self, route: &str, sandbox_id: &str, member: &str, process: &str) {
+            self.replica("owner-writer")
+                .write_owner(
+                    &OwnerPayload {
+                        route: route.to_string(),
+                        sandbox_id: sandbox_id.to_string(),
+                        generation: "generation-1".to_string(),
+                        member_id: member.to_string(),
+                        process_id: process.to_string(),
+                        auth_epoch: 1,
+                        supervisor_instance_id: None,
+                        gateway_token_id: None,
+                        phase: OwnerPhase::Granted,
+                        previous_member_id: None,
+                    },
+                    WriteCondition::MustCreate,
+                )
+                .await
+                .unwrap();
+        }
+
+        /// `count` running instances owned by `member`'s `process`, each
+        /// with its sandbox and published record.
+        async fn fill(&self, member: &str, process: &str, count: usize) -> Vec<String> {
+            let mut routes = Vec::with_capacity(count);
+            for index in 0..count {
+                let route = format!("rt-{member}-{index:05}");
+                let sandbox = format!("sandbox-{member}-{index}");
+                self.sandbox(&sandbox, "generation-1", SandboxPhase::Ready)
+                    .await;
+                self.publish(&route, &sandbox, "generation-1").await;
+                self.own(&route, &sandbox, member, process).await;
+                routes.push(route);
+            }
+            routes
+        }
+
+        /// Write `payload` as its term's report row, as any writer could.
+        async fn write_report(&self, payload: ReportPayload) {
+            self.store
+                .put_if(
+                    REPORT_OBJECT_TYPE,
+                    &report_object_id(&payload.route, payload.auth_epoch),
+                    &report_object_name(&payload.route, payload.auth_epoch),
+                    "",
+                    &serde_json::to_vec(&payload).unwrap(),
+                    None,
+                    WriteCondition::Unconditional,
+                )
+                .await
+                .unwrap();
+        }
+
+        /// Every report row of `route`, by term.
+        async fn report_rows(&self, route: &str) -> BTreeMap<u64, ReportPayload> {
+            self.replica("report-reader")
+                .report_rows()
+                .await
+                .unwrap()
+                .into_values()
+                .map(|(payload, _)| (payload.auth_epoch, payload))
+                .filter(|(_, payload)| payload.route == route)
+                .collect()
+        }
+
+        /// Routes `member` is charged for.
+        async fn charged(&self, member: &str) -> BTreeSet<String> {
+            self.replica("capacity-reader")
+                .capacity(member)
+                .await
+                .unwrap()
+                .payload
+                .routes
+        }
+
+        async fn withdraw_record(&self, route: &str) {
+            let record = self.instance(route).await.unwrap();
+            self.store
+                .delete(
+                    ASSIGNMENT_OBJECT_TYPE,
+                    &assignment_object_id(route, &record.payload.writer),
+                )
+                .await
+                .unwrap();
         }
 
         async fn instance(&self, route: &str) -> Option<AssignmentRecord> {
@@ -2890,24 +3693,9 @@ mod tests {
             phase: 2,
             ready,
             exit_code: 0,
+            connected_at_ms: 0,
         };
-        let record = |payload: ReportPayload| {
-            let store = fixture.store.clone();
-            async move {
-                store
-                    .put_if(
-                        REPORT_OBJECT_TYPE,
-                        &report_object_id(&payload.route),
-                        &payload.route,
-                        "",
-                        &serde_json::to_vec(&payload).unwrap(),
-                        None,
-                        WriteCondition::Unconditional,
-                    )
-                    .await
-                    .unwrap();
-            }
-        };
+        let record = |payload: ReportPayload| fixture.write_report(payload);
         // The replica serving the owner recorded that it is ready; this
         // replica, which does not serve it, reads the verdict.
         record(report("p1", true)).await;
@@ -2925,6 +3713,791 @@ mod tests {
         );
     }
 
+    /// One more instance than a listing page, the live one listed last and
+    /// owned by `m1`; returns the routes and a replica that places nothing,
+    /// whose first pass has loaded the view.
+    async fn two_page_pool(fixture: &Fixture) -> (Vec<String>, Arc<SupervisorPool>) {
+        fixture.member("m1", "p1", false).await;
+        let count = LIST_LIMIT as usize + 1;
+        let routes = (0..count)
+            .map(|index| format!("rt-route-{index:05}"))
+            .collect::<Vec<_>>();
+        for (index, route) in routes.iter().enumerate() {
+            let sandbox = format!("sandbox-{index}");
+            fixture
+                .sandbox(&sandbox, "generation-1", SandboxPhase::Ready)
+                .await;
+            fixture.publish(route, &sandbox, "generation-1").await;
+        }
+        fixture
+            .own(
+                &routes[count - 1],
+                &format!("sandbox-{}", count - 1),
+                "m1",
+                "p1",
+            )
+            .await;
+        let pool = fixture.starting_replica("gw-a");
+        pool.reconcile_once().await.unwrap();
+        assert!(
+            pool.controller
+                .pool_view()
+                .unwrap()
+                .desired
+                .contains(&routes[count - 1])
+        );
+        (routes, pool)
+    }
+
+    #[tokio::test]
+    async fn a_row_removed_between_listing_pages_shifts_nothing_out() {
+        let fixture = Fixture::new().await;
+        let (routes, pool) = two_page_pool(&fixture).await;
+        let live = routes.last().unwrap();
+        // Another replica withdraws an instance page one already returned.
+        let (paused, resume) = pool.pause_listing_after_first_page(ASSIGNMENT_OBJECT_TYPE);
+        let listing = {
+            let pool = pool.clone();
+            tokio::spawn(async move { pool.list_all(ASSIGNMENT_OBJECT_TYPE).await })
+        };
+        paused.await.unwrap();
+        fixture.withdraw_record(&routes[0]).await;
+        resume.send(()).unwrap();
+        // Page two starts after page one's last row instead of skipping one.
+        let listed = listing.await.unwrap().unwrap();
+        assert_eq!(listed.len(), routes.len());
+        assert!(listed.iter().any(|record| record.name == *live));
+    }
+
+    #[tokio::test]
+    async fn a_row_removed_mid_pass_never_stops_a_live_route() {
+        let fixture = Fixture::new().await;
+        let (routes, pool) = two_page_pool(&fixture).await;
+        let live = routes.last().unwrap();
+        let (paused, resume) = pool.pause_listing_after_first_page(ASSIGNMENT_OBJECT_TYPE);
+        let pass = {
+            let pool = pool.clone();
+            tokio::spawn(async move { pool.reconcile_once().await })
+        };
+        paused.await.unwrap();
+        fixture.withdraw_record(&routes[0]).await;
+        resume.send(()).unwrap();
+        pass.await.unwrap().unwrap();
+        // The live route stays desired and owned, so its owner is never told
+        // to stop it; the withdrawn one is no longer desired.
+        let view = pool.controller.pool_view().unwrap();
+        assert!(view.desired.contains(live));
+        assert_eq!(view.owners[live.as_str()].member_id, "m1");
+        assert!(!pool.controller.stopping_routes().contains(live));
+        pool.reconcile_once().await.unwrap();
+        assert!(
+            !pool
+                .controller
+                .pool_view()
+                .unwrap()
+                .desired
+                .contains(&routes[0])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_route_a_listing_misses_is_confirmed_before_it_is_stopped() {
+        let fixture = Fixture::new().await;
+        fixture.member("m1", "p1", false).await;
+        for (route, sandbox) in [
+            ("rt-route-live", "sandbox-a"),
+            ("rt-route-gone", "sandbox-b"),
+        ] {
+            fixture
+                .sandbox(sandbox, "generation-1", SandboxPhase::Ready)
+                .await;
+            fixture.publish(route, sandbox, "generation-1").await;
+            fixture.own(route, sandbox, "m1", "p1").await;
+        }
+        let pool = fixture.starting_replica("gw-a");
+        pool.reconcile_once().await.unwrap();
+        // A listing misses a live route's instance and owner rows; a real
+        // withdrawal removes the other's instance record.
+        pool.omit_from_listings("rt-route-live");
+        fixture.withdraw_record("rt-route-gone").await;
+        pool.reconcile_once().await.unwrap();
+        let view = pool.controller.pool_view().unwrap();
+        assert!(view.desired.contains("rt-route-live"));
+        assert!(view.owners.contains_key("rt-route-live"));
+        assert!(!pool.controller.stopping_routes().contains("rt-route-live"));
+        // The confirmed withdrawal still stops its instance.
+        assert!(!view.desired.contains("rt-route-gone"));
+        assert!(pool.controller.stopping_routes().contains("rt-route-gone"));
+    }
+
+    #[tokio::test]
+    async fn the_last_slot_of_a_member_is_admitted_once_across_replicas() {
+        the_last_slot_of_a_member_is_admitted_once_across_replicas_on(&Fixture::new().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_the_last_slot_of_a_member_is_admitted_once_across_replicas() {
+        let schema = TestSchema::create("supervisor_pool").await;
+        the_last_slot_of_a_member_is_admitted_once_across_replicas_on(&Fixture::with_store(
+            schema.connect_store().await,
+        ))
+        .await;
+        schema.drop_schema().await;
+    }
+
+    async fn the_last_slot_of_a_member_is_admitted_once_across_replicas_on(fixture: &Fixture) {
+        fixture.member("m1", "p1", false).await;
+        fixture.fill("m1", "p1", MAX_ASSIGNED_INSTANCES - 1).await;
+        for sandbox in ["sandbox-x", "sandbox-y"] {
+            fixture
+                .sandbox(sandbox, "generation-1", SandboxPhase::Ready)
+                .await;
+        }
+        // Both launches read 255 charged routes before either writes.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let (first, second) = (fixture.replica("gw-a"), fixture.replica("gw-b"));
+        first.pause_next_transition(barrier.clone());
+        second.pause_next_transition(barrier);
+        let (x, y) = tokio::join!(
+            first.place_launch(launch("rt-route-x000", "sandbox-x", "generation-1")),
+            second.place_launch(launch("rt-route-y000", "sandbox-y", "generation-1")),
+        );
+        assert_eq!(
+            usize::from(x.is_ok()) + usize::from(y.is_ok()),
+            1,
+            "{x:?} {y:?}"
+        );
+        assert_eq!(fixture.charged("m1").await.len(), MAX_ASSIGNED_INSTANCES);
+        let owned = [
+            fixture.owner("rt-route-x000").await,
+            fixture.owner("rt-route-y000").await,
+        ];
+        assert_eq!(owned.iter().flatten().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_takeover_and_a_launch_compete_for_the_last_slot() {
+        a_takeover_and_a_launch_compete_for_the_last_slot_on(&Fixture::new().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_a_takeover_and_a_launch_compete_for_the_last_slot() {
+        let schema = TestSchema::create("supervisor_pool").await;
+        a_takeover_and_a_launch_compete_for_the_last_slot_on(&Fixture::with_store(
+            schema.connect_store().await,
+        ))
+        .await;
+        schema.drop_schema().await;
+    }
+
+    async fn a_takeover_and_a_launch_compete_for_the_last_slot_on(fixture: &Fixture) {
+        fixture.member("m1", "p1", false).await;
+        fixture.member("m2", "p2", false).await;
+        let orphaned = fixture.fill("m1", "p1", 1).await.remove(0);
+        fixture.fill("m2", "p2", MAX_ASSIGNED_INSTANCES - 1).await;
+        fixture
+            .sandbox("sandbox-new", "generation-1", SandboxPhase::Ready)
+            .await;
+        // m1 fails; its route and a new launch both need m2's last slot.
+        fixture.remove_member("m1").await;
+        let (taking, launching) = (fixture.replica("gw-a"), fixture.replica("gw-b"));
+        let members = taking.live_members().await.unwrap();
+        let charges = charges_of(&taking.capacities().await.unwrap());
+        let record = taking.reload_owner(&orphaned).await;
+        let ring = ring_of(&members);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        taking.pause_next_transition(barrier.clone());
+        launching.pause_next_transition(barrier);
+        let (taken, launched) = tokio::join!(
+            taking.take_over(&record, &ring, &members, &charges),
+            launching.place_launch(launch("rt-route-new0", "sandbox-new", "generation-1")),
+        );
+        taken.unwrap();
+        let moved = fixture.owner(&orphaned).await.unwrap().member_id == "m2";
+        assert_ne!(moved, launched.is_ok(), "exactly one gets the slot");
+        assert_eq!(fixture.charged("m2").await.len(), MAX_ASSIGNED_INSTANCES);
+        // A takeover that lost the slot leaves the route charged to m1.
+        assert_eq!(fixture.charged("m1").await.contains(&orphaned), !moved);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_admission_cannot_take_a_slot_consumed_meanwhile() {
+        a_stalled_admission_cannot_take_a_slot_consumed_meanwhile_on(&Fixture::new().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_a_stalled_admission_cannot_take_a_slot_consumed_meanwhile() {
+        let schema = TestSchema::create("supervisor_pool").await;
+        a_stalled_admission_cannot_take_a_slot_consumed_meanwhile_on(&Fixture::with_store(
+            schema.connect_store().await,
+        ))
+        .await;
+        schema.drop_schema().await;
+    }
+
+    async fn a_stalled_admission_cannot_take_a_slot_consumed_meanwhile_on(fixture: &Fixture) {
+        fixture.member("m1", "p1", false).await;
+        fixture.fill("m1", "p1", MAX_ASSIGNED_INSTANCES - 1).await;
+        for sandbox in ["sandbox-x", "sandbox-y"] {
+            fixture
+                .sandbox(sandbox, "generation-1", SandboxPhase::Ready)
+                .await;
+        }
+        // One launch stalls after reading 255 charged routes; another
+        // admits the last slot meanwhile.
+        let stalled = fixture.replica("gw-a");
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let reached = stalled.pause_next_transition_reached(release.clone());
+        let stalled_launch = {
+            let stalled = stalled.clone();
+            tokio::spawn(async move {
+                stalled
+                    .place_launch(launch("rt-route-x000", "sandbox-x", "generation-1"))
+                    .await
+            })
+        };
+        reached.await.unwrap();
+        fixture
+            .replica("gw-b")
+            .place_launch(launch("rt-route-y000", "sandbox-y", "generation-1"))
+            .await
+            .unwrap();
+        release.wait().await;
+        assert!(stalled_launch.await.unwrap().is_err());
+        assert!(fixture.owner("rt-route-x000").await.is_none());
+        assert_eq!(fixture.charged("m1").await.len(), MAX_ASSIGNED_INSTANCES);
+    }
+
+    #[tokio::test]
+    async fn a_failed_contender_for_an_owned_route_charges_nothing() {
+        a_failed_contender_for_an_owned_route_charges_nothing_on(&Fixture::new().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_a_failed_contender_for_an_owned_route_charges_nothing() {
+        let schema = TestSchema::create("supervisor_pool").await;
+        a_failed_contender_for_an_owned_route_charges_nothing_on(&Fixture::with_store(
+            schema.connect_store().await,
+        ))
+        .await;
+        schema.drop_schema().await;
+    }
+
+    async fn a_failed_contender_for_an_owned_route_charges_nothing_on(fixture: &Fixture) {
+        fixture.member("m1", "p1", false).await;
+        fixture.member("m2", "p2", false).await;
+        let route = fixture.fill("m1", "p1", 1).await.remove(0);
+        let contender = fixture.replica("gw-b");
+        let mut payload = fixture.owner(&route).await.unwrap();
+        payload.member_id = "m2".to_string();
+        payload.process_id = "p2".to_string();
+        assert!(matches!(
+            contender
+                .transition(&route, None, Some(&payload))
+                .await
+                .unwrap(),
+            Transition::OwnerChanged
+        ));
+        assert!(fixture.charged("m2").await.is_empty());
+        assert!(fixture.charged("m1").await.contains(&route));
+        assert_eq!(fixture.owner(&route).await.unwrap().member_id, "m1");
+    }
+
+    #[tokio::test]
+    async fn a_restarted_member_of_a_full_pool_re_adopts_its_routes_in_place() {
+        a_restarted_member_of_a_full_pool_re_adopts_its_routes_in_place_on(&Fixture::new().await)
+            .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_a_restarted_member_of_a_full_pool_re_adopts_its_routes_in_place() {
+        let schema = TestSchema::create("supervisor_pool").await;
+        a_restarted_member_of_a_full_pool_re_adopts_its_routes_in_place_on(&Fixture::with_store(
+            schema.connect_store().await,
+        ))
+        .await;
+        schema.drop_schema().await;
+    }
+
+    async fn a_restarted_member_of_a_full_pool_re_adopts_its_routes_in_place_on(fixture: &Fixture) {
+        fixture.member("m1", "p1", false).await;
+        fixture.member("m2", "p2", false).await;
+        let routes = fixture.fill("m1", "p1", MAX_ASSIGNED_INSTANCES).await;
+        fixture.fill("m2", "p2", MAX_ASSIGNED_INSTANCES).await;
+        fixture
+            .sandbox("sandbox-new", "generation-1", SandboxPhase::Ready)
+            .await;
+        // m1's supervisor restarts inside its Pod: same member, new process.
+        fixture.member("m1", "p1-restarted", false).await;
+        let pool = fixture.replica("gw-a");
+        let launching = fixture.replica("gw-b");
+        let (pass, launched) = tokio::join!(
+            pool.reconcile_once(),
+            launching.place_launch(launch("rt-route-new0", "sandbox-new", "generation-1")),
+        );
+        pass.unwrap();
+        // Every route is re-adopted by the new process at the next term,
+        // without needing a free slot, and the launch found none.
+        for route in &routes {
+            let owner = fixture.owner(route).await.unwrap();
+            assert_eq!(
+                (
+                    owner.member_id.as_str(),
+                    owner.process_id.as_str(),
+                    owner.auth_epoch,
+                    owner.phase
+                ),
+                ("m1", "p1-restarted", 2, OwnerPhase::Granted),
+                "{route}"
+            );
+        }
+        assert!(launched.is_err());
+        assert!(fixture.owner("rt-route-new0").await.is_none());
+        assert_eq!(fixture.charged("m1").await.len(), MAX_ASSIGNED_INSTANCES);
+        assert_eq!(fixture.charged("m2").await.len(), MAX_ASSIGNED_INSTANCES);
+    }
+
+    /// A member stream accepted at `connected_at_ms`.
+    fn stream(member_id: &str, process_id: &str, connected_at_ms: i64) -> ConnectedMember {
+        ConnectedMember {
+            member_id: member_id.to_string(),
+            member_uid: format!("uid-{member_id}"),
+            process_id: process_id.to_string(),
+            runtime_address: "10.0.0.1:5500".to_string(),
+            leaving: false,
+            connected_at_ms,
+        }
+    }
+
+    /// Short membership timings, so expiry happens within a test.
+    const TEST_TTL: Duration = Duration::from_millis(600);
+    const TEST_REFRESH: Duration = Duration::from_millis(100);
+
+    /// Start `pool`; the returned sender stops it.
+    fn run(pool: &Arc<SupervisorPool>) -> tokio::sync::watch::Sender<bool> {
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        pool.start(stopped);
+        stop
+    }
+
+    async fn member_record(fixture: &Fixture, member_id: &str) -> MemberPayload {
+        let record = fixture
+            .store
+            .get(MEMBER_OBJECT_TYPE, &member_object_id(member_id))
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_slice(&record.payload).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_stalled_pass_never_lets_a_served_member_expire() {
+        let fixture = Fixture::new().await;
+        let serving = fixture.timed_replica("gw-a", TEST_TTL, TEST_REFRESH);
+        serving.serve(vec![stream("m1", "p1", now_ms())]);
+        let (paused, resume) = serving.pause_next_pass();
+        let stop = run(&serving);
+        paused.await.unwrap();
+        // The pass stays stalled for several TTLs.
+        tokio::time::sleep(TEST_TTL * 4).await;
+        let observer = fixture.timed_replica("gw-b", TEST_TTL, TEST_REFRESH);
+        let live = observer.live_members().await.unwrap();
+        assert_eq!(
+            live.iter()
+                .map(|member| member.member_id.as_str())
+                .collect::<Vec<_>>(),
+            ["m1"]
+        );
+        let _ = resume.send(());
+        stop.send_replace(true);
+    }
+
+    #[tokio::test]
+    async fn a_member_that_reconnects_past_a_frozen_replica_keeps_its_instances() {
+        let fixture = Fixture::new().await;
+        let route = fixture.fill("m1", "p1", 1).await.remove(0);
+        let first_stream = now_ms();
+        let frozen = fixture.timed_replica("gw-a", TEST_TTL, TEST_REFRESH);
+        frozen.serve(vec![stream("m1", "p1", first_stream)]);
+        let peer = fixture.timed_replica("gw-b", TEST_TTL, TEST_REFRESH);
+        peer.serve(vec![stream("m2", "p2", first_stream)]);
+        let stop_frozen = run(&frozen);
+        let stop_peer = run(&peer);
+        tokio::time::sleep(TEST_REFRESH * 2).await;
+        // gw-a freezes; m1 notices and reconnects through gw-b well within
+        // the TTL, keeping its process.
+        stop_frozen.send_replace(true);
+        tokio::time::sleep(TEST_REFRESH * 2).await;
+        peer.serve(vec![
+            stream("m1", "p1", first_stream + 1_000),
+            stream("m2", "p2", first_stream),
+        ]);
+        // Any replica reconciling meanwhile leaves m1's instance alone.
+        let judge = fixture.timed_replica("gw-c", TEST_TTL, TEST_REFRESH);
+        let until = tokio::time::Instant::now() + TEST_TTL * 4;
+        while tokio::time::Instant::now() < until {
+            judge.reconcile_once().await.unwrap();
+            let owner = fixture.owner(&route).await.unwrap();
+            assert_eq!(
+                (owner.member_id.as_str(), owner.auth_epoch),
+                ("m1", 1),
+                "m1 kept its instance"
+            );
+            tokio::time::sleep(TEST_REFRESH).await;
+        }
+        // gw-a thaws with the member's stale stream still open: its refresh
+        // leaves the newer stream's record alone.
+        frozen.refresh_members().await;
+        let record = member_record(&fixture, "m1").await;
+        assert_eq!(
+            (record.gateway_replica.as_str(), record.connected_at_ms),
+            ("gw-b", first_stream + 1_000)
+        );
+        stop_peer.send_replace(true);
+    }
+
+    #[tokio::test]
+    async fn a_member_no_replica_serves_expires_and_its_instances_move() {
+        let fixture = Fixture::new().await;
+        let route = fixture.fill("m1", "p1", 1).await.remove(0);
+        let lost = fixture.timed_replica("gw-a", TEST_TTL, TEST_REFRESH);
+        lost.serve(vec![stream("m1", "p1", now_ms())]);
+        let peer = fixture.timed_replica("gw-b", TEST_TTL, TEST_REFRESH);
+        peer.serve(vec![stream("m2", "p2", now_ms())]);
+        let stop_lost = run(&lost);
+        let stop_peer = run(&peer);
+        tokio::time::sleep(TEST_REFRESH * 2).await;
+        // m1 is cut off from every replica.
+        lost.serve(Vec::new());
+        let judge = fixture.timed_replica("gw-c", TEST_TTL, TEST_REFRESH);
+        judge.reconcile_once().await.unwrap();
+        assert_eq!(fixture.owner(&route).await.unwrap().member_id, "m1");
+        tokio::time::sleep(TEST_TTL + TEST_REFRESH * 2).await;
+        judge.reconcile_once().await.unwrap();
+        let owner = fixture.owner(&route).await.unwrap();
+        assert_eq!((owner.member_id.as_str(), owner.auth_epoch), ("m2", 2));
+        stop_lost.send_replace(true);
+        stop_peer.send_replace(true);
+    }
+
+    /// What `member`'s `process` reported of `route` under `auth_epoch`.
+    fn member_report(
+        (member_id, process_id, auth_epoch): (&str, &str, u64),
+        route: &str,
+        sandbox_id: &str,
+        (phase, ready): (i32, bool),
+        connected_at_ms: i64,
+    ) -> MemberReport {
+        MemberReport {
+            member_id: member_id.to_string(),
+            process_id: process_id.to_string(),
+            auth_epoch,
+            connected_at_ms,
+            status: SandboxInstanceStatus {
+                route: route.to_string(),
+                sandbox_id: sandbox_id.to_string(),
+                phase,
+                ready,
+                exit_code: 0,
+                error: String::new(),
+            },
+        }
+    }
+
+    /// Grant `route` to `member`'s `process` at the next term, as a
+    /// completed takeover would.
+    async fn grant_next_term(fixture: &Fixture, route: &str, member_id: &str, process_id: &str) {
+        let mover = fixture.replica("mover");
+        let record = mover.reload_owner(route).await;
+        let next = OwnerPayload {
+            member_id: member_id.to_string(),
+            process_id: process_id.to_string(),
+            auth_epoch: record.payload.auth_epoch + 1,
+            supervisor_instance_id: Some(Uuid::new_v4().to_string()),
+            gateway_token_id: Some(Uuid::new_v4().to_string()),
+            phase: OwnerPhase::Granted,
+            previous_member_id: Some(record.payload.member_id.clone()),
+            ..record.payload.clone()
+        };
+        assert!(matches!(
+            mover
+                .transition(route, Some(&record), Some(&next))
+                .await
+                .unwrap(),
+            Transition::Applied(Some(_))
+        ));
+    }
+
+    /// The status a replica's last pass published for `route`.
+    fn published_report(pool: &SupervisorPool, route: &str) -> Option<(i32, bool)> {
+        pool.controller
+            .pool_view()
+            .unwrap()
+            .reports
+            .get(route)
+            .map(|status| (status.phase, status.ready))
+    }
+
+    #[tokio::test]
+    async fn a_paused_report_of_an_earlier_term_never_hides_the_new_terms() {
+        let fixture = Fixture::new().await;
+        fixture.member("m1", "p1", false).await;
+        fixture.member("m2", "p2", false).await;
+        let route = fixture.fill("m1", "p1", 1).await.remove(0);
+        let sandbox = fixture.owner(&route).await.unwrap().sandbox_id;
+        // The replica serving m1 read m1's term-1 report and stalls before
+        // writing it.
+        let old = fixture.replica("gw-a");
+        old.serve_reports(vec![member_report(
+            ("m1", "p1", 1),
+            &route,
+            &sandbox,
+            (2, true),
+            1,
+        )]);
+        let (paused, resume) = old.pause_next_report_recording();
+        let stalled = {
+            let old = old.clone();
+            tokio::spawn(async move { old.reconcile_once().await })
+        };
+        paused.await.unwrap();
+        // m2 takes the route over at term 2 and reports it starting.
+        grant_next_term(&fixture, &route, "m2", "p2").await;
+        let new = fixture.replica("gw-b");
+        new.serve_reports(vec![member_report(
+            ("m2", "p2", 2),
+            &route,
+            &sandbox,
+            (1, false),
+            1,
+        )]);
+        new.reconcile_once().await.unwrap();
+        // The stalled write lands afterwards.
+        let _ = resume.send(());
+        stalled.await.unwrap().unwrap();
+        let judge = fixture.replica("gw-c");
+        judge.reconcile_once().await.unwrap();
+        assert_eq!(published_report(&judge, &route), Some((1, false)));
+        // The earlier term's row is gone; term 2's row is untouched, and an
+        // unchanged report leaves it so.
+        let rows = fixture.report_rows(&route).await;
+        assert_eq!(rows.keys().copied().collect::<Vec<_>>(), [2]);
+        new.reconcile_once().await.unwrap();
+        judge.reconcile_once().await.unwrap();
+        assert_eq!(published_report(&judge, &route), Some((1, false)));
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_report_whose_row_was_replaced_or_removed_is_rewritten() {
+        let fixture = Fixture::new().await;
+        fixture.member("m1", "p1", false).await;
+        let route = fixture.fill("m1", "p1", 1).await.remove(0);
+        let sandbox = fixture.owner(&route).await.unwrap().sandbox_id;
+        let serving = fixture.replica("gw-a");
+        serving.serve_reports(vec![member_report(
+            ("m1", "p1", 1),
+            &route,
+            &sandbox,
+            (2, true),
+            5,
+        )]);
+        serving.reconcile_once().await.unwrap();
+        let written = fixture.report_rows(&route).await.remove(&1).unwrap();
+        assert!(written.ready);
+        // Another writer replaced the row; the same report repairs it.
+        fixture
+            .write_report(ReportPayload {
+                ready: false,
+                connected_at_ms: 0,
+                ..written.clone()
+            })
+            .await;
+        serving.reconcile_once().await.unwrap();
+        assert_eq!(fixture.report_rows(&route).await.get(&1), Some(&written));
+        // So it does after the row was removed.
+        fixture
+            .store
+            .delete(REPORT_OBJECT_TYPE, &report_object_id(&route, 1))
+            .await
+            .unwrap();
+        serving.reconcile_once().await.unwrap();
+        assert_eq!(fixture.report_rows(&route).await.get(&1), Some(&written));
+    }
+
+    #[tokio::test]
+    async fn the_newest_stream_of_a_term_keeps_its_report() {
+        let fixture = Fixture::new().await;
+        fixture.member("m1", "p1", false).await;
+        let route = fixture.fill("m1", "p1", 1).await.remove(0);
+        let sandbox = fixture.owner(&route).await.unwrap().sandbox_id;
+        let current = fixture.replica("gw-b");
+        current.serve_reports(vec![member_report(
+            ("m1", "p1", 1),
+            &route,
+            &sandbox,
+            (2, true),
+            2_000,
+        )]);
+        // A replica still holding the process's older stream.
+        let stale = fixture.replica("gw-a");
+        stale.serve_reports(vec![member_report(
+            ("m1", "p1", 1),
+            &route,
+            &sandbox,
+            (1, false),
+            1_000,
+        )]);
+        current.reconcile_once().await.unwrap();
+        stale.reconcile_once().await.unwrap();
+        let row = fixture.report_rows(&route).await.remove(&1).unwrap();
+        assert_eq!((row.ready, row.connected_at_ms), (true, 2_000));
+    }
+
+    #[tokio::test]
+    async fn reports_count_only_for_their_owners_term() {
+        let fixture = Fixture::new().await;
+        fixture.member("m1", "p1", false).await;
+        let route = fixture.fill("m1", "p1", 1).await.remove(0);
+        let sandbox = fixture.owner(&route).await.unwrap().sandbox_id;
+        // The route returns to the same process at term 2; its stream has
+        // only acknowledged term 1.
+        grant_next_term(&fixture, &route, "m1", "p1").await;
+        let serving = fixture.replica("gw-a");
+        serving.serve_reports(vec![member_report(
+            ("m1", "p1", 1),
+            &route,
+            &sandbox,
+            (2, true),
+            1,
+        )]);
+        serving.reconcile_once().await.unwrap();
+        assert!(fixture.report_rows(&route).await.is_empty());
+        assert_eq!(published_report(&serving, &route), None);
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_only_rows_older_than_the_listed_owner() {
+        let fixture = Fixture::new().await;
+        fixture.member("m1", "p1", false).await;
+        let route = fixture.fill("m1", "p1", 1).await.remove(0);
+        let pool = fixture.replica("gw-a");
+        let listed = pool.owners().await.unwrap();
+        for auth_epoch in [1, 2] {
+            fixture
+                .write_report(ReportPayload {
+                    route: route.clone(),
+                    member_id: "m1".to_string(),
+                    process_id: "p1".to_string(),
+                    auth_epoch,
+                    sandbox_id: "sandbox".to_string(),
+                    phase: 2,
+                    ready: true,
+                    exit_code: 0,
+                    connected_at_ms: 0,
+                })
+                .await;
+        }
+        // Term 2's row is newer than the listed owner (term 1): kept, as is
+        // the listed owner's own row.
+        let rows = pool.report_rows().await.unwrap();
+        pool.remove_stale_reports(&listed, &rows).await;
+        assert_eq!(
+            fixture
+                .report_rows(&route)
+                .await
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        // Once the owner is listed at term 2, term 1's row goes.
+        grant_next_term(&fixture, &route, "m1", "p1").await;
+        let listed = pool.owners().await.unwrap();
+        pool.remove_stale_reports(&listed, &rows).await;
+        assert_eq!(
+            fixture
+                .report_rows(&route)
+                .await
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        // A row changed since it was listed is left for the next pass.
+        fixture
+            .write_report(ReportPayload {
+                route: route.clone(),
+                member_id: "m1".to_string(),
+                process_id: "p1".to_string(),
+                auth_epoch: 2,
+                sandbox_id: "sandbox".to_string(),
+                phase: 2,
+                ready: false,
+                exit_code: 0,
+                connected_at_ms: 0,
+            })
+            .await;
+        let rows = pool.report_rows().await.unwrap();
+        fixture.remove_owner_record(&route).await;
+        fixture
+            .write_report(ReportPayload {
+                route: route.clone(),
+                member_id: "m1".to_string(),
+                process_id: "p1".to_string(),
+                auth_epoch: 2,
+                sandbox_id: "sandbox".to_string(),
+                phase: 3,
+                ready: false,
+                exit_code: 0,
+                connected_at_ms: 0,
+            })
+            .await;
+        pool.remove_stale_reports(&BTreeMap::new(), &rows).await;
+        assert_eq!(
+            fixture
+                .report_rows(&route)
+                .await
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        // Without an owner, a row as listed goes.
+        let rows = pool.report_rows().await.unwrap();
+        pool.remove_stale_reports(&BTreeMap::new(), &rows).await;
+        assert!(fixture.report_rows(&route).await.is_empty());
+    }
+
+    #[test]
+    fn a_takeover_names_why_the_owner_lost_its_instance() {
+        let owner = OwnerPayload {
+            route: "rt-a".to_string(),
+            sandbox_id: "sandbox-a".to_string(),
+            generation: "generation-1".to_string(),
+            member_id: "m1".to_string(),
+            process_id: "p1".to_string(),
+            auth_epoch: 1,
+            supervisor_instance_id: None,
+            gateway_token_id: None,
+            phase: OwnerPhase::Granted,
+            previous_member_id: None,
+        };
+        let member = |process_id: &str, leaving| LiveMember {
+            member_id: "m1".to_string(),
+            process_id: process_id.to_string(),
+            runtime_address: "10.0.0.1:5500".to_string(),
+            leaving,
+        };
+        assert_eq!(takeover_cause(&owner, &[]), "expired");
+        assert_eq!(takeover_cause(&owner, &[member("p1", true)]), "leaving");
+        assert_eq!(takeover_cause(&owner, &[member("p2", false)]), "restarted");
+    }
+
     #[test]
     fn placement_prefers_the_ring_and_moves_on_only_when_a_member_is_full() {
         let member = |id: &str, leaving| LiveMember {
@@ -2939,23 +4512,48 @@ mod tests {
             .map(|index| format!("sandbox-{index}"))
             .find(|sandbox| ring.owner_for(sandbox) == Some("m1"))
             .expect("a sandbox the ring places on m1");
-        let load = |m1, m2| HashMap::from([("m1".to_string(), m1), ("m2".to_string(), m2)]);
-        let chosen = |load: HashMap<String, usize>| {
-            choose(&ring, &members, &sandbox, &load).map(|member| member.member_id.clone())
+        let routes_for = |member: &str, count: usize| {
+            (
+                member.to_string(),
+                (0..count)
+                    .map(|index| format!("rt-{member}-{index}"))
+                    .collect::<BTreeSet<_>>(),
+            )
         };
+        let order = |charges: BTreeMap<String, BTreeSet<String>>, route: &str, same| {
+            candidates(&ring, &members, &sandbox, route, &charges, same)
+                .into_iter()
+                .map(|member| member.member_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let charges = |m1, m2| BTreeMap::from([routes_for("m1", m1), routes_for("m2", m2)]);
         assert_eq!(
-            chosen(load(MAX_ASSIGNED_INSTANCES - 1, 0)).as_deref(),
-            Some("m1")
+            order(charges(MAX_ASSIGNED_INSTANCES - 1, 0), "rt-new", None),
+            ["m1", "m2"]
         );
-        // A full member is skipped for the least loaded one with room; a
+        // A full member is skipped for the least charged one with room; a
         // leaving member never receives instances.
         assert_eq!(
-            chosen(load(MAX_ASSIGNED_INSTANCES, 3)).as_deref(),
-            Some("m2")
+            order(charges(MAX_ASSIGNED_INSTANCES, 3), "rt-new", None),
+            ["m2"]
         );
+        assert!(
+            order(
+                charges(MAX_ASSIGNED_INSTANCES, MAX_ASSIGNED_INSTANCES),
+                "rt-new",
+                None
+            )
+            .is_empty()
+        );
+        // A full member still has room for a route it is charged for, and
+        // its restarted process re-adopts it before any other member.
         assert_eq!(
-            chosen(load(MAX_ASSIGNED_INSTANCES, MAX_ASSIGNED_INSTANCES)),
-            None
+            order(
+                charges(MAX_ASSIGNED_INSTANCES, MAX_ASSIGNED_INSTANCES),
+                "rt-m2-0",
+                Some("m2")
+            ),
+            ["m2"]
         );
     }
 }

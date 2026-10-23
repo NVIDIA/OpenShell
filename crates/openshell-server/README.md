@@ -28,9 +28,22 @@ pool's durable state and reconciles it every two seconds on every gateway
 replica, independent of which replica runs the compute driver's watch:
 
 - **Membership.** The replica serving a member's host stream refreshes its
-  `supervisor_pool_member` record. A record older than 15 seconds is dead; a
-  member that announces it is leaving drops out at once; a member whose process
-  changed lost every instance its previous process owned.
+  `supervisor_pool_member` record from a task of its own, every two seconds and
+  at once when a member attaches, leaves, or detaches, each write bounded, so a
+  slow reconciliation pass never lets a served member expire. Only the member's
+  newest stream (by accept time) writes the record, so a replica still holding
+  a stale stream of the same process cannot overwrite it. A record older than 15
+  seconds is dead; a member that announces it is leaving drops out at once; a
+  member whose process changed lost every instance its previous process owned.
+  The timings members and replicas share, and the reconnect budget that keeps a
+  member reconnecting past an unresponsive replica well inside the TTL, are in
+  `openshell_supervisor_control::pool_timing`.
+- **Listings.** A pass reads each record type page by page after an immutable
+  key (`list_by_type_after`), so a row removed meanwhile shifts nothing out of
+  the listing. A listing is still not a snapshot, so before a pass drops an
+  owner its previous view had, or an instance that view or an owner names, it
+  reads the record by key; a failed read fails the pass, which then publishes
+  nothing.
 - **Desired set.** A launch records the instance (`supervisor_instance_assignment`)
   before anything else. The record holds only the handle of the launch
   material, which the configured credential store keeps, as it keeps sandbox SSH
@@ -54,6 +67,16 @@ replica, independent of which replica runs the compute driver's watch:
   `supervisor_instance_owner` record per instance names the member, its
   process, and the ownership term (the sandbox's credential epoch). Records
   change only by compare-and-swap, and a live owner keeps its instances.
+- **Capacity.** One `supervisor_pool_capacity` record per member lists the
+  routes whose owner record, in any phase, names the member. Every owner
+  create, move, or removal is one `Store::write_atomically` transaction with
+  the capacity records it changes, conditioned on all of their versions, and a
+  full member is refused before anything is written. Two replicas admitting
+  the last slot of a member, by launch or takeover, therefore admit one, and a
+  stalled admission whose slot was taken meanwhile fails. A takeover prefers
+  the route's previous member, whose record already lists it, so a member
+  whose process restarted re-adopts its instances even when every member is
+  full.
 - **Takeover.** Only an instance whose owner failed or left moves. A replica
   records the intent (new owner, next term, the process the runtime will pin,
   a new token lineage), advances the sandbox's persisted epoch with
@@ -62,7 +85,8 @@ replica, independent of which replica runs the compute driver's watch:
   interrupted intent; a stopping, stopped, or deleted sandbox, a replaced
   generation, or a term another lineage holds cancels it. A replica that just
   started waits 30 seconds before taking over, so members reconnect after a
-  gateway restart first.
+  gateway restart first. The takeover log names its `cause`: `expired`,
+  `leaving`, or `restarted`.
 - **Credentials.** Each replica mints a takeover term's grant and session
   credentials only for members it serves, from the granted record and the
   persisted identity, and mints them again after half the grant's lifetime.
@@ -70,10 +94,17 @@ replica, independent of which replica runs the compute driver's watch:
   it keeps it.
 
 - **Observations.** The replica serving an owner records what the owner reports
-  of its instances (`supervisor_instance_report`; no error text), and every
-  replica judges an instance whose owner streams elsewhere from the record of
-  the current owner term, so launch readiness and bootstrap completion do not
-  depend on which replica a member reached.
+  of its instances (`supervisor_instance_report`; no error text), one record per
+  instance and ownership term, and every replica judges an instance whose owner
+  streams elsewhere from the record of the current owner term, so launch
+  readiness and bootstrap completion do not depend on which replica a member
+  reached. A report counts for a term only once the member's stream
+  acknowledged the snapshot that installed the term, and only if the pass's
+  owner record shows that term, so a status from an earlier term is never
+  recorded as a later one. A record is rewritten whenever it differs from the
+  report, so one another writer replaced is repaired. Reports are listed before
+  owners, and only records of terms older than the listed owner, or of
+  instances without one, are removed.
 
 Owner records of withdrawn instances are removed once their generation ended,
 or two minutes after the withdrawal, after their owner was told to stop them.

@@ -6,9 +6,9 @@ use super::mutation_lock::{
     MUTATION_LOCK_TIMEOUT, MUTATION_LOCK_TIMEOUT_SETTING, MutationLockSet,
 };
 use super::{
-    DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
-    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error,
-    map_migrate_error,
+    AtomicWrite, DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
+    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, atomic_write_order,
+    current_time_ms, map_db_error, map_migrate_error,
 };
 use crate::gateway_metrics::GaugeSlot;
 use crate::policy_store::{
@@ -731,6 +731,107 @@ RETURNING resource_version, created_at_ms, updated_at_ms
                 })
             }
         }
+    }
+
+    pub async fn write_atomically(
+        &self,
+        writes: &[AtomicWrite],
+    ) -> PersistenceResult<Vec<Option<WriteResult>>> {
+        let now_ms = current_time_ms();
+        let result_of = |row: &sqlx::postgres::PgRow| {
+            let resource_version: i64 = row.try_get("resource_version").unwrap_or(1);
+            WriteResult {
+                resource_version: resource_version.max(1).cast_unsigned(),
+                created_at_ms: row.get("created_at_ms"),
+                updated_at_ms: row.get("updated_at_ms"),
+            }
+        };
+        let mut results = vec![None; writes.len()];
+        // One transaction on one data-pool connection; dropping it on an
+        // early return rolls every write back. Writes run in a fixed row
+        // order, so concurrent groups take row locks in one order.
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        for index in atomic_write_order(writes) {
+            match &writes[index] {
+                AtomicWrite::Create {
+                    object_type,
+                    id,
+                    name,
+                    workspace,
+                    payload,
+                } => {
+                    let row = sqlx::query(
+                        r"
+INSERT INTO objects (object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version)
+VALUES ($1, $2, $3, $4, $5, $6, $6, '{}'::jsonb, 1)
+RETURNING resource_version, created_at_ms, updated_at_ms
+",
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(name)
+                    .bind(workspace)
+                    .bind(payload)
+                    .bind(now_ms)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+                    results[index] = Some(result_of(&row));
+                }
+                AtomicWrite::Update {
+                    object_type,
+                    id,
+                    payload,
+                    expected_version,
+                } => {
+                    let row = sqlx::query(
+                        r"
+UPDATE objects
+SET payload = $4, updated_at_ms = $5, resource_version = resource_version + 1
+WHERE object_type = $1 AND id = $2 AND resource_version = $3
+RETURNING resource_version, created_at_ms, updated_at_ms
+",
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(i64::try_from(*expected_version).unwrap_or(i64::MAX))
+                    .bind(payload)
+                    .bind(now_ms)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?
+                    .ok_or(PersistenceError::Conflict {
+                        current_resource_version: None,
+                    })?;
+                    results[index] = Some(result_of(&row));
+                }
+                AtomicWrite::Delete {
+                    object_type,
+                    id,
+                    expected_version,
+                } => {
+                    let deleted = sqlx::query(
+                        r"
+DELETE FROM objects
+WHERE object_type = $1 AND id = $2 AND resource_version = $3
+",
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(i64::try_from(*expected_version).unwrap_or(i64::MAX))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+                    if deleted.rows_affected() == 0 {
+                        return Err(PersistenceError::Conflict {
+                            current_resource_version: None,
+                        });
+                    }
+                }
+            }
+        }
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(results)
     }
 
     pub async fn delete_if(
