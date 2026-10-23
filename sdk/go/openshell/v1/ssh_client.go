@@ -65,7 +65,8 @@ func (s *sshClient) Tunnel(ctx context.Context, workspace, sandboxName string, p
 			Message: fmt.Sprintf("port must be in range 1-65535, got %d", port),
 		}
 	}
-	if _, err := s.sandboxes.Get(ctx, workspace, sandboxName); err != nil {
+	owner, err := sandboxOwner(ctx, s.sandboxes, workspace, sandboxName)
+	if err != nil {
 		return nil, err
 	}
 
@@ -84,13 +85,6 @@ func (s *sshClient) Tunnel(ctx context.Context, workspace, sandboxName string, p
 		}
 	}()
 
-	streamCtx, cancel := context.WithCancel(ctx)
-	stream, err := s.client.ForwardTcp(streamCtx)
-	if err != nil {
-		cancel()
-		return nil, converter.FromGRPCError(err)
-	}
-
 	initFrame := &pb.TcpForwardFrame{
 		Payload: &pb.TcpForwardFrame_Init{
 			Init: &pb.TcpForwardInit{
@@ -105,7 +99,9 @@ func (s *sshClient) Tunnel(ctx context.Context, workspace, sandboxName string, p
 		},
 	}
 
-	if err := stream.Send(initFrame); err != nil {
+	streamCtx, cancel := context.WithCancel(ctx)
+	stream, err := openForward(streamCtx, s.client, owner, initFrame)
+	if err != nil {
 		cancel()
 		return nil, converter.FromGRPCError(err)
 	}

@@ -37,19 +37,13 @@ func (t *tcpClient) Forward(ctx context.Context, workspace, sandboxName string, 
 			Message: fmt.Sprintf("port must be in range 1-65535, got %d", port),
 		}
 	}
-	if _, err := t.sandboxes.Get(ctx, workspace, sandboxName); err != nil {
+	owner, err := sandboxOwner(ctx, t.sandboxes, workspace, sandboxName)
+	if err != nil {
 		return nil, err
 	}
 
 	var cfg forwardConfig
 	options.Apply(&cfg, opts)
-
-	streamCtx, cancel := context.WithCancel(ctx)
-	stream, err := t.client.ForwardTcp(streamCtx)
-	if err != nil {
-		cancel()
-		return nil, converter.FromGRPCError(err)
-	}
 
 	initFrame := &pb.TcpForwardFrame{
 		Payload: &pb.TcpForwardFrame_Init{
@@ -67,7 +61,9 @@ func (t *tcpClient) Forward(ctx context.Context, workspace, sandboxName string, 
 		},
 	}
 
-	if err := stream.Send(initFrame); err != nil {
+	streamCtx, cancel := context.WithCancel(ctx)
+	stream, err := openForward(streamCtx, t.client, owner, initFrame)
+	if err != nil {
 		cancel()
 		return nil, converter.FromGRPCError(err)
 	}
