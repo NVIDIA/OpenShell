@@ -28,11 +28,13 @@ REPO = "owner/repo"
 PULL = "repos/owner/repo/pulls/42"
 
 
-def pr(*labels, requested=(), author="author", draft=False, state="open"):
+def pr(*labels, requested=(), author="author", draft=False, state="open", body=""):
     return {
         "state": state,
         "draft": draft,
         "user": {"login": author},
+        "node_id": "PR_node_42",
+        "body": body,
         "labels": [{"name": label} for label in labels],
         "requested_reviewers": [{"login": login} for login in requested],
     }
@@ -235,7 +237,171 @@ class GitHubTests(unittest.TestCase):
             )
 
 
+class AcceptanceTests(unittest.TestCase):
+    @staticmethod
+    def response(
+        *, accepted=(), linked=(), permission="READ", collaborator="author",
+        repository=REPO, more=(),
+    ):
+        def page(key):
+            return {
+                "hasNextPage": key in more,
+                "endCursor": "next-page" if key in more else None,
+            }
+
+        return {"data": {"repository": {
+            "collaborators": {
+                "edges": [{"node": {"login": collaborator}, "permission": permission}],
+                "pageInfo": page("collaboratorCursor"),
+            },
+            "issues": {
+                "nodes": [{"number": n} for n in accepted],
+                "pageInfo": page("acceptedCursor"),
+            },
+            "pullRequest": {"closingIssuesReferences": {
+                "nodes": [
+                    {"number": n, "repository": {"nameWithOwner": repository}}
+                    for n in linked
+                ],
+                "pageInfo": page("linkedCursor"),
+            }},
+        }}}
+
+    def test_write_maintain_and_admin_authors_need_no_issue(self):
+        for permission in ("WRITE", "MAINTAIN", "ADMIN"):
+            with (
+                self.subTest(permission=permission),
+                mock.patch.object(
+                    routing, "_api", return_value=self.response(permission=permission)
+                ),
+            ):
+                self.assertTrue(routing._accepted_work(REPO, 42, pr(body="See #9999999")))
+
+    def test_collaborator_search_result_must_match_the_pr_author(self):
+        with mock.patch.object(
+            routing, "_api",
+            return_value=self.response(permission="ADMIN", collaborator="someone-else"),
+        ):
+            self.assertFalse(routing._accepted_work(REPO, 42, pr()))
+
+    def test_queries_only_accepted_issues_submitted_by_the_pr_author(self):
+        with mock.patch.object(routing, "_api", return_value=self.response()) as api:
+            self.assertFalse(
+                routing._accepted_work(REPO, 42, pr(author="AUTHOR", body="Related to #1"))
+            )
+        query = api.call_args.kwargs["data"]["query"]
+        self.assertIn('labels: ["state:accepted"]', query)
+        self.assertIn("filterBy: {createdBy: $author}", query)
+        self.assertIn("states: [OPEN, CLOSED]", query)
+        self.assertEqual(api.call_args.kwargs["data"]["variables"]["author"], "author")
+
+    def test_description_and_closing_references_must_intersect_own_accepted_issues(self):
+        for body in (
+            "", "Related to #1", "Related to owner/repo#1", "Related to OWNER/REPO#1",
+            "Related to https://github.com/owner/repo/issues/1",
+        ):
+            for accepted, expected in (((), False), ((2,), False), ((1,), True)):
+                with (
+                    self.subTest(body=body, accepted=accepted),
+                    mock.patch.object(
+                        routing, "_api",
+                        return_value=self.response(
+                            accepted=accepted, linked=() if body else (1,),
+                        ),
+                    ),
+                ):
+                    self.assertEqual(
+                        routing._accepted_work(REPO, 42, pr(body=body)), expected
+                    )
+
+    def test_one_qualifying_issue_is_enough(self):
+        with mock.patch.object(
+            routing, "_api", return_value=self.response(accepted=(2,), linked=(1, 2))
+        ):
+            self.assertTrue(routing._accepted_work(REPO, 42, pr()))
+
+    def test_reads_later_accepted_issue_closing_reference_and_collaborator_pages(self):
+        for cursor in ("acceptedCursor", "linkedCursor", "collaboratorCursor"):
+            if cursor == "acceptedCursor":
+                first = self.response(linked=(1,), more=(cursor,))
+                second = self.response(accepted=(1,))
+            elif cursor == "linkedCursor":
+                first = self.response(accepted=(1,), more=(cursor,))
+                second = self.response(linked=(1,))
+            else:
+                first = self.response(more=(cursor,))
+                second = self.response(permission="WRITE")
+            with (
+                self.subTest(cursor=cursor),
+                mock.patch.object(routing, "_api", side_effect=[first, second]) as api,
+            ):
+                self.assertTrue(routing._accepted_work(REPO, 42, pr()))
+                self.assertEqual(
+                    api.call_args.kwargs["data"]["variables"][cursor], "next-page"
+                )
+
+    def test_cross_repository_references_do_not_qualify(self):
+        with mock.patch.object(
+            routing, "_api",
+            return_value=self.response(accepted=(1,), linked=(1,), repository="other/repo"),
+        ):
+            self.assertFalse(routing._accepted_work(
+                REPO, 42,
+                pr(body="Related to other/repo#1 and https://github.com/other/repo/issues/1"),
+            ))
+
+    def test_rejection_drafts_before_label_validation_or_reviewer_changes(self):
+        for apply in (False, True):
+            with (
+                self.subTest(apply=apply),
+                mock.patch.object(routing, "_api", side_effect=[pr(), None]) as api,
+                mock.patch.object(routing, "_accepted_work", return_value=False),
+                mock.patch.object(routing, "_load_reviewers") as load,
+            ):
+                with self.assertRaisesRegex(ValueError, "not accepted work"):
+                    routing.check_review_readiness(CATEGORIES, REPO, 42, apply=apply)
+                load.assert_not_called()
+                self.assertEqual(api.call_count, 2 if apply else 1)
+                if apply:
+                    self.assertEqual(api.call_args.args, ("graphql",))
+                    self.assertEqual(api.call_args.kwargs["method"], "POST")
+                    self.assertIn(
+                        "convertPullRequestToDraft", api.call_args.kwargs["data"]["query"]
+                    )
+                    self.assertEqual(
+                        api.call_args.kwargs["data"]["variables"], {"id": "PR_node_42"}
+                    )
+
+    def test_lookup_errors_fail_without_drafting_or_requesting_reviewers(self):
+        with (
+            mock.patch.object(routing, "_api", side_effect=[
+                pr(), subprocess.CalledProcessError(1, "gh"),
+            ]) as api,
+            mock.patch.object(routing, "_load_reviewers") as load,
+            self.assertRaises(subprocess.CalledProcessError),
+        ):
+            routing.check_review_readiness(CATEGORIES, REPO, 42, apply=True)
+        self.assertEqual(api.call_count, 2)
+        load.assert_not_called()
+
+    def test_draft_conversion_errors_propagate(self):
+        with (
+            mock.patch.object(
+                routing, "_api",
+                side_effect=[pr(), subprocess.CalledProcessError(1, "gh")],
+            ),
+            mock.patch.object(routing, "_accepted_work", return_value=False),
+            self.assertRaises(subprocess.CalledProcessError),
+        ):
+            routing.check_review_readiness(CATEGORIES, REPO, 42, apply=True)
+
+
 class ReconciliationTests(unittest.TestCase):
+    def setUp(self):
+        self.accepted = mock.patch.object(routing, "_accepted_work", return_value=True)
+        self.accepted.start()
+        self.addCleanup(self.accepted.stop)
+
     def run_routing(self, categories, *, snapshots, responses, apply=True):
         with (
             mock.patch.object(routing, "_api", side_effect=responses) as api,
