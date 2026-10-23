@@ -12,6 +12,7 @@ CI/CD workflows, release pipelines, build targets, packaging, and artifact publi
 | --- | --- | --- |
 | Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
 | Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
+| Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
 
 ### area:drivers
 
@@ -22,6 +23,7 @@ Infrastructure orchestration, including compute scheduling, secret management, r
 | Evan Lezar | [@elezar](https://github.com/elezar) | NVIDIA |
 | Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
 | Mrunal Patel | [@mrunalp](https://github.com/mrunalp) | Red Hat |
+| Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
 
 ### area:runtime
 
@@ -34,6 +36,7 @@ Provider discovery and configuration, profiles, sandbox attachments, provider-co
 | Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
 | Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
 | Shiju | [@shiju-nv](https://github.com/shiju-nv) | NVIDIA |
+| Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
 
 ### area:enterprise
 
@@ -52,6 +55,7 @@ SDKs, CLIs, API machinery, gateway infrastructure, persistence (eg postgres, sql
 | --- | --- | --- |
 | Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
 | Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
+| Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
 
 ## Topics
 
@@ -91,6 +95,7 @@ FIPS, regulatory alignment, auditability, and standardization requirements.
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
 | John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
+| Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
 
 ### topic:documentation
 
@@ -109,6 +114,8 @@ Ensure OpenShell is easy to contribute to for humans and agents.
 | --- | --- | --- |
 | Evan Lezar | [@elezar](https://github.com/elezar) | NVIDIA |
 | John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
+| Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
+| Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
 
 ### topic:gpu
 
@@ -127,6 +134,9 @@ Kubernetes operator development, custom resource definitions (CRDs), deployment 
 | --- | --- | --- |
 | Mrunal Patel | [@mrunalp](https://github.com/mrunalp) | Red Hat |
 | Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
+| Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
+| Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
+| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
 
 ### topic:mcp
 
@@ -164,6 +174,7 @@ Deployment and configuration of OpenShell installations, upgrades, backup and re
 | --- | --- | --- |
 | Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
 | Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
+| Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
 
 ### topic:performance
 
@@ -173,6 +184,7 @@ Startup time, latency, throughput, resource overhead, scalability, and benchmark
 | --- | --- | --- |
 | Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
 | Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
+| Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
 
 ### topic:policy
 
@@ -192,6 +204,8 @@ High availability, failure recovery, retries, graceful degradation, fault tolera
 | --- | --- | --- |
 | Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
 | Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
+| Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
+| Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
 
 ### topic:sdk
 
@@ -211,6 +225,7 @@ Vulnerability management, static/dynamic analysis, FSR (Functional Security Requ
 | --- | --- | --- |
 | Adrien Langou | [@alangou](https://github.com/alangou) | NVIDIA |
 | John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
+| Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
 
 ### topic:testing
 
