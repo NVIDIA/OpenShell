@@ -3,10 +3,13 @@
 
 //! Shared SPIFFE helpers used by the gateway and sandbox supervisor.
 
+use std::fmt;
 use std::path::Path;
 
 use base64::Engine as _;
 use serde::Deserialize;
+
+use crate::token_grant_failure::TokenGrantFailure;
 
 /// SPIFFE JWT-SVID claims used by `OpenShell` token exchange flows.
 #[derive(Debug, Clone, Deserialize)]
@@ -139,6 +142,48 @@ impl SandboxSpiffeIdPrefix {
     }
 }
 
+/// A JWT-SVID verified for a sandbox's stable SPIFFE ID and one audience.
+#[derive(Clone)]
+pub struct SandboxJwtSvid {
+    /// The stable SPIFFE ID the token was issued and verified for.
+    pub spiffe_id: String,
+    /// The signed token. It is a credential and never printed.
+    pub token: String,
+    /// The verified `exp` claim, in Unix seconds.
+    pub expires_at: i64,
+}
+
+impl fmt::Debug for SandboxJwtSvid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SandboxJwtSvid")
+            .field("spiffe_id", &self.spiffe_id)
+            .field("token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// Source of verified sandbox JWT-SVIDs for the gateway's provider broker.
+///
+/// The gateway authorizes the sandbox session and the provider credential
+/// before each request; implementations own issuance and verification only.
+#[async_trait::async_trait]
+pub trait SandboxIdentityProvider: fmt::Debug + Send + Sync {
+    /// Obtain a JWT-SVID for `audience` whose identity is exactly the stable
+    /// SPIFFE ID of `sandbox_id` under `gateway_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized failure at the workload identity stage, or a
+    /// configuration failure when the IDs cannot form a stable SPIFFE ID.
+    async fn fetch_jwt_svid(
+        &self,
+        gateway_id: &str,
+        sandbox_id: &str,
+        audience: &str,
+    ) -> Result<SandboxJwtSvid, TokenGrantFailure>;
+}
+
 /// A non-empty SPIFFE path segment other than `.` and `..`.
 #[must_use]
 pub fn is_spiffe_path_segment(segment: &str) -> bool {
@@ -256,6 +301,18 @@ mod tests {
         for (gateway, sandbox) in [("gw/x", "a"), ("gw", "a/b"), ("gw", ".."), ("", "a")] {
             assert!(prefix.sandbox_spiffe_id(gateway, sandbox).is_err());
         }
+    }
+
+    #[test]
+    fn sandbox_jwt_svid_debug_redacts_the_token() {
+        let svid = SandboxJwtSvid {
+            spiffe_id: "spiffe://example.org/openshell/gateway/gw/sandbox/sb".into(),
+            token: "secret-token".into(),
+            expires_at: 1,
+        };
+        let printed = format!("{svid:?}");
+        assert!(!printed.contains("secret-token"));
+        assert!(printed.contains("sandbox/sb"));
     }
 
     #[test]

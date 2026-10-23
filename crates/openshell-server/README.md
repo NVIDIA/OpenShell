@@ -108,10 +108,13 @@ lifetime. The session is authorized again around each SPIRE and
 token-service call. A cache hit and a fresh token then pass the same final
 check: the grant configuration still matches and the session is still
 authorized. A fresh token is cached only after that check. Startup validates
-the delegation settings, and gateway state construction parses them once and
-returns a configuration error when they are invalid; each cache miss fetches
-a new SVID and the agent's current JWT bundle. SPIRE still trusts the gateway as a
-delegate for its agent's available registration scope.
+the delegation settings, and gateway state construction builds the
+[`openshell-spire`](../openshell-spire/README.md) adapter once and returns a
+configuration error when they are invalid. The broker depends only on
+`openshell_core::spiffe::SandboxIdentityProvider`, which returns a JWT-SVID
+verified for the requested gateway, sandbox, and audience; each cache miss
+fetches a new SVID and the agent's current JWT bundle. SPIRE still trusts the
+gateway as a delegate for its agent's available registration scope.
 
 `openshell_core::token_grant_failure` defines the time limits: SPIRE and
 Workload API calls, token-service requests, the gateway's deadline for one

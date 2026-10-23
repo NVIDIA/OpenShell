@@ -110,8 +110,9 @@ carried by the next lease renewal; expired observations mean unknown supervision
 `openshell.gateway.spiffe_delegation` overlay
 (`ci/values-supervisor-spiffe.yaml`), then registers sandbox
 identities with `ClusterStaticEntry` resources. `mise run test:spire-delegation`
-checks delegated issuance and identity selection against a local SPIRE server
-and agent without a cluster; the Kubernetes test covers the gateway broker.
+checks the `openshell-spire` adapter's delegated issuance and identity selection
+against a local SPIRE server and agent without a cluster; the Kubernetes test
+covers the gateway broker.
 
 The fixture requires admission that permits the admin socket `hostPath` and
 supplemental group; an unlabeled namespace can still inherit cluster-wide
