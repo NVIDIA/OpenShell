@@ -552,9 +552,6 @@ impl KubernetesComputeConfig {
                     "supervisor_topology=gateway requires shared_supervisor".to_string()
                 })?;
                 shared.validate()?;
-                if self.provider_spiffe_enabled() {
-                    return Err("supervisor_topology=gateway does not support provider_spiffe_workload_api_socket_path; a shared supervisor has no per-sandbox workload identity".into());
-                }
                 if self.https_proxy.is_some()
                     || self.proxy_auth_secret_name.is_some()
                     || self.proxy_ca_bundle.is_some()

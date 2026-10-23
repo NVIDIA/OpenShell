@@ -53,42 +53,6 @@ pub trait TokenGrantResolver: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<String, TokenGrantFailure>> + Send + 'a>>;
 }
 
-/// Resolves provider tokens through one sandbox instance's authenticated grant flow.
-pub struct SpiffeTokenGrantResolver {
-    grants: crate::token_grant::SandboxInstanceTokenGrants,
-}
-
-impl SpiffeTokenGrantResolver {
-    #[must_use]
-    pub fn new(grants: crate::token_grant::SandboxInstanceTokenGrants) -> Self {
-        Self { grants }
-    }
-}
-
-impl TokenGrantResolver for SpiffeTokenGrantResolver {
-    fn obtain<'a>(
-        &'a self,
-        request: TokenGrantRequest<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<String, TokenGrantFailure>> + Send + 'a>> {
-        Box::pin(async move {
-            self.grants
-                .obtain_provider_token(crate::token_grant::ObtainProviderTokenRequest {
-                    provider_name: request.provider_key,
-                    token_endpoint: request.token_endpoint,
-                    jwt_svid_audience: request.jwt_svid_audience,
-                    client_assertion_type: request.client_assertion_type,
-                    audience: request.audience,
-                    scopes: request.scopes,
-                    cache_ttl_override: request.cache_ttl,
-                    grant_type: request.grant_type,
-                    requested_token_type: request.requested_token_type,
-                    request_id: request.request_id,
-                })
-                .await
-        })
-    }
-}
-
 /// A refused request: the grant failure and the credential whose grant failed.
 ///
 /// The credential is the `provider:credential` name pair of the selected

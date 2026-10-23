@@ -302,7 +302,7 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         admitted_isolation_backend: Some("test-held".into()),
         main_exit_marker: None,
         trace_context: None,
-        provider_workload_api_socket: None,
+        provider_identity: openshell_supervisor_network::run::ProviderIdentitySource::default(),
         proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
     };
     let bindings = SandboxInstanceBindings::dedicated(

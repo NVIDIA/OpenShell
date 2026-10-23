@@ -5,6 +5,8 @@
 
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
 
+pub(super) mod access_token;
+
 use crate::compute::MutationScope;
 #[cfg(test)]
 use crate::credentials::RefreshMaterialScope;
@@ -2555,14 +2557,14 @@ use openshell_core::proto::{
     ProviderResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
 };
-use openshell_core::spiffe::{
-    SpiffeJwtClaims, parse_unverified_jwt_svid_claims, trust_domain as spiffe_trust_domain,
-    workload_api_endpoint,
-};
 use openshell_providers::{
     CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile,
     normalize_profile_id, strategy_output_env_key, strategy_output_spec, strategy_primary_env_key,
     validate_profile_set,
+};
+use openshell_spiffe::{
+    SpiffeJwtClaims, parse_unverified_jwt_svid_claims, trust_domain as spiffe_trust_domain,
+    workload_api_endpoint,
 };
 use std::sync::{Arc, LazyLock, RwLock};
 use tonic::{Request, Response};
@@ -2577,7 +2579,7 @@ use openshell_core::oauth::{
     effective_token_type,
 };
 use openshell_core::token_grant_failure::{
-    TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
+    TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage, WORKLOAD_IDENTITY_CALL_TIMEOUT,
 };
 const DEFAULT_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
 const MAX_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS: i64 = 3600;
@@ -2614,17 +2616,23 @@ impl IntermediateTokenCache {
     }
 
     fn get(&self, key: &str) -> Option<oauth::OAuthTokenResponse> {
+        self.get_until(key).map(|(token, _)| token)
+    }
+
+    /// The unexpired token with the time its entry expires, in milliseconds.
+    fn get_until(&self, key: &str) -> Option<(oauth::OAuthTokenResponse, i64)> {
         let now_ms = crate::persistence::current_time_ms();
         let tokens = self.tokens.read().ok()?;
         let cached = tokens.get(key)?;
         if cached.expires_at_ms <= now_ms {
             return None;
         }
-        Some(oauth::OAuthTokenResponse {
+        let token = oauth::OAuthTokenResponse {
             access_token: cached.access_token.clone(),
             expires_in: cached.expires_at_ms.saturating_sub(now_ms) / 1000,
             token_type: cached.token_type.clone(),
-        })
+        };
+        Some((token, cached.expires_at_ms))
     }
 
     fn set(&self, key: String, token: &oauth::OAuthTokenResponse, expires_at_ms: i64) {
@@ -4658,13 +4666,28 @@ async fn fetch_gateway_jwt_svid(audience: &str) -> Result<String, Status> {
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     let endpoint = workload_api_endpoint(std::path::Path::new(&socket_path));
-    let client = spiffe::WorkloadApiClient::connect_to(&endpoint)
-        .await
-        .map_err(|error| token_grant_workload_api_status(error, tonic::Code::FailedPrecondition))?;
-    client
-        .fetch_jwt_token([audience], None)
-        .await
-        .map_err(|error| token_grant_workload_api_status(error, tonic::Code::FailedPrecondition))
+    // A wedged Workload API socket must not hold the grant past its deadline.
+    tokio::time::timeout(WORKLOAD_IDENTITY_CALL_TIMEOUT, async {
+        let client = spiffe::WorkloadApiClient::connect_to(&endpoint)
+            .await
+            .map_err(|error| {
+                token_grant_workload_api_status(error, tonic::Code::FailedPrecondition)
+            })?;
+        client
+            .fetch_jwt_token([audience], None)
+            .await
+            .map_err(|error| {
+                token_grant_workload_api_status(error, tonic::Code::FailedPrecondition)
+            })
+    })
+    .await
+    .map_err(|_| {
+        TokenGrantFailure::new(
+            TokenGrantFailureKind::Timeout,
+            TokenGrantStage::WorkloadIdentity,
+        )
+        .to_status()
+    })?
 }
 
 fn validate_gateway_jwt_svid_claims(
@@ -5713,6 +5736,53 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn broker_failure_log_names_authenticated_sandbox() {
+            let state = test_server_state_without_provider_profiles().await;
+            let mut request = Request::new(
+                openshell_core::proto::GetSandboxProviderAccessTokenRequest {
+                    credential_key: SECRET.to_string(),
+                },
+            );
+            request
+                .extensions_mut()
+                .insert(Principal::Sandbox(SandboxPrincipal {
+                    sandbox_id: "broker-sandbox".to_string(),
+                    source: SandboxIdentitySource::BootstrapJwt {
+                        issuer: SECRET.to_string(),
+                    },
+                    trust_domain: None,
+                }));
+            request
+                .metadata_mut()
+                .insert("x-request-id", REQUEST_ID.parse().unwrap());
+
+            let output = GrantTraceBuffer::default();
+            let writer = output.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish();
+            let capture = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+            let error = access_token::handle(&state, request).await.unwrap_err();
+            drop(capture);
+
+            let failure = assert_generic(&error, Code::Unauthenticated);
+            let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                logs.contains(&format!(
+                    "dynamic token grant failed request_id={REQUEST_ID} code={} stage={}",
+                    failure.code(),
+                    failure.stage().code(),
+                )),
+                "{logs}"
+            );
+            assert!(logs.contains("sandbox_id=broker-sandbox"), "{logs}");
+            assert!(!logs.contains(SECRET), "{logs}");
+        }
+
+        #[tokio::test]
         async fn missing_expired_or_unresolvable_subject_credential_is_generic() {
             let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
             let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
@@ -5840,7 +5910,7 @@ mod tests {
             let claims = SpiffeJwtClaims {
                 iss: SECRET.to_string(),
                 sub: SECRET.to_string(),
-                aud: openshell_core::spiffe::AudienceClaim::One(SECRET.to_string()),
+                aud: openshell_spiffe::AudienceClaim::One(SECRET.to_string()),
                 exp: 0,
             };
             let gateway =
@@ -8675,17 +8745,20 @@ mod tests {
         // Model a second gateway replica: it shares the durable database and
         // credential backend, but owns an independent sandbox synchronization
         // guard, so process-local serialization cannot hide this race.
-        let second_state = Arc::new(ServerState::new_with_credentials(
-            first_state.config.clone(),
-            Arc::clone(&first_state.store),
-            crate::compute::new_test_runtime(Arc::clone(&first_state.store)).await,
-            crate::sandbox_index::SandboxIndex::new(),
-            crate::sandbox_watch::SandboxWatchBus::new(),
-            crate::tracing_bus::TracingLogBus::new(),
-            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
-            None,
-            first_state.credentials.clone(),
-        ));
+        let second_state = Arc::new(
+            ServerState::new_with_credentials(
+                first_state.config.clone(),
+                Arc::clone(&first_state.store),
+                crate::compute::new_test_runtime(Arc::clone(&first_state.store)).await,
+                crate::sandbox_index::SandboxIndex::new(),
+                crate::sandbox_watch::SandboxWatchBus::new(),
+                crate::tracing_bus::TracingLogBus::new(),
+                Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+                None,
+                first_state.credentials.clone(),
+            )
+            .unwrap(),
+        );
         let request = |client_secret: &str| ConfigureProviderRefreshRequest {
             request_id: String::new(),
             provider: "configure-create-race".to_string(),

@@ -884,6 +884,11 @@ impl ComputeRuntime {
         mut self,
         supervisor_host: Option<openshell_supervisor_control::SupervisorHostController>,
     ) -> Self {
+        if !self.store.is_single_replica()
+            && let Some(controller) = &supervisor_host
+        {
+            controller.require_leadership();
+        }
         self.supervisor_host = supervisor_host;
         self
     }
@@ -4184,6 +4189,9 @@ impl ComputeRuntime {
             match lease.acquire_or_steal().await {
                 Ok(guard) => {
                     info!(replica = %lease.replica_id(), "acquired reconciler lease");
+                    if let Some(controller) = &self.supervisor_host {
+                        controller.start_publishing(guard.deadline());
+                    }
                     self.run_as_holder(&lease, guard, &mut shutdown_rx, startup_rx.clone())
                         .await;
                 }
@@ -4193,6 +4201,29 @@ impl ComputeRuntime {
                         error = %e,
                         "reconciler lease acquisition attempt failed"
                     );
+                    if let Some(controller) = &self.supervisor_host {
+                        // Unknown on every failed/expired read. Never turn stale
+                        // readiness into a terminal absence for a running sandbox.
+                        let observations = match tokio::time::timeout(
+                            LEASE_ACQUIRE_INTERVAL,
+                            lease.read(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(Some(record))) => {
+                                let remaining =
+                                    lease::remaining_ttl(record.updated_at_ms, LEASE_TTL);
+                                record
+                                    .supervisor_observations
+                                    .filter(|_| !remaining.is_zero())
+                                    .map(|observations| {
+                                        (tokio::time::Instant::now() + remaining, observations)
+                                    })
+                            }
+                            _ => None,
+                        };
+                        controller.mirror_observations(observations);
+                    }
                     tokio::select! {
                         () = tokio::time::sleep(LEASE_ACQUIRE_INTERVAL) => {}
                         _ = shutdown_rx.changed() => {
@@ -4250,17 +4281,36 @@ impl ComputeRuntime {
 
         loop {
             tokio::select! {
+                () = tokio::time::sleep_until(guard.deadline()) => {
+                    warn!("reconciler lease expired locally — releasing holder role");
+                    break;
+                }
                 () = tokio::time::sleep(LEASE_RENEWAL_INTERVAL) => {
-                    match lease.renew(&mut guard).await {
-                        Ok(()) => {
+                    let previous_deadline = guard.deadline();
+                    let renewed = tokio::time::timeout_at(previous_deadline, async {
+                        if let Some(controller) = &self.supervisor_host {
+                            lease.renew_with_observations(&mut guard, controller.shared_observations()).await
+                        } else {
+                            lease.renew(&mut guard).await
+                        }
+                    }).await;
+                    match renewed {
+                        Ok(Ok(())) => {
+                            if tokio::time::Instant::now() >= previous_deadline {
+                                warn!("reconciler renewal completed after local expiry — releasing holder role");
+                                break;
+                            }
+                            if let Some(controller) = &self.supervisor_host {
+                                controller.renew_publishing(guard.deadline());
+                            }
                             debug!(replica = %lease.replica_id(), "renewed reconciler lease");
                         }
-                        Err(e) => {
-                            warn!(
-                                replica = %lease.replica_id(),
-                                error = %e,
-                                "reconciler lease renewal failed — releasing holder role"
-                            );
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "reconciler lease renewal failed — releasing holder role");
+                            break;
+                        }
+                        Err(_) => {
+                            warn!("reconciler lease renewal timed out — releasing holder role");
                             break;
                         }
                     }
@@ -4268,6 +4318,9 @@ impl ComputeRuntime {
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         info!(replica = %lease.replica_id(), "shutdown — releasing reconciler lease");
+                        if let Some(controller) = &self.supervisor_host {
+                            controller.stop_publishing();
+                        }
                         if let Err(e) = lease.release(guard).await {
                             warn!(error = %e, "failed to release reconciler lease on shutdown");
                         }
@@ -4282,6 +4335,9 @@ impl ComputeRuntime {
             }
         }
 
+        if let Some(controller) = &self.supervisor_host {
+            controller.stop_publishing();
+        }
         let _ = cancel_tx.send(true);
         let _ = watch_handle.await;
         let _ = reconcile_handle.await;
@@ -8995,6 +9051,61 @@ mod tests {
             supervisor_ocsf_headers: Arc::new(OnceLock::new()),
             supervisor_host: None,
         }
+    }
+
+    #[tokio::test]
+    async fn shared_supervisor_follows_reconciler_leadership_between_replicas() {
+        use openshell_supervisor_control::SupervisorHostController;
+        let first_driver = ControlledDriver::new();
+        let second_driver = ControlledDriver::new();
+        let mut first = test_runtime(first_driver.clone()).await;
+        let mut second = test_runtime(second_driver.clone()).await;
+        first.replica_id = "first".to_string();
+        second.replica_id = "second".to_string();
+        second.store = first.store.clone();
+        let first_controller = SupervisorHostController::new();
+        let second_controller = SupervisorHostController::new();
+        first_controller.require_leadership();
+        second_controller.require_leadership();
+        first.supervisor_host = Some(first_controller.clone());
+        second.supervisor_host = Some(second_controller.clone());
+        let (first_stop, first_shutdown) = watch::channel(false);
+        let (second_stop, second_shutdown) = watch::channel(false);
+        let (_startup, started) = watch::channel(true);
+        let first_task =
+            tokio::spawn(Arc::new(first).lease_coordinator(first_shutdown, started.clone()));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            first_driver.watch_started.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(first_controller.is_publisher());
+        let second_task =
+            tokio::spawn(Arc::new(second).lease_coordinator(second_shutdown, started));
+        assert!(!second_controller.is_publisher());
+        first_stop.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), first_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!first_controller.is_publisher());
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            second_driver.watch_started.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(second_controller.is_publisher());
+        // Every new term requires durable recovery, including an explicit
+        // empty result. An uninitialized controller must not stop workloads.
+        assert!(!second_controller.is_initialized());
+        second_stop.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), second_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!second_controller.is_publisher());
     }
 
     #[tokio::test]

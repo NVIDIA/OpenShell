@@ -282,7 +282,7 @@ tests:
           supervisor_topology: gateway
     asserts:
       - failedTemplate:
-          errorMessage: supervisor_topology=gateway does not support upstream proxy settings or provider SPIFFE identity
+          errorMessage: supervisor_topology=gateway does not support upstream proxy settings
   - it: rejects workspace until implemented
     template: templates/supervisor.yaml
     set:
