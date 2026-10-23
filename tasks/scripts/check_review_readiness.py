@@ -7,11 +7,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Reconcile PR reviewers from the merged REVIEWERS.md and current PR metadata.
+"""Validate accepted work and reconcile reviewers from the merged REVIEWERS.md.
 
-Preview with --repo OWNER/REPO --pr NUMBER; add --apply to update requests.
-For newly opened PRs, --label-accepted-work also adds state:accepted if qualified.
-Request all matching roster members, excluding the author. Preserve
+Preview with --repo OWNER/REPO --pr NUMBER; add --apply to update the PR.
+Unaccepted work is moved to draft before any reviewer requests are changed.
+Request all matching members with write access, excluding the author. Preserve
 manual choices, unknown request provenance, and anyone who commented or reviewed.
 The parser and planning helpers are importable. No state is stored between runs.
 """
@@ -200,6 +200,94 @@ def _load_reviewers(repository: str, number: int, pr: dict) -> dict[str, set[str
     }
 
 
+def _eligible_reviewers(repository: str, logins: set[str]) -> set[str]:
+    eligible = set()
+    for login in sorted(logins):
+        value = _api(f"repos/{repository}/collaborators/{login}/permission")
+        if value.get("permission") in {"write", "maintain", "admin"}:
+            eligible.add(login)
+    return eligible
+
+
+def _accepted_work(repository: str, number: int, pr: dict) -> bool:
+    """Accept write access or a reference to an accepted issue filed by the author."""
+    author = pr["user"]["login"].lower()
+    escaped = re.escape(repository)
+    references = (
+        rf"https://github\.com/{escaped}/issues/(\d+)\b"
+        rf"|(?<![\w/])(?:{escaped})?#(\d+)\b"
+    )
+    referenced = {
+        int(url_number or short_number)
+        for url_number, short_number in re.findall(references, pr.get("body") or "", re.I)
+    }
+
+    owner, repo = repository.split("/")
+    cursors = dict.fromkeys(("acceptedCursor", "linkedCursor", "collaboratorCursor"))
+    accepted = set()
+    while True:
+        result = _api(
+            "graphql",
+            method="POST",
+            data={
+                "query": """
+                query($owner: String!, $repo: String!, $number: Int!, $author: String!,
+                      $acceptedCursor: String, $linkedCursor: String, $collaboratorCursor: String) {
+                  repository(owner: $owner, name: $repo) {
+                    collaborators(first: 100, query: $author, after: $collaboratorCursor) {
+                      edges { permission node { login } }
+                      pageInfo { hasNextPage endCursor }
+                    }
+                    issues(first: 100, after: $acceptedCursor, states: [OPEN, CLOSED],
+                           labels: ["state:accepted"], filterBy: {createdBy: $author}) {
+                      nodes { number }
+                      pageInfo { hasNextPage endCursor }
+                    }
+                    pullRequest(number: $number) {
+                      closingIssuesReferences(first: 100, after: $linkedCursor) {
+                        nodes { number repository { nameWithOwner } }
+                        pageInfo { hasNextPage endCursor }
+                      }
+                    }
+                  }
+                }
+                """,
+                "variables": {
+                    "owner": owner,
+                    "repo": repo,
+                    "number": number,
+                    "author": author,
+                    **cursors,
+                },
+            },
+        )
+        data = result["data"]["repository"]
+        if any(
+            edge["node"]["login"].lower() == author
+            and edge["permission"] in {"WRITE", "MAINTAIN", "ADMIN"}
+            for edge in data["collaborators"]["edges"]
+        ):
+            return True
+        linked = data["pullRequest"]["closingIssuesReferences"]
+        referenced.update(
+            issue["number"]
+            for issue in linked["nodes"]
+            if issue["repository"]["nameWithOwner"].lower() == repository.lower()
+        )
+        accepted.update(issue["number"] for issue in data["issues"]["nodes"])
+        if referenced & accepted:
+            return True
+        pages = {
+            "acceptedCursor": data["issues"],
+            "linkedCursor": linked,
+            "collaboratorCursor": data["collaborators"],
+        }
+        if not any(page["pageInfo"]["hasNextPage"] for page in pages.values()):
+            return False
+        for key, page in pages.items():
+            cursors[key] = page["pageInfo"]["endCursor"] or cursors[key]
+
+
 def _routing_key(pr: dict):
     return (
         pr["state"],
@@ -221,42 +309,34 @@ def check_review_readiness(
     label_accepted_work=False,
     maintainers: set[str] | None = None,
 ) -> ReviewPlan | None:
-    """Plan labeling and routing; callers serialize runs for the same PR.
-
-    Enable label_accepted_work for newly opened PRs, including drafts. Acceptance
-    is independent of readiness and classification; only reviewer routing needs
-    a ready PR with an area label. Labeling never removes an existing label.
-    """
+    """Validate acceptance, then route. Callers must serialize runs for the same PR."""
     pull = f"repos/{repository}/pulls/{number}"
     pr = _api(pull)
     if pr["state"] != "open":
         return None
-    accepted = None
-    add_labels = ()
-    labels = {label["name"] for label in pr["labels"]}
-    if label_accepted_work:
-        accepted = check_pr_accepted_work(
-            repository, pr, maintainers or set(), api=_api
+    if not _accepted_work(repository, number, pr):
+        if apply:
+            _api(
+                "graphql",
+                method="POST",
+                data={
+                    "query": """
+                    mutation($id: ID!) {
+                      convertPullRequestToDraft(input: {pullRequestId: $id}) {
+                        pullRequest { isDraft }
+                      }
+                    }
+                    """,
+                    "variables": {"id": pr["node_id"]},
+                },
+            )
+        raise ValueError(
+            "PR is not accepted work: the author needs repository write access "
+            "or a referenced state:accepted issue they submitted themselves"
         )
-        if accepted and ACCEPTED_LABEL not in labels:
-            add_labels = (ACCEPTED_LABEL,)
-            if apply:
-                _api(
-                    f"repos/{repository}/issues/{number}/labels",
-                    method="POST",
-                    data={"labels": list(add_labels)},
-                )
-    if pr["draft"] or not any(label.startswith("area:") for label in labels):
-        if pr["draft"] and not label_accepted_work:
-            return None
-        return ReviewPlan((), (), accepted, add_labels)
-    selected = select_reviewers(categories, labels)
-    selected -= {pr["user"]["login"].lower()}
-    plan = replace(
-        plan_review_requests(selected, **_load_reviewers(repository, number, pr)),
-        accepted_work=accepted,
-        add_labels=add_labels,
-    )
+    selected = select_reviewers(categories, {label["name"] for label in pr["labels"]})
+    selected = _eligible_reviewers(repository, selected - {pr["user"]["login"].lower()})
+    plan = plan_review_requests(selected, **_load_reviewers(repository, number, pr))
     if apply:
         endpoint = f"{pull}/requested_reviewers"
         if plan.add:
@@ -287,7 +367,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", required=True, help="target OWNER/REPO")
     parser.add_argument("--pr", required=True, type=int, help="pull request number")
     parser.add_argument(
-        "--apply", action="store_true", help="apply requests; otherwise preview JSON"
+        "--apply", action="store_true", help="update requests or draft unaccepted work"
     )
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo) or args.pr <= 0:
