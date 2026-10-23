@@ -196,7 +196,7 @@ async fn auth_connect(
     let cf_token = headers
         .get("cookie")
         .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| extract_cookie(cookies, "CF_Authorization"));
+        .and_then(|cookies| extract_cookie(cookies, super::edge::EDGE_TOKEN_COOKIE));
 
     // Prefer the Host header (set by Cloudflare Tunnel / reverse proxies)
     // so the page shows the external URL the user actually connected through
@@ -236,7 +236,7 @@ async fn auth_connect(
 }
 
 /// Extract a named cookie value from a `Cookie` header string.
-fn extract_cookie(cookies: &str, name: &str) -> Option<String> {
+pub(super) fn extract_cookie(cookies: &str, name: &str) -> Option<String> {
     cookies.split(';').find_map(|c| {
         let mut parts = c.trim().splitn(2, '=');
         let key = parts.next()?.trim();

@@ -644,6 +644,13 @@ fn prepare_server_config_with_drivers(
         });
     }
 
+    if let Some(edge_auth) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.edge_auth.clone())
+    {
+        config = config.with_edge_auth(edge_auth);
+    }
+
     // `gateway_jwt` is configured through TOML in cluster deployments. Local
     // package-managed starts also auto-detect the JWT bundle written next to
     // the generated TLS bundle so upgrades pick up sandbox auth without a
@@ -719,6 +726,7 @@ async fn run_from_args(
         .and_then(|tls| tls.client_ca_path.as_ref())
         .is_some();
     let has_oidc = prepared.config.oidc.is_some();
+    let has_edge_auth = prepared.config.edge_auth.is_some();
 
     if prepared.config.tls.is_none() {
         warn!("TLS disabled — listening on plaintext HTTP");
@@ -739,6 +747,19 @@ async fn run_from_args(
     }
     if has_oidc {
         info!("OIDC authentication enabled");
+    }
+    if has_edge_auth {
+        info!("Edge JWT authentication enabled");
+    }
+    if prepared
+        .config
+        .edge_auth
+        .as_ref()
+        .is_some_and(|edge| edge.admin_role.is_empty())
+    {
+        warn!(
+            "edge_auth has no admin_role or user_role: every caller the proxy admits is a platform admin and workspace membership is not enforced"
+        );
     }
     if let Some(err) = otlp_error.as_ref().or(driver_otlp_error.as_ref()) {
         error!(
@@ -762,10 +783,11 @@ async fn run_from_args(
         && !prepared.config.mtls_auth.enabled
         && !prepared.config.mtls_auth.operator_enabled
         && !has_oidc
+        && !has_edge_auth
         && prepared.config.gateway_jwt.is_none()
     {
         warn!(
-            "Neither mTLS user auth nor OIDC nor sandbox JWT auth is configured — \
+            "Neither mTLS user auth nor OIDC nor edge JWT nor sandbox JWT auth is configured; \
              the gateway has no authentication mechanism"
         );
     }
@@ -3761,6 +3783,44 @@ mem_mib = "not-a-number"
                     .contains("image_preparation_timeout_seconds must be between 1 and 86400")
             );
         }
+            });
+    }
+
+    #[test]
+    fn server_config_loads_edge_auth_from_file() {
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .run(|| {
+                let state = std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                std::fs::write(
+                    &config_path,
+                    r#"
+[openshell]
+version = 2
+[openshell.gateway.edge_auth]
+provider = "cloudflare_access"
+issuer = "https://team.cloudflareaccess.com"
+audience = "aud-tag"
+"#,
+                )
+                .unwrap();
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--config",
+                    config_path.to_str().unwrap(),
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--compute-driver",
+                    "docker",
+                    "--disable-tls",
+                ]);
+                let prepared = super::prepare_server_config(&mut args, &matches).unwrap();
+                let edge = prepared.config.edge_auth.expect("edge_auth is set");
+                assert_eq!(edge.audience, "aud-tag");
             });
     }
 

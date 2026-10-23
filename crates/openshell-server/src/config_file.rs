@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use openshell_core::proto::SupervisorMiddlewareService;
 use openshell_core::{
-    GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
+    EdgeAuthConfig, GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
     GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig,
 };
 use serde::{Deserialize, Serialize};
@@ -178,6 +178,8 @@ pub struct GatewayFileSection {
     pub tls: Option<GatewayTlsFileConfig>,
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
+    #[serde(default)]
+    pub edge_auth: Option<EdgeAuthConfig>,
     #[serde(default)]
     pub auth: Option<GatewayAuthConfig>,
     #[serde(default)]
@@ -1092,6 +1094,50 @@ compute_driver = 42
 
         let serialized = toml::to_string(&file).expect("config serializes");
         assert!(serialized.contains("compute_driver = \"docker\""));
+    }
+
+    #[test]
+    fn parses_edge_auth_table() {
+        let toml = r#"
+[openshell]
+version = 2
+
+[openshell.gateway.edge_auth]
+provider = "cloudflare_access"
+issuer = "https://example-team.cloudflareaccess.com"
+audience = "aud-tag"
+roles_claim = "custom.groups"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("edge_auth parses");
+        let edge = file
+            .openshell
+            .gateway
+            .edge_auth
+            .as_ref()
+            .expect("edge_auth table");
+        assert_eq!(
+            edge.provider,
+            openshell_core::EdgeAuthProvider::CloudflareAccess
+        );
+        assert_eq!(edge.jwks_ttl_secs, 3600);
+        assert_eq!(edge.roles_claim, "custom.groups");
+        assert!(edge.admin_role.is_empty() && edge.user_role.is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_edge_auth_provider() {
+        let toml = r#"
+[openshell]
+version = 2
+
+[openshell.gateway.edge_auth]
+provider = "other"
+issuer = "https://example.com"
+audience = "aud"
+"#;
+        let tmp = write_tmp(toml);
+        assert!(load(tmp.path()).is_err());
     }
 
     #[test]
