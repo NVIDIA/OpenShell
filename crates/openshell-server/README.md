@@ -111,7 +111,8 @@ authorized. A fresh token is cached only after that check. Startup validates
 the delegation settings, and gateway state construction builds the
 [`openshell-spire`](../openshell-spire/README.md) adapter once and returns a
 configuration error when they are invalid. The broker depends only on
-`openshell_core::spiffe::SandboxIdentityProvider`, which returns a JWT-SVID
+[`openshell-spiffe`](../openshell-spiffe/README.md)'s `SandboxIdentityProvider`
+with `TokenGrantFailure` as its error, which returns a JWT-SVID
 verified for the requested gateway, sandbox, and audience; each cache miss
 fetches a new SVID and the agent's current JWT bundle. SPIRE still trusts the
 gateway as a delegate for its agent's available registration scope.

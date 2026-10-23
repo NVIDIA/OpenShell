@@ -43,6 +43,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-gateway/` | Gateway binary composition | Links selected first-party compute drivers into the backend-agnostic server registry |
 | `crates/openshell-sdk/` | Shared client SDK | Async Rust gateway client (gRPC transport, TLS, OIDC refresh, edge tunnel); consumed by CLI, TUI, and `@openshell/sdk` |
 | `crates/openshell-providers/` | Provider management | Credential provider backends |
+| `crates/openshell-spiffe/` | SPIFFE identity types | Dependency-light SPIFFE ID mapping, claim parsing, and the sandbox identity provider interface |
 | `crates/openshell-spire/` | SPIRE adapter | Gateway-owned SPIRE Delegated Identity client that issues and verifies stable sandbox JWT-SVIDs |
 | `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
 | `crates/openshell-driver-kubernetes-secrets/` | Kubernetes Secrets credential driver | In-process `CredentialDriver` backend for OpenShell-managed K8s Secret storage |
