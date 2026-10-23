@@ -8,7 +8,8 @@
 //! broker stages that connection to the supervisor, the network proxy hands
 //! the stream to [`receiver::OtlpConnectionServer`], and the accepted batch
 //! is enriched with the sandbox id, buffered, and forwarded over OTLP/gRPC to
-//! the collector the supervisor already uses for its own spans.
+//! the collector the gateway names in `OPENSHELL_OTLP_AGENT_ENDPOINT`. The
+//! gateway sets it only when `[openshell.gateway.otlp.agent]` is enabled.
 
 pub mod buffer;
 pub mod enrichment;
@@ -94,10 +95,14 @@ pub struct RelayCounters {
     exported: AtomicU64,
     rejected: AtomicU64,
     export_failures: AtomicU64,
+    /// Metrics and logs exports acknowledged and dropped, since the relay
+    /// forwards traces only.
+    discarded_signals: AtomicU64,
     /// Whether the most recent export attempt failed. Cleared by the next
     /// success; flushes skip waiting while it is set.
     last_export_failed: AtomicBool,
     first_rejection_logged: AtomicBool,
+    first_discard_logged: AtomicBool,
     first_failure_logged: AtomicBool,
     final_summary_logged: AtomicBool,
 }
@@ -118,6 +123,24 @@ impl RelayCounters {
                 "OTLP relay rejected an agent export: buffer full"
             );
         }
+    }
+
+    /// Records one metrics or logs export that was acknowledged and dropped.
+    /// Logs the first occurrence only, since an agent SDK sends one per
+    /// export interval for as long as it runs.
+    pub fn record_discarded_signal(&self, signal: &'static str) {
+        self.discarded_signals.fetch_add(1, Ordering::Relaxed);
+        if !self.first_discard_logged.swap(true, Ordering::Relaxed) {
+            info!(
+                signal,
+                "OTLP relay discarded an agent export: the relay forwards traces only"
+            );
+        }
+    }
+
+    /// Metrics and logs exports discarded so far.
+    pub fn discarded_signals(&self) -> u64 {
+        self.discarded_signals.load(Ordering::Relaxed)
     }
 
     /// Records one export attempt that failed or timed out. Warns on the
@@ -169,7 +192,13 @@ impl RelayCounters {
             rejected,
             export_failures,
         } = self.snapshot();
-        info!(exported, rejected, export_failures, "OTLP relay summary");
+        info!(
+            exported,
+            rejected,
+            export_failures,
+            discarded_signals = self.discarded_signals(),
+            "OTLP relay summary"
+        );
     }
 
     /// Logs the final summary once, and only when something was rejected or
@@ -192,7 +221,7 @@ impl RelayCounters {
 /// Input to [`start`].
 #[derive(Debug, Clone)]
 pub struct OtlpRelayConfig {
-    /// OTLP/gRPC collector URI (`OPENSHELL_OTLP_ENDPOINT`).
+    /// OTLP/gRPC collector URI (`OPENSHELL_OTLP_AGENT_ENDPOINT`).
     pub endpoint: String,
     /// Sandbox identifier attached to every forwarded resource.
     pub sandbox_id: String,
@@ -334,7 +363,7 @@ pub fn activate(
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
                 .state(StateId::Disabled, "disabled")
-                .message("OTLP agent trace relay inactive: no collector endpoint configured")
+                .message("OTLP agent trace relay inactive: not enabled by the gateway")
                 .build()
         );
         return (None, None);

@@ -795,7 +795,7 @@ pub struct SandboxInstanceConfig {
     pub proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles,
     /// OTLP/gRPC collector for relayed agent traces; `None` keeps the relay
     /// inactive.
-    pub otlp_endpoint: Option<String>,
+    pub agent_otlp_endpoint: Option<String>,
 }
 
 impl SandboxInstanceConfig {
@@ -944,7 +944,7 @@ pub async fn run_sandbox_instance(
         trace_context,
         provider_workload_api_socket,
         proxy_tls,
-        otlp_endpoint,
+        agent_otlp_endpoint,
     } = config;
     // The owner binds the event context and log sink to the instance's
     // threads; the instance itself uses the rest.
@@ -1164,7 +1164,7 @@ pub async fn run_sandbox_instance(
     // before attach so the agent spec can tell the boundary whether to point
     // workload SDKs at it.
     let (mut otlp_relay, otlp_reserved_destination) =
-        otlp_relay::activate(otlp_endpoint, sandbox_id.clone());
+        otlp_relay::activate(agent_otlp_endpoint, sandbox_id.clone());
 
     // Construct the selected client only after shared policy and credential
     // setup has completed. Keep live credentials and later CA publication in
@@ -4398,7 +4398,7 @@ mod tests {
             trace_context: None,
             provider_workload_api_socket: None,
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
-            otlp_endpoint: None,
+            agent_otlp_endpoint: None,
         };
         let bindings = SandboxInstanceBindings::dedicated(
             &config,

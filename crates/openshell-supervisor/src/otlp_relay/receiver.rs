@@ -181,6 +181,22 @@ impl OtlpConnectionServer {
         &self,
         request: Request<Incoming>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
+        // The relay forwards traces only. Agents whose SDK also exports
+        // metrics or logs to the generic endpoint get an OTLP success, so they
+        // do not retry forever, and the body is drained without being kept.
+        if request.method() == Method::POST
+            && let Some(signal) = discarded_signal(request.uri().path())
+        {
+            // A body that is not delivered in time is abandoned; hyper closes
+            // the connection because the request was not consumed.
+            let _ = tokio::time::timeout(BODY_READ_TIMEOUT, drain_body(request.into_body())).await;
+            self.counters.record_discarded_signal(signal);
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/x-protobuf")
+                .body(Full::new(Bytes::new()))
+                .expect("static response builds"));
+        }
         if request.method() != Method::POST || request.uri().path() != "/v1/traces" {
             return Ok(rejected(
                 StatusCode::NOT_FOUND,
@@ -340,6 +356,30 @@ enum BodyRead {
     Complete(Bytes),
     TooLarge,
     Failed(hyper::Error),
+}
+
+/// The OTLP signal a path exports when the relay accepts and discards it.
+fn discarded_signal(path: &str) -> Option<&'static str> {
+    match path {
+        "/v1/metrics" => Some("metrics"),
+        "/v1/logs" => Some("logs"),
+        _ => None,
+    }
+}
+
+/// Reads and drops a discarded export body, up to [`OVERSIZE_DRAIN_CAP`], so
+/// the response is delivered on a connection the client has finished writing
+/// to. Nothing is buffered.
+async fn drain_body(mut body: Incoming) {
+    let mut total = 0usize;
+    while let Some(Ok(frame)) = body.frame().await {
+        if let Some(data) = frame.data_ref() {
+            total += data.len();
+            if total > OVERSIZE_DRAIN_CAP {
+                break;
+            }
+        }
+    }
 }
 
 /// Reads the body up to [`MAX_BODY_BYTES`]. Once the limit is crossed, or
@@ -653,10 +693,38 @@ mod tests {
     async fn other_paths_and_methods_are_not_found() {
         let (server, _handle, _rx) = start(BUFFER_CAPACITY);
         let mut client = connect(&server);
-        let head = send(&mut client, &request("POST", "/v1/metrics", PROTOBUF, b"")).await;
+        let head = send(&mut client, &request("POST", "/v1/profiles", PROTOBUF, b"")).await;
         assert_eq!(head.status, 404);
         let head = send(&mut client, &request("GET", "/v1/traces", PROTOBUF, b"")).await;
         assert_eq!(head.status, 404);
+        let head = send(&mut client, &request("GET", "/v1/metrics", PROTOBUF, b"")).await;
+        assert_eq!(head.status, 404);
+    }
+
+    #[tokio::test]
+    async fn metrics_and_logs_are_acknowledged_and_discarded() {
+        let (server, _handle, mut rx) = start(BUFFER_CAPACITY);
+        let mut client = connect(&server);
+        for path in ["/v1/metrics", "/v1/logs"] {
+            let head = send(&mut client, &request("POST", path, PROTOBUF, &[1, 2, 3])).await;
+            assert_eq!(head.status, 200, "{path}");
+            assert_eq!(head.header("content-type"), Some(PROTOBUF));
+        }
+        // The same connection still serves a trace export afterwards, so the
+        // discarded bodies were consumed.
+        let head = send(
+            &mut client,
+            &request("POST", "/v1/traces", PROTOBUF, &body()),
+        )
+        .await;
+        assert_eq!(head.status, 200);
+        assert!(rx.recv().await.is_some(), "the trace batch is buffered");
+        assert_eq!(
+            server.counters.accepted.load(Ordering::Relaxed),
+            1,
+            "metrics and logs are not buffered"
+        );
+        assert_eq!(server.counters.discarded_signals(), 2);
     }
 
     #[tokio::test]

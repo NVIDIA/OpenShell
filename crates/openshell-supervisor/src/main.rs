@@ -133,6 +133,11 @@ struct Args {
     #[arg(long, env = openshell_core::sandbox_env::OTLP_OCSF_SCHEMA_VERSION)]
     otlp_ocsf_schema_version: Option<openshell_ocsf::OcsfSchemaVersion>,
 
+    /// OTLP/gRPC collector endpoint that workload traces are relayed to.
+    /// Absent keeps the relay inactive.
+    #[arg(long, env = openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT)]
+    otlp_agent_endpoint: Option<String>,
+
     /// Name of the gateway that launched this sandbox, for telemetry.
     #[arg(long, env = openshell_core::sandbox_env::GATEWAY_NAME)]
     gateway_name: Option<String>,
@@ -596,7 +601,7 @@ fn main() -> Result<()> {
                     .filter(|path| !path.is_empty())
                     .map(PathBuf::from),
                     proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
-                    otlp_endpoint: args.otlp_endpoint.clone(),
+                    agent_otlp_endpoint: args.otlp_agent_endpoint.clone(),
                 };
                 // Log push already shares these credentials and the logging
                 // layers these OCSF JSON settings.
@@ -903,6 +908,31 @@ mod tests {
             Args::try_parse_from(["openshell-supervisor", "--otlp-ocsf-schema-version", "1.8"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn agent_relay_endpoint_is_separate_from_trace_export() {
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--otlp-endpoint",
+            "http://traces:4317",
+        ])
+        .expect("parse trace export");
+        assert_eq!(
+            args.otlp_agent_endpoint, None,
+            "trace export alone leaves the relay inactive"
+        );
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--otlp-agent-endpoint",
+            "http://agents:4317",
+        ])
+        .expect("parse agent relay");
+        assert_eq!(
+            args.otlp_agent_endpoint.as_deref(),
+            Some("http://agents:4317")
+        );
+        assert_eq!(args.otlp_endpoint, None);
     }
 
     #[tokio::test]

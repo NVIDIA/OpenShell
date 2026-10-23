@@ -619,6 +619,11 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   if [ -n "${OPENSHELL_E2E_OTLP_ENDPOINT:-}" ]; then
     printf '[openshell.gateway.otlp]\n'
     printf 'endpoint = %s\n\n' "$(toml_string "${OPENSHELL_E2E_OTLP_ENDPOINT}")"
+    # The agent trace relay is opt-in; OPENSHELL_E2E_OTLP_AGENT=0 runs the
+    # relay's inert case with trace export still on.
+    if [ "${OPENSHELL_E2E_OTLP_AGENT:-1}" != "0" ]; then
+      printf '[openshell.gateway.otlp.agent]\nenabled = true\n\n'
+    fi
   fi
   printf '[openshell.drivers.docker]\n'
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then

@@ -32,6 +32,12 @@ pub const OTLP_ENDPOINT: &str = "OPENSHELL_OTLP_ENDPOINT";
 /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
 pub const OTLP_OCSF_ENDPOINT: &str = "OPENSHELL_OTLP_OCSF_ENDPOINT";
 
+/// OTLP/gRPC collector endpoint that supervisors relay workload traces to.
+///
+/// Set only when the gateway enables `[openshell.gateway.otlp.agent]`; absent
+/// keeps the relay inactive and leaves the workload environment unchanged.
+pub const OTLP_AGENT_ENDPOINT: &str = "OPENSHELL_OTLP_AGENT_ENDPOINT";
+
 /// OCSF schema version that supervisors downgrade exported events to.
 pub const OTLP_OCSF_SCHEMA_VERSION: &str = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION";
 

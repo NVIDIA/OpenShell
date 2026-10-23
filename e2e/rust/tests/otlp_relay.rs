@@ -4,10 +4,11 @@
 //! Supervisor-direct OTLP trace relay.
 //!
 //! The gateway wrapper writes `[openshell.gateway.otlp].endpoint` from
-//! `OPENSHELL_E2E_OTLP_ENDPOINT`. These tests bind a collector stub on that
-//! endpoint's port and prove that a span exported from inside a sandbox
+//! `OPENSHELL_E2E_OTLP_ENDPOINT` and enables `[openshell.gateway.otlp.agent]`
+//! unless `OPENSHELL_E2E_OTLP_AGENT=0`. These tests bind a collector stub on
+//! that endpoint's port and prove that a span exported from inside a sandbox
 //! arrives with the supervisor's attribution. With the variable unset or
-//! empty, the inert case runs instead.
+//! empty, or with the relay disabled, the inert case runs instead.
 
 #![cfg(feature = "e2e-local-container-driver")]
 
@@ -70,10 +71,13 @@ except Exception as error:
     print("ERROR", type(error).__name__)
 "#;
 
+/// The collector the relay forwards to, when the harness enabled both OTLP
+/// export and the agent trace relay.
 fn collector_endpoint() -> Option<String> {
+    let relay_enabled = std::env::var("OPENSHELL_E2E_OTLP_AGENT").as_deref() != Ok("0");
     std::env::var("OPENSHELL_E2E_OTLP_ENDPOINT")
         .ok()
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty() && relay_enabled)
 }
 
 fn collector_bind_addr(endpoint: &str) -> SocketAddr {
@@ -312,7 +316,7 @@ async fn agent_span_reaches_collector_with_attribution() {
 #[serial]
 async fn relay_is_inert_without_collector() {
     if collector_endpoint().is_some() {
-        eprintln!("OPENSHELL_E2E_OTLP_ENDPOINT is set; skipping the inert case");
+        eprintln!("the agent trace relay is enabled; skipping the inert case");
         return;
     }
 

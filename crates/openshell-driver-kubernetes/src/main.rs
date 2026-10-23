@@ -57,6 +57,11 @@ struct Args {
     )]
     otlp_ocsf_schema_version: Option<String>,
 
+    /// OTLP/gRPC collector endpoint that supervisors relay workload traces
+    /// to. Absent keeps the agent trace relay off.
+    #[arg(long, env = "OPENSHELL_OTLP_AGENT_ENDPOINT")]
+    otlp_agent_endpoint: Option<String>,
+
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
 
@@ -298,6 +303,7 @@ async fn main() -> Result<()> {
             proxy_ca_bundle: args.proxy_ca_bundle,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
             supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
+            supervisor_otlp_agent_endpoint: args.otlp_agent_endpoint.clone(),
             supervisor_gateway_name: args.gateway_name.clone(),
             supervisor_ocsf_export: args.otlp_ocsf_endpoint.clone().map(|endpoint| {
                 openshell_core::sandbox_env::OcsfOtlpExport {

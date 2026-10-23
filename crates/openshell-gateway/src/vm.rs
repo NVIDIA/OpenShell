@@ -681,9 +681,13 @@ fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>, gat
                 .arg(version.as_str());
         }
     }
+    let agent_endpoint = otlp_config.and_then(OtlpConfig::agent_endpoint);
+    if let Some(endpoint) = agent_endpoint {
+        command.arg("--otlp-agent-endpoint").arg(endpoint);
+    }
     // The driver names its own spans with the gateway name, and supervisors
-    // name their spans and OCSF records with it.
-    if traces_endpoint.is_some() || ocsf.is_some() {
+    // name their spans, OCSF records, and relayed traces with it.
+    if traces_endpoint.is_some() || ocsf.is_some() || agent_endpoint.is_some() {
         command.arg("--gateway-name").arg(gateway_name);
     }
 }
@@ -837,6 +841,7 @@ mod tests {
                     endpoint: "http://collector.internal:4317".to_string(),
                 }),
                 ocsf: None,
+                agent: None,
             }),
             "production-us-west",
         );
@@ -869,6 +874,7 @@ mod tests {
                     endpoint: "http://siem.internal:4317".to_string(),
                     schema_version: Some(OcsfSchemaVersion::V1_3),
                 }),
+                agent: None,
             }),
             "production-us-west",
         );
@@ -885,6 +891,38 @@ mod tests {
                 "http://siem.internal:4317",
                 "--otlp-ocsf-schema-version",
                 "1.3",
+                "--gateway-name",
+                "production-us-west"
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_driver_command_includes_the_agent_trace_relay() {
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_otlp_args(
+            &mut command,
+            Some(&OtlpConfig {
+                service_name: None,
+                traces: None,
+                ocsf: None,
+                agent: Some(openshell_server::config_file::AgentOtlpConfig {
+                    endpoint: "http://agents.internal:4317".to_string(),
+                }),
+            }),
+            "production-us-west",
+        );
+
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--otlp-agent-endpoint",
+                "http://agents.internal:4317",
                 "--gateway-name",
                 "production-us-west"
             ]

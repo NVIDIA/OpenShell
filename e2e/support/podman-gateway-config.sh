@@ -89,6 +89,11 @@ e2e_write_podman_gateway_config() {
     if [ -n "${OPENSHELL_E2E_OTLP_ENDPOINT:-}" ]; then
       printf '\n[openshell.gateway.otlp]\n'
       printf 'endpoint = %s\n' "$(e2e_podman_toml_string "${OPENSHELL_E2E_OTLP_ENDPOINT}")"
+      # The agent trace relay is opt-in; OPENSHELL_E2E_OTLP_AGENT=0 runs the
+      # relay's inert case with trace export still on.
+      if [ "${OPENSHELL_E2E_OTLP_AGENT:-1}" != "0" ]; then
+        printf '\n[openshell.gateway.otlp.agent]\nenabled = true\n'
+      fi
     fi
   } >>"${output}"
 }

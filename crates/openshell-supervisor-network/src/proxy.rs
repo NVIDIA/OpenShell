@@ -678,12 +678,12 @@ async fn preauthorize_transparent_open(
         if RELAY_DENIAL_WARNED.swap(true, Ordering::SeqCst) {
             debug!(
                 %destination,
-                "agent OTLP export attempted but no collector is configured"
+                "agent OTLP export attempted but the agent trace relay is not enabled"
             );
         } else {
             warn!(
                 %destination,
-                "agent OTLP export attempted but no collector is configured"
+                "agent OTLP export attempted but the agent trace relay is not enabled"
             );
         }
         let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied));

@@ -90,7 +90,7 @@ port_is_in_use() {
 append_local_otlp_config_if_available() {
   local config_path=$1
   if ! port_is_in_use 4317; then
-    echo "OTLP collector not detected on 127.0.0.1:4317; trace and OCSF log export disabled."
+    echo "OTLP collector not detected on 127.0.0.1:4317; trace export, OCSF log export, and the agent trace relay disabled."
     return
   fi
 
@@ -101,8 +101,11 @@ endpoint = "http://127.0.0.1:4317"
 
 [openshell.gateway.otlp.ocsf]
 enabled = true
+
+[openshell.gateway.otlp.agent]
+enabled = true
 EOF
-  echo "OTLP trace and OCSF log export enabled for http://127.0.0.1:4317."
+  echo "OTLP trace export, OCSF log export, and the agent trace relay enabled for http://127.0.0.1:4317."
 }
 
 invoking_user() {
