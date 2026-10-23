@@ -198,11 +198,11 @@ before relying on IDs; older protobuf servers can silently ignore unknown fields
 
 ### Sandbox image update recovery
 
-`SandboxUpdates.UpdateSandbox` is an image-only conditional mutation for stopped
+`SandboxUpdates.UpdateSandbox` conditionally updates image, command, environment overrides, labels, and annotations for stopped
 Kubernetes sandboxes. It defaults to disabled and returns `FAILED_PRECONDITION`
-until the operator [activates a compatible deployment](/kubernetes/high-availability#activate-sandbox-image-updates).
+until the operator [activates a compatible deployment](/kubernetes/high-availability#activate-sandbox-updates).
 After activation, other compute drivers return `UNIMPLEMENTED`. Supply a named
-`workspace_scope`, sandbox `name`, nonempty OCI `image`, and a required nonzero
+`workspace_scope`, sandbox `name`, at least one selected update field, and a required nonzero
 `expected_resource_version` read from `sandbox.metadata.resource_version`.
 A stale version returns `ABORTED`; read fresh state before constructing another
 conditional request. The operation does not start compute.
@@ -212,14 +212,14 @@ image alone does not prove driver reconciliation completed. Start, stop,
 provisioning retry, and delete return `FAILED_PRECONDITION` while that operation remains.
 Image intent and revision are private; the public `SandboxStatus` shape does not
 change. On an operation-pending error, read a fresh resource version and retry
-the same image originally requested. A different target image cannot replace a
+the same selected fields and target values originally requested. A different configuration cannot replace a
 pending update.
 
 If the original request supplied `request_id`, an error leaves its admission
 unresolved. Reusing that ID with the original payload returns
 `REQUEST_OUTCOME_UNCERTAIN`; changing its expected version returns
-`REQUEST_ID_PAYLOAD_MISMATCH`. Reconcile against the original requested image,
-then make a new conditional same-image request with the fresh version and a new
+`REQUEST_ID_PAYLOAD_MISMATCH`. Reconcile against the original requested configuration,
+then make a new conditional request for the same target with the fresh version and a new
 ID, or without an ID. This is explicit recovery, not permission to blindly
 repeat uncertain mutations. A replay of a confirmed success returns the
 sandbox's current state without applying the image again.

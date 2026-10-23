@@ -98,7 +98,7 @@ async fn registered_runtime(factory: impl ComputeDriverFactory + 'static) -> cra
     )
     .await
     .unwrap()
-    .with_sandbox_image_updates(true)
+    .with_sandbox_updates(true)
 }
 
 #[tokio::test]

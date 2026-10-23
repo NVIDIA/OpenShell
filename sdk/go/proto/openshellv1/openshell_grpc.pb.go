@@ -3647,9 +3647,10 @@ const (
 // Optional sandbox mutations are separate from OpenShell so existing generated
 // OpenShell server implementations remain source-compatible.
 type SandboxUpdatesClient interface {
-	// Update only the workload image of a stopped sandbox without deleting its
-	// identity or retained storage. Requires compute-driver image-update support
-	// and explicit gateway activation of sandbox image updates.
+	// Update the workload image, command, environment, labels, or annotations of a
+	// stopped sandbox while preserving its identity and retained storage. Requires
+	// compute-driver support for the selected changes and explicit gateway activation
+	// of sandbox updates.
 	UpdateSandbox(ctx context.Context, in *UpdateSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
 }
 
@@ -3678,9 +3679,10 @@ func (c *sandboxUpdatesClient) UpdateSandbox(ctx context.Context, in *UpdateSand
 // Optional sandbox mutations are separate from OpenShell so existing generated
 // OpenShell server implementations remain source-compatible.
 type SandboxUpdatesServer interface {
-	// Update only the workload image of a stopped sandbox without deleting its
-	// identity or retained storage. Requires compute-driver image-update support
-	// and explicit gateway activation of sandbox image updates.
+	// Update the workload image, command, environment, labels, or annotations of a
+	// stopped sandbox while preserving its identity and retained storage. Requires
+	// compute-driver support for the selected changes and explicit gateway activation
+	// of sandbox updates.
 	UpdateSandbox(context.Context, *UpdateSandboxRequest) (*SandboxResponse, error)
 	mustEmbedUnimplementedSandboxUpdatesServer()
 }

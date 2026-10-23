@@ -334,7 +334,7 @@ async fn assert_image_update_supported(client: &mut AuthedGrpcClient) {
         extension
             .supported_capabilities
             .iter()
-            .any(|capability| capability == "openshell.compute.update-sandbox-image")
+            .any(|capability| capability == "openshell.compute.update-sandbox-configuration")
     }));
 }
 
@@ -371,13 +371,14 @@ async fn image_update_retains_workspace_and_identity() {
     let running_update = proto::UpdateSandboxRequest {
         workspace_scope: Some(proto::workspace_selector("default")),
         name: sandbox.name.clone(),
-        image: UPDATED_IMAGE.to_owned(),
+        image: Some(UPDATED_IMAGE.to_owned()),
         expected_resource_version: original
             .metadata
             .as_ref()
             .expect("metadata")
             .resource_version,
         request_id: String::new(),
+        ..Default::default()
     };
     let error = image_client
         .update_sandbox(rpc(running_update.clone()))
@@ -399,6 +400,14 @@ async fn image_update_retains_workspace_and_identity() {
             .expect("metadata")
             .resource_version,
         request_id: request_id(),
+        command: Some(proto::SandboxCommandUpdate { argv: vec![
+            "/bin/sh".into(), "-c".into(),
+            "mkdir -p /sandbox/harness; printf '%s:%s' \"$AGENT_MODE\" \"$1\" > /sandbox/harness/configuration; exec sleep 86400".into(),
+            "agent-bootstrap".into(), "new-argument".into(),
+        ] }),
+        environment: Some(proto::SandboxMapUpdate { values: std::collections::HashMap::from([("AGENT_MODE".into(), "updated".into())]) }),
+        labels: Some(proto::SandboxMapUpdate { values: std::collections::HashMap::from([("team".into(), "updated-agent".into())]) }),
+        annotations: Some(proto::SandboxMapUpdate { values: std::collections::HashMap::from([("example.com/revision".into(), "2".into())]) }),
         ..running_update
     };
     let updated = image_client
@@ -419,6 +428,35 @@ async fn image_update_retains_workspace_and_identity() {
         .await
         .expect("updated sandbox ready");
     assert_base_release(&sandbox, "3.22.").await;
+    assert_eq!(
+        sandbox
+            .exec(&["cat", "/sandbox/harness/configuration"])
+            .await
+            .expect("updated command and environment ran on start")
+            .trim(),
+        "updated:new-argument"
+    );
+    let observed = get_sandbox(&mut client, &sandbox.name).await;
+    assert_eq!(
+        observed
+            .metadata
+            .as_ref()
+            .unwrap()
+            .labels
+            .get("team")
+            .map(String::as_str),
+        Some("updated-agent")
+    );
+    assert_eq!(
+        observed
+            .metadata
+            .as_ref()
+            .unwrap()
+            .annotations
+            .get("example.com/revision")
+            .map(String::as_str),
+        Some("2")
+    );
     assert_eq!(
         sandbox
             .exec(&["cat", SENTINEL_PATH])

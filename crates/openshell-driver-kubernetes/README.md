@@ -323,6 +323,16 @@ trusted runtime images, or bootstrap annotations. They leave the sandbox
 stopped. Existing workspace contents and the seed sentinel remain unchanged,
 so an image update does not replace files already stored under `/sandbox`.
 
+The additional `openshell.compute.update-sandbox-configuration` capability and
+`ComputeDriverConfigurationUpdates` service reconcile workload argv and effective
+user environment with the image in one UID/resource-version-fenced patch. The
+main-process annotation and agent environment supply the next runtime generation;
+the trusted container launcher and runtime environment remain intact. Retry
+records identify selected fields and verify their live target values without
+copying environment values into operation evidence. Top-level public sandbox
+labels and annotations remain gateway metadata; this operation does not change
+Kubernetes pod metadata.
+
 The workspace PVC size defaults to `workspace_default_storage_size`. Set
 `workspace_storage_class` to pin the PVC to a specific `StorageClass`; an empty
 value omits `storageClassName` so the cluster's default `StorageClass` applies.

@@ -861,9 +861,10 @@ service OpenShell {
 // Optional sandbox mutations are separate from OpenShell so existing generated
 // OpenShell server implementations remain source-compatible.
 service SandboxUpdates {
-  // Update only the workload image of a stopped sandbox without deleting its
-  // identity or retained storage. Requires compute-driver image-update support
-  // and explicit gateway activation of sandbox image updates.
+  // Update the workload image, command, environment, labels, or annotations of a
+  // stopped sandbox while preserving its identity and retained storage. Requires
+  // compute-driver support for the selected changes and explicit gateway activation
+  // of sandbox updates.
   rpc UpdateSandbox(UpdateSandboxRequest) returns (SandboxResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
@@ -1345,8 +1346,8 @@ message CreateSandboxRequest {
   repeated SandboxServiceExposure service_exposures = 9;
 }
 
-// Image-only update. Other create-time configuration is not mutable through
-// this RPC. Stop before updating; start explicitly after a successful update.
+// Update selected configuration of a stopped sandbox. Omitted fields are unchanged.
+// Start explicitly after a successful update. At least one field must be selected.
 message UpdateSandboxRequest {
   // Workspace scope. Only a named workspace selection is accepted.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
@@ -1354,11 +1355,28 @@ message UpdateSandboxRequest {
   string name = 2;
   // Nonempty OCI workload image reference. This does not change trusted runtime
   // images or reseed an existing workspace.
-  string image = 3;
+  optional string image = 3;
+  // Replace workload argv; an empty list restores image-resolved default shell behavior.
+  SandboxCommandUpdate command = 6;
+  // Replace sandbox-level overrides. Empty clears overrides; template defaults remain.
+  SandboxMapUpdate environment = 7;
+  // Replace user metadata, preserving gateway-owned keys. These do not set pod metadata.
+  SandboxMapUpdate labels = 8;
+  SandboxMapUpdate annotations = 9;
   // Required nonzero resource version read by the caller.
   uint64 expected_resource_version = 4;
   // Optional nonzero UUID for durable at-most-once admission.
   string request_id = 5;
+}
+
+// Presence selects replacement, including an explicitly empty list.
+message SandboxCommandUpdate {
+  repeated string argv = 1;
+}
+
+// Presence selects replacement, including an explicitly empty map.
+message SandboxMapUpdate {
+  map<string, string> values = 1;
 }
 
 message CreateSandboxTemplateRequest {

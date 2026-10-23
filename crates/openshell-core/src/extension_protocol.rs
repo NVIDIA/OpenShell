@@ -26,6 +26,8 @@ pub const COMPUTE_ISOLATION_BACKEND: &str = "openshell.compute.isolation-backend
 pub const COMPUTE_SUSPEND_RESUME: &str = "openshell.compute.suspend-resume";
 
 /// Optional stopped-state image updates retaining the resource and its storage.
+pub const COMPUTE_UPDATE_SANDBOX_CONFIGURATION: &str =
+    "openshell.compute.update-sandbox-configuration";
 pub const COMPUTE_UPDATE_SANDBOX_IMAGE: &str = "openshell.compute.update-sandbox-image";
 
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
@@ -132,6 +134,7 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
         supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
         supported_capabilities.push(COMPUTE_ISOLATION_BACKEND.to_string());
         supported_capabilities.push(COMPUTE_UPDATE_SANDBOX_IMAGE.to_string());
+        supported_capabilities.push(COMPUTE_UPDATE_SANDBOX_CONFIGURATION.to_string());
     }
     PeerMetadata {
         protocol_version: Some(ProtocolVersion {

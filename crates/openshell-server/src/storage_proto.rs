@@ -172,12 +172,17 @@ mod tests {
     // Image updates add a separate public service/request and a new private
     // image-state format. Existing public status and frozen storage.v1 stay
     // unchanged; only the private durable closure grows.
+    // Configuration updates add presence-aware argv/map wrappers shared with
+    // private durable intent. Existing image-only payloads decode with all four
+    // selections absent; storage.v1 remains frozen. Public field 3 retains its
+    // image wire identity, now with explicit presence. Compute configuration
+    // updates use a separate capability/service and add one classified RPC.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "15367b833a8ef74b18f4b1d06d88e43a6f6751ebd52135b70cd095808ee8438d";
+        "be99bb3fcc7894eb85d774f54b642173e70dd37bc8e5fcaf3fdff2454ae689e1";
     const DURABLE_SCHEMA_SHA256: &str =
-        "74d934bb33cc275730f193927d709f932681e8821868cf9b2261d10eba9e1195";
+        "a20f41356b6cee4b543091c3533b0d4fd409d040fcfb2e17ecf1b6c4a3460794";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "ac1ffc4b5b81467de27270a4e33f6db1e31eeb2c52f79750dbaaf19515eadbb2";
+        "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -647,7 +652,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            108 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            109 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -718,9 +723,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (331, 31),
-                (97, 22),
-                (83, 22),
+                (334, 31),
+                (100, 22),
+                (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256

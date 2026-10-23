@@ -5,10 +5,10 @@ use super::*;
 use crate::auth::audit::ConnectionSource;
 use crate::grpc::test_support::{authed_request, test_server_state};
 use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
-use openshell_core::proto::UpdateSandboxRequest;
 use openshell_core::proto::compute::v1::GetCapabilitiesResponse;
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::sandbox_updates_client::SandboxUpdatesClient;
+use openshell_core::proto::{SandboxCommandUpdate, UpdateSandboxRequest};
 use tonic::Code;
 
 struct RunningService(tokio::task::JoinHandle<()>);
@@ -76,9 +76,10 @@ fn request() -> UpdateSandboxRequest {
     UpdateSandboxRequest {
         workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
         name: "image-update".into(),
-        image: "example/workload:new".into(),
+        image: Some("example/workload:new".into()),
         expected_resource_version: 1,
         request_id: String::new(),
+        ..Default::default()
     }
 }
 
@@ -89,7 +90,7 @@ fn image_only_request_requires_target_image_and_conditional_version() {
     for image in ["", "  ", "example/workload:tag\n", "bad image", "a\0b"] {
         assert_eq!(
             validate_image_update_request(&UpdateSandboxRequest {
-                image: image.into(),
+                image: Some(image.into()),
                 ..valid.clone()
             })
             .unwrap_err()
@@ -99,7 +100,7 @@ fn image_only_request_requires_target_image_and_conditional_version() {
     }
     assert!(
         validate_image_update_request(&UpdateSandboxRequest {
-            image: "a".repeat(super::super::MAX_TEMPLATE_STRING_LEN + 1),
+            image: Some("a".repeat(super::super::MAX_TEMPLATE_STRING_LEN + 1)),
             ..valid.clone()
         })
         .is_err()
@@ -125,7 +126,7 @@ async fn state() -> (Arc<ServerState>, Arc<FakeComputeDriver>, Sandbox) {
     Arc::get_mut(&mut state)
         .unwrap()
         .config
-        .enable_sandbox_image_updates = true;
+        .enable_sandbox_updates = true;
     let driver = Arc::new(
         FakeComputeDriver::new().with_capabilities(GetCapabilitiesResponse {
             driver_name: "image-test".into(),
@@ -134,7 +135,10 @@ async fn state() -> (Arc<ServerState>, Arc<FakeComputeDriver>, Sandbox) {
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/image-test",
                 "test",
-                [openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_IMAGE.into()],
+                [
+                    openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_IMAGE.into(),
+                    openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION.into(),
+                ],
             )),
             ..Default::default()
         }),
@@ -152,7 +156,7 @@ async fn state() -> (Arc<ServerState>, Arc<FakeComputeDriver>, Sandbox) {
     .await
     .unwrap()
     .with_image_update_driver(Some(driver.clone()))
-    .with_sandbox_image_updates(true);
+    .with_sandbox_updates(true);
     Arc::get_mut(&mut state).unwrap().compute = compute;
     let mut sandbox = Sandbox {
         metadata: Some(ObjectMeta {
@@ -235,6 +239,18 @@ async fn public_image_update_replays_without_reapplying_or_touching_same_name_re
     let req = UpdateSandboxRequest {
         expected_resource_version: sandbox.get_resource_version(),
         request_id: uuid::Uuid::new_v4().to_string(),
+        command: Some(SandboxCommandUpdate {
+            argv: vec!["/usr/local/bin/start-agent".into(), "--updated".into()],
+        }),
+        environment: Some(openshell_core::proto::SandboxMapUpdate {
+            values: HashMap::from([("AGENT_MODE".into(), "updated".into())]),
+        }),
+        labels: Some(openshell_core::proto::SandboxMapUpdate {
+            values: HashMap::from([("team".into(), "agents".into())]),
+        }),
+        annotations: Some(openshell_core::proto::SandboxMapUpdate {
+            values: HashMap::from([("example.com/revision".into(), "2".into())]),
+        }),
         ..request()
     };
     let updated = client
@@ -254,14 +270,26 @@ async fn public_image_update_replays_without_reapplying_or_touching_same_name_re
             .as_ref()
             .unwrap()
             .image,
-        req.image
+        req.image.as_ref().unwrap().as_str()
+    );
+    assert_eq!(
+        updated.spec.as_ref().unwrap().command,
+        req.command.as_ref().unwrap().argv
+    );
+    assert_eq!(
+        updated.spec.as_ref().unwrap().environment,
+        req.environment.as_ref().unwrap().values
+    );
+    assert_eq!(
+        updated.metadata.as_ref().unwrap().labels,
+        req.labels.as_ref().unwrap().values
     );
     let replay = client.update_sandbox(req.clone()).await.unwrap();
     assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
     assert_eq!(replay.get_ref().sandbox.as_ref().unwrap(), &updated);
-    assert_eq!(driver.calls().iter().filter(|call| matches!(call, FakeComputeDriverCall::UpdateSandboxImage { request } if !request.validate_only)).count(), 1);
+    assert_eq!(driver.calls().iter().filter(|call| matches!(call, FakeComputeDriverCall::UpdateSandboxConfiguration { request } if !request.image_update.as_ref().unwrap().validate_only)).count(), 1);
     let changed = UpdateSandboxRequest {
-        image: "example/workload:other".into(),
+        image: Some("example/workload:other".into()),
         ..req.clone()
     };
     assert_eq!(
@@ -289,5 +317,118 @@ async fn public_image_update_replays_without_reapplying_or_touching_same_name_re
         .unwrap()
         .unwrap();
     assert_eq!(replacement.spec, sandbox.spec);
-    assert_eq!(driver.calls().iter().filter(|call| matches!(call, FakeComputeDriverCall::UpdateSandboxImage { request } if !request.validate_only)).count(), 1);
+    assert_eq!(driver.calls().iter().filter(|call| matches!(call, FakeComputeDriverCall::UpdateSandboxConfiguration { request } if !request.image_update.as_ref().unwrap().validate_only)).count(), 1);
+}
+
+#[test]
+fn configuration_update_presence_and_reserved_metadata() {
+    let mut update = request();
+    update.image = None;
+    assert!(validate_image_update_request(&update).is_err());
+    update.command = Some(SandboxCommandUpdate::default());
+    validate_image_update_request(&update).unwrap();
+    for key in [
+        "internal.openshell.ai/auth-epoch",
+        "openshell.ai/identity",
+        "agents.x-k8s.io/name",
+    ] {
+        update.annotations = Some(openshell_core::proto::SandboxMapUpdate {
+            values: HashMap::from([(key.into(), "forged".into())]),
+        });
+        assert!(validate_image_update_request(&update).is_err());
+        update.labels = update.annotations.take();
+        assert!(validate_image_update_request(&update).is_err());
+    }
+}
+
+#[tokio::test]
+async fn pending_update_retry_preserves_later_update_config_annotations() {
+    use openshell_core::proto::{SandboxMapUpdate, UpdateConfigRequest};
+
+    let (state, driver, sandbox) = state().await;
+    let mut update = UpdateSandboxRequest {
+        expected_resource_version: sandbox.get_resource_version(),
+        annotations: Some(SandboxMapUpdate {
+            values: HashMap::from([
+                ("example.com/revision".into(), "original".into()),
+                ("example.com/retained".into(), "value".into()),
+            ]),
+        }),
+        ..request()
+    };
+    driver.set_image_update_error(Some(Code::Unavailable));
+    assert_eq!(
+        handle_update_sandbox(&state, authed_request(update.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unavailable
+    );
+    let pending = state
+        .store
+        .get_message::<Sandbox>(sandbox.object_id())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Exercise the existing public annotation writer while the update is
+    // pending, including both a new key and an overwrite of a selected key.
+    let annotations = crate::grpc::policy::handle_update_config(
+        &state,
+        authed_request(UpdateConfigRequest {
+            sandbox: sandbox.object_name().into(),
+            workspace_scope: update.workspace_scope.clone(),
+            expected_resource_version: pending.get_resource_version(),
+            setting_key: "log_level".into(),
+            delete_setting: true,
+            annotations: HashMap::from([
+                ("example.com/revision".into(), "later".into()),
+                ("example.com/added".into(), "new".into()),
+            ]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .annotations;
+    assert_eq!(annotations.get("example.com/retained").unwrap(), "value");
+    let current = state
+        .store
+        .get_message::<Sandbox>(sandbox.object_id())
+        .await
+        .unwrap()
+        .unwrap();
+    update.expected_resource_version = current.get_resource_version();
+    driver.set_image_update_error(None);
+    let completed = handle_update_sandbox(&state, authed_request(update))
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+    assert_eq!(
+        completed.metadata.as_ref().unwrap().annotations,
+        annotations
+    );
+    assert_eq!(completed.phase(), SandboxPhase::Stopped as i32);
+    assert!(
+        completed
+            .status
+            .as_ref()
+            .unwrap()
+            .provisioning
+            .as_ref()
+            .is_none_or(|record| !record.driver_operation_pending)
+    );
+    assert!(
+        state
+            .store
+            .get_sandbox_image_state(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .pending
+            .is_none()
+    );
 }

@@ -253,9 +253,9 @@ pub struct Config {
     pub enable_websocket_tunnel: bool,
 
     /// Operator activation after all gateways and outstanding legacy driver
-    /// operations have been drained onto the image-update-compatible protocol.
+    /// operations have been drained onto the configuration-update-compatible protocol.
     /// Disabled by default; not a license to run mixed-version writers.
-    pub enable_sandbox_image_updates: bool,
+    pub enable_sandbox_updates: bool,
 
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
@@ -1004,7 +1004,7 @@ impl Config {
             oidc: None,
             auth: GatewayAuthConfig::default(),
             enable_websocket_tunnel: false,
-            enable_sandbox_image_updates: false,
+            enable_sandbox_updates: false,
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),

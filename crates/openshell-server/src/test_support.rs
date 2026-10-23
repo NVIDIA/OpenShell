@@ -107,6 +107,9 @@ pub enum FakeComputeDriverCall {
     CreateSandbox {
         sandbox: Option<DriverSandbox>,
     },
+    UpdateSandboxConfiguration {
+        request: openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest,
+    },
     UpdateSandboxImage {
         request: openshell_core::proto::compute::v1::UpdateSandboxImageRequest,
     },
@@ -277,6 +280,7 @@ impl FakeComputeDriver {
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(ComputeDriverServer::new(driver.clone()))
+                .add_service(openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdatesServer::new(driver.clone()))
                 .add_service(ComputeDriverImageUpdatesServer::new(driver))
                 .serve_with_incoming(UnixIncoming { listener })
                 .await
@@ -344,6 +348,32 @@ impl Stream for UnixIncoming {
 
 #[tonic::async_trait]
 impl openshell_core::compute::ComputeDriver for FakeComputeDriver {
+    async fn update_sandbox_configuration(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>,
+        Status,
+    > {
+        self.record_traceparent(request.metadata());
+        self.with_state(|state| {
+            let request = request.into_inner();
+            let validate_only = request.image_update.as_ref().unwrap().validate_only;
+            state
+                .calls
+                .push(FakeComputeDriverCall::UpdateSandboxConfiguration { request });
+            if let Some(code) = state.image_validation_error.filter(|_| validate_only) {
+                return Err(Status::new(code, "injected configuration validation error"));
+            }
+            if let Some(code) = state.image_update_error.filter(|_| !validate_only) {
+                return Err(Status::new(code, "injected configuration update error"));
+            }
+            Ok(Response::new(
+                openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse {},
+            ))
+        })
+    }
+
     async fn update_sandbox_image(
         &self,
         request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
@@ -378,6 +408,13 @@ impl openshell_core::proto::compute::v1::compute_driver_image_updates_server::Co
         request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
     ) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>, Status> {
         openshell_core::compute::ComputeDriver::update_sandbox_image(self, request).await
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdates for FakeComputeDriver {
+    async fn update_sandbox_configuration(&self, request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>, Status> {
+        openshell_core::compute::ComputeDriver::update_sandbox_configuration(self, request).await
     }
 }
 

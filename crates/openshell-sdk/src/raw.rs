@@ -29,12 +29,12 @@ pub use openshell_core::proto::{
     ListSandboxTemplatesRequest, ListSandboxesRequest, ListWorkspacesRequest,
     ProviderDesiredIdentity, ProviderMutationKind, ProviderMutationReceipt,
     ProviderReadinessObservation, ProviderReadinessReason, ProviderReadinessState,
-    ProviderReadinessStatus, ResumeSandboxRequest, Sandbox, SandboxPhase as ProtoSandboxPhase,
-    SandboxResources, SandboxServiceLevel, SandboxSpec as ProtoSandboxSpec, SandboxStartup,
-    SandboxTemplate, SandboxTemplateResponse, SandboxWorkloadConfig, SandboxWorkloadTemplate,
-    SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec,
-    ServiceStatus as ProtoServiceStatus, StartSandboxRequest, StopSandboxRequest,
-    SuspendSandboxRequest, UpdateSandboxRequest, Workspace,
+    ProviderReadinessStatus, ResumeSandboxRequest, Sandbox, SandboxCommandUpdate, SandboxMapUpdate,
+    SandboxPhase as ProtoSandboxPhase, SandboxResources, SandboxServiceLevel,
+    SandboxSpec as ProtoSandboxSpec, SandboxStartup, SandboxTemplate, SandboxTemplateResponse,
+    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
+    SandboxWorkloadTemplateSpec, ServiceStatus as ProtoServiceStatus, StartSandboxRequest,
+    StopSandboxRequest, SuspendSandboxRequest, UpdateSandboxRequest, Workspace,
 };
 
 /// Type alias for the gRPC client wrapped in the SDK's auth interceptor.

@@ -422,7 +422,8 @@ above) instead of relying only on `OPENSHELL_GATEWAY_ENDPOINT`; some tests call
 
 Use `mise run e2e:kubernetes` for the standard Helm-backed Kubernetes suite.
 Set `OPENSHELL_E2E_KUBE_TEST=kubernetes_image_update` to scope the Rust suite to
-image replacement with retained sandbox, SSH, and PVC identities. This target is
+combined image, command, environment, and metadata updates with retained sandbox,
+SSH, and PVC identities. The next start verifies the new argv and environment. This target is
 included in both existing Agent Sandbox API-version lanes; unlike the Python
 Docker suite, it exercises the driver that supports image updates.
 
@@ -432,9 +433,9 @@ in only for a fresh gateway fixture that it owns; set
 activation to an existing shared gateway or enable it during a mixed-version
 rollout. For manual testing, follow the retirement and activation checklist in
 `docs/kubernetes/high-availability.mdx` before setting
-`gatewayConfig: {"openshell.gateway": {enable_sandbox_image_updates: true}}`.
-The gateway process equivalents are `--enable-sandbox-image-updates true` and
-`OPENSHELL_ENABLE_SANDBOX_IMAGE_UPDATES=true`. Retire every old process and Job,
+`gatewayConfig: {"openshell.gateway": {enable_sandbox_updates: true}}`.
+The gateway process equivalents are `--enable-sandbox-updates true` and
+`OPENSHELL_ENABLE_SANDBOX_UPDATES=true`. Retire every old process and Job,
 settle outstanding driver work, prevent old binaries returning, and do not
 treat PostgreSQL connection markers or membership TTL expiry as retirement
 proof. SQLite testing supports one gateway process only. Image-update clients

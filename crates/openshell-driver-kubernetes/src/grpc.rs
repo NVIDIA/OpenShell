@@ -339,6 +339,22 @@ impl ComputeDriver for ComputeDriverService {
 
 #[tonic::async_trait]
 impl openshell_core::compute::ComputeDriver for ComputeDriverService {
+    async fn update_sandbox_configuration(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>,
+        Status,
+    > {
+        self.driver
+            .update_sandbox_configuration(&request.into_inner())
+            .await
+            .map_err(|error| Status::from(openshell_core::ComputeDriverError::from(error)))?;
+        Ok(Response::new(
+            openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse {},
+        ))
+    }
+
     async fn update_sandbox_image(
         &self,
         request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
@@ -369,6 +385,13 @@ impl openshell_core::proto::compute::v1::compute_driver_image_updates_server::Co
         request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
     ) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>, Status> {
         openshell_core::compute::ComputeDriver::update_sandbox_image(self, request).await
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdates for ComputeDriverService {
+    async fn update_sandbox_configuration(&self, request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>, Status> {
+        openshell_core::compute::ComputeDriver::update_sandbox_configuration(self, request).await
     }
 }
 

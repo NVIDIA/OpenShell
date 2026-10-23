@@ -2425,9 +2425,10 @@ async fn raw_sandbox_updates_shares_transport_and_live_auth_slot() {
     let request = proto::UpdateSandboxRequest {
         workspace_scope: Some(proto::workspace_selector("team")),
         name: "sandbox".into(),
-        image: "example/workload:new".into(),
+        image: Some("example/workload:new".into()),
         expected_resource_version: 42,
         request_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+        ..Default::default()
     };
     assert_eq!(
         updates

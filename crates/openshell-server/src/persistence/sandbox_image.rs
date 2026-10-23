@@ -97,6 +97,20 @@ fn require_stopped(sandbox: &Sandbox) -> PersistenceResult<()> {
 }
 
 fn validate_intent(intent: &StoredSandboxImageUpdate) -> PersistenceResult<()> {
+    for map in [intent.labels.as_ref(), intent.annotations.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if map
+            .values
+            .keys()
+            .any(|key| openshell_core::sandbox_update::is_system_metadata_key(key))
+        {
+            return Err(PersistenceError::Encode(
+                "system metadata cannot be updated".into(),
+            ));
+        }
+    }
     if intent.operation_id.is_empty()
         || intent.previous_image.is_empty()
         || intent.image.is_empty()
@@ -171,6 +185,13 @@ fn project_begin(
         return Err(conflict(Some(current_version)));
     }
     template.image.clone_from(&intent.image);
+    openshell_core::sandbox_update::apply_configuration(
+        &mut sandbox,
+        intent.command.as_ref(),
+        intent.environment.as_ref(),
+        intent.labels.as_ref(),
+        intent.annotations.as_ref(),
+    );
     state.revision = next_revision;
     state.pending = Some(intent.clone());
     state.previous_provisioning = previous_provisioning;
@@ -213,6 +234,21 @@ fn project_complete(
         .and_then(|spec| spec.template.as_ref())
         .is_none_or(|template| template.image != intent.image)
     {
+        return Err(conflict(Some(current_version)));
+    }
+    // Acceptance already committed the annotation replacement. UpdateConfig
+    // may subsequently merge annotations while driver reconciliation is pending;
+    // preserve those accepted writes rather than requiring the old map forever.
+    // Annotations are gateway metadata and are not reconciled by the driver.
+    let mut target = sandbox.clone();
+    openshell_core::sandbox_update::apply_configuration(
+        &mut target,
+        intent.command.as_ref(),
+        intent.environment.as_ref(),
+        intent.labels.as_ref(),
+        None,
+    );
+    if target != sandbox {
         return Err(conflict(Some(current_version)));
     }
     let status = sandbox
@@ -429,28 +465,33 @@ WHERE object_type = 'sandbox' AND id = $1 FOR UPDATE",
         })?;
         let now_ms = current_time_ms();
         let sandbox_payload = sandbox.encode_to_vec();
+        let labels = sandbox.metadata.as_ref().map(|metadata| &metadata.labels);
+        let labels = serde_json::to_value(labels)
+            .map_err(|error| PersistenceError::Encode(error.to_string()))?;
         let affected = match self {
             Self::Sqlite(tx) => sqlx::query(
                 r#"UPDATE "objects"
-SET "payload" = ?2, "updated_at_ms" = ?3, "resource_version" = "resource_version" + 1
+SET "payload" = ?2, "updated_at_ms" = ?3, "resource_version" = "resource_version" + 1, "labels" = ?5
 WHERE "object_type" = 'sandbox' AND "id" = ?1 AND "resource_version" = ?4"#,
             )
             .bind(sandbox_id)
             .bind(&sandbox_payload)
             .bind(now_ms)
             .bind(previous_version_sql)
+            .bind(labels.to_string())
             .execute(&mut **tx)
             .await
             .map(|result| result.rows_affected()),
             Self::Postgres(tx) => sqlx::query(
                 "UPDATE objects
-SET payload = $2, updated_at_ms = $3, resource_version = resource_version + 1
+SET payload = $2, updated_at_ms = $3, resource_version = resource_version + 1, labels = $5
 WHERE object_type = 'sandbox' AND id = $1 AND resource_version = $4",
             )
             .bind(sandbox_id)
             .bind(&sandbox_payload)
             .bind(now_ms)
             .bind(previous_version_sql)
+            .bind(&labels)
             .execute(&mut **tx)
             .await
             .map(|result| result.rows_affected()),
@@ -549,6 +590,7 @@ mod tests {
             previous_image: "old-image".into(),
             image: "new-image".into(),
             revision: 1,
+            ..Default::default()
         }
     }
 
@@ -763,6 +805,7 @@ mod tests {
             previous_image: "new-image".into(),
             image: "newer-image".into(),
             revision: 2,
+            ..Default::default()
         };
         assert!(project_begin(accepted, Some(state), 6, 1, &next).is_err());
     }
@@ -845,6 +888,99 @@ mod tests {
             .unwrap()
             .unwrap();
         (store, stored)
+    }
+
+    #[test]
+    fn legacy_image_intent_decodes_without_configuration_selections() {
+        let decoded =
+            StoredSandboxImageUpdate::decode(&b"\x0a\x02op\x12\x01a\x1a\x01b\x20\x01"[..]).unwrap();
+        assert_eq!(decoded.operation_id, "op");
+        assert_eq!(decoded.previous_image, "a");
+        assert_eq!(decoded.image, "b");
+        assert_eq!(decoded.revision, 1);
+        assert!(
+            decoded.command.is_none()
+                && decoded.environment.is_none()
+                && decoded.labels.is_none()
+                && decoded.annotations.is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_configuration_update_reindexes_labels_atomically() {
+        let (store, original) = fixture().await;
+        assert_configuration_update_reindexes_labels(&store, original).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database; run mise run test:rust:postgres"]
+    async fn postgres_sandbox_image_configuration_reindexes_labels_atomically() {
+        let schema =
+            super::super::test_postgres::TestSchema::create("sandbox_configuration_labels").await;
+        let store = schema.connect_store().await;
+        crate::ensure_default_workspace(&store).await.unwrap();
+        store.put_message(&sandbox()).await.unwrap();
+        let original = store
+            .get_message::<Sandbox>("sandbox-id")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_configuration_update_reindexes_labels(&store, original).await;
+        store.close().await;
+        schema.drop_schema().await;
+    }
+
+    async fn assert_configuration_update_reindexes_labels(store: &Store, mut original: Sandbox) {
+        use openshell_core::proto::SandboxMapUpdate;
+        original
+            .metadata
+            .as_mut()
+            .unwrap()
+            .labels
+            .insert("team".into(), "old".into());
+        store.put_message(&original).await.unwrap();
+        let original = store
+            .get_message::<Sandbox>("sandbox-id")
+            .await
+            .unwrap()
+            .unwrap();
+        let update = StoredSandboxImageUpdate {
+            labels: Some(SandboxMapUpdate {
+                values: std::collections::HashMap::from([("team".into(), "new".into())]),
+            }),
+            ..intent()
+        };
+        store
+            .begin_sandbox_image_update("sandbox-id", resource_version(&original), 0, &update)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_with_selector("sandbox", "default", "team=old", 10, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .list_with_selector("sandbox", "default", "team=new", 10, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .complete_sandbox_image_update("sandbox-id", &update)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .list_with_selector("sandbox", "default", "team=new", 10, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -944,6 +1080,7 @@ mod tests {
             previous_image: "new-image".into(),
             image: "newer-image".into(),
             revision: 2,
+            ..Default::default()
         };
         store
             .begin_sandbox_image_update("sandbox-id", resource_version(&completed), 1, &next)
@@ -1295,6 +1432,7 @@ updated_at_ms = $3 WHERE object_type = 'sandbox' AND id = $1 AND resource_versio
             previous_image: winning_intent.image.clone(),
             image: "next-generation-image".into(),
             revision: 2,
+            ..Default::default()
         };
         let accepted_next = second
             .begin_sandbox_image_update("sandbox-id", resource_version(&completed), 1, &next)

@@ -685,6 +685,7 @@ impl AcquiredRemoteDriverEndpoint {
 #[derive(Debug, Clone)]
 struct RemoteComputeDriver {
     client: RemoteComputeDriverClient,
+    configuration_updates_client: openshell_core::proto::compute::v1::compute_driver_configuration_updates_client::ComputeDriverConfigurationUpdatesClient<tonic::service::interceptor::InterceptedService<Channel, TraceContextInterceptor>>,
     image_updates_client: ComputeDriverImageUpdatesClient<
         tonic::service::interceptor::InterceptedService<Channel, TraceContextInterceptor>,
     >,
@@ -699,6 +700,7 @@ impl RemoteComputeDriver {
     fn new(channel: Channel) -> Self {
         Self {
             client: ComputeDriverClient::with_interceptor(channel.clone(), TraceContextInterceptor),
+            configuration_updates_client: openshell_core::proto::compute::v1::compute_driver_configuration_updates_client::ComputeDriverConfigurationUpdatesClient::with_interceptor(channel.clone(), TraceContextInterceptor),
             image_updates_client: ComputeDriverImageUpdatesClient::with_interceptor(
                 channel,
                 TraceContextInterceptor,
@@ -745,6 +747,20 @@ impl RemoteComputeDriver {
 
 #[tonic::async_trait]
 impl openshell_core::compute::ComputeDriver for RemoteComputeDriver {
+    async fn update_sandbox_configuration(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>,
+        Status,
+    > {
+        self.verify_admission_policy(false).await?;
+        self.configuration_updates_client
+            .clone()
+            .update_sandbox_configuration(request)
+            .await
+    }
+
     async fn update_sandbox_image(
         &self,
         request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
@@ -923,7 +939,7 @@ pub struct ComputeRuntime {
     driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
     image_preparation_timeout_seconds: u32,
-    image_updates_enabled: bool,
+    sandbox_updates_enabled: bool,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
@@ -1041,7 +1057,7 @@ impl ComputeRuntime {
             driver_process,
             default_image,
             image_preparation_timeout_seconds: 1800,
-            image_updates_enabled: false,
+            sandbox_updates_enabled: false,
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -6157,9 +6173,15 @@ impl ComputeRuntime {
             .await
             .map_err(|e| e.to_string())?;
         if let Some(sandbox) = sandbox.as_ref() {
+            // Timeout cleanup can emit Deleted before an explicit stop exposes
+            // Stopped for repair. A delayed (or repeated) event must retain that
+            // recovery record too; explicit deletion still transitions to Deleting.
             if provisioning_deadline::driver_operation_pending(sandbox)
                 || (provisioning_deadline::timed_out(sandbox)
-                    && sandbox.phase() == i32::from(SandboxPhase::Error))
+                    && matches!(
+                        SandboxPhase::try_from(sandbox.phase()),
+                        Ok(SandboxPhase::Error | SandboxPhase::Stopped)
+                    ))
             {
                 return Ok(());
             }
@@ -8482,7 +8504,7 @@ pub fn new_test_runtime_with_driver(
         driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
         image_preparation_timeout_seconds: 1800,
-        image_updates_enabled: false,
+        sandbox_updates_enabled: false,
         store,
         sandbox_index: SandboxIndex::new(),
         sandbox_watch_bus: SandboxWatchBus::new(),
@@ -9683,7 +9705,7 @@ mod tests {
             driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
             image_preparation_timeout_seconds: 1800,
-            image_updates_enabled: false,
+            sandbox_updates_enabled: false,
             store,
             sandbox_index: SandboxIndex::new(),
             sandbox_watch_bus: SandboxWatchBus::new(),
@@ -18367,7 +18389,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             )
             .await
             .unwrap();
-            runtime.image_updates_enabled = true;
+            runtime.sandbox_updates_enabled = true;
             assert!(
                 !runtime
                     .driver_info
@@ -18462,7 +18484,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         // NoopTestDriver implements only the baseline generated trait.
         let mut runtime = test_runtime(Arc::new(NoopTestDriver::default()))
             .await
-            .with_sandbox_image_updates(true);
+            .with_sandbox_updates(true);
         runtime
             .driver_info
             .negotiated_extension

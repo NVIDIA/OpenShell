@@ -28,6 +28,12 @@ struct ImageUpdateRecord {
     expected_image: String,
     image: String,
     revision: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    configuration: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    command_updated: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    environment_updated: bool,
 }
 
 impl KubernetesComputeDriver {
@@ -48,6 +54,27 @@ impl KubernetesComputeDriver {
         &self,
         request: &UpdateSandboxImageRequest,
     ) -> Result<(), KubernetesDriverError> {
+        self.update_workload(request, None).await
+    }
+
+    pub async fn update_sandbox_configuration(
+        &self,
+        request: &openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest,
+    ) -> Result<(), KubernetesDriverError> {
+        let image = request.image_update.as_ref().ok_or_else(|| {
+            KubernetesDriverError::InvalidArgument("image_update is required".into())
+        })?;
+        validate_configuration(request)?;
+        self.update_workload(image, Some(request)).await
+    }
+
+    async fn update_workload(
+        &self,
+        request: &UpdateSandboxImageRequest,
+        configuration: Option<
+            &openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest,
+        >,
+    ) -> Result<(), KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         validate_image_update_request(request)?;
         let _guard = self
@@ -56,21 +83,25 @@ impl KubernetesComputeDriver {
             .lock_owned()
             .await;
         // Include discovery, admission and Pod pagination in a single bound.
-        let result =
-            tokio::time::timeout(KUBE_API_TIMEOUT, self.update_sandbox_image_inner(request))
-                .await
-                .unwrap_or_else(|_| {
-                    Err(KubernetesDriverError::Message(
-                        "timed out updating Kubernetes sandbox image; retry the same operation"
-                            .into(),
-                    ))
-                });
+        let result = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            self.update_sandbox_image_inner(request, configuration),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(KubernetesDriverError::Message(
+                "timed out updating Kubernetes sandbox image; retry the same operation".into(),
+            ))
+        });
         span_status.finish(result)
     }
 
     async fn update_sandbox_image_inner(
         &self,
         request: &UpdateSandboxImageRequest,
+        configuration: Option<
+            &openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest,
+        >,
     ) -> Result<(), KubernetesDriverError> {
         let expected = parse_kubernetes_runtime_identity(&request.expected_runtime_identity)?;
         self.wait_for_operator_allowlist()
@@ -123,7 +154,10 @@ impl KubernetesComputeDriver {
         }
         require_stopped_for_image_update(&object, &lookup.resource.version)?;
         let mut candidate = object.clone();
-        let repeat = prepare_image_update(&mut candidate, request)?;
+        let repeat = prepare_update(&mut candidate, request, configuration)?;
+        if let Some(configuration) = configuration {
+            prepare_configuration(&mut candidate, configuration, repeat)?;
+        }
         // Revalidate the saved provenance and attachment UIDs against current
         // operator policy, even for retries. Do not manufacture new provenance
         // or re-render driver_config from a caller's request.
@@ -161,6 +195,16 @@ impl KubernetesComputeDriver {
                 "containers": candidate.data["spec"]["podTemplate"]["spec"]["containers"]
             }}}
         });
+        if configuration.is_some_and(|configuration| configuration.main_process.is_some()) {
+            let key = super::ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC;
+            patch["metadata"]["annotations"][key] = serde_json::json!(
+                candidate
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.get(key))
+            );
+        }
         if let Some(init) = candidate
             .data
             .pointer("/spec/podTemplate/spec/initContainers")
@@ -324,9 +368,10 @@ fn require_stopped_for_image_update(
 }
 
 /// Apply the image-only mutation in memory; return true for an exact retry.
-fn prepare_image_update(
+fn prepare_update(
     object: &mut DynamicObject,
     request: &UpdateSandboxImageRequest,
+    configuration: Option<&openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
 ) -> Result<bool, KubernetesDriverError> {
     let evidence = object
         .metadata
@@ -343,6 +388,9 @@ fn prepare_image_update(
         expected_image: request.expected_image.clone(),
         image: request.image.clone(),
         revision: request.revision,
+        configuration: configuration.is_some(),
+        command_updated: configuration.is_some_and(|value| value.main_process.is_some()),
+        environment_updated: configuration.is_some_and(|value| value.environment.is_some()),
     };
     if let Some(saved) = &evidence {
         if request.revision < saved.revision {
@@ -418,6 +466,115 @@ fn prepare_image_update(
             serde_json::to_string(&record).expect("image update record serializes"),
         );
     Ok(repeat)
+}
+
+fn validate_configuration(
+    request: &openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest,
+) -> Result<(), KubernetesDriverError> {
+    let invalid = |message: &str| KubernetesDriverError::InvalidArgument(message.into());
+    if let Some(spec) = &request.main_process
+        && (spec.command.len() > 256
+            || spec.command.iter().map(String::len).sum::<usize>() > 256 * 1024
+            || spec.command.first().is_some_and(String::is_empty)
+            || spec.command.iter().any(|arg| arg.contains('\0')))
+    {
+        return Err(invalid("invalid workload argv"));
+    }
+    if let Some(environment) = &request.environment {
+        if environment.values.len() > 256
+            || environment
+                .values
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum::<usize>()
+                > 256 * 1024
+        {
+            return Err(invalid("environment exceeds size limits"));
+        }
+        for (key, value) in &environment.values {
+            if key.is_empty()
+                || key.starts_with("OPENSHELL_")
+                || key.as_bytes()[0].is_ascii_digit()
+                || !key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                || value.contains(['\0', '\n', '\r'])
+            {
+                return Err(invalid("invalid or reserved workload environment entry"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prepare_configuration(
+    object: &mut DynamicObject,
+    request: &openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest,
+    repeat: bool,
+) -> Result<(), KubernetesDriverError> {
+    if let Some(spec) = &request.main_process {
+        let key = super::ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC;
+        let encoded = super::required_sandbox_annotation(object, key)?;
+        let mut main = openshell_core::sandbox_env::MainProcessConfig::decode(&encoded)
+            .map_err(KubernetesDriverError::Precondition)?;
+        let original = main.clone();
+        main.command.clone_from(&spec.command);
+        main.tty = spec.command.is_empty() || spec.tty;
+        if repeat && main != original {
+            return Err(KubernetesDriverError::Precondition(
+                "recorded update command does not match target".into(),
+            ));
+        }
+        object
+            .metadata
+            .annotations
+            .get_or_insert_with(BTreeMap::new)
+            .insert(
+                key.into(),
+                serde_json::to_string(&main).map_err(|_| {
+                    KubernetesDriverError::InvalidArgument("cannot encode main process".into())
+                })?,
+            );
+    }
+    if let Some(environment) = &request.environment {
+        let containers = object
+            .data
+            .pointer_mut("/spec/podTemplate/spec/containers")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(|| {
+                KubernetesDriverError::Precondition("missing workload containers".into())
+            })?;
+        let agent = containers
+            .iter_mut()
+            .find(|container| container["name"] == "agent")
+            .ok_or_else(|| KubernetesDriverError::Precondition("missing agent container".into()))?;
+        let mut current = std::collections::HashMap::new();
+        let mut retained = Vec::new();
+        for entry in agent["env"].as_array().into_iter().flatten() {
+            let name = entry["name"].as_str().ok_or_else(|| {
+                KubernetesDriverError::Precondition("invalid workload environment".into())
+            })?;
+            if name.starts_with("OPENSHELL_") {
+                retained.push(entry.clone());
+            } else if let Some(value) = entry["value"].as_str() {
+                current.insert(name.to_owned(), value.to_owned());
+            } else {
+                return Err(KubernetesDriverError::Precondition(
+                    "cannot replace workload environment with external value sources".into(),
+                ));
+            }
+        }
+        if repeat && current != environment.values {
+            return Err(KubernetesDriverError::Precondition(
+                "recorded update environment does not match target".into(),
+            ));
+        }
+        let mut entries: Vec<_> = environment.values.iter().collect();
+        entries.sort_unstable_by_key(|(name, _)| *name);
+        for (name, value) in entries {
+            retained.push(serde_json::json!({"name": name, "value": value}));
+        }
+        agent["env"] = serde_json::json!(retained);
+    }
+    Ok(())
 }
 
 fn image_update_pod_matches(pod: &Pod, object: &DynamicObject, sandbox_id: &str) -> bool {

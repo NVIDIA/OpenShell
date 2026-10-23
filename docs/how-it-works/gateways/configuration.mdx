@@ -256,7 +256,7 @@ metrics_bind_address  = "0.0.0.0:9090"
 log_level             = "info"
 
 # Activate only after retiring incompatible gateways and outstanding driver work.
-enable_sandbox_image_updates = false
+enable_sandbox_updates = false
 
 # Connection ceiling for the gateway's database pool. Omit to use the backend
 # default: 10 for Postgres, 5 for on-disk SQLite.
@@ -502,16 +502,19 @@ Changing the installation name, the hostname format, or both changes every
 hash URL issued before the change; previously issued URLs stop resolving
 until callers request a fresh URL.
 
-## Sandbox Image Updates
+## Sandbox Updates
 
-`[openshell.gateway] enable_sandbox_image_updates` defaults to `false`. It gates
+`[openshell.gateway] enable_sandbox_updates` defaults to `false`. It gates
 the separate `openshell.v1.SandboxUpdates/UpdateSandbox` RPC on the existing
-gateway listener. The equivalent gateway process flag and environment variable
-are `--enable-sandbox-image-updates true` and
-`OPENSHELL_ENABLE_SANDBOX_IMAGE_UPDATES=true`.
+gateway listener. It gates image, command, environment, label, and annotation
+updates for stopped sandboxes. Protocol 2 requires upgrading all
+gateways, including gateways that previously supported image-only updates.
+The equivalent gateway process flag and environment variable
+are `--enable-sandbox-updates true` and
+`OPENSHELL_ENABLE_SANDBOX_UPDATES=true`.
 
 Enable it only after completing the
-[activation checklist](/kubernetes/high-availability#activate-sandbox-image-updates).
+[activation checklist](/kubernetes/high-availability#activate-sandbox-updates).
 Setting it to `true` attests that every gateway that can write the database is
 compatible and incompatible gateways cannot return. Keep it false throughout a
 rolling upgrade, including while outstanding operations from retired gateways
@@ -521,7 +524,7 @@ For a schema-v2 file, set:
 
 ```toml
 [openshell.gateway]
-enable_sandbox_image_updates = true
+enable_sandbox_updates = true
 ```
 
 The canonical Helm values form uses a dotted table key:
@@ -529,7 +532,7 @@ The canonical Helm values form uses a dotted table key:
 ```yaml
 gatewayConfig:
   "openshell.gateway":
-    enable_sandbox_image_updates: true
+    enable_sandbox_updates: true
 ```
 
 This is not an automatic mixed-version migration switch. Do not downgrade while

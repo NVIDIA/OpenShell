@@ -87,6 +87,33 @@ service ComputeDriverImageUpdates {
       returns (UpdateSandboxImageResponse);
 }
 
+// Optional extension; never send configuration changes through the image-only RPC.
+service ComputeDriverConfigurationUpdates {
+  rpc UpdateSandboxConfiguration(UpdateSandboxConfigurationRequest)
+      returns (UpdateSandboxConfigurationResponse);
+}
+
+message UpdateSandboxConfigurationRequest {
+  // Shared lifecycle, image, revision and runtime identity preconditions.
+  UpdateSandboxImageRequest image_update = 1;
+  // Absent leaves the command unchanged; empty restores the default shell.
+  SandboxMainProcessUpdate main_process = 2;
+  // Effective user environment after template inheritance. Presence replaces it.
+  SandboxEnvironmentUpdate environment = 3;
+}
+
+// Only workload argv and its existing TTY setting are carried to the driver.
+message SandboxMainProcessUpdate {
+  repeated string command = 1;
+  bool tty = 2;
+}
+
+message SandboxEnvironmentUpdate {
+  map<string, string> values = 1;
+}
+
+message UpdateSandboxConfigurationResponse {}
+
 message GetCapabilitiesRequest {
   // Gateway protocol metadata. Drivers must reject unmet requirements.
   openshell.extension.v1.PeerMetadata gateway = 1;

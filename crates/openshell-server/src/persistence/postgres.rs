@@ -31,7 +31,7 @@ static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations
 /// A protocol capability, not an exact build version or an authorization
 /// credential. Identify every pool connection, including after reconnect.
 async fn identify_image_update_writer(connection: &mut PgConnection) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT set_config('application_name', 'openshell-image-update-v1', false)")
+    sqlx::query("SELECT set_config('application_name', 'openshell-image-update-v2', false)")
         .execute(connection)
         .await?;
     Ok(())

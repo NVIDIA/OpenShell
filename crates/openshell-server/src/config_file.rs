@@ -145,7 +145,7 @@ pub struct GatewayFileSection {
     pub image_preparation_timeout_seconds: Option<u32>,
     /// Explicit activation only after the compatible deployment rollout ends.
     #[serde(default)]
-    pub enable_sandbox_image_updates: Option<bool>,
+    pub enable_sandbox_updates: Option<bool>,
     #[serde(default)]
     pub grpc_rate_limit_requests: Option<u64>,
     #[serde(default)]

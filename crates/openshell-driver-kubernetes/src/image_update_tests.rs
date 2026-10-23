@@ -310,6 +310,9 @@ async fn image_update_preserves_resource_storage_and_operator_bootstrap_annotati
             expected["metadata"]["generation"] = serde_json::json!(8);
             expected["metadata"]["annotations"][IMAGE_UPDATE_ANNOTATION] = serde_json::json!(
                 serde_json::to_string(&ImageUpdateRecord {
+                    configuration: false,
+                    command_updated: false,
+                    environment_updated: false,
                     operation_id: request().operation_id,
                     expected_image: request().expected_image,
                     image: request().image,
@@ -656,4 +659,146 @@ async fn image_update_serializes_with_other_lifecycle_operations() {
     assert!(state.lock().unwrap().calls.is_empty());
     drop(guard);
     pending.await.unwrap();
+}
+
+#[tokio::test]
+async fn configuration_update_atomically_changes_restart_inputs_and_retries_without_writes() {
+    use openshell_core::proto::compute::v1::{
+        SandboxEnvironmentUpdate, SandboxMainProcessUpdate, UpdateSandboxConfigurationRequest,
+    };
+    for version in [SANDBOX_VERSION_V1ALPHA1, SANDBOX_VERSION_V1BETA1] {
+        let (driver, state) = fixture(version, false);
+        {
+            let mut state = state.lock().unwrap();
+            state.sandbox["metadata"]["annotations"]
+                [ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC] = serde_json::json!(
+                openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(None).unwrap()
+            );
+            state.sandbox["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"name":"OPENSHELL_TEST_RUNTIME", "value":"protected"}));
+        }
+        let before = state.lock().unwrap().sandbox.clone();
+        let mut update = UpdateSandboxConfigurationRequest {
+            image_update: Some(request()),
+            main_process: Some(SandboxMainProcessUpdate {
+                command: vec!["/usr/local/bin/start-agent".into(), "--new".into()],
+                ..Default::default()
+            }),
+            environment: Some(SandboxEnvironmentUpdate {
+                values: std::collections::HashMap::from([(
+                    "AGENT_MODE".into(),
+                    "sensitive-environment-value".into(),
+                )]),
+            }),
+        };
+        update.image_update.as_mut().unwrap().validate_only = true;
+        driver.update_sandbox_configuration(&update).await.unwrap();
+        assert_eq!(state.lock().unwrap().sandbox, before);
+        update.image_update.as_mut().unwrap().validate_only = false;
+        driver.update_sandbox_configuration(&update).await.unwrap();
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.patches.len(), 1);
+            assert_eq!(
+                state.sandbox["spec"]["volumeClaimTemplates"],
+                before["spec"]["volumeClaimTemplates"]
+            );
+            let agent = &state.sandbox["spec"]["podTemplate"]["spec"]["containers"][0];
+            assert_eq!(
+                agent["command"],
+                before["spec"]["podTemplate"]["spec"]["containers"][0]["command"]
+            );
+            assert_eq!(agent["image"], update.image_update.as_ref().unwrap().image);
+            let env = agent["env"].as_array().unwrap();
+            assert!(env.iter().any(|entry| entry["name"] == "AGENT_MODE"
+                && entry["value"] == "sensitive-environment-value"));
+            assert!(
+                env.iter()
+                    .any(|entry| entry["name"] == "OPENSHELL_TEST_RUNTIME"
+                        && entry["value"] == "protected")
+            );
+            assert!(!env.iter().any(|entry| entry["name"] == "UNCHANGED"));
+            let encoded = state.sandbox["metadata"]["annotations"]
+                [ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                openshell_core::sandbox_env::MainProcessConfig::decode(encoded)
+                    .unwrap()
+                    .command,
+                update.main_process.as_ref().unwrap().command
+            );
+            let evidence = state.sandbox["metadata"]["annotations"][IMAGE_UPDATE_ANNOTATION]
+                .as_str()
+                .unwrap();
+            assert!(
+                !evidence.contains("sensitive-environment-value"),
+                "operation evidence must not contain environment values"
+            );
+        }
+        driver.update_sandbox_configuration(&update).await.unwrap();
+        assert_eq!(state.lock().unwrap().patches.len(), 1);
+        let mut changed = update.clone();
+        changed
+            .environment
+            .as_mut()
+            .unwrap()
+            .values
+            .insert("AGENT_MODE".into(), "different".into());
+        assert!(driver.update_sandbox_configuration(&changed).await.is_err());
+        changed = update.clone();
+        changed
+            .main_process
+            .as_mut()
+            .unwrap()
+            .command
+            .push("--different".into());
+        assert!(driver.update_sandbox_configuration(&changed).await.is_err());
+        update.image_update.as_mut().unwrap().expected_image =
+            update.image_update.as_ref().unwrap().image.clone();
+        update.image_update.as_mut().unwrap().revision += 1;
+        update.image_update.as_mut().unwrap().operation_id = "clear-configuration".into();
+        update.main_process.as_mut().unwrap().command.clear();
+        update.environment.as_mut().unwrap().values.clear();
+        driver.update_sandbox_configuration(&update).await.unwrap();
+        let state = state.lock().unwrap();
+        let encoded = state.sandbox["metadata"]["annotations"]
+            [ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC]
+            .as_str()
+            .unwrap();
+        let main = openshell_core::sandbox_env::MainProcessConfig::decode(encoded).unwrap();
+        assert!(main.command.is_empty() && main.tty);
+        assert_eq!(
+            state.sandbox["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn configuration_update_rejects_reserved_environment_without_writes() {
+    use openshell_core::proto::compute::v1::{
+        SandboxEnvironmentUpdate, UpdateSandboxConfigurationRequest,
+    };
+    let (driver, state) = fixture(SANDBOX_VERSION_V1BETA1, false);
+    let update = UpdateSandboxConfigurationRequest {
+        image_update: Some(request()),
+        main_process: None,
+        environment: Some(SandboxEnvironmentUpdate {
+            values: std::collections::HashMap::from([(
+                "OPENSHELL_SESSION".into(),
+                "forged".into(),
+            )]),
+        }),
+    };
+    assert!(matches!(
+        driver.update_sandbox_configuration(&update).await,
+        Err(KubernetesDriverError::InvalidArgument(_))
+    ));
+    assert!(state.lock().unwrap().calls.is_empty());
 }

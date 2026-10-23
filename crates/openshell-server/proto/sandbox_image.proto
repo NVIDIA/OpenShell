@@ -13,6 +13,11 @@ message StoredSandboxImageUpdate {
   string previous_image = 2;
   string image = 3;
   uint64 revision = 4;
+  // Absent for legacy image-only operations. Presence retains selection semantics.
+  openshell.v1.SandboxCommandUpdate command = 5;
+  openshell.v1.SandboxMapUpdate environment = 6;
+  openshell.v1.SandboxMapUpdate labels = 7;
+  openshell.v1.SandboxMapUpdate annotations = 8;
 }
 
 message StoredSandboxImageState {

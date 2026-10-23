@@ -482,7 +482,7 @@ impl ServerState {
         credentials: credentials::CredentialRuntime,
     ) -> Self {
         let replica_id = compute::lease::replica_id();
-        let compute = compute.with_sandbox_image_updates(config.enable_sandbox_image_updates);
+        let compute = compute.with_sandbox_updates(config.enable_sandbox_updates);
         compute.configure_ssh_identities(credentials.clone());
         let service_route_index = Arc::new(service_routing::ServiceRouteIndex::new(
             config.service_routing_discriminator().map(str::to_string),

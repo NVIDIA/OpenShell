@@ -74,7 +74,7 @@ impl GatewayMemberIndex {
         let payload = MemberPayload {
             replica_id: replica_id.to_string(),
             peer_endpoint: peer_endpoint.to_string(),
-            image_update_protocol: 1,
+            image_update_protocol: 2,
         };
         let bytes = serde_json::to_vec(&payload)
             .map_err(|err| PersistenceError::Encode(err.to_string()))?;

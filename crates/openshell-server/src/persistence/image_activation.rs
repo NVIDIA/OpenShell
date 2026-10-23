@@ -18,7 +18,7 @@ use openshell_core::time::now_ms;
 ///
 /// This marker describes a protocol, not an exact build version. It is neither
 /// authentication nor a security boundary: database clients can set it too.
-pub(super) const IMAGE_UPDATE_APPLICATION_NAME: &str = "openshell-image-update-v1";
+pub(super) const IMAGE_UPDATE_APPLICATION_NAME: &str = "openshell-image-update-v2";
 
 const MEMBER_OBJECT_TYPE: &str = "gateway_member";
 const MEMBER_LIMIT: u32 = 1024;
@@ -95,9 +95,9 @@ fn ensure_live_members_compatible(records: &[ObjectRecord], now: i64) -> Persist
         let protocol = member
             .get("image_update_protocol")
             .and_then(serde_json::Value::as_u64);
-        if replica_id.is_none_or(|id| id.trim().is_empty()) || protocol != Some(1) {
+        if replica_id.is_none_or(|id| id.trim().is_empty()) || protocol != Some(2) {
             return Err(PersistenceError::Config(
-                "sandbox image updates require every live gateway membership record to advertise image-update protocol 1 and a nonempty replica id"
+                "sandbox image updates require every live gateway membership record to advertise image-update protocol 2 and a nonempty replica id"
                     .into(),
             ));
         }
@@ -231,7 +231,7 @@ mod tests {
                 "gateway-member:legacy",
                 "legacy",
                 "",
-                br#"{"replica_id":"legacy","image_update_protocol":1}"#,
+                br#"{"replica_id":"legacy","image_update_protocol":2}"#,
                 None,
                 WriteCondition::MatchResourceVersion(member.resource_version),
             )
@@ -261,7 +261,7 @@ mod tests {
     fn compatible_live_members_and_empty_snapshot_pass() {
         assert!(ensure_live_members_compatible(&[], 100).is_ok());
         let member = record(
-            br#"{"replica_id":"gw-0","peer_endpoint":"https://gw-0:8443","image_update_protocol":1}"#,
+            br#"{"replica_id":"gw-0","peer_endpoint":"https://gw-0:8443","image_update_protocol":2}"#,
             100,
         );
         assert!(ensure_live_members_compatible(&[member], 100).is_ok());
@@ -276,10 +276,10 @@ mod tests {
             br"null",
             br#"{"replica_id":"gw-0"}"#,
             br#"{"replica_id":"gw-0","image_update_protocol":0}"#,
-            br#"{"replica_id":"gw-0","image_update_protocol":2}"#,
+            br#"{"replica_id":"gw-0","image_update_protocol":1}"#,
             br#"{"replica_id":"gw-0","image_update_protocol":"1"}"#,
             br#"{"replica_id":"gw-0","image_update_protocol":true}"#,
-            br#"{"replica_id":"gw-0","image_update_protocol":1.0}"#,
+            br#"{"replica_id":"gw-0","image_update_protocol":2.0}"#,
             br#"{"image_update_protocol":1}"#,
             br#"{"replica_id":"","image_update_protocol":1}"#,
             br#"{"replica_id":"  ","image_update_protocol":1}"#,
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn any_incompatible_live_member_rejects_the_snapshot() {
-        let compatible = record(br#"{"replica_id":"gw-0","image_update_protocol":1}"#, 100);
+        let compatible = record(br#"{"replica_id":"gw-0","image_update_protocol":2}"#, 100);
         let legacy = record(br#"{"replica_id":"gw-1"}"#, 100);
         assert!(ensure_live_members_compatible(&[compatible, legacy], 100).is_err());
     }

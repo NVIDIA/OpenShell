@@ -335,24 +335,33 @@ pub(super) async fn handle_update_sandbox(
     super::workspace::resolve_workspace(state.store.as_ref(), sandbox.object_workspace())
         .await?
         .ensure_active()?;
-    let mut candidate = sandbox
+    let mut candidate = sandbox.clone();
+    let spec = candidate
         .spec
-        .clone()
+        .as_mut()
         .ok_or_else(|| Status::failed_precondition("sandbox has no spec"))?;
-    candidate
-        .template
-        .get_or_insert_with(Default::default)
-        .image
-        .clone_from(&request.image);
-    validate_sandbox_spec(&request.name, &candidate)?;
-    let sandbox = state
-        .compute
-        .update_sandbox_image(
-            sandbox.object_id(),
-            request.image,
-            request.expected_resource_version,
-        )
-        .await?;
+    if let Some(image) = &request.image {
+        spec.template
+            .get_or_insert_with(Default::default)
+            .image
+            .clone_from(image);
+    }
+    openshell_core::sandbox_update::apply_configuration(
+        &mut candidate,
+        request.command.as_ref(),
+        request.environment.as_ref(),
+        request.labels.as_ref(),
+        request.annotations.as_ref(),
+    );
+    let candidate_spec = candidate.spec.as_ref().expect("spec checked above");
+    validate_sandbox_spec(&request.name, candidate_spec)?;
+
+    let sandbox = Box::pin(
+        state
+            .compute
+            .update_sandbox_configuration(sandbox.object_id(), &request),
+    )
+    .await?;
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
@@ -370,16 +379,44 @@ fn validate_image_update_request(
             "expected_resource_version must be nonzero",
         ));
     }
-    if request.image.is_empty()
-        || request.image.len() > super::MAX_TEMPLATE_STRING_LEN
-        || request
-            .image
-            .chars()
-            .any(|character| character.is_whitespace() || character.is_control())
+    if request.image.is_none()
+        && request.command.is_none()
+        && request.environment.is_none()
+        && request.labels.is_none()
+        && request.annotations.is_none()
+    {
+        return Err(Status::invalid_argument(
+            "at least one update field is required",
+        ));
+    }
+    if let Some(image) = &request.image
+        && (image.is_empty()
+            || image.len() > super::MAX_TEMPLATE_STRING_LEN
+            || image.chars().any(|c| c.is_whitespace() || c.is_control()))
     {
         return Err(Status::invalid_argument(
             "image must be a nonempty bounded OCI reference without whitespace or control characters",
         ));
+    }
+    for map in [request.labels.as_ref(), request.annotations.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        super::validation::validate_annotations(&map.values, "metadata")?;
+        if map
+            .values
+            .keys()
+            .any(|key| openshell_core::sandbox_update::is_system_metadata_key(key))
+        {
+            return Err(Status::invalid_argument(
+                "system metadata cannot be updated",
+            ));
+        }
+    }
+    if let Some(labels) = &request.labels {
+        for value in labels.values.values() {
+            super::validation::validate_label_value(value)?;
+        }
     }
     Ok(())
 }

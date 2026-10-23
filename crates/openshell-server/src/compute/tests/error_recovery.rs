@@ -209,6 +209,12 @@ async fn timeout_stop_preserves_cleanup_and_direct_start_recovery() {
                 repeated, stopped,
                 "the retained stopped transition is idempotent"
             );
+            // Docker cleanup and its snapshot poll can both report deletion of
+            // the cancelled preparation after explicit stop has returned.
+            for _ in 0..2 {
+                runtime.apply_deleted(sandbox.object_id()).await.unwrap();
+                assert_eq!(stored(&runtime, sandbox.object_id()).await, stopped);
+            }
         } else {
             let error = stop.unwrap_err();
             assert_eq!(error.code(), Code::FailedPrecondition);

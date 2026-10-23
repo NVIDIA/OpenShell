@@ -67,7 +67,7 @@ func (s *imageUpdateServer) UpdateSandbox(_ context.Context, request *pb.UpdateS
 	s.request = proto.Clone(request).(*pb.UpdateSandboxRequest)
 	return &pb.SandboxResponse{Sandbox: &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{Id: "stable-id", Name: request.Name, Workspace: request.WorkspaceScope.GetWorkspace()},
-		Spec:     &pb.SandboxSpec{Template: &pb.SandboxTemplate{Image: request.Image}},
+		Spec:     &pb.SandboxSpec{Template: &pb.SandboxTemplate{Image: request.GetImage()}},
 	}}, nil
 }
 
@@ -101,7 +101,7 @@ func TestSeparateSandboxUpdatesTransportCoexistsWithLegacyOpenShell(t *testing.T
 	request := &pb.UpdateSandboxRequest{
 		WorkspaceScope:          &dm.WorkspaceSelector{Selection: &dm.WorkspaceSelector_Workspace{Workspace: "team"}},
 		Name:                    "sandbox",
-		Image:                   "example/workload:new",
+		Image:                   proto.String("example/workload:new"),
 		ExpectedResourceVersion: 42,
 		RequestId:               "550e8400-e29b-41d4-a716-446655440000",
 	}
@@ -114,7 +114,7 @@ func TestSeparateSandboxUpdatesTransportCoexistsWithLegacyOpenShell(t *testing.T
 	require.True(t, proto.Equal(request, updatesServer.request))
 	require.Equal(t, "stable-id", response.Sandbox.Metadata.Id)
 	require.Equal(t, "team", response.Sandbox.Metadata.Workspace)
-	require.Equal(t, request.Image, response.Sandbox.Spec.Template.Image)
+	require.Equal(t, request.GetImage(), response.Sandbox.Spec.Template.Image)
 	// The old service has no accidental update endpoint.
 	err = conn.Invoke(ctx, "/openshell.v1.OpenShell/UpdateSandbox", request, &pb.SandboxResponse{})
 	require.Equal(t, codes.Unimplemented, status.Code(err))
