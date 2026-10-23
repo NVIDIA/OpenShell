@@ -30,7 +30,7 @@ Use `--harness codex` to select Codex explicitly. Other harness names are reject
 
 Use `--codex-bin "$(command -v codex)"` only when the host executable is compatible with the sandbox OS and architecture.
 
-The manifest-driven launcher at `scripts/agents/run.sh` reads `agent.yaml`, which defines the versioned immutable payload, prompt template, provider profile IDs, provider credential sources, gateway settings, skills, subagents, supporting resources, sandbox defaults, runtime mode, and harness defaults. The shared sandbox entrypoint at `scripts/agents/runtime/entrypoint.sh` starts the in-sandbox supervisor, which invokes the selected harness adapter for bounded cycles.
+The manifest-driven launcher at `scripts/agents/run.sh` reads `agent.yaml`, which defines the versioned immutable payload, prompt template, provider profile IDs, provider credential sources, sandbox settings, skills, subagents, supporting resources, sandbox defaults, runtime mode, and harness defaults. The shared sandbox entrypoint at `scripts/agents/runtime/entrypoint.sh` starts the in-sandbox supervisor, which invokes the selected harness adapter for bounded cycles.
 
 The launcher:
 
@@ -41,7 +41,7 @@ The launcher:
 - For `--harness codex`, imports `providers/codex-gator.yaml`, creates or updates the `codex-gator` provider from `$HOME/.codex/auth.json`, and stores the refresh token as gateway-only refresh material.
 - For `--harness codex`, configures gateway-managed refresh for `CODEX_AUTH_ACCESS_TOKEN` and rotates it before launching the sandbox.
 - Passes the non-secret Codex account ID from host auth as `CODEX_ACCOUNT_ID`. The harness writes it literally into `auth.json` for local workspace discovery; access tokens remain opaque provider placeholders and refresh tokens remain gateway-only.
-- Enables `agent_policy_proposals_enabled` and `proposal_approval_mode=auto` at gateway scope.
+- Enables `agent_policy_proposals_enabled` and `proposal_approval_mode=auto` on the gator sandbox only. Gateway-global values for these keys take precedence; the launcher does not change them.
 - Uses the gator image policy copied to `/etc/openshell/policy.yaml`.
 - Installs the gator-specific `gh` wrapper from `gator/bin/gh` as `/usr/local/bin/gh` to fail closed when same-head-SHA history cannot be checked, prevent duplicate dispositions, and require versioned review payloads.
 - Installs `gator/bin/review-feedback-ledger` as `/usr/local/bin/review-feedback-ledger` so reviews receive tree- and patch-aware scope, prior summaries and findings, resolution state, convergence telemetry, and the three-round Warning budget.

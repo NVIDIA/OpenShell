@@ -716,13 +716,6 @@ RUBY
 log "Staging immutable sandbox payload from '$SANDBOX_FROM'."
 prepare_immutable_sandbox_source "$SANDBOX_FROM"
 
-log "Configuring gateway settings."
-for ((setting_index = 0; setting_index < SETTING_COUNT; setting_index++)); do
-    key_var="SETTING_${setting_index}_KEY"
-    value_var="SETTING_${setting_index}_VALUE"
-    openshell_cmd settings set --global --key "${!key_var}" --value "${!value_var}" --yes >/dev/null
-done
-
 PROVIDER_ARGS=()
 for ((provider_index = 0; provider_index < PROVIDER_COUNT; provider_index++)); do
     name_var="PROVIDER_${provider_index}_NAME"
@@ -844,3 +837,18 @@ run_agent_sandbox() {
 
 log "Launching $AGENT_DISPLAY_NAME sandbox '$SANDBOX_NAME' on gateway '$GATEWAY'."
 run_agent_sandbox
+
+# Scope manifest settings to this sandbox so launches never change gateway-wide
+# behavior for other users. The supervisor picks them up on its settings poll.
+# A failure leaves the gateway default (manual proposal approval) in effect, so
+# warn instead of tearing down the running sandbox.
+if ((SETTING_COUNT > 0)); then
+    log "Configuring sandbox settings."
+fi
+for ((setting_index = 0; setting_index < SETTING_COUNT; setting_index++)); do
+    key_var="SETTING_${setting_index}_KEY"
+    value_var="SETTING_${setting_index}_VALUE"
+    if ! openshell_cmd settings set "$SANDBOX_NAME" --key "${!key_var}" --value "${!value_var}" >/dev/null; then
+        log "warning: could not set '${!key_var}' on sandbox '$SANDBOX_NAME'; if the gateway manages it globally, the global value applies."
+    fi
+done
