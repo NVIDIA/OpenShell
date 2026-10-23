@@ -784,6 +784,15 @@ If the gateway pod is pending with `MountVolume.SetUp failed for volume
 `templates/certgen.yaml` output and the hook Job logs; cert-manager creates TLS
 Secrets but does not create the sandbox JWT signing Secret.
 
+Operator certificates can be issued with a standalone cert-manager `Certificate`
+using the chart's existing `<fullname>-ca-issuer`. Verify exact `OU=operator`,
+client authentication usage, and a chain trusted by the gateway client CA.
+Authorization needs `gatewayConfig["openshell.gateway.mtls_auth"].operator_enabled=true`
+and direct mTLS. Check the standalone Certificate's Ready condition and its
+Secret's subject and expiry. Keep this dedicated Secret outside gateway,
+supervisor, and workload pods. Exported CLI certificate/key files need refreshing
+after renewal. See Managing Certificates in the published Kubernetes docs.
+
 If the gateway exits with `failed to read sandbox JWT signing key from
 /etc/openshell-jwt/signing.pem`, verify that `openshell-jwt-keys` contains
 `signing.pem`, `public.pem`, and `kid`, and that the gateway workload mounts the

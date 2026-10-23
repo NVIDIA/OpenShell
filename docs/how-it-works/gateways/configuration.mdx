@@ -317,13 +317,20 @@ Set `[openshell.gateway.mtls_auth] enabled = true` to map a verified client cert
 
 Set `[openshell.gateway.mtls_auth] operator_enabled = true`,
 `--enable-operator-auth true`, or `OPENSHELL_ENABLE_OPERATOR_AUTH=true` to enable
-direct mTLS operators. The default is false. TLS and a client CA are required.
+an operator application or user to authenticate through direct mTLS as a gateway
+administrative principal. The default is false. TLS and a client CA are required.
 This setting is independent of `enabled` and OIDC. A verified certificate with
 the exact `OU=operator` grants user/platform-admin capabilities across all
 workspaces and access to `GetProviderCredentials`. Do not combine an operator
 certificate with an `Authorization` header. See
 [Authentication](/how-it-works/gateways/authentication#mtls-operators) for the
 certificate trust boundary.
+
+On Helm deployments, set
+`gatewayConfig["openshell.gateway.mtls_auth"].operator_enabled=true` and use an
+operator client certificate signed by a trusted client CA.
+See [Managing Certificates](/kubernetes/managing-certificates#issue-an-operator-client-certificate)
+for an example using cert-manager to issue an operator client certificate.
 
 The client-certificate handshake policy has no `require_client_auth` TOML field. Client certificates are optional at the transport layer; gateway RPC authorization enforces the configured user or sandbox identity.
 
