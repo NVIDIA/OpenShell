@@ -73,8 +73,8 @@ NOTES:
     x86_64/aarch64, depending on the host package manager. Set
     OPENSHELL_INSTALL_METHOD=snap to install the OpenShell snap instead; hosts
     that already have the OpenShell snap keep refreshing it. snap installs use
-    latest/stable by default and latest/edge for dev, and do not support
-    explicit release tags or prereleases. The OpenShell snap requires a running
+    latest/stable by default, latest/beta for pre, and latest/edge for dev. They
+    do not support explicit release tags. The OpenShell snap requires a running
     Docker Engine installed from a system package or Docker's package
     repository. The Docker snap is not currently compatible with OpenShell.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
@@ -1271,6 +1271,7 @@ install_linux_rpm() {
 openshell_snap_channel() {
   case "${OPENSHELL_VERSION:-}" in
     dev) printf '%s\n' "latest/edge" ;;
+    pre) printf '%s\n' "latest/beta" ;;
     '') printf '%s\n' "latest/stable" ;;
     *) error "snap installs do not support OPENSHELL_VERSION=${OPENSHELL_VERSION}; use a native package" ;;
   esac

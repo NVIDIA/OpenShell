@@ -327,6 +327,7 @@ Pre-release builds, then publishes and calls `release-qualification.yml` in
 parallel within the same run, using native job dependencies.
 Its platform package artifacts are uploaded after versioned images and the chart,
 so the installer can use them while qualification runs or after it fails.
+The pre-release snap artifact is published to the `latest/beta` channel.
 The implemented `release-tag-v1` profile is an incremental subset of RFC 0014
 qualification. Failed checks fail the parent workflow and retain evidence in Actions.
 
@@ -644,7 +645,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by prerelease previews, notes-only previews, and stable publication when no preview is reused. |
 | `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev, Release, and Pre-release without Store credentials or publication. |
-| `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts to the Store without rebuilding. Release Dev calls it directly for `latest/edge` after snap builds and requires it to succeed before creating the dev release. Release calls it through `release-publish.yml` for `latest/stable` after qualification and release publication succeed. |
+| `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts directly to a Store channel without rebuilding. Release Dev uses `latest/edge`, Pre-release uses `latest/beta`, and Release uses `latest/stable` for the stable rebuild. Tagged beta and stable publication recheck repository tags before updating their floating channels. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts

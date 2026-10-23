@@ -63,6 +63,8 @@ jobs:
       python-version: ${{ needs.build.outputs.python_version }}
       npm-version: ${{ needs.build.outputs.npm_version }}
       is-prerelease: true
+    secrets:
+      SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   qualify:
     name: Qualify
