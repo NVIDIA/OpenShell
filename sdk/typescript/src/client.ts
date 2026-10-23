@@ -40,6 +40,7 @@ import {
 import type { EffectiveSetting, GetSandboxConfigResponse, SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
 import { PolicySource, type SandboxPolicySchema, SettingScope, type SettingValueSchema } from './gen/sandbox_pb.js';
 import { ProviderClient } from './providers.js';
+import { heldUntilReady, OWNER_REPLICA_HEADER, OWNER_REQUEST_HEADER, routedStream } from './routing.js';
 import { validateSshResponse } from './ssh-validate.js';
 import { buildTransport, type ConnectOptions } from './transport.js';
 
@@ -1282,6 +1283,29 @@ export class SandboxClient {
     }
   }
 
+  // get() that also asks the gateway which replica owns the supervisor session.
+  private async getWithOwner(
+    name: string,
+    options?: SandboxCallOptions | null,
+  ): Promise<{ ref: SandboxRef; owner?: string }> {
+    let owner: string | undefined;
+    try {
+      const resp = await this.grpc.getSandbox(
+        { ...namedTarget(name, options) },
+        {
+          ...requestCallOptions(options),
+          headers: { [OWNER_REQUEST_HEADER]: '1' },
+          onHeader: (header) => {
+            owner = header.get(OWNER_REPLICA_HEADER) || undefined;
+          },
+        },
+      );
+      return { ref: sandboxRef(resp.sandbox), owner };
+    } catch (e) {
+      throw fromConnect(e);
+    }
+  }
+
   list(options?: ListOptions | null): Pager<SandboxRef> {
     return new Pager(async (pageToken) => {
       try {
@@ -1385,22 +1409,22 @@ export class SandboxClient {
   ): AsyncGenerator<ExecStreamEvent, void, void> {
     try {
       // Preserve the existing preflight so lookup failures surface before the stream starts.
-      await this.get(name, {
+      const { owner } = await this.getWithOwner(name, {
         workspace: options?.workspace,
         ...(options?.signal ? { signal: options.signal } : {}),
       });
-      const stream = this.grpc.execSandbox(
-        {
-          ...sandboxTarget(name, options),
-          command,
-          workdir: options?.workdir ?? '',
-          environment: options?.environment ?? {},
-          executionTimeout: durationFromSeconds(options?.timeoutSecs ?? 0),
-          stdin: options?.stdin ? new Uint8Array(options.stdin) : new Uint8Array(),
-          tty: false,
-          noLoginShell: options?.noLoginShell ?? false,
-        },
-        { signal: options?.signal },
+      const request = {
+        ...sandboxTarget(name, options),
+        command,
+        workdir: options?.workdir ?? '',
+        environment: options?.environment ?? {},
+        executionTimeout: durationFromSeconds(options?.timeoutSecs ?? 0),
+        stdin: options?.stdin ? new Uint8Array(options.stdin) : new Uint8Array(),
+        tty: false,
+        noLoginShell: options?.noLoginShell ?? false,
+      };
+      const stream = routedStream(owner, ({ headers, onHeader }) =>
+        this.grpc.execSandbox(request, { signal: options?.signal, headers, onHeader }),
       );
 
       let sawExit = false;
@@ -1541,14 +1565,18 @@ export class SandboxClient {
     command: string[],
     options?: ExecInteractiveOptions | null,
   ): Promise<ExecInteractiveSessionControl> {
+    let owner: string | undefined;
     try {
-      await this.get(name, { workspace: options?.workspace, ...(options?.signal ? { signal: options.signal } : {}) });
+      ({ owner } = await this.getWithOwner(name, {
+        workspace: options?.workspace,
+        ...(options?.signal ? { signal: options.signal } : {}),
+      }));
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);
     }
 
     const input = new Pushable<MessageInitShape<typeof ExecSandboxInputSchema>>();
-    input.push({
+    const start: MessageInitShape<typeof ExecSandboxInputSchema> = {
       payload: {
         case: 'start',
         value: {
@@ -1564,7 +1592,7 @@ export class SandboxClient {
           noLoginShell: options?.noLoginShell ?? false,
         },
       },
-    });
+    };
 
     const controller = new AbortController();
     const signal = options?.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
@@ -1618,7 +1646,9 @@ export class SandboxClient {
         if (signal.aborted) throw new SdkError('canceled', 'exec cancelled');
         // Start and observe the transport immediately, independently of output
         // consumption. Backpressure bounds the queue to 16 chunks of 64 KiB.
-        const stream = grpc.execSandboxInteractive(input, { signal });
+        const stream = routedStream(owner, ({ headers, onHeader, ready }) =>
+          grpc.execSandboxInteractive(heldUntilReady(start, input, ready), { signal, headers, onHeader }),
+        );
         for await (const event of stream) {
           if (signal.aborted) throw new SdkError('canceled', 'exec cancelled');
           if (exitCode !== undefined) {
@@ -1713,12 +1743,18 @@ export class SandboxClient {
     const localPort = opts.localPort ?? 0;
 
     let sandboxId: string;
+    let owner: string | undefined;
     try {
-      const ref = await this.get(name, { workspace: opts.workspace, ...(opts.signal ? { signal: opts.signal } : {}) });
+      const found = await this.getWithOwner(name, {
+        workspace: opts.workspace,
+        ...(opts.signal ? { signal: opts.signal } : {}),
+      });
+      const ref = found.ref;
       if (ref.phase !== 'ready') {
         throw new SdkError('connect', `sandbox '${name}' is not ready (phase: ${ref.phase})`);
       }
       sandboxId = ref.id;
+      owner = found.owner;
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);
     }
@@ -1744,6 +1780,7 @@ export class SandboxClient {
         opts.workspace,
         targetHost,
         targetPort,
+        owner,
         controller.signal,
       )
         .catch((error: unknown) => {
@@ -1828,6 +1865,7 @@ export class SandboxClient {
     workspace: string | undefined,
     targetHost: string,
     targetPort: number,
+    owner: string | undefined,
     signal: AbortSignal,
   ): Promise<void> {
     let token: string | undefined;
@@ -1840,7 +1878,7 @@ export class SandboxClient {
       // tears down this one socket via the catch below.
       validateSshResponse(session, sandboxId);
       token = session.token;
-      input.push({
+      const init: MessageInitShape<typeof TcpForwardFrameSchema> = {
         payload: {
           case: 'init',
           value: {
@@ -1853,7 +1891,7 @@ export class SandboxClient {
             authorizationToken: token,
           },
         },
-      });
+      };
 
       socket.on('data', (chunk: Buffer) => {
         for (let off = 0; off < chunk.length; off += FORWARD_CHUNK) {
@@ -1875,7 +1913,10 @@ export class SandboxClient {
       signal.addEventListener('abort', onAbort, { once: true });
 
       try {
-        for await (const frame of this.grpc.forwardTcp(input, { signal })) {
+        const frames = routedStream(owner, ({ headers, onHeader, ready }) =>
+          this.grpc.forwardTcp(heldUntilReady(init, input, ready), { signal, headers, onHeader }),
+        );
+        for await (const frame of frames) {
           if (frame.payload.case !== 'data') continue;
           const data = frame.payload.value;
           if (data.length === 0) continue;
