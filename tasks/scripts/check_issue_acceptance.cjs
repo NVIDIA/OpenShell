@@ -6,7 +6,6 @@ module.exports = async function checkIssueAcceptance({ github, context, core }) 
   const { data: pr } = await github.rest.pulls.get({
     owner, repo, pull_number: context.payload.pull_request.number,
   });
-  if (pr.state !== 'open') return;
   const author = pr.user.login;
 
   async function evaluate() {
@@ -74,17 +73,5 @@ module.exports = async function checkIssueAcceptance({ github, context, core }) 
   }
 
   const failure = await evaluate();
-  if (failure) {
-    core.setFailed(failure);
-    if (!pr.draft) {
-      await github.graphql(`
-        mutation($pullRequestId: ID!) {
-          convertPullRequestToDraft(input: { pullRequestId: $pullRequestId }) {
-            pullRequest { isDraft }
-          }
-        }
-      `, { pullRequestId: pr.node_id });
-      core.info(`Converted PR #${pr.number} to draft because issue acceptance failed.`);
-    }
-  }
+  if (failure) core.setFailed(failure);
 };

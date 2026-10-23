@@ -5,12 +5,12 @@ name: PR Issue Acceptance
 
 on:
   pull_request_target:
-    types: [opened, edited, reopened, synchronize, ready_for_review]
+    types: [opened, edited, reopened, synchronize]
 
 permissions:
   contents: read
   issues: read
-  pull-requests: write
+  pull-requests: read
 
 concurrency:
   group: pr-issue-acceptance-${{ github.event.pull_request.number }}
