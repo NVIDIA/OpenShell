@@ -41,6 +41,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     environment: ${{ inputs.github-environment }}
+    concurrency:
+      group: snap-publish-${{ inputs.upload-channel }}-${{ matrix.arch }}
+      cancel-in-progress: false
+      queue: max
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: inputs.release-tag != ''
