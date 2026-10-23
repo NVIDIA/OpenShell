@@ -229,6 +229,11 @@ path = "tests/sandbox_templates.rs"
 required-features = ["e2e"]
 
 [[test]]
+name = "supervisor_middleware_http_session"
+path = "tests/supervisor_middleware_http_session.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
 name = "proxy_egress_pipeline"
 path = "tests/proxy_egress_pipeline.rs"
 required-features = ["e2e-host-gateway"]
@@ -279,6 +284,7 @@ url = "2"
 nix = { version = "0.29", features = ["process", "signal", "term", "user"] }
 
 [dev-dependencies]
+flate2 = "1"
 serial_test = "3"
 
 [lints.rust]

@@ -12408,6 +12408,18 @@ network_middlewares:
                 "invalid middleware configuration",
             ),
             (
+                "selector with a port",
+                r#"
+network_middlewares:
+  redactor:
+    middleware: openshell/regex
+    endpoints:
+      include: ["api.example.com"]
+      exclude: ["api.example.com:22"]
+"#,
+                "invalid middleware configuration",
+            ),
+            (
                 "tls skip selector",
                 r#"
 network_middlewares:

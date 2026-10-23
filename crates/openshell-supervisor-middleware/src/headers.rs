@@ -15,7 +15,17 @@ pub const MAX_HEADER_MUTATION_BYTES: usize = 32 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderAuthority {
     Request,
+    /// An HTTP session hook request head. Body-mode offers come from the
+    /// original head, so `Content-Encoding` is read-only too: a stage must
+    /// not relabel a body it replaced.
+    SessionRequest,
+    RequestTrailers,
     Response,
+    /// An HTTP session hook response head. Unlike legacy response hooks,
+    /// a stage may write integrity headers such as `ETag` and
+    /// `Content-Digest`. They are not stripped when a body changes: the stage
+    /// that changes the body owns them.
+    SessionResponse,
     ResponseTrailers,
 }
 
@@ -132,7 +142,64 @@ pub fn apply(
             count: mutations.len(),
         });
     }
+    apply_checked(
+        authority,
+        existing_headers,
+        connection_nominated_headers,
+        mutations,
+        true,
+    )
+}
 
+/// Apply the mutations of several middleware responses, each of which
+/// [`apply`] already accepted, in order. Every rule except the per-response
+/// count and size limits applies.
+pub fn apply_accumulated(
+    authority: HeaderAuthority,
+    existing_headers: &[HttpHeader],
+    connection_nominated_headers: &[String],
+    mutations: &[HeaderMutation],
+) -> Result<Vec<HttpHeader>, HeaderMutationError> {
+    apply_checked(
+        authority,
+        existing_headers,
+        connection_nominated_headers,
+        mutations,
+        false,
+    )
+}
+
+/// Reject mutations of the headers an HTTP session hook request head omits
+/// because their values carry a credential placeholder. A stage cannot see
+/// them, so it cannot write or remove them either.
+pub fn reject_credential_reference_mutations(
+    credential_reference_headers: &[String],
+    mutations: &[HeaderMutation],
+) -> Result<(), HeaderMutationError> {
+    for mutation in mutations {
+        let name = match mutation.operation.as_ref() {
+            Some(header_mutation::Operation::Write(write)) => &write.name,
+            Some(header_mutation::Operation::Remove(remove)) => &remove.name,
+            // `apply` reports an empty mutation.
+            None => continue,
+        };
+        if credential_reference_headers
+            .iter()
+            .any(|hidden| hidden.eq_ignore_ascii_case(name))
+        {
+            return Err(HeaderMutationError::Protected { name: name.clone() });
+        }
+    }
+    Ok(())
+}
+
+fn apply_checked(
+    authority: HeaderAuthority,
+    existing_headers: &[HttpHeader],
+    connection_nominated_headers: &[String],
+    mutations: &[HeaderMutation],
+    limit_size: bool,
+) -> Result<Vec<HttpHeader>, HeaderMutationError> {
     let mut headers = existing_headers.to_vec();
     let mut mutation_bytes = 0usize;
     for mutation in mutations {
@@ -140,10 +207,12 @@ pub fn apply(
             Some(header_mutation::Operation::Write(write)) => {
                 let name = validate_name(&write.name)?;
                 validate_authority(authority, MutationKind::Write, &write.name, &name)?;
-                if authority == HeaderAuthority::ResponseTrailers
-                    && !existing_headers
-                        .iter()
-                        .any(|existing| existing.name.eq_ignore_ascii_case(&name))
+                if matches!(
+                    authority,
+                    HeaderAuthority::RequestTrailers | HeaderAuthority::ResponseTrailers
+                ) && !existing_headers
+                    .iter()
+                    .any(|existing| existing.name.eq_ignore_ascii_case(&name))
                 {
                     return Err(HeaderMutationError::AbsentTrailerName {
                         name: write.name.clone(),
@@ -167,7 +236,9 @@ pub fn apply(
                 mutation_bytes = mutation_bytes
                     .saturating_add(name.len())
                     .saturating_add(write.value.len());
-                enforce_size_limit(mutation_bytes)?;
+                if limit_size {
+                    enforce_size_limit(mutation_bytes)?;
+                }
 
                 let action = ExistingHeaderAction::try_from(write.on_existing)
                     .map_err(|_| HeaderMutationError::InvalidExistingAction)?;
@@ -201,7 +272,9 @@ pub fn apply(
                     });
                 }
                 mutation_bytes = mutation_bytes.saturating_add(name.len());
-                enforce_size_limit(mutation_bytes)?;
+                if limit_size {
+                    enforce_size_limit(mutation_bytes)?;
+                }
                 headers.retain(|existing| existing.name != name);
             }
             None => return Err(HeaderMutationError::Empty),
@@ -240,12 +313,19 @@ fn validate_authority(
     normalized_name: &str,
 ) -> Result<(), HeaderMutationError> {
     let protected = match authority {
-        HeaderAuthority::Request => is_request_protected(normalized_name),
+        HeaderAuthority::Request | HeaderAuthority::RequestTrailers => {
+            is_request_protected(normalized_name)
+        }
+        HeaderAuthority::SessionRequest => {
+            is_request_protected(normalized_name) || normalized_name == "content-encoding"
+        }
         HeaderAuthority::Response => {
             is_response_protected(normalized_name)
                 || (kind == MutationKind::Write && is_response_remove_only(normalized_name))
         }
-        HeaderAuthority::ResponseTrailers => is_response_protected(normalized_name),
+        HeaderAuthority::SessionResponse | HeaderAuthority::ResponseTrailers => {
+            is_response_protected(normalized_name)
+        }
     };
     if protected {
         return Err(HeaderMutationError::Protected {
@@ -654,6 +734,50 @@ mod tests {
     }
 
     #[test]
+    fn session_response_authority_lets_stages_own_integrity_headers() {
+        let existing = [
+            header("etag", "\"upstream\""),
+            header("content-length", "5"),
+        ];
+        let updated = apply(
+            HeaderAuthority::SessionResponse,
+            &existing,
+            &[],
+            &[
+                write("ETag", "\"rewritten\"", ExistingHeaderAction::Overwrite),
+                write(
+                    "Content-Digest",
+                    "sha-256=:abc=:",
+                    ExistingHeaderAction::Overwrite,
+                ),
+            ],
+        )
+        .expect("session stages may write integrity headers");
+        assert_eq!(
+            updated,
+            vec![
+                header("content-length", "5"),
+                header("etag", "\"rewritten\""),
+                header("content-digest", "sha-256=:abc=:"),
+            ]
+        );
+        // Framing and coding headers stay protected.
+        for mutation in [
+            remove("Content-Length"),
+            write("Content-Encoding", "gzip", ExistingHeaderAction::Overwrite),
+        ] {
+            let error = apply(
+                HeaderAuthority::SessionResponse,
+                &existing,
+                &[],
+                &[mutation],
+            )
+            .expect_err("protected session response mutation");
+            assert!(matches!(error, HeaderMutationError::Protected { .. }));
+        }
+    }
+
+    #[test]
     fn response_authority_keeps_visible_body_metadata_read_only() {
         let existing = [
             header("content-length", "5"),
@@ -670,6 +794,70 @@ mod tests {
                 assert!(matches!(error, HeaderMutationError::Protected { .. }));
             }
         }
+    }
+
+    #[test]
+    fn credential_reference_headers_reject_writes_and_removals() {
+        let hidden = ["x-api-key".to_string()];
+        for mutation in [
+            write("X-Api-Key", "replacement", ExistingHeaderAction::Overwrite),
+            remove("x-api-key"),
+        ] {
+            assert_eq!(
+                reject_credential_reference_mutations(&hidden, std::slice::from_ref(&mutation)),
+                Err(HeaderMutationError::Protected {
+                    name: match mutation.operation {
+                        Some(header_mutation::Operation::Write(write)) => write.name,
+                        Some(header_mutation::Operation::Remove(remove)) => remove.name,
+                        None => unreachable!(),
+                    },
+                })
+            );
+        }
+        assert_eq!(
+            reject_credential_reference_mutations(
+                &hidden,
+                &[write("x-trace", "one", ExistingHeaderAction::Append)]
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn session_request_authority_keeps_content_encoding_read_only() {
+        let existing = [header("content-encoding", "gzip")];
+        for mutation in [
+            write(
+                "Content-Encoding",
+                "identity",
+                ExistingHeaderAction::Overwrite,
+            ),
+            remove("Content-Encoding"),
+        ] {
+            let error = apply(
+                HeaderAuthority::SessionRequest,
+                &existing,
+                &[],
+                std::slice::from_ref(&mutation),
+            )
+            .expect_err("read-only session request coding");
+            assert!(matches!(error, HeaderMutationError::Protected { .. }));
+            // Legacy request hooks keep their released rules.
+            apply(HeaderAuthority::Request, &existing, &[], &[mutation])
+                .expect("legacy request coding mutation");
+        }
+        let error = apply(
+            HeaderAuthority::SessionRequest,
+            &[],
+            &[],
+            &[write(
+                "Content-Encoding",
+                "gzip",
+                ExistingHeaderAction::Overwrite,
+            )],
+        )
+        .expect_err("cannot label a plaintext body as encoded");
+        assert!(matches!(error, HeaderMutationError::Protected { .. }));
     }
 
     #[test]

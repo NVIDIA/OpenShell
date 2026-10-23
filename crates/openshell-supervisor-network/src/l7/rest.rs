@@ -8,16 +8,22 @@
 //! and chunked transfer encoding for body framing.
 
 mod http_response;
+mod request_body;
 
 pub(crate) use http_response::{
     DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT, HttpResponseMiddlewareRelay,
 };
-use http_response::{RelayResponseOptions, relay_response};
+use http_response::{RelayResponseOptions, finish_response, relay_response};
 #[cfg(test)]
 use http_response::{
     http_response_middleware_fail_open_finding_event, http_response_middleware_invocation_events,
     parse_connection_close, parse_status_code, response_is_event_stream,
     strip_response_integrity_headers,
+};
+pub(crate) use request_body::{
+    LiveRequestFailure, RequestBodyReader, prepare_request_body_stream,
+    rebuild_request_for_live_body, rebuild_request_headers_only,
+    rebuild_request_with_middleware_body,
 };
 
 use crate::l7::EndpointObserver;
@@ -44,10 +50,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
 const MAX_HEADER_BYTES: usize = 16384; // 16 KiB for HTTP headers
-const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
 /// Maximum body bytes for `SigV4` body-signing mode. Larger than the credential
 /// rewrite limit because Bedrock payloads can be several megabytes.
-const MAX_SIGV4_BODY_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_SIGV4_BODY_BYTES: usize = 10 * 1024 * 1024;
 #[cfg(test)]
 async fn max_middleware_body_bytes() -> usize {
     let chain = openshell_supervisor_middleware::ChainRunner::new(
@@ -755,6 +761,7 @@ where
             websocket_extensions: WebSocketExtensionMode::Preserve,
             request_body_credential_rewrite: false,
             deny_uninspected_credentials: false,
+            identity_response_coding: false,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: "",
             signing_region: "",
@@ -783,6 +790,11 @@ pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) websocket_extensions: WebSocketExtensionMode,
     pub(crate) request_body_credential_rewrite: bool,
     pub(crate) deny_uninspected_credentials: bool,
+    /// Ask the upstream for an identity-coded response.
+    ///
+    /// The relay sets it when an HTTP session hook response stage may inspect
+    /// the body.
+    pub(crate) identity_response_coding: bool,
     pub(crate) credential_signing: crate::l7::CredentialSigning,
     pub(crate) signing_service: &'a str,
     pub(crate) signing_region: &'a str,
@@ -901,8 +913,39 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    Box::pin(relay_http_request_with_body_guarded_observed(
+        req,
+        client,
+        upstream,
+        options,
+        None,
+        response_middleware,
+        observer,
+    ))
+    .await
+}
+
+/// Relay one request and its response. `live_body` carries a body that HTTP
+/// session hook request middleware streams; `req` then holds only its head.
+pub(crate) async fn relay_http_request_with_body_guarded_observed<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    options: RelayRequestOptions<'_>,
+    live_body: Option<&mut crate::l7::middleware::RequestBodyStream>,
+    response_middleware: Option<HttpResponseMiddlewareRelay<'_>>,
+    observer: Option<&EndpointObserver>,
+) -> Result<RelayOutcome>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
     let mut observed_upstream = ObservedUpstream { upstream, observer };
     let upstream = &mut observed_upstream;
+    let mut options = options;
+    if let Some(middleware) = response_middleware.as_ref() {
+        options.identity_response_coding = middleware.inspects_bodies().await;
+    }
     ensure_credential_generation_current(options)?;
     let header_end = req
         .raw_header
@@ -912,6 +955,39 @@ where
     let header_str = std::str::from_utf8(&req.raw_header[..header_end])
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
     let client_requested_upgrade = client_requested_upgrade(header_str);
+    if let Some(body) = live_body {
+        // Signing, body rewriting, and MCP validation need the whole body, so
+        // their routes withhold middleware output instead.
+        if options.credential_signing.is_sigv4()
+            || options.request_body_credential_rewrite
+            || options.mcp_request_validation.is_some()
+        {
+            return Err(miette!(
+                "this route cannot stream a request middleware body to the upstream"
+            ));
+        }
+        let relayed = request_body::relay_live_request_and_response(
+            req,
+            client,
+            upstream,
+            body,
+            options,
+            RelayResponseOptions {
+                websocket_extensions: options.websocket_extensions,
+                websocket: None,
+                client_requested_upgrade,
+                observer,
+            },
+            response_middleware,
+        )
+        .await;
+        if let Err(error) = &relayed
+            && let Some(reason) = error.downcast_ref::<BodyCredentialError>()
+        {
+            emit_uninspected_body_credential_denial(req, &options, *reason);
+        }
+        return relayed;
+    }
     let is_websocket_request = request_is_websocket_upgrade(&req.raw_header[..header_end]);
     let websocket_request = if options.websocket_extensions == WebSocketExtensionMode::Preserve {
         None
@@ -935,7 +1011,10 @@ where
         options.websocket_extensions,
         websocket_request.is_some(),
     )?;
-    let header_bytes = strip_connection_nominated_headers(&header_bytes, is_websocket_request)?;
+    let mut header_bytes = strip_connection_nominated_headers(&header_bytes, is_websocket_request)?;
+    if options.identity_response_coding {
+        header_bytes = require_identity_response_coding(&header_bytes)?;
+    }
     let websocket_response =
         websocket_request
             .as_ref()
@@ -2325,6 +2404,15 @@ fn strip_connection_nominated_headers(
     Ok(out)
 }
 
+/// Replace every `Accept-Encoding` field with `identity`.
+///
+/// A request without the field lets the server choose any content coding, so
+/// the field is set rather than removed.
+fn require_identity_response_coding(headers: &[u8]) -> Result<Vec<u8>> {
+    let headers = strip_header(headers, "accept-encoding")?;
+    Ok(append_header(&headers, "Accept-Encoding", "identity"))
+}
+
 fn append_header(headers: &[u8], name: &str, value: &str) -> Vec<u8> {
     let split = headers
         .windows(4)
@@ -2340,7 +2428,10 @@ fn append_header(headers: &[u8], name: &str, value: &str) -> Vec<u8> {
     out
 }
 
-fn apply_header_mutations(headers: &[u8], mutations: &[HeaderMutation]) -> Result<Vec<u8>> {
+pub(crate) fn apply_header_mutations(
+    headers: &[u8],
+    mutations: &[HeaderMutation],
+) -> Result<Vec<u8>> {
     let mut out = headers.to_vec();
     for mutation in mutations {
         match mutation.operation.as_ref() {
@@ -2468,7 +2559,7 @@ pub(crate) fn upgrade_refusal_for_protocol(
 /// upstream `101` may reach the client. A refusal based on this test therefore
 /// covers every request either one treats as an upgrade. Headers that are not
 /// UTF-8 return false; the shared relay rejects them before forwarding.
-fn request_has_upgrade_header(raw_header: &[u8]) -> bool {
+pub(crate) fn request_has_upgrade_header(raw_header: &[u8]) -> bool {
     let header_end = raw_header
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -2835,16 +2926,39 @@ pub(crate) async fn send_middleware_deny_response<C: AsyncWrite + Unpin>(
 ///
 /// Unlike an L7 policy denial, a middleware failure does not indicate a
 /// missing policy rule. The response therefore omits policy-advisor guidance
-/// and does not include the middleware runtime's diagnostic text.
+/// and does not include the middleware runtime's diagnostic text. An HTTP
+/// session hook failure carries its platform-owned code and stage.
 pub(crate) async fn send_middleware_failure_response<C: AsyncWrite + Unpin>(
     req: &L7Request,
     policy_name: &str,
+    failure: Option<&openshell_supervisor_middleware::MiddlewareFailureDetail>,
     client: &mut C,
     redacted_target: Option<&str>,
     context: Option<DenyResponseContext<'_>>,
 ) -> Result<()> {
-    let body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    let mut body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    if let Some(failure) = failure {
+        insert_middleware_failure(&mut body, failure);
+    }
     send_forbidden_json(policy_name, body, client).await
+}
+
+/// Add a middleware failure's stage and platform-owned code to a response
+/// body.
+pub(crate) fn insert_middleware_failure(
+    body: &mut serde_json::Value,
+    failure: &openshell_supervisor_middleware::MiddlewareFailureDetail,
+) {
+    let serde_json::Value::Object(fields) = body else {
+        return;
+    };
+    if let Some(config_name) = &failure.config_name {
+        fields.insert("middleware".to_string(), serde_json::json!(config_name));
+    }
+    fields.insert(
+        "failure_code".to_string(),
+        serde_json::json!(failure.code.as_str()),
+    );
 }
 
 /// Send a platform-owned availability response when shared middleware work
@@ -2856,8 +2970,35 @@ pub(crate) async fn send_middleware_unavailable_response<C: AsyncWrite + Unpin>(
     redacted_target: Option<&str>,
     context: Option<DenyResponseContext<'_>>,
 ) -> Result<()> {
-    let body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    let mut body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    insert_middleware_failure(
+        &mut body,
+        &openshell_supervisor_middleware::MiddlewareFailureDetail {
+            config_name: None,
+            code: openshell_supervisor_middleware::HttpFailureCode::Unavailable,
+        },
+    );
     send_json_response(policy_name, body, client, "503 Service Unavailable").await
+}
+
+/// Send a platform-owned 408 when the sandbox stops sending a request body
+/// that request middleware is processing.
+pub(crate) async fn send_request_timeout_response<C: AsyncWrite + Unpin>(
+    req: &L7Request,
+    policy_name: &str,
+    client: &mut C,
+    redacted_target: Option<&str>,
+    context: Option<DenyResponseContext<'_>>,
+) -> Result<()> {
+    let mut body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    if let serde_json::Value::Object(fields) = &mut body {
+        fields.insert("error".to_string(), serde_json::json!("request_timeout"));
+        fields.insert(
+            "detail".to_string(),
+            serde_json::json!("Request body was not received in time"),
+        );
+    }
+    send_json_response(policy_name, body, client, "408 Request Timeout").await
 }
 
 async fn send_forbidden_json<C: AsyncWrite + Unpin>(
@@ -5275,6 +5416,23 @@ mod tests {
     }
 
     #[test]
+    fn identity_response_coding_replaces_every_accept_encoding_field() {
+        for raw in [
+            &b"GET /api HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip, br\r\naccept-encoding: zstd;q=0.5\r\nX-Visible: yes\r\n\r\n"[..],
+            // Without the field the server may choose any coding.
+            b"GET /api HTTP/1.1\r\nHost: x\r\nX-Visible: yes\r\n\r\n",
+        ] {
+            let rewritten = require_identity_response_coding(raw).expect("rewrite request head");
+            let rewritten = String::from_utf8(rewritten).unwrap();
+
+            assert_eq!(
+                rewritten,
+                "GET /api HTTP/1.1\r\nHost: x\r\nX-Visible: yes\r\nAccept-Encoding: identity\r\n\r\n"
+            );
+        }
+    }
+
+    #[test]
     fn connection_sanitization_preserves_only_websocket_upgrade_exception() {
         let raw = b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: h2c\r\nUpgrade: h2c, websocket\r\nConnection: keep-alive, Upgrade, x-guard\r\nX-Guard: hidden\r\n\r\n";
         let sanitized =
@@ -6852,7 +7010,22 @@ mod tests {
             policy_name: "test-policy",
             generation_guard: None,
             whole_body_timeout: DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+            client_accepts_chunked: true,
+            request_head: Some(forwarded_request_head(&format!(
+                "{method} /data HTTP/1.1\r\nHost: example.test\r\n\r\n"
+            ))),
         }
+    }
+
+    /// The forwarded head of a request whose raw head is `raw`.
+    fn forwarded_request_head(raw: &str) -> crate::l7::middleware::ForwardedRequestHead {
+        crate::l7::middleware::ForwardedRequestHead::new(&L7Request {
+            action: "GET".into(),
+            target: "/data".into(),
+            query_params: HashMap::new(),
+            raw_header: raw.as_bytes().to_vec(),
+            body_length: BodyLength::None,
+        })
     }
 
     async fn run_response_middleware_relay(
@@ -7153,6 +7326,484 @@ mod tests {
         let error = outcome.expect_err("stale whole-body output must not be delivered");
         assert!(error.to_string().contains("policy generation is stale"));
         assert!(delivered.is_empty());
+    }
+
+    /// HTTP session hook response stage that streams its input back and
+    /// declares `declared` output bytes. A stage that declares an empty output
+    /// emits nothing. With `gate`, it waits after the first byte of each input
+    /// chunk. It rejects at `input_end` when `reject` is set. `output_start`
+    /// carries `late_mutations`. With `captured_request_headers`, it records
+    /// the request headers its preflight carries.
+    #[derive(Default)]
+    struct SessionEchoStage {
+        declared: Option<u64>,
+        reject: bool,
+        gate: Option<ResponseBodyGate>,
+        late_mutations: Vec<HeaderMutation>,
+        captured_request_headers: Option<Arc<std::sync::Mutex<Option<Vec<HttpHeader>>>>>,
+    }
+
+    async fn emit_session_result(
+        sender: &mpsc::Sender<
+            std::result::Result<openshell_core::proto::HttpResponseSessionResult, tonic::Status>,
+        >,
+        result: openshell_core::proto::http_response_session_result::Result,
+    ) -> bool {
+        sender
+            .send(Ok(openshell_core::proto::HttpResponseSessionResult {
+                result: Some(result),
+            }))
+            .await
+            .is_ok()
+    }
+
+    #[tonic::async_trait]
+    impl openshell_supervisor_middleware::InProcessMiddleware for SessionEchoStage {
+        async fn describe(&self) -> MiddlewareManifest {
+            MiddlewareManifest {
+                name: "test/session-echo".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpResponse as i32,
+                    phase: SupervisorMiddlewarePhase::PreReturn as i32,
+                    max_payload_bytes: 4096,
+                    request_timeout: None,
+                }],
+                expected_audience: String::new(),
+                extension: Some(
+                    openshell_core::extension_protocol::http_session_middleware_metadata(
+                        "openshell/test-session-echo",
+                        "test",
+                    ),
+                ),
+            }
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: openshell_supervisor_middleware::HttpRequestView<'_>,
+        ) -> Result<HttpRequestResult> {
+            Err(miette!("HTTP session hook test stage"))
+        }
+
+        async fn open_http_response_session(
+            &self,
+            mut events: mpsc::Receiver<openshell_core::proto::HttpResponseSessionEvent>,
+        ) -> std::result::Result<
+            openshell_supervisor_middleware::HttpResponseSessionResultStream,
+            tonic::Status,
+        > {
+            use openshell_core::proto::{
+                HttpDenial, HttpFinish, HttpInspect, HttpOutputChunk, HttpOutputStart,
+                HttpPreflightResult, HttpStreamMode, MiddlewareDiagnostics, http_inspect,
+                http_preflight_result, http_response_session_event, http_response_session_result,
+            };
+            let (declared, reject, gate) = (self.declared, self.reject, self.gate.clone());
+            let late_mutations = self.late_mutations.clone();
+            let captured_request_headers = self.captured_request_headers.clone();
+            let (sender, receiver) = mpsc::channel(4);
+            tokio::spawn(async move {
+                while let Some(event) = events.recv().await {
+                    let sent = match event.event {
+                        Some(http_response_session_event::Event::Preflight(preflight)) => {
+                            if let Some(captured) = &captured_request_headers {
+                                *captured.lock().expect("preflight capture lock") =
+                                    preflight.response.map(|response| response.request_headers);
+                            }
+                            emit_session_result(
+                                &sender,
+                                http_response_session_result::Result::PreflightResult(
+                                    HttpPreflightResult {
+                                        decision: Some(http_preflight_result::Decision::Inspect(
+                                            HttpInspect {
+                                                mode: Some(http_inspect::Mode::Stream(
+                                                    HttpStreamMode {},
+                                                )),
+                                            },
+                                        )),
+                                        ..Default::default()
+                                    },
+                                ),
+                            )
+                            .await
+                        }
+                        Some(http_response_session_event::Event::Begin(_)) => {
+                            emit_session_result(
+                                &sender,
+                                http_response_session_result::Result::OutputStart(
+                                    HttpOutputStart {
+                                        header_mutations: late_mutations.clone(),
+                                        output_body_bytes: declared,
+                                    },
+                                ),
+                            )
+                            .await
+                        }
+                        Some(http_response_session_event::Event::InputChunk(_))
+                            if declared == Some(0) =>
+                        {
+                            true
+                        }
+                        Some(http_response_session_event::Event::InputChunk(chunk)) => {
+                            let (first, rest) = chunk.data.split_at(1);
+                            let mut sent = emit_session_result(
+                                &sender,
+                                http_response_session_result::Result::OutputChunk(
+                                    HttpOutputChunk {
+                                        data: first.to_vec(),
+                                    },
+                                ),
+                            )
+                            .await;
+                            if let Some(gate) = &gate {
+                                gate.entered.notify_one();
+                                gate.release.notified().await;
+                            }
+                            if sent && !rest.is_empty() {
+                                sent = emit_session_result(
+                                    &sender,
+                                    http_response_session_result::Result::OutputChunk(
+                                        HttpOutputChunk {
+                                            data: rest.to_vec(),
+                                        },
+                                    ),
+                                )
+                                .await;
+                            }
+                            sent
+                        }
+                        Some(http_response_session_event::Event::InputEnd(_)) if reject => {
+                            emit_session_result(
+                                &sender,
+                                http_response_session_result::Result::BlockDelivery(HttpDenial {
+                                    diagnostics: Some(MiddlewareDiagnostics {
+                                        reason_code: "late_match".into(),
+                                        ..Default::default()
+                                    }),
+                                }),
+                            )
+                            .await
+                        }
+                        Some(http_response_session_event::Event::InputEnd(_)) => {
+                            emit_session_result(
+                                &sender,
+                                http_response_session_result::Result::Finish(HttpFinish::default()),
+                            )
+                            .await
+                        }
+                        _ => break,
+                    };
+                    if !sent {
+                        break;
+                    }
+                }
+            });
+            Ok(Box::pin(ReceiverStream::new(receiver)))
+        }
+    }
+
+    fn session_echo_fixture(
+        stage: SessionEchoStage,
+    ) -> (
+        openshell_supervisor_middleware::ChainRunner,
+        Vec<openshell_supervisor_middleware::ChainEntry>,
+    ) {
+        let runner = openshell_supervisor_middleware::ChainRunner::new(Arc::new(stage));
+        let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            name: "response".into(),
+            implementation: "test/session-echo".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        }];
+        (runner, chain)
+    }
+
+    #[tokio::test]
+    async fn session_response_holds_back_completion_until_the_stage_finishes() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        for (name, declared, reject, expected_end) in [
+            ("declared length, finished", Some(5), false, "\r\n\r\nhello"),
+            // The client sees a body one byte short of its declared length.
+            ("declared length, rejected", Some(5), true, "\r\n\r\nhell"),
+            ("chunked, finished", None, false, "4\r\nello\r\n0\r\n\r\n"),
+            // No terminating chunk follows a rejection.
+            ("chunked, rejected", None, true, "1\r\nh\r\n4\r\nello\r\n"),
+        ] {
+            let (runner, chain) = session_echo_fixture(SessionEchoStage {
+                declared,
+                reject,
+                ..Default::default()
+            });
+            let mut upstream = response.as_slice();
+            let mut delivered = Vec::new();
+            let outcome = relay_response(
+                "GET",
+                &mut upstream,
+                &mut delivered,
+                RelayResponseOptions::default(),
+                Some(response_middleware_context(&runner, &chain, "GET")),
+            )
+            .await;
+            assert_eq!(outcome.is_ok(), !reject, "{name}: {outcome:?}");
+            let delivered = String::from_utf8(delivered).unwrap();
+            assert!(
+                delivered.starts_with("HTTP/1.1 200 OK\r\n"),
+                "{name}: {delivered}"
+            );
+            assert!(delivered.ends_with(expected_end), "{name}: {delivered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn session_response_preflight_carries_forwarded_request_headers() {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let (runner, chain) = session_echo_fixture(SessionEchoStage {
+            declared: Some(5),
+            captured_request_headers: Some(Arc::clone(&captured)),
+            ..Default::default()
+        });
+        let mut context = response_middleware_context(&runner, &chain, "POST");
+        // The head as request middleware forwarded it, before credentials,
+        // with its inline body.
+        context.request_head = Some(forwarded_request_head(
+            "POST /data HTTP/1.1\r\n\
+             Host: example.test\r\n\
+             Content-Type: application/json\r\n\
+             Authorization: Bearer sandbox-token\r\n\
+             Cookie: session=secret\r\n\
+             X-Api-Key: openshell:resolve:env:API_KEY\r\n\
+             X-Upstream-Auth: Basic dXNlcjpvcGVuc2hlbGw6cmVzb2x2ZTplbnY6UEFTU1dPUkQ=\r\n\
+             X-Trace: one\r\n\
+             X-Trace: two\r\n\
+             Content-Length: 2\r\n\r\n{}",
+        ));
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let mut upstream = response.as_slice();
+        let mut delivered = Vec::new();
+
+        relay_response(
+            "POST",
+            &mut upstream,
+            &mut delivered,
+            RelayResponseOptions::default(),
+            Some(context),
+        )
+        .await
+        .expect("response relay");
+
+        let observed = captured
+            .lock()
+            .expect("preflight capture lock")
+            .clone()
+            .expect("stage received a response preflight");
+        assert_eq!(
+            observed
+                .iter()
+                .map(|header| (header.name.as_str(), header.value.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("content-type", "application/json"),
+                ("x-trace", "one"),
+                ("x-trace", "two"),
+            ]
+        );
+        assert!(delivered.ends_with(b"\r\n\r\nhello"));
+    }
+
+    #[tokio::test]
+    async fn session_response_without_forwarded_request_head_fails_closed() {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let (runner, chain) = session_echo_fixture(SessionEchoStage {
+            captured_request_headers: Some(Arc::clone(&captured)),
+            ..Default::default()
+        });
+        let mut context = response_middleware_context(&runner, &chain, "GET");
+        context.request_head = None;
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let mut upstream = response.as_slice();
+        let mut delivered = Vec::new();
+
+        let outcome = relay_response(
+            "GET",
+            &mut upstream,
+            &mut delivered,
+            RelayResponseOptions::default(),
+            Some(context),
+        )
+        .await;
+
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+        assert!(captured.lock().expect("preflight capture lock").is_none());
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(
+            delivered.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "{delivered}"
+        );
+        assert!(
+            delivered.contains("middleware_cannot_inspect"),
+            "{delivered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_response_stages_own_integrity_headers() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"v1\"\r\nContent-MD5: md5\r\n\r\nhello";
+        for (name, late_mutations, kept, absent) in [
+            // A STREAM stage that passes the body through keeps the
+            // upstream's validators.
+            (
+                "pass-through",
+                Vec::new(),
+                vec!["etag: \"v1\"\r\n", "content-md5: md5\r\n"],
+                vec![],
+            ),
+            // A stage that changes the body replaces or removes them itself.
+            (
+                "rewritten",
+                vec![
+                    write_header("ETag", "\"v2\"", ExistingHeaderAction::Overwrite),
+                    remove_header("Content-MD5"),
+                ],
+                vec!["etag: \"v2\"\r\n"],
+                vec!["content-md5", "\"v1\""],
+            ),
+        ] {
+            let (runner, chain) = session_echo_fixture(SessionEchoStage {
+                declared: Some(5),
+                late_mutations,
+                ..Default::default()
+            });
+            let mut upstream = response.as_slice();
+            let mut delivered = Vec::new();
+            let outcome = relay_response(
+                "GET",
+                &mut upstream,
+                &mut delivered,
+                RelayResponseOptions::default(),
+                Some(response_middleware_context(&runner, &chain, "GET")),
+            )
+            .await;
+            assert!(outcome.is_ok(), "{name}: {outcome:?}");
+            let delivered = String::from_utf8(delivered).unwrap().to_ascii_lowercase();
+            for header in kept {
+                assert!(delivered.contains(header), "{name}: {delivered}");
+            }
+            for text in absent {
+                assert!(!delivered.contains(text), "{name}: {delivered}");
+            }
+            assert!(delivered.ends_with("\r\n\r\nhello"), "{name}: {delivered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn session_response_holds_the_head_of_an_empty_declared_body() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        for reject in [false, true] {
+            let (runner, chain) = session_echo_fixture(SessionEchoStage {
+                declared: Some(0),
+                reject,
+                ..Default::default()
+            });
+            let mut upstream = response.as_slice();
+            let mut delivered = Vec::new();
+            let outcome = relay_response(
+                "GET",
+                &mut upstream,
+                &mut delivered,
+                RelayResponseOptions::default(),
+                Some(response_middleware_context(&runner, &chain, "GET")),
+            )
+            .await;
+            assert!(outcome.is_ok(), "{outcome:?}");
+            let delivered = String::from_utf8(delivered).unwrap();
+            if reject {
+                // Nothing was committed, so the client gets the canonical
+                // denial.
+                assert!(
+                    delivered.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+                    "{delivered}"
+                );
+                assert!(delivered.contains("middleware_denied"), "{delivered}");
+            } else {
+                assert!(delivered.starts_with("HTTP/1.1 200 OK\r\n"), "{delivered}");
+                assert!(delivered.contains("Content-Length: 0\r\n"), "{delivered}");
+                assert!(delivered.ends_with("\r\n\r\n"), "{delivered}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_response_checks_the_policy_generation_before_every_write() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (runner, chain) = session_echo_fixture(SessionEchoStage {
+            declared: None,
+            reject: false,
+            gate: Some(ResponseBodyGate {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            ..Default::default()
+        });
+        let engine = OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("initial generation guard");
+        let mut middleware = response_middleware_context(&runner, &chain, "GET");
+        middleware.generation_guard = Some(&guard);
+        let mut upstream = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nAB".as_slice();
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        let relay = async move {
+            let outcome = relay_response(
+                "GET",
+                &mut upstream,
+                &mut client_write,
+                RelayResponseOptions::default(),
+                Some(middleware),
+            )
+            .await;
+            drop(client_write);
+            outcome
+        };
+        let client = async {
+            // The stage consumed the whole input, emitted `A`, and waits.
+            entered.notified().await;
+            let mut delivered = Vec::new();
+            let mut buffer = [0u8; 512];
+            while !delivered.windows(6).any(|window| window == b"1\r\nA\r\n") {
+                let count = client_read.read(&mut buffer).await.unwrap();
+                assert!(count > 0, "client closed before the first output chunk");
+                delivered.extend_from_slice(&buffer[..count]);
+            }
+            engine
+                .reload(TEST_POLICY, "network_policies: {}\n")
+                .expect("policy reload");
+            release.notify_one();
+            client_read.read_to_end(&mut delivered).await.unwrap();
+            delivered
+        };
+        let (outcome, delivered) = tokio::join!(relay, client);
+
+        let error = outcome.expect_err("output after a policy reload must not be delivered");
+        assert!(
+            error.to_string().contains("policy generation is stale"),
+            "{error}"
+        );
+        assert!(
+            !delivered.windows(6).any(|window| window == b"1\r\nB\r\n"),
+            "{}",
+            String::from_utf8_lossy(&delivered)
+        );
+        assert!(!delivered.ends_with(b"0\r\n\r\n"));
     }
 
     #[tokio::test]

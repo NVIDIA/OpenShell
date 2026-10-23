@@ -3293,6 +3293,90 @@ network_policies:
     }
 
     #[test]
+    fn validate_rejects_ports_in_middleware_selector_patterns() {
+        for (include, exclude, reason) in [
+            ("api.example.com:443", None, "cannot include one"),
+            ("*.example.com:443", None, "cannot include one"),
+            ("api.example.com:*", None, "cannot include one"),
+            (
+                "api.example.com",
+                Some("api.example.com:22"),
+                "cannot include one",
+            ),
+            ("10.0.0.1:443", None, "cannot include one"),
+            ("10.0.0.1:*", None, "cannot include one"),
+            ("*:443", None, "cannot include one"),
+            ("[2001:db8::1]:443", None, "without brackets"),
+            ("[2001:db8::1]", None, "without brackets"),
+            ("2001:db8::1::2", None, "not a valid IPv6 address"),
+        ] {
+            let mut policy = restrictive_default_policy();
+            let mut middleware = middleware_config("openshell/regex");
+            let selector = middleware.endpoints.as_mut().unwrap();
+            selector.include = vec![include.into()];
+            selector.exclude = exclude.into_iter().map(Into::into).collect();
+            add_middleware(&mut policy, "redactor", middleware);
+
+            let errors = validate_sandbox_policy(&policy)
+                .expect_err("a selector pattern with a port")
+                .into_iter()
+                .map(|violation| violation.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            let pattern = exclude.unwrap_or(include);
+            assert!(
+                errors.contains(&format!("pattern '{pattern}' is invalid"))
+                    && errors.contains(reason),
+                "{errors}"
+            );
+        }
+
+        // The supervisor's local-file policy path runs the same check.
+        let data = serde_json::json!({
+            "network_middlewares": {
+                "redactor": {
+                    "middleware": "openshell/regex",
+                    "endpoints": {"include": ["api.example.com:443"]}
+                }
+            }
+        });
+        let violations = validate_network_middleware_json(&data).expect("parse middleware policy");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::InvalidMiddlewareConfig { name, reason }
+                if name == "redactor" && reason.contains("cannot include one")
+        )));
+    }
+
+    #[test]
+    fn validate_accepts_ipv6_middleware_selector_patterns() {
+        for pattern in [
+            "2001:db8::1",
+            "2001:DB8::1",
+            "::1",
+            "2001:4860:*",
+            "2001:*",
+            "fe80::*",
+            "*::*",
+            "2001:db8::[0-9a-f]",
+            "::ffff:10.0.*",
+        ] {
+            let mut policy = restrictive_default_policy();
+            let mut middleware = middleware_config("openshell/regex");
+            middleware.endpoints.as_mut().unwrap().include = vec![pattern.into()];
+            add_middleware(&mut policy, "redactor", middleware);
+            if let Err(violations) = validate_sandbox_policy(&policy) {
+                panic!("IPv6 selector '{pattern}' was rejected: {violations:?}");
+            }
+        }
+
+        // The proxy matches IPv6 hosts without brackets, and `*` spans ':'.
+        assert!(middleware_host_matches("2001:4860:*", "2001:4860:4860::8888").unwrap());
+        assert!(middleware_host_matches("2001:DB8::1", "2001:db8::1").unwrap());
+        assert!(!middleware_host_matches("2001:4860:*", "2001:db8::1").unwrap());
+    }
+
+    #[test]
     fn middleware_host_selector_matching_is_case_insensitive() {
         assert!(middleware_host_matches("*.Example.COM", "API.example.com").unwrap());
         assert!(!middleware_host_matches("*.example.com", "example.com").unwrap());
