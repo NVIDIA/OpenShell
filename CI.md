@@ -4,6 +4,12 @@ This document describes how OpenShell's continuous integration works for pull re
 
 For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CONTRIBUTING.md](CONTRIBUTING.md).
 
+For failures during `Prepare all required actions`, preserve the original job log
+and runner/request metadata before rerunning. These failures occur before workflow
+steps. See the [runner action archive cache proposal](deploy/ci/action-archive-cache.md)
+for the Debian codeload 404 investigation and the runner-admin configuration and
+validation it requires. The proposal is not active in repository workflows.
+
 ## Overview
 
 PR CI that runs on NVIDIA self-hosted runners uses NVIDIA's copy-pr-bot. The bot mirrors trusted PR commits to internal `pull-request/<N>` branches in this repository. The gated workflows trigger on pushes to those branches, not on the original PR.
