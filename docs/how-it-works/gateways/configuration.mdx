@@ -1084,6 +1084,8 @@ supervisor_network_mode = "host"
 # Optional override; Docker's host address is discovered automatically.
 # host_gateway_ip = "172.29.0.254"
 # Optional override. Omit for automatic host or bridge callback selection.
+# Host mode uses host.docker.internal when the gateway runs inside WSL 2
+# with Docker Desktop.
 # grpc_endpoint = "https://gateway.example.com:17670"
 # Workload-side runtime. Defaults to the gateway version.
 # sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:<version>"
