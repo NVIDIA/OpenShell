@@ -56,13 +56,6 @@ impl<'a> ConfigStateChangeBuilder<'a> {
         self
     }
 
-    /// Add an unmapped field.
-    #[must_use]
-    pub fn unmapped(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
-        self.unmapped.insert(key.to_string(), value.into());
-        self
-    }
-
     #[must_use]
     pub fn build(self) -> OcsfEvent {
         let mut base = BaseEventData::new(
@@ -93,6 +86,7 @@ impl<'a> ConfigStateChangeBuilder<'a> {
 }
 
 impl_builder_setters!(ConfigStateChangeBuilder);
+impl_unmapped_setter!(ConfigStateChangeBuilder);
 
 #[cfg(test)]
 mod tests {

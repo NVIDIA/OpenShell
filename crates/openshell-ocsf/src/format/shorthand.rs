@@ -5,10 +5,11 @@
 //!
 //! Pattern: `<HH:MM:SS.mmm> <severity> <CLASS:ACTIVITY> <action> <key fields> [context]`
 
-use crate::enums::UserTypeId;
+use crate::enums::{ActionId, UserTypeId};
 use crate::events::OcsfEvent;
 use crate::events::base_event::BaseEventData;
-use crate::objects::{Endpoint, Url, User};
+use crate::objects::{Endpoint, HttpRequest, Url, User};
+use crate::sanitize::truncate_with_ellipsis;
 
 /// Format a timestamp (ms since epoch) as `HH:MM:SS.mmm`.
 ///
@@ -67,21 +68,6 @@ pub fn severity_tag(severity_id: u8) -> &'static str {
 /// the shorthand denial logs; 80 chars cut a typical reason mid-endpoint.
 const MAX_REASON_LEN: usize = 256;
 const MAX_MESSAGE_LEN: usize = 120;
-
-/// Truncate `text` to at most `max` bytes at a UTF-8 char boundary, appending
-/// an ellipsis when it was shortened. Slicing on a raw byte index panics when
-/// the index falls inside a multibyte char, so step back to the nearest
-/// boundary first.
-fn truncate_with_ellipsis(text: &str, max: usize) -> String {
-    if text.len() <= max {
-        return text.to_string();
-    }
-    let mut end = max;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &text[..end])
-}
 
 fn escape_quoted_field(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
@@ -156,6 +142,31 @@ fn peer_label(endpoint: &Endpoint) -> String {
         .or(endpoint.name.as_deref())
         .unwrap_or("unknown");
     format!(" from {}{port}", escape_context_field(host))
+}
+
+/// Render an event's action as ` ACTION`, or nothing when it has none.
+fn action_label(action: Option<ActionId>) -> String {
+    action.map_or(String::new(), |a| format!(" {}", a.label().to_uppercase()))
+}
+
+/// The path of the request an event describes.
+fn request_path(request: Option<&HttpRequest>) -> Option<&str> {
+    request
+        .and_then(|r| r.url.as_ref())
+        .and_then(|u| u.path.as_deref())
+}
+
+/// Render a `key:value` context entry, bounding and escaping the value.
+fn context_entry(key: &str, value: &str) -> String {
+    format!(
+        "{key}:{}",
+        escape_context_field(&truncate_with_ellipsis(value, MAX_REASON_LEN))
+    )
+}
+
+/// Render a `reason:...` context entry from an event's status detail.
+fn reason_entry(status_detail: Option<&str>) -> Option<String> {
+    reason_text(status_detail).map(|reason| format!("reason:{}", escape_context_field(&reason)))
 }
 
 /// Format a `[reason:...]` tag from `status_detail` (or `message` fallback)
@@ -354,9 +365,7 @@ impl OcsfEvent {
 
             Self::ApiActivity(e) if e.actor.user.is_some() => {
                 let activity = e.base.activity_name.to_uppercase();
-                let action = e
-                    .action
-                    .map_or(String::new(), |a| format!(" {}", a.label().to_uppercase()));
+                let action = action_label(e.action);
                 let principal = e
                     .actor
                     .user
@@ -364,29 +373,18 @@ impl OcsfEvent {
                     .map(principal_label)
                     .unwrap_or_default();
                 let peer = peer_label(&e.src_endpoint);
-                let operation = e
-                    .http_request
-                    .as_ref()
-                    .and_then(|r| r.url.as_ref())
-                    .and_then(|u| u.path.as_deref())
-                    .unwrap_or(&e.api.operation);
-                let mut context = vec![format!(
-                    "op:{}",
-                    escape_context_field(&truncate_with_ellipsis(operation, MAX_REASON_LEN))
-                )];
+                let operation = request_path(e.http_request.as_ref()).unwrap_or(&e.api.operation);
+                let mut context = vec![context_entry("op", operation)];
                 for resource in e.resources.iter().flatten() {
                     let Some(id) = resource.uid.as_deref().or(resource.name.as_deref()) else {
                         continue;
                     };
-                    context.push(format!(
-                        "{}:{}",
-                        escape_context_field(resource.type_label.as_deref().unwrap_or("resource")),
-                        escape_context_field(&truncate_with_ellipsis(id, MAX_REASON_LEN))
+                    context.push(context_entry(
+                        &escape_context_field(resource.type_label.as_deref().unwrap_or("resource")),
+                        id,
                     ));
                 }
-                if let Some(reason) = reason_text(e.base.status_detail.as_deref()) {
-                    context.push(format!("reason:{}", escape_context_field(&reason)));
-                }
+                context.extend(reason_entry(e.base.status_detail.as_deref()));
                 let context = context.join(" ");
 
                 format!("API:{activity} {sev}{action} {principal}{peer} [{context}]")
@@ -479,9 +477,7 @@ impl OcsfEvent {
 
             Self::Authentication(e) => {
                 let activity = e.base.activity_name.to_uppercase();
-                let action = e
-                    .action
-                    .map_or(String::new(), |a| format!(" {}", a.label().to_uppercase()));
+                let action = action_label(e.action);
                 let principal = principal_label(&e.user);
                 let peer = e.src_endpoint.as_ref().map(peer_label).unwrap_or_default();
                 let mut context = Vec::new();
@@ -492,20 +488,10 @@ impl OcsfEvent {
                 }) {
                     context.push(format!("protocol:{}", escape_context_field(protocol)));
                 }
-                if let Some(path) = e
-                    .http_request
-                    .as_ref()
-                    .and_then(|r| r.url.as_ref())
-                    .and_then(|u| u.path.as_deref())
-                {
-                    context.push(format!(
-                        "op:{}",
-                        escape_context_field(&truncate_with_ellipsis(path, MAX_REASON_LEN))
-                    ));
+                if let Some(path) = request_path(e.http_request.as_ref()) {
+                    context.push(context_entry("op", path));
                 }
-                if let Some(reason) = reason_text(e.base.status_detail.as_deref()) {
-                    context.push(format!("reason:{}", escape_context_field(&reason)));
-                }
+                context.extend(reason_entry(e.base.status_detail.as_deref()));
                 let context = if context.is_empty() {
                     String::new()
                 } else {
@@ -659,14 +645,7 @@ mod tests {
     use crate::objects::*;
 
     fn test_metadata() -> Metadata {
-        Metadata {
-            version: "1.8.0".to_string(),
-            product: Product::openshell_sandbox("0.1.0"),
-            profiles: vec!["security_control".to_string()],
-            uid: Some("sandbox-abc123".to_string()),
-            log_source: None,
-            correlation_uid: None,
-        }
+        Metadata::test(&["security_control"])
     }
 
     fn base(

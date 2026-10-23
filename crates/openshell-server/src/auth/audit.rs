@@ -493,14 +493,7 @@ const MAX_REQUESTED_ID_LEN: usize = 128;
 
 /// Cap a request-supplied identifier so a caller cannot inflate events.
 fn bounded(value: &str) -> String {
-    if value.len() <= MAX_REQUESTED_ID_LEN {
-        return value.to_string();
-    }
-    let mut end = MAX_REQUESTED_ID_LEN;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &value[..end])
+    openshell_ocsf::truncate_with_ellipsis(value, MAX_REQUESTED_ID_LEN)
 }
 
 /// The principal as an OCSF user, identified but never with credentials.

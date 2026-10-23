@@ -182,11 +182,6 @@ impl<'a, EndpointState> NetworkActivityBuilder<'a, EndpointState> {
         self
     }
     #[must_use]
-    pub fn status_detail(mut self, detail: impl Into<String>) -> Self {
-        self.status_detail = Some(detail.into());
-        self
-    }
-    #[must_use]
     pub fn log_source(mut self, source: impl Into<String>) -> Self {
         self.log_source = Some(source.into());
         self
@@ -202,53 +197,17 @@ impl<'a, EndpointState> NetworkActivityBuilder<'a, EndpointState> {
     }
 
     #[must_use]
-    pub fn activity(mut self, id: ActivityId) -> Self {
-        self.activity = id;
-        self
-    }
-
-    #[must_use]
-    pub fn action(mut self, id: ActionId) -> Self {
-        self.action = Some(id);
-        self
-    }
-
-    #[must_use]
-    pub fn disposition(mut self, id: DispositionId) -> Self {
-        self.disposition = Some(id);
-        self
-    }
-
-    #[must_use]
-    pub fn actor_process(mut self, process: crate::objects::Process) -> Self {
-        self.actor = Some(Actor::process(process));
-        self
-    }
-
-    #[must_use]
     pub fn firewall_rule(mut self, name: &str, rule_type: &str) -> Self {
         self.firewall_rule = Some(FirewallRule::new(name, rule_type));
         self
     }
-
-    #[must_use]
-    pub fn severity(mut self, id: SeverityId) -> Self {
-        self.severity = id;
-        self
-    }
-
-    #[must_use]
-    pub fn status(mut self, id: StatusId) -> Self {
-        self.status = Some(id);
-        self
-    }
-
-    #[must_use]
-    pub fn message(mut self, msg: impl Into<String>) -> Self {
-        self.message = Some(msg.into());
-        self
-    }
 }
+
+impl_activity_setter!(NetworkActivityBuilder<EndpointState>);
+impl_action_disposition_setters!(NetworkActivityBuilder<EndpointState>);
+impl_actor_process_setter!(NetworkActivityBuilder<EndpointState>);
+impl_status_detail_setter!(NetworkActivityBuilder<EndpointState>);
+impl_builder_setters!(NetworkActivityBuilder<EndpointState>);
 
 impl NetworkActivityBuilder<'_, HasNetworkEndpoint> {
     /// Finalize and return the `OcsfEvent`.

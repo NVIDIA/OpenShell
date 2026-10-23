@@ -64,25 +64,6 @@ impl<'a> AuthenticationBuilder<'a> {
         self
     }
 
-    #[must_use]
-    pub fn status_detail(mut self, detail: impl Into<String>) -> Self {
-        self.status_detail = Some(detail.into());
-        self
-    }
-
-    /// Set the identifier shared by events about the same request.
-    #[must_use]
-    pub fn correlation_uid(mut self, uid: impl Into<String>) -> Self {
-        self.correlation_uid = Some(uid.into());
-        self
-    }
-
-    #[must_use]
-    pub fn src_endpoint(mut self, endpoint: Endpoint) -> Self {
-        self.src_endpoint = Some(endpoint);
-        self
-    }
-
     /// Set the request the credential was presented with.
     #[must_use]
     pub fn http_request(mut self, request: HttpRequest) -> Self {
@@ -133,6 +114,9 @@ impl<'a> AuthenticationBuilder<'a> {
 
 impl_action_disposition_setters!(AuthenticationBuilder);
 impl_builder_setters!(AuthenticationBuilder);
+impl_src_endpoint_setter!(AuthenticationBuilder);
+impl_status_detail_setter!(AuthenticationBuilder);
+impl_correlation_uid_setter!(AuthenticationBuilder);
 
 #[cfg(test)]
 mod tests {

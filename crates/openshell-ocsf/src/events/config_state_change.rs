@@ -60,7 +60,7 @@ impl Serialize for DeviceConfigStateChangeEvent {
 mod tests {
     use super::*;
     use crate::enums::{SecurityLevelId, SeverityId, StateId};
-    use crate::objects::{Metadata, Product};
+    use crate::objects::Metadata;
 
     #[test]
     fn test_config_state_change_serialization() {
@@ -72,14 +72,7 @@ mod tests {
             1,
             "Log",
             SeverityId::Informational,
-            Metadata {
-                version: "1.8.0".to_string(),
-                product: Product::openshell_sandbox("0.1.0"),
-                profiles: vec!["security_control".to_string()],
-                uid: Some("sandbox-abc123".to_string()),
-                log_source: None,
-                correlation_uid: None,
-            },
+            Metadata::test(&["security_control"]),
         );
         base.set_message("Policy reloaded successfully");
         base.add_unmapped("policy_version", serde_json::json!("v3"));

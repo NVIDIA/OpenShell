@@ -89,7 +89,7 @@ impl serde::Serialize for ApiActivityEvent {
 mod tests {
     use super::*;
     use crate::enums::SeverityId;
-    use crate::objects::{AiModel, Metadata, Process, Product};
+    use crate::objects::{AiModel, Metadata, Process};
 
     fn test_api_activity() -> ApiActivityEvent {
         let mut base = BaseEventData::new(
@@ -101,12 +101,8 @@ mod tests {
             "Other",
             SeverityId::Informational,
             Metadata {
-                version: "1.8.0".to_string(),
-                product: Product::openshell_sandbox("0.1.0"),
-                profiles: vec!["ai_operation".to_string()],
                 uid: None,
-                log_source: None,
-                correlation_uid: None,
+                ..Metadata::test(&["ai_operation"])
             },
         );
         base.set_ai_model(AiModel::new("claude-3-haiku", "anthropic"));

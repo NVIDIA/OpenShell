@@ -6,6 +6,9 @@
 //! Each event class has a builder that takes a `EventContext` reference
 //! and provides chainable methods for setting event fields.
 
+// Each macro takes the builder's name, followed by its type-state parameter
+// for builders that have one: `impl_activity_setter!(HttpActivityBuilder<C>)`.
+
 /// Generate the shared `severity`, `status`, and `message` setter methods that
 /// appear identically on every OCSF event builder in this crate.
 ///
@@ -15,30 +18,19 @@
 /// impl_builder_setters!(MyBuilder, no_status); // severity + message only
 /// ```
 macro_rules! impl_builder_setters {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
-            /// Set the event severity.
-            #[must_use]
-            pub fn severity(mut self, id: $crate::enums::SeverityId) -> Self {
-                self.severity = id;
-                self
-            }
+    ($builder:ident $(<$state:ident>)?) => {
+        impl_builder_setters!($builder $(<$state>)?, no_status);
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the overall event status.
             #[must_use]
             pub fn status(mut self, id: $crate::enums::StatusId) -> Self {
                 self.status = Some(id);
                 self
             }
-            /// Set a human-readable event message.
-            #[must_use]
-            pub fn message(mut self, msg: impl Into<String>) -> Self {
-                self.message = Some(msg.into());
-                self
-            }
         }
     };
-    ($builder:ident, no_status) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?, no_status) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the event severity.
             #[must_use]
             pub fn severity(mut self, id: $crate::enums::SeverityId) -> Self {
@@ -58,8 +50,8 @@ macro_rules! impl_builder_setters {
 /// Generate the `activity` setter used by every event builder that carries an
 /// `activity` field.
 macro_rules! impl_activity_setter {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the event activity identifier.
             #[must_use]
             pub fn activity(mut self, id: $crate::enums::ActivityId) -> Self {
@@ -73,8 +65,8 @@ macro_rules! impl_activity_setter {
 /// Generate `action` and `disposition` setters shared by network, HTTP, SSH,
 /// process, and detection-finding builders.
 macro_rules! impl_action_disposition_setters {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the action taken.
             #[must_use]
             pub fn action(mut self, id: $crate::enums::ActionId) -> Self {
@@ -94,8 +86,8 @@ macro_rules! impl_action_disposition_setters {
 /// Generate the `actor_process` setter shared by network, HTTP, SSH, and
 /// process-activity builders.
 macro_rules! impl_actor_process_setter {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the acting process.
             #[must_use]
             pub fn actor_process(mut self, process: $crate::objects::Process) -> Self {
@@ -106,10 +98,10 @@ macro_rules! impl_actor_process_setter {
     };
 }
 
-/// Generate the `dst_endpoint` setter shared by network, HTTP, and SSH builders.
+/// Generate the `dst_endpoint` setter shared by HTTP and SSH builders.
 macro_rules! impl_dst_endpoint_setter {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the destination endpoint.
             #[must_use]
             pub fn dst_endpoint(mut self, endpoint: $crate::objects::Endpoint) -> Self {
@@ -120,14 +112,76 @@ macro_rules! impl_dst_endpoint_setter {
     };
 }
 
-/// Generate the `src_endpoint_addr` setter shared by network and SSH builders.
+/// Generate the `src_endpoint` setter shared by HTTP and authentication
+/// builders.
+macro_rules! impl_src_endpoint_setter {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
+            /// Set the source endpoint.
+            #[must_use]
+            pub fn src_endpoint(mut self, endpoint: $crate::objects::Endpoint) -> Self {
+                self.src_endpoint = Some(endpoint);
+                self
+            }
+        }
+    };
+}
+
+/// Generate the `src_endpoint_addr` setter shared by SSH builders.
 macro_rules! impl_src_endpoint_addr_setter {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the source endpoint from a raw IP address and port.
             #[must_use]
             pub fn src_endpoint_addr(mut self, ip: std::net::IpAddr, port: u16) -> Self {
                 self.src_endpoint = Some($crate::objects::Endpoint::from_ip(ip, port));
+                self
+            }
+        }
+    };
+}
+
+/// Generate the `status_detail` setter shared by builders that explain a
+/// status.
+macro_rules! impl_status_detail_setter {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
+            /// Set a detail explaining the event status.
+            #[must_use]
+            pub fn status_detail(mut self, detail: impl Into<String>) -> Self {
+                self.status_detail = Some(detail.into());
+                self
+            }
+        }
+    };
+}
+
+/// Generate the `correlation_uid` setter shared by builders whose events
+/// pair with others about the same request.
+macro_rules! impl_correlation_uid_setter {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
+            /// Set the identifier shared by events about the same request or
+            /// incident.
+            #[must_use]
+            pub fn correlation_uid(mut self, uid: impl Into<String>) -> Self {
+                self.correlation_uid = Some(uid.into());
+                self
+            }
+        }
+    };
+}
+
+/// Generate the `unmapped` setter shared by builders whose unmapped fields
+/// are always present.
+macro_rules! impl_unmapped_setter {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
+            /// Add a source-specific attribute that is not defined by the OCSF
+            /// class.
+            #[must_use]
+            pub fn unmapped(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
+                self.unmapped.insert(key.to_string(), value.into());
                 self
             }
         }

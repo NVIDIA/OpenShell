@@ -107,7 +107,7 @@ mod tests {
     use crate::enums::SeverityId;
     use crate::events::base_event::BaseEventData;
     use crate::events::{BaseEvent, OcsfEvent};
-    use crate::objects::{Metadata, Product};
+    use crate::objects::Metadata;
 
     fn test_event() -> OcsfEvent {
         OcsfEvent::Base(BaseEvent {
@@ -120,12 +120,8 @@ mod tests {
                 "Other",
                 SeverityId::Informational,
                 Metadata {
-                    version: "1.8.0".to_string(),
-                    product: Product::openshell_sandbox("0.1.0"),
-                    profiles: vec![],
                     uid: None,
-                    log_source: None,
-                    correlation_uid: None,
+                    ..Metadata::test(&[])
                 },
             ),
         })

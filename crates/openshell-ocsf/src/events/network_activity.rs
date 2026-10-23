@@ -95,7 +95,7 @@ impl Serialize for NetworkActivityEvent {
 mod tests {
     use super::*;
     use crate::enums::{ActionId, DispositionId, SeverityId};
-    use crate::objects::{Metadata, Product};
+    use crate::objects::Metadata;
 
     #[test]
     fn test_network_activity_serialization() {
@@ -108,14 +108,7 @@ mod tests {
                 1,
                 "Open",
                 SeverityId::Informational,
-                Metadata {
-                    version: "1.8.0".to_string(),
-                    product: Product::openshell_sandbox("0.1.0"),
-                    profiles: vec!["security_control".to_string(), "network_proxy".to_string()],
-                    uid: Some("sandbox-abc123".to_string()),
-                    log_source: None,
-                    correlation_uid: None,
-                },
+                Metadata::test(&["security_control", "network_proxy"]),
             ),
             src_endpoint: Some(Endpoint::from_ip_str("10.42.0.2", 54321)),
             dst_endpoint: Some(Endpoint::from_domain("api.example.com", 443)),

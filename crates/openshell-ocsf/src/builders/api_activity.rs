@@ -14,16 +14,7 @@ use crate::objects::{
 const MAX_MODEL_LEN: usize = 256;
 
 fn sanitize_model_name(name: &str) -> String {
-    let truncated = if name.len() > MAX_MODEL_LEN {
-        let mut end = MAX_MODEL_LEN;
-        while end > 0 && !name.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &name[..end])
-    } else {
-        name.to_string()
-    };
-    truncated.replace(['\n', '\r', '\t'], " ")
+    crate::sanitize::truncate_with_ellipsis(name, MAX_MODEL_LEN).replace(['\n', '\r', '\t'], " ")
 }
 
 /// Builder for API Activity [6003] events.
@@ -71,24 +62,6 @@ impl<'a> ApiActivityBuilder<'a> {
         }
     }
 
-    #[must_use]
-    pub fn severity(mut self, severity: SeverityId) -> Self {
-        self.severity = severity;
-        self
-    }
-
-    #[must_use]
-    pub fn status(mut self, status: StatusId) -> Self {
-        self.status = Some(status);
-        self
-    }
-
-    #[must_use]
-    pub fn message(mut self, message: impl Into<String>) -> Self {
-        self.message = Some(message.into());
-        self
-    }
-
     /// Set the service that exposes the operation.
     #[must_use]
     pub fn api_service(mut self, service: Service) -> Self {
@@ -109,19 +82,6 @@ impl<'a> ApiActivityBuilder<'a> {
     #[must_use]
     pub fn src_endpoint(mut self, endpoint: Endpoint) -> Self {
         self.src_endpoint = Some(endpoint);
-        self
-    }
-
-    #[must_use]
-    pub fn status_detail(mut self, detail: impl Into<String>) -> Self {
-        self.status_detail = Some(detail.into());
-        self
-    }
-
-    /// Set the identifier shared by events about the same request.
-    #[must_use]
-    pub fn correlation_uid(mut self, uid: impl Into<String>) -> Self {
-        self.correlation_uid = Some(uid.into());
         self
     }
 
@@ -155,12 +115,6 @@ impl<'a> ApiActivityBuilder<'a> {
             uid: model.uid,
         };
         self.ai_model = Some(sanitized);
-        self
-    }
-
-    #[must_use]
-    pub fn unmapped(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
-        self.unmapped.insert(key.to_string(), value.into());
         self
     }
 
@@ -224,6 +178,10 @@ impl<'a> ApiActivityBuilder<'a> {
 }
 
 impl_action_disposition_setters!(ApiActivityBuilder);
+impl_builder_setters!(ApiActivityBuilder);
+impl_status_detail_setter!(ApiActivityBuilder);
+impl_correlation_uid_setter!(ApiActivityBuilder);
+impl_unmapped_setter!(ApiActivityBuilder);
 
 #[cfg(test)]
 mod tests {

@@ -37,13 +37,6 @@ impl<'a> BaseEventBuilder<'a> {
         self
     }
 
-    /// Add an unmapped field.
-    #[must_use]
-    pub fn unmapped(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
-        self.unmapped.insert(key.to_string(), value.into());
-        self
-    }
-
     #[must_use]
     pub fn build(self) -> OcsfEvent {
         let activity_name = self.activity_name.as_deref().unwrap_or("Other");
@@ -68,6 +61,7 @@ impl<'a> BaseEventBuilder<'a> {
 }
 
 impl_builder_setters!(BaseEventBuilder);
+impl_unmapped_setter!(BaseEventBuilder);
 
 #[cfg(test)]
 mod tests {

@@ -78,20 +78,6 @@ impl<'a> DetectionFindingBuilder<'a> {
         self
     }
 
-    /// Set the identifier shared by events about the same incident.
-    #[must_use]
-    pub fn correlation_uid(mut self, uid: impl Into<String>) -> Self {
-        self.correlation_uid = Some(uid.into());
-        self
-    }
-
-    /// Add a source-specific attribute that is not defined by the OCSF class.
-    #[must_use]
-    pub fn unmapped(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
-        self.unmapped.insert(key.to_string(), value.into());
-        self
-    }
-
     /// Add a remediation description.
     #[must_use]
     pub fn remediation(mut self, desc: &str) -> Self {
@@ -179,6 +165,8 @@ impl<'a> DetectionFindingBuilder<'a> {
 impl_activity_setter!(DetectionFindingBuilder);
 impl_action_disposition_setters!(DetectionFindingBuilder);
 impl_builder_setters!(DetectionFindingBuilder, no_status);
+impl_correlation_uid_setter!(DetectionFindingBuilder);
+impl_unmapped_setter!(DetectionFindingBuilder);
 
 #[cfg(test)]
 mod tests {

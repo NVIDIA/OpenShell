@@ -26,7 +26,7 @@ mod tests {
     use crate::enums::SeverityId;
     use crate::events::base_event::BaseEventData;
     use crate::events::{BaseEvent, OcsfEvent};
-    use crate::objects::{Metadata, Product};
+    use crate::objects::Metadata;
 
     fn test_event() -> OcsfEvent {
         let mut base = BaseEventData::new(
@@ -37,14 +37,7 @@ mod tests {
             99,
             "Other",
             SeverityId::Informational,
-            Metadata {
-                version: "1.8.0".to_string(),
-                product: Product::openshell_sandbox("0.1.0"),
-                profiles: vec!["container".to_string()],
-                uid: Some("sandbox-abc123".to_string()),
-                log_source: None,
-                correlation_uid: None,
-            },
+            Metadata::test(&["container"]),
         );
         base.set_time(1_742_054_400_000);
         base.set_message("Test event");

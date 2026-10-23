@@ -89,7 +89,7 @@ impl Serialize for DetectionFindingEvent {
 mod tests {
     use super::*;
     use crate::enums::{ActionId, ConfidenceId, DispositionId, RiskLevelId, SeverityId};
-    use crate::objects::{Metadata, Product};
+    use crate::objects::Metadata;
 
     #[test]
     fn test_detection_finding_serialization() {
@@ -102,14 +102,7 @@ mod tests {
                 1,
                 "Create",
                 SeverityId::High,
-                Metadata {
-                    version: "1.8.0".to_string(),
-                    product: Product::openshell_sandbox("0.1.0"),
-                    profiles: vec!["security_control".to_string()],
-                    uid: Some("sandbox-abc123".to_string()),
-                    log_source: None,
-                    correlation_uid: None,
-                },
+                Metadata::test(&["security_control"]),
             ),
             finding_info: FindingInfo::new("nssh1-replay-abc", "NSSH1 Nonce Replay Attack")
                 .with_desc("A nonce was replayed."),
