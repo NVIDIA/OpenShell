@@ -10,12 +10,15 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/converter"
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 	"google.golang.org/grpc"
 )
+
+const tunnelSetupTimeout = time.Second * 30
 
 type tcpClient struct {
 	client    pb.OpenShellClient
@@ -171,58 +174,72 @@ type tunnelListener struct {
 	closeErr    error
 }
 
-func (tl *tunnelListener) acceptAndBridge() error {
-	for {
-		conn, err := tl.inner.Accept()
-		if err != nil {
-			return err
-		}
+// setupAndBridge sets up a connection with a specified timeout.
+// It will open the connection and handle decrementing the WaitGroup
+// and closing the net.Conn connection once it times out or
+// the brdiged connection closes.
+func (tl *tunnelListener) setupAndBridge(conn net.Conn) {
+	defer tl.wg.Done()
+	defer func() { _ = conn.Close() }()
 
-		// Establish the tunnel to the sandbox.
-		var tunnel io.ReadWriteCloser
-		if tl.cfg.useSSHTunnel && tl.ssh != nil {
-			var tunnelOpts []TunnelOption
-			if tl.cfg.serviceID != "" {
-				tunnelOpts = append(tunnelOpts, WithTunnelServiceID(tl.cfg.serviceID))
-			}
-			tunnel, err = tl.ssh.Tunnel(tl.ctx, tl.workspace, tl.sandboxName, tl.remotePort, tunnelOpts...)
-		} else {
-			var fwdOpts []ForwardOption
-			if tl.cfg.serviceID != "" {
-				fwdOpts = append(fwdOpts, WithForwardServiceID(tl.cfg.serviceID))
-			}
-			tunnel, err = tl.tcp.Forward(tl.ctx, tl.workspace, tl.sandboxName, tl.remotePort, fwdOpts...)
-		}
+	// setup timer limit
+	ctx, cancel := context.WithCancel(tl.ctx)
+	defer cancel()
+	timer := time.AfterFunc(tunnelSetupTimeout, cancel)
 
-		if err != nil {
-			_ = conn.Close()
-			select {
-			case <-tl.ctx.Done():
-				return tl.ctx.Err()
-			default:
-				continue
-			}
-		}
+	// Establish the tunnel to the sandbox.
+	var tunnel io.ReadWriteCloser
+	var err error
 
-		tl.mu.Lock()
-		if tl.closing {
-			tl.mu.Unlock()
-			_ = conn.Close()
-			_ = tunnel.Close()
-			return net.ErrClosed
+	if tl.cfg.useSSHTunnel && tl.ssh != nil {
+		var tunnelOpts []TunnelOption
+		if tl.cfg.serviceID != "" {
+			tunnelOpts = append(tunnelOpts, WithTunnelServiceID(tl.cfg.serviceID))
 		}
-		tl.wg.Add(1)
-		tl.mu.Unlock()
-		go tl.bridge(conn, tunnel)
-
-		return nil
+		tunnel, err = tl.ssh.Tunnel(ctx, tl.workspace, tl.sandboxName, tl.remotePort, tunnelOpts...)
+	} else {
+		var fwdOpts []ForwardOption
+		if tl.cfg.serviceID != "" {
+			fwdOpts = append(fwdOpts, WithForwardServiceID(tl.cfg.serviceID))
+		}
+		tunnel, err = tl.tcp.Forward(ctx, tl.workspace, tl.sandboxName, tl.remotePort, fwdOpts...)
 	}
+
+	if err != nil {
+		return
+	}
+
+	if !timer.Stop() {
+		// Connection setup timed out
+		_ = tunnel.Close()
+		return
+	}
+
+	tl.bridge(conn, tunnel)
+}
+
+func (tl *tunnelListener) acceptAndBridge() error {
+	conn, err := tl.inner.Accept()
+	if err != nil {
+		return err
+	}
+
+	tl.mu.Lock()
+	if tl.closing {
+		tl.mu.Unlock()
+		_ = conn.Close()
+		return net.ErrClosed
+	}
+	tl.wg.Add(1)
+	tl.mu.Unlock()
+
+	go tl.setupAndBridge(conn)
+	return nil
 }
 
 // bridge copies data bidirectionally between the local connection and the
-// tunnel. It runs in its own goroutine and decrements the WaitGroup on exit.
+// tunnel. It runs in its own goroutine.
 func (tl *tunnelListener) bridge(local net.Conn, tunnel io.ReadWriteCloser) {
-	defer tl.wg.Done()
 	defer func() { _ = local.Close() }()
 	defer func() { _ = tunnel.Close() }()
 

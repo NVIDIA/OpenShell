@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -98,6 +99,53 @@ func setupTCPTest(t *testing.T, mock *mockTCPServer) (*tcpClient, func()) {
 		_ = conn.Close()
 		srv.Stop()
 	}
+}
+
+type stubTunnelSetupResolver struct {
+	SandboxInterface
+	get func(context.Context) error
+}
+
+func (r *stubTunnelSetupResolver) Get(ctx context.Context, _, name string) (*Sandbox, error) {
+	if err := r.get(ctx); err != nil {
+		return nil, err
+	}
+	return &Sandbox{ID: "sb-" + name, Name: name}, nil
+}
+
+func setupTCPListenTest(t *testing.T, useSSH bool, get func(context.Context) error) (*tcpClient, []ListenOption) {
+	t.Helper()
+	client, cleanup := setupTCPTest(t, newMockTCPServer())
+	t.Cleanup(cleanup)
+	resolver := &stubTunnelSetupResolver{SandboxInterface: client.sandboxes, get: get}
+	client.sandboxes = resolver
+	if !useSSH {
+		return client, nil
+	}
+
+	ssh, sshCleanup := setupSSHTestWithSandboxes(t, newMockSSHServer(), resolver)
+	t.Cleanup(sshCleanup)
+	client.ssh = ssh
+	return client, []ListenOption{WithSSHTunnel()}
+}
+
+func dialForwardListener(t *testing.T, ln ForwardListener) net.Conn {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", ln.Addr().String(), 5*time.Second)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+	return conn
+}
+
+func assertTCPForwardEcho(t *testing.T, conn net.Conn) {
+	t.Helper()
+	_, err := conn.Write([]byte("ping"))
+	require.NoError(t, err)
+	buf := make([]byte, len("ping"))
+	_, err = io.ReadFull(conn, buf)
+	require.NoError(t, err)
+	assert.Equal(t, "ping", string(buf))
 }
 
 // --- Tests ---
@@ -370,7 +418,6 @@ func TestTCPForward_ServerError(t *testing.T) {
 	defer cleanup()
 
 	rwc, err := client.Forward(context.Background(), "default", "my-sandbox", 8080)
-
 	// The stream opens successfully (gRPC bidi streams don't fail on open),
 	// but the first write or read should surface the server error.
 	if err != nil {
@@ -534,6 +581,50 @@ func TestTCPListen_ConcurrentConnections(t *testing.T) {
 	}
 }
 
+// tcp listener should allow 4 concurrent connections that do not block each other
+func TestTCPListen_ConcurrentTunnelSetup(t *testing.T) {
+	for _, transport := range []string{"tcp", "ssh"} {
+		t.Run(transport, func(t *testing.T) {
+			const numConns = 4
+			entered := make(chan struct{}, numConns)
+			release := make(chan struct{})
+			client, opts := setupTCPListenTest(t, transport == "ssh", func(ctx context.Context) error {
+				entered <- struct{}{}
+				select {
+				case <-release:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			})
+
+			ln, err := client.Listen(context.Background(), "default", "my-sandbox", 8080, 0, opts...)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = ln.Close() })
+
+			conns := make([]net.Conn, numConns)
+			for i := range numConns {
+				conns[i] = dialForwardListener(t, ln)
+			}
+
+			// Every setup must start before any is allowed to finish.
+			timer := time.NewTimer(5 * time.Second)
+			defer timer.Stop()
+			for i := range numConns {
+				select {
+				case <-entered:
+				case <-timer.C:
+					t.Fatalf("only %d/%d tunnel setups started; setup is serialized", i, numConns)
+				}
+			}
+			close(release)
+			for _, conn := range conns {
+				assertTCPForwardEcho(t, conn)
+			}
+		})
+	}
+}
+
 func TestTCPListen_EphemeralPort(t *testing.T) {
 	mock := newMockTCPServer()
 	client, cleanup := setupTCPTest(t, mock)
@@ -636,6 +727,46 @@ func TestTCPListen_InvalidRemotePort(t *testing.T) {
 }
 
 // --- Graceful shutdown tests ---
+
+func TestTCPListen_HungTunnelSetup(t *testing.T) {
+	for _, transport := range []string{"tcp", "ssh"} {
+		t.Run(transport, func(t *testing.T) {
+			var calls atomic.Int32
+			started := make(chan struct{})
+			client, opts := setupTCPListenTest(t, transport == "ssh", func(ctx context.Context) error {
+				if calls.Add(1) == 1 {
+					close(started)
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				return nil
+			})
+
+			ln, err := client.Listen(context.Background(), "default", "my-sandbox", 8080, 0, opts...)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = ln.Close() })
+			_ = dialForwardListener(t, ln)
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("first tunnel setup did not start")
+			}
+
+			// A hung setup must not block another connection's data flow.
+			assertTCPForwardEcho(t, dialForwardListener(t, ln))
+
+			// Close must cancel the hung setup and wait for workers to finish.
+			closed := make(chan error, 1)
+			go func() { closed <- ln.Close() }()
+			select {
+			case err := <-closed:
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("Close did not cancel and drain tunnel setup workers")
+			}
+		})
+	}
+}
 
 func TestTCPListen_CloseTerminatesConnections(t *testing.T) {
 	mock := newMockTCPServer()
