@@ -114,9 +114,18 @@ pub struct UnresolvedPlaceholderError {
 enum UnresolvedPlaceholderReason {
     Unavailable,
     EndpointMismatch,
+    PlacementMismatch,
 }
 
+pub const CREDENTIAL_PLACEMENT_MISMATCH: &str =
+    "credential is not authorized for the request location";
+
 impl UnresolvedPlaceholderError {
+    #[must_use]
+    pub fn is_placement_mismatch(&self) -> bool {
+        self.reason == UnresolvedPlaceholderReason::PlacementMismatch
+    }
+
     #[must_use]
     pub fn unavailable(location: &'static str) -> Self {
         unresolved(location)
@@ -136,6 +145,7 @@ impl fmt::Display for UnresolvedPlaceholderError {
             match self.reason {
                 UnresolvedPlaceholderReason::Unavailable =>
                     "credential placeholder could not be resolved",
+                UnresolvedPlaceholderReason::PlacementMismatch => CREDENTIAL_PLACEMENT_MISMATCH,
                 UnresolvedPlaceholderReason::EndpointMismatch =>
                     "credential is not authorized for the request endpoint",
             },
@@ -180,9 +190,30 @@ pub struct RewriteTargetResult {
 // SecretResolver
 // ---------------------------------------------------------------------------
 
+/// Credential-specific destinations authorized by the provider profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialPlacement {
+    Header(String),
+    QueryParam(String),
+    PathTemplate(String),
+    SigningOnly,
+}
+
+/// The actual destination of a workload-provided credential placeholder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestCredentialLocation {
+    Header(String),
+    QueryParam(String),
+    Path(String),
+    Body,
+    WebSocket,
+}
+
 #[derive(Clone, Default)]
 pub struct SecretResolver {
     by_placeholder: HashMap<String, SecretValue>,
+    placements: HashMap<String, CredentialPlacement>,
+    request_location: Option<RequestCredentialLocation>,
     denied_env_keys: HashSet<String>,
     identity_bound_env_keys: HashSet<String>,
     revision_fallback_allowed_revisions: HashMap<String, Arc<HashSet<u64>>>,
@@ -292,6 +323,8 @@ impl SecretResolver {
         let resolver = |by_placeholder: HashMap<String, SecretValue>| {
             (!by_placeholder.is_empty()).then_some(Self {
                 by_placeholder,
+                placements: HashMap::new(),
+                request_location: None,
                 denied_env_keys: HashSet::new(),
                 identity_bound_env_keys: HashSet::new(),
                 revision_fallback_allowed_revisions: HashMap::new(),
@@ -347,6 +380,8 @@ impl SecretResolver {
                 child_env,
                 Some(Self {
                     by_placeholder,
+                    placements: HashMap::new(),
+                    request_location: None,
                     denied_env_keys: HashSet::new(),
                     identity_bound_env_keys: HashSet::new(),
                     revision_fallback_allowed_revisions: HashMap::new(),
@@ -357,11 +392,13 @@ impl SecretResolver {
 
     pub fn merge<'a>(resolvers: impl IntoIterator<Item = &'a Self>) -> Option<Self> {
         let mut by_placeholder = HashMap::new();
+        let mut placements = HashMap::new();
         let mut denied_env_keys = HashSet::new();
         let mut identity_bound_env_keys = HashSet::new();
         let mut revision_fallback_allowed_revisions = HashMap::new();
         for resolver in resolvers {
             by_placeholder.extend(resolver.by_placeholder.clone());
+            placements.extend(resolver.placements.clone());
             denied_env_keys.extend(resolver.denied_env_keys.iter().cloned());
             identity_bound_env_keys.extend(resolver.identity_bound_env_keys.iter().cloned());
             revision_fallback_allowed_revisions
@@ -372,6 +409,8 @@ impl SecretResolver {
         } else {
             Some(Self {
                 by_placeholder,
+                placements,
+                request_location: None,
                 denied_env_keys,
                 identity_bound_env_keys,
                 revision_fallback_allowed_revisions,
@@ -405,9 +444,82 @@ impl SecretResolver {
             .collect();
         Self {
             by_placeholder,
+            placements: self.placements.clone(),
+            request_location: None,
             denied_env_keys,
             identity_bound_env_keys: bound_keys.clone(),
             revision_fallback_allowed_revisions,
+        }
+    }
+
+    /// Attach mandatory placement metadata to a resolver snapshot.
+    pub(crate) fn with_placements(
+        mut self,
+        placements: HashMap<String, CredentialPlacement>,
+    ) -> Self {
+        self.placements = placements;
+        self
+    }
+
+    /// Select the actual structured request destination before resolving input.
+    #[must_use]
+    pub fn with_request_location(&self, location: RequestCredentialLocation) -> Self {
+        let mut scoped = self.clone();
+        scoped.request_location = Some(location);
+        scoped
+    }
+
+    fn placement_permits(&self, placeholder: &str) -> bool {
+        let Some(key) = placeholder_env_key(placeholder) else {
+            return true;
+        };
+        let Some(placement) = self.placements.get(key) else {
+            return true;
+        };
+        match (placement, self.request_location.as_ref()) {
+            (
+                CredentialPlacement::Header(expected),
+                Some(RequestCredentialLocation::Header(actual)),
+            ) => expected.eq_ignore_ascii_case(actual),
+            (
+                CredentialPlacement::QueryParam(expected),
+                Some(RequestCredentialLocation::QueryParam(actual)),
+            ) => expected == actual,
+            (
+                CredentialPlacement::PathTemplate(expected),
+                Some(RequestCredentialLocation::Path(actual)),
+            ) => {
+                // Normalize only this credential's slot; all other path text must match.
+                let mut normalized = String::new();
+                let mut pos = 0;
+                let mut slots = 0;
+                while pos < actual.len() {
+                    let next_canonical = actual[pos..]
+                        .find(PLACEHOLDER_PREFIX)
+                        .map(|offset| pos + offset);
+                    let next_alias = actual[pos..]
+                        .find(PROVIDER_ALIAS_MARKER)
+                        .map(|offset| alias_start_for_marker(actual, pos + offset));
+                    let next = [next_canonical, next_alias].into_iter().flatten().min();
+                    let Some(start) = next else {
+                        normalized.push_str(&actual[pos..]);
+                        break;
+                    };
+                    normalized.push_str(&actual[pos..start]);
+                    let Some((end, token)) = self.credential_token_at(actual, start) else {
+                        return false;
+                    };
+                    if placeholder_env_key(token) == Some(key) {
+                        normalized.push_str("{credential}");
+                        slots += 1;
+                    } else {
+                        normalized.push_str(token);
+                    }
+                    pos = end;
+                }
+                slots == 1 && normalized == *expected
+            }
+            _ => false,
         }
     }
 
@@ -420,6 +532,8 @@ impl SecretResolver {
             .is_some_and(|key| self.denied_env_keys.contains(key))
         {
             UnresolvedPlaceholderReason::EndpointMismatch
+        } else if !self.placement_permits(placeholder) {
+            UnresolvedPlaceholderReason::PlacementMismatch
         } else {
             UnresolvedPlaceholderReason::Unavailable
         };
@@ -435,6 +549,9 @@ impl SecretResolver {
         // handle retains the original endpoint, epoch, and expiration constraints.
         let canonical_alias = alias_env_key(value).map(placeholder_for_env_key);
         let value = canonical_alias.as_deref().unwrap_or(value);
+        if !self.placement_permits(value) {
+            return None;
+        }
         if placeholder_env_key(value).is_some_and(|key| self.identity_bound_env_keys.contains(key))
             && revisioned_placeholder_parts(value).is_none()
             && stable_placeholder_parts(value).is_none()
@@ -487,6 +604,16 @@ impl SecretResolver {
                 reason: UnresolvedPlaceholderReason::EndpointMismatch,
             });
         }
+        if self
+            .placements
+            .get(key)
+            .is_some_and(|placement| !matches!(placement, CredentialPlacement::SigningOnly))
+        {
+            return Err(UnresolvedPlaceholderError {
+                location,
+                reason: UnresolvedPlaceholderReason::PlacementMismatch,
+            });
+        }
         let placeholder = placeholder_for_env_key(key);
         Ok(self
             .by_placeholder
@@ -510,6 +637,9 @@ impl SecretResolver {
                 reason: UnresolvedPlaceholderReason::EndpointMismatch,
             });
         }
+        if !self.placement_permits(value) {
+            return Err(self.unresolved_for(location, value));
+        }
         Ok(self.resolve_placeholder(value))
     }
 
@@ -517,6 +647,15 @@ impl SecretResolver {
         self.by_placeholder
             .get(placeholder)
             .map(|s| s.expires_at_ms)
+    }
+
+    pub fn rewrite_header_value_for_name(
+        &self,
+        name: &str,
+        value: &str,
+    ) -> Result<Option<String>, UnresolvedPlaceholderError> {
+        self.with_request_location(RequestCredentialLocation::Header(name.to_string()))
+            .rewrite_header_value(value)
     }
 
     pub fn rewrite_header_value(
@@ -559,6 +698,15 @@ impl SecretResolver {
     }
 
     pub fn rewrite_text_placeholders(
+        &self,
+        text: &mut String,
+        location: &'static str,
+    ) -> Result<usize, UnresolvedPlaceholderError> {
+        self.with_request_location(RequestCredentialLocation::Body)
+            .rewrite_text_placeholders_at_location(text, location)
+    }
+
+    fn rewrite_text_placeholders_at_location(
         &self,
         text: &mut String,
         location: &'static str,
@@ -627,7 +775,8 @@ impl SecretResolver {
         &self,
         text: &mut String,
     ) -> Result<usize, UnresolvedPlaceholderError> {
-        self.rewrite_text_placeholders(text, "websocket")
+        self.with_request_location(RequestCredentialLocation::WebSocket)
+            .rewrite_text_placeholders_at_location(text, "websocket")
     }
 
     fn credential_token_at<'a>(
@@ -677,7 +826,7 @@ impl SecretResolver {
         }
 
         let mut rewritten = decoded;
-        let replacements = self.rewrite_text_placeholders(&mut rewritten, "header")?;
+        let replacements = self.rewrite_text_placeholders_at_location(&mut rewritten, "header")?;
 
         if replacements == 0 {
             return Ok(None);
@@ -1092,6 +1241,9 @@ fn rewrite_uri_path(
     path: &str,
     resolver: &SecretResolver,
 ) -> Result<Option<(String, String)>, UnresolvedPlaceholderError> {
+    let scoped =
+        resolver.with_request_location(RequestCredentialLocation::Path(percent_decode(path)));
+    let resolver = &scoped;
     let segments: Vec<&str> = path.split('/').collect();
     let mut resolved_segments = Vec::with_capacity(segments.len());
     let mut redacted_segments = Vec::with_capacity(segments.len());
@@ -1202,8 +1354,11 @@ fn rewrite_uri_query_params(
             let decoded_value = percent_decode(value);
             if contains_raw_reserved_marker(&decoded_value) {
                 let mut rewritten = decoded_value.clone();
+                let decoded_key = percent_decode(&key.replace('+', " "));
+                let scoped = resolver
+                    .with_request_location(RequestCredentialLocation::QueryParam(decoded_key));
                 let replacements =
-                    resolver.rewrite_text_placeholders(&mut rewritten, "query_param")?;
+                    scoped.rewrite_text_placeholders_at_location(&mut rewritten, "query_param")?;
                 if replacements == 0 || contains_raw_reserved_marker(&rewritten) {
                     return Err(unresolved("query_param"));
                 }
@@ -1326,10 +1481,12 @@ pub fn rewrite_header_line_checked(
         return Ok(line.to_string());
     };
 
-    resolver.rewrite_header_value(value.trim())?.map_or_else(
-        || Ok(line.to_string()),
-        |rewritten| Ok(format!("{name}: {rewritten}")),
-    )
+    resolver
+        .rewrite_header_value_for_name(name, value.trim())?
+        .map_or_else(
+            || Ok(line.to_string()),
+            |rewritten| Ok(format!("{name}: {rewritten}")),
+        )
 }
 
 /// Resolve placeholders in a request target (path + query) for OPA evaluation.
@@ -1471,6 +1628,141 @@ mod tests {
         assert!(!header_value_contains_reserved_credential_marker(
             "Bearer ordinary-token"
         ));
+    }
+
+    fn placement_resolver(placement: CredentialPlacement) -> SecretResolver {
+        let (_, resolver) = SecretResolver::from_provider_env_for_revision(
+            HashMap::from([("TOKEN".to_string(), "secret-value".to_string())]),
+            HashMap::new(),
+            1,
+        );
+        resolver
+            .unwrap()
+            .with_placements(HashMap::from([("TOKEN".to_string(), placement)]))
+    }
+
+    #[test]
+    fn static_header_placement_cannot_be_overridden_by_request_location() {
+        let resolver = placement_resolver(CredentialPlacement::Header("Authorization".into()));
+        let token = "openshell:resolve:env:v1_TOKEN";
+        assert_eq!(
+            resolver
+                .rewrite_header_value_for_name("aUtHoRiZaTiOn", &format!("token {token}"))
+                .unwrap(),
+            Some("token secret-value".into())
+        );
+        assert!(
+            resolver
+                .rewrite_header_value_for_name("X-Reflect", token)
+                .unwrap_err()
+                .is_placement_mismatch()
+        );
+        assert!(
+            rewrite_target_for_eval(&format!("/search?q={token}"), &resolver)
+                .unwrap_err()
+                .is_placement_mismatch()
+        );
+        assert!(
+            rewrite_target_for_eval(&format!("/bot{token}/events"), &resolver)
+                .unwrap_err()
+                .is_placement_mismatch()
+        );
+        assert!(
+            resolver
+                .rewrite_text_placeholders(&mut token.to_string(), "body")
+                .unwrap_err()
+                .is_placement_mismatch()
+        );
+        assert!(
+            resolver
+                .rewrite_websocket_text_placeholders(&mut token.to_string())
+                .unwrap_err()
+                .is_placement_mismatch()
+        );
+        assert!(resolver.resolve_placeholder(token).is_none());
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("user:{token}"));
+        assert!(
+            resolver
+                .rewrite_header_value_for_name("Authorization", &format!("Basic {basic}"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            resolver
+                .rewrite_header_value_for_name("X-Reflect", &format!("Basic {basic}"))
+                .unwrap_err()
+                .is_placement_mismatch()
+        );
+    }
+
+    #[test]
+    fn query_placement_checks_each_decoded_parameter_name() {
+        let resolver = placement_resolver(CredentialPlacement::QueryParam("api_key".into()));
+        let token = "openshell:resolve:env:v1_TOKEN";
+        let valid = format!("/search?%61pi_key={token}");
+        assert_eq!(
+            rewrite_target_for_eval(&valid, &resolver).unwrap().resolved,
+            "/search?%61pi_key=secret-value"
+        );
+        for target in [
+            format!("/search?other={token}"),
+            format!("/search?api_key={token}&other={token}"),
+            "/search?other=vendor-OPENSHELL-RESOLVE-ENV-v1_TOKEN".to_string(),
+        ] {
+            assert!(
+                rewrite_target_for_eval(&target, &resolver)
+                    .unwrap_err()
+                    .is_placement_mismatch()
+            );
+        }
+        assert!(
+            rewrite_target_for_eval(
+                &format!("/search?api_key={token}&api_key={token}"),
+                &resolver
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn path_placement_checks_exact_slot_and_literal_template() {
+        let resolver = placement_resolver(CredentialPlacement::PathTemplate(
+            "/bot{credential}/events".into(),
+        ));
+        let token = "openshell:resolve:env:v1_TOKEN";
+        assert_eq!(
+            rewrite_target_for_eval(&format!("/bot{token}/events"), &resolver)
+                .unwrap()
+                .resolved,
+            "/botsecret-value/events"
+        );
+        assert!(
+            rewrite_target_for_eval(&format!("/bot{token}/echo"), &resolver)
+                .unwrap_err()
+                .is_placement_mismatch()
+        );
+        assert!(
+            rewrite_target_for_eval(&format!("/echo/{token}/events"), &resolver)
+                .unwrap_err()
+                .is_placement_mismatch()
+        );
+        assert!(
+            rewrite_target_for_eval(
+                &format!("/bot{}/events", fully_percent_encoded(token)),
+                &resolver
+            )
+            .is_ok()
+        );
+        let alias_resolver = placement_resolver(CredentialPlacement::PathTemplate(
+            "/{credential}/events".into(),
+        ));
+        assert!(
+            rewrite_target_for_eval(
+                "/vendor-OPENSHELL-RESOLVE-ENV-v1_TOKEN/events",
+                &alias_resolver
+            )
+            .is_ok()
+        );
     }
 
     fn fully_percent_encoded(marker: &str) -> String {

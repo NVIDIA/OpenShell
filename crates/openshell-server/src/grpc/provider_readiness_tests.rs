@@ -73,6 +73,7 @@ fn hello() -> SupervisorHello {
         connection_epoch: 0,
         supports_provider_readiness: true,
         supports_config_push: false,
+        supports_static_credential_placement: false,
         redirected: false,
         supports_session_redirect: true,
     }

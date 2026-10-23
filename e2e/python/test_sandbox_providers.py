@@ -236,6 +236,8 @@ def native_endpoint_server() -> Iterator[int]:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(encoded)))
+                separator = "&" if "?" in self.path else "?"
+                self.send_header("Link", f"<{self.path}{separator}page=2>; rel=next")
                 self.end_headers()
                 self.wfile.write(encoded)
 
@@ -723,6 +725,108 @@ def test_imported_openai_profile_allows_native_endpoint_with_attached_provider(
                     assert payload["path"] == "/v1/chat/completions"
                     assert payload["authorization"] == f"Bearer {secret}"
                     assert body["model"] == "fixture-openai-model"
+
+
+def test_static_header_credentials_reject_reflective_request_locations(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """Only the declared auth header can resolve a static credential."""
+    stub = sandbox_client._stub
+    profile_id = f"e2e-placement-{time.time_ns()}"
+    secret = "synthetic-placement-secret"
+    profile = _native_inference_profile(
+        profile_id=profile_id,
+        env_var="API_TOKEN",
+        port=0,
+        rules=[sandbox_pb2.L7Rule(allow=sandbox_pb2.L7Allow(method="*", path="/**"))],
+    )
+    profile.endpoints[0].request_body_credential_rewrite = True
+
+    def probe_locations(host: str, port: int) -> str:
+        import json
+        import os
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        token = os.environ["API_TOKEN"]
+        root = f"http://{host}:{port}"
+        requests = [
+            urllib.request.Request(
+                root
+                + "/search?"
+                + urllib.parse.urlencode({"q": "rust", "per_page": "1", "probe": token})
+            ),
+            urllib.request.Request(root + "/search", headers={"X-Reflect": token}),
+            urllib.request.Request(
+                root + "/" + urllib.parse.quote(token, safe="") + "/search"
+            ),
+            urllib.request.Request(
+                root + "/search",
+                data=urllib.parse.urlencode({"token": token}).encode(),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            ),
+        ]
+        results = []
+        for request in requests:
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    results.append(
+                        {"status": response.status, "body": response.read().decode()}
+                    )
+            except urllib.error.HTTPError as error:
+                results.append(
+                    {
+                        "status": error.code,
+                        "body": error.read().decode(),
+                        "link": error.headers.get("Link"),
+                    }
+                )
+        request = urllib.request.Request(
+            root + "/search?q=rust&per_page=1",
+            headers={"Authorization": f"token {token}"},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            valid = {
+                "body": json.loads(response.read()),
+                "link": response.headers.get("Link"),
+            }
+        return json.dumps({"denied": results, "valid": valid})
+
+    with native_endpoint_server() as port:
+        profile.endpoints[0].port = port
+        with (
+            imported_provider_profile(
+                stub, profile=profile, source=f"{profile_id}.yaml"
+            ),
+            provider(
+                stub,
+                name=f"{profile_id}-provider",
+                provider_type=profile_id,
+                credentials={"API_TOKEN": secret},
+                profile_workspace="default",
+            ) as attached_provider,
+        ):
+            spec = datamodel_pb2.SandboxSpec(
+                policy=_default_policy(), providers=[attached_provider]
+            )
+            with sandbox(spec=spec, delete_on_exit=True) as sb:
+                result = sb.exec_python(
+                    probe_locations,
+                    args=("host.openshell.internal", port),
+                    timeout_seconds=180,
+                )
+                assert result.exit_code == 0, result.stderr
+                payload = json.loads(result.stdout)
+                for denied in payload["denied"]:
+                    assert denied["status"] == 403, denied
+                    assert "credential_placement_mismatch" in denied["body"]
+                    assert secret not in denied["body"]
+                    assert denied["link"] is None
+                assert payload["valid"]["body"]["authorization"] == f"token {secret}"
+                assert "per_page=1&page=2" in payload["valid"]["link"]
+                assert secret not in payload["valid"]["link"]
 
 
 def test_imported_anthropic_profile_allows_native_endpoint_with_attached_provider(

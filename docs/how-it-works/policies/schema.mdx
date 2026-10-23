@@ -166,8 +166,8 @@ the gateway host.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `credential_binding.provider` | string | None | Binds the static credentials of an attached provider whose profile defines no endpoints. Valid only in a sandbox policy. |
-| `request_body_credential_rewrite` | bool | `false` | Replaces credential placeholders in REST request bodies. |
-| `websocket_credential_rewrite` | bool | `false` | Replaces credential placeholders in client WebSocket text messages. |
+| `request_body_credential_rewrite` | bool | `false` | Enables REST body rewriting without overriding credential placement. Header-, query-, and path-bound static credentials cannot resolve in bodies. |
+| `websocket_credential_rewrite` | bool | `false` | Enables WebSocket text rewriting without overriding credential placement. Header-, query-, and path-bound static credentials cannot resolve in messages. |
 | `allow_uninspected_credentials` | bool | `false` | Allows a provider-credentialed endpoint to omit request inspection or use `tls: skip`. |
 | `credential_signing` | string | None | AWS request signing: `sigv4`, `sigv4:body`, or `sigv4:no_body`. |
 | `signing_service` | string | None | AWS service name, such as `bedrock` or `s3`. Required with `credential_signing`. |

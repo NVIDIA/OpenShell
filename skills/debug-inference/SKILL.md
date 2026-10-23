@@ -103,8 +103,9 @@ inference request using the provider's documented API shape.
 | A retired managed endpoint fails DNS resolution | Client still uses the removed managed endpoint | Configure the provider's native base URL and attach an endpoint-bearing provider profile |
 | Direct request is denied | Missing attachment, endpoint policy, HTTP rule, or binary authorization | Inspect the attached provider profile and sandbox effective policy |
 | `credential_endpoint_mismatch` | Credential profile does not authorize the request recipient | Correct the host/port/path or import a narrowly scoped profile for the intended endpoint |
+| `credential_placement_mismatch` | A credential placeholder is outside its declared header, query parameter, or path slot | Match the profile's declared placement. Body and WebSocket rewrite flags do not override credential placement. |
 | `request_authority_mismatch` | HTTP authority differs from the CONNECT destination | Use the same host and effective port in both authorities |
-| Credential variable is absent | Provider was not attached when this process launched, or profiles collide on a key | Attach the provider and launch a new process; resolve duplicate keys explicitly |
+| Credential variable is absent | Provider was not attached when this process launched, profiles collide on a key, or placement metadata is missing | Check provider readiness and placement metadata, then launch a new process; resolve duplicate keys explicitly. Older supervisors require an upgrade before receiving static credentials. |
 | Upstream rejects the model or body | Client relied on removed model/request rewriting | Configure the real model and provider-native request format in the application |
 | `127.0.0.1` works on the host but not in the sandbox | Loopback refers to different runtime | Use `host.openshell.internal` or another gateway-reachable endpoint and profile |
 | Host-local request times out | Server bind address, gateway topology, or host firewall blocks container-to-host traffic | Verify the listener and permit only the required gateway network path and port |

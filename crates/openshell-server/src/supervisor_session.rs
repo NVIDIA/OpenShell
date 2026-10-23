@@ -2506,6 +2506,13 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
     Ok(())
 }
 
+// A pushed session reuses its capability for its entire lifetime, including
+// bootstrap and subsequent credential refreshes. Older supervisors are accepted
+// in polling mode, whose request capability gates all static credential values.
+fn supports_protected_config_push(hello: &SupervisorHello) -> bool {
+    hello.supports_config_push && hello.supports_static_credential_placement
+}
+
 pub async fn handle_connect_supervisor(
     state: &Arc<ServerState>,
     request: Request<tonic::Streaming<SupervisorMessage>>,
@@ -2542,7 +2549,7 @@ pub async fn handle_connect_supervisor(
     // apply it; the rest keep polling.
     let pushes_config = state.config.config_delivery_mode
         == openshell_core::config::ConfigDeliveryMode::Push
-        && hello.supports_config_push;
+        && supports_protected_config_push(&hello);
     let mode = if pushes_config {
         SessionMode::Push
     } else {
@@ -5544,6 +5551,23 @@ mod tests {
                 ring_redirect("gw-0", preferred, Some(format!("https://{preferred}:8443")))
                     .expect("a draining replica must hand off its own sandboxes");
             assert_ne!(redirect.owner_replica_id, "gw-0");
+        }
+    }
+
+    #[test]
+    fn static_placement_capability_gates_the_entire_push_session() {
+        for supports_push in [false, true] {
+            for supports_placement in [false, true] {
+                let hello = SupervisorHello {
+                    supports_config_push: supports_push,
+                    supports_static_credential_placement: supports_placement,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    supports_protected_config_push(&hello),
+                    supports_push && supports_placement
+                );
+            }
         }
     }
 
