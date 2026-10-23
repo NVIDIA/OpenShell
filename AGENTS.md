@@ -186,7 +186,7 @@ Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-reposito
 - Format: `<type>(<scope>): <description>` (scope is optional)
 - Common types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `ci`, `perf`
 - Sign off on each commit for DCO compliance. Use the `--signoff` option to `git commit` to add the `Signed-off-by` footer to ensure the user's configured email address is used.
-- Never mention Claude or any AI agent in commits (no author attribution, no Co-Authored-By, no references in commit messages)
+- Never mention Claude or any AI agent in commits, PR descriptions, or issues (no author attribution, no Co-Authored-By, no "Generated with" footers)
 
 ## Go SDK (`sdk/go/`)
 
