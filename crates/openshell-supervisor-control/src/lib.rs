@@ -38,14 +38,17 @@ pub mod proto {
 
 pub use controller::{
     AssignmentError, ConnectedMember, HOST_HEARTBEAT_INTERVAL, HostIdentity, InstanceOwner,
-    MAX_ASSIGNED_INSTANCES, MAX_REPORTED_INSTANCES, MemberView, ObservedInstance,
-    POOL_HEARTBEAT_INTERVAL, PoolView, SupervisorCredential, SupervisorHostController,
+    MAX_ASSIGNED_INSTANCES, MAX_POOL_INSTANCES, MAX_REPORTED_INSTANCES, MemberView,
+    ObservedInstance, OwnedReport, POOL_HEARTBEAT_INTERVAL, POOL_RECOVERY_TIMEOUT_SECS, PoolView,
+    SupervisorCredential, SupervisorHostController,
 };
 pub use coordinator::{
     InstancePlacement, InstanceSupervision, LaunchError, PlacementFuture, PlacementRequest,
     RecoverableInstance, RecoveryBaseline, RecoveryOutcome, SharedSupervision,
 };
 pub use credential::deliver_credentials;
+/// Recovery deadlines, in seconds, a supervisor may offer a sandbox runtime.
+pub use openshell_sandbox_backend::boundary_protocol::SUPERVISOR_RECOVERY_TIMEOUT_RANGE;
 pub use registration::{
     INSTANCE_REMOVAL_GRACE, MAX_LAUNCH_MATERIAL_BYTES, ProxyCaMaterial, RegistrationError,
     RegistrationTraceContext, SandboxInstanceRegistration, SecretPem,

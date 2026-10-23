@@ -71,14 +71,18 @@ supervisor:
     digest: ""
   # -- Shared supervisor replicas, used only when gatewayConfig selects
   # supervisor_topology = "gateway". 1 runs a single shared supervisor with no
-  # failover. 2 or more form a high-availability pool: when a member fails or
-  # leaves, another member takes over its sandboxes without restarting their
-  # workloads.
+  # failover. 2 or more form a high-availability pool, which the chart enables
+  # in the gateway's [openshell.gateway.supervisor_pool] table: when a member
+  # fails or leaves, another member takes over its sandboxes without
+  # restarting their workloads.
   replicas: 1
-  # -- (int) Seconds a sandbox workload stays frozen after losing its shared
-  # supervisor before the sandbox runtime terminates it, when
-  # supervisor_topology = "gateway". Must be an integer from 10 to 300. Null
-  # uses 60 seconds in a high-availability pool and 30 seconds otherwise.
+  # -- (int) Seconds a sandbox workload stays frozen after losing its pool
+  # member's supervision before the sandbox runtime terminates it. Used only
+  # by a high-availability pool (supervisor.replicas of 2 or more), as
+  # [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an
+  # integer from 10 to 300. Null uses the gateway's pool default of 60
+  # seconds. A single shared supervisor keeps the runtime default of 30
+  # seconds.
   recoveryTimeoutSeconds: null
   # Pod security context for the shared supervisor Deployment, rendered only
   # when gatewayConfig selects supervisor_topology = "gateway". On OpenShift,

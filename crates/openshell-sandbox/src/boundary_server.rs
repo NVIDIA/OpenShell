@@ -103,12 +103,13 @@ mod linux {
     const RUNTIME_ROUTE_HOP_TIMEOUT: Duration = Duration::from_secs(2);
     /// Redirects followed from each supervisor address a dial starts at.
     const MAX_RUNTIME_ROUTE_REDIRECTS: usize = 2;
-    /// Spares a runtime supervised by a pool keeps unused at once: one at its
-    /// owner, and one at each member that discovery finds hosting its route.
+    /// Spares a routed runtime keeps unused at once: one at its owner, and in
+    /// a supervisor pool one at each member that discovery finds hosting its
+    /// route. A lone shared supervisor is one member, so it holds one.
     const POOL_MAX_UNCLAIMED_SPARES: usize = 3;
     /// Interval of route discovery through the configured supervisor
     /// addresses, which finds a new owner while the previous one stays
-    /// reachable.
+    /// reachable. Only runs once a supervisor showed it is a pool member.
     const POOL_ROUTE_DISCOVERY_INTERVAL: Duration = Duration::from_secs(15);
     /// Dials in one discovery round.
     const POOL_ROUTE_DISCOVERY_PROBES: usize = 3;
@@ -344,9 +345,6 @@ mod linux {
         if config.verification_keys.is_empty() {
             return Err("at least one gateway verification key is required".to_string());
         }
-        config
-            .supervisor_recovery_timeout()
-            .map_err(|error| error.to_string())?;
         validate_resource_claims(&config.resource_claims).map_err(|error| error.to_string())?;
         config
             .provisioning_evidence
@@ -404,14 +402,11 @@ mod linux {
                 addresses,
                 tls,
                 route,
-                route_redirects,
             } => {
                 validate_runtime_initiated_targets(authority, addresses, tls)?;
                 if let Some(route) = route {
                     openshell_sandbox_backend::runtime_routed::validate_route_handle(route)
                         .map_err(|error| error.to_string())?;
-                } else if *route_redirects {
-                    return Err("runtime route redirects require a route handle".to_string());
                 }
             }
             BoundaryListenerConfig::Unix { .. }
@@ -703,8 +698,9 @@ mod linux {
     /// connection before retiring the old one, never wait on this loop. TLS
     /// failures back off like dial failures. Established spares are served
     /// like accepted connections: same identity, slot limit, and disconnect,
-    /// freeze, and termination handling. A runtime supervised by a pool keeps
-    /// its spares as [`run_pool_runtime_control`] describes.
+    /// freeze, and termination handling. A runtime of a supervisor shared by
+    /// several sandboxes keeps its spares as [`run_routed_runtime_control`]
+    /// describes.
     async fn run_runtime_initiated_control(
         config: BoundaryListenerConfig,
         server_config: Arc<rustls::ServerConfig>,
@@ -714,12 +710,11 @@ mod linux {
         if let BoundaryListenerConfig::RuntimeInitiatedTlsTcp {
             addresses,
             route: Some(route),
-            route_redirects: true,
             ..
         } = &config
         {
-            return run_pool_runtime_control(
-                PoolRoute {
+            return run_routed_runtime_control(
+                SupervisorRoute {
                     addresses: addresses.clone(),
                     route: route.clone(),
                 },
@@ -800,25 +795,13 @@ mod linux {
         }
     }
 
-    /// Dial only driver-provided supervisor addresses from the bootstrap.
-    ///
-    /// A shared supervisor first receives this generation's route handle so
-    /// it can expect the right pinned identity; this runtime then serves TLS
-    /// exactly as it does for a dedicated supervisor.
+    /// Dial only driver-provided addresses of a dedicated supervisor from the
+    /// bootstrap. A shared supervisor is reached through
+    /// [`run_routed_runtime_control`] instead.
     async fn dial_supervisor(config: &BoundaryListenerConfig) -> io::Result<PlainControlStream> {
         match config {
-            BoundaryListenerConfig::RuntimeInitiatedTlsTcp {
-                addresses, route, ..
-            } => {
-                let mut stream = connect_supervisor(addresses).await?;
-                if let Some(route) = route {
-                    let preface =
-                        openshell_sandbox_backend::runtime_routed::encode_route_preface(route)
-                            .map_err(|error| {
-                                io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
-                            })?;
-                    stream.write_all(&preface).await?;
-                }
+            BoundaryListenerConfig::RuntimeInitiatedTlsTcp { addresses, .. } => {
+                let stream = connect_supervisor(addresses).await?;
                 Ok(PlainControlStream::Tcp(stream.into_std()?))
             }
             BoundaryListenerConfig::RuntimeInitiatedUnix { socket_path, .. } => {
@@ -866,33 +849,36 @@ mod linux {
         Ok(stream)
     }
 
-    /// Where a runtime supervised by a pool dials: the configured supervisor
-    /// addresses (the pool's Service) and its route handle.
-    struct PoolRoute {
+    /// Where a runtime of a shared supervisor dials: the configured supervisor
+    /// addresses (the shared supervisor's Service) and its route handle.
+    struct SupervisorRoute {
         addresses: Vec<std::net::SocketAddr>,
         route: String,
     }
 
-    /// An authenticated connection a pool member has not used yet.
-    struct PoolSpare {
+    /// An authenticated connection a supervisor has not used yet.
+    struct RouteSpare {
         member: std::net::SocketAddr,
         claimed: tokio::sync::oneshot::Receiver<()>,
         established_at: tokio::time::Instant,
     }
 
-    /// Unclaimed spares of a runtime supervised by a pool, at most one per
-    /// member. A member's address grants nothing: a member whose earlier term
-    /// was fenced may hold a later one, which only its signed grant proves,
-    /// so every member may be offered a spare and stale credentials are
-    /// refused on it.
+    /// Unclaimed spares of a routed runtime, at most one per supervisor pool
+    /// member; a lone shared supervisor is one member. A member's address
+    /// grants nothing: a member whose earlier term was fenced may hold a
+    /// later one, which only its signed grant proves, so every member may be
+    /// offered a spare and stale credentials are refused on it.
     #[derive(Default)]
-    struct PoolSpares {
-        unclaimed: Vec<PoolSpare>,
+    struct RouteSpares {
+        unclaimed: Vec<RouteSpare>,
         /// The member whose connection the runtime confirmed last.
         owner: Option<std::net::SocketAddr>,
+        /// A supervisor named itself as a pool member or redirected this
+        /// runtime: its route can move to another member, so discovery runs.
+        pooled: bool,
     }
 
-    impl PoolSpares {
+    impl RouteSpares {
         fn holds(&self, member: std::net::SocketAddr) -> bool {
             self.unclaimed.iter().any(|spare| spare.member == member)
         }
@@ -912,7 +898,7 @@ mod linux {
         }
 
         /// The next spare its member used (`true`) or that closed unused.
-        async fn next_settled(&mut self) -> (PoolSpare, bool) {
+        async fn next_settled(&mut self) -> (RouteSpare, bool) {
             if self.unclaimed.is_empty() {
                 return std::future::pending().await;
             }
@@ -930,27 +916,30 @@ mod linux {
         }
     }
 
-    /// Keep a runtime supervised by a supervisor pool reachable by whichever
-    /// member owns its route.
+    /// Keep a runtime of a shared supervisor reachable by whichever
+    /// supervisor owns its route.
     ///
-    /// A spare waits at the member whose connection the runtime confirmed
-    /// last, its authenticated owner, or wherever the configured addresses
-    /// lead before one is confirmed; an unauthenticated accept never makes a
-    /// member the owner. A previous owner can stay reachable, and keep its
-    /// spare unused, after the gateway granted the route to another member,
-    /// so discovery rounds also dial the configured addresses past every
-    /// known member: a member found hosting the route without a spare gets
-    /// one, on which it can authenticate its takeover. Spares are bounded per
-    /// member and in total, and established connections are never closed to
-    /// refresh routing.
-    async fn run_pool_runtime_control(
-        pool: PoolRoute,
+    /// Every dial names the route in a version 2 preface. A spare waits at
+    /// the member whose connection the runtime confirmed last, its
+    /// authenticated owner, or wherever the configured addresses lead before
+    /// one is confirmed; an unauthenticated accept never makes a member the
+    /// owner. In a supervisor pool a previous owner can stay reachable, and
+    /// keep its spare unused, after the gateway granted the route to another
+    /// member, so once a supervisor names itself a pool member or redirects
+    /// this runtime, discovery rounds also dial the configured addresses past
+    /// every known member: a member found hosting the route without a spare
+    /// gets one, on which it can authenticate its takeover. A lone shared
+    /// supervisor is never probed. Spares are bounded per member and in
+    /// total, and established connections are never closed to refresh
+    /// routing.
+    async fn run_routed_runtime_control(
+        pool: SupervisorRoute,
         server_config: Arc<rustls::ServerConfig>,
         runtime: Arc<BoundaryRuntime>,
         active_connections: Arc<AtomicUsize>,
         discovery_interval: Duration,
     ) {
-        let mut spares = PoolSpares::default();
+        let mut spares = RouteSpares::default();
         let mut backoff = RUNTIME_DIAL_BACKOFF_MIN;
         let mut retry_at = tokio::time::Instant::now();
         let mut warn_at: Option<tokio::time::Instant> = None;
@@ -974,14 +963,18 @@ mod linux {
                     ))
                 });
                 let started = match dialed {
-                    Ok(dialed) if spares.admits(dialed.member) => {
-                        start_pool_spare(dialed, &server_config, &runtime, &active_connections)
-                            .await
-                            .map(Some)
+                    Ok(dialed) => {
+                        spares.pooled |= dialed.shows_pool();
+                        if spares.admits(dialed.member) {
+                            start_route_spare(dialed, &server_config, &runtime, &active_connections)
+                                .await
+                                .map(Some)
+                        } else {
+                            // The addresses led to a member that already
+                            // holds a spare; discovery tries again.
+                            Ok(None)
+                        }
                     }
-                    // The addresses led to a member that already holds a
-                    // spare; discovery tries again.
-                    Ok(_) => Ok(None),
                     Err(error) => Err(error),
                 };
                 match started {
@@ -1011,8 +1004,8 @@ mod linux {
                         backoff = (backoff * 2).min(RUNTIME_DIAL_BACKOFF_MAX);
                     }
                 }
-                _ = discovery.tick() => {
-                    discover_pool_route(&pool, &mut spares, &server_config, &runtime, &active_connections)
+                _ = discovery.tick(), if spares.pooled => {
+                    discover_route_owner(&pool, &mut spares, &server_config, &runtime, &active_connections)
                         .await;
                 }
                 () = tokio::time::sleep_until(retry_at), if waiting => {}
@@ -1024,9 +1017,9 @@ mod linux {
     /// member, so a member that hosts the route without a spare gets one. A
     /// redirect to a member that already holds a spare means the pool's
     /// directory agrees with this runtime and ends the round.
-    async fn discover_pool_route(
-        pool: &PoolRoute,
-        spares: &mut PoolSpares,
+    async fn discover_route_owner(
+        pool: &SupervisorRoute,
+        spares: &mut RouteSpares,
         server_config: &Arc<rustls::ServerConfig>,
         runtime: &Arc<BoundaryRuntime>,
         active_connections: &Arc<AtomicUsize>,
@@ -1043,12 +1036,13 @@ mod linux {
             else {
                 return;
             };
+            spares.pooled |= dialed.shows_pool();
             if spares.admits(dialed.member) {
                 tracing::info!(
                     member = %dialed.member,
                     "Supervisor pool member hosts this runtime's route without a spare; opening one"
                 );
-                match start_pool_spare(dialed, server_config, runtime, active_connections).await {
+                match start_route_spare(dialed, server_config, runtime, active_connections).await {
                     Ok(spare) => spares.unclaimed.push(spare),
                     Err(error) => {
                         tracing::debug!(%error, "Could not open a spare to a supervisor pool member");
@@ -1062,14 +1056,14 @@ mod linux {
         }
     }
 
-    /// Complete the runtime's TLS handshake with a reached pool member and
-    /// serve the connection until the member uses it or it closes.
-    async fn start_pool_spare(
+    /// Complete the runtime's TLS handshake with a reached supervisor and
+    /// serve the connection until the supervisor uses it or it closes.
+    async fn start_route_spare(
         dialed: DialedMember,
         server_config: &Arc<rustls::ServerConfig>,
         runtime: &Arc<BoundaryRuntime>,
         active_connections: &Arc<AtomicUsize>,
-    ) -> io::Result<PoolSpare> {
+    ) -> io::Result<RouteSpare> {
         let stream = ControlStream::PendingTls {
             stream: PlainControlStream::Tcp(dialed.stream.into_std()?),
             server_config: server_config.clone(),
@@ -1089,21 +1083,30 @@ mod linux {
                 tracing::debug!(%error, "Boundary control connection ended");
             }
         });
-        Ok(PoolSpare {
+        Ok(RouteSpare {
             member: dialed.member,
             claimed,
             established_at: tokio::time::Instant::now(),
         })
     }
 
-    /// A supervisor pool member that accepted this runtime's route.
+    /// A supervisor that accepted this runtime's route.
     struct DialedMember {
         /// The member's runtime listener as it names itself, or the address
         /// dialed when it names none.
         member: std::net::SocketAddr,
         stream: tokio::net::TcpStream,
+        /// The supervisor named itself, as only a pool member does.
+        named: bool,
         /// A member's route directory led here.
         redirected: bool,
+    }
+
+    impl DialedMember {
+        /// Whether reaching this supervisor showed it belongs to a pool.
+        fn shows_pool(&self) -> bool {
+            self.named || self.redirected
+        }
     }
 
     /// Find a supervisor pool member that hosts `route`: `preferred` first,
@@ -1148,6 +1151,7 @@ mod linux {
                         return Ok(DialedMember {
                             member,
                             stream,
+                            named: named.is_some(),
                             redirected: redirects > 0,
                         });
                     }
@@ -1186,6 +1190,16 @@ mod linux {
     }
 
     /// Connect to one supervisor address and negotiate `route` there.
+    ///
+    /// A shared supervisor from before route negotiation closes a version 2
+    /// preface without replying; it reads only the preface header, so the
+    /// close usually arrives as a reset. That address is then reached again with the
+    /// version 1 preface, which such a supervisor routes to its local
+    /// registration of the route, and the dial reads as an accept that names
+    /// no member: no pool evidence, so no discovery. The fallback changes only
+    /// routing; the supervisor still has to complete the generation-pinned
+    /// TLS handshake and authenticate every request, and a takeover still
+    /// needs its signed grant.
     async fn negotiate_route_at(
         address: std::net::SocketAddr,
         route: &str,
@@ -1193,12 +1207,35 @@ mod linux {
         tokio::net::TcpStream,
         openshell_sandbox_backend::runtime_routed::RouteReply,
     )> {
+        use openshell_sandbox_backend::runtime_routed::{
+            RouteReply, encode_route_preface, negotiate_route,
+        };
+
         tokio::time::timeout(RUNTIME_ROUTE_HOP_TIMEOUT, async {
             let mut stream = connect_supervisor(&[address]).await?;
-            let reply =
-                openshell_sandbox_backend::runtime_routed::negotiate_route(&mut stream, route)
-                    .await?;
-            Ok((stream, reply))
+            match negotiate_route(&mut stream, route).await {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    tracing::debug!(
+                        %address,
+                        "Supervisor closed the route negotiation without replying; using the version 1 preface"
+                    );
+                    let mut stream = connect_supervisor(&[address]).await?;
+                    let preface = encode_route_preface(route).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+                    })?;
+                    stream.write_all(&preface).await?;
+                    Ok((stream, RouteReply::Accept(None)))
+                }
+                negotiated => negotiated.map(|reply| (stream, reply)),
+            }
         })
         .await
         .unwrap_or_else(|_| {
@@ -2234,16 +2271,52 @@ mod linux {
             }
             _ => {}
         }
-        let (supervisor_instance_id, supervisor_takeover) = match &request.request {
+        let (supervisor_instance_id, supervisor_takeover, recovery_offer) = match &request.request {
             Request::Attach {
                 supervisor_instance_id,
                 supervisor_takeover,
+                supervisor_recovery_timeout_secs,
                 ..
-            } => (Some(*supervisor_instance_id), supervisor_takeover.clone()),
-            _ => (None, None),
+            } => (
+                Some(*supervisor_instance_id),
+                supervisor_takeover.clone(),
+                *supervisor_recovery_timeout_secs,
+            ),
+            _ => (None, None, None),
         };
         let is_attach = supervisor_instance_id.is_some();
         let is_confirm = matches!(&request.request, Request::Confirm);
+        // A recovery deadline outside the bounds is refused before the attach
+        // can touch the boundary: recovery is always bounded.
+        let recovery_offer = match recovery_offer {
+            None => None,
+            Some(seconds) => {
+                let Some(offer) =
+                    openshell_sandbox_backend::boundary_protocol::supervisor_recovery_timeout(
+                        seconds,
+                    )
+                else {
+                    let range =
+                        openshell_sandbox_backend::boundary_protocol::SUPERVISOR_RECOVERY_TIMEOUT_RANGE;
+                    return write_frame(
+                        &mut stream,
+                        &ResponseEnvelope {
+                            request_id: request.request_id,
+                            response: guest_error(
+                                BoundaryErrorKind::Invalid,
+                                format!(
+                                    "supervisor recovery timeout must be between {} and {} seconds",
+                                    range.start(),
+                                    range.end()
+                                ),
+                            ),
+                        },
+                    )
+                    .map_err(|error| format!("write control frame: {error}"));
+                };
+                Some(offer)
+            }
+        };
         // Attach and confirm are serialized, so what an attach's precheck
         // admits still holds when it commits.
         let _admission = (is_attach || is_confirm).then(|| lock(&runtime.admission));
@@ -2302,9 +2375,12 @@ mod linux {
         if is_attach && matches!(&response.response, Response::Attached { .. }) {
             let supervisor_instance_id = supervisor_instance_id
                 .ok_or_else(|| "attach request lost supervisor instance identity".to_string())?;
-            if let Err((kind, message)) =
-                runtime.commit_attach(principal, supervisor_instance_id, takeover.as_ref())
-            {
+            if let Err((kind, message)) = runtime.commit_attach(
+                principal,
+                supervisor_instance_id,
+                takeover.as_ref(),
+                recovery_offer,
+            ) {
                 if takeover.is_some() {
                     emit_takeover_denial(&message, takeover.as_ref());
                 }
@@ -2378,8 +2454,16 @@ mod linux {
         /// VM-only termination flush.
         filesystem_flush: Option<FilesystemFlush>,
         /// How long a workload stays frozen without supervision before it is
-        /// terminated.
-        recovery_timeout: Duration,
+        /// terminated, unless the connection in force negotiated a deadline.
+        default_recovery_timeout: Duration,
+        /// Recovery deadlines supervisors offered when their connections
+        /// attached; the deadline of the connection in force governs the
+        /// freeze that follows its loss. Entries live as long as their
+        /// connections.
+        recovery_offers: Mutex<std::collections::HashMap<SandboxConnectionId, Duration>>,
+        /// Recovery deadlines of the freezes this runtime started.
+        #[cfg(test)]
+        scheduled_recoveries: Mutex<Vec<Duration>>,
         /// Serializes attach and confirm, so a candidate's registry checks
         /// hold from its precheck, before it touches the boundary, through
         /// its commit.
@@ -2691,9 +2775,6 @@ mod linux {
             )
             .map_err(|error| format!("configure Sandbox Protocol JWT verifier: {error}"))?;
             let filesystem_flush = FilesystemFlush::for_listener(&config.listener);
-            let recovery_timeout = config
-                .supervisor_recovery_timeout()
-                .map_err(|error| error.to_string())?;
             Ok(Self {
                 authenticator: SandboxProtocolAuthenticator::new(
                     verifier,
@@ -2706,7 +2787,11 @@ mod linux {
                     config.session_rotation,
                     config.auth_epoch,
                 ),
-                recovery_timeout,
+                default_recovery_timeout:
+                    openshell_sandbox_backend::boundary_protocol::DEFAULT_SUPERVISOR_RECOVERY_TIMEOUT,
+                recovery_offers: Mutex::new(std::collections::HashMap::new()),
+                #[cfg(test)]
+                scheduled_recoveries: Mutex::new(Vec::new()),
                 admission: Mutex::new(()),
                 ownership: tokio::sync::RwLock::new(()),
                 #[cfg(test)]
@@ -2878,17 +2963,34 @@ mod linux {
             Ok(guard)
         }
 
+        /// Commit an attach the registry admits, with the recovery deadline
+        /// its supervisor offered (`None` keeps the default) for the freeze
+        /// that follows the loss of this connection once it is in force.
         fn commit_attach(
             &self,
             principal: &SandboxProtocolPrincipal,
             supervisor_instance_id: openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId,
             takeover: Option<&openshell_core::jwt::VerifiedSupervisorTakeover>,
+            recovery_offer: Option<Duration>,
         ) -> Result<(), CommitError> {
-            if let Some(replaced) = self
+            let replaced = self
                 .connections
                 .attach(principal, supervisor_instance_id, takeover)
-                .map_err(connection_auth_error)?
+                .map_err(connection_auth_error)?;
             {
+                let mut offers = lock(&self.recovery_offers);
+                // An attach that raced its connection's loss leaves an entry
+                // behind; keep only served connections once the map grows.
+                if offers.len() >= MAX_CONTROL_CONNECTIONS {
+                    let served = lock(&self.connection_shutdowns);
+                    offers.retain(|connection, _| served.contains_key(connection));
+                }
+                match recovery_offer {
+                    Some(offer) => offers.insert(principal.connection_id(), offer),
+                    None => offers.remove(&principal.connection_id()),
+                };
+            }
+            if let Some(replaced) = replaced {
                 self.close_connection(replaced);
             }
             Ok(())
@@ -3038,6 +3140,7 @@ mod linux {
             if let Some(shutdown) = shutdown {
                 let _ = shutdown.send(());
             }
+            let recovery_offer = lock(&self.recovery_offers).remove(&connection_id);
             let recovery_id = {
                 // Taken before the registry, as promotion does, so the loss
                 // of a connection promoted a moment ago finds it in force.
@@ -3085,8 +3188,12 @@ mod linux {
                     .message("Sandbox Protocol connection lost; workload frozen")
                     .build()
             );
+            // The supervisor whose connection was in force chose how long its
+            // replacement may take.
+            let recovery_timeout = recovery_offer.unwrap_or(self.default_recovery_timeout);
+            #[cfg(test)]
+            lock(&self.scheduled_recoveries).push(recovery_timeout);
             let runtime = Arc::downgrade(self);
-            let recovery_timeout = self.recovery_timeout;
             self.process_runtime.spawn(async move {
                 tokio::time::sleep(recovery_timeout).await;
                 if let Some(runtime) = runtime.upgrade() {
@@ -5401,7 +5508,6 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
-                supervisor_recovery_timeout_secs: None,
             };
             let debug = format!("{config:?}");
             assert!(debug.contains("test-key"));
@@ -5516,7 +5622,6 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
-                supervisor_recovery_timeout_secs: None,
             };
             assert!(allows_runtime_supplementary_groups(&config));
         }
@@ -5601,7 +5706,6 @@ mod linux {
                     workload_identity: test_workload_identity(),
                     provisioning_evidence: test_provisioning_evidence(),
                     child_env: std::collections::HashMap::new(),
-                    supervisor_recovery_timeout_secs: None,
                 },
                 tokio::runtime::Handle::current(),
                 broker,
@@ -5710,7 +5814,7 @@ mod linux {
                 .authenticate_request(first_id, bearer_request((), &token).metadata())
                 .expect("first principal");
             runtime
-                .commit_attach(&first, supervisor_instance_id, None)
+                .commit_attach(&first, supervisor_instance_id, None, None)
                 .expect("attach first");
             // Confirmation runs on a blocking thread in production.
             tokio::task::block_in_place(|| runtime.commit_confirm(&first)).expect("confirm first");
@@ -5726,7 +5830,7 @@ mod linux {
                 .expect("early replacement principal");
             assert!(
                 matches!(
-                    runtime.commit_attach(&early, supervisor_instance_id, None),
+                    runtime.commit_attach(&early, supervisor_instance_id, None, None),
                     Err((BoundaryErrorKind::Unavailable, _))
                 ),
                 "reattach before the old transport is retired must be retryable"
@@ -5744,12 +5848,12 @@ mod linux {
                 .expect("replacement principal");
             assert!(
                 runtime
-                    .commit_attach(&replacement, test_supervisor_instance_id(), None)
+                    .commit_attach(&replacement, test_supervisor_instance_id(), None, None)
                     .is_err(),
                 "a replacement supervisor process must not claim the generation"
             );
             runtime
-                .commit_attach(&replacement, supervisor_instance_id, None)
+                .commit_attach(&replacement, supervisor_instance_id, None, None)
                 .expect("reattach replacement");
             assert_eq!(
                 runtime.connections.require_active(&replacement),
@@ -5779,7 +5883,7 @@ mod linux {
                 .authenticate_request(connection_id, bearer_request((), &token).metadata())
                 .expect("test principal");
             runtime
-                .commit_attach(&principal, supervisor_instance_id, None)
+                .commit_attach(&principal, supervisor_instance_id, None, None)
                 .expect("attach");
             tokio::task::block_in_place(|| runtime.commit_confirm(&principal)).expect("confirm");
             runtime.transport_disconnected(connection_id);
@@ -5800,7 +5904,7 @@ mod linux {
                 .expect("replacement principal");
             assert!(
                 runtime
-                    .commit_attach(&replacement, supervisor_instance_id, None)
+                    .commit_attach(&replacement, supervisor_instance_id, None, None)
                     .is_err()
             );
         }
@@ -5973,7 +6077,7 @@ mod linux {
                 .authenticate_request(connection_id, bearer_request((), &token).metadata())
                 .expect("test principal");
             runtime
-                .commit_attach(&principal, supervisor_instance_id, None)
+                .commit_attach(&principal, supervisor_instance_id, None, None)
                 .expect("attach");
             tokio::task::block_in_place(|| runtime.commit_confirm(&principal)).expect("confirm");
 
@@ -6359,7 +6463,6 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
-                supervisor_recovery_timeout_secs: None,
             };
 
             validate_config(&config).unwrap();
@@ -6540,7 +6643,6 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
-                supervisor_recovery_timeout_secs: None,
             };
             for address in [
                 "127.0.0.1:5500",
@@ -6557,37 +6659,6 @@ mod linux {
                 validate_config(&config(address))
                     .unwrap_or_else(|error| panic!("{address} must be accepted: {error}"));
             }
-        }
-
-        #[test]
-        fn runtime_route_redirects_require_a_route_handle() {
-            let config = |route: Option<String>, route_redirects| BoundaryConfig {
-                boundary_id: "sandbox-1".to_string(),
-                generation: "generation-1".to_string(),
-                session_id: test_session_id(),
-                session_rotation: openshell_core::jwt::SessionRotation::new(1)
-                    .expect("session rotation"),
-                auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
-                gateway_id: "test-gateway".to_string(),
-                verification_keys: vec![test_verification_key()],
-                listener: BoundaryListenerConfig::RuntimeInitiatedTlsTcp {
-                    authority: "supervisor.openshell.svc".to_string(),
-                    addresses: vec!["10.42.0.7:7443".parse().expect("valid address")],
-                    tls: placeholder_server_tls(),
-                    route,
-                    route_redirects,
-                },
-                resource_claims: std::collections::BTreeMap::new(),
-                resource_claim_files: std::collections::BTreeMap::new(),
-                workload_identity: test_workload_identity(),
-                provisioning_evidence: test_provisioning_evidence(),
-                child_env: std::collections::HashMap::new(),
-                supervisor_recovery_timeout_secs: None,
-            };
-            validate_config(&config(Some(new_route_handle()), true))
-                .expect("a routed runtime may follow redirects");
-            validate_config(&config(None, false)).expect("a dedicated supervisor needs no route");
-            assert!(validate_config(&config(None, true)).is_err());
         }
 
         /// Find the member hosting `route` as a pool runtime does, then serve
@@ -6684,6 +6755,66 @@ mod linux {
         }
 
         #[tokio::test]
+        async fn a_supervisor_from_before_route_negotiation_is_reached_with_the_first_preface() {
+            // A shared supervisor that only knows version 1 prefaces closes a
+            // version 2 one without replying, as the #4702 router did.
+            let legacy = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("legacy supervisor");
+            let address = legacy.local_addr().expect("legacy address");
+            let route = new_route_handle();
+            let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+            let server = tokio::spawn(async move {
+                // Connections kept for the TLS handshake that follows; they
+                // close when the task is aborted.
+                #[allow(clippy::collection_is_never_read)]
+                let mut kept = Vec::new();
+                loop {
+                    let (mut stream, _) = legacy.accept().await.expect("accept");
+                    let mut header = [0_u8; 6];
+                    tokio::io::AsyncReadExt::read_exact(&mut stream, &mut header)
+                        .await
+                        .expect("preface header");
+                    if header[4] != 1 {
+                        seen_tx.send((header[4], String::new())).expect("record");
+                        continue;
+                    }
+                    let mut handle = vec![0_u8; usize::from(header[5])];
+                    tokio::io::AsyncReadExt::read_exact(&mut stream, &mut handle)
+                        .await
+                        .expect("route handle");
+                    seen_tx
+                        .send((header[4], String::from_utf8(handle).expect("handle")))
+                        .expect("record");
+                    kept.push(stream);
+                }
+            });
+            let (_stream, reply) = negotiate_route_at(address, &route)
+                .await
+                .expect("the legacy supervisor is reached");
+            assert_eq!(
+                reply,
+                openshell_sandbox_backend::runtime_routed::RouteReply::Accept(None)
+            );
+            assert_eq!(seen.recv().await, Some((2, String::new())));
+            assert_eq!(seen.recv().await, Some((1, route)));
+            server.abort();
+
+            // A current supervisor's refusal is a reply, not a reason to fall
+            // back: the runtime stays on the negotiated path.
+            let router = RuntimeRouter::bind("127.0.0.1:0".parse().expect("router address"))
+                .expect("router");
+            let unknown = new_route_handle();
+            let (_stream, reply) = negotiate_route_at(router.local_addr(), &unknown)
+                .await
+                .expect("negotiated");
+            assert_eq!(
+                reply,
+                openshell_sandbox_backend::runtime_routed::RouteReply::Unknown
+            );
+        }
+
+        #[tokio::test]
         async fn runtime_refuses_route_redirects_off_the_supervisor_port_or_past_two_hops() {
             let route = new_route_handle();
             let member = RuntimeRouter::bind("127.0.0.1:0".parse().unwrap()).expect("bind member");
@@ -6731,6 +6862,93 @@ mod linux {
                 .err()
                 .expect("a redirect loop is abandoned");
             assert!(error.to_string().contains("hop limit"), "{error}");
+        }
+
+        /// A routed runtime of a lone shared supervisor, which never names
+        /// itself, keeps its one spare there and never probes the configured
+        /// addresses; a runtime whose supervisor named itself a pool member
+        /// runs discovery rounds through them.
+        #[test]
+        fn only_a_runtime_that_saw_a_pool_probes_for_its_route() {
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test process runtime");
+            let _entered = process_runtime.enter();
+            for pooled in [false, true] {
+                let gateway = TestGateway::new();
+                let boundary = takeover_test_runtime(
+                    &gateway,
+                    "sandbox-probe",
+                    "generation-probe",
+                    &process_runtime,
+                );
+                let directory = tempfile::tempdir().expect("temporary directory");
+                let (server_tls, client_tls) = stage_test_tls(directory.path(), "probe");
+                let server_config = Arc::new(
+                    load_tls_server_config(&server_tls).expect("load runtime TLS identity"),
+                );
+                let route = new_route_handle();
+                let supervisor =
+                    RuntimeRouter::bind("127.0.0.1:0".parse().unwrap()).expect("bind supervisor");
+                let _registration = supervisor
+                    .register(&route, &client_tls)
+                    .expect("supervisor hosts route");
+                if pooled {
+                    supervisor.set_directory(
+                        Some(supervisor.local_addr()),
+                        std::collections::HashMap::from([(route.clone(), supervisor.local_addr())]),
+                    );
+                }
+                // The configured address counts every connection the runtime
+                // opens before passing it on to the supervisor.
+                let service = process_runtime
+                    .block_on(tokio::net::TcpListener::bind((
+                        "127.0.0.3",
+                        supervisor.local_addr().port(),
+                    )))
+                    .expect("bind service");
+                let service_address = service.local_addr().expect("service address");
+                let dialed = Arc::new(AtomicUsize::new(0));
+                let target = supervisor.local_addr();
+                let counter = dialed.clone();
+                let forwarding = process_runtime.spawn(async move {
+                    while let Ok((mut inbound, _)) = service.accept().await {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        tokio::spawn(async move {
+                            if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
+                                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
+                                    .await;
+                            }
+                        });
+                    }
+                });
+                let control = process_runtime.spawn(run_routed_runtime_control(
+                    SupervisorRoute {
+                        addresses: vec![service_address],
+                        route: route.clone(),
+                    },
+                    server_config,
+                    boundary,
+                    Arc::new(AtomicUsize::new(0)),
+                    Duration::from_millis(100),
+                ));
+                std::thread::sleep(Duration::from_millis(1200));
+                let connections = dialed.load(Ordering::SeqCst);
+                control.abort();
+                forwarding.abort();
+                if pooled {
+                    assert!(
+                        connections > 1,
+                        "a pool runtime must run discovery rounds: {connections} connections"
+                    );
+                } else {
+                    assert_eq!(
+                        connections, 1,
+                        "a lone supervisor gets exactly one spare and no probes"
+                    );
+                }
+            }
         }
 
         /// The gateway granted a pool runtime's route to member B while the
@@ -6798,8 +7016,8 @@ mod linux {
             let registration_a = member_a
                 .register(&route, &client_tls)
                 .expect("A hosts route");
-            process_runtime.spawn(run_pool_runtime_control(
-                PoolRoute {
+            process_runtime.spawn(run_routed_runtime_control(
+                SupervisorRoute {
                     addresses: vec![service_address],
                     route: route.clone(),
                 },
@@ -6856,7 +7074,7 @@ mod linux {
             let launch_owner =
                 authenticate(connection_from(a, &std::collections::HashSet::default()), 1);
             boundary
-                .commit_attach(&launch_owner, test_supervisor_instance_id(), None)
+                .commit_attach(&launch_owner, test_supervisor_instance_id(), None, None)
                 .expect("attach A");
             boundary.commit_confirm(&launch_owner).expect("confirm A");
             assert_eq!(boundary.confirmed_route_owner(), Some(a));
@@ -6937,7 +7155,7 @@ mod linux {
             let candidate =
                 authenticate(connection_from(b, &std::collections::HashSet::default()), 2);
             boundary
-                .commit_attach(&candidate, replacement, Some(&grant))
+                .commit_attach(&candidate, replacement, Some(&grant), None)
                 .expect("stage B");
             boundary.commit_confirm(&candidate).expect("confirm B");
 
@@ -7005,7 +7223,7 @@ mod linux {
                 .expect("grant");
             let returning = authenticate(connection_from(a, &before_return), 3);
             boundary
-                .commit_attach(&returning, restarted, Some(&grant))
+                .commit_attach(&returning, restarted, Some(&grant), None)
                 .expect("stage A's later term");
             boundary
                 .commit_confirm(&returning)
@@ -7081,7 +7299,6 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
-                supervisor_recovery_timeout_secs: None,
             };
 
             validate_config(&config).expect("valid runtime claim configuration");
@@ -7379,7 +7596,6 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
-                        supervisor_recovery_timeout_secs: None,
                     },
                     tokio::runtime::Handle::current(),
                     network_broker,
@@ -7413,6 +7629,7 @@ mod linux {
                 supervisor_instance_id: test_supervisor_instance_id(),
                 policy: Box::new(policy),
                 supervisor_takeover: None,
+                supervisor_recovery_timeout_secs: None,
             })
             .expect("encode attach request");
             let handle = test_open_boundary(channel.clone(), opening, &token).await;
@@ -7687,7 +7904,6 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
-                        supervisor_recovery_timeout_secs: None,
                     },
                     process_runtime.handle().clone(),
                     network_broker,
@@ -8073,35 +8289,34 @@ mod linux {
                 .expect("test process runtime");
             let _entered = process_runtime.enter();
             let (network_broker, workload_launcher) = test_network_broker();
-            let boundary = Arc::new(
-                BoundaryRuntime::new(
-                    BoundaryConfig {
-                        boundary_id: SANDBOX.to_string(),
-                        generation: GENERATION.to_string(),
-                        session_id: test_session_id(),
-                        session_rotation: openshell_core::jwt::SessionRotation::new(1)
-                            .expect("session rotation"),
-                        auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
-                        gateway_id: "test-gateway".to_string(),
-                        verification_keys: vec![gateway.verification_key.clone()],
-                        listener: BoundaryListenerConfig::TlsTcp {
-                            address: "127.0.0.1:5500".parse().expect("control address"),
-                            tls: placeholder_server_tls(),
-                        },
-                        resource_claims: std::collections::BTreeMap::new(),
-                        resource_claim_files: std::collections::BTreeMap::new(),
-                        workload_identity: test_workload_identity(),
-                        provisioning_evidence: test_provisioning_evidence(),
-                        child_env: std::collections::HashMap::new(),
-                        supervisor_recovery_timeout_secs: Some(10),
+            let mut boundary = BoundaryRuntime::new(
+                BoundaryConfig {
+                    boundary_id: SANDBOX.to_string(),
+                    generation: GENERATION.to_string(),
+                    session_id: test_session_id(),
+                    session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                        .expect("session rotation"),
+                    auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+                    gateway_id: "test-gateway".to_string(),
+                    verification_keys: vec![gateway.verification_key.clone()],
+                    listener: BoundaryListenerConfig::TlsTcp {
+                        address: "127.0.0.1:5500".parse().expect("control address"),
+                        tls: placeholder_server_tls(),
                     },
-                    process_runtime.handle().clone(),
-                    network_broker,
-                    workload_launcher,
-                    test_runtime_qualification(),
-                )
-                .expect("test boundary runtime"),
-            );
+                    resource_claims: std::collections::BTreeMap::new(),
+                    resource_claim_files: std::collections::BTreeMap::new(),
+                    workload_identity: test_workload_identity(),
+                    provisioning_evidence: test_provisioning_evidence(),
+                    child_env: std::collections::HashMap::new(),
+                },
+                process_runtime.handle().clone(),
+                network_broker,
+                workload_launcher,
+                test_runtime_qualification(),
+            )
+            .expect("test boundary runtime");
+            boundary.default_recovery_timeout = Duration::from_secs(10);
+            let boundary = Arc::new(boundary);
             let authenticate = |token: &str| {
                 boundary.authenticate_request(
                     SandboxConnectionId::new(),
@@ -8124,7 +8339,7 @@ mod linux {
                 Response::Attached { .. }
             ));
             boundary
-                .commit_attach(&first, launch_owner, None)
+                .commit_attach(&first, launch_owner, None, None)
                 .expect("attach launch owner");
             assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
             boundary
@@ -8175,7 +8390,7 @@ mod linux {
             let replacement = test_supervisor_instance_id();
             let ungranted = authenticate(&gateway.token(SANDBOX, GENERATION, 2)).expect("ahead");
             assert!(matches!(
-                boundary.commit_attach(&ungranted, replacement, None),
+                boundary.commit_attach(&ungranted, replacement, None, None),
                 Err((BoundaryErrorKind::Denied, _))
             ));
             let grant = gateway.grant(SANDBOX, GENERATION, 2, replacement);
@@ -8184,7 +8399,12 @@ mod linux {
                 .verify_takeover(&grant)
                 .expect("verify grant");
             assert!(matches!(
-                boundary.commit_attach(&ungranted, test_supervisor_instance_id(), Some(&verified)),
+                boundary.commit_attach(
+                    &ungranted,
+                    test_supervisor_instance_id(),
+                    Some(&verified),
+                    None
+                ),
                 Err((BoundaryErrorKind::Denied, _))
             ));
             // A grant for another runtime generation is refused outright.
@@ -8211,7 +8431,7 @@ mod linux {
                     && process.status.is_none()
             }));
             boundary
-                .commit_attach(&candidate, replacement, Some(&verified))
+                .commit_attach(&candidate, replacement, Some(&verified), None)
                 .expect("stage takeover");
             // The staged replacement cannot act before it confirms, and the
             // previous owner can no longer return while it is staged.
@@ -8219,7 +8439,7 @@ mod linux {
             let returning = authenticate(&gateway.token(SANDBOX, GENERATION, 1)).expect("old");
             assert!(
                 boundary
-                    .commit_attach(&returning, launch_owner, None)
+                    .commit_attach(&returning, launch_owner, None, None)
                     .is_err()
             );
             assert!(matches!(
@@ -8306,7 +8526,6 @@ mod linux {
                     workload_identity: test_workload_identity(),
                     provisioning_evidence: test_provisioning_evidence(),
                     child_env: std::collections::HashMap::new(),
-                    supervisor_recovery_timeout_secs: Some(10),
                 },
                 process_runtime.handle().clone(),
                 network_broker,
@@ -8314,9 +8533,7 @@ mod linux {
                 test_runtime_qualification(),
             )
             .expect("test boundary runtime");
-            if let Some(recovery_timeout) = recovery_timeout {
-                runtime.recovery_timeout = recovery_timeout;
-            }
+            runtime.default_recovery_timeout = recovery_timeout.unwrap_or(Duration::from_secs(10));
             Arc::new(runtime)
         }
 
@@ -8380,6 +8597,7 @@ mod linux {
                 supervisor_instance_id: instance,
                 policy: Box::new(other_policy.clone()),
                 supervisor_takeover: takeover,
+                supervisor_recovery_timeout_secs: None,
             };
 
             // An epoch-ahead bearer without a grant, a grant for another
@@ -8440,6 +8658,7 @@ mod linux {
                         supervisor_instance_id: launch_owner,
                         policy: Box::new(takeover_test_policy()),
                         supervisor_takeover: None,
+                        supervisor_recovery_timeout_secs: None,
                     }
                 ),
                 Response::Attached { .. }
@@ -8448,6 +8667,113 @@ mod linux {
                 lock(&boundary.attached_policy).as_ref(),
                 Some(&takeover_test_policy())
             );
+        }
+
+        /// The supervisor whose connection is in force when supervision is
+        /// lost chose how long the workload stays frozen: the deadline its
+        /// attach offered, or the default without one.
+        #[test]
+        fn the_lost_connections_offer_governs_the_recovery_deadline() {
+            const SANDBOX: &str = "sandbox-recovery-offer";
+            const GENERATION: &str = "generation-recovery-offer";
+            let gateway = TestGateway::new();
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test process runtime");
+            let _entered = process_runtime.enter();
+            let boundary = takeover_test_runtime(&gateway, SANDBOX, GENERATION, &process_runtime);
+            let owner = test_supervisor_instance_id();
+            let connection = || {
+                boundary
+                    .authenticate_request(
+                        SandboxConnectionId::new(),
+                        bearer_request((), &gateway.token(SANDBOX, GENERATION, 1)).metadata(),
+                    )
+                    .expect("principal")
+            };
+            let attach = |offer| Request::Attach {
+                supervisor_instance_id: owner,
+                policy: Box::new(takeover_test_policy()),
+                supervisor_takeover: None,
+                supervisor_recovery_timeout_secs: offer,
+            };
+            let mut deadlines = Vec::new();
+            // The second connection reconnects the same process without an
+            // offer, after the first one's loss froze the workload.
+            for (offer, deadline) in [
+                (Some(45), Duration::from_secs(45)),
+                (None, boundary.default_recovery_timeout),
+            ] {
+                let principal = connection();
+                assert!(matches!(
+                    serve_request(&boundary, &principal, attach(offer)),
+                    Response::Attached { .. }
+                ));
+                assert!(matches!(
+                    serve_request(&boundary, &principal, Request::Confirm),
+                    Response::Confirmed { .. }
+                ));
+                boundary.transport_disconnected(principal.connection_id());
+                deadlines.push(deadline);
+                assert_eq!(*lock(&boundary.scheduled_recoveries), deadlines);
+                assert!(matches!(
+                    *lock(&boundary.supervisor_connection),
+                    SupervisorConnectionState::Frozen { .. }
+                ));
+            }
+            assert!(lock(&boundary.recovery_offers).is_empty());
+        }
+
+        /// A recovery deadline outside the accepted bounds is refused before
+        /// the attach binds launch controls or records anything.
+        #[test]
+        fn out_of_range_recovery_offers_are_refused_before_the_boundary_binds() {
+            const SANDBOX: &str = "sandbox-recovery-bounds";
+            const GENERATION: &str = "generation-recovery-bounds";
+            let gateway = TestGateway::new();
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test process runtime");
+            let _entered = process_runtime.enter();
+            let boundary = takeover_test_runtime(&gateway, SANDBOX, GENERATION, &process_runtime);
+            let owner = test_supervisor_instance_id();
+            let connection = || {
+                boundary
+                    .authenticate_request(
+                        SandboxConnectionId::new(),
+                        bearer_request((), &gateway.token(SANDBOX, GENERATION, 1)).metadata(),
+                    )
+                    .expect("principal")
+            };
+            let attach = |seconds| Request::Attach {
+                supervisor_instance_id: owner,
+                policy: Box::new(takeover_test_policy()),
+                supervisor_takeover: None,
+                supervisor_recovery_timeout_secs: Some(seconds),
+            };
+            for seconds in [0, 9, 301, u32::MAX] {
+                assert!(matches!(
+                    serve_request(&boundary, &connection(), attach(seconds)),
+                    Response::Error {
+                        kind: BoundaryErrorKind::Invalid,
+                        ..
+                    }
+                ));
+                assert!(lock(&boundary.attached_policy).is_none());
+                assert!(matches!(
+                    *lock(&boundary.state),
+                    RuntimeState::AwaitingAttach
+                ));
+                assert!(lock(&boundary.recovery_offers).is_empty());
+            }
+            for seconds in [10, 300] {
+                assert!(matches!(
+                    serve_request(&boundary, &connection(), attach(seconds)),
+                    Response::Attached { .. }
+                ));
+            }
         }
 
         /// Promoting a replacement waits for an operation the replaced owner
@@ -8499,7 +8825,9 @@ mod linux {
                 boundary.attach(policy.clone(), false),
                 Response::Attached { .. }
             ));
-            boundary.commit_attach(&old, owner, None).expect("attach");
+            boundary
+                .commit_attach(&old, owner, None, None)
+                .expect("attach");
             assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
             boundary.commit_confirm(&old).expect("confirm");
             let Response::Started { process_id, .. } = boundary.start_agent(
@@ -8532,7 +8860,7 @@ mod linux {
                 panic!("takeover attach refused");
             };
             boundary
-                .commit_attach(&candidate, replacement, Some(&grant))
+                .commit_attach(&candidate, replacement, Some(&grant), None)
                 .expect("stage takeover");
             assert!(
                 staged
@@ -8718,7 +9046,7 @@ mod linux {
                 Response::Attached { .. }
             ));
             boundary
-                .commit_attach(&old, test_supervisor_instance_id(), None)
+                .commit_attach(&old, test_supervisor_instance_id(), None, None)
                 .expect("attach owner");
             assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
             boundary.commit_confirm(&old).expect("confirm owner");
@@ -8733,7 +9061,7 @@ mod linux {
                 Response::Attached { .. }
             ));
             boundary
-                .commit_attach(&candidate, replacement, Some(&grant))
+                .commit_attach(&candidate, replacement, Some(&grant), None)
                 .expect("stage takeover");
 
             // An owner operation holds the guard across `block_on`, as Exec,
@@ -8930,7 +9258,7 @@ mod linux {
                     Response::Attached { .. }
                 ));
                 boundary
-                    .commit_attach(&old, test_supervisor_instance_id(), None)
+                    .commit_attach(&old, test_supervisor_instance_id(), None, None)
                     .expect("attach owner");
                 assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
                 boundary.commit_confirm(&old).expect("confirm owner");
@@ -8974,7 +9302,7 @@ mod linux {
                     Response::Attached { .. }
                 ));
                 boundary
-                    .commit_attach(&candidate, replacement, Some(&grant))
+                    .commit_attach(&candidate, replacement, Some(&grant), None)
                     .expect("stage takeover");
 
                 // The replacement's connection is lost between its promotion
@@ -9116,7 +9444,6 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
-                        supervisor_recovery_timeout_secs: None,
                     },
                     process_runtime.handle().clone(),
                     network_broker,

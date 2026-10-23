@@ -526,11 +526,11 @@ supervisor:
   recoveryTimeoutSeconds: 90
 ```
 
-With two or more replicas, the chart enables high availability in the gateway
-configuration and prefers to schedule the supervisor Pods on different nodes.
-It replaces them one at a time during rollouts, and its PodDisruptionBudget
-lets voluntary disruptions, such as node drains, evict one supervisor Pod at a
-time.
+With two or more replicas, the chart enables the gateway's
+[supervisor pool](/how-it-works/gateways/configuration#supervisor-pool) and
+prefers to schedule the supervisor Pods on different nodes. It replaces them
+one at a time during rollouts, and its PodDisruptionBudget lets voluntary
+disruptions, such as node drains, evict one supervisor Pod at a time.
 
 Each sandbox runs on one pool member, and a healthy member keeps its
 sandboxes. When a member's process exits, its node fails, or it shuts down, the
@@ -546,16 +546,22 @@ agent and exec processes and keeps the sandbox CA, SSH host key, and
 Proxied connections and interactive exec and SSH sessions that are open during
 the failure break, and clients must reconnect.
 
-`supervisor.recoveryTimeoutSeconds` limits how long a workload stays frozen.
-If no replacement confirms the takeover in time, the sandbox runtime terminates
-the workload instead of letting it run unsupervised. When unset, the limit is
-60 seconds in a pool and 30 seconds with one replica. The gateway takes up to
-17 seconds to detect a failed node, or 30 seconds right after a gateway replica
-starts, and the replacement then needs time to take over, so keep the limit
-well above that. A single replica has no
-failover, so a supervisor failure terminates the workloads it supervises when
-the limit passes. A pool fails over only to a live member, so keep at least two
-members running.
+`supervisor.recoveryTimeoutSeconds` limits how long a workload stays frozen in
+a pool. The pool's supervisors offer the limit to each sandbox runtime when
+they attach. If no replacement confirms the takeover in time, the sandbox
+runtime terminates the workload instead of letting it run unsupervised. When
+unset, the limit is 60 seconds. The gateway takes up to 17 seconds to detect a
+failed node, or 30 seconds right after a gateway replica starts, and the
+replacement then needs time to take over, so keep the limit well above that.
+A pool fails over only to a live member, so keep at least two members running.
+
+A single replica has no failover and ignores
+`supervisor.recoveryTimeoutSeconds`: the sandbox runtime keeps its default
+limit of 30 seconds, and a supervisor failure terminates the workloads it
+supervises when the limit passes. Changing `supervisor.replicas` between 1 and
+2 or more switches the supervision mode and interrupts shared sandboxes that are
+running, whose workloads can be terminated. Make the change when no shared
+sandboxes are running, or recreate them afterward.
 
 Check the supervisor Pods and their disruption budget:
 

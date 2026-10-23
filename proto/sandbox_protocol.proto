@@ -119,6 +119,11 @@ message Attach {
   // openshell.sandbox.supervisor-takeover. The runtime stages the replacement
   // and promotes it at Confirm, fencing every older connection and epoch.
   optional string supervisor_takeover = 3 [(openshell.options.v1.secret) = true];
+  // How long the runtime should keep the workload frozen after losing this
+  // connection's supervision, offered by the supervisor in whole seconds. The
+  // runtime refuses an offer outside 10 to 300 seconds and applies its
+  // default (30 seconds) without one.
+  google.protobuf.Duration supervisor_recovery_timeout = 4;
 }
 // Success asserts that the backend can enforce the attached policy and trusted
 // workload identity. Unsupported requirements fail before StartAgent, which

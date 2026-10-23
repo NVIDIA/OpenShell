@@ -136,6 +136,10 @@ pub struct SharedHost {
     leaving: watch::Sender<bool>,
     /// A gateway currently accepts this host's stream.
     gateway_connected: watch::Sender<bool>,
+    /// Recovery deadline (seconds) the latest snapshot offers the runtimes
+    /// of instances this host starts or takes over; `None` keeps the runtime
+    /// default.
+    recovery_timeout_secs: Mutex<Option<u32>>,
 }
 
 /// A rejected sandbox instance assignment.
@@ -186,6 +190,7 @@ impl SharedHost {
             deferred_reports: Mutex::new(BTreeMap::new()),
             leaving: watch::Sender::new(false),
             gateway_connected: watch::Sender::new(false),
+            recovery_timeout_secs: Mutex::new(None),
         }))
     }
 
@@ -396,6 +401,7 @@ impl SharedHost {
                 ));
             }
         }
+        self.offer_recovery_timeout(snapshot.recovery_timeout.as_ref());
         if snapshot.pool != self.pool.is_some() {
             return Err(ControlError::Invalid(if snapshot.pool {
                 "the gateway sent a supervisor pool snapshot to a lone shared supervisor"
@@ -603,6 +609,34 @@ impl SharedHost {
             .any(|hosted| !desired.contains(&hosted.route))
     }
 
+    /// Keep the recovery deadline a snapshot offers for the instances admitted
+    /// from now on. Absent offers none; a value the runtime would refuse is
+    /// ignored, so the runtime default applies.
+    fn offer_recovery_timeout(&self, offered: Option<&prost_types::Duration>) {
+        let offer = offered.and_then(|offered| {
+            let seconds = u32::try_from(offered.seconds)
+                .ok()
+                .filter(|_| offered.nanos == 0)
+                .filter(|seconds| {
+                    openshell_sandbox_backend::boundary_protocol::supervisor_recovery_timeout(
+                        *seconds,
+                    )
+                    .is_some()
+                });
+            if seconds.is_none() {
+                tracing::warn!(
+                    seconds = offered.seconds,
+                    "ignoring an out-of-range sandbox recovery deadline from the gateway"
+                );
+            }
+            seconds
+        });
+        *self
+            .recovery_timeout_secs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = offer;
+    }
+
     /// Launch material of `registration` with its private files in `dir`.
     fn instance_launch(
         &self,
@@ -671,6 +705,10 @@ impl SharedHost {
                 directory: Some(trust_dir),
             },
             takeover,
+            supervisor_recovery_timeout_secs: *self
+                .recovery_timeout_secs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
         };
         crate::sandbox_instance_host::sandbox_instance_launch(
             Box::new(crate::backend_setup::RoutedBackendSetup::new(
@@ -1153,6 +1191,46 @@ mod tests {
                 |_| Ok::<_, ControlError>((bindings, body)),
             )
             .unwrap();
+    }
+
+    /// A pool snapshot sets the recovery deadline offered to the runtimes of
+    /// instances admitted after it; none, or one the runtime would refuse,
+    /// leaves the runtime default.
+    #[tokio::test]
+    async fn snapshots_set_the_recovery_deadline_offered_to_new_instances() {
+        let root = tempfile::tempdir().unwrap();
+        let host = SharedHost::start(SharedHostConfig {
+            gateway_endpoint: "https://gateway.invalid".to_string(),
+            instance_root: root.path().join("instances"),
+            runtime_listen: "127.0.0.1:0".parse().unwrap(),
+            removal_grace: Duration::from_secs(10),
+            pool: Some(PoolIdentity {
+                member_id: "member-1".to_string(),
+                member_uid: "uid-1".to_string(),
+                runtime_address: "127.0.0.1:5500".parse().unwrap(),
+            }),
+        })
+        .unwrap();
+        for (revision, (offered, kept)) in [
+            (Some(60), Some(60)),
+            (None, None),
+            (Some(301), None),
+            (Some(10), Some(10)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            host.reconcile(&AssignmentSnapshot {
+                revision: u64::try_from(revision).unwrap() + 1,
+                pool: true,
+                recovery_timeout: offered
+                    .map(|seconds| prost_types::Duration { seconds, nanos: 0 }),
+                ..AssignmentSnapshot::default()
+            })
+            .await
+            .unwrap();
+            assert_eq!(*host.recovery_timeout_secs.lock().unwrap(), kept);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

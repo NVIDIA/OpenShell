@@ -123,7 +123,6 @@ impl VmBoundarySpec {
                 workload_identity: workload_identity.clone(),
                 provisioning_evidence: provisioning_evidence.clone(),
                 child_env: self.child_env,
-                supervisor_recovery_timeout_secs: None,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
                 boundary_id: self.boundary_id,

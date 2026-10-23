@@ -27,20 +27,26 @@ closes. Live connections keep the same disconnect, freeze, and recovery-deadline
 handling as listener mode, and the workload still cannot connect to the control
 port.
 
-With `route_redirects` (a supervisor pool) the runtime also dials the members
-the configured supervisors redirect it to, on the same port and never on
-loopback, following at most two redirects. It keeps a spare at the member
-whose connection it last confirmed, its authenticated owner; an
-unauthenticated accept never makes a member the owner. Every 15 seconds it
-also dials the configured addresses past every known member, up to three
-times, so a member that hosts the route without a spare gets one: a previous
-owner that stays reachable after the gateway granted the route elsewhere,
-holding an unused spare, cannot keep the new owner from the runtime. The
-runtime keeps at most three unused spares, one per member, gives none to an
-owner a confirmation replaced for two minutes, and never closes an
-established connection to refresh routing. A retired connection that does not
-shut down gracefully within two seconds, such as an unused spare, has its
-transport dropped.
+A runtime of a supervisor shared by several sandboxes (one with a route handle)
+names its route in a version 2 preface on every dial and follows the
+supervisors' redirects, on the same port and never on loopback, at most two
+hops. A supervisor that closes the negotiation without replying, as one from
+before version 2 does, is dialed again with a version 1 preface and treated
+as a lone supervisor; this changes only routing, since TLS pinning, request
+authentication, and takeover grants are unaffected. It keeps a spare at the member whose connection it last confirmed, its
+authenticated owner; an unauthenticated accept never makes a member the
+owner. Once a supervisor names itself a pool member or redirects it, the
+runtime also dials the configured addresses past every known member every 15
+seconds, up to three times, so a member that hosts the route without a spare
+gets one: a previous owner that stays reachable after the gateway granted the
+route elsewhere, holding an unused spare, cannot keep the new owner from the
+runtime. A lone shared supervisor never names itself, so it holds the one
+spare and is never probed. The runtime keeps at most three unused spares, one
+per member, and never closes an established connection to refresh routing. A
+member's address grants nothing: a later term at a fenced owner's address
+authenticates with its own grant. A retired connection that does not shut down
+gracefully within two seconds, such as an unused spare, has its transport
+dropped.
 
 ## Supervisor takeover
 
@@ -62,8 +68,11 @@ asynchronous: tasks on the runtime's workers wait for it without blocking
 them. A confirmation replay on the connection in force promotes nothing and
 skips the guard. Promotion and the supervisory state change together, so a
 replacement lost mid-promotion leaves the workload frozen under a fresh
-recovery deadline. `BoundaryConfig.supervisor_recovery_timeout_secs` (10 to
-300 seconds, default 30) bounds the freeze.
+recovery deadline. Each supervisor offers a recovery deadline when it attaches
+(10 to 300 seconds; the runtime refuses any other before binding anything), and
+the deadline of the connection in force when supervision is lost bounds the
+freeze: 30 seconds without an offer. A supervisor pool offers 60 seconds unless
+the gateway configures another.
 
 The runtime keeps the trust-on-first-use executable pins of the generation
 (`binary_pins`): the first digest it offers for each path, from its own

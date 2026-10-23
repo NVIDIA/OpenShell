@@ -98,6 +98,13 @@ confirmed, it forgets the grant and re-attaches without it to refresh the
 snapshot, so reconnects of the same process never depend on the grant's
 lifetime.
 
+Every attach also offers the runtime a recovery deadline
+(`supervisor_recovery_timeout_secs`, bounded by
+`SUPERVISOR_RECOVERY_TIMEOUT_RANGE`): how long the workload stays frozen after
+that supervisor's connection is lost. `OpenShellRuntimeBackend` sends the
+deadline it was built with on its first attach, a takeover attach, and every
+re-attach; without one the runtime uses `DEFAULT_SUPERVISOR_RECOVERY_TIMEOUT`.
+
 Sandbox and generation identity come from the verified bearer, rather than
 duplicate fields on `OpenBoundaryRequest`. Attach supplies policy; confirmation
 reports resource claims from backend-owned provisioned state, which the
@@ -200,8 +207,8 @@ afterwards. The launch material and status of one hosted instance
 descriptor and route validation.
 
 In a supervisor pool, one member hosts each route, but a runtime reaches an
-arbitrary member. A runtime configured with `route_redirects` sends preface
-version `2`, which the member answers before any TLS with a status byte, a
+arbitrary member. A routed runtime therefore sends preface version `2` on every
+dial, which the supervisor answers before any TLS with a status byte, a
 length byte, and a runtime listener address as ASCII `ip:port` (IPv6
 bracketed): `1` accepts, naming the member itself (empty before it has a
 route directory), and the handshake proceeds as for version 1; `2` redirects
@@ -211,7 +218,12 @@ redirects routes it does not host according to the gateway's route directory
 also wins over a local registration it no longer agrees with, which is being
 released. Replies are unauthenticated hints like the handle: the member must
 still complete the pinned TLS handshake, and every request still carries the
-bearer token. Version 1 prefaces receive no reply.
+bearer token. A lone shared supervisor accepts without naming itself, which
+tells the runtime there is no pool to probe. Version 1 prefaces, from runtimes
+that predate version 2, receive no reply. A supervisor that predates version 2
+closes a version 2 preface without replying (usually as a reset, since it
+reads only the header); the runtime then dials it again with version 1, so
+upgrades may roll the runtime and the supervisor in either order.
 
 Runtime-initiated transport supports TCP, protected Unix sockets, and host
 vsock listeners. These share bounded TLS handshakes, the authenticated spare

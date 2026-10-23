@@ -40,6 +40,8 @@ pub struct BackendServices {
     pub sandbox_bearer: SessionBearerTokenSlot,
     /// Gateway-granted authority to replace the generation's current owner.
     pub takeover: Option<openshell_sandbox_backend::BoundaryTakeover>,
+    /// Recovery deadline (seconds) offered to the runtime at every attach.
+    pub supervisor_recovery_timeout_secs: Option<u32>,
 }
 
 /// Startup result; native payload decoding never reaches shared runtime
@@ -331,7 +333,8 @@ impl PreparedBackend for OpenShellLaunch {
             services.provider_credentials,
             services.sandbox_bearer,
         )
-        .with_transport(self.transport);
+        .with_transport(self.transport)
+        .with_recovery_timeout_secs(services.supervisor_recovery_timeout_secs);
         if let Some(takeover) = services.takeover {
             backend = backend.with_takeover(takeover);
         }

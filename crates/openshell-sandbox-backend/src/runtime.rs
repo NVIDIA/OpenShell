@@ -329,6 +329,7 @@ pub struct OpenShellRuntimeBackend {
     delegated: Option<DelegatedRuntime>,
     resume: Option<ResumeLaunch>,
     takeover: Option<BoundaryTakeover>,
+    recovery_timeout_secs: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -372,6 +373,7 @@ impl OpenShellRuntimeBackend {
             delegated: None,
             resume: None,
             takeover: None,
+            recovery_timeout_secs: None,
         }
     }
 
@@ -451,6 +453,16 @@ impl OpenShellRuntimeBackend {
         self
     }
 
+    /// Offer the runtime a recovery deadline on every attach: how long it
+    /// keeps the workload frozen after losing this supervisor's connection
+    /// (see [`crate::boundary_protocol::SUPERVISOR_RECOVERY_TIMEOUT_RANGE`]).
+    /// `None` leaves the runtime's default.
+    #[must_use]
+    pub fn with_recovery_timeout_secs(mut self, seconds: Option<u32>) -> Self {
+        self.recovery_timeout_secs = seconds;
+        self
+    }
+
     pub fn backend_name(&self) -> &str {
         self.delegated
             .as_ref()
@@ -497,6 +509,7 @@ impl OpenShellRuntimeBackend {
             client.supervisor_instance_id = takeover.supervisor_instance_id;
             client.requires_takeover = true;
         }
+        client.recovery_timeout_secs = self.recovery_timeout_secs;
         let client = Arc::new(client);
         let policy = Box::new(SandboxPolicyWire::from(sandbox.policy.clone()));
         let response = client
@@ -507,6 +520,7 @@ impl OpenShellRuntimeBackend {
                     .takeover
                     .as_ref()
                     .map(|takeover| takeover.grant.expose_secret().to_string()),
+                supervisor_recovery_timeout_secs: client.recovery_timeout_secs,
             })
             .await?;
         let Response::Attached { snapshot } = response else {
@@ -1580,6 +1594,8 @@ struct BoundaryClient {
     /// This client attaches with a takeover grant; the runtime must
     /// advertise takeover support before any request is sent.
     requires_takeover: bool,
+    /// Recovery deadline offered on every attach.
+    recovery_timeout_secs: Option<u32>,
     /// True once a connection of this client was confirmed.
     confirmed: tokio::sync::watch::Sender<bool>,
 }
@@ -1779,6 +1795,7 @@ impl BoundaryClient {
             network_streams: Arc::new(tokio::sync::Semaphore::new(MAX_NETWORK_STREAMS)),
             network_streams_exhausted: AtomicBool::new(false),
             requires_takeover: false,
+            recovery_timeout_secs: None,
             confirmed: tokio::sync::watch::Sender::new(false),
         }
     }
@@ -1794,6 +1811,7 @@ impl BoundaryClient {
                 supervisor_instance_id: self.supervisor_instance_id,
                 policy,
                 supervisor_takeover: None,
+                supervisor_recovery_timeout_secs: self.recovery_timeout_secs,
             })
             .await?;
         let Response::Attached { snapshot } = response else {
@@ -1815,6 +1833,7 @@ impl BoundaryClient {
             supervisor_instance_id: self.supervisor_instance_id,
             policy,
             supervisor_takeover: None,
+            supervisor_recovery_timeout_secs: self.recovery_timeout_secs,
         })?;
         *self
             .attach_request
@@ -3626,8 +3645,17 @@ mod tests {
                     received.lock().unwrap().push(match &envelope.request {
                         Request::Attach {
                             supervisor_takeover: Some(_),
+                            supervisor_recovery_timeout_secs: Some(_),
+                            ..
+                        } => "takeover-attach offering recovery",
+                        Request::Attach {
+                            supervisor_takeover: Some(_),
                             ..
                         } => "takeover-attach",
+                        Request::Attach {
+                            supervisor_recovery_timeout_secs: Some(_),
+                            ..
+                        } => "attach offering recovery",
                         Request::Attach { .. } => "attach",
                         Request::Confirm => "confirm",
                         Request::StartAgent { .. } => "start-agent",
@@ -3883,6 +3911,7 @@ mod tests {
             supervisor_instance_id: client.supervisor_instance_id,
             policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
             supervisor_takeover: None,
+            supervisor_recovery_timeout_secs: None,
         };
         assert!(matches!(
             client.call_idempotent(attach).await.unwrap(),
@@ -3997,6 +4026,7 @@ mod tests {
             supervisor_instance_id: client.supervisor_instance_id,
             policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
             supervisor_takeover: None,
+            supervisor_recovery_timeout_secs: None,
         };
         assert!(matches!(
             client.call_idempotent(attach).await.unwrap(),
@@ -5072,7 +5102,8 @@ mod tests {
         .with_takeover(BoundaryTakeover {
             supervisor_instance_id: instance,
             grant: SecretJwt::parse("test-grant").unwrap(),
-        });
+        })
+        .with_recovery_timeout_secs(Some(60));
         let bound = backend
             .attach(descriptor.backend_descriptor().unwrap(), sandbox())
             .await
@@ -5098,10 +5129,15 @@ mod tests {
             ["test-generation:exec:4"]
         );
         // The grant goes out once; the refresh reattaches as the pinned
-        // owner, and the agent is never started again.
+        // owner, and the agent is never started again. Every attach offers
+        // the recovery deadline.
         assert_eq!(
             *received.lock().unwrap(),
-            ["takeover-attach", "confirm", "attach"]
+            [
+                "takeover-attach offering recovery",
+                "confirm",
+                "attach offering recovery"
+            ]
         );
         server.abort();
         let _ = server.await;
@@ -5157,10 +5193,11 @@ mod tests {
         );
         assert_eq!(opens, 0);
 
-        let (opened, opens, client) =
+        let (opened, opens, mut client) =
             open(crate::isolation_protocol::metadata("openshell/sandbox")).await;
         opened.expect("a takeover-capable runtime opens");
         assert_eq!(opens, 1);
+        client.recovery_timeout_secs = Some(60);
 
         // Once confirmed, reconnects reattach as the pinned process without
         // the grant, so its expiry cannot break transport recovery.
@@ -5170,16 +5207,19 @@ mod tests {
                 supervisor_instance_id: client.supervisor_instance_id,
                 policy: policy.clone(),
                 supervisor_takeover: Some("grant".to_string()),
+                supervisor_recovery_timeout_secs: Some(60),
             })
             .unwrap(),
         );
         client.forget_takeover_grant(policy).unwrap();
         let remembered = client.attach_request.lock().unwrap().clone().unwrap();
+        // The pinned process keeps offering its recovery deadline.
         assert!(matches!(
             remembered.request,
             Request::Attach {
                 supervisor_takeover: None,
                 supervisor_instance_id,
+                supervisor_recovery_timeout_secs: Some(60),
                 ..
             } if supervisor_instance_id == client.supervisor_instance_id
         ));

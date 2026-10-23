@@ -27,15 +27,16 @@
 //! process is refused.
 //!
 //! With a supervisor pool (high availability) the same rules apply per pool
-//! member, and several members are served at once. Every assigned instance
-//! has one durable owner (a member's process and an ownership term) that the
-//! gateway maintains through [`PoolView`]; each member is sent only the
-//! instances its current process owns, with the credentials of their term.
-//! A pool member releases, without stopping, an instance a snapshot omits;
-//! only instances whose assignment was withdrawn are listed for stopping.
-//! Nothing is sent to pool members until both the desired set and the
-//! ownership view have been loaded, so a restarted gateway never releases
-//! running instances.
+//! member, and several members are served at once. The pool's desired set,
+//! the durable owner of every instance (a member's process and an ownership
+//! term), and the latest reports of owners served by other gateway replicas
+//! come from the gateway's durable records through [`PoolView`], on every
+//! gateway replica alike; each member is sent only the instances its current
+//! process owns, with the credentials of their term. A pool member releases,
+//! without stopping, an instance a snapshot omits; only withdrawn instances
+//! are listed for stopping. Nothing is sent to pool members until the first
+//! view has been loaded, so a restarted gateway never releases running
+//! instances.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -51,6 +52,13 @@ use crate::proto::{
     HostMessage, HostStatus, PoolMember, RouteOwner, SandboxInstanceAssignment,
     SandboxInstanceStatus, SandboxInstanceTakeover, host_gateway_message, host_message,
 };
+
+/// Recovery deadline a supervisor pool offers each sandbox runtime.
+///
+/// Membership expiry, one reconciliation pass, and a replacement instance's
+/// startup fit with room to spare. The gateway may configure another; without
+/// a pool the runtime keeps its own default.
+pub const POOL_RECOVERY_TIMEOUT_SECS: u32 = 60;
 
 /// Interval at which both ends send heartbeats on an idle stream.
 pub const HOST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -169,14 +177,46 @@ pub struct MemberView {
     pub leaving: bool,
 }
 
-/// The gateway's durable view of a supervisor pool: live members and the
-/// owner of every placed instance, replaced as a whole by the gateway's
-/// pool reconciler.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// The gateway's durable view of a supervisor pool, replaced as a whole by
+/// the gateway's pool reconciler on every replica.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct PoolView {
     pub members: Vec<MemberView>,
     /// Owner of each placed route.
     pub owners: BTreeMap<String, InstanceOwner>,
+    /// Every route the pool must run, from the gateway's durable records. An
+    /// owned route that is not desired was withdrawn.
+    pub desired: BTreeSet<String>,
+    /// Assignments, launch material included, this gateway replica loaded
+    /// for routes its members own. An owned desired route missing here is
+    /// kept by its owner as it is.
+    pub assignments: BTreeMap<String, SandboxInstanceAssignment>,
+    /// Latest report of each route's current owner term, recorded by the
+    /// gateway replica that serves the owner, for judging instances whose
+    /// owner streams to another replica.
+    pub reports: BTreeMap<String, SandboxInstanceStatus>,
+}
+
+impl std::fmt::Debug for PoolView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PoolView")
+            .field("members", &self.members)
+            .field("owners", &self.owners)
+            .field("desired", &self.desired)
+            .field("assignments", &self.assignments.keys().collect::<Vec<_>>())
+            .field("reports", &self.reports.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// A report a host served here made of a route its process owns, for the
+/// gateway to record durably so other replicas can judge the instance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedReport {
+    pub route: String,
+    pub owner: InstanceOwner,
+    pub status: SandboxInstanceStatus,
 }
 
 /// A connected pool member's stream, for the gateway's membership records.
@@ -232,7 +272,6 @@ impl Desired {
 
 /// Pool state: the durable view and when each owner term was first recorded
 /// here, for telling a reconciling host from one that dropped an instance.
-#[derive(Default)]
 struct Pool {
     loaded: bool,
     view: PoolView,
@@ -240,6 +279,28 @@ struct Pool {
     /// Owners placed by launches on this gateway, with when, so a view whose
     /// records were listed before a placement does not drop it.
     placed: BTreeMap<String, (InstanceOwner, tokio::time::Instant)>,
+    /// Instances launched through this gateway, with when, kept over views
+    /// listed before them.
+    launched: BTreeMap<String, tokio::time::Instant>,
+    /// Instances withdrawn here whose durable records the gateway has not
+    /// removed yet; they are not desired whatever a view says.
+    withdrawals: BTreeSet<String>,
+    /// Recovery deadline offered to every instance's runtime.
+    recovery_timeout_secs: u32,
+}
+
+impl Pool {
+    fn new(recovery_timeout_secs: u32) -> Self {
+        Self {
+            loaded: false,
+            view: PoolView::default(),
+            owned_since: BTreeMap::new(),
+            placed: BTreeMap::new(),
+            launched: BTreeMap::new(),
+            withdrawals: BTreeSet::new(),
+            recovery_timeout_secs,
+        }
+    }
 }
 
 struct HostSession {
@@ -338,12 +399,13 @@ impl SupervisorHostController {
         }
     }
 
-    /// Serve a supervisor pool instead of a single host. Must be called
-    /// before any host attaches.
-    pub fn enable_pool(&self) {
+    /// Serve a supervisor pool instead of a single host, offering every
+    /// instance's runtime `recovery_timeout_secs`. Must be called before any
+    /// host attaches.
+    pub fn enable_pool(&self, recovery_timeout_secs: u32) {
         let mut pool = lock(&self.inner.pool);
         if pool.is_none() {
-            *pool = Some(Pool::default());
+            *pool = Some(Pool::new(recovery_timeout_secs));
         }
     }
 
@@ -511,9 +573,33 @@ impl SupervisorHostController {
 
     /// Assign one instance. Before initialization the edit is kept until the
     /// first full list arrives. Refused when it would exceed the host's
-    /// capacity, so the caller fails its create before anything runs.
+    /// capacity, so the caller fails its create before anything runs. In a
+    /// pool the instance is served at once and kept over views listed before
+    /// it; its durable record makes it desired on every gateway replica.
     pub fn assign(&self, assignment: SandboxInstanceAssignment) -> Result<(), AssignmentError> {
         let mut desired = lock(&self.inner.desired);
+        {
+            let mut pool_guard = lock(&self.inner.pool);
+            if let Some(pool) = pool_guard.as_mut() {
+                if !desired.assignments.contains_key(&assignment.route)
+                    && desired.assignments.len() >= MAX_POOL_INSTANCES
+                {
+                    return Err(AssignmentError::Capacity);
+                }
+                pool.launched
+                    .insert(assignment.route.clone(), tokio::time::Instant::now());
+                pool.withdrawals.remove(&assignment.route);
+                pool.view.desired.insert(assignment.route.clone());
+                drop(pool_guard);
+                let next = desired.revision + 1;
+                desired.stopping.remove(&assignment.route);
+                if desired.put(assignment, next) {
+                    desired.revision = next;
+                    self.inner.revision.send_replace(next);
+                }
+                return Ok(());
+            }
+        }
         if !desired.initialized {
             let pending_additions = desired
                 .pending
@@ -544,9 +630,32 @@ impl SupervisorHostController {
         Ok(())
     }
 
-    /// Withdraw one instance so the host stops it.
+    /// Withdraw one instance so the host stops it. In a pool the withdrawal
+    /// is also listed for the gateway to remove the instance's durable
+    /// record (see [`Self::pool_withdrawals`]).
     pub fn unassign(&self, route: &str) {
         let mut desired = lock(&self.inner.desired);
+        {
+            let mut pool_guard = lock(&self.inner.pool);
+            if let Some(pool) = pool_guard.as_mut() {
+                pool.launched.remove(route);
+                pool.withdrawals.insert(route.to_string());
+                pool.view.desired.remove(route);
+                let owner = pool.view.owners.get(route).cloned();
+                drop(pool_guard);
+                let removed = desired.assignments.remove(route).is_some();
+                if let Some(owner) = &owner {
+                    desired.stopping.insert(
+                        route.to_string(),
+                        (owner.clone(), tokio::time::Instant::now()),
+                    );
+                }
+                if removed || owner.is_some() {
+                    self.bump(&mut desired);
+                }
+                return;
+            }
+        }
         if !desired.initialized {
             desired.pending.insert(route.to_string(), None);
             return;
@@ -557,11 +666,15 @@ impl SupervisorHostController {
         }
     }
 
-    /// Replace the durable pool view, derived from owner records listed at
-    /// `listed_at`. Owners placed here since then are kept until a view
-    /// includes them. Owners whose term is new to this gateway are recorded as
-    /// assigned at the next revision, so their host is considered reconciling
-    /// until it acknowledges it.
+    /// Replace the durable pool view, derived from records listed at
+    /// `listed_at`; the view's loaded assignments become the desired
+    /// assignments this gateway serves. Owners placed and instances launched
+    /// here since then are kept until a view includes them, and instances
+    /// withdrawn here stay withdrawn until their records are gone. An owned
+    /// instance that leaves the desired set is listed for its owner to stop.
+    /// Owners whose term is new to this gateway are recorded as assigned at
+    /// the next revision, so their host is considered reconciling until it
+    /// acknowledges it.
     pub fn update_pool(&self, mut view: PoolView, listed_at: tokio::time::Instant) {
         let mut desired = lock(&self.inner.desired);
         let mut pool_guard = lock(&self.inner.pool);
@@ -575,7 +688,39 @@ impl SupervisorHostController {
                 .entry(route.clone())
                 .or_insert_with(|| owner.clone());
         }
-        if pool.loaded && pool.view == view {
+        pool.launched
+            .retain(|_, launched_at| *launched_at >= listed_at);
+        for route in pool.launched.keys() {
+            view.desired.insert(route.clone());
+            if let Some(assigned) = desired.assignments.get(route) {
+                view.assignments
+                    .entry(route.clone())
+                    .or_insert_with(|| assigned.assignment.clone());
+            }
+        }
+        for route in &pool.withdrawals {
+            view.desired.remove(route);
+            view.assignments.remove(route);
+        }
+        let now = tokio::time::Instant::now();
+        let stopping_before = desired.stopping.len();
+        if pool.loaded {
+            for route in pool.view.desired.difference(&view.desired) {
+                if let Some(owner) = pool.view.owners.get(route) {
+                    desired
+                        .stopping
+                        .entry(route.clone())
+                        .or_insert_with(|| (owner.clone(), now));
+                }
+            }
+        }
+        // A desired route is not being stopped, whatever an earlier
+        // withdrawal recorded.
+        desired
+            .stopping
+            .retain(|route, _| !view.desired.contains(route));
+        let stops_changed = desired.stopping.len() != stopping_before;
+        if pool.loaded && desired.initialized && pool.view == view && !stops_changed {
             return;
         }
         let next = desired.revision + 1;
@@ -593,11 +738,90 @@ impl SupervisorHostController {
                 .unwrap_or(next);
             pool.owned_since.insert(route.clone(), since);
         }
+        let assignments = view
+            .assignments
+            .iter()
+            .map(|(route, assignment)| {
+                let revision = desired
+                    .assignments
+                    .get(route)
+                    .filter(|assigned| assigned.assignment == *assignment)
+                    .map_or(next, |assigned| assigned.revision);
+                (
+                    route.clone(),
+                    Assigned {
+                        assignment: assignment.clone(),
+                        revision,
+                    },
+                )
+            })
+            .collect();
+        desired.assignments = assignments;
+        desired.initialized = true;
         pool.view = view;
         pool.loaded = true;
         drop(pool_guard);
         desired.revision = next;
         self.inner.revision.send_replace(next);
+    }
+
+    /// Routes withdrawn here whose durable records the gateway still has to
+    /// remove; see [`Self::forget_withdrawal`].
+    #[must_use]
+    pub fn pool_withdrawals(&self) -> Vec<String> {
+        lock(&self.inner.pool)
+            .as_ref()
+            .map(|pool| pool.withdrawals.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The durable record of a route withdrawn here is gone.
+    pub fn forget_withdrawal(&self, route: &str) {
+        if let Some(pool) = lock(&self.inner.pool).as_mut() {
+            pool.withdrawals.remove(route);
+        }
+    }
+
+    /// Recovery deadline a pool offers each instance's runtime; `None`
+    /// without a pool.
+    #[must_use]
+    pub fn pool_recovery_timeout_secs(&self) -> Option<u32> {
+        lock(&self.inner.pool)
+            .as_ref()
+            .map(|pool| pool.recovery_timeout_secs)
+    }
+
+    /// What hosts served here last reported of the routes their processes
+    /// own, for the gateway to record for its other replicas.
+    #[must_use]
+    pub fn owned_reports(&self) -> Vec<OwnedReport> {
+        let pool = lock(&self.inner.pool);
+        let Some(pool) = pool.as_ref().filter(|pool| pool.loaded) else {
+            return Vec::new();
+        };
+        let observed = lock(&self.inner.observed);
+        let mut reports = Vec::new();
+        for session in observed.sessions.values() {
+            let (Some(member_id), Some(status)) = (session.member_id(), &session.status) else {
+                continue;
+            };
+            for instance in &status.instances {
+                if let Some(owner) = pool.view.owners.get(&instance.route)
+                    && owner.member_id == member_id
+                    && owner.process_id == session.instance_id
+                {
+                    reports.push(OwnedReport {
+                        route: instance.route.clone(),
+                        owner: InstanceOwner {
+                            takeover: None,
+                            ..owner.clone()
+                        },
+                        status: instance.clone(),
+                    });
+                }
+            }
+        }
+        reports
     }
 
     /// Pool routes withdrawn for stopping; they must not be placed or taken
@@ -700,7 +924,15 @@ impl SupervisorHostController {
                     session.member_id() == Some(owner.member_id.as_str())
                         && session.instance_id == owner.process_id
                 }) else {
-                    return ObservedInstance::NoHost;
+                    // The owner streams to another gateway replica, which
+                    // records its reports for every replica.
+                    return pool
+                        .view
+                        .reports
+                        .get(route)
+                        .map_or(ObservedInstance::NoHost, |status| {
+                            ObservedInstance::Reported(status.clone())
+                        });
                 };
                 let assigned = desired
                     .assignments
@@ -975,11 +1207,25 @@ impl SupervisorHostController {
         desired
             .stopping
             .retain(|_, (_, since)| now.duration_since(*since) < POOL_STOP_RETENTION);
+        // Withdrawn here, or owned yet no longer desired anywhere.
         let stop_routes = desired
             .stopping
             .iter()
             .filter(|(_, (owner, _))| owner.member_id == member_id)
             .map(|(route, _)| route.clone())
+            .chain(
+                pool.view
+                    .owners
+                    .iter()
+                    .filter(|(route, owner)| {
+                        owner.member_id == member_id
+                            && !pool.view.desired.contains(*route)
+                            && !desired.stopping.contains_key(*route)
+                    })
+                    .map(|(route, _)| route.clone()),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
         let addresses = pool
             .view
@@ -998,15 +1244,15 @@ impl SupervisorHostController {
                 })
             })
             .collect();
-        // Owned instances whose launch material this gateway has not loaded,
-        // such as one launched through another gateway moments ago, are kept
-        // as they are rather than released.
+        // Owned desired instances whose launch material this gateway has not
+        // loaded yet are kept as they are rather than released.
         let keep_routes = pool
             .view
             .owners
             .iter()
             .filter(|(route, owner)| {
                 owned_by_session(owner)
+                    && pool.view.desired.contains(*route)
                     && !desired.assignments.contains_key(*route)
                     && !desired.stopping.contains_key(*route)
             })
@@ -1019,6 +1265,10 @@ impl SupervisorHostController {
             stop_routes,
             route_directory,
             keep_routes,
+            recovery_timeout: Some(prost_types::Duration {
+                seconds: i64::from(pool.recovery_timeout_secs),
+                nanos: 0,
+            }),
         })
     }
 
@@ -1397,6 +1647,27 @@ mod tests {
         }
     }
 
+    /// A pool view in which every owned route is desired and loaded.
+    fn loaded_view(
+        members: Vec<MemberView>,
+        owners: impl IntoIterator<Item = (&'static str, InstanceOwner)>,
+    ) -> PoolView {
+        let owners = owners
+            .into_iter()
+            .map(|(route, owner)| (route.to_string(), owner))
+            .collect::<BTreeMap<_, _>>();
+        PoolView {
+            members,
+            desired: owners.keys().cloned().collect(),
+            assignments: owners
+                .keys()
+                .map(|route| (route.clone(), assignment(route, route.as_bytes())))
+                .collect(),
+            owners,
+            reports: BTreeMap::new(),
+        }
+    }
+
     fn routes(snapshot: &AssignmentSnapshot) -> Vec<&str> {
         snapshot
             .instances
@@ -1408,10 +1679,7 @@ mod tests {
     #[tokio::test]
     async fn pool_members_receive_only_what_their_process_owns() {
         let controller = SupervisorHostController::new();
-        controller.enable_pool();
-        controller
-            .replace_assignments(0, [assignment("rt-a", b"a"), assignment("rt-b", b"b")])
-            .unwrap();
+        controller.enable_pool(75);
         let (one, _) = controller
             .begin_session(identity(), &member_hello("m1", "p1", 1))
             .unwrap();
@@ -1424,17 +1692,25 @@ mod tests {
         assert_eq!(controller.connected_members().len(), 2);
 
         controller.update_pool(
-            PoolView {
-                members: vec![member_view("m1", "p1"), member_view("m-2", "p2")],
-                owners: BTreeMap::from([
-                    ("rt-a".to_string(), owner("m1", "p1", 1)),
-                    ("rt-b".to_string(), owner("m-2", "p2", 1)),
-                ]),
-            },
+            loaded_view(
+                vec![member_view("m1", "p1"), member_view("m-2", "p2")],
+                [
+                    ("rt-a", owner("m1", "p1", 1)),
+                    ("rt-b", owner("m-2", "p2", 1)),
+                ],
+            ),
             tokio::time::Instant::now(),
         );
         let first = controller.snapshot(one).unwrap();
         assert!(first.pool);
+        // Every member offers its instances' runtimes the pool's deadline.
+        assert_eq!(
+            first.recovery_timeout,
+            Some(prost_types::Duration {
+                seconds: 75,
+                nanos: 0
+            })
+        );
         assert_eq!(routes(&first), ["rt-a"]);
         assert!(first.instances[0].takeover.is_none());
         assert_eq!(routes(&controller.snapshot(two).unwrap()), ["rt-b"]);
@@ -1451,13 +1727,13 @@ mod tests {
         // A takeover moves rt-b to m1 with the new term's credentials; m2's
         // snapshot omits it, which releases it without stopping it.
         controller.update_pool(
-            PoolView {
-                members: vec![member_view("m1", "p1"), member_view("m-2", "p2")],
-                owners: BTreeMap::from([
-                    ("rt-a".to_string(), owner("m1", "p1", 1)),
-                    ("rt-b".to_string(), owner("m1", "p1", 2)),
-                ]),
-            },
+            loaded_view(
+                vec![member_view("m1", "p1"), member_view("m-2", "p2")],
+                [
+                    ("rt-a", owner("m1", "p1", 1)),
+                    ("rt-b", owner("m1", "p1", 2)),
+                ],
+            ),
             tokio::time::Instant::now(),
         );
         let moved = controller.snapshot(one).unwrap();
@@ -1478,13 +1754,10 @@ mod tests {
         let mut unminted = owner("m1", "p1", 2);
         unminted.takeover = None;
         controller.update_pool(
-            PoolView {
-                members: vec![member_view("m1", "p1"), member_view("m-2", "p2")],
-                owners: BTreeMap::from([
-                    ("rt-a".to_string(), owner("m1", "p1", 1)),
-                    ("rt-b".to_string(), unminted),
-                ]),
-            },
+            loaded_view(
+                vec![member_view("m1", "p1"), member_view("m-2", "p2")],
+                [("rt-a", owner("m1", "p1", 1)), ("rt-b", unminted)],
+            ),
             tokio::time::Instant::now(),
         );
         let term = controller.snapshot(one).unwrap().instances[1]
@@ -1498,11 +1771,12 @@ mod tests {
         assert!(term.grant.is_empty() && term.gateway_token.is_empty());
 
         // Withdrawing an instance lists it for its owner, and only its owner,
-        // to stop.
+        // to stop, and for the gateway to remove its durable record.
         controller.unassign("rt-a");
         assert_eq!(controller.snapshot(one).unwrap().stop_routes, ["rt-a"]);
         assert!(controller.snapshot(two).unwrap().stop_routes.is_empty());
         assert!(controller.stopping_routes().contains("rt-a"));
+        assert_eq!(controller.pool_withdrawals(), ["rt-a"]);
 
         // A restarted process of a member supersedes that member's stream
         // only; it owns nothing until the gateway grants it a term.
@@ -1527,10 +1801,7 @@ mod tests {
     #[test]
     fn pool_observations_follow_the_owning_process_through_a_takeover() {
         let controller = SupervisorHostController::new();
-        controller.enable_pool();
-        controller
-            .replace_assignments(0, [assignment("rt-b", b"b")])
-            .unwrap();
+        controller.enable_pool(POOL_RECOVERY_TIMEOUT_SECS);
         let (two, _) = controller
             .begin_session(identity(), &member_hello("m-2", "p2", 1))
             .unwrap();
@@ -1540,10 +1811,10 @@ mod tests {
         // An unplaced instance has no verdict.
         assert_eq!(controller.observed("rt-b"), ObservedInstance::NoHost);
         controller.update_pool(
-            PoolView {
-                members: vec![member_view("m1", "p1"), member_view("m-2", "p2")],
-                owners: BTreeMap::from([("rt-b".to_string(), owner("m-2", "p2", 1))]),
-            },
+            loaded_view(
+                vec![member_view("m1", "p1"), member_view("m-2", "p2")],
+                [("rt-b", owner("m-2", "p2", 1))],
+            ),
             tokio::time::Instant::now(),
         );
         let revision = controller.revision();
@@ -1563,10 +1834,10 @@ mod tests {
             .unwrap();
 
         controller.update_pool(
-            PoolView {
-                members: vec![member_view("m1", "p1"), member_view("m-2", "p2")],
-                owners: BTreeMap::from([("rt-b".to_string(), owner("m1", "p1", 2))]),
-            },
+            loaded_view(
+                vec![member_view("m1", "p1"), member_view("m-2", "p2")],
+                [("rt-b", owner("m1", "p1", 2))],
+            ),
             tokio::time::Instant::now(),
         );
         // The new owner has not reconciled to the takeover yet.
@@ -1580,50 +1851,81 @@ mod tests {
             controller.observed("rt-b"),
             ObservedInstance::Reported(_)
         ));
-        // An owner process this gateway does not serve gives no verdict.
-        controller.update_pool(
-            PoolView {
-                members: vec![member_view("m1", "p1")],
-                owners: BTreeMap::from([("rt-b".to_string(), owner("m-3", "p3", 3))]),
-            },
-            tokio::time::Instant::now(),
+        // Its reports are recorded for the other gateway replicas, without
+        // the term's credentials.
+        let reports = controller.owned_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].route, "rt-b");
+        assert_eq!(
+            (
+                reports[0].owner.member_id.as_str(),
+                reports[0].owner.auth_epoch
+            ),
+            ("m1", 2)
         );
+        assert!(reports[0].owner.takeover.is_none());
+
+        // An owner process this gateway does not serve gives no verdict of
+        // its own; another replica's recorded report of the owner gives one.
+        let mut elsewhere = loaded_view(
+            vec![member_view("m1", "p1")],
+            [("rt-b", owner("m-3", "p3", 3))],
+        );
+        controller.update_pool(elsewhere.clone(), tokio::time::Instant::now());
         assert_eq!(controller.observed("rt-b"), ObservedInstance::NoHost);
+        let mut recorded = status(0, &["rt-b"]).instances.remove(0);
+        recorded.ready = false;
+        elsewhere
+            .reports
+            .insert("rt-b".to_string(), recorded.clone());
+        controller.update_pool(elsewhere, tokio::time::Instant::now());
+        assert_eq!(
+            controller.observed("rt-b"),
+            ObservedInstance::Reported(recorded)
+        );
+        assert!(controller.owned_reports().is_empty());
     }
 
     #[tokio::test]
     async fn pool_views_keep_fresh_placements_and_owned_instances() {
         let controller = SupervisorHostController::new();
-        controller.enable_pool();
-        controller
-            .replace_assignments(0, [assignment("rt-a", b"a")])
-            .unwrap();
+        controller.enable_pool(POOL_RECOVERY_TIMEOUT_SECS);
         let (one, _) = controller
             .begin_session(identity(), &member_hello("m1", "p1", 1))
             .unwrap();
-        let view = |routes: &[&str]| PoolView {
-            members: vec![member_view("m1", "p1")],
-            owners: routes
-                .iter()
-                .map(|route| ((*route).to_string(), owner("m1", "p1", 1)))
-                .collect(),
+        // `loaded` routes carry material this replica read; the rest are
+        // desired and owned only.
+        let view = |owned: &[&'static str], loaded: &[&str]| {
+            let mut view = loaded_view(
+                vec![member_view("m1", "p1")],
+                owned.iter().map(|route| (*route, owner("m1", "p1", 1))),
+            );
+            view.assignments
+                .retain(|route, _| loaded.contains(&route.as_str()));
+            view
         };
-        controller.update_pool(view(&["rt-a"]), tokio::time::Instant::now());
+        controller.update_pool(view(&["rt-a"], &["rt-a"]), tokio::time::Instant::now());
 
         // A launch through this gateway places and assigns rt-b while a
-        // reconciliation pass that listed owner records before it runs; the
-        // pass's view must not release the new instance.
+        // reconciliation pass that listed records before it runs; the pass's
+        // view must not release the new instance.
         let listed_before_launch = tokio::time::Instant::now();
         controller.place_owner("rt-b", owner("m1", "p1", 1));
         controller.assign(assignment("rt-b", b"b")).unwrap();
-        controller.update_pool(view(&["rt-a"]), listed_before_launch);
+        controller.update_pool(view(&["rt-a"], &["rt-a"]), listed_before_launch);
         assert_eq!(routes(&controller.snapshot(one).unwrap()), ["rt-a", "rt-b"]);
-        controller.update_pool(view(&["rt-a", "rt-b"]), tokio::time::Instant::now());
+        controller.update_pool(
+            view(&["rt-a", "rt-b"], &["rt-a", "rt-b"]),
+            tokio::time::Instant::now(),
+        );
         assert_eq!(routes(&controller.snapshot(one).unwrap()), ["rt-a", "rt-b"]);
 
         // An owned instance whose launch material this gateway has not loaded
         // yet, such as one launched through another gateway, is kept as is.
-        controller.update_pool(view(&["rt-a", "rt-b", "rt-c"]), tokio::time::Instant::now());
+        controller.update_pool(
+            view(&["rt-a", "rt-b", "rt-c"], &["rt-a", "rt-b"]),
+            tokio::time::Instant::now(),
+        );
         let snapshot = controller.snapshot(one).unwrap();
         assert_eq!(routes(&snapshot), ["rt-a", "rt-b"]);
         assert_eq!(snapshot.keep_routes, ["rt-c"]);
@@ -1633,19 +1935,46 @@ mod tests {
                 .iter()
                 .any(|entry| entry.route == "rt-c")
         );
+        // Once loaded, it is assigned.
+        controller.update_pool(
+            view(&["rt-a", "rt-b", "rt-c"], &["rt-a", "rt-b", "rt-c"]),
+            tokio::time::Instant::now(),
+        );
+        let snapshot = controller.snapshot(one).unwrap();
+        assert_eq!(routes(&snapshot), ["rt-a", "rt-b", "rt-c"]);
+        assert!(snapshot.keep_routes.is_empty());
 
-        // A withdrawn instance is stopped, not kept, until a recovery assigns
-        // it again.
+        // A withdrawal here is stopped, not kept, and stays withdrawn over
+        // views that still list its record, until the record is gone.
         controller.unassign("rt-b");
         let snapshot = controller.snapshot(one).unwrap();
         assert_eq!(snapshot.stop_routes, ["rt-b"]);
-        assert_eq!(snapshot.keep_routes, ["rt-c"]);
-        controller
-            .replace_assignments(
-                controller.revision(),
-                [assignment("rt-a", b"a"), assignment("rt-b", b"b")],
-            )
-            .unwrap();
+        controller.update_pool(
+            view(&["rt-a", "rt-b", "rt-c"], &["rt-a", "rt-b", "rt-c"]),
+            tokio::time::Instant::now(),
+        );
+        let snapshot = controller.snapshot(one).unwrap();
+        assert_eq!(routes(&snapshot), ["rt-a", "rt-c"]);
+        assert_eq!(snapshot.stop_routes, ["rt-b"]);
+        controller.forget_withdrawal("rt-b");
+        assert!(controller.pool_withdrawals().is_empty());
+
+        // An instance withdrawn through another replica leaves the desired
+        // set while its owner record remains: its owner stops it.
+        let mut withdrawn_elsewhere = view(&["rt-a", "rt-c"], &["rt-a", "rt-c"]);
+        withdrawn_elsewhere.desired.remove("rt-c");
+        withdrawn_elsewhere.assignments.remove("rt-c");
+        controller.update_pool(withdrawn_elsewhere, tokio::time::Instant::now());
+        let snapshot = controller.snapshot(one).unwrap();
+        assert_eq!(routes(&snapshot), ["rt-a"]);
+        assert_eq!(snapshot.stop_routes, ["rt-b", "rt-c"]);
+        assert!(snapshot.keep_routes.is_empty());
+
+        // An instance desired again is no longer stopped.
+        controller.update_pool(
+            view(&["rt-a", "rt-b", "rt-c"], &["rt-a", "rt-b", "rt-c"]),
+            tokio::time::Instant::now(),
+        );
         assert!(controller.snapshot(one).unwrap().stop_routes.is_empty());
         assert!(controller.stopping_routes().is_empty());
     }

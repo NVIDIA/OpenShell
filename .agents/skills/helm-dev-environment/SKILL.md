@@ -100,8 +100,10 @@ OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
 ### Shared supervisor high availability
 
 `supervisor.replicas` of 2 or more makes the shared supervisor a pool. The
-chart then renders `high_availability = true` in `shared_supervisor` (plus
-`recovery_timeout_secs` when `supervisor.recoveryTimeoutSeconds` is set), a
+chart then renders the gateway's `[openshell.gateway.supervisor_pool]` table
+(`enabled = true`, plus `recovery_timeout_secs` when
+`supervisor.recoveryTimeoutSeconds` is set; the driver's `shared_supervisor`
+table stays unchanged), a
 RollingUpdate Deployment (`maxSurge: 1`, `maxUnavailable: 0`) with preferred
 hostname anti-affinity and a 60-second grace period, the pool identity env vars
 (`OPENSHELL_SUPERVISOR_POOL_MEMBER_ID`, `_MEMBER_UID`, `_ADVERTISE_IP` from the

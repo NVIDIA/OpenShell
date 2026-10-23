@@ -215,35 +215,9 @@ pub struct SharedSupervisorConfig {
     /// gateway-minted supervisor token (key `token`); the supervisor Pod
     /// mounts it and presents the token on its assignment stream.
     pub token_secret_name: String,
-    /// The shared supervisor runs as a pool of replicas: the gateway places
-    /// each sandbox instance on a live member and grants it to another member
-    /// when its owner fails.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub high_availability: bool,
-    /// How long a sandbox runtime keeps its workload frozen without a
-    /// supervisor before it terminates the workload. Unset uses
-    /// [`HIGH_AVAILABILITY_RECOVERY_TIMEOUT_SECS`] with high availability and
-    /// the runtime's default otherwise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recovery_timeout_secs: Option<u32>,
 }
 
-/// Recovery deadline of shared generations in a supervisor pool unless
-/// configured: membership expiry, one reconciliation pass, and a replacement
-/// instance's startup fit with room to spare.
-pub const HIGH_AVAILABILITY_RECOVERY_TIMEOUT_SECS: u32 = 60;
-
 impl SharedSupervisorConfig {
-    /// Recovery deadline written into a shared generation's boundary config;
-    /// `None` keeps the runtime's default.
-    #[must_use]
-    pub fn boundary_recovery_timeout_secs(&self) -> Option<u32> {
-        self.recovery_timeout_secs.or_else(|| {
-            self.high_availability
-                .then_some(HIGH_AVAILABILITY_RECOVERY_TIMEOUT_SECS)
-        })
-    }
-
     fn validate(&self) -> Result<(), String> {
         if !is_dns_label(&self.service_name) || !is_dns_label(&self.service_namespace) {
             return Err(
@@ -255,16 +229,6 @@ impl SharedSupervisorConfig {
         }
         if !is_dns_subdomain(&self.token_secret_name) {
             return Err("shared_supervisor token_secret_name must be a DNS subdomain name".into());
-        }
-        let range = openshell_sandbox_backend::boundary_protocol::SUPERVISOR_RECOVERY_TIMEOUT_RANGE;
-        if let Some(timeout) = self.recovery_timeout_secs
-            && !range.contains(&timeout)
-        {
-            return Err(format!(
-                "shared_supervisor recovery_timeout_secs must be between {} and {}",
-                range.start(),
-                range.end()
-            ));
         }
         Ok(())
     }
@@ -1156,8 +1120,6 @@ mod tests {
             service_namespace: "openshell".to_string(),
             runtime_port: 8443,
             token_secret_name: "openshell-supervisor-token".to_string(),
-            high_availability: false,
-            recovery_timeout_secs: None,
         };
         let gateway = |shared: Option<SharedSupervisorConfig>| KubernetesComputeConfig {
             supervisor_topology: Some(SupervisorTopology::Gateway),
@@ -1170,36 +1132,6 @@ mod tests {
                 .is_ok()
         );
         assert!(gateway(None).validate_supervisor_topology().is_err());
-        // A pool recovers within its own default deadline unless configured.
-        let pool = SharedSupervisorConfig {
-            high_availability: true,
-            ..shared()
-        };
-        assert!(
-            gateway(Some(pool.clone()))
-                .validate_supervisor_topology()
-                .is_ok()
-        );
-        assert_eq!(
-            pool.boundary_recovery_timeout_secs(),
-            Some(HIGH_AVAILABILITY_RECOVERY_TIMEOUT_SECS)
-        );
-        assert_eq!(shared().boundary_recovery_timeout_secs(), None);
-        let configured = SharedSupervisorConfig {
-            recovery_timeout_secs: Some(90),
-            ..pool
-        };
-        assert_eq!(configured.boundary_recovery_timeout_secs(), Some(90));
-        // Gateway TOML without the new keys keeps parsing as a lone supervisor.
-        let parsed: SharedSupervisorConfig = serde_json::from_value(serde_json::json!({
-            "service_name": "openshell-supervisor",
-            "service_namespace": "openshell",
-            "runtime_port": 5500,
-            "token_secret_name": "openshell-supervisor-token",
-        }))
-        .unwrap();
-        assert!(!parsed.high_availability);
-        assert_eq!(parsed.recovery_timeout_secs, None);
         // The connection alone does not opt a gateway in.
         let unset = KubernetesComputeConfig {
             shared_supervisor: Some(shared()),
@@ -1217,14 +1149,6 @@ mod tests {
             },
             SharedSupervisorConfig {
                 token_secret_name: "Not_A_Secret_Name".to_string(),
-                ..shared()
-            },
-            SharedSupervisorConfig {
-                recovery_timeout_secs: Some(9),
-                ..shared()
-            },
-            SharedSupervisorConfig {
-                recovery_timeout_secs: Some(301),
                 ..shared()
             },
         ] {

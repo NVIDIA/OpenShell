@@ -429,7 +429,7 @@ tests:
         documentSelector:
           path: kind
           value: PodDisruptionBudget
-  - it: renders high availability into gateway TOML only for a pool
+  - it: enables the supervisor pool in the gateway table, not the driver table
     template: templates/gateway-config.yaml
     set:
       supervisor:
@@ -440,8 +440,14 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: 'shared_supervisor = \{ high_availability = true, runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
-  - it: renders a configured recovery timeout into gateway TOML
+          pattern: 'shared_supervisor = \{ runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.supervisor_pool\]\nenabled = true\n'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: recovery_timeout_secs|high_availability
+  - it: renders a configured recovery timeout into the supervisor pool table
     template: templates/gateway-config.yaml
     set:
       supervisor:
@@ -453,8 +459,11 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: 'shared_supervisor = \{ high_availability = true, recovery_timeout_secs = 45, runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
-  - it: renders a recovery timeout for a single shared supervisor without high availability
+          pattern: '\[openshell\.gateway\.supervisor_pool\]\nenabled = true\nrecovery_timeout_secs = 45\n'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'shared_supervisor = \{ runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
+  - it: renders no supervisor pool for a single shared supervisor
     template: templates/gateway-config.yaml
     set:
       supervisor:
@@ -465,10 +474,44 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: 'shared_supervisor = \{ recovery_timeout_secs = 120, runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
+          pattern: 'shared_supervisor = \{ runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
       - notMatchRegex:
           path: data["gateway.toml"]
-          pattern: high_availability
+          pattern: supervisor_pool|recovery_timeout_secs|high_availability
+  - it: rejects a hand-written supervisor pool table
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        replicas: 2
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.supervisor_pool:
+          enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds
+  - it: rejects a hand-written supervisor pool inside the gateway table
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway:
+          supervisor_pool:
+            enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds
+  - it: rejects a hand-written supervisor pool without the gateway topology
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.gateway.supervisor_pool:
+          enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds
   - it: rejects zero supervisor replicas
     template: templates/supervisor.yaml
     set:

@@ -222,8 +222,10 @@ control listener: it dials the gateway and receives its assignments from it.
   and keeps the launch material's proxy CA and SSH host key. A term that
   arrives without credentials, or whose route is still being released, is
   deferred, reported as starting, and retried at the heartbeat cadence. The
-  host follows the gateway's heartbeat interval, feeds the route directory
-  to the runtime router for redirects, and on SIGTERM announces that it is
+  host follows the gateway's heartbeat interval, offers each instance's
+  runtime the recovery deadline of the latest snapshot
+  (`recovery_timeout_secs`) when it attaches, feeds the route directory to the
+  runtime router for redirects, and on SIGTERM announces that it is
   leaving, waits up to 40 seconds for the gateway to move its instances, and
   relinquishes what remains.
 

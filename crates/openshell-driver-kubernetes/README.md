@@ -255,24 +255,8 @@ fails closed.
   and the routing preface only selects which generation-pinned TLS identity
   the supervisor demands.
 
-- **High availability.** With `shared_supervisor.high_availability` (the
-  chart sets it for `supervisor.replicas` of two or more), the driver makes
-  the gateway coordinate a pool of supervisor replicas. Shared generations get
-  `route_redirects` in their boundary config, so a runtime that reaches a
-  replica that does not own its instance is redirected to the owner, and a
-  recovery deadline of `recovery_timeout_secs` (60 seconds by default in a
-  pool, the runtime's 30 seconds otherwise). Pool members connect to any
-  gateway replica, so every replica refreshes the shared desired set from the
-  Sandbox resources every 10 seconds, not only the replica running the watch.
-  An instance being taken over reads as degraded or unknown, never
-  unavailable, until its new owner reports it.
-
-The topology does not support upstream proxies or provider SPIFFE identity.
-Without high availability, the shared supervisor is a single point of failure
-for the sandboxes it hosts. Switching a running release between one replica
-and a pool interrupts its shared sandboxes: a lone supervisor stops its
-sandboxes when it shuts down, and pool members' sandboxes have no owner a
-lone supervisor could take over.
+The topology does not support upstream proxies or provider SPIFFE identity, and
+the shared supervisor is a single point of failure for the sandboxes it hosts.
 Shared sandbox instances export no supervisor OTLP traces or OCSF events; the driver
 warns at startup when the gateway configures that export.
 When the setting is removed, reconciliation suspends shared generations, and a

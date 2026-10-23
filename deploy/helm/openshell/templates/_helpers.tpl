@@ -419,8 +419,9 @@ for a high-availability pool. A missing value (for example after `helm upgrade
 {{- end }}
 
 {{/*
-Seconds a sandbox runtime keeps its workload frozen after losing the shared
-supervisor, or nothing when unset so the gateway applies its default.
+Seconds a sandbox runtime keeps its workload frozen after losing a pool
+member's supervision, or nothing when unset so the gateway applies its pool
+default.
 */}}
 {{- define "openshell.supervisorRecoveryTimeoutSeconds" -}}
 {{- $supervisor := .Values.supervisor | default dict -}}
@@ -431,6 +432,32 @@ supervisor, or nothing when unset so the gateway applies its default.
 {{- fail "supervisor.recoveryTimeoutSeconds must be an integer between 10 and 300, or null for the default" -}}
 {{- end -}}
 {{- $timeout -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The gateway's [openshell.gateway.supervisor_pool] table as YAML, or nothing.
+The chart owns it: two or more shared supervisor replicas form a
+high-availability pool that the gateway coordinates. A single replica renders
+no table, so its gateway configuration is unchanged. Validates the supervisor
+values whenever the gateway topology is selected, and refuses a hand-written
+table in either TOML form.
+*/}}
+{{- define "openshell.supervisorPoolConfig" -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- if or (hasKey $gatewayConfig "openshell.gateway.supervisor_pool") (hasKey (get $gatewayConfig "openshell.gateway" | default dict) "supervisor_pool") -}}
+{{- fail "supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds" -}}
+{{- end -}}
+{{- if include "openshell.supervisorEnabled" . -}}
+{{- $replicas := int64 (include "openshell.supervisorReplicas" .) -}}
+{{- $recoveryTimeout := include "openshell.supervisorRecoveryTimeoutSeconds" . -}}
+{{- if gt $replicas 1 -}}
+{{- $pool := dict "enabled" true -}}
+{{- if $recoveryTimeout -}}
+{{- $_ := set $pool "recovery_timeout_secs" (int64 $recoveryTimeout) -}}
+{{- end -}}
+{{- toYaml $pool -}}
+{{- end -}}
 {{- end -}}
 {{- end }}
 
@@ -664,20 +691,9 @@ like user-supplied schema-v2 fields during compatibility resolution. */}}
 {{- if not (hasKey $kubernetes "supervisor_image") -}}{{- $_ := set $kubernetes "supervisor_image" (include "openshell.supervisorImage" .) -}}{{- end -}}
 {{- if not (hasKey $runtimeConfig "boundary_port") -}}{{- $_ := set $runtimeConfig "boundary_port" 5500 -}}{{- end -}}
 {{- $_ := set $kubernetes "sandbox_runtime" $runtimeConfig -}}
-{{/* The chart owns the shared supervisor and the Secret that delivers its token.
-high_availability appears only for a pool of two or more replicas and
-recovery_timeout_secs only when set, so a default single replica renders the
-connection unchanged. */}}
+{{/* The chart owns the shared supervisor and the Secret that delivers its token. */}}
 {{- if include "openshell.supervisorEnabled" . -}}
-{{- $shared := dict "service_name" (include "openshell.supervisorName" .) "service_namespace" .Release.Namespace "runtime_port" 5500 "token_secret_name" (printf "%s-token" (include "openshell.supervisorName" .)) -}}
-{{- if gt (int64 (include "openshell.supervisorReplicas" .)) 1 -}}
-{{- $_ := set $shared "high_availability" true -}}
-{{- end -}}
-{{- $recoveryTimeout := include "openshell.supervisorRecoveryTimeoutSeconds" . -}}
-{{- if $recoveryTimeout -}}
-{{- $_ := set $shared "recovery_timeout_secs" (int64 $recoveryTimeout) -}}
-{{- end -}}
-{{- $_ := set $kubernetes "shared_supervisor" $shared -}}
+{{- $_ := set $kubernetes "shared_supervisor" (dict "service_name" (include "openshell.supervisorName" .) "service_namespace" .Release.Namespace "runtime_port" 5500 "token_secret_name" (printf "%s-token" (include "openshell.supervisorName" .))) -}}
 {{- end -}}
 {{- toYaml $kubernetes -}}
 {{- end }}
@@ -712,6 +728,7 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if hasKey (get (.Values.gatewayConfig | default dict) "openshell.drivers.kubernetes" | default dict) "shared_supervisor" -}}
 {{- fail "shared_supervisor is rendered by the chart; set only supervisor_topology" -}}
 {{- end -}}
+{{- $_ := include "openshell.supervisorPoolConfig" . -}}
 {{- $workloadKind := include "openshell.workloadKind" . -}}
 {{- $workload := .Values.workload | default dict -}}
 {{- $maxReplicas := int (include "openshell.maxReplicas" .) -}}

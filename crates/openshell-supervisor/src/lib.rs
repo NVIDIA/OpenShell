@@ -913,6 +913,10 @@ pub struct SandboxInstanceConfig {
     /// Gateway-granted authority to replace the generation's current owner.
     /// The instance then adopts the running workload instead of starting it.
     pub takeover: Option<openshell_sandbox_backend::BoundaryTakeover>,
+    /// Recovery deadline (seconds) offered to the sandbox runtime at every
+    /// attach: how long it keeps the workload frozen after losing this
+    /// supervisor. `None` leaves the runtime default.
+    pub supervisor_recovery_timeout_secs: Option<u32>,
 }
 
 impl SandboxInstanceConfig {
@@ -1065,6 +1069,7 @@ pub async fn run_sandbox_instance(
         provider_workload_api_socket,
         proxy_tls,
         takeover,
+        supervisor_recovery_timeout_secs,
     } = config;
     // The owner binds the event context and log sink to the instance's
     // threads; the instance itself uses the rest.
@@ -1292,6 +1297,7 @@ pub async fn run_sandbox_instance(
                 provider_credentials: provider_credentials.clone(),
                 sandbox_bearer,
                 takeover,
+                supervisor_recovery_timeout_secs,
             },
             policy.clone(),
             openshell_isolation_interface::AgentSpec {
@@ -4602,6 +4608,7 @@ mod tests {
             provider_workload_api_socket: None,
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
             takeover: None,
+            supervisor_recovery_timeout_secs: None,
         };
         let bindings = SandboxInstanceBindings::dedicated(
             &config,

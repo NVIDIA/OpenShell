@@ -641,6 +641,7 @@ fn main() -> Result<()> {
                     .map(PathBuf::from),
                     proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
                     takeover: None,
+                    supervisor_recovery_timeout_secs: None,
                 };
                 // Log push already shares these credentials and the logging
                 // layers these OCSF JSON settings.

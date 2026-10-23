@@ -109,6 +109,11 @@ message AssignmentSnapshot {
   // unchanged; it neither releases nor stops them, and starts nothing for
   // them.
   repeated string keep_routes = 6;
+  // Pool hosts only: how long, in whole seconds, a sandbox runtime keeps its
+  // workload frozen after losing this host's supervision before terminating
+  // it. The host offers it to each instance's runtime when it attaches;
+  // absent keeps the runtime default.
+  google.protobuf.Duration recovery_timeout = 7;
 }
 
 // The pool member that supervises one route.

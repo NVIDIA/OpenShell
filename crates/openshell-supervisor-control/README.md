@@ -24,19 +24,24 @@ re-implementing the control contracts.
   of revisions never sent, regressing acks, and oversized reports are
   dropped. A stream ends when the token that opened it expires; hosted
   instances keep running. A lone host runs at most 256 instances.
-- **Supervisor pool.** With `enable_pool`, several hosts (pool members) are
-  served at once and each instance has one durable owner: a member, its
-  process, and an ownership term. The gateway's pool reconciler replaces the
-  `PoolView` as a whole (`update_pool`, keeping owners placed since its
-  records were listed). Each member's snapshot carries the instances its
-  process owns (a takeover term with its credentials, or with the term alone
-  when another gateway replica minted them), `stop_routes` for withdrawn
-  instances it owns, `keep_routes` for owned instances whose launch material
-  this gateway has not loaded yet, and the route directory for runtime
-  redirects. Omission means release, never stop. Nothing is sent before both
-  the desired set and the pool view have loaded. Only the owning process's
-  session renders a verdict on an instance. A pool holds up to 4096 instances;
-  placement keeps each member at 256.
+- **Supervisor pool.** With `enable_pool` (set by the gateway from its own
+  configuration), several hosts (pool members) are served at once and each
+  instance has one durable owner: a member, its process, and an ownership
+  term. The gateway's pool reconciler replaces the `PoolView` as a whole
+  (`update_pool`): the desired set from the gateway's durable records, the
+  owners, the launch material this replica loaded, and the latest recorded
+  reports of owners served elsewhere. Owners placed, instances launched, and
+  instances withdrawn here since the records were listed are kept as they are.
+  Each member's snapshot carries the instances its process owns (a takeover
+  term with its credentials, or with the term alone when another gateway
+  replica minted them), `stop_routes` for withdrawn instances it owns,
+  `keep_routes` for owned desired instances whose material this replica has
+  not loaded yet, the route directory for runtime redirects, and the recovery
+  deadline its hosts offer each runtime (`POOL_RECOVERY_TIMEOUT_SECS`, 60 s,
+  unless configured). Omission means release, never stop. Nothing is sent
+  before the first view. An instance is judged by its owning process's
+  session, or by that owner term's recorded report on other replicas.
+  Placement keeps each member at 256 instances.
 - `registration`: `SandboxInstanceRegistration` is the JSON launch material
   one assignment carries and the driver persists with the generation. It
   grants the supervisor exactly that generation's gateway and Sandbox Protocol
@@ -50,8 +55,11 @@ re-implementing the control contracts.
   persists the encoded launch material through the driver's operation, and
   only then assigns the instance; a host at capacity is refused before the
   workload runs. For a pool, the gateway's installed `InstancePlacement`
-  durably records the launch term's owner before the assignment, and a launch
-  no member can take is refused (`LaunchError::Unplaced`). `begin_recovery` captures
+  durably records the instance and its launch term's owner before the
+  assignment, and a launch no member can take is refused like a full host
+  (`LaunchError::Refused`). A pool's withdrawals are removed from the durable
+  records by the gateway, and a recovery reconciles those records with the
+  driver's listing instead of replacing the desired set. `begin_recovery` captures
   the revision before the driver lists its durable records and
   `complete_recovery` reuses current assignments, reads the rest through the
   driver's operation, binds each to its recorded route and sandbox, and keeps

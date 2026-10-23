@@ -756,6 +756,32 @@ Multi-replica gateways relay session-bound traffic to the replica that owns a sa
 
 The gateway refuses to start when a peer endpoint is configured on a multi-replica backend and peer authentication is unavailable, because the replica could not serve relays from its peers. That happens when the pod identity variables are missing, when the in-cluster Kubernetes client cannot be built, or when the gateway is not running in a cluster. A plaintext `http://` peer endpoint is also rejected when the gateway serves TLS; use it only when the gateway itself serves plaintext.
 
+## Supervisor Pool
+
+`[openshell.gateway.supervisor_pool]` runs the Kubernetes driver's shared
+supervisor as a high-availability pool. The gateway places each sandbox on one
+pool member, records its owner durably, and moves the sandboxes of a member
+that fails or leaves to a live member without restarting their workloads. The
+pool requires the Kubernetes driver's `supervisor_topology = "gateway"`; the
+gateway refuses to start a pool when no compute driver uses the shared
+supervisor.
+
+```toml
+[openshell.gateway.supervisor_pool]
+enabled = true
+recovery_timeout_secs = 60
+```
+
+| Field | Default | Behavior |
+|---|---|---|
+| `enabled` | `false` | Coordinates the shared supervisor's replicas as a pool. |
+| `recovery_timeout_secs` | `60` | Seconds, from 10 to 300, that a sandbox runtime keeps its workload frozen after losing its pool member before it terminates the workload. The pool's supervisors offer this limit to each sandbox runtime when they attach. Without a pool, the runtime uses 30 seconds. |
+
+The Helm chart renders this table when `supervisor.replicas` is 2 or more, sets
+`recovery_timeout_secs` from `supervisor.recoveryTimeoutSeconds`, and rejects a
+hand-written table. For failover behavior, refer to
+[Shared Supervisor High Availability](/kubernetes/high-availability#shared-supervisor-high-availability).
+
 ## Driver References
 
 ### External Resource Admission
@@ -940,10 +966,9 @@ sandbox_runtime_image_pull_policy = "if_not_present"
 # supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "if_not_present"
 # Supervise new sandboxes with one shared supervisor Deployment instead of a
-# supervisor Pod per sandbox. Helm deploys it and renders shared_supervisor
-# from the chart's supervisor.* values.
+# supervisor Pod per sandbox. Helm deploys it and renders shared_supervisor.
 # supervisor_topology          = "gateway"
-# shared_supervisor            = { service_name = "openshell-supervisor", service_namespace = "openshell", runtime_port = 5500, token_secret_name = "openshell-supervisor-token", high_availability = true, recovery_timeout_secs = 60 }
+# shared_supervisor            = { service_name = "openshell-supervisor", service_namespace = "openshell", runtime_port = 5500, token_secret_name = "openshell-supervisor-token" }
 
 # Optional corporate forward proxy for policy-approved TLS egress. The sandbox
 # workload cannot select or override these settings. http:// and https:// proxy
@@ -1055,17 +1080,9 @@ already exist in the sandbox namespace.
 
 With `supervisor_topology = "gateway"`, `shared_supervisor` tells the gateway
 how to reach the shared supervisor that the Helm chart deploys. The chart
-renders `shared_supervisor` and rejects a hand-written one, so set the chart's
-`supervisor.replicas` and `supervisor.recoveryTimeoutSeconds` values instead.
-These `shared_supervisor` fields control failover:
-
-| Field | Default | Behavior |
-|---|---|---|
-| `high_availability` | `false` | Runs the shared supervisor as a pool whose members take over each other's sandboxes. Requires two or more replicas. Helm sets it when `supervisor.replicas` is 2 or more. |
-| `recovery_timeout_secs` | `60` with `high_availability`, otherwise `30` | Seconds, from 10 to 300, that a sandbox keeps its workload frozen after losing its supervisor before the sandbox runtime terminates it. Helm renders `supervisor.recoveryTimeoutSeconds`. |
-
-For failover behavior, refer to
-[Shared Supervisor High Availability](/kubernetes/high-availability#shared-supervisor-high-availability).
+renders `shared_supervisor` and rejects a hand-written one. To run the shared
+supervisor as a high-availability pool, configure the gateway's
+[supervisor pool](#supervisor-pool).
 
 For token-exchange provider profiles, the gateway also needs access to its own
 SPIFFE Workload API socket. In Helm deployments, set

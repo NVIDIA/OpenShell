@@ -20,17 +20,37 @@ authorize the new one.
 
 ## Shared supervisor pool
 
-With a supervisor pool (the Kubernetes driver's `shared_supervisor.high_availability`),
-`supervisor_pool` keeps the pool's durable state and reconciles it every two
-seconds on every gateway replica:
+With `[openshell.gateway.supervisor_pool] enabled = true`, the `SharedSupervision`
+the gateway hands its compute driver coordinates a pool of shared supervisor
+hosts; the driver itself is unchanged. The gateway refuses a pool when no
+in-process driver uses the shared supervisor. `supervisor_pool` keeps the
+pool's durable state and reconciles it every two seconds on every gateway
+replica, independent of which replica runs the compute driver's watch:
 
 - **Membership.** The replica serving a member's host stream refreshes its
   `supervisor_pool_member` record. A record older than 15 seconds is dead; a
   member that announces it is leaving drops out at once; a member whose process
   changed lost every instance its previous process owned.
+- **Desired set.** A launch records the instance (`supervisor_instance_assignment`)
+  before anything else. The record holds only the handle of the launch
+  material, which the configured credential store keeps, as it keeps sandbox SSH
+  host keys. Every replica derives the desired set from these records and loads
+  the material of instances owned by members it serves. Recording takes single
+  atomic store writes and holds no lock: it reserves the route with a row named
+  by the route and identified by a fresh writer token, stores the material, has
+  a `supervisor_instance_material_candidate` row own the handle, and publishes
+  by advancing exactly its reservation's version. Collection deletes a
+  candidate's material only once its recording no longer holds the reservation,
+  after which that recording can never publish; a reservation that does not
+  publish within two minutes is fenced by removing it. A withdrawal removes the
+  material and then the record, or fences a reservation; an ended generation
+  (sandbox gone, replaced, stopped, or deleting) is withdrawn by the sweep; and
+  the compute driver's recovery backfills instances it runs without a record and
+  withdraws records published before its listing that it no longer lists.
 - **Placement and ownership.** A launch records its owner, the live member the
-  consistent-hash ring prefers (`gateway_ring`), before the instance is
-  assigned; a member at its 256-instance capacity is skipped. One
+  consistent-hash ring prefers (`gateway_ring`), right after the instance; a
+  member at its 256-instance capacity is skipped, and with no live member with
+  room the launch is refused as a capacity refusal. One
   `supervisor_instance_owner` record per instance names the member, its
   process, and the ownership term (the sandbox's credential epoch). Records
   change only by compare-and-swap, and a live owner keeps its instances.
@@ -49,10 +69,16 @@ seconds on every gateway replica:
   Other replicas send the term without credentials; a host that already runs
   it keeps it.
 
-Owner records of ended generations (sandbox gone, replaced, stopped, or being
-deleted) are removed. Pool members still authenticate with the one shared
-supervisor token, so a member identity is asserted by its hello rather than
-bound to its Pod.
+- **Observations.** The replica serving an owner records what the owner reports
+  of its instances (`supervisor_instance_report`; no error text), and every
+  replica judges an instance whose owner streams elsewhere from the record of
+  the current owner term, so launch readiness and bootstrap completion do not
+  depend on which replica a member reached.
+
+Owner records of withdrawn instances are removed once their generation ended,
+or two minutes after the withdrawal, after their owner was told to stop them.
+Pool members still authenticate with the one shared supervisor token, so a
+member identity is asserted by its hello rather than bound to its Pod.
 
 ## Operator credential export
 

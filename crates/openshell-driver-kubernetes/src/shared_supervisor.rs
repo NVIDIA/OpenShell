@@ -89,13 +89,7 @@ pub struct SharedSupervisor {
 }
 
 impl SharedSupervisor {
-    /// The shared supervisor this driver is configured with. A
-    /// high-availability configuration makes the gateway coordinate a pool of
-    /// supervisor replicas, before any of them attaches.
     pub fn new(config: SharedSupervisorConfig, supervision: SharedSupervision) -> Self {
-        if config.high_availability {
-            supervision.enable_pool();
-        }
         Self {
             config,
             supervision,

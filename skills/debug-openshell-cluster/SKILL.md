@@ -1147,8 +1147,10 @@ OpenShell chart rather than treating missing workload Pods as Pod failures.
 #### Shared supervisor high availability
 
 With `supervisor_topology = "gateway"`, `supervisor.replicas` of 2 or more runs
-the `<release>-supervisor` Deployment as a pool. The chart then renders
-`high_availability = true` in `shared_supervisor`, rolls one member at a time,
+the `<release>-supervisor` Deployment as a pool. The chart then renders the
+gateway's `[openshell.gateway.supervisor_pool]` table with `enabled = true`
+(the driver's `shared_supervisor` table carries no pool settings), rolls one
+member at a time,
 prefers separate nodes, gives each member a 60-second grace period to leave,
 and adds a `<release>-supervisor` PodDisruptionBudget with `maxUnavailable: 1`.
 Each member takes its identity from `OPENSHELL_SUPERVISOR_POOL_MEMBER_ID`,
@@ -1157,7 +1159,7 @@ Each member takes its identity from `OPENSHELL_SUPERVISOR_POOL_MEMBER_ID`,
 
 ```bash
 kubectl -n openshell get deployment,poddisruptionbudget,pod -l app.kubernetes.io/component=supervisor -o wide
-kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E 'supervisor_topology|shared_supervisor'
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E -A2 'supervisor_topology|shared_supervisor|supervisor_pool'
 kubectl -n openshell logs -l app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell \
   -c openshell-gateway --prefix --tail=500 | grep -E 'supervisor pool|taking over a shared sandbox instance'
 kubectl -n openshell logs -l app.kubernetes.io/name=openshell-supervisor --prefix --tail=500 \
@@ -1188,9 +1190,12 @@ The sandbox runtime writes these OCSF findings to the workload Pod log:
 - `sandbox-supervisor-takeover-denied`: the runtime refused a supervisor
   without a valid grant for the current term, such as a fenced owner returning.
 
-The recovery timeout is `recovery_timeout_secs` (Helm
-`supervisor.recoveryTimeoutSeconds`, 10 to 300 seconds), or 60 seconds in a
-pool and 30 seconds otherwise. A graceful leave hands instances over at once.
+In a pool, the recovery timeout is the gateway's
+`[openshell.gateway.supervisor_pool] recovery_timeout_secs` (Helm
+`supervisor.recoveryTimeoutSeconds`, 10 to 300 seconds, default 60). Each pool
+supervisor offers it to a sandbox runtime when it attaches; one replica keeps
+the runtime default of 30 seconds. A graceful leave hands instances over at
+once.
 A lost node takes up to the 15-second membership TTL plus a 2-second
 reconcile pass to detect, before the replacement starts, so a short timeout
 terminates workloads that would have recovered. A gateway replica that just
@@ -1202,16 +1207,24 @@ ends in `sandbox-supervisor-recovery-expired`.
 `supervisor pool reconciliation failed; retrying` means a gateway replica could
 not read or write the pool's store records: `supervisor_pool_member` (one per
 member, refreshed by the gateway replica serving its stream; older than 15
-seconds means dead) and `supervisor_instance_owner` (one per instance, written
-with compare-and-swap, naming the owner and its term). Check the database. To
-read them on PostgreSQL without changing them:
+seconds means dead), `supervisor_instance_assignment` (one per instance the pool
+must run, written by the replica that launched it; it holds the handle of the
+launch material, which the gateway's credential store keeps),
+`supervisor_instance_owner` (one per instance, written with compare-and-swap,
+naming the owner and its term), and `supervisor_instance_report` (the owner's
+latest report, recorded by the replica serving it). Every gateway replica
+serves the pool from these records, so a sandbox launched through one replica
+reaches a member connected to another. `could not load a supervisor pool
+instance's launch material` points at the credential store instead. Check the
+database. To read the records on PostgreSQL without changing them:
 
 ```sql
 SELECT object_type, id,
        (extract(epoch FROM now()) * 1000)::bigint - updated_at_ms AS age_ms,
        convert_from(payload, 'UTF8') AS record
 FROM objects
-WHERE object_type IN ('supervisor_pool_member', 'supervisor_instance_owner')
+WHERE object_type IN ('supervisor_pool_member', 'supervisor_instance_assignment',
+                      'supervisor_instance_owner', 'supervisor_instance_report')
 ORDER BY object_type, id;
 ```
 
