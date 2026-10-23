@@ -440,9 +440,9 @@ frames or messages from the server. If the endpoint carries provider
 credentials, OpenShell closes the connection with close code `1008` when the
 client sends a binary frame, because it cannot check the frame for credentials.
 Set `allow_uninspected_credentials: true` to relay binary frames anyway. Set
-`websocket_credential_rewrite` does not override provider credential placement.
-Static credentials declared for a header, query parameter, or path cannot
-resolve inside WebSocket messages, even when this flag is enabled.
+`websocket_credential_rewrite: true` when client text messages contain credential
+placeholders that must be resolved. This explicitly authorizes WebSocket text
+rewriting for ordinary static credentials, including credentials with HTTP placement metadata.
 
 When new network rules take effect, OpenShell closes open WebSocket connections,
 so the client must reconnect. The client might receive close code `1012`, or the

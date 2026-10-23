@@ -1910,9 +1910,13 @@ where
                 assembly_budget,
                 resolver,
                 generation_guard: options.generation_guard,
-                provider_credentials: options
-                    .ctx
-                    .and_then(|ctx| ctx.provider_credentials.as_ref()),
+                provider_credentials: if options.websocket.credential_rewrite {
+                    options
+                        .ctx
+                        .and_then(|ctx| ctx.provider_credentials.as_ref())
+                } else {
+                    None
+                },
                 target: &options.target,
                 inspector,
                 compression,
@@ -3999,13 +4003,6 @@ mod tests {
             }],
             credential_identity: identity.to_string(),
             workload_credential_handle: String::new(),
-            placement: Some(openshell_core::proto::StaticCredentialPlacement {
-                location: Some(
-                    openshell_core::proto::static_credential_placement::Location::HeaderName(
-                        "Authorization".into(),
-                    ),
-                ),
-            }),
         }
     }
 
@@ -4332,11 +4329,202 @@ mod tests {
             1,
             TestHashMap::from([("API_TOKEN".into(), "synthetic-private-token".into())]),
             TestHashMap::new(),
-            TestHashMap::new(),
+            crate::test_support::header_placement_metadata(&["API_TOKEN"]),
             TestHashMap::from([("API_TOKEN".into(), endpoint_binding("provider:API_TOKEN"))]),
             Vec::new(),
         )
         .expect("bound placement fixture")
+    }
+
+    #[tokio::test]
+    async fn mixed_legacy_and_strict_credentials_preserve_opt_in_body_and_query_rewriting() {
+        let legacy_binding = endpoint_binding("provider:LEGACY_TOKEN");
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            TestHashMap::from([
+                ("STRICT_TOKEN".into(), "strict-private-token".into()),
+                ("LEGACY_TOKEN".into(), "legacy-private-token".into()),
+            ]),
+            TestHashMap::new(),
+            crate::test_support::header_placement_metadata(&["STRICT_TOKEN"]),
+            TestHashMap::from([
+                (
+                    "STRICT_TOKEN".into(),
+                    endpoint_binding("provider:STRICT_TOKEN"),
+                ),
+                ("LEGACY_TOKEN".into(), legacy_binding),
+            ]),
+            Vec::new(),
+        )
+        .expect("mixed placement fixture");
+        let snapshot = state.snapshot();
+        let strict = &snapshot.child_env["STRICT_TOKEN"];
+        let legacy = &snapshot.child_env["LEGACY_TOKEN"];
+        let resolver = state
+            .resolver_for_endpoint("allowed.example.test", 443, "/allowed/search")
+            .unwrap();
+        let body = format!("legacy={legacy}&strict={strict}");
+        let target = format!("/allowed/search?probe={legacy}");
+        let raw = format!(
+            "POST {target} HTTP/1.1\r\nHost: allowed.example.test\r\nAuthorization: token {strict}\r\nX-Legacy: {legacy}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let request = crate::l7::rest::request_from_buffered_http(
+            "POST",
+            "/allowed/search",
+            &target,
+            raw.into_bytes(),
+        )
+        .unwrap();
+        let (mut _app, mut client) = tokio::io::duplex(8192);
+        let (mut upstream, mut service) = tokio::io::duplex(8192);
+        let service_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            loop {
+                let mut byte = [0];
+                service.read_exact(&mut byte).await.unwrap();
+                bytes.push(byte[0]);
+                if bytes.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = String::from_utf8(bytes).unwrap();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("Content-Length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            let mut body = vec![0; length];
+            service.read_exact(&mut body).await.unwrap();
+            service
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            (headers, String::from_utf8(body).unwrap())
+        });
+        crate::l7::rest::relay_http_request_with_options_guarded(
+            &request,
+            &mut client,
+            &mut upstream,
+            crate::l7::rest::RelayRequestOptions {
+                resolver: Some(&resolver),
+                request_body_credential_rewrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let (headers, body) = service_task.await.unwrap();
+        assert!(headers.contains("/allowed/search?probe=legacy-private-token"));
+        assert!(headers.contains("Authorization: token strict-private-token"));
+        assert!(headers.contains("X-Legacy: legacy-private-token"));
+        assert_eq!(
+            body,
+            "legacy=legacy-private-token&strict=strict-private-token"
+        );
+        assert!(
+            resolver
+                .rewrite_header_value_for_name("X-Legacy", strict)
+                .unwrap_err()
+                .is_placement_mismatch()
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_credentials_do_not_enable_disabled_body_rewriting() {
+        let state = placement_test_state();
+        let resolver = state
+            .resolver_for_endpoint("allowed.example.test", 443, "/allowed/search")
+            .unwrap();
+        let token = state.snapshot().child_env["API_TOKEN"].clone();
+        let body = format!("token={token}");
+        let raw = format!(
+            "POST /allowed/search HTTP/1.1\r\nHost: allowed.example.test\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let request = crate::l7::rest::request_from_buffered_http(
+            "POST",
+            "/allowed/search",
+            "/allowed/search",
+            raw.into_bytes(),
+        )
+        .unwrap();
+        let (mut _app, mut client) = tokio::io::duplex(8192);
+        let (mut upstream, mut service) = tokio::io::duplex(8192);
+        let error = crate::l7::rest::relay_http_request_with_options_guarded(
+            &request,
+            &mut client,
+            &mut upstream,
+            crate::l7::rest::RelayRequestOptions {
+                resolver: Some(&resolver),
+                request_body_credential_rewrite: false,
+                deny_uninspected_credentials: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("placement metadata must not enable body rewriting");
+        assert!(
+            error
+                .downcast_ref::<secrets::body::BodyCredentialError>()
+                .is_some(),
+            "{error}"
+        );
+        drop(upstream);
+        let mut sent = String::new();
+        service.read_to_string(&mut sent).await.unwrap();
+        assert!(!sent.contains("synthetic-private-token"));
+    }
+
+    #[tokio::test]
+    async fn metadata_credentials_do_not_enable_disabled_websocket_rewriting() {
+        let state = placement_test_state();
+        let token = state.snapshot().child_env["API_TOKEN"].clone();
+        let ctx = L7EvalContext {
+            host: "allowed.example.test".into(),
+            port: 443,
+            provider_credentials: Some(state.clone()),
+            ..Default::default()
+        };
+        let (mut app, mut client) = tokio::io::duplex(8192);
+        let (mut upstream, mut service) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            handle_upgrade(
+                &mut client,
+                &mut upstream,
+                Vec::new(),
+                "allowed.example.test",
+                443,
+                UpgradeRelayOptions {
+                    websocket_request: true,
+                    websocket: WebSocketUpgradeBehavior {
+                        credential_rewrite: false,
+                        deny_uninspected_credentials: true,
+                        ..Default::default()
+                    },
+                    secret_resolver: state.resolver(),
+                    ctx: Some(&ctx),
+                    target: "/allowed/socket".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+        app.write_all(&masked_text_frame(token.as_bytes()))
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect_err("disabled rewriting must deny credential frames");
+        assert!(error.to_string().contains("rewrite is disabled"), "{error}");
+        let mut sent = Vec::new();
+        service.read_to_end(&mut sent).await.unwrap();
+        assert!(sent.is_empty());
     }
 
     #[tokio::test]
@@ -4360,12 +4548,6 @@ mod tests {
                 format!("X-Reflect: {token}\r\n"),
                 String::new(),
                 false,
-            ),
-            (
-                "/allowed/search".into(),
-                String::new(),
-                format!("token={token}"),
-                true,
             ),
         ] {
             let raw = format!(
@@ -4523,7 +4705,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signing_only_credentials_support_supervisor_sigv4_without_request_substitution() {
+    async fn trusted_sigv4_signing_preserves_metadata_free_credentials() {
         let values = TestHashMap::from([
             ("AWS_ACCESS_KEY_ID".into(), "synthetic-access-key".into()),
             (
@@ -4535,14 +4717,7 @@ mod tests {
         let bindings = values
             .keys()
             .map(|key: &String| {
-                let mut binding = endpoint_binding(&format!("aws:{key}"));
-                binding.placement = Some(openshell_core::proto::StaticCredentialPlacement {
-                    location: Some(
-                        openshell_core::proto::static_credential_placement::Location::SigningOnly(
-                            true,
-                        ),
-                    ),
-                });
+                let binding = endpoint_binding(&format!("aws:{key}"));
                 (key.clone(), binding)
             })
             .collect();
@@ -4558,13 +4733,6 @@ mod tests {
         let resolver = state
             .resolver_for_endpoint("allowed.example.test", 443, "/allowed/api")
             .unwrap();
-        let placeholder = state.snapshot().child_env["AWS_SECRET_ACCESS_KEY"].clone();
-        assert!(
-            resolver
-                .rewrite_header_value_for_name("Authorization", &placeholder)
-                .unwrap_err()
-                .is_placement_mismatch()
-        );
         let request = crate::l7::rest::request_from_buffered_http(
             "GET",
             "/allowed/api",
@@ -6299,9 +6467,6 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
-                    placement: Some(openshell_core::proto::StaticCredentialPlacement {
-                        location: Some(openshell_core::proto::static_credential_placement::Location::HeaderName("Authorization".into())),
-                    }),
                 },
             )]),
             Vec::new(),
@@ -6406,9 +6571,6 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
-                    placement: Some(openshell_core::proto::StaticCredentialPlacement {
-                        location: Some(openshell_core::proto::static_credential_placement::Location::HeaderName("Authorization".into())),
-                    }),
                 },
             )]),
             Vec::new(),
@@ -7064,9 +7226,6 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
-                    placement: Some(openshell_core::proto::StaticCredentialPlacement {
-                        location: Some(openshell_core::proto::static_credential_placement::Location::HeaderName("Authorization".into())),
-                    }),
                 },
             )]),
             Vec::new(),
@@ -9959,9 +10118,6 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
-                    placement: Some(openshell_core::proto::StaticCredentialPlacement {
-                        location: Some(openshell_core::proto::static_credential_placement::Location::HeaderName("Authorization".into())),
-                    }),
                 },
             )]),
             Vec::new(),
@@ -12522,9 +12678,6 @@ network_policies:
                             }],
                             credential_identity: "provider:API_TOKEN".into(),
                             workload_credential_handle: String::new(),
-                            placement: Some(openshell_core::proto::StaticCredentialPlacement {
-                                location: Some(openshell_core::proto::static_credential_placement::Location::HeaderName("Authorization".into())),
-                            }),
                         },
                     )]),
                     Vec::new(),

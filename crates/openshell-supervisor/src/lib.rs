@@ -2701,29 +2701,14 @@ impl VmPolicyIdentity {
 #[derive(Clone)]
 struct CapturedProviderEnvironment {
     credentials: ProviderCredentialState,
-    readiness_reason: ProviderReadinessReason,
     expires_at_ms: Option<i64>,
     identity: EnvironmentIdentity,
 }
 
 impl CapturedProviderEnvironment {
     fn install(self, readiness: &ProviderReadinessTracker) -> ProviderCredentialState {
-        self.record_installation(readiness, &self.credentials);
+        readiness.credentials_installed(self.identity, &self.credentials, self.expires_at_ms);
         self.credentials
-    }
-
-    fn record_installation(
-        &self,
-        readiness: &ProviderReadinessTracker,
-        credentials: &ProviderCredentialState,
-    ) {
-        if self.readiness_reason == ProviderReadinessReason::Unspecified {
-            readiness.credentials_installed(self.identity.clone(), credentials, self.expires_at_ms);
-        } else {
-            // The reduced snapshot is valid and its remaining keys are usable,
-            // while readiness still reports the omitted credential material.
-            readiness.credentials_failed(self.identity.clone(), self.readiness_reason);
-        }
     }
 
     /// Validate the environment's bindings without touching live credentials.
@@ -2737,7 +2722,6 @@ impl CapturedProviderEnvironment {
     ) -> Self {
         Self {
             credentials,
-            readiness_reason: provider.readiness_reason,
             expires_at_ms: provider
                 .credential_expires_at_ms
                 .values()
@@ -3915,7 +3899,7 @@ fn initial_provider_credentials(
         .copied()
         .filter(|expiry| *expiry > 0)
         .min();
-    if !provider_environment_is_installable(result.readiness_reason) {
+    if result.readiness_reason != ProviderReadinessReason::Unspecified {
         readiness.credentials_failed(identity, result.readiness_reason);
         return ProviderCredentialState::from_environment(
             result.provider_env_revision,
@@ -3936,11 +3920,7 @@ fn initial_provider_credentials(
     ) {
         Ok(credentials) => {
             credentials.set_managed_files(result.files);
-            if result.readiness_reason == ProviderReadinessReason::Unspecified {
-                readiness.credentials_installed(identity, &credentials, expires_at_ms);
-            } else {
-                readiness.credentials_failed(identity, result.readiness_reason);
-            }
+            readiness.credentials_installed(identity, &credentials, expires_at_ms);
             credentials
         }
         Err(error) => {
@@ -6512,53 +6492,6 @@ network_policies:
             static_credential_bindings: std::collections::HashMap::new(),
             non_secret_environment_keys: Vec::new(),
             stable_placeholder_environment_keys: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn reduced_environment_preserves_authorized_credentials_and_omission_readiness() {
-        use openshell_core::proto::{
-            StaticCredentialBinding, StaticCredentialEndpointBinding, StaticCredentialPlacement,
-            static_credential_placement,
-        };
-        for captured in [false, true] {
-            let mut provider = startup_provider(10);
-            provider.policy_hash = "policy".into();
-            provider.readiness_reason = ProviderReadinessReason::CredentialsWithheld;
-            provider
-                .environment
-                .insert("TOKEN".into(), "synthetic".into());
-            provider.static_credential_bindings.insert(
-                "TOKEN".into(),
-                StaticCredentialBinding {
-                    endpoints: vec![StaticCredentialEndpointBinding {
-                        host: "api.example.com".into(),
-                        port: 443,
-                        path: "/**".into(),
-                    }],
-                    credential_identity: "provider:TOKEN".into(),
-                    placement: Some(StaticCredentialPlacement {
-                        location: Some(static_credential_placement::Location::HeaderName(
-                            "authorization".into(),
-                        )),
-                    }),
-                    ..Default::default()
-                },
-            );
-            let identity = EnvironmentIdentity::from_environment(&provider);
-            let tracker = ProviderReadinessTracker::new();
-            let credentials = if captured {
-                CapturedProviderEnvironment::prepare(&provider)
-                    .unwrap()
-                    .install(&tracker)
-            } else {
-                initial_provider_credentials(provider, &tracker)
-            };
-            assert!(credentials.snapshot().child_env.contains_key("TOKEN"));
-            assert!(
-                tracker.needs_environment(&identity),
-                "omitted keys remain visible in readiness"
-            );
         }
     }
 

@@ -2739,7 +2739,7 @@ network_policies:
             1,
             HashMap::from([("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())]),
             HashMap::new(),
-            HashMap::new(),
+            crate::test_support::header_placement_metadata(&["DISCORD_BOT_TOKEN"]),
             HashMap::from([(
                 "DISCORD_BOT_TOKEN".to_string(),
                 StaticCredentialBinding {
@@ -2750,9 +2750,6 @@ network_policies:
                     }],
                     credential_identity: "provider-a:DISCORD_BOT_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
-                    placement: Some(openshell_core::proto::StaticCredentialPlacement {
-                        location: Some(openshell_core::proto::static_credential_placement::Location::HeaderName("Authorization".into())),
-                    }),
                 },
             )]),
             Vec::new(),
@@ -2844,7 +2841,7 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn guarded_websocket_rejects_header_credential_in_text() {
+    async fn guarded_websocket_rewrites_header_credentials_with_policy_opt_in() {
         let state = bound_websocket_provider_state();
         let placeholder = b"openshell:resolve:env:v1_DISCORD_BOT_TOKEN";
         let input = masked_frame(true, OPCODE_TEXT, placeholder);
@@ -2875,24 +2872,79 @@ network_policies:
         )
         .await;
         assert!(
-            result.as_ref().is_err_and(|error| error
-                .error
-                .to_string()
-                .contains(CREDENTIAL_PLACEMENT_MISMATCH)),
-            "header credentials must not resolve in WebSocket frames: {result:?}"
+            result.is_ok(),
+            "explicit WebSocket rewriting must permit header credentials: {result:?}"
         );
 
         drop(relay_write);
         let mut output = Vec::new();
         upstream_read.read_to_end(&mut output).await.unwrap();
-        assert!(
-            output.is_empty(),
-            "placement denial must send no upstream bytes"
-        );
+        assert_eq!(decode_masked_text_frame(&output), "real-token");
     }
 
     #[tokio::test]
-    async fn compressed_websocket_rejects_header_credential_before_frame_write() {
+    async fn legacy_websocket_credential_rewrite_remains_available() {
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "DISCORD_BOT_TOKEN".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "gateway.example.test".into(),
+                        port: 443,
+                        path: "/socket".into(),
+                    }],
+                    credential_identity: "provider:DISCORD_BOT_TOKEN".into(),
+                    workload_credential_handle: String::new(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("legacy websocket fixture");
+        let placeholder = b"openshell:resolve:env:v1_DISCORD_BOT_TOKEN";
+        let input = masked_frame(true, OPCODE_TEXT, placeholder);
+        let (mut client_write, mut relay_read) = tokio::io::duplex(4096);
+        let (mut relay_write, mut upstream_read) = tokio::io::duplex(4096);
+        client_write.write_all(&input).await.unwrap();
+        drop(client_write);
+
+        let mut options = RelayOptions {
+            policy_name: "test-policy",
+            assembly_budget: WebSocketAssemblyBudget::default(),
+            resolver: None,
+            generation_guard: None,
+            provider_credentials: Some(&state),
+            target: "/socket",
+            inspector: None,
+            compression: WebSocketCompression::None,
+            middleware_session: None,
+            middleware_context: None,
+            deny_uninspected_credentials: true,
+        };
+        let result = relay_client_to_server(
+            &mut relay_read,
+            &mut relay_write,
+            "gateway.example.test",
+            443,
+            &mut options,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "legacy placement must preserve WebSocket rewriting: {result:?}"
+        );
+
+        drop(relay_write);
+        let mut output = Vec::new();
+        upstream_read.read_to_end(&mut output).await.unwrap();
+        assert_eq!(decode_masked_text_frame(&output), "real-token");
+    }
+
+    #[tokio::test]
+    async fn websocket_rewrite_rejects_revocation_before_frame_write() {
         let state = bound_websocket_provider_state();
         let fallback = state.resolver().expect("upgrade-time resolver");
         let placeholder = b"openshell:resolve:env:v1_DISCORD_BOT_TOKEN";
@@ -2919,6 +2971,8 @@ network_policies:
             middleware_context: None,
             deny_uninspected_credentials: false,
         };
+        let reached_write = tokio::sync::Barrier::new(2);
+        let release_write = tokio::sync::Barrier::new(2);
         let (mut relay_write, mut upstream_read) = tokio::io::duplex(4096);
 
         let relay = relay_text_payload_with_before_credential_write(
@@ -2932,15 +2986,22 @@ network_policies:
             "gateway.example.test",
             443,
             &mut options,
-            async { panic!("placement denial must precede credential write callback") },
+            async {
+                reached_write.wait().await;
+                release_write.wait().await;
+            },
         );
-        let result = relay.await;
+        let revoke = async {
+            reached_write.wait().await;
+            state.revoke_static_provider_environment(2);
+            release_write.wait().await;
+        };
+        let (result, ()) = tokio::join!(relay, revoke);
         assert!(
-            result.as_ref().is_err_and(|error| error
-                .error
-                .to_string()
-                .contains(CREDENTIAL_PLACEMENT_MISMATCH)),
-            "placement denial must fail before the frame write: {result:?}"
+            result
+                .as_ref()
+                .is_err_and(|error| error.error.to_string().contains("generation changed")),
+            "revoked generation must fail before the frame write: {result:?}"
         );
 
         drop(relay_write);
@@ -2948,7 +3009,7 @@ network_policies:
         upstream_read.read_to_end(&mut output).await.unwrap();
         assert!(
             output.is_empty(),
-            "placement-denied credential must not reach upstream"
+            "credential revoked before the write guard must not reach upstream"
         );
     }
 

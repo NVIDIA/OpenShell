@@ -2768,9 +2768,6 @@ message GetSandboxProviderEnvironmentRequest {
   // metadata. Gateways withhold credentials that require this behavior when
   // the capability is absent.
   bool supports_stable_placeholder_environment_keys = 3;
-  // The supervisor enforces credential-specific request locations. Gateways
-  // withhold static credential material when this capability is absent.
-  bool supports_static_credential_placement = 4;
 }
 
 // One network endpoint at which a static provider credential may be resolved.
@@ -2780,19 +2777,7 @@ message StaticCredentialEndpointBinding {
   string path = 3;
 }
 
-// Authorized request location for one static credential. Missing or unknown
-// locations must never authorize substitution. Signing-only material may be
-// accessed only by the supervisor-owned request signer.
-message StaticCredentialPlacement {
-  oneof location {
-    string header_name = 1;
-    string query_param = 2;
-    string path_template = 3;
-    bool signing_only = 4;
-  }
-}
-
-// Endpoint and request-location authorization for one static credential.
+// Endpoint allowlist for one static provider credential environment variable.
 message StaticCredentialBinding {
   repeated StaticCredentialEndpointBinding endpoints = 1;
   // Stable identity of the provider credential that produced this binding.
@@ -2802,10 +2787,9 @@ message StaticCredentialBinding {
   // Opaque gateway-issued handle for a stable credential lifecycle. When
   // non-empty, supervisors keep the workload placeholder stable across value
   // updates and replace only the resolver value. The handle changes when the
-  // sandbox, provider, credential key, endpoint or placement authorization, or
-  // an applicable refresh authorization epoch changes.
+  // sandbox, provider, credential key, endpoint authorization, or an applicable
+  // refresh authorization epoch changes.
   string workload_credential_handle = 3;
-  StaticCredentialPlacement placement = 4;
 }
 
 // Polling projection of ProviderEnvironmentSnapshot. The parallel maps below
@@ -2820,9 +2804,10 @@ message GetSandboxProviderEnvironmentResponse {
   uint64 provider_env_revision = 2;
   // Expiration timestamps for returned environment variables.
   map<string, google.protobuf.Timestamp> credential_expiration_times = 103;
-  // Dynamic credentials that require token grants or other runtime injection.
-  // Maps endpoint-bound provider metadata to credential metadata.
-  // Supervisor uses this to inject Authorization headers for token grant credentials.
+  // Endpoint-bound token grants and static credential request metadata.
+  // Reserved static-env:<ENV_KEY> entries carry authored placement fields for
+  // a delivered static value and have no token_grant. Older supervisors ignore
+  // those entries; newer supervisors separate them before grant processing.
   map<string, ProviderProfileCredential> dynamic_credentials = 4;
   // Endpoint allowlists for static credential environment variables. Metadata
   // can be incomplete when a provider profile is invalid; capable supervisors
@@ -2883,6 +2868,8 @@ message ProviderEnvironmentValue {
 message ProviderEnvironmentSnapshot {
   uint64 provider_env_revision = 1;
   repeated ProviderEnvironmentValue values = 2;
+  // Token grants and reserved static-env:<ENV_KEY> request metadata, atomically
+  // delivered with the static environment. Metadata entries have no token_grant.
   map<string, ProviderProfileCredential> dynamic_credentials = 3;
   string provider_attachment_epoch = 4;
   string policy_hash = 5;
@@ -3258,9 +3245,6 @@ message SupervisorHello {
   // ConfigUpdate payloads, and answers each with its result and admission.
   // Gateways push configuration only to supervisors that set this.
   bool supports_config_push = 7;
-  // Required for pushed static credential material. Older supervisors fall
-  // back to polling, which withholds material without this capability.
-  bool supports_static_credential_placement = 8;
 }
 
 // Gateway accepts the supervisor session.

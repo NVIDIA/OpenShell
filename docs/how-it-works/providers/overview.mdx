@@ -443,8 +443,9 @@ Static credential resolution has three independent authorization boundaries:
    endpoints provide the binding by default. An endpointless profile can use a
    sandbox policy endpoint that names the attached provider instance through
    `credential_binding.provider`.
-3. The request location must match the credential's declared header, query
-   parameter, or path-template slot.
+3. When placement metadata is supported and available, the request location
+   must match the declared header, query parameter, or path-template slot, or an
+   explicitly enabled body/WebSocket rewrite policy.
 
 All three checks must pass. A provider profile endpoint does not grant network access
 unless provider policy composition or the sandbox's own policy allows the
@@ -463,9 +464,10 @@ for endpoint matching and migration guidance.
 
 ### Supported injection locations
 
-The proxy resolves static credential placeholders only in their declared
-placement. Moving a header credential into a query parameter, path, or another
-header is denied before the request is forwarded.
+The proxy automatically enforces declared placement when the gateway and
+supervisor support it. Moving a header credential into a query parameter, path,
+or unrelated header is denied before forwarding. Credentials without usable
+placement metadata and older components retain legacy endpoint-scoped rewriting.
 
 | Location | How the agent uses it | Example |
 |---|---|---|
@@ -478,9 +480,9 @@ header is denied before the request is forwarded.
 The proxy does not rewrite cookies, response content, unsupported request
 bodies, or WebSocket binary frames.
 
-Static credentials bound to headers, query parameters, or paths cannot resolve in
-request bodies or WebSocket messages. Endpoint-wide rewrite flags do not grant
-additional credential placements. See [Profiles](/how-it-works/providers/profiles#understand-static-credential-endpoint-binding)
+Explicit endpoint policies can enable credential rewriting in request bodies
+or WebSocket text messages. These flags do not authorize arbitrary query
+parameters, path slots, or unrelated headers. See [Profiles](/how-it-works/providers/profiles#understand-static-credential-endpoint-binding)
 for placement configuration and upgrade requirements.
 
 ### Clients that parse JWT claims

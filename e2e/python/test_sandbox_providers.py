@@ -727,11 +727,15 @@ def test_imported_openai_profile_allows_native_endpoint_with_attached_provider(
                     assert body["model"] == "fixture-openai-model"
 
 
+@pytest.mark.parametrize(
+    "placement_metadata", [True, False], ids=["metadata", "legacy"]
+)
 def test_static_header_credentials_reject_reflective_request_locations(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
+    placement_metadata: bool,
 ) -> None:
-    """Only the declared auth header can resolve a static credential."""
+    """Existing metadata selects placement checks while missing metadata stays compatible."""
     stub = sandbox_client._stub
     profile_id = f"e2e-placement-{time.time_ns()}"
     secret = "synthetic-placement-secret"
@@ -741,6 +745,9 @@ def test_static_header_credentials_reject_reflective_request_locations(
         port=0,
         rules=[sandbox_pb2.L7Rule(allow=sandbox_pb2.L7Allow(method="*", path="/**"))],
     )
+    if not placement_metadata:
+        profile.credentials[0].auth_style = ""
+        profile.credentials[0].header_name = ""
     profile.endpoints[0].request_body_credential_rewrite = True
 
     def probe_locations(host: str, port: int) -> str:
@@ -758,7 +765,7 @@ def test_static_header_credentials_reject_reflective_request_locations(
                 + "/search?"
                 + urllib.parse.urlencode({"q": "rust", "per_page": "1", "probe": token})
             ),
-            urllib.request.Request(root + "/search", headers={"X-Reflect": token}),
+            urllib.request.Request(root + "/search", headers={"X-Api-Key": token}),
             urllib.request.Request(
                 root + "/" + urllib.parse.quote(token, safe="") + "/search"
             ),
@@ -773,7 +780,11 @@ def test_static_header_credentials_reject_reflective_request_locations(
             try:
                 with urllib.request.urlopen(request, timeout=30) as response:
                     results.append(
-                        {"status": response.status, "body": response.read().decode()}
+                        {
+                            "status": response.status,
+                            "body": response.read().decode(),
+                            "link": response.headers.get("Link"),
+                        }
                     )
             except urllib.error.HTTPError as error:
                 results.append(
@@ -819,11 +830,20 @@ def test_static_header_credentials_reject_reflective_request_locations(
                 )
                 assert result.exit_code == 0, result.stderr
                 payload = json.loads(result.stdout)
-                for denied in payload["denied"]:
-                    assert denied["status"] == 403, denied
-                    assert "credential_placement_mismatch" in denied["body"]
-                    assert secret not in denied["body"]
-                    assert denied["link"] is None
+                for result in payload["denied"][:3]:
+                    if placement_metadata:
+                        assert result["status"] == 403, result
+                        assert "credential_placement_mismatch" in result["body"]
+                        assert secret not in result["body"]
+                        assert result["link"] is None
+                    else:
+                        assert result["status"] == 200, result
+                        assert secret in result["body"], result
+                body_result = payload["denied"][3]
+                assert body_result["status"] == 200, body_result
+                assert secret in body_result["body"]
+                if not placement_metadata:
+                    assert secret in payload["denied"][0]["link"]
                 assert payload["valid"]["body"]["authorization"] == f"token {secret}"
                 assert "per_page=1&page=2" in payload["valid"]["link"]
                 assert secret not in payload["valid"]["link"]
