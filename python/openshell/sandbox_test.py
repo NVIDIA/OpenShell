@@ -3090,3 +3090,25 @@ def test_sandbox_session_delete_passes_workspace() -> None:
 
     assert stub.delete_request is not None
     assert _request_workspace(stub.delete_request) == "staging"
+
+
+def test_sandbox_session_delete_omits_timeout_for_legacy_clients() -> None:
+    from openshell.sandbox import SandboxSession
+
+    calls: list[tuple[str, str, bool]] = []
+
+    class LegacyClient:
+        def delete(self, name, *, workspace, allow_missing=False):
+            calls.append((name, workspace, allow_missing))
+
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        workspace="staging",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+    session = SandboxSession(cast("Any", LegacyClient()), ref)
+
+    session.delete(allow_missing=True)
+
+    assert calls == [("job-1", "staging", True)]

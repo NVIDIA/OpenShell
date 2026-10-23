@@ -3,6 +3,7 @@
 
 """Cleanup status handling through the curated client's real gRPC interceptor."""
 
+import time
 from concurrent import futures
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ def cleanup_client():
     state = SimpleNamespace(
         exists=False,
         code=grpc.StatusCode.NOT_FOUND,
+        delete_delay=0.0,
         calls=[],
         closed=[],
     )
@@ -46,6 +48,7 @@ def cleanup_client():
         assert request.name == "cleanup-test"
         assert request.workspace_scope.workspace == "default"
         assert request.allow_missing
+        time.sleep(state.delete_delay)
         if state.code == grpc.StatusCode.NOT_FOUND:
             return openshell_pb2.DeleteSandboxResponse(
                 outcome=openshell_pb2.DELETION_OUTCOME_ALREADY_ABSENT
@@ -156,6 +159,36 @@ def test_context_cleanup_handles_absence_and_intercepted_errors(
     assert state.closed == [True]
     assert managed._client is None
     assert managed._session is None
+
+
+@pytest.mark.parametrize(
+    ("delete_timeout_seconds", "expect_deadline"), [(None, True), (5, False)]
+)
+def test_context_cleanup_delete_timeout_is_opt_in(
+    cleanup_client, monkeypatch, delete_timeout_seconds, expect_deadline
+):
+    client, state = cleanup_client
+    state.exists = True
+    state.delete_delay = 0.5
+    client._timeout = 0.2
+    monkeypatch.setattr(
+        SandboxClient,
+        "from_active_cluster",
+        classmethod(lambda _cls, **_kwargs: client),
+    )
+
+    managed = Sandbox(
+        workspace="default",
+        sandbox="cleanup-test",
+        delete_timeout_seconds=delete_timeout_seconds,
+    )
+    expected = pytest.raises(GatewayError) if expect_deadline else nullcontext()
+    with expected as caught, managed:
+        state.exists = False
+    if caught is not None:
+        assert caught.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+    assert state.closed == [True]
+    assert managed._client is None
 
 
 class _EntryFailureClient:

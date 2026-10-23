@@ -626,9 +626,16 @@ class SandboxSession:
             timeout_seconds=timeout_seconds,
         )
 
-    def delete(self, *, allow_missing: bool = False) -> DeletionResult:
+    def delete(
+        self, *, allow_missing: bool = False, timeout: float | None = None
+    ) -> DeletionResult:
+        # Forward `timeout` only on opt-in so older client subclasses still work.
+        extra = {} if timeout is None else {"timeout": timeout}
         return self._client.delete(
-            self.sandbox.name, workspace=self._workspace, allow_missing=allow_missing
+            self.sandbox.name,
+            workspace=self._workspace,
+            allow_missing=allow_missing,
+            **extra,
         )
 
     def stop(self) -> SandboxRef:
@@ -1072,15 +1079,21 @@ class SandboxClient:
         ]
 
     def delete(
-        self, name: str, *, workspace: str, allow_missing: bool = False
+        self,
+        name: str,
+        *,
+        workspace: str,
+        allow_missing: bool = False,
+        timeout: float | None = None,
     ) -> DeletionResult:
+        """Delete a sandbox, waiting up to `timeout` (default: client timeout)."""
         response = self._stub.DeleteSandbox(
             openshell_pb2.DeleteSandboxRequest(
                 workspace_scope=_workspace_scope(workspace),
                 name=name,
                 allow_missing=allow_missing,
             ),
-            timeout=self._timeout,
+            timeout=self._timeout if timeout is None else timeout,
         )
         return DeletionResult(
             DeletionOutcome(response.outcome), response.sandbox_id or None
@@ -1586,12 +1599,17 @@ class Sandbox:
         workload_template: str | None = None,
         timeout: float = 30.0,
         ready_timeout_seconds: float = 120.0,
+        delete_timeout_seconds: float | None = None,
         auto_refresh: bool = True,
         write_back: bool = True,
         insecure: bool = False,
         client_credentials: ClientCredentialsAuth | None = None,
     ) -> None:
         """Bind a Sandbox context to the active gateway.
+
+        `delete_timeout_seconds` bounds the delete RPC on exit and defaults to
+        `timeout`. Raise it for drivers that hold the delete open while the
+        workload terminates.
 
         OIDC kwargs (`auto_refresh`, `write_back`, `insecure`, and
         `client_credentials`) forward
@@ -1612,6 +1630,7 @@ class Sandbox:
         self._workload_template = workload_template
         self._timeout = timeout
         self._ready_timeout_seconds = ready_timeout_seconds
+        self._delete_timeout_seconds = delete_timeout_seconds
         self._auto_refresh = auto_refresh
         self._write_back = write_back
         self._insecure = insecure
@@ -1707,7 +1726,9 @@ class Sandbox:
                 and self._session is not None
                 and self._client is not None
             ):
-                result = self._session.delete(allow_missing=True)
+                result = self._session.delete(
+                    allow_missing=True, timeout=self._delete_timeout_seconds
+                )
                 if result.outcome == DeletionOutcome.ACCEPTED:
                     self._client.wait_deleted(
                         self._session.sandbox.name,
