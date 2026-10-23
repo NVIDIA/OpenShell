@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# E2E overlay: supervise new sandbox generations with a high-availability pool
+# of shared supervisors that starts with one member, so the test can scale it
+# to two members and back with `helm upgrade --set supervisor.replicas=N`
+# without changing the gateway configuration or the supervisor Pod template.
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    supervisor_topology: gateway
+
+supervisor:
+  highAvailability: true
+  replicas: 1
+  recoveryTimeoutSeconds: 60

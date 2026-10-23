@@ -69,16 +69,26 @@ supervisor:
     tag: ""
     # -- Supervisor image digest. When set, this takes precedence over tag.
     digest: ""
+  # -- Run the shared supervisor as a high-availability pool at any replica
+  # count, including 1. Used only when gatewayConfig selects
+  # supervisor_topology = "gateway". The chart enables the pool in the
+  # gateway's [openshell.gateway.supervisor_pool] table: when a member fails
+  # or leaves, another member takes over its sandboxes without restarting
+  # their workloads. A pool's gateway configuration and supervisor Pod
+  # template do not depend on supervisor.replicas, so it scales between 1 and
+  # more replicas without disrupting running sandboxes. Two or more replicas
+  # always form a pool. Switching between a single shared supervisor and a
+  # pool interrupts running shared sandboxes.
+  highAvailability: false
   # -- Shared supervisor replicas, used only when gatewayConfig selects
   # supervisor_topology = "gateway". 1 runs a single shared supervisor with no
-  # failover. 2 or more form a high-availability pool, which the chart enables
-  # in the gateway's [openshell.gateway.supervisor_pool] table: when a member
-  # fails or leaves, another member takes over its sandboxes without
-  # restarting their workloads.
+  # failover, unless supervisor.highAvailability is true. 2 or more form a
+  # high-availability pool.
   replicas: 1
   # -- (int) Seconds a sandbox workload stays frozen after losing its pool
   # member's supervision before the sandbox runtime terminates it. Used only
-  # by a high-availability pool (supervisor.replicas of 2 or more), as
+  # by a high-availability pool (supervisor.highAvailability, or
+  # supervisor.replicas of 2 or more), as
   # [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an
   # integer from 10 to 300. Null uses the gateway's pool default of 60
   # seconds. A single shared supervisor keeps the runtime default of 30

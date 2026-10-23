@@ -757,6 +757,11 @@ run_scenario() {
   export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_E2E_KUBE_RELEASE="${RELEASE_NAME}"
+  # Tests that upgrade the release (for example to scale the shared
+  # supervisor pool) reuse its values against this exact chart, through the
+  # kubeconfig this harness uses.
+  export OPENSHELL_E2E_KUBE_CHART="${ROOT}/deploy/helm/openshell"
+  export OPENSHELL_E2E_KUBECONFIG="${KUBECONFIG:-}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
 
   e2e_import_example_provider_profiles \
@@ -1516,6 +1521,11 @@ else
   export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_E2E_KUBE_RELEASE="${RELEASE_NAME}"
+  # Tests that upgrade the release (for example to scale the shared
+  # supervisor pool) reuse its values against this exact chart, through the
+  # kubeconfig this harness uses.
+  export OPENSHELL_E2E_KUBE_CHART="${ROOT}/deploy/helm/openshell"
+  export OPENSHELL_E2E_KUBECONFIG="${KUBECONFIG:-}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
 
   e2e_import_example_provider_profiles \

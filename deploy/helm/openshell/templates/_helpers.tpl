@@ -400,9 +400,8 @@ fractions do not.
 {{- end }}
 
 {{/*
-Shared supervisor replica count: 1 for a single shared supervisor, 2 or more
-for a high-availability pool. A missing value (for example after `helm upgrade
---reuse-values` from a release that predates it) means 1.
+Shared supervisor replica count. A missing value (for example after `helm
+upgrade --reuse-values` from a release that predates it) means 1.
 */}}
 {{- define "openshell.supervisorReplicas" -}}
 {{- $supervisor := .Values.supervisor | default dict -}}
@@ -412,10 +411,26 @@ for a high-availability pool. A missing value (for example after `helm upgrade
 {{- else -}}
 {{- $replicas := include "openshell.wholeNumber" $value -}}
 {{- if or (eq $replicas "") (lt (int64 $replicas) 1) -}}
-{{- fail "supervisor.replicas must be 1 for a single shared supervisor or an integer of at least 2 for a high-availability pool" -}}
+{{- fail "supervisor.replicas must be an integer of at least 1" -}}
 {{- end -}}
 {{- $replicas -}}
 {{- end -}}
+{{- end }}
+
+{{/*
+"true" when the shared supervisor runs as a high-availability pool, else
+nothing. supervisor.highAvailability selects the pool at any replica count,
+including one, so the count can later change without changing the gateway
+configuration or the supervisor Pod template; two or more replicas always
+form a pool. Every pool-dependent resource reads this helper.
+*/}}
+{{- define "openshell.supervisorPool" -}}
+{{- $supervisor := .Values.supervisor | default dict -}}
+{{- $value := get $supervisor "highAvailability" -}}
+{{- if and (hasKey $supervisor "highAvailability") (not (kindIs "invalid" $value)) (not (kindIs "bool" $value)) -}}
+{{- fail "supervisor.highAvailability must be true or false" -}}
+{{- end -}}
+{{- if or (and (kindIs "bool" $value) $value) (gt (int64 (include "openshell.supervisorReplicas" .)) 1) -}}true{{- end -}}
 {{- end }}
 
 {{/*
@@ -437,21 +452,20 @@ default.
 
 {{/*
 The gateway's [openshell.gateway.supervisor_pool] table as YAML, or nothing.
-The chart owns it: two or more shared supervisor replicas form a
-high-availability pool that the gateway coordinates. A single replica renders
-no table, so its gateway configuration is unchanged. Validates the supervisor
-values whenever the gateway topology is selected, and refuses a hand-written
-table in either TOML form.
+The chart owns it: a high-availability pool (openshell.supervisorPool) is one
+the gateway coordinates, and the table does not depend on the replica count.
+A single shared supervisor renders no table, so its gateway configuration is
+unchanged. Validates the supervisor values whenever the gateway topology is
+selected, and refuses a hand-written table in either TOML form.
 */}}
 {{- define "openshell.supervisorPoolConfig" -}}
 {{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
 {{- if or (hasKey $gatewayConfig "openshell.gateway.supervisor_pool") (hasKey (get $gatewayConfig "openshell.gateway" | default dict) "supervisor_pool") -}}
-{{- fail "supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds" -}}
+{{- fail "supervisor_pool is rendered by the chart; set supervisor.highAvailability, supervisor.replicas, and supervisor.recoveryTimeoutSeconds" -}}
 {{- end -}}
 {{- if include "openshell.supervisorEnabled" . -}}
-{{- $replicas := int64 (include "openshell.supervisorReplicas" .) -}}
 {{- $recoveryTimeout := include "openshell.supervisorRecoveryTimeoutSeconds" . -}}
-{{- if gt $replicas 1 -}}
+{{- if include "openshell.supervisorPool" . -}}
 {{- $pool := dict "enabled" true -}}
 {{- if $recoveryTimeout -}}
 {{- $_ := set $pool "recovery_timeout_secs" (int64 $recoveryTimeout) -}}

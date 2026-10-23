@@ -13,7 +13,7 @@
 {{- $endpointUrl := urlParse $endpoint }}
 {{- $gatewayTls := and (not .Values.server.disableTls) .Values.server.tls.clientTlsSecretName }}
 {{- $replicas := int64 (include "openshell.supervisorReplicas" .) }}
-{{- $pool := gt $replicas 1 }}
+{{- $pool := include "openshell.supervisorPool" . }}
 # One supervisor process per replica hosts a sandbox instance for each sandbox
 # generation placed on it. The process dials the gateway over TLS with the
 # supervisor token the gateway mints for it and receives its assignments from
@@ -29,11 +29,12 @@ metadata:
     {{- include "openshell.labels" . | nindent 4 }}
     app.kubernetes.io/component: supervisor
 spec:
-  # Each instance lives in the process hosting it. A single replica has no
-  # failover, so Recreate replaces it outright. Two or more replicas form a
-  # high-availability pool that rolls one member at a time, starting a new
-  # member before an old one leaves; the gateway hands a failed or leaving
-  # member's instances to the remaining members.
+  # Each instance lives in the process hosting it. A single shared supervisor
+  # has no failover, so Recreate replaces it outright. A high-availability
+  # pool rolls one member at a time, starting a new member before an old one
+  # leaves; the gateway hands a failed or leaving member's instances to the
+  # remaining members. Only the replica count depends on the pool's size, so
+  # scaling it changes nothing else here or in the gateway configuration.
   {{- if $pool }}
   replicas: {{ $replicas }}
   strategy:

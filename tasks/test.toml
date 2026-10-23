@@ -281,6 +281,13 @@ env = { OPENSHELL_E2E_KUBE_TEST = "kubernetes_shared_supervisor_ha", OPENSHELL_E
 # The shared supervisor requires gateway TLS, which the Skaffold values turn off.
 run = 'OPENSHELL_E2E_KUBE_EXTRA_VALUES="deploy/helm/openshell/ci/values-supervisor-ha.yaml:deploy/helm/openshell/ci/values-tls-port-forward.yaml${OPENSHELL_E2E_KUBE_EXTRA_VALUES:+:$OPENSHELL_E2E_KUBE_EXTRA_VALUES}" e2e/rust/e2e-kubernetes.sh'
 
+["e2e:kubernetes:shared-supervisor-scaling"]
+description = "Run Kubernetes e2e that scales a one-member shared supervisor pool to two members and back to one with Helm, checking sandboxes are handed off, not restarted"
+env = { OPENSHELL_E2E_KUBE_TEST = "kubernetes_shared_supervisor_scaling", OPENSHELL_E2E_KUBE_TLS = "1", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-host-gateway,e2e-kubernetes,e2e-kubernetes-shared-supervisor-scaling" }
+# Its own release: the test upgrades it, so it never runs beside the abrupt-loss
+# test. The shared supervisor requires gateway TLS, which the Skaffold values turn off.
+run = 'OPENSHELL_E2E_KUBE_EXTRA_VALUES="deploy/helm/openshell/ci/values-supervisor-ha-scaling.yaml:deploy/helm/openshell/ci/values-tls-port-forward.yaml${OPENSHELL_E2E_KUBE_EXTRA_VALUES:+:$OPENSHELL_E2E_KUBE_EXTRA_VALUES}" e2e/rust/e2e-kubernetes.sh'
+
 ["e2e:kubernetes:workspace-operator"]
 description = "Run Kubernetes e2e with operator workspace mode (pre-provisioned per-workspace namespaces)"
 env = { OPENSHELL_E2E_KUBE_EXTRA_VALUES = "deploy/helm/openshell/ci/values-workspace-operator.yaml", OPENSHELL_E2E_KUBE_TEST = "workspace_namespace_operator", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-kubernetes,e2e-kubernetes-workspace-operator" }

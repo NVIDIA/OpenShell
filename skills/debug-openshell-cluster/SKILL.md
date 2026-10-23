@@ -1146,8 +1146,9 @@ OpenShell chart rather than treating missing workload Pods as Pod failures.
 
 #### Shared supervisor high availability
 
-With `supervisor_topology = "gateway"`, `supervisor.replicas` of 2 or more runs
-the `<release>-supervisor` Deployment as a pool. The chart then renders the
+With `supervisor_topology = "gateway"`, `supervisor.highAvailability: true` or
+`supervisor.replicas` of 2 or more runs the `<release>-supervisor` Deployment
+as a pool. The chart then renders the
 gateway's `[openshell.gateway.supervisor_pool]` table with `enabled = true`
 (the driver's `shared_supervisor` table carries no pool settings), rolls one
 member at a time,
@@ -1155,7 +1156,16 @@ prefers separate nodes, gives each member a 60-second grace period to leave,
 and adds a `<release>-supervisor` PodDisruptionBudget with `maxUnavailable: 1`.
 Each member takes its identity from `OPENSHELL_SUPERVISOR_POOL_MEMBER_ID`,
 `OPENSHELL_SUPERVISOR_POOL_MEMBER_UID`, and `OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP`
-(Pod name, UID, and IP). One replica renders none of this and has no failover.
+(Pod name, UID, and IP). One replica without `supervisor.highAvailability`
+renders none of this and has no failover. In a pool, only the Deployment's
+replica count depends on `supervisor.replicas`: scaling it must not change the
+gateway ConfigMap or the supervisor Pod template, so neither the gateway nor
+the remaining members restart. A member removed by scaling down announces
+that it is leaving (`pool member is leaving` in its log), and the gateway logs
+`cause=leaving` as it moves each of its sandboxes. If a scale step restarts
+the gateway or every supervisor Pod, the release switched between a single
+shared supervisor and a pool (for example `supervisor.replicas` 1 to 2 without
+`supervisor.highAvailability: true`), which interrupts running sandboxes.
 
 ```bash
 kubectl -n openshell get deployment,poddisruptionbudget,pod -l app.kubernetes.io/component=supervisor -o wide
@@ -1168,7 +1178,15 @@ kubectl -n <sandbox-namespace> logs -l openshell.ai/sandbox-id=<sandbox-id>,open
   --tail=200 | grep -E 'sandbox-supervisor-|Supervisor takeover'
 ```
 
-Each sandbox instance runs on one member, and a live owner keeps it. The
+Each sandbox instance runs on one member, and a live owner keeps it. A
+member's console log names an instance by its route (the Sandbox's
+`openshell.ai/sandbox-runtime-supervisor-session` annotation) at the end of
+`admitted assigned sandbox instance <route>`, `removing withdrawn sandbox
+instance <route>`, and `relinquishing a sandbox instance ... <route>`; the
+member whose latest such line for a route is an admission supervises it. Other
+lines that mention the route, such as SSH relay socket paths, say nothing
+about ownership. Gateway console fields are styled, so strip ANSI escapes
+(for example `sed 's/\x1b\[[0-9;]*m//g'`) before matching `cause=leaving`. The
 gateway logs `shared supervisor pool enabled; reconciling pool membership and
 ownership` at startup. When an owner's process exits, its node is lost, or it
 leaves, the gateway logs `taking over a shared sandbox instance from a failed
@@ -1383,7 +1401,7 @@ credential failures.
 | Gateway or `<release>-certgen` hook pod rejected with `violates PodSecurity "restricted:latest"` | The rendered container lacks `runAsNonRoot` or `seccompProfile`: an older chart version does not set them, or an override in `securityContext` / `pkiInitJob.securityContext` unset them | `kubectl -n openshell get events --field-selector reason=FailedCreate`; upgrade the chart, then remove overrides that unset those fields |
 | OpenShift gateway pod fails to start with an SCC/`runAsUser` error (e.g. `unable to validate against any security context constraint`) | Chart's default `podSecurityContext`/`securityContext` hardcodes `runAsUser`/`fsGroup`, which the restricted-v2 SCC rejects; it must instead inject the namespace-assigned UID/GID range | `oc -n openshell describe pod <pod>`; deploy with `podSecurityContext: null` and clear `securityContext.runAsUser` (see `deploy/helm/openshell/ci/values-openshift-scc.yaml`) |
 | OpenShift `<release>-supervisor` Deployment never creates pods after setting `supervisor_topology = "gateway"` (SCC `runAsUser`/`fsGroup` not in the namespace range) | `supervisor.podSecurityContext` defaults `runAsUser`, `runAsGroup`, and `fsGroup` to 65534, outside the namespace's assigned UID/GID ranges | `kubectl -n openshell get events --field-selector reason=FailedCreate`; compare with the `openshift.io/sa.scc.*` annotations from `oc describe ns openshell`; set `supervisor.podSecurityContext.runAsUser`, `.runAsGroup`, and `.fsGroup` to `null`, as `deploy/helm/openshell/ci/values-openshift-scc.yaml` does, and keep `runAsNonRoot` and `seccompProfile` |
-| Shared sandboxes stay `Starting` or report `unavailable` readiness with `supervisor_topology = "gateway"`, gateway logs say no shared supervisor host is connected | The `<release>-supervisor` Pod cannot reach or authenticate to the gateway: wrong `OPENSHELL_TLS_CA`, the `<release>-supervisor-token` Secret is missing or still empty (gateway logs `wrote the supervisor token Secret` once it has delivered a token; `no usable supervisor token` in the supervisor means it has not), or the gateway was deployed without TLS or without the sandbox-JWT signing key | `kubectl -n openshell logs deployment/<release>-supervisor` for `gateway accepted the supervisor host` or a refusal; gateway logs for `supervisor host attached`, `wrote the supervisor token Secret`, or `failed to write the supervisor token Secret`; `kubectl -n openshell get secret <release>-supervisor-token -o jsonpath='{.metadata.annotations}'` shows the token expiry; the gateway refuses to start the topology without TLS or `gateway_jwt` |
+| Shared sandboxes stay `Starting` or report `unavailable` readiness with `supervisor_topology = "gateway"`, gateway logs say no shared supervisor host is connected | The `<release>-supervisor` Pod cannot reach or authenticate to the gateway: wrong `OPENSHELL_TLS_CA`, the `<release>-supervisor-token` Secret is missing or still empty (gateway logs `wrote the supervisor token Secret` once it has delivered a token; `no usable supervisor token` in the supervisor means it has not; right after a fresh install the kubelet can take about 90 seconds to project the written token into the already-ready Pod, so launches can be refused for no live pool member until the supervisor logs `gateway accepted the supervisor host`), or the gateway was deployed without TLS or without the sandbox-JWT signing key | `kubectl -n openshell logs deployment/<release>-supervisor` for `gateway accepted the supervisor host` or a refusal; gateway logs for `supervisor host attached`, `wrote the supervisor token Secret`, or `failed to write the supervisor token Secret`; `kubectl -n openshell get secret <release>-supervisor-token -o jsonpath='{.metadata.annotations}'` shows the token expiry; the gateway refuses to start the topology without TLS or `gateway_jwt` |
 | Shared sandbox workloads terminate after a supervisor Pod or node failure (`sandbox-supervisor-recovery-expired`) | One supervisor replica (no failover), no live pool member took over, or the recovery timeout is shorter than detection plus takeover | `supervisor.replicas` and the `<release>-supervisor` PodDisruptionBudget; gateway `taking over a shared sandbox instance` logs; workload Pod `sandbox-supervisor-*` findings; `supervisor.recoveryTimeoutSeconds`. See "Shared supervisor high availability" in Step 6 |
 | OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | An explicit sandbox UID/GID override or custom security context conflicts with the namespace's SCC range | Inspect pod events and the namespace's `openshift.io/sa.scc.uid-range` and `openshift.io/sa.scc.supplemental-groups` annotations; remove incompatible `sandbox_uid` / `sandbox_gid` overrides so the driver uses the namespace-assigned identity. Current sandbox pods use `restricted-v2` without a privileged SCC grant; see the [OpenShift guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) and [RFC 0012](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0012-isolation-backend/README.md#motivation). |
 | OpenShift self-hosted Vault/OpenBao credential store pod never schedules (waits time out with `no matching resources found`) | The store's Helm chart pins `runAsUser`/`fsGroup`/seccomp, which restricted-v2 rejects, so the StatefulSet controller never creates the pod | Deploy the store's chart in its OpenShift mode (`--set global.openshift=true` for the OpenBao/Vault chart) so the namespace SCC assigns a compliant security context — no manual SCC grant needed |

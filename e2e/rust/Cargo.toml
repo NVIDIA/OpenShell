@@ -40,6 +40,9 @@ e2e-kubernetes-workspace-operator = ["e2e-kubernetes"]
 e2e-kubernetes-shared-supervisor = ["e2e-kubernetes", "e2e-host-gateway"]
 # A high-availability pool of shared supervisors.
 e2e-kubernetes-shared-supervisor-ha = ["e2e-kubernetes", "e2e-host-gateway"]
+# Scaling a one-member high-availability pool of shared supervisors to two
+# members and back. It upgrades the release, so it runs on its own release.
+e2e-kubernetes-shared-supervisor-scaling = ["e2e-kubernetes", "e2e-host-gateway"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
 e2e-oidc-pkce = []

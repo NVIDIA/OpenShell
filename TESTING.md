@@ -621,6 +621,7 @@ Available task variants:
 | `e2e:kubernetes:external-driver` | External Kubernetes driver sidecar |
 | `e2e:kubernetes:shared-supervisor` | One shared supervisor for the gateway's sandboxes (gateway TLS through the port-forward) |
 | `e2e:kubernetes:shared-supervisor-ha` | Two-replica shared supervisor pool: kills the member that owns a sandbox and checks the sandbox is adopted, not restarted |
+| `e2e:kubernetes:shared-supervisor-scaling` | One-replica shared supervisor pool (`supervisor.highAvailability: true`): scales it to two members and back with `helm upgrade`, checking sandboxes stay running and the removed member hands its sandboxes off |
 
 Kubernetes e2e environment variables:
 
@@ -629,6 +630,7 @@ Kubernetes e2e environment variables:
 | `OPENSHELL_E2E_KUBE_CONTEXT` | kubectl context for an existing cluster (skips k3d creation) |
 | `OPENSHELL_E2E_KUBE_TEST` | Scope to a single test (e.g. `smoke`) |
 | `OPENSHELL_E2E_KUBE_EXTRA_VALUES` | Colon-separated additional Helm values files |
+| `OPENSHELL_E2E_KUBE_CHART`, `OPENSHELL_E2E_KUBECONFIG` | Set by the harness for tests that upgrade the release, such as the supervisor pool scaling test: the chart it installed, and the kubeconfig passed as `--kubeconfig` to kubectl and helm. Set them yourself when running such a test directly against an existing release |
 | `OPENSHELL_E2E_KUBE_TLS` | `1` reaches the gateway over mTLS through the port-forward; pair it with an overlay that keeps gateway TLS on, such as `ci/values-tls-port-forward.yaml` |
 | `OPENSHELL_E2E_KUBERNETES_FEATURES` | Cargo feature flags (default: `e2e,e2e-host-gateway,e2e-kubernetes`) |
 | `IMAGE_TAG` | Gateway/supervisor image tag (default: `latest` for existing clusters) |

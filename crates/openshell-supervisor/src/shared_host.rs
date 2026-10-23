@@ -53,6 +53,17 @@ use crate::sandbox_instance_host::{
     SandboxInstanceHostError,
 };
 
+/// Assignment lifecycle messages. Each names the route in its text, after
+/// the phrase: the console's shorthand format keeps only an event's message,
+/// and operators (and the supervisor pool E2E tests) follow which member
+/// supervises a route by these lines. The structured fields stay as well.
+const ADMITTED: &str = "admitted assigned sandbox instance";
+const REMOVING_WITHDRAWN: &str = "removing withdrawn sandbox instance";
+const RELINQUISHED_TO_OTHER_MEMBER: &str =
+    "relinquishing a sandbox instance owned by another pool member";
+const RELINQUISHED_FOR_LATER_TERM: &str =
+    "relinquishing a sandbox instance for its later ownership term";
+
 /// Interval at which the host sends heartbeats on an idle stream, unless the
 /// gateway asks for a shorter one.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -460,10 +471,11 @@ impl SharedHost {
             // This process was granted a later term of an instance it still
             // supervises for an earlier one; hand the earlier term over first.
             Err(ControlError::Conflict) => {
+                let route = &assignment.route;
                 tracing::info!(
-                    route = %assignment.route,
+                    route = %route,
                     sandbox_id = %assignment.sandbox_id,
-                    "relinquishing a sandbox instance for its later ownership term"
+                    "{RELINQUISHED_FOR_LATER_TERM} {route}"
                 );
                 self.host.relinquish(&assignment.route).await;
                 self.admit(registration, fingerprint, takeover)
@@ -614,10 +626,11 @@ impl SharedHost {
             };
             match outcome {
                 Ok(SandboxInstanceAdmitted::Created) => {
+                    let route = &assignment.route;
                     tracing::info!(
-                        route = %assignment.route,
+                        route = %route,
                         sandbox_id = %assignment.sandbox_id,
-                        "admitted assigned sandbox instance"
+                        "{ADMITTED} {route}"
                     );
                 }
                 Ok(SandboxInstanceAdmitted::Unchanged) => {}
@@ -735,18 +748,19 @@ impl SharedHost {
         futures::future::join_all(withdrawn.iter().map(|hosted| {
             let stop = self.pool.is_none() || stop_routes.contains(&hosted.route);
             async move {
+                let route = &hosted.route;
                 if stop {
                     tracing::info!(
-                        route = %hosted.route,
+                        route = %route,
                         sandbox_id = %hosted.sandbox_id,
-                        "removing withdrawn sandbox instance"
+                        "{REMOVING_WITHDRAWN} {route}"
                     );
                     self.remove(&hosted.route).await;
                 } else {
                     tracing::info!(
-                        route = %hosted.route,
+                        route = %route,
                         sandbox_id = %hosted.sandbox_id,
-                        "relinquishing a sandbox instance owned by another pool member"
+                        "{RELINQUISHED_TO_OTHER_MEMBER} {route}"
                     );
                     self.host.relinquish(&hosted.route).await;
                 }
@@ -1780,6 +1794,77 @@ mod tests {
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected),
             "a pool member relinquishes what it still hosts at shutdown"
         );
+    }
+
+    /// Console output of the shorthand layer the supervisor logs through.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The shorthand console format keeps only an event's message, so the
+    /// lines that say which member supervises a route carry the route in
+    /// their text.
+    #[tokio::test]
+    async fn assignment_lifecycle_lines_name_their_route_in_shorthand_output() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let captured = Captured::default();
+        let _logging =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(
+                openshell_ocsf::OcsfShorthandLayer::new(captured.clone()).with_non_ocsf(true),
+            ));
+        let root = tempfile::tempdir().unwrap();
+        let host = SharedHost::start(SharedHostConfig {
+            gateway_endpoint: "https://gateway.invalid".to_string(),
+            instance_root: root.path().join("instances"),
+            runtime_listen: "127.0.0.1:0".parse().unwrap(),
+            removal_grace: Duration::from_secs(10),
+            pool: Some(PoolIdentity {
+                member_id: "member-1".to_string(),
+                member_uid: "uid-1".to_string(),
+                runtime_address: "127.0.0.1:5500".parse().unwrap(),
+            }),
+        })
+        .unwrap();
+        let (released, stopped) = ("rt-released-0123456789", "rt-stopped-0123456789");
+        let mut stops = Vec::new();
+        for route in [released, stopped] {
+            let (stop, stops_of) = tokio::sync::mpsc::channel(1);
+            admit_supervising(&host, route, stop);
+            stops.push(stops_of);
+        }
+        host.reconcile(&AssignmentSnapshot {
+            revision: 1,
+            pool: true,
+            stop_routes: vec![stopped.to_string()],
+            ..AssignmentSnapshot::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            stops[1].try_recv(),
+            Ok(()),
+            "the withdrawn instance stopped"
+        );
+        host.shut_down().await;
+        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        for line in [
+            format!("{RELINQUISHED_TO_OTHER_MEMBER} {released}"),
+            format!("{REMOVING_WITHDRAWN} {stopped}"),
+        ] {
+            assert!(output.contains(&line), "no {line:?} in:\n{output}");
+        }
+        // The structured fields alone would not show the route.
+        assert!(!output.contains("route="), "{output}");
     }
 
     #[test]

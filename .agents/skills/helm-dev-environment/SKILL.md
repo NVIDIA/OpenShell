@@ -68,8 +68,8 @@ gatewayConfig:
     supervisor_topology: gateway
 ```
 
-The gateway chart creates a shared supervisor Deployment (one replica unless
-`supervisor.replicas` is 2 or more), Service, NetworkPolicy, and an empty
+The gateway chart creates a shared supervisor Deployment (`supervisor.replicas`,
+default one), Service, NetworkPolicy, and an empty
 `<release>-supervisor-token` Secret in
 the release namespace, regardless of shared/managed/operator workspace mode.
 The gateway mints a supervisor token from its sandbox-JWT signing key, writes
@@ -99,8 +99,10 @@ OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
 
 ### Shared supervisor high availability
 
-`supervisor.replicas` of 2 or more makes the shared supervisor a pool. The
-chart then renders the gateway's `[openshell.gateway.supervisor_pool]` table
+`supervisor.highAvailability: true` makes the shared supervisor a pool at any
+replica count, including one, and `supervisor.replicas` of 2 or more always
+does (`openshell.supervisorPool` in `_helpers.tpl` decides it for every
+template). The chart then renders the gateway's `[openshell.gateway.supervisor_pool]` table
 (`enabled = true`, plus `recovery_timeout_secs` when
 `supervisor.recoveryTimeoutSeconds` is set; the driver's `shared_supervisor`
 table stays unchanged), a
@@ -115,6 +117,23 @@ the gateway over mTLS through its port-forward. `mise run
 e2e:kubernetes:shared-supervisor-ha` sets both, creates a task-scoped k3d
 cluster, kills the supervisor Pod that owns a sandbox, and checks that the
 sandbox keeps its Pod, generation, main process, and in-memory state.
+
+A pool's rendered gateway configuration and supervisor Pod template do not
+depend on `supervisor.replicas`; `deploy/helm/test-supervisor-pool-scaling.sh`
+(part of `mise run helm:test`) renders a pool at 1, 2, and 3 replicas and
+fails if anything but the replica count differs. `mise run
+e2e:kubernetes:shared-supervisor-scaling` installs a one-member pool
+(`ci/values-supervisor-ha-scaling.yaml`), then the test runs `helm upgrade
+--reuse-values --set supervisor.replicas=2` and back to 1 against the chart
+the harness installed (`OPENSHELL_E2E_KUBE_CHART`), probing exec and
+policy-mediated networking throughout. It checks that scaling up moves
+nothing, that the member removed by scaling down hands its sandboxes to the
+other (`cause=leaving`), that no workload, gateway Pod, or remaining member
+restarts, and that a new sandbox runs after each step. It upgrades its
+release, so it runs on a release of its own; the two pool tests also share a
+nextest test group that never runs them at once. Against an existing cluster
+whose kubeconfig the shell environment may override, set
+`OPENSHELL_E2E_KUBECONFIG` (passed as `--kubeconfig` to kubectl and helm).
 
 On k3d, deploy the pool with the Skaffold profile, which layers the overlay and
 turns gateway TLS back on over `ci/values-skaffold.yaml`:
@@ -136,9 +155,12 @@ export KUBECONFIG=kubeconfig OPENSHELL_GATEWAY_ENDPOINT=https://localhost:8090
 openshell sandbox create --detach --name ha-probe -- sh -c 'echo $$ > /sandbox/main.pid; exec sleep infinity'
 openshell sandbox exec --name ha-probe --no-tty -- cat /sandbox/main.pid
 openshell sandbox get ha-probe  # note the sandbox ID
-# The member that admitted the instance owns it.
+# Supervisor logs name the instance by its route, not its sandbox ID.
+kubectl get sandboxes.agents.x-k8s.io -A -l openshell.ai/sandbox-name=ha-probe \
+  -o jsonpath='{.items[0].metadata.annotations.openshell\.ai/sandbox-runtime-supervisor-session}'
+# The member whose latest admission, removal, or release line names the route owns it.
 kubectl -n openshell logs -l app.kubernetes.io/name=openshell-supervisor --prefix --tail=-1 \
-  | grep 'admitted assigned sandbox instance' | grep <sandbox-id>
+  | grep -E '(admitted assigned|removing withdrawn|relinquishing a) sandbox instance.* <route>$'
 # Force-delete the owner, the closest local stand-in for a crash.
 kubectl -n openshell delete pod <owner-pod> --grace-period=0 --force
 kubectl -n openshell logs -l app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell \
@@ -561,7 +583,7 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; disables pkiInitJob) |
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
-| `deploy/helm/openshell/ci/values-supervisor.yaml`, `ci/values-supervisor-ha.yaml` | Shared supervisor topology overlays: one replica, or a two-replica high-availability pool (Skaffold profile `shared-supervisor-high-availability`) |
+| `deploy/helm/openshell/ci/values-supervisor.yaml`, `ci/values-supervisor-ha.yaml`, `ci/values-supervisor-ha-scaling.yaml` | Shared supervisor topology overlays: one replica, a two-replica high-availability pool (Skaffold profile `shared-supervisor-high-availability`), or a one-replica pool to scale |
 | `deploy/helm/openshell/ci/values-tls-port-forward.yaml` | Keeps gateway TLS on over the Skaffold values for e2e topologies that need it (`OPENSHELL_E2E_KUBE_TLS=1`) |
 | `deploy/helm/openshell/ci/values-autoscaling.yaml` | Render-only overlay for the optional gateway HorizontalPodAutoscaler (helm lint and helm-unittest) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |

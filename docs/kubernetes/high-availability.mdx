@@ -526,7 +526,8 @@ supervisor:
   recoveryTimeoutSeconds: 90
 ```
 
-With two or more replicas, the chart enables the gateway's
+With two or more replicas, or with `supervisor.highAvailability: true`, the
+chart enables the gateway's
 [supervisor pool](/how-it-works/gateways/configuration#supervisor-pool) and
 prefers to schedule the supervisor Pods on different nodes. It replaces them
 one at a time during rollouts, and its PodDisruptionBudget lets voluntary
@@ -555,13 +556,39 @@ failed node, or 30 seconds right after a gateway replica starts, and the
 replacement then needs time to take over, so keep the limit well above that.
 A pool fails over only to a live member, so keep at least two members running.
 
-A single replica has no failover and ignores
+A single shared supervisor has no failover and ignores
 `supervisor.recoveryTimeoutSeconds`: the sandbox runtime keeps its default
 limit of 30 seconds, and a supervisor failure terminates the workloads it
-supervises when the limit passes. Changing `supervisor.replicas` between 1 and
-2 or more switches the supervision mode and interrupts shared sandboxes that are
-running, whose workloads can be terminated. Make the change when no shared
-sandboxes are running, or recreate them afterward.
+supervises when the limit passes.
+
+To scale between one and more supervisors without interrupting sandboxes, run
+the pool with `supervisor.highAvailability: true`. A one-replica pool has no
+failover either, but its gateway configuration and supervisor Pod template do
+not depend on the replica count, so changing only `supervisor.replicas`
+neither restarts the gateway nor replaces running members:
+
+```yaml
+supervisor:
+  highAvailability: true
+  replicas: 1
+```
+
+```shell
+helm upgrade openshell <chart> -n openshell --reuse-values --set supervisor.replicas=2
+helm upgrade openshell <chart> -n openshell --reuse-values --set supervisor.replicas=1
+```
+
+Scaling up adds a member and moves no running sandbox; new sandboxes can land
+on the new member. Scaling down removes a member, which hands its sandboxes to
+the remaining members before it exits, within its 60-second grace period. The
+sandboxes keep running; open proxied connections and exec or SSH sessions on
+the handed-off sandboxes break and must reconnect.
+
+Switching between a single shared supervisor and a pool, by changing
+`supervisor.highAvailability` or by changing `supervisor.replicas` between 1
+and 2 or more without it, switches the supervision mode and interrupts shared
+sandboxes that are running, whose workloads can be terminated. Make that change
+when no shared sandboxes are running, or recreate them afterward.
 
 Check the supervisor Pods and their disruption budget:
 

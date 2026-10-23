@@ -410,6 +410,110 @@ tests:
         documentSelector:
           path: kind
           value: PodDisruptionBudget
+  - it: runs a one-replica pool when high availability is enabled
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        highAvailability: true
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - hasDocuments:
+          count: 5
+      - equal:
+          path: spec.replicas
+          value: 1
+        documentIndex: 0
+      - equal:
+          path: spec.strategy
+          value:
+            type: RollingUpdate
+            rollingUpdate:
+              maxSurge: 1
+              maxUnavailable: 0
+        documentIndex: 0
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 60
+        documentIndex: 0
+      - exists:
+          path: spec.template.spec.affinity.podAntiAffinity
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_SUPERVISOR_POOL_MEMBER_ID
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+        documentIndex: 0
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+        documentSelector:
+          path: kind
+          value: PodDisruptionBudget
+  - it: keeps two or more replicas a pool when high availability is false
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        highAvailability: false
+        replicas: 2
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - hasDocuments:
+          count: 5
+      - equal:
+          path: spec.replicas
+          value: 2
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+        documentIndex: 0
+  - it: rejects a high availability setting that is not a boolean
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        highAvailability: "yes"
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - failedTemplate:
+          errorPattern: supervisor.highAvailability must be true or false
+  - it: enables the supervisor pool table for a one-replica pool
+    template: templates/gateway-config.yaml
+    set:
+      supervisor:
+        highAvailability: true
+        recoveryTimeoutSeconds: 90
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.supervisor_pool\]\nenabled = true\nrecovery_timeout_secs = 90\n'
+  - it: keeps a single shared supervisor out of the pool table when high availability is false
+    template: templates/gateway-config.yaml
+    set:
+      supervisor:
+        highAvailability: false
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: supervisor_pool
   - it: protects the pool from voluntary disruption without a NetworkPolicy
     template: templates/supervisor.yaml
     set:
@@ -490,7 +594,7 @@ tests:
           enabled: true
     asserts:
       - failedTemplate:
-          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds
+          errorMessage: supervisor_pool is rendered by the chart; set supervisor.highAvailability, supervisor.replicas, and supervisor.recoveryTimeoutSeconds
   - it: rejects a hand-written supervisor pool inside the gateway table
     template: templates/supervisor.yaml
     set:
@@ -502,7 +606,7 @@ tests:
             enabled: true
     asserts:
       - failedTemplate:
-          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds
+          errorMessage: supervisor_pool is rendered by the chart; set supervisor.highAvailability, supervisor.replicas, and supervisor.recoveryTimeoutSeconds
   - it: rejects a hand-written supervisor pool without the gateway topology
     template: templates/supervisor.yaml
     set:
@@ -511,7 +615,7 @@ tests:
           enabled: true
     asserts:
       - failedTemplate:
-          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds
+          errorMessage: supervisor_pool is rendered by the chart; set supervisor.highAvailability, supervisor.replicas, and supervisor.recoveryTimeoutSeconds
   - it: rejects zero supervisor replicas
     template: templates/supervisor.yaml
     set:
@@ -522,7 +626,7 @@ tests:
           supervisor_topology: gateway
     asserts:
       - failedTemplate:
-          errorMessage: supervisor.replicas must be 1 for a single shared supervisor or an integer of at least 2 for a high-availability pool
+          errorMessage: supervisor.replicas must be an integer of at least 1
   - it: rejects fractional supervisor replicas
     template: templates/supervisor.yaml
     set:
@@ -533,7 +637,7 @@ tests:
           supervisor_topology: gateway
     asserts:
       - failedTemplate:
-          errorMessage: supervisor.replicas must be 1 for a single shared supervisor or an integer of at least 2 for a high-availability pool
+          errorMessage: supervisor.replicas must be an integer of at least 1
   - it: rejects supervisor replicas given as a string
     template: templates/supervisor.yaml
     set:
@@ -544,7 +648,7 @@ tests:
           supervisor_topology: gateway
     asserts:
       - failedTemplate:
-          errorMessage: supervisor.replicas must be 1 for a single shared supervisor or an integer of at least 2 for a high-availability pool
+          errorMessage: supervisor.replicas must be an integer of at least 1
   - it: rejects a recovery timeout below 10 seconds
     template: templates/supervisor.yaml
     set:
