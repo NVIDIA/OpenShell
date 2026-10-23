@@ -5292,14 +5292,30 @@ impl ComputeRuntime {
                 self.schedule_ephemeral_sandbox_delete(&current);
                 return Ok(());
             }
-            if matches!(
-                current_phase,
-                SandboxPhase::Deleting
-                    | SandboxPhase::Error
-                    | SandboxPhase::Stopping
-                    | SandboxPhase::Stopped
-                    | SandboxPhase::Completed
-            ) {
+            // A container restart kills the supervisor together with the main
+            // process, so the supervisor that reconnects afterwards is a
+            // *fresh* instance. Its connect outlives the main-process exit
+            // report from the instance it replaces: accept the session and
+            // restore Ready instead of leaving the sandbox stuck in Error.
+            // A reconnect from the same instance (e.g. a main-process crash
+            // that is not being restarted) is still rejected, and Completed
+            // stays terminal.
+            let recovering_from_container_restart = connected
+                && current_phase == SandboxPhase::Error
+                && current.status.as_ref().is_some_and(|status| {
+                    !status.main_process_instance_id.is_empty()
+                        && Some(status.main_process_instance_id.as_str()) != instance_id
+                });
+            if !recovering_from_container_restart
+                && matches!(
+                    current_phase,
+                    SandboxPhase::Deleting
+                        | SandboxPhase::Error
+                        | SandboxPhase::Stopping
+                        | SandboxPhase::Stopped
+                        | SandboxPhase::Completed
+                )
+            {
                 return Ok(());
             }
             if !connected && current_phase != SandboxPhase::Ready {
@@ -15246,6 +15262,115 @@ mod tests {
             SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
         );
+    }
+
+    #[tokio::test]
+    async fn container_restart_fresh_supervisor_restores_ready_from_main_process_error() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Error);
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Error as i32,
+            main_process_instance_id: "instance-1".into(),
+            exit_code: Some(143),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".into(),
+                status: "False".into(),
+                reason: "MainProcessFailed".into(),
+                message: "Canonical main process exited with status 143".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        // After the container restarts, a fresh supervisor instance connects.
+        runtime
+            .supervisor_session_connected("sb-1", "instance-2")
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        let status = stored.status.unwrap();
+        assert_eq!(status.main_process_instance_id, "instance-2");
+        assert_eq!(status.exit_code, None);
+        assert!(status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.status == "True"
+                && condition.reason == "DependenciesReady"
+        }));
+    }
+
+    #[tokio::test]
+    async fn container_restart_same_instance_reconnect_keeps_sandbox_in_error() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Error);
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Error as i32,
+            main_process_instance_id: "instance-1".into(),
+            exit_code: Some(9),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".into(),
+                status: "False".into(),
+                reason: "MainProcessFailed".into(),
+                message: "Canonical main process exited with status 9".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        // The same supervisor instance reconnecting (e.g. a gateway restart
+        // after a main-process crash that is not being restarted) must not
+        // resurrect a failed sandbox.
+        runtime
+            .supervisor_session_connected("sb-1", "instance-1")
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Error as i32);
+        assert_eq!(stored.status.unwrap().exit_code, Some(9));
+    }
+
+    #[tokio::test]
+    async fn container_restart_reconnect_does_not_revive_completed_sandbox() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Completed);
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Completed as i32,
+            main_process_instance_id: "instance-1".into(),
+            exit_code: Some(0),
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .supervisor_session_connected("sb-1", "instance-2")
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Completed as i32);
+        assert_eq!(stored.status.unwrap().exit_code, Some(0));
     }
 
     #[tokio::test]
