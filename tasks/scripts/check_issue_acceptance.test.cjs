@@ -8,6 +8,7 @@ const checkIssueAcceptance = require('./check_issue_acceptance.cjs');
 async function check({
   permission = 'read', issues = [], body = '', permissionError,
   number = 7, headSha = 'pr-head', pullError, issueError, labelError,
+  draft = false, state = 'open', drafts = [], draftError,
 } = {}) {
   const failures = [];
   const github = {
@@ -18,6 +19,7 @@ async function check({
           if (pullError) throw new Error('PR lookup failed');
           return { data: {
             number, user: { login: 'contributor' }, head: { sha: headSha }, body,
+            node_id: `pr-node-${number}`, draft, state,
           } };
         },
       },
@@ -31,7 +33,14 @@ async function check({
       },
       issues: { listLabelsOnIssue() {} },
     },
-    graphql: async (_query, variables) => {
+    graphql: async (query, variables) => {
+      if (query.includes('convertPullRequestToDraft')) {
+        assert.equal(variables.pullRequestId, `pr-node-${number}`);
+        drafts.push(variables.pullRequestId);
+        if (draftError) throw new Error('Draft conversion failed');
+        return { convertPullRequestToDraft: { pullRequest: { isDraft: true } } };
+      }
+      assert.match(query, /closingIssuesReferences/);
       assert.equal(variables.number, number);
       if (issueError) throw new Error('Issue lookup failed');
       return { repository: { pullRequest: { closingIssuesReferences: {
@@ -62,7 +71,9 @@ async function check({
 
 for (const permission of ['write', 'maintain', 'admin']) {
   test(`${permission} access allows an issue-less PR`, async () => {
-    assert.deepEqual(await check({ permission }), []);
+    const drafts = [];
+    assert.deepEqual(await check({ permission, drafts }), []);
+    assert.deepEqual(drafts, []);
   });
 }
 
@@ -84,7 +95,9 @@ test('all linked issues must be accepted, regardless of PR body or triggering ac
 });
 
 test('accepted issues in the target repository pass', async () => {
-  assert.deepEqual(await check({ issues: [{ number: 1, labels: [{ name: 'state:accepted' }] }] }), []);
+  const drafts = [];
+  assert.deepEqual(await check({ drafts, issues: [{ number: 1, labels: [{ name: 'state:accepted' }] }] }), []);
+  assert.deepEqual(drafts, []);
 });
 
 test('accepted issues in another repository cannot bypass the gate', async () => {
@@ -98,7 +111,9 @@ test('a non-collaborator still needs an accepted issue', async () => {
 });
 
 test('permission lookup failures do not grant an exemption', async () => {
-  await assert.rejects(check({ permissionError: 403 }), /lookup failed/);
+  const drafts = [];
+  await assert.rejects(check({ permissionError: 403, drafts }), /lookup failed/);
+  assert.deepEqual(drafts, []);
 });
 
 for (const [option, message] of [
@@ -107,7 +122,9 @@ for (const [option, message] of [
   ['labelError', /Label lookup failed/],
 ]) {
   test(`${option} fails the workflow invocation`, async () => {
-    await assert.rejects(check({ [option]: true, issues: [{ number: 1 }] }), message);
+    const drafts = [];
+    await assert.rejects(check({ [option]: true, issues: [{ number: 1 }], drafts }), message);
+    assert.deepEqual(drafts, []);
   });
 }
 
@@ -128,4 +145,41 @@ test('PRs sharing a head SHA evaluate their own issue references in either order
 test('a failed refresh rejects after an earlier successful evaluation', async () => {
   assert.deepEqual(await check({ permission: 'write' }), []);
   await assert.rejects(check({ permission: 'write', pullError: true }), /PR lookup failed/);
+});
+
+for (const issues of [
+  [],
+  [{ number: 1 }],
+  [{ number: 1, labels: [{ name: 'state:accepted' }] }, { number: 2 }],
+  [{ number: 1, owner: 'contributor', labels: [{ name: 'state:accepted' }] }],
+]) {
+  test(`rejected ready PR converts to draft for issues ${JSON.stringify(issues)}`, async () => {
+    const drafts = [];
+    assert.equal((await check({ issues, drafts })).length, 1);
+    assert.deepEqual(drafts, ['pr-node-7']);
+  });
+}
+
+test('an already-draft PR still fails acceptance without another conversion', async () => {
+  const drafts = [];
+  assert.equal((await check({ draft: true, drafts })).length, 1);
+  assert.deepEqual(drafts, []);
+});
+
+test('accepted draft PRs stay draft', async () => {
+  const drafts = [];
+  assert.deepEqual(await check({
+    draft: true, drafts, issues: [{ number: 1, labels: [{ name: 'state:accepted' }] }],
+  }), []);
+  assert.deepEqual(drafts, []);
+});
+
+test('closed PRs are left alone using current metadata', async () => {
+  const drafts = [];
+  assert.deepEqual(await check({ state: 'closed', drafts, permissionError: 403 }), []);
+  assert.deepEqual(drafts, []);
+});
+
+test('draft conversion errors fail the workflow invocation', async () => {
+  await assert.rejects(check({ draftError: true }), /Draft conversion failed/);
 });

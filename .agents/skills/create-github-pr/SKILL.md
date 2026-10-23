@@ -250,7 +250,9 @@ EOF
 The command outputs the PR URL and number.
 
 Rerun `PR Issue Acceptance` after linked issue labels change; it does not refresh
-automatically on issue-label events.
+automatically on issue-label events. A ready PR that fails acceptance is moved
+to draft. After acceptance passes, mark it ready manually; the workflow checks
+acceptance again on that transition.
 
 **Display the URL using markdown link syntax** so it's easily clickable:
 
