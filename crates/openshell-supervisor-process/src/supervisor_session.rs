@@ -690,7 +690,6 @@ async fn run_single_session(
             redirected,
             supports_session_redirect: true,
             supports_config_push: true,
-            supports_static_credential_placement: true,
         })),
     })
     .await

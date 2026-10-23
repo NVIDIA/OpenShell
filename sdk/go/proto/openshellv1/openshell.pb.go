@@ -11868,9 +11868,10 @@ type GetSandboxProviderEnvironmentResponse struct {
 	ProviderEnvRevision uint64 `protobuf:"varint,2,opt,name=provider_env_revision,json=providerEnvRevision,proto3" json:"provider_env_revision,omitempty"`
 	// Expiration timestamps for returned environment variables.
 	CredentialExpirationTimes map[string]*timestamppb.Timestamp `protobuf:"bytes,103,rep,name=credential_expiration_times,json=credentialExpirationTimes,proto3" json:"credential_expiration_times,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// Dynamic credentials that require token grants or other runtime injection.
-	// Maps endpoint-bound provider metadata to credential metadata.
-	// Supervisor uses this to inject Authorization headers for token grant credentials.
+	// Endpoint-bound token grants and static credential request metadata.
+	// Reserved static-env:<ENV_KEY> entries carry authored placement fields for
+	// a delivered static value and have no token_grant. Older supervisors ignore
+	// those entries; newer supervisors separate them before grant processing.
 	DynamicCredentials map[string]*ProviderProfileCredential `protobuf:"bytes,4,rep,name=dynamic_credentials,json=dynamicCredentials,proto3" json:"dynamic_credentials,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Endpoint allowlists for static credential environment variables. Metadata
 	// can be incomplete when a provider profile is invalid; capable supervisors
@@ -12113,9 +12114,11 @@ func (x *ProviderEnvironmentValue) GetStablePlaceholder() bool {
 // credentials are endpoint selectors rather than environment values and stay
 // in their own collection.
 type ProviderEnvironmentSnapshot struct {
-	state                   protoimpl.MessageState                `protogen:"open.v1"`
-	ProviderEnvRevision     uint64                                `protobuf:"varint,1,opt,name=provider_env_revision,json=providerEnvRevision,proto3" json:"provider_env_revision,omitempty"`
-	Values                  []*ProviderEnvironmentValue           `protobuf:"bytes,2,rep,name=values,proto3" json:"values,omitempty"`
+	state               protoimpl.MessageState      `protogen:"open.v1"`
+	ProviderEnvRevision uint64                      `protobuf:"varint,1,opt,name=provider_env_revision,json=providerEnvRevision,proto3" json:"provider_env_revision,omitempty"`
+	Values              []*ProviderEnvironmentValue `protobuf:"bytes,2,rep,name=values,proto3" json:"values,omitempty"`
+	// Token grants and reserved static-env:<ENV_KEY> request metadata, atomically
+	// delivered with the static environment. Metadata entries have no token_grant.
 	DynamicCredentials      map[string]*ProviderProfileCredential `protobuf:"bytes,3,rep,name=dynamic_credentials,json=dynamicCredentials,proto3" json:"dynamic_credentials,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	ProviderAttachmentEpoch string                                `protobuf:"bytes,4,opt,name=provider_attachment_epoch,json=providerAttachmentEpoch,proto3" json:"provider_attachment_epoch,omitempty"`
 	PolicyHash              string                                `protobuf:"bytes,5,opt,name=policy_hash,json=policyHash,proto3" json:"policy_hash,omitempty"`

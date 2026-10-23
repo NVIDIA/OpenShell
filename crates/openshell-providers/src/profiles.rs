@@ -3936,13 +3936,6 @@ credentials:
         use openshell_core::provider_credentials::ProviderCredentialState;
         use openshell_core::secrets::body::BodyPlaceholderGuard;
         let binding = |profile: &ProviderTypeProfile| StaticCredentialBinding {
-            placement: Some(openshell_core::proto::StaticCredentialPlacement {
-                location: Some(
-                    openshell_core::proto::static_credential_placement::Location::HeaderName(
-                        profile.credentials[0].header_name.clone(),
-                    ),
-                ),
-            }),
             credential_identity: profile.id.clone(),
             workload_credential_handle: String::new(),
             endpoints: profile

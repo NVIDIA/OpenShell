@@ -11235,9 +11235,6 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
-                    placement: Some(openshell_core::proto::StaticCredentialPlacement {
-                        location: Some(openshell_core::proto::static_credential_placement::Location::HeaderName("Authorization".into())),
-                    }),
                 },
             )]),
             Vec::new(),
@@ -13600,9 +13597,6 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
-                    placement: Some(openshell_core::proto::StaticCredentialPlacement {
-                        location: Some(openshell_core::proto::static_credential_placement::Location::HeaderName("Authorization".into())),
-                    }),
                 },
             )]),
             Vec::new(),
@@ -13648,9 +13642,6 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
-                    placement: Some(openshell_core::proto::StaticCredentialPlacement {
-                        location: Some(openshell_core::proto::static_credential_placement::Location::HeaderName("Authorization".into())),
-                    }),
                 },
             )]),
             Vec::new(),
@@ -13697,9 +13688,6 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
-                    placement: Some(openshell_core::proto::StaticCredentialPlacement {
-                        location: Some(openshell_core::proto::static_credential_placement::Location::HeaderName("Authorization".into())),
-                    }),
                 },
             )]),
             Vec::new(),
@@ -14373,9 +14361,6 @@ network_policies:
                 StaticCredentialBinding {
                     credential_identity: "provider".into(),
                     workload_credential_handle: String::new(),
-                    placement: Some(openshell_core::proto::StaticCredentialPlacement {
-                        location: Some(openshell_core::proto::static_credential_placement::Location::HeaderName("Authorization".into())),
-                    }),
                     endpoints: vec![StaticCredentialEndpointBinding {
                         host: "api.example.com".into(),
                         port: 80,
@@ -14528,9 +14513,6 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
-                    placement: Some(openshell_core::proto::StaticCredentialPlacement {
-                        location: Some(openshell_core::proto::static_credential_placement::Location::HeaderName("Authorization".into())),
-                    }),
                 },
             )]),
             Vec::new(),
@@ -14622,9 +14604,6 @@ network_policies:
                         }],
                         credential_identity: format!("provider-a:{key}"),
                         workload_credential_handle: String::new(),
-                        placement: Some(openshell_core::proto::StaticCredentialPlacement {
-                            location: Some(openshell_core::proto::static_credential_placement::Location::SigningOnly(true)),
-                        }),
                     },
                 )
             })

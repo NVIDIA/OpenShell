@@ -44,10 +44,10 @@ trace relay is active.
 
 ## Static credential placement
 
-Static credential substitution checks the credential's declared request location
-before writing upstream. HTTP placement violations return a safe 403 response;
+When placement metadata is available, substitution checks the declared request
+location before writing upstream. HTTP placement violations return a safe 403 response;
 WebSocket violations close the connection with policy denial. Both paths emit a
 domain event and a detection finding without credential values or placeholders.
-Body and WebSocket rewrite flags do not override static placement. SigV4 signing
-uses the endpoint-scoped resolver's trusted signing-only access instead of a
-workload-selected request location.
+Legacy credentials preserve endpoint-scoped rewriting. Explicit body and WebSocket
+rewrite flags authorize those locations for ordinary static credentials. SigV4
+signing retains the endpoint-scoped resolver's existing trusted access.

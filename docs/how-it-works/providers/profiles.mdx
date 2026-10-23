@@ -70,7 +70,7 @@ A request can use a static credential only when all of these checks pass:
 | The placeholder belongs to the current attached provider state. | Sandbox provider attachment and current provider record. |
 | The calling binary and destination are allowed. | Effective sandbox network policy. |
 | The host, port, and canonical request path match the credential binding. | Provider profile endpoints, or an explicit sandbox policy binding for an endpointless profile. |
-| The request location matches the credential's declared placement. | The credential's `auth_style` and its header, query parameter, or path template. |
+| When supported placement metadata is available, the request location matches it or an explicit body/WebSocket rewrite policy. | The credential's `auth_style` and its header, query parameter, or path template. |
 | The HTTP method, path, or protocol operation is allowed when L7 inspection is configured. | Effective sandbox network policy. |
 | The credential has not expired. | Provider credential expiry metadata. |
 
@@ -95,34 +95,32 @@ glob matching. OpenShell removes the query string and uses a canonical,
 secret-redacted path for this check, so a credential embedded in a request path
 does not need to be revealed before authorization.
 
-Each static credential also has a placement boundary. Header credentials resolve
-only in the declared header, query credentials only in the declared parameter,
-and path credentials only in the `{credential}` slot of their path template.
-Header names are case-insensitive. An `Authorization` binding supports the
-client's authentication format, including Bearer, token, and Basic authentication;
-it does not require a literal `Bearer` prefix.
+The supervisor automatically enforces usable static credential auth metadata.
+No additional profile flag is required. Header credentials resolve only in the
+declared header, query credentials only in the declared parameter, and path
+credentials only in the `{credential}` slot of their path template. Header names
+are case-insensitive. An `Authorization` binding accepts Bearer, token, and Basic
+authentication.
 
-The gateway withholds static credentials that lack usable placement metadata and
-reports `CredentialsWithheld`. Add the appropriate placement to the profile
-before attaching it. Signing-only AWS credentials are available only to the
-supervisor's SigV4 signer.
-Request-body and WebSocket rewrite flags do not override a credential's placement.
+Existing endpoint policies that enable request-body or WebSocket text rewriting
+continue to authorize those locations. Those flags do not authorize arbitrary
+query parameters, URL paths, or unrelated headers. Trusted AWS signing retains
+its existing endpoint authorization.
 
-Signing-only credentials require a profile signing endpoint or an AWS STS
-refresh declaration. A custom endpointless AWS profile with signing configured
-only in sandbox policy is withheld; move the signing declaration into the
-profile before upgrading that workload.
+Credentials without usable placement metadata retain legacy endpoint-scoped
+substitution. This preserves custom profiles, policy-only AWS signers, and Codex
+refresh and ID tokens. The Codex reference profile supplies placement for its
+access token and account header.
 
-The Codex reference profile declares placement for its access token and account
-header. Its refresh token and ID token have no supported static HTTP placement
-and are withheld. Workloads that require those environment variables need a
-compatible credential flow before upgrading; body rewrite flags cannot restore
-that access.
+Gateway and supervisor upgrades can happen in either order. The gateway forwards
+static auth metadata with the existing provider environment. Older supervisors
+ignore it and keep their previous behavior. New supervisors connected to an older
+gateway receive no static auth metadata and retain legacy behavior. Existing
+credential delivery and wire identities remain unchanged.
 
-Upgrade both gateway and supervisor before using placement-bound credentials.
-An upgraded gateway withholds static credentials from supervisors that do not
-advertise placement enforcement. Restart older sandboxes after upgrading, then
-wait for provider readiness before launching clients.
+The hardening takes effect automatically once both components support it and
+usable placement is declared. Existing credential placeholder and update
+lifecycles remain unchanged.
 
 Use an explicit sandbox policy binding when the profile intentionally defines
 credentials without defining service endpoints. The policy names the concrete

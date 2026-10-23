@@ -150,12 +150,14 @@ when a placeholder is present but requests receive
 `credential_endpoint_mismatch`. A profileless static provider fails closed
 because the gateway cannot construct a binding.
 
-Static credentials also require declared placement. A
-`credential_placement_mismatch` means the placeholder is outside its permitted
-header, query parameter, or path-template slot. Match the profile instead of
-broadening network policy or enabling body/WebSocket rewriting. Missing placement
-metadata or an older supervisor can cause `CredentialsWithheld`; inspect provider
-readiness, correct the profile, and upgrade the supervisor before retrying.
+Usable credential placement is enforced automatically when both gateway and
+supervisor support it. `credential_placement_mismatch` means a placeholder is
+outside its declared header, query parameter, or path-template slot. Match the
+profile. Explicit body/WebSocket rewrite policies retain their documented
+behavior for ordinary credentials. Missing placement metadata or older components
+retain legacy endpoint-scoped substitution; they do not cause withholding by
+themselves. Check provider readiness after changing placement and launch a new
+process if retained references were revoked.
 
 When an inspected request receives `request_authority_mismatch`, compare its
 HTTP authority with the CONNECT tunnel endpoint. The host and effective port

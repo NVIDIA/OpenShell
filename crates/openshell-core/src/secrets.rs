@@ -193,10 +193,11 @@ pub struct RewriteTargetResult {
 /// Credential-specific destinations authorized by the provider profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialPlacement {
+    /// Historical substitution behavior when no placement metadata is delivered.
+    Legacy,
     Header(String),
     QueryParam(String),
     PathTemplate(String),
-    SigningOnly,
 }
 
 /// The actual destination of a workload-provided credential placeholder.
@@ -477,6 +478,13 @@ impl SecretResolver {
             return true;
         };
         match (placement, self.request_location.as_ref()) {
+            (CredentialPlacement::Legacy, _)
+            | (
+                CredentialPlacement::Header(_)
+                | CredentialPlacement::QueryParam(_)
+                | CredentialPlacement::PathTemplate(_),
+                Some(RequestCredentialLocation::Body | RequestCredentialLocation::WebSocket),
+            ) => true,
             (
                 CredentialPlacement::Header(expected),
                 Some(RequestCredentialLocation::Header(actual)),
@@ -602,16 +610,6 @@ impl SecretResolver {
             return Err(UnresolvedPlaceholderError {
                 location,
                 reason: UnresolvedPlaceholderReason::EndpointMismatch,
-            });
-        }
-        if self
-            .placements
-            .get(key)
-            .is_some_and(|placement| !matches!(placement, CredentialPlacement::SigningOnly))
-        {
-            return Err(UnresolvedPlaceholderError {
-                location,
-                reason: UnresolvedPlaceholderReason::PlacementMismatch,
             });
         }
         let placeholder = placeholder_for_env_key(key);
@@ -1667,17 +1665,17 @@ mod tests {
                 .unwrap_err()
                 .is_placement_mismatch()
         );
-        assert!(
+        assert_eq!(
             resolver
                 .rewrite_text_placeholders(&mut token.to_string(), "body")
-                .unwrap_err()
-                .is_placement_mismatch()
+                .unwrap(),
+            1
         );
-        assert!(
+        assert_eq!(
             resolver
                 .rewrite_websocket_text_placeholders(&mut token.to_string())
-                .unwrap_err()
-                .is_placement_mismatch()
+                .unwrap(),
+            1
         );
         assert!(resolver.resolve_placeholder(token).is_none());
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("user:{token}"));
