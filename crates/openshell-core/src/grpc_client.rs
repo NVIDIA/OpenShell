@@ -1441,6 +1441,7 @@ pub async fn fetch_provider_environment_with_stable_placeholders(
         .get_sandbox_provider_environment(GetSandboxProviderEnvironmentRequest {
             sandbox_id: sandbox_id.to_string(),
             supports_static_credential_bindings: true,
+            supports_static_credential_placement: true,
             supports_stable_placeholder_environment_keys: true,
         })
         .await
@@ -1510,6 +1511,13 @@ mod provider_environment_tests {
                         path: "/v1/**".to_string(),
                     }],
                     credential_identity: "provider:TOKEN".to_string(),
+                    placement: Some(crate::proto::StaticCredentialPlacement {
+                        location: Some(
+                            crate::proto::static_credential_placement::Location::HeaderName(
+                                "authorization".into(),
+                            ),
+                        ),
+                    }),
                     ..Default::default()
                 },
             )]),

@@ -352,6 +352,13 @@ mod tests {
                 HashMap::from([(
                     "KEY".into(),
                     StaticCredentialBinding {
+                        placement: Some(crate::proto::StaticCredentialPlacement {
+                            location: Some(
+                                crate::proto::static_credential_placement::Location::HeaderName(
+                                    "Authorization".into(),
+                                ),
+                            ),
+                        }),
                         credential_identity: "provider".into(),
                         workload_credential_handle: handle,
                         endpoints: vec![StaticCredentialEndpointBinding {

@@ -356,6 +356,13 @@ mod tests {
             }],
             credential_identity: "test-google:token".into(),
             workload_credential_handle: String::new(),
+            placement: Some(openshell_core::proto::StaticCredentialPlacement {
+                location: Some(
+                    openshell_core::proto::static_credential_placement::Location::HeaderName(
+                        "Authorization".into(),
+                    ),
+                ),
+            }),
         }
     }
 

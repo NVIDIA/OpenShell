@@ -3820,7 +3820,8 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     request: Request<GetSandboxProviderEnvironmentRequest>,
 ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
     let sandbox_id = request.get_ref().sandbox_id.clone();
-    let supports_static_credential_bindings = request.get_ref().supports_static_credential_bindings;
+    let supports_static_credential_bindings = request.get_ref().supports_static_credential_bindings
+        && request.get_ref().supports_static_credential_placement;
     let supports_stable_placeholder_environment_keys = request
         .get_ref()
         .supports_stable_placeholder_environment_keys;
@@ -12345,6 +12346,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-snapshot-consistency".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -14189,6 +14191,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-env".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -14202,6 +14205,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-env".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -14275,6 +14279,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-files-and-credentials".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: false,
             })),
         )
@@ -14323,6 +14328,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-static-ready".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: false,
             })),
         )
@@ -14377,24 +14383,29 @@ mod tests {
             .await
             .unwrap();
 
-        let response = handle_get_sandbox_provider_environment(
-            &state,
-            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                sandbox_id: "sb-legacy-provider-env".to_string(),
-                supports_static_credential_bindings: false,
-                supports_stable_placeholder_environment_keys: false,
-            })),
-        )
-        .await
-        .unwrap()
-        .into_inner();
+        for (supports_bindings, supports_placement) in
+            [(false, false), (true, false), (false, true)]
+        {
+            let response = handle_get_sandbox_provider_environment(
+                &state,
+                with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                    sandbox_id: "sb-legacy-provider-env".to_string(),
+                    supports_static_credential_bindings: supports_bindings,
+                    supports_static_credential_placement: supports_placement,
+                    supports_stable_placeholder_environment_keys: false,
+                })),
+            )
+            .await
+            .unwrap()
+            .into_inner();
 
-        assert!(!response.environment.contains_key("GITHUB_TOKEN"));
-        assert!(response.static_credential_bindings.is_empty());
-        assert_eq!(
-            response.readiness_reason,
-            ProviderReadinessReason::UnsupportedSupervisor as i32
-        );
+            assert!(!response.environment.contains_key("GITHUB_TOKEN"));
+            assert!(response.static_credential_bindings.is_empty());
+            assert_eq!(
+                response.readiness_reason,
+                ProviderReadinessReason::UnsupportedSupervisor as i32
+            );
+        }
     }
 
     #[tokio::test]
@@ -14427,6 +14438,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-unbound-provider-env".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -14480,6 +14492,8 @@ mod tests {
                     credentials: vec![openshell_core::proto::ProviderProfileCredential {
                         name: "cloud_token".to_string(),
                         env_vars: vec!["CLOUD_TOKEN".to_string()],
+                        auth_style: "bearer".to_string(),
+                        header_name: "authorization".to_string(),
                         stable_placeholder: true,
                         ..Default::default()
                     }],
@@ -14542,6 +14556,7 @@ mod tests {
                 with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                     sandbox_id: "sb-policy-binding".to_string(),
                     supports_static_credential_bindings: supports_bindings,
+                    supports_static_credential_placement: supports_bindings,
                     supports_stable_placeholder_environment_keys: supports_stable,
                 })),
             )
@@ -14586,6 +14601,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-policy-binding".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -14664,6 +14680,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-policy-binding".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -14730,6 +14747,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-policy-binding".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -14827,6 +14845,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-mixed-provider-env".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -14936,6 +14955,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-token-exchange-subject".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -15004,6 +15024,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-revision".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -15044,6 +15065,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-revision".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -15363,7 +15385,7 @@ mod tests {
                 .static_credential_bindings
                 .get("GITHUB_TOKEN")
                 .map(|binding| binding.credential_identity.as_str()),
-            Some("provider-identity-a:GITHUB_TOKEN")
+            Some("provider-identity-a:GITHUB_TOKEN:0a0d617574686f72697a6174696f6e")
         );
         assert_eq!(first_environment.dynamic_credentials.len(), 1);
         assert!(
@@ -15405,7 +15427,7 @@ mod tests {
                 .static_credential_bindings
                 .get("GITHUB_TOKEN")
                 .map(|binding| binding.credential_identity.as_str()),
-            Some("provider-identity-b:GITHUB_TOKEN")
+            Some("provider-identity-b:GITHUB_TOKEN:0a0d617574686f72697a6174696f6e")
         );
         assert_eq!(replacement_environment.dynamic_credentials.len(), 1);
         assert!(
@@ -15667,6 +15689,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -15701,6 +15724,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -15743,6 +15767,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -15848,6 +15873,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -15885,6 +15911,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -15926,6 +15953,7 @@ mod tests {
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             })),
         )
@@ -25681,6 +25709,7 @@ mod tests {
             non_member_request(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sandbox-other".into(),
                 supports_static_credential_bindings: true,
+                supports_static_credential_placement: true,
                 supports_stable_placeholder_environment_keys: true,
             }),
         )

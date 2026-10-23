@@ -1045,6 +1045,8 @@ pub mod test_support {
     pub enum StreamFeatures {
         /// Predates streamed configuration and keeps polling.
         Legacy,
+        /// Supports config push but predates static credential placement.
+        ApplyWithoutPlacement,
         /// Applies and acknowledges streamed configuration.
         Apply,
     }
@@ -1109,7 +1111,8 @@ pub mod test_support {
                 payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
                     sandbox_id: sandbox_id.into(),
                     instance_id: "instance".into(),
-                    supports_config_push: features == StreamFeatures::Apply,
+                    supports_config_push: features != StreamFeatures::Legacy,
+                    supports_static_credential_placement: features == StreamFeatures::Apply,
                     connection_epoch,
                     supports_provider_readiness: false,
                     redirected: false,

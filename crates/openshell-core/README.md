@@ -58,6 +58,22 @@ router agree on provider defaults. Profiles define:
 Do not duplicate provider-specific inference behavior in callers. Add shared
 behavior here, then consume it from the gateway, sandbox, and router.
 
+## Static Credential Resolution
+
+Static credential bindings carry both an endpoint boundary and a placement
+boundary. `provider_credentials` compiles them together and preserves placement
+when creating a request-scoped resolver. Request rewriting supplies the actual
+header name, query key, or path slot before resolving each reference. Missing or
+unsupported placement fails closed.
+
+Header placement authorizes a header name independently of authentication
+scheme. Basic authentication applies the same check before resolving decoded
+references. Body and WebSocket rewriting cannot override a credential's declared
+placement. Signing-only material uses the supervisor's trusted signing path.
+
+Placement changes are authorization changes: retained references and stable
+handles must not retain access to the previous placement.
+
 ## Middleware Contracts
 
 Built-in supervisor middleware identifiers, host-selector matching, and pure

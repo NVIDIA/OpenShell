@@ -1735,24 +1735,34 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_supervisor_keeps_polling_when_gateway_push_is_enabled() {
-        let state = push_state().await;
-        put_sandbox(&state, "legacy-sandbox", &[]).await;
-        let mut harness =
-            connect_supervisor_stream(&state, "legacy-sandbox", StreamFeatures::Legacy)
+        for features in [
+            StreamFeatures::Legacy,
+            StreamFeatures::ApplyWithoutPlacement,
+        ] {
+            let state = push_state().await;
+            put_provider(&state, "github").await;
+            put_sandbox(&state, "legacy-sandbox", &["github"]).await;
+            let mut harness = connect_supervisor_stream(&state, "legacy-sandbox", features)
                 .await
                 .unwrap();
-        let first = harness.inbound.message().await.unwrap().unwrap();
-        let Some(gateway_message::Payload::SessionAccepted(accepted)) = first.payload else {
-            panic!("expected SessionAccepted");
-        };
-        assert!(accepted.bootstrap.is_none());
-        publish_sandbox(&state, "legacy-sandbox");
-        publish_all_connected(&state);
-        assert!(
-            next_update(&mut harness, Duration::from_millis(100))
-                .await
-                .is_none()
-        );
+            let first = harness.inbound.message().await.unwrap().unwrap();
+            let Some(gateway_message::Payload::SessionAccepted(accepted)) = first.payload else {
+                panic!("expected SessionAccepted");
+            };
+            assert!(!accepted.config_push_enabled);
+            assert!(accepted.bootstrap.is_none());
+            assert!(!has_recipient(&state, "legacy-sandbox"));
+            // Rotating protected material must not deliver it later on this stream.
+            put_provider_with_token(&state, "github", Some("synthetic-rotated")).await;
+            publish_provider(&state, "default", "github");
+            publish_sandbox(&state, "legacy-sandbox");
+            publish_all_connected(&state);
+            assert!(
+                next_update(&mut harness, Duration::from_millis(100))
+                    .await
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]

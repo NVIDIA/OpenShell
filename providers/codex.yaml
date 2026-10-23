@@ -33,17 +33,24 @@ credentials:
     description: Codex OAuth access token
     env_vars: [CODEX_AUTH_ACCESS_TOKEN]
     required: true
+    auth_style: bearer
+    header_name: authorization
   - name: refresh_token
     description: Codex OAuth refresh token
     env_vars: [CODEX_AUTH_REFRESH_TOKEN]
     required: true
+    # OAuth refresh uses a request body. Static body placement is unsupported,
+    # so this credential is withheld rather than granted arbitrary placement.
   - name: account_id
     description: Codex account identifier
     env_vars: [CODEX_AUTH_ACCOUNT_ID]
     required: true
+    auth_style: header
+    header_name: chatgpt-account-id
   - name: id_token
     description: Codex OAuth ID token
     env_vars: [CODEX_AUTH_ID_TOKEN]
+    # Local token inspection has no HTTP placement; this value is withheld.
 discovery:
   credentials: [access_token, refresh_token, account_id, id_token]
 endpoints:

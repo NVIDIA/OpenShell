@@ -436,15 +436,17 @@ startup, OpenShell replaces each credential with an opaque placeholder token in
 the agent's environment. When the agent sends an HTTP request containing a
 placeholder, the proxy resolves it immediately before forwarding the request.
 
-Static credential resolution has two independent authorization boundaries:
+Static credential resolution has three independent authorization boundaries:
 
 1. Network policy must allow the calling binary and request destination.
 2. The credential binding must include the request host, port, and path. Profile
    endpoints provide the binding by default. An endpointless profile can use a
    sandbox policy endpoint that names the attached provider instance through
    `credential_binding.provider`.
+3. The request location must match the credential's declared header, query
+   parameter, or path-template slot.
 
-Both checks must pass. A provider profile endpoint does not grant network access
+All three checks must pass. A provider profile endpoint does not grant network access
 unless provider policy composition or the sandbox's own policy allows the
 request. A plain sandbox policy endpoint does not grant credential use unless
 the profile already covers it or the endpoint explicitly binds an endpointless
@@ -461,20 +463,25 @@ for endpoint matching and migration guidance.
 
 ### Supported injection locations
 
-The proxy resolves credential placeholders in the following parts of an HTTP request:
+The proxy resolves static credential placeholders only in their declared
+placement. Moving a header credential into a query parameter, path, or another
+header is denied before the request is forwarded.
 
 | Location | How the agent uses it | Example |
 |---|---|---|
-| Header value | Agent reads `$API_KEY` from env and places it in a header. | `Authorization: Bearer <placeholder>` |
+| Declared header value | Agent reads `$API_KEY` from env and places it in the declared header. | `Authorization: Bearer <placeholder>` |
 | Header value (Basic auth) | Agent base64-encodes `user:<placeholder>` in an `Authorization: Basic` header. The proxy decodes, resolves, and re-encodes. | `Authorization: Basic <base64>` |
-| Query parameter value | Agent places the placeholder in a URL query parameter. | `GET /api?key=<placeholder>` |
-| URL path segment | Agent builds a URL with the placeholder in the path. Supports concatenated patterns. | `POST /bot<placeholder>/sendMessage` |
-| Supported request body | An inspected REST endpoint opts in with `request_body_credential_rewrite: true`. | `{"api_key":"<placeholder>"}` |
-| WebSocket text message | A REST or WebSocket endpoint opts in with `websocket_credential_rewrite: true`. | `{"token":"<placeholder>"}` |
+| Declared query parameter value | Agent uses the profile's `query_param`. | `GET /api?key=<placeholder>` |
+| Declared URL path slot | Agent uses the profile's `path_template`, including concatenated patterns. | `POST /bot<placeholder>/sendMessage` |
 | AWS SigV4 signing | An endpoint configures `credential_signing`, and the proxy signs with the endpoint-bound AWS credentials. | `credential_signing: sigv4` |
 
 The proxy does not rewrite cookies, response content, unsupported request
 bodies, or WebSocket binary frames.
+
+Static credentials bound to headers, query parameters, or paths cannot resolve in
+request bodies or WebSocket messages. Endpoint-wide rewrite flags do not grant
+additional credential placements. See [Profiles](/how-it-works/providers/profiles#understand-static-credential-endpoint-binding)
+for placement configuration and upgrade requirements.
 
 ### Clients that parse JWT claims
 
