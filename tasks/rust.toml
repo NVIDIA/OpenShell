@@ -64,11 +64,17 @@ hide = true
 
 ["rust:deny"]
 description = "Check dependencies for all cargo-deny rules"
+depends = ["rust:deny:crypto-test"]
 run = "cargo deny check"
 
 ["rust:deny:policy"]
 description = "Check dependencies for license violations, bans, and source restrictions"
+depends = ["rust:deny:crypto-test"]
 run = "cargo deny check licenses bans sources"
+
+["rust:deny:crypto-test"]
+description = "Verify cargo-deny rejects crypto dependencies that bypass the facade"
+run = "uv run --no-project python tasks/scripts/test-crypto-dependency-policy.py"
 
 
 ["rust:verify:telemetry-off"]

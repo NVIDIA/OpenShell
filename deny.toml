@@ -62,14 +62,352 @@ registries = []
 
 # -- Bans ----------------------------------------------------------------------
 [bans]
-deny = [
-    { name = "ring", wrappers = ["rustls", "rustls-webpki"], reason = "Use the selected crypto backend instead. These wrappers are allowed for z3-sys's prebuilt archive downloader." },
-]
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
+
+# Crypto implementations must stay behind the facade or an explicit wrapper.
+# See crates/openshell-crypto/CRYPTO.md#dependency-guardrail for classifications.
+# Wrappers permit only direct parents, not arbitrary descendants. Keep this
+# catalog and its exceptions reviewed when changing cryptographic dependencies.
+
+[[bans.deny]]
+name = "ring"
+wrappers = ["rustls", "rustls-webpki"]
+reason = "Use the selected crypto backend instead. These wrappers are allowed for z3-sys's prebuilt archive downloader."
+
+[[bans.deny]]
+name = "aws-lc-rs"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "jsonwebtoken",
+    "openshell-crypto",
+    "rcgen",
+    "russh",
+    "rustls",
+    "rustls-webpki",
+]
+
+[[bans.deny]]
+name = "aws-lc-sys"
+reason = "Native crypto bindings belong behind their provider libraries, not application crates."
+wrappers = [
+    "aws-lc-rs",
+]
+
+[[bans.deny]]
+name = "aws-lc-fips-sys"
+# Keep this boundary even when the FIPS build feature is disabled.
+# The aws-lc-rs wrapper is intentionally unused in the current resolved graph;
+# cargo-deny's unused-wrapper warning for this entry is expected. Revisit this
+# acknowledgement if the FIPS dependency is enabled; other unused wrappers
+# still require review.
+reason = "Native crypto bindings belong behind their provider libraries, not application crates."
+wrappers = [
+    "aws-lc-rs",
+]
+
+[[bans.deny]]
+name = "openssl"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "jsonwebtoken-openssl",
+    "openshell-crypto",
+    "rustls-openssl",
+]
+
+[[bans.deny]]
+name = "openssl-src"
+reason = "Use system-provided OpenSSL; vendored OpenSSL is not permitted."
+
+[[bans.deny]]
+name = "openssl-sys"
+reason = "Native crypto bindings belong behind their provider libraries, not application crates."
+wrappers = [
+    "openssl",
+    "rustls-openssl",
+]
+
+[[bans.deny]]
+name = "rustls-openssl"
+reason = "OpenSSL protocol adapters are owned by openshell-crypto."
+wrappers = [
+    "openshell-crypto",
+]
+
+[[bans.deny]]
+name = "jsonwebtoken-openssl"
+reason = "OpenSSL protocol adapters are owned by openshell-crypto."
+wrappers = [
+    "openshell-crypto",
+]
+
+[[bans.deny]]
+name = "sha1"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "axum",
+    "openshell-supervisor-network",
+    "russh",
+    "ssh-key",
+    "tungstenite",
+    "zip",
+]
+
+[[bans.deny]]
+name = "sha2"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "aws-sigv4",
+    "bcrypt-pbkdf",
+    "ed25519-dalek",
+    "jsonwebtoken",
+    "lzma-rust2",
+    "oauth2",
+    "oci-client",
+    "openshell-core",
+    "openshell-driver-docker",
+    "openshell-driver-kubernetes-secrets",
+    "openshell-driver-vault",
+    "openshell-driver-vm",
+    "openshell-gateway-interceptors",
+    "openshell-isolation-interface",
+    "openshell-server",
+    "openshell-supervisor-network",
+    "openshell-supervisor-process",
+    "p256",
+    "p384",
+    "p521",
+    "pageant",
+    "pest_meta",
+    "pkcs5",
+    "rsa",
+    "russh",
+    "scrypt",
+    "sqlx-core",
+    "sqlx-macros-core",
+    "sqlx-postgres",
+    "ssh-key",
+]
+
+[[bans.deny]]
+name = "sha3"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "ml-kem",
+    "russh",
+]
+
+[[bans.deny]]
+name = "hmac"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "aws-sigv4",
+    "hkdf",
+    "jsonwebtoken",
+    "openshell-server",
+    "pbkdf2",
+    "rfc6979",
+    "russh",
+    "sqlx-postgres",
+    "ssh-key",
+    "zip",
+]
+
+[[bans.deny]]
+name = "hkdf"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "elliptic-curve",
+    "sqlx-postgres",
+]
+
+[[bans.deny]]
+name = "rsa"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "jsonwebtoken",
+    "openshell-server",
+    "russh",
+    "ssh-key",
+]
+
+[[bans.deny]]
+name = "aes"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "aes-gcm",
+    "pkcs5",
+    "russh",
+    "ssh-cipher",
+    "zip",
+]
+
+[[bans.deny]]
+name = "aes-gcm"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "pkcs5",
+    "ssh-cipher",
+]
+
+[[bans.deny]]
+name = "chacha20"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "rand",
+    "ssh-cipher",
+]
+
+[[bans.deny]]
+name = "chacha20poly1305"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+
+[[bans.deny]]
+name = "poly1305"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "ssh-cipher",
+]
+
+[[bans.deny]]
+name = "p256"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "jsonwebtoken",
+    "russh",
+    "ssh-key",
+]
+
+[[bans.deny]]
+name = "p384"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "jsonwebtoken",
+    "russh",
+    "ssh-key",
+]
+
+[[bans.deny]]
+name = "p521"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "russh",
+    "ssh-key",
+]
+
+[[bans.deny]]
+name = "ed25519-dalek"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "jsonwebtoken",
+    "russh",
+    "ssh-key",
+]
+
+[[bans.deny]]
+name = "curve25519-dalek"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "ed25519-dalek",
+    "russh",
+]
+
+[[bans.deny]]
+name = "blake2"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "argon2",
+]
+
+[[bans.deny]]
+name = "blake3"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+
+[[bans.deny]]
+name = "md-5"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "sqlx-postgres",
+]
+
+[[bans.deny]]
+name = "md5"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "russh",
+]
+
+[[bans.deny]]
+name = "pbkdf2"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "bcrypt-pbkdf",
+    "pkcs5",
+    "russh",
+    "scrypt",
+    "zip",
+]
+
+[[bans.deny]]
+name = "scrypt"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "pkcs5",
+    "russh",
+]
+
+[[bans.deny]]
+name = "argon2"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+wrappers = [
+    "ssh-key",
+]
+
+[[bans.deny]]
+name = "k256"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+
+[[bans.deny]]
+name = "secp256k1"
+reason = "Use openshell-crypto; exceptions are classified in CRYPTO.md."
+
+# Lower-level implementations used by the dependency-owned SSH stack.
+[[bans.deny]]
+name = "bcrypt-pbkdf"
+wrappers = ["ssh-key"]
+reason = "SSH key derivation is dependency-owned."
+
+[[bans.deny]]
+name = "des"
+reason = "No DES implementation is enabled; compatibility exceptions require explicit review."
+
+[[bans.deny]]
+name = "ecdsa"
+wrappers = ["p256", "p384", "p521", "russh"]
+reason = "Use the facade for signing; dependency-owned implementations remain permitted."
+
+[[bans.deny]]
+name = "fiat-crypto"
+wrappers = ["curve25519-dalek", "p384"]
+reason = "Curve arithmetic belongs behind the dependency-owned implementations."
+
+[[bans.deny]]
+name = "ml-kem"
+wrappers = ["russh"]
+reason = "Post-quantum SSH cryptography is dependency-owned."
+
+[[bans.deny]]
+name = "rfc6979"
+wrappers = ["ecdsa"]
+reason = "Signature nonce generation belongs behind the signing implementation."
+
+[[bans.deny]]
+name = "ssh-cipher"
+wrappers = ["ssh-key"]
+reason = "SSH ciphers are dependency-owned."
 
 # -- Sources -------------------------------------------------------------------
 [sources]

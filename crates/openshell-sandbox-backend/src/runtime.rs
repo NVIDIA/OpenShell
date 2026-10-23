@@ -444,10 +444,12 @@ fn tls_client_config(tls: &SandboxTlsClientConfig) -> Result<rustls::ClientConfi
             BackendError::Descriptor(format!("load boundary TLS CA certificate: {error}"))
         })?;
     }
-    let mut config =
-        openshell_crypto::tls::client_builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+    let mut config = openshell_crypto::tls::try_client_builder_with_protocol_versions(&[
+        &rustls::version::TLS13,
+    ])
+    .map_err(|error| BackendError::Descriptor(format!("configure boundary TLS client: {error}")))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     config.alpn_protocols = vec![b"h2".to_vec()];
     Ok(config)
 }

@@ -4026,9 +4026,15 @@ mod linux {
                     "boundary TLS private-key file contains no private key",
                 )
             })?;
-        let mut config = openshell_crypto::tls::server_builder_with_protocol_versions(&[
+        let mut config = openshell_crypto::tls::try_server_builder_with_protocol_versions(&[
             &rustls::version::TLS13,
         ])
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("configure boundary TLS server: {error}"),
+            )
+        })?
         .with_no_client_auth()
         .with_single_cert(certificates, private_key)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
