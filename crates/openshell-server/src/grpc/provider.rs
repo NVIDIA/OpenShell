@@ -2557,14 +2557,14 @@ use openshell_core::proto::{
     ProviderResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
 };
-use openshell_core::spiffe::{
-    SpiffeJwtClaims, parse_unverified_jwt_svid_claims, trust_domain as spiffe_trust_domain,
-    workload_api_endpoint,
-};
 use openshell_providers::{
     CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile,
     normalize_profile_id, strategy_output_env_key, strategy_output_spec, strategy_primary_env_key,
     validate_profile_set,
+};
+use openshell_spiffe::{
+    SpiffeJwtClaims, parse_unverified_jwt_svid_claims, trust_domain as spiffe_trust_domain,
+    workload_api_endpoint,
 };
 use std::sync::{Arc, LazyLock, RwLock};
 use tonic::{Request, Response};
@@ -5910,7 +5910,7 @@ mod tests {
             let claims = SpiffeJwtClaims {
                 iss: SECRET.to_string(),
                 sub: SECRET.to_string(),
-                aud: openshell_core::spiffe::AudienceClaim::One(SECRET.to_string()),
+                aud: openshell_spiffe::AudienceClaim::One(SECRET.to_string()),
                 exp: 0,
             };
             let gateway =

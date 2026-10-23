@@ -238,7 +238,7 @@ impl SpiffeDelegationConfig {
         {
             return Err("spiffe_delegation requires a canonical absolute admin socket path in a dedicated directory and a non-root socket group".into());
         }
-        crate::spiffe::SandboxSpiffeIdPrefix::parse(&self.spiffe_id_prefix)?
+        openshell_spiffe::SandboxSpiffeIdPrefix::parse(&self.spiffe_id_prefix)?
             .sandbox_spiffe_id(gateway_id, "sandbox")?;
         Ok(())
     }

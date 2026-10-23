@@ -392,7 +392,7 @@ async fn fetch_jwt_svid_from_socket(
     socket_path: &std::path::Path,
     audience: &str,
 ) -> Result<String, TokenGrantFailure> {
-    let endpoint = openshell_core::spiffe::workload_api_endpoint(socket_path);
+    let endpoint = openshell_spiffe::workload_api_endpoint(socket_path);
 
     // Connect to SPIRE agent
     let client = WorkloadApiClient::connect_to(&endpoint)

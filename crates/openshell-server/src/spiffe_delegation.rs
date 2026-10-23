@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use openshell_core::config::{Config, SpiffeDelegationConfig};
-use openshell_core::spiffe::SandboxIdentityProvider;
+use openshell_core::token_grant_failure::TokenGrantFailure;
+use openshell_spiffe::SandboxIdentityProvider;
 
 /// Check the delegation settings `config` enables without building them.
 ///
@@ -28,7 +29,7 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 /// Rejects what [`validate_config`] rejects.
 pub fn sandbox_identity_provider(
     config: &Config,
-) -> Result<Option<Arc<dyn SandboxIdentityProvider>>, String> {
+) -> Result<Option<Arc<dyn SandboxIdentityProvider<Error = TokenGrantFailure>>>, String> {
     let Some(delegation) = enabled(config)? else {
         return Ok(None);
     };

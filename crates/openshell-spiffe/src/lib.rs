@@ -2,14 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Shared SPIFFE helpers used by the gateway and sandbox supervisor.
+//!
+//! Protocol types, unverified claim parsing, stable sandbox identity mapping,
+//! and the sandbox identity provider interface. Signature verification and
+//! SPIRE access belong to the crates that implement the interface.
 
 use std::fmt;
 use std::path::Path;
 
 use base64::Engine as _;
 use serde::Deserialize;
-
-use crate::token_grant_failure::TokenGrantFailure;
 
 /// SPIFFE JWT-SVID claims used by `OpenShell` token exchange flows.
 #[derive(Debug, Clone, Deserialize)]
@@ -169,19 +171,23 @@ impl fmt::Debug for SandboxJwtSvid {
 /// before each request; implementations own issuance and verification only.
 #[async_trait::async_trait]
 pub trait SandboxIdentityProvider: fmt::Debug + Send + Sync {
+    /// Failure the implementation reports. It must not carry credentials or
+    /// upstream diagnostics.
+    type Error;
+
     /// Obtain a JWT-SVID for `audience` whose identity is exactly the stable
     /// SPIFFE ID of `sandbox_id` under `gateway_id`.
     ///
     /// # Errors
     ///
-    /// Returns a sanitized failure at the workload identity stage, or a
-    /// configuration failure when the IDs cannot form a stable SPIFFE ID.
+    /// Fails when issuance or verification fails, or when the IDs cannot
+    /// form a stable SPIFFE ID.
     async fn fetch_jwt_svid(
         &self,
         gateway_id: &str,
         sandbox_id: &str,
         audience: &str,
-    ) -> Result<SandboxJwtSvid, TokenGrantFailure>;
+    ) -> Result<SandboxJwtSvid, Self::Error>;
 }
 
 /// A non-empty SPIFFE path segment other than `.` and `..`.

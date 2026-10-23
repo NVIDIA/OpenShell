@@ -12,10 +12,10 @@ mod wire;
 use std::path::PathBuf;
 
 use openshell_core::config::SpiffeDelegationConfig;
-use openshell_core::spiffe::{SandboxIdentityProvider, SandboxJwtSvid, SandboxSpiffeIdPrefix};
 use openshell_core::token_grant_failure::{
     TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
 };
+use openshell_spiffe::{SandboxIdentityProvider, SandboxJwtSvid, SandboxSpiffeIdPrefix};
 
 use client::AdminClient;
 
@@ -39,7 +39,7 @@ impl SpireDelegatedIdentity {
     /// Rejects an invalid SPIFFE ID prefix or trust domain.
     pub fn new(config: &SpiffeDelegationConfig) -> Result<Self, String> {
         let prefix = SandboxSpiffeIdPrefix::parse(&config.spiffe_id_prefix)?;
-        let trust_domain = openshell_core::spiffe::trust_domain(prefix.as_str())
+        let trust_domain = openshell_spiffe::trust_domain(prefix.as_str())
             .and_then(|name| spiffe::TrustDomain::new(name).ok())
             .ok_or("spiffe_delegation prefix has no valid trust domain")?;
         Ok(Self {
@@ -52,6 +52,8 @@ impl SpireDelegatedIdentity {
 
 #[async_trait::async_trait]
 impl SandboxIdentityProvider for SpireDelegatedIdentity {
+    type Error = TokenGrantFailure;
+
     async fn fetch_jwt_svid(
         &self,
         gateway_id: &str,

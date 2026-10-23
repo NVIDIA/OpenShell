@@ -7,7 +7,9 @@ the gateway reaches the SPIRE agent.
 ## Interface
 
 `SpireDelegatedIdentity` implements
-`openshell_core::spiffe::SandboxIdentityProvider`. The gateway builds it once
+`openshell_spiffe::SandboxIdentityProvider` with
+`openshell_core::token_grant_failure::TokenGrantFailure` as its error type.
+The gateway builds it once
 at startup from `[openshell.gateway.spiffe_delegation]` and keeps it as a
 trait object, so the provider-token broker does not depend on SPIRE. The
 broker authorizes the sandbox session and provider credential first, then asks
@@ -22,7 +24,7 @@ its verified expiry. Its `Debug` output omits the token.
 
 The stable identity is
 `<spiffe_id_prefix>/gateway/<gateway-id>/sandbox/<sandbox-id>`, built by
-`openshell_core::spiffe::SandboxSpiffeIdPrefix`, which configuration
+`openshell_spiffe::SandboxSpiffeIdPrefix`, which configuration
 validation also uses. Gateway and sandbox IDs must already be SPIFFE path
 segments; anything else fails as a configuration error before the agent is
 contacted.

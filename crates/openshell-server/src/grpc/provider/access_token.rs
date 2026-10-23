@@ -19,8 +19,8 @@ use openshell_core::proto::{
     GetSandboxProviderAccessTokenRequest, GetSandboxProviderAccessTokenResponse,
     ProviderCredentialTokenGrant,
 };
-use openshell_core::spiffe::SandboxIdentityProvider;
 use openshell_core::token_grant_failure::BROKERED_TOKEN_GATEWAY_DEADLINE;
+use openshell_spiffe::SandboxIdentityProvider;
 use std::time::Duration;
 
 static ACCESS_TOKENS: LazyLock<IntermediateTokenCache> = LazyLock::new(IntermediateTokenCache::new);
@@ -354,7 +354,7 @@ async fn acquire(
     state: &ServerState,
     bearer: &str,
     session: &AuthenticatedSandboxSession,
-    identity: &dyn SandboxIdentityProvider,
+    identity: &dyn SandboxIdentityProvider<Error = TokenGrantFailure>,
     gateway_id: &str,
     grant: &ProviderCredentialTokenGrant,
     subject: Option<&Subject>,

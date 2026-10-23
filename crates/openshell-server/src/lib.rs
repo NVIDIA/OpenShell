@@ -62,10 +62,12 @@ mod ws_tunnel;
 
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
+use openshell_core::token_grant_failure::TokenGrantFailure;
 use openshell_core::{Config, Error, ObjectLabels, Result};
 use openshell_extension_core::{
     BearerTokenSlot, ExtensionAudience, ExtensionCallerKind, ExtensionKind, MAX_EXTENSION_TOKEN_TTL,
 };
+use openshell_spiffe::SandboxIdentityProvider;
 use openshell_supervisor_middleware::MiddlewareRegistry;
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
@@ -417,7 +419,8 @@ pub struct ServerState {
 
     /// Source of sandbox JWT-SVIDs for brokered provider tokens, built once
     /// from the SPIRE delegation settings. `None` when disabled.
-    pub(crate) sandbox_identity: Option<Arc<dyn openshell_core::spiffe::SandboxIdentityProvider>>,
+    pub(crate) sandbox_identity:
+        Option<Arc<dyn SandboxIdentityProvider<Error = TokenGrantFailure>>>,
 
     /// OIDC admin role name for workspace-level authorization.
     /// Empty when OIDC is not configured — `authorize_workspace()` treats

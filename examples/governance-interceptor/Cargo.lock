@@ -1865,6 +1865,7 @@ dependencies = [
  "openshell-crypto",
  "openshell-extension-core",
  "openshell-policy-schema",
+ "openshell-spiffe",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
@@ -1972,6 +1973,17 @@ dependencies = [
  "serde_json",
  "thiserror",
  "url",
+]
+
+[[package]]
+name = "openshell-spiffe"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
