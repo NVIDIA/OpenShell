@@ -155,6 +155,12 @@ Read through the full diff (and the PR description if available). Produce a summ
     for both the prior and proposed behavior.
 - **Cryptographic boundaries**: For changed first-party security-sensitive crypto, verify use of `openshell-crypto`, backend dispatch, failure propagation without fallback, and protocol/storage compatibility. Missing operations belong in the facade/backend contracts. Check dependency-owned and non-security exceptions against the repository's [crypto architecture](../../../crates/openshell-crypto/CRYPTO.md); protocol/parsing types alone are not bypasses. Report undocumented bypasses or scope expansion under **Potential Concerns**.
 - **Agent infrastructure**: When the PR changes behavior, commands, or development workflows, use the `sync-agent-infra` maintenance map to check that related skills were updated. When it adds, removes, or renames skills or crates; changes workflow relationships or skill coverage; modifies issue or PR templates; or changes agent cross-references, apply the full consistency checklist. Report missing companion updates or drift under **Potential Concerns**.
+- **Test quality**: When the PR adds or changes tests, apply the `test-audit`
+  skill's junk-pattern checks to the diff. Report an assertion-free probe,
+  implementation-coupled test, mock-only coverage of a dependency a real
+  integration test could exercise cheaply, or near-duplicate coverage under
+  **Potential Concerns** when it creates a concrete risk, rather than
+  duplicating `test-audit`'s detailed criteria here.
 
 ## Step 5: Output
 

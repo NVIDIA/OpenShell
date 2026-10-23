@@ -32,6 +32,7 @@ Run after adding, removing, or renaming a skill or crate; changing issue or PR c
 | Gator supervision | `launch-openshell-gator` |
 | SBOM workflow | `sbom` |
 | RFC workflow | `create-rfc` |
+| Test authoring, test-quality gating, or junk-test patterns | `build-from-issue`, `review-github-pr` |
 
 Search both `skills/` and `.agents/skills/` for affected commands, fields, and components; the map is a starting point.
 
@@ -44,6 +45,7 @@ Search both `skills/` and `.agents/skills/` for affected commands, fields, and c
 5. Check the PR template, `create-github-pr`, `build-from-issue`, `fix-security-issue`, and `CONTRIBUTING.md`: every PR must close an existing issue covering its scope, except automated dependency updates and build or flaky-test fixes from authors with write access, as described in `CONTRIBUTING.md`. Multi-PR work needs an issue per PR; a separate issue may track the overall effort.
 6. Check contributor branch instructions and examples against Branch Names in `CONTRIBUTING.md`; AGENTS.md and skills should refer to that convention. Check `README.md`, `.github/ISSUE_TEMPLATE/`, `.github/workflows/`, `.agents/agents/`, and related skill cross references for stale workflow statements. Keep user-facing documentation changes minimal and avoid duplicated internal explanations.
 7. Check that PR, build, TUI, and docs contribution guidance follow the scoped verification guidance in `CONTRIBUTING.md`; they must not require full Rust, SDK, or repository CI for changes that cannot affect those areas.
-8. Use `npx -y skills add . --list` from a disposable clean copy when skill discovery changes. It should expose public skills only; clean generated files afterward.
+8. **Test-audit routing** — `build-from-issue` and `review-github-pr` must route test authoring and review to the `test-audit` skill's authoring gate and junk-pattern checks without copying its detailed criteria.
+9. Use `npx -y skills add . --list` from a disposable clean copy when skill discovery changes. It should expose public skills only; clean generated files afterward.
 
 Fix contradictions, then repeat the affected checks. Report files changed and any remaining drift. Do not treat an old document's label list as a source of truth over current GitHub metadata.
