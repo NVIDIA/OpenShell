@@ -506,6 +506,18 @@ The gateway honors these variables:
 | `OTEL_EXPORTER_OTLP_LOGS_HEADERS`, `OTEL_EXPORTER_OTLP_LOGS_COMPRESSION`, `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` | Exporter transport tuning for OCSF log records only. These override the general variables. |
 | `SSL_CERT_FILE`, `SSL_CERT_DIR` | Additional trust roots for `https://` endpoints, such as a private CA. |
 
+For Helm deployments, set these variables with `server.extraEnv`. Read credentials from a Secret so they stay out of the values file:
+
+```yaml
+server:
+  extraEnv:
+    - name: OTEL_EXPORTER_OTLP_HEADERS
+      valueFrom:
+        secretKeyRef:
+          name: otel-collector-auth
+          key: headers
+```
+
 These variables have no effect. Only `[openshell.gateway.otlp]` decides which signals are exported and where they go, for two reasons:
 
 - OCSF events are security records, so where they go must be a deliberate choice. Platform tooling can add `OTEL_*` variables to a process, as the OpenTelemetry Operator does for annotated pods on Kubernetes. Such a variable must not start sending security records to a collector, redirect them, or turn them off.

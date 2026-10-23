@@ -369,6 +369,9 @@ server:
   extraVolumes: []
   # -- Additional volume mounts for the gateway container.
   extraVolumeMounts: []
+  # -- Additional environment variables for the gateway container, such as
+  # OTEL_* exporter settings. Entries can read from a Secret with valueFrom.
+  extraEnv: []
   # -- Enable anonymous OpenShell telemetry from the gateway and the sandbox
   # supervisors it launches.
   telemetryEnabled: true

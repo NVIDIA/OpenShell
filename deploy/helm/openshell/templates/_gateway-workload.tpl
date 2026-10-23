@@ -140,6 +140,9 @@ spec:
         - name: OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET
           value: {{ $spiffeSocketPath | quote }}
         {{- end }}
+        {{- with .Values.server.extraEnv }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       volumeMounts:
         {{- if eq (include "openshell.workloadKind" .) "statefulset" }}
         - name: openshell-data
