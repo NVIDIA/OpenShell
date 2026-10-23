@@ -3,6 +3,9 @@
 
 //! HTTP response pre-return middleware chain execution.
 
+// Response failures retain structured context for downstream error handling.
+#![allow(clippy::result_large_err)]
+
 mod preflight;
 mod validation;
 
@@ -2319,7 +2322,7 @@ mod tests {
             if allowed {
                 assert_eq!(pushed.unwrap(), vec![original]);
                 assert!(!session.requires_whole_body());
-                for fill in [b'b', b'c'] {
+                for fill in *b"bc" {
                     let unit = vec![fill; MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES];
                     assert_eq!(
                         session

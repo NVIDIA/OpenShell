@@ -62,6 +62,7 @@ impl Drop for PendingDnsSlot {
     }
 }
 
+#[allow(deprecated, reason = "try_update requires Rust 1.95; MSRV is 1.94")]
 fn acquire_pending_dns_slot(active: &Arc<AtomicUsize>) -> io::Result<PendingDnsSlot> {
     active
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -71,6 +72,7 @@ fn acquire_pending_dns_slot(active: &Arc<AtomicUsize>) -> io::Result<PendingDnsS
         .map_err(|_| io::Error::from_raw_os_error(libc::EAGAIN))
 }
 
+#[allow(deprecated, reason = "try_update requires Rust 1.95; MSRV is 1.94")]
 fn acquire_pending_open_slot(active: &Arc<AtomicUsize>) -> io::Result<PendingOpenSlot> {
     active
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {

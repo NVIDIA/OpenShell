@@ -585,13 +585,11 @@ impl VmDriverConfig {
                 "OPENSHELL_VM_TLS_CA is required when TLS materials are configured".to_string(),
             );
         };
-        for path in [&ca] {
-            if !path.is_file() {
-                return Err(format!(
-                    "TLS material '{}' does not exist or is not a file",
-                    path.display()
-                ));
-            }
+        if !ca.is_file() {
+            return Err(format!(
+                "TLS material '{}' does not exist or is not a file",
+                ca.display()
+            ));
         }
 
         Ok(Some(VmDriverTlsPaths { ca }))

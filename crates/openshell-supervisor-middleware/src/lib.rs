@@ -4687,7 +4687,9 @@ mod tests {
         assert_eq!(outcome.findings.len(), MAX_MIDDLEWARE_CHAIN_FINDINGS);
         for (stage, findings) in outcome
             .findings
-            .chunks_exact(MAX_MIDDLEWARE_FINDINGS_PER_STAGE)
+            .as_chunks::<MAX_MIDDLEWARE_FINDINGS_PER_STAGE>()
+            .0
+            .iter()
             .enumerate()
         {
             assert!(

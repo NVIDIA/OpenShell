@@ -609,14 +609,13 @@ mod tests {
             let errno = *libc::__errno_location();
             if ret == -1 && errno == expected_errno {
                 libc::_exit(0);
-            } else {
-                // Write diagnostic before exiting so test failures are debuggable.
-                let msg = format!(
-                    "syscall {syscall_nr}: expected errno={expected_errno}, got ret={ret} errno={errno}\n"
-                );
-                libc::write(2, msg.as_ptr().cast(), msg.len());
-                libc::_exit(1);
             }
+            // Write diagnostic before exiting so test failures are debuggable.
+            let msg = format!(
+                "syscall {syscall_nr}: expected errno={expected_errno}, got ret={ret} errno={errno}\n"
+            );
+            libc::write(2, msg.as_ptr().cast(), msg.len());
+            libc::_exit(1);
         }
         // Parent: wait for child.
         let mut status: libc::c_int = 0;
@@ -697,13 +696,12 @@ mod tests {
                 let errno = *libc::__errno_location();
                 if ret == -1 && errno == libc::EPERM {
                     libc::_exit(0);
-                } else {
-                    let msg = format!(
-                        "mount: expected EPERM after supervisor prelude, got ret={ret} errno={errno}\n"
-                    );
-                    libc::write(2, msg.as_ptr().cast(), msg.len());
-                    libc::_exit(1);
                 }
+                let msg = format!(
+                    "mount: expected EPERM after supervisor prelude, got ret={ret} errno={errno}\n"
+                );
+                libc::write(2, msg.as_ptr().cast(), msg.len());
+                libc::_exit(1);
             }
         }
 
@@ -731,11 +729,10 @@ mod tests {
                 let errno = *libc::__errno_location();
                 if ret == -1 && errno == libc::ENOSYS {
                     libc::_exit(0);
-                } else {
-                    let msg = format!("clone3: expected ENOSYS, got ret={ret} errno={errno}\n");
-                    libc::write(2, msg.as_ptr().cast(), msg.len());
-                    libc::_exit(1);
                 }
+                let msg = format!("clone3: expected ENOSYS, got ret={ret} errno={errno}\n");
+                libc::write(2, msg.as_ptr().cast(), msg.len());
+                libc::_exit(1);
             }
         }
         let mut status: libc::c_int = 0;
@@ -808,14 +805,13 @@ mod tests {
                 if fd >= 0 {
                     libc::close(fd);
                     libc::_exit(0);
-                } else {
-                    let errno = *libc::__errno_location();
-                    let msg = format!(
-                        "socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE): expected success, got errno={errno}\n"
-                    );
-                    libc::write(2, msg.as_ptr().cast(), msg.len());
-                    libc::_exit(1);
                 }
+                let errno = *libc::__errno_location();
+                let msg = format!(
+                    "socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE): expected success, got errno={errno}\n"
+                );
+                libc::write(2, msg.as_ptr().cast(), msg.len());
+                libc::_exit(1);
             }
         }
         let mut status: libc::c_int = 0;
@@ -843,16 +839,15 @@ mod tests {
                 let errno = *libc::__errno_location();
                 if fd == -1 && errno == libc::EPERM {
                     libc::_exit(0);
-                } else {
-                    if fd >= 0 {
-                        libc::close(fd);
-                    }
-                    let msg = format!(
-                        "socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG): expected EPERM, got fd={fd} errno={errno}\n"
-                    );
-                    libc::write(2, msg.as_ptr().cast(), msg.len());
-                    libc::_exit(1);
                 }
+                if fd >= 0 {
+                    libc::close(fd);
+                }
+                let msg = format!(
+                    "socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG): expected EPERM, got fd={fd} errno={errno}\n"
+                );
+                libc::write(2, msg.as_ptr().cast(), msg.len());
+                libc::_exit(1);
             }
         }
         let mut status: libc::c_int = 0;
