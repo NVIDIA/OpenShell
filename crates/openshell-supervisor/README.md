@@ -163,6 +163,10 @@ control listener: it dials the gateway and receives its assignments from it.
   connection begins. Private files live under `--session-root` (proxy CA,
   trust directory, SSH socket); the registry owns removal and keeps the route
   reserved until the instance has ended and its files are deleted.
+  The Helm chart mounts this root on a memory-backed `emptyDir`, keeping
+  per-instance proxy CA private keys off the node filesystem. The files count
+  toward the supervisor container's memory usage. Durable launch Secrets used
+  for gateway recovery remain separate from this runtime storage.
 - **Status.** After each reconciliation and whenever an instance is admitted,
   changes phase or readiness, or is removed, the host sends a complete
   `HostStatus` naming the revision it has reconciled to; readiness is set only

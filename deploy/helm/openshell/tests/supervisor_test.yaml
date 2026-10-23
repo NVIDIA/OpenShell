@@ -80,6 +80,13 @@ tests:
             name: run
             mountPath: /run/openshell
         documentIndex: 0
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: run
+            emptyDir:
+              medium: Memory
+        documentIndex: 0
       - equal:
           path: spec.ports
           value:

@@ -90,6 +90,14 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 | VM | VM driver logs, rootfs availability, host virtualization support. |
 | Extension | External driver process, Unix socket ownership/mode, configured driver name, capability handshake, gateway logs. |
 
+For the shared supervisor (`supervisor_topology = "gateway"`), the chart mounts
+`/run/openshell` on a memory-backed `emptyDir` (`medium: Memory`). This holds
+per-instance proxy CA private keys and trust files under
+`/run/openshell/sessions`; its contents count toward the supervisor container's
+memory usage and disappear when the Pod is removed. Check the deployed Pod's
+`run` volume if it uses an older chart. Durable launch Secrets used for gateway
+recovery are separate and remain in Kubernetes Secret storage.
+
 ### Step 3: Check Gateway Startup Dependencies
 
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
