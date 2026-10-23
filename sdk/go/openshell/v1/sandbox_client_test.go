@@ -45,8 +45,13 @@ type mockSandboxServer struct {
 	watchEvents          []*pb.SandboxStreamEvent
 	watchErr             error
 	watchPostEventsErr   error
-	watchKeepOpen        chan struct{}           // if non-nil, WatchSandbox blocks after sending events until closed
-	watchRequest         *pb.WatchSandboxRequest // recorded request
+	watchKeepOpen        chan struct{}             // if non-nil, WatchSandbox blocks after sending events until closed
+	watchRequest         *pb.WatchSandboxRequest   // last recorded request
+	watchRequests        []*pb.WatchSandboxRequest // every recorded request, in attempt order
+	// watchFunc, when set, fully replaces the default WatchSandbox behavior.
+	// attempt is the zero-based index of this call, letting a test script a
+	// different response per reconnect.
+	watchFunc func(attempt int, req *pb.WatchSandboxRequest, stream grpc.ServerStreamingServer[pb.SandboxStreamEvent]) error
 
 	// GetLogs fields
 	getLogsResp    *pb.GetSandboxLogsResponse
@@ -238,7 +243,13 @@ func (s *mockSandboxServer) ListSandboxProviders(_ context.Context, req *pb.List
 func (s *mockSandboxServer) WatchSandbox(req *pb.WatchSandboxRequest, stream grpc.ServerStreamingServer[pb.SandboxStreamEvent]) error {
 	s.mu.Lock()
 	s.watchRequest = req
+	s.watchRequests = append(s.watchRequests, proto.Clone(req).(*pb.WatchSandboxRequest))
+	attempt := len(s.watchRequests) - 1
+	handler := s.watchFunc
 	s.mu.Unlock()
+	if handler != nil {
+		return handler(attempt, req, stream)
+	}
 	if s.watchErr != nil {
 		return s.watchErr
 	}
