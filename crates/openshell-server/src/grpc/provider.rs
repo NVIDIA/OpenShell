@@ -1532,6 +1532,104 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
     })
 }
 
+/// Copy authored request metadata for static values that survived snapshot
+/// filtering. The reserved namespace keeps it separate from endpoint token grants;
+/// older supervisors ignore entries without `token_grant` before parsing selectors.
+pub(super) fn static_credential_request_metadata(
+    sandbox_id: &str,
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[ProviderEnvironmentRecord],
+    environment: &ProviderEnvironment,
+) -> Result<HashMap<String, ProviderProfileCredential>, Status> {
+    use openshell_core::provider_credentials::STATIC_CREDENTIAL_METADATA_PREFIX;
+    let mut metadata = HashMap::new();
+    for record in records {
+        let provider = &record.provider;
+        let Some(profile) = get_provider_type_profile_for_scope(
+            catalog,
+            &provider.r#type,
+            &provider.profile_workspace,
+        ) else {
+            continue;
+        };
+        let refresh_epochs = refresh_authorization_epochs_by_key(record)?;
+        for credential in &profile.credentials {
+            if !has_usable_static_request_metadata(
+                &credential.auth_style,
+                &credential.header_name,
+                &credential.query_param,
+                &credential.path_template,
+            ) {
+                continue;
+            }
+            for key in credential.accepted_stored_keys() {
+                if !environment.environment.contains_key(key)
+                    || !environment.static_credential_keys.contains(key)
+                {
+                    continue;
+                }
+                let Some(baseline) = environment.static_credential_bindings.get(key) else {
+                    continue;
+                };
+                // A later optional declaration with the same environment key
+                // must not override metadata belonging to the actual owner.
+                let expected = static_credential_binding(
+                    Some(sandbox_id),
+                    record,
+                    key,
+                    &baseline.endpoints,
+                    refresh_epochs.get(key).map(String::as_str),
+                    credential.stable_placeholder,
+                );
+                if expected != *baseline {
+                    continue;
+                }
+                metadata.insert(
+                    format!("{STATIC_CREDENTIAL_METADATA_PREFIX}{key}"),
+                    ProviderProfileCredential {
+                        name: credential.name.clone(),
+                        env_vars: vec![key.to_string()],
+                        auth_style: credential.auth_style.clone(),
+                        header_name: credential.header_name.clone(),
+                        query_param: credential.query_param.clone(),
+                        path_template: credential.path_template.clone(),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
+    Ok(metadata)
+}
+
+const CREDENTIAL_PATH_SLOT: &str = "{credential}";
+
+fn has_usable_static_request_metadata(
+    auth_style: &str,
+    header_name: &str,
+    query_param: &str,
+    path_template: &str,
+) -> bool {
+    match auth_style.trim().to_ascii_lowercase().as_str() {
+        "basic" => true,
+        "header" | "bearer" => header_name.trim().parse::<http::HeaderName>().is_ok(),
+        "query" => {
+            !query_param.trim().is_empty()
+                && !query_param
+                    .chars()
+                    .any(|c| c.is_control() || "&=#?".contains(c))
+        }
+        "path" => {
+            path_template.starts_with('/')
+                && path_template.matches(CREDENTIAL_PATH_SLOT).count() == 1
+                && !path_template
+                    .chars()
+                    .any(|c| c.is_control() || "?#".contains(c))
+        }
+        _ => false,
+    }
+}
+
 fn refresh_authorization_epochs_by_key(
     record: &ProviderEnvironmentRecord,
 ) -> Result<HashMap<String, String>, Status> {
@@ -12161,6 +12259,97 @@ mod tests {
                 .static_credential_bindings
                 .get("CLAUDE_API_KEY")
                 .is_some_and(|binding| !binding.endpoints.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn static_request_metadata_is_minimal_owner_bound_and_tracks_delivered_values() {
+        use openshell_core::provider_credentials::STATIC_CREDENTIAL_METADATA_PREFIX;
+        let store = test_store().await;
+        let mut owned = custom_profile("metadata-owner");
+        owned.credentials = vec![static_credential("token", "TOKEN", true)];
+        owned.endpoints = vec![NetworkEndpoint {
+            host: "api.example.com".into(),
+            port: 443,
+            protocol: "rest".into(),
+            access: openshell_core::proto::NetworkAccessPreset::Full as i32,
+            ..Default::default()
+        }];
+        let mut optional = owned.clone();
+        optional.id = "metadata-optional".into();
+        optional.credentials[0].required = false;
+        optional.credentials[0].header_name = "x-wrong-owner".into();
+        let sources = ProviderProfileSources::from_test_profiles(vec![owned, optional]);
+        let catalog = sources.snapshot_catalog(&store, "default").await.unwrap();
+        let record = |name: &str, id: &str, profile: &str| ProviderEnvironmentRecord {
+            name: name.into(),
+            object_id: id.into(),
+            resource_version: 1,
+            provider: Provider {
+                r#type: profile.into(),
+                profile_workspace: "default".into(),
+                ..Default::default()
+            },
+            refresh_states: Vec::new(),
+        };
+        let mut records = [
+            record("owner", "owner-id", "metadata-owner"),
+            record("optional", "optional-id", "metadata-optional"),
+        ];
+        records[0]
+            .provider
+            .credentials
+            .insert("TOKEN".into(), "synthetic-sensitive-token".into());
+        let endpoints = vec![StaticCredentialEndpointBinding {
+            host: "api.example.com".into(),
+            port: 443,
+            path: "/**".into(),
+        }];
+        let baseline = static_credential_binding(
+            Some("sandbox"),
+            &records[0],
+            "TOKEN",
+            &endpoints,
+            None,
+            false,
+        );
+        let mut environment = ProviderEnvironment {
+            environment: HashMap::from([("TOKEN".into(), "synthetic-sensitive-token".into())]),
+            static_credential_keys: HashSet::from(["TOKEN".into()]),
+            static_credential_bindings: HashMap::from([("TOKEN".into(), baseline.clone())]),
+            ..Default::default()
+        };
+        let metadata =
+            static_credential_request_metadata("sandbox", &catalog, &records, &environment)
+                .unwrap();
+        let key = format!("{STATIC_CREDENTIAL_METADATA_PREFIX}TOKEN");
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(
+            metadata[&key],
+            ProviderProfileCredential {
+                name: "token".into(),
+                env_vars: vec!["TOKEN".into()],
+                auth_style: "bearer".into(),
+                header_name: "authorization".into(),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            environment.static_credential_bindings["TOKEN"], baseline,
+            "legacy handles and identities must not change"
+        );
+        let encoded = metadata[&key].encode_to_vec();
+        assert!(
+            !encoded
+                .windows(b"synthetic-sensitive-token".len())
+                .any(|window| window == b"synthetic-sensitive-token")
+        );
+        environment.environment.remove("TOKEN");
+        assert!(
+            static_credential_request_metadata("sandbox", &catalog, &records, &environment)
+                .unwrap()
+                .is_empty(),
+            "expired or withheld material must not leave request metadata behind"
         );
     }
 

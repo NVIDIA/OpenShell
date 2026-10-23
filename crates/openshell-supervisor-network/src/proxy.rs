@@ -6490,7 +6490,10 @@ async fn handle_forward_proxy(
                     .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                     .await;
             }
-            if e.is_endpoint_mismatch() {
+            if e.is_placement_mismatch() {
+                crate::l7::relay::reject_credential_resolution(client, &l7_ctx, method, &e).await?;
+                client.shutdown().await.into_diagnostic()?;
+            } else if e.is_endpoint_mismatch() {
                 if let Some(observer) = endpoint_observer.as_ref() {
                     observer.observe_credential_failure(true);
                 }
@@ -13005,6 +13008,9 @@ network_policies:
             credentials
                 .resolver
                 .expect("endpoint resolver")
+                .with_request_location(secrets::RequestCredentialLocation::Header(
+                    "Authorization".into()
+                ))
                 .resolve_placeholder("openshell:resolve:env:v42_API_TOKEN"),
             Some("secret")
         );

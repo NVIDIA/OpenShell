@@ -2712,9 +2712,10 @@ message GetSandboxProviderEnvironmentResponse {
   uint64 provider_env_revision = 2;
   // Expiration timestamps for returned environment variables.
   map<string, google.protobuf.Timestamp> credential_expiration_times = 103;
-  // Dynamic credentials that require token grants or other runtime injection.
-  // Maps endpoint-bound provider metadata to credential metadata.
-  // Supervisor uses this to inject Authorization headers for token grant credentials.
+  // Endpoint-bound token grants and static credential request metadata.
+  // Reserved static-env:<ENV_KEY> entries carry authored placement fields for
+  // a delivered static value and have no token_grant. Older supervisors ignore
+  // those entries; newer supervisors separate them before grant processing.
   map<string, ProviderProfileCredential> dynamic_credentials = 4;
   // Endpoint allowlists for static credential environment variables. Metadata
   // can be incomplete when a provider profile is invalid; capable supervisors
@@ -2775,6 +2776,8 @@ message ProviderEnvironmentValue {
 message ProviderEnvironmentSnapshot {
   uint64 provider_env_revision = 1;
   repeated ProviderEnvironmentValue values = 2;
+  // Token grants and reserved static-env:<ENV_KEY> request metadata, atomically
+  // delivered with the static environment. Metadata entries have no token_grant.
   map<string, ProviderProfileCredential> dynamic_credentials = 3;
   string provider_attachment_epoch = 4;
   string policy_hash = 5;

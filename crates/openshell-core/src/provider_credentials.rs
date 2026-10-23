@@ -3,7 +3,7 @@
 
 //! Runtime provider credential snapshots.
 
-use crate::secrets::SecretResolver;
+use crate::secrets::{CredentialPlacement, SecretResolver};
 use crate::{
     endpoint_path::EndpointPathPattern,
     host_pattern::HostPattern,
@@ -67,6 +67,7 @@ struct StaticCredentialIdentityEpoch {
 
 #[derive(Debug, Clone)]
 struct CompiledStaticCredentialBinding {
+    placement: CredentialPlacement,
     endpoints: Vec<CompiledStaticCredentialEndpointBinding>,
     credential_identity: String,
     workload_credential_handle: String,
@@ -97,6 +98,29 @@ impl fmt::Display for StaticCredentialBindingError {
 
 impl std::error::Error for StaticCredentialBindingError {}
 
+/// Reserved entries in the existing credential map carry static placement only.
+pub const STATIC_CREDENTIAL_METADATA_PREFIX: &str = "static-env:";
+
+const CREDENTIAL_PATH_SLOT: &str = "{credential}";
+
+fn split_static_credential_metadata(
+    credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
+) -> (
+    HashMap<String, crate::proto::ProviderProfileCredential>,
+    HashMap<String, crate::proto::ProviderProfileCredential>,
+) {
+    let mut metadata = HashMap::new();
+    let mut grants = HashMap::new();
+    for (key, credential) in credentials {
+        if let Some(env_key) = key.strip_prefix(STATIC_CREDENTIAL_METADATA_PREFIX) {
+            metadata.insert(env_key.to_string(), credential);
+        } else {
+            grants.insert(key, credential);
+        }
+    }
+    (metadata, grants)
+}
+
 impl ProviderCredentialState {
     pub fn from_environment(
         revision: u64,
@@ -104,6 +128,7 @@ impl ProviderCredentialState {
         credential_expires_at_ms: HashMap<String, i64>,
         dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
     ) -> Self {
+        let (_, dynamic_credentials) = split_static_credential_metadata(dynamic_credentials);
         let (child_env, generation_resolver, current_resolver) =
             SecretResolver::from_provider_env_for_current_revision(
                 env,
@@ -173,11 +198,14 @@ impl ProviderCredentialState {
         non_secret_environment_keys: Vec<String>,
         stable_placeholder_environment_keys: Vec<String>,
     ) -> Result<Self, StaticCredentialBindingError> {
+        let (placement_metadata, dynamic_credentials) =
+            split_static_credential_metadata(dynamic_credentials);
         let static_credential_bindings = compile_static_credential_bindings(
             &env,
             static_credential_bindings,
             &non_secret_environment_keys,
             &stable_placeholder_environment_keys,
+            &placement_metadata,
         )?;
         let stable_handles = static_credential_stable_handles(&static_credential_bindings);
         let (child_env, generation_resolver, current_resolver) =
@@ -304,11 +332,21 @@ impl ProviderCredentialState {
     }
 
     pub fn resolver(&self) -> Option<Arc<SecretResolver>> {
-        self.inner
+        let inner = self
+            .inner
             .read()
-            .expect("provider credential state poisoned")
-            .combined_resolver
-            .clone()
+            .expect("provider credential state poisoned");
+        inner.combined_resolver.as_ref().map(|resolver| {
+            Arc::new(
+                resolver.as_ref().clone().with_placements(
+                    inner
+                        .static_credential_bindings
+                        .iter()
+                        .map(|(key, binding)| (key.clone(), binding.placement.clone()))
+                        .collect(),
+                ),
+            )
+        })
     }
 
     /// Resolve provider placeholders only for credentials bound to this
@@ -414,11 +452,23 @@ impl ProviderCredentialState {
                 })
                 .map(|(key, epoch)| (key.clone(), epoch.revisions.clone()))
                 .collect();
-            Arc::new(resolver.scoped_to_env_keys(
-                &inner.known_static_credential_keys,
-                &allowed,
-                revision_fallback_allowed_revisions,
-            ))
+            Arc::new(
+                resolver
+                    .as_ref()
+                    .clone()
+                    .with_placements(
+                        inner
+                            .static_credential_bindings
+                            .iter()
+                            .map(|(key, binding)| (key.clone(), binding.placement.clone()))
+                            .collect(),
+                    )
+                    .scoped_to_env_keys(
+                        &inner.known_static_credential_keys,
+                        &allowed,
+                        revision_fallback_allowed_revisions,
+                    ),
+            )
         });
         (resolver, classifier, revision)
     }
@@ -694,6 +744,7 @@ impl ProviderCredentialState {
         credential_expires_at_ms: HashMap<String, i64>,
         dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
     ) -> usize {
+        let (_, dynamic_credentials) = split_static_credential_metadata(dynamic_credentials);
         let (mut child_env, generation_resolver, current_resolver) =
             SecretResolver::from_provider_env_for_current_revision(
                 env,
@@ -774,11 +825,14 @@ impl ProviderCredentialState {
         non_secret_environment_keys: Vec<String>,
         stable_placeholder_environment_keys: Vec<String>,
     ) -> Result<usize, StaticCredentialBindingError> {
+        let (placement_metadata, dynamic_credentials) =
+            split_static_credential_metadata(dynamic_credentials);
         let static_credential_bindings = match compile_static_credential_bindings(
             &env,
             static_credential_bindings,
             &non_secret_environment_keys,
             &stable_placeholder_environment_keys,
+            &placement_metadata,
         ) {
             Ok(bindings) => bindings,
             Err(error) => {
@@ -939,6 +993,7 @@ impl ProviderCredentialState {
             .expect("provider credential state poisoned");
         let dynamic_credentials =
             dynamic_credentials.unwrap_or_else(|| inner.current.dynamic_credentials.clone());
+        let (_, dynamic_credentials) = split_static_credential_metadata(dynamic_credentials);
         inner.current = Arc::new(ProviderCredentialSnapshot {
             installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
@@ -959,7 +1014,22 @@ fn compile_static_credential_bindings(
     bindings: HashMap<String, StaticCredentialBinding>,
     non_secret_environment_keys: &[String],
     stable_placeholder_environment_keys: &[String],
+    placement_metadata: &HashMap<String, crate::proto::ProviderProfileCredential>,
 ) -> Result<HashMap<String, CompiledStaticCredentialBinding>, StaticCredentialBindingError> {
+    for (key, metadata) in placement_metadata {
+        if !env.contains_key(key)
+            || !bindings.contains_key(key)
+            || metadata.env_vars.len() != 1
+            || metadata.env_vars[0] != *key
+            || metadata.token_grant.is_some()
+            || metadata.refresh.is_some()
+            || !metadata.token_grant_owners.is_empty()
+        {
+            return Err(binding_error(
+                "static credential placement metadata does not match delivered credentials",
+            ));
+        }
+    }
     let non_secret_keys = non_secret_environment_keys
         .iter()
         .cloned()
@@ -1056,6 +1126,10 @@ fn compile_static_credential_bindings(
     bindings
         .into_iter()
         .map(|(key, binding)| {
+            let placement = placement_metadata.get(&key).map_or(
+                Ok(CredentialPlacement::Legacy),
+                compile_credential_placement,
+            )?;
             let endpoints = binding
                 .endpoints
                 .into_iter()
@@ -1065,12 +1139,56 @@ fn compile_static_credential_bindings(
                 key,
                 CompiledStaticCredentialBinding {
                     endpoints,
+                    placement,
                     credential_identity: binding.credential_identity,
                     workload_credential_handle: binding.workload_credential_handle,
                 },
             ))
         })
         .collect()
+}
+
+fn compile_credential_placement(
+    metadata: &crate::proto::ProviderProfileCredential,
+) -> Result<CredentialPlacement, StaticCredentialBindingError> {
+    let placement = match metadata.auth_style.trim().to_ascii_lowercase().as_str() {
+        "basic" => CredentialPlacement::Header("authorization".into()),
+        "header" | "bearer"
+            if !metadata.header_name.trim().is_empty()
+                && metadata
+                    .header_name
+                    .trim()
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)) =>
+        {
+            CredentialPlacement::Header(metadata.header_name.trim().to_ascii_lowercase())
+        }
+        "query"
+            if !metadata.query_param.trim().is_empty()
+                && !metadata
+                    .query_param
+                    .chars()
+                    .any(|c| c.is_control() || "&=#?".contains(c)) =>
+        {
+            CredentialPlacement::QueryParam(metadata.query_param.trim().to_string())
+        }
+        "path"
+            if metadata.path_template.starts_with('/')
+                && metadata.path_template.matches(CREDENTIAL_PATH_SLOT).count() == 1
+                && !metadata
+                    .path_template
+                    .chars()
+                    .any(|c| c.is_control() || "?#".contains(c)) =>
+        {
+            CredentialPlacement::PathTemplate(metadata.path_template.clone())
+        }
+        _ => {
+            return Err(binding_error(
+                "static credential placement metadata has an invalid request location",
+            ));
+        }
+    };
+    Ok(placement)
 }
 
 fn compile_static_credential_endpoint(
@@ -1365,15 +1483,182 @@ mod tests {
         binding
     }
 
+    fn placement_metadata(style: &str) -> HashMap<String, crate::proto::ProviderProfileCredential> {
+        HashMap::from([(
+            format!("{STATIC_CREDENTIAL_METADATA_PREFIX}API_KEY"),
+            crate::proto::ProviderProfileCredential {
+                name: "api_key".into(),
+                env_vars: vec!["API_KEY".into()],
+                auth_style: style.into(),
+                header_name: "Authorization".into(),
+                query_param: "api_key".into(),
+                path_template: "/v1/{credential}/events".into(),
+                ..Default::default()
+            },
+        )])
+    }
+
+    #[test]
+    fn static_metadata_infers_locations_without_becoming_a_token_grant() {
+        for style in ["bearer", "header", "basic", "query", "path"] {
+            let state = ProviderCredentialState::from_bound_environment(
+                7,
+                HashMap::from([("API_KEY".into(), "synthetic".into())]),
+                HashMap::new(),
+                placement_metadata(style),
+                HashMap::from([("API_KEY".into(), binding("api.example.com", 443, "/**"))]),
+                vec![],
+            )
+            .unwrap();
+            assert!(state.snapshot().dynamic_credentials.is_empty());
+            let reference = state.snapshot().child_env["API_KEY"].clone();
+            let resolver = state
+                .resolver_for_endpoint("api.example.com", 443, "/v1/chat")
+                .unwrap();
+            assert!(
+                resolver
+                    .rewrite_header_value_for_name("X-Reflect", &reference)
+                    .is_err()
+            );
+            let header = resolver.rewrite_header_value_for_name("Authorization", &reference);
+            let query = crate::secrets::rewrite_target_for_eval(
+                &format!("/v1/chat?api_key={reference}"),
+                &resolver,
+            );
+            let path = crate::secrets::rewrite_target_for_eval(
+                &format!("/v1/{reference}/events"),
+                &resolver,
+            );
+            assert_eq!(
+                header.is_ok(),
+                matches!(style, "bearer" | "header" | "basic")
+            );
+            assert_eq!(query.is_ok(), style == "query");
+            assert_eq!(path.is_ok(), style == "path");
+        }
+    }
+
+    #[test]
+    fn malformed_static_metadata_revokes_static_material_and_preserves_real_grants() {
+        for malformed in 0..6 {
+            let state = ProviderCredentialState::from_bound_environment(
+                7,
+                HashMap::from([("API_KEY".into(), "synthetic".into())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([("API_KEY".into(), binding("api.example.com", 443, "/**"))]),
+                vec![],
+            )
+            .unwrap();
+            let mut metadata = placement_metadata("header");
+            let key = format!("{STATIC_CREDENTIAL_METADATA_PREFIX}API_KEY");
+            let value = metadata.get_mut(&key).unwrap();
+            match malformed {
+                0 => value.env_vars = vec!["OTHER".into()],
+                1 => {
+                    value.token_grant = Some(crate::proto::ProviderCredentialTokenGrant::default());
+                }
+                2 => value.refresh = Some(crate::proto::ProviderCredentialRefresh::default()),
+                3 => value.token_grant_owners = vec!["owner".into()],
+                4 => value.auth_style = "unsupported".into(),
+                5 => {
+                    let value = metadata.remove(&key).unwrap();
+                    metadata.insert(format!("{STATIC_CREDENTIAL_METADATA_PREFIX}OTHER"), value);
+                }
+                _ => unreachable!(),
+            }
+            metadata.insert(
+                "real-grant".into(),
+                crate::proto::ProviderProfileCredential {
+                    token_grant: Some(crate::proto::ProviderCredentialTokenGrant::default()),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                state
+                    .install_bound_environment(
+                        8,
+                        HashMap::from([("API_KEY".into(), "replacement".into())]),
+                        HashMap::new(),
+                        metadata,
+                        HashMap::from([("API_KEY".into(), binding("api.example.com", 443, "/**"))]),
+                        vec![],
+                    )
+                    .is_err()
+            );
+            assert!(state.snapshot().child_env.is_empty());
+            assert_eq!(state.snapshot().dynamic_credentials.len(), 1);
+            assert!(
+                state
+                    .snapshot()
+                    .dynamic_credentials
+                    .contains_key("real-grant")
+            );
+        }
+    }
+
+    #[test]
+    fn stable_references_survive_metadata_arrival_and_use_the_current_location() {
+        let handle = "a".repeat(64);
+        let bindings = HashMap::from([(
+            "API_KEY".into(),
+            stable_binding("api.example.com", 443, "/**", &handle),
+        )]);
+        let state = ProviderCredentialState::from_bound_environment_with_stable_placeholders(
+            7,
+            HashMap::from([("API_KEY".into(), "synthetic".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            bindings.clone(),
+            vec![],
+            vec!["API_KEY".into()],
+        )
+        .unwrap();
+        let reference = state.snapshot().child_env["API_KEY"].clone();
+        for style in [None, Some("header"), Some("query"), None] {
+            state
+                .install_bound_environment_with_stable_placeholders(
+                    8,
+                    HashMap::from([("API_KEY".into(), "synthetic".into())]),
+                    HashMap::new(),
+                    style.map_or_else(HashMap::new, placement_metadata),
+                    bindings.clone(),
+                    vec![],
+                    vec!["API_KEY".into()],
+                )
+                .unwrap();
+            assert_eq!(state.snapshot().child_env["API_KEY"], reference);
+            let resolver = state
+                .resolver_for_endpoint("api.example.com", 443, "/v1/chat")
+                .unwrap();
+            let query = crate::secrets::rewrite_target_for_eval(
+                &format!("/v1/chat?api_key={reference}"),
+                &resolver,
+            );
+            assert_eq!(query.is_ok(), style != Some("header"));
+            assert_eq!(
+                resolver
+                    .rewrite_header_value_for_name("Authorization", &reference)
+                    .is_ok(),
+                style != Some("query")
+            );
+        }
+    }
+
     fn assert_binding_validation_error(
         env: HashMap<String, String>,
         bindings: HashMap<String, StaticCredentialBinding>,
         non_secret_environment_keys: Vec<String>,
         expected: &str,
     ) {
-        let error =
-            compile_static_credential_bindings(&env, bindings, &non_secret_environment_keys, &[])
-                .expect_err("malformed provider metadata must fail validation");
+        let error = compile_static_credential_bindings(
+            &env,
+            bindings,
+            &non_secret_environment_keys,
+            &[],
+            &HashMap::new(),
+        )
+        .expect_err("malformed provider metadata must fail validation");
         assert_eq!(error.to_string(), expected);
     }
 

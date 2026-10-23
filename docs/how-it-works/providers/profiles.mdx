@@ -70,6 +70,7 @@ A request can use a static credential only when all of these checks pass:
 | The placeholder belongs to the current attached provider state. | Sandbox provider attachment and current provider record. |
 | The calling binary and destination are allowed. | Effective sandbox network policy. |
 | The host, port, and canonical request path match the credential binding. | Provider profile endpoints, or an explicit sandbox policy binding for an endpointless profile. |
+| When supported placement metadata is available, the request location matches it or an explicit body/WebSocket rewrite policy. | The credential's `auth_style` and its header, query parameter, or path template. |
 | The HTTP method, path, or protocol operation is allowed when L7 inspection is configured. | Effective sandbox network policy. |
 | The credential has not expired. | Provider credential expiry metadata. |
 
@@ -93,6 +94,33 @@ The path `/v1/**` matches `/v1` and its descendants. An empty path, `**`, or
 glob matching. OpenShell removes the query string and uses a canonical,
 secret-redacted path for this check, so a credential embedded in a request path
 does not need to be revealed before authorization.
+
+The supervisor automatically enforces usable static credential auth metadata.
+No additional profile flag is required. Header credentials resolve only in the
+declared header, query credentials only in the declared parameter, and path
+credentials only in the `{credential}` slot of their path template. Header names
+are case-insensitive. An `Authorization` binding accepts Bearer, token, and Basic
+authentication.
+
+Existing endpoint policies that enable request-body or WebSocket text rewriting
+continue to authorize those locations. Those flags do not authorize arbitrary
+query parameters, URL paths, or unrelated headers. Trusted AWS signing retains
+its existing endpoint authorization.
+
+Credentials without usable placement metadata retain legacy endpoint-scoped
+substitution. This preserves custom profiles, policy-only AWS signers, and Codex
+refresh and ID tokens. The Codex reference profile supplies placement for its
+access token and account header.
+
+Gateway and supervisor upgrades can happen in either order. The gateway forwards
+static auth metadata with the existing provider environment. Older supervisors
+ignore it and keep their previous behavior. New supervisors connected to an older
+gateway receive no static auth metadata and retain legacy behavior. Existing
+credential delivery and wire identities remain unchanged.
+
+The hardening takes effect automatically once both components support it and
+usable placement is declared. Existing credential placeholder and update
+lifecycles remain unchanged.
 
 Use an explicit sandbox policy binding when the profile intentionally defines
 credentials without defining service endpoints. The policy names the concrete
@@ -202,7 +230,6 @@ The following provider profile design items are not part of the current behavior
 
 | Roadmap item | Current behavior |
 |---|---|
-| General profile-driven credential placement | Static `auth_style`, `header_name`, `query_param`, and `path_template` placement metadata is stored and validated, but static credential injection still depends on environment placeholders generated from provider credentials. Dynamic `token_grant` credentials support `bearer` and `header` placement for matching HTTP endpoints. |
 | Binary-scoped credential injection | Static placeholder resolution is endpoint-scoped. Dynamic grants in single-route REST and multi-route inspection also require admission by their owning endpoint's policy, including its binary restrictions. L4-only credential forwarding retains endpoint-selector matching. |
 | Credential verification on create | `openshell provider create` does not yet probe provider verification endpoints or expose `--no-verify`. |
 | Automatic credential scope extraction | OpenShell does not yet inspect upstream provider responses to discover credential scopes. |
@@ -372,12 +399,11 @@ credentials:
     stable_placeholder: false
 
     # Accepted values: basic, bearer, header, query, path.
-    # These fields describe static credential placement.
-    # Static runtime injection still uses env placeholder resolution.
+    # These fields restrict where a static placeholder can resolve.
     auth_style: bearer
     header_name: authorization
-    query_param: api_key
-    path_template: /v1/{credential}/resources
+    # For auth_style: query, set query_param: api_key instead.
+    # For auth_style: path, set path_template: /v1/{credential}/resources instead.
 
     refresh:
       # Accepted values:
