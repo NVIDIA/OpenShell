@@ -837,6 +837,7 @@ mod tests {
                     endpoint: "http://collector.internal:4317".to_string(),
                 }),
                 ocsf: None,
+                metrics: None,
             }),
             "production-us-west",
         );
@@ -869,6 +870,7 @@ mod tests {
                     endpoint: "http://siem.internal:4317".to_string(),
                     schema_version: Some(OcsfSchemaVersion::V1_3),
                 }),
+                metrics: None,
             }),
             "production-us-west",
         );

@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared OpenTelemetry trace and log export support for `OpenShell` services.
+//! Shared OpenTelemetry trace, log, and metric export support for `OpenShell` services.
 
 mod driver;
 mod grpc;
 mod logs;
+mod meter;
 mod ocsf;
 mod propagation;
 
@@ -19,6 +20,7 @@ pub use grpc::{
     RecordGrpcStatus, TracedGrpcStream, compute_driver_rpc_layer, compute_driver_rpc_operation,
     grpc_status_code_name, record_grpc_status, rpc,
 };
+pub use meter::MetricsBridge;
 pub use ocsf::{OcsfOtlp, OcsfOtlpLayer};
 pub use propagation::{
     HeaderMapExtractor, MetadataMapInjector, TRACEPARENT_ENV, TRACESTATE_ENV,
@@ -32,6 +34,7 @@ pub use opentelemetry_otlp::LogExporter;
 use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithTonicConfig};
 use opentelemetry_sdk::Resource;
+pub use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracer;
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::Subscriber;

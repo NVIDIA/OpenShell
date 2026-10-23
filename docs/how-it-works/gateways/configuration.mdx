@@ -400,7 +400,7 @@ Allow enough retention and disk space for shipper outages. Graceful shutdown all
 
 ## OTLP Export
 
-`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP/gRPC. Omit the table to disable export. Its `endpoint` is the collector for every signal the gateway exports and, on its own, enables trace export. `[openshell.gateway.otlp.traces]` sends spans to a different collector. [OCSF log export](#ocsf-log-export) is off until `[openshell.gateway.otlp.ocsf]` sets `enabled = true`, and can use its own collector.
+`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP/gRPC. Omit the table to disable export. Its `endpoint` is the collector for every signal the gateway exports and, on its own, enables trace export. `[openshell.gateway.otlp.traces]` sends spans to a different collector. [OCSF log export](#ocsf-log-export) is off until `[openshell.gateway.otlp.ocsf]` sets `enabled = true`, and can use its own collector. [Metrics push](/observability/gateway-metrics#push-metrics-over-otlp) is off until `[openshell.gateway.otlp.metrics]` sets `enabled = true`, and can use its own collector.
 
 The gateway already uses the Rust `tracing` framework for structured logs sent to stdout and the sandbox log stream. Enabling this section adds an OpenTelemetry layer to the same tracing subscriber. It exports span trees to an OTLP collector without exporting, replacing, or redirecting the existing diagnostic log events.
 
@@ -504,6 +504,8 @@ The gateway honors these variables:
 | `OTEL_EXPORTER_OTLP_COMPRESSION` | Set to `gzip` to compress exports of every signal. `zstd` is not supported. |
 | `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `OTEL_EXPORTER_OTLP_TRACES_COMPRESSION`, `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` | Exporter transport tuning for spans only. These override the general variables. |
 | `OTEL_EXPORTER_OTLP_LOGS_HEADERS`, `OTEL_EXPORTER_OTLP_LOGS_COMPRESSION`, `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` | Exporter transport tuning for OCSF log records only. These override the general variables. |
+| `OTEL_EXPORTER_OTLP_METRICS_HEADERS`, `OTEL_EXPORTER_OTLP_METRICS_COMPRESSION`, `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` | Exporter transport tuning for metrics only. These override the general variables. |
+| `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` | How often the gateway pushes metrics, in milliseconds, which defaults to 60000, and whether it sends `cumulative` (the default) or `delta` values. |
 | `SSL_CERT_FILE`, `SSL_CERT_DIR` | Additional trust roots for `https://` endpoints, such as a private CA. |
 
 These variables have no effect. Only `[openshell.gateway.otlp]` decides which signals are exported and where they go, for two reasons:
@@ -513,13 +515,12 @@ These variables have no effect. Only `[openshell.gateway.otlp]` decides which si
 
 | Variable | Reason |
 |---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Enablement has one source, `[openshell.gateway.otlp]`, so an environment variable cannot silently turn export on or redirect it. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Enablement has one source, `[openshell.gateway.otlp]`, so an environment variable cannot silently turn export on or redirect it. |
 | `OTEL_SDK_DISABLED`, `OTEL_TRACES_EXPORTER`, `OTEL_LOGS_EXPORTER`, `OTEL_METRICS_EXPORTER` | `[openshell.gateway.otlp]` decides which signals are exported. To disable export, omit it. |
-| `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | The gateway is built with the gRPC exporter only. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL`, `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` | The gateway is built with the gRPC exporter only. |
 | `OTEL_EXPORTER_OTLP_INSECURE`, `OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_KEY`, and their per-signal forms | The endpoint scheme selects TLS, and collector certificates are verified against the system trust roots. Client certificates are not supported. |
 | `OTEL_PROPAGATORS` | The gateway always propagates W3C Trace Context. |
 | `OTEL_BLRP_SCHEDULE_DELAY`, `OTEL_BLRP_MAX_QUEUE_SIZE`, `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BLRP_EXPORT_TIMEOUT` | OCSF log export uses its own queue and batching, described in [OCSF Log Export](#ocsf-log-export). |
-| `OTEL_EXPORTER_OTLP_METRICS_*`, `OTEL_METRIC_EXPORT_INTERVAL` | The gateway serves metrics for Prometheus scraping and does not export them over OTLP. |
 
 To sample 10% of traces:
 

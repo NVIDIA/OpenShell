@@ -290,9 +290,10 @@ impl TryFrom<RawOcsfLogConfig> for OcsfLogConfig {
 /// `endpoint` is the collector for every enabled signal, and on its own
 /// enables trace export. `[otlp.traces]` overrides the trace endpoint, and
 /// `[otlp.ocsf]` with `enabled = true` exports OCSF events as log records,
-/// optionally to a different endpoint. SDK tuning knobs are deliberately absent — see
-/// [`crate::otel_tracing`] for what this table owns and what the `OTEL_*`
-/// environment variables own.
+/// optionally to a different endpoint. `[otlp.metrics]` with `enabled = true`,
+/// or `metrics = true`, pushes gateway metrics. SDK tuning knobs are deliberately
+/// absent. See [`crate::otel_tracing`] for what this table owns and what the
+/// `OTEL_*` environment variables own.
 ///
 /// Endpoints are resolved when parsing, so each enabled signal carries its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,27 +311,36 @@ pub struct OtlpConfig {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_enabled_ocsf"
+        serialize_with = "serialize_enabled"
     )]
     pub ocsf: Option<OcsfOtlpConfig>,
+
+    /// Gateway metrics pushed as OTLP metrics, when enabled.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_enabled"
+    )]
+    pub metrics: Option<OtlpMetricsConfig>,
 }
 
 /// Writes `enabled = true` so that a serialized config parses back to the
 /// same export.
-fn serialize_enabled_ocsf<S: serde::Serializer>(
-    ocsf: &Option<OcsfOtlpConfig>,
+fn serialize_enabled<T: Serialize, S: serde::Serializer>(
+    table: &Option<T>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     #[derive(Serialize)]
-    struct Enabled<'a> {
+    struct Enabled<'a, T> {
         enabled: bool,
         #[serde(flatten)]
-        ocsf: &'a OcsfOtlpConfig,
+        table: &'a T,
     }
-    ocsf.as_ref()
-        .map(|ocsf| Enabled {
+    table
+        .as_ref()
+        .map(|table| Enabled {
             enabled: true,
-            ocsf,
+            table,
         })
         .serialize(serializer)
 }
@@ -347,6 +357,13 @@ impl OtlpConfig {
 pub struct OtlpTracesConfig {
     /// OTLP/gRPC collector endpoint, e.g.
     /// `http://otel-collector.observability.svc:4317`.
+    pub endpoint: String,
+}
+
+/// `[openshell.gateway.otlp.metrics]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OtlpMetricsConfig {
+    /// OTLP/gRPC collector endpoint for gateway metrics.
     pub endpoint: String,
 }
 
@@ -372,6 +389,25 @@ struct RawOtlpConfig {
     traces: Option<RawOtlpTraces>,
     #[serde(default)]
     ocsf: Option<RawOcsfOtlp>,
+    #[serde(default)]
+    metrics: Option<RawOtlpMetrics>,
+}
+
+/// `metrics = true`, or a table with an optional endpoint.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawOtlpMetrics {
+    Enabled(bool),
+    Table(RawOtlpMetricsTable),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOtlpMetricsTable {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    endpoint: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -416,13 +452,33 @@ impl TryFrom<RawOtlpConfig> for OtlpConfig {
                 })
             })
             .transpose()?;
-        if traces.is_none() && ocsf.is_none() {
-            return Err("otlp needs an endpoint, or otlp.ocsf with enabled = true".to_string());
+        let metrics = raw
+            .metrics
+            .map(|metrics| match metrics {
+                RawOtlpMetrics::Enabled(enabled) => RawOtlpMetricsTable {
+                    enabled,
+                    endpoint: None,
+                },
+                RawOtlpMetrics::Table(table) => table,
+            })
+            .filter(|metrics| metrics.enabled)
+            .map(|metrics| {
+                Ok::<_, String>(OtlpMetricsConfig {
+                    endpoint: endpoint_for("metrics", metrics.endpoint)?,
+                })
+            })
+            .transpose()?;
+        if traces.is_none() && ocsf.is_none() && metrics.is_none() {
+            return Err(
+                "otlp needs an endpoint, or otlp.ocsf or otlp.metrics with enabled = true"
+                    .to_string(),
+            );
         }
         Ok(Self {
             service_name: raw.service_name,
             traces,
             ocsf,
+            metrics,
         })
     }
 }
@@ -1322,6 +1378,55 @@ service_name = "openshell-gateway-dev"
     }
 
     #[test]
+    fn otlp_metrics_default_to_the_shared_endpoint() {
+        for metrics in [
+            "metrics = true\n",
+            "\n[openshell.gateway.otlp.metrics]\nenabled = true\n",
+        ] {
+            let otlp = otlp(&format!(
+                "[openshell.gateway.otlp]\nendpoint = 'http://127.0.0.1:4317'\n{metrics}"
+            ));
+            assert_eq!(otlp.traces_endpoint(), Some("http://127.0.0.1:4317"));
+            assert_eq!(
+                otlp.metrics,
+                Some(OtlpMetricsConfig {
+                    endpoint: "http://127.0.0.1:4317".into(),
+                }),
+                "{metrics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn otlp_metrics_can_use_their_own_endpoint_without_traces() {
+        let otlp = otlp(
+            "[openshell.gateway.otlp.metrics]\nenabled = true\nendpoint = 'http://metrics:4317'\n",
+        );
+        assert_eq!(otlp.traces_endpoint(), None);
+        assert_eq!(
+            otlp.metrics.map(|metrics| metrics.endpoint).as_deref(),
+            Some("http://metrics:4317")
+        );
+    }
+
+    #[test]
+    fn otlp_metrics_are_off_unless_enabled() {
+        for metrics in [
+            "",
+            "metrics = false\n",
+            "\n[openshell.gateway.otlp.metrics]\nendpoint = 'http://metrics:4317'\n",
+        ] {
+            let otlp = otlp(&format!(
+                "[openshell.gateway.otlp]\nendpoint = 'http://127.0.0.1:4317'\n{metrics}"
+            ));
+            assert_eq!(
+                otlp.metrics, None,
+                "enabled metrics export with {metrics:?}"
+            );
+        }
+    }
+
+    #[test]
     fn otlp_ocsf_is_off_unless_enabled() {
         for ocsf in ["", "enabled = false\n", "endpoint = 'http://siem:4317'\n"] {
             let otlp = otlp(&format!(
@@ -1336,7 +1441,8 @@ service_name = "openshell-gateway-dev"
     fn otlp_config_round_trips() {
         let tmp = write_tmp(
             "[openshell.gateway.otlp]\nendpoint = 'http://shared:4317'\nservice_name = 'gw'\n\n\
-             [openshell.gateway.otlp.ocsf]\nenabled = true\nschema_version = '1.3'\n",
+             [openshell.gateway.otlp.ocsf]\nenabled = true\nschema_version = '1.3'\n\n\
+             [openshell.gateway.otlp.metrics]\nenabled = true\nendpoint = 'http://metrics:4317'\n",
         );
         let file = load(tmp.path()).unwrap();
         let encoded = toml::to_string(&file).unwrap();
@@ -1354,6 +1460,9 @@ service_name = "openshell-gateway-dev"
             "[openshell.gateway.otlp.ocsf]\nenabled = true\nendpoint = 'http://siem:4317'\nschema_version = '1.8'\n",
             "[openshell.gateway.otlp.ocsf]\nenabled = 'yes'\nendpoint = 'http://siem:4317'\n",
             "[openshell.gateway.otlp.metrics]\nendpoint = 'http://metrics:4317'\n",
+            "[openshell.gateway.otlp.metrics]\nenabled = true\n",
+            "[openshell.gateway.otlp]\nmetrics = true\n",
+            "[openshell.gateway.otlp]\nendpoint = 'http://127.0.0.1:4317'\nmetrics = 'yes'\n",
             "[openshell.gateway.otlp]\nendpoint = 'http://127.0.0.1:4317'\nocsf_logs = true\n",
         ] {
             let tmp = write_tmp(table);
