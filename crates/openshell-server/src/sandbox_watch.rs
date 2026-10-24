@@ -154,6 +154,43 @@ pub fn lag_warning_event(n: u64) -> openshell_core::proto::SandboxStreamEvent {
     }
 }
 
+/// Build the warning payload emitted when the cross-source coverage floor
+/// withholds events on connect.
+///
+/// Unlike broadcast lag, nothing was evicted here: the withheld events are
+/// still sitting in a bus's tail, excluded only because a sibling source's
+/// shallower replay depth means handing them out would let the client's
+/// single shared cursor imply coverage that sibling can't back. They won't
+/// be resent later in this stream -- a resume replays past the cursor this
+/// connect settles on, and these are at or below it by construction -- so
+/// the client needs to know now, not discover it silently after a reconnect.
+pub fn coverage_gap_warning(log_withheld: usize, platform_withheld: usize) -> SandboxStreamWarning {
+    SandboxStreamWarning {
+        message: format!(
+            "resume cursor cannot cover every followed source's backlog; withheld {log_withheld} \
+             log line(s) and {platform_withheld} platform event(s) that a shallower sibling source \
+             had not replayed. Restart the watch with a deeper log_tail_lines/event_tail if you need them; \
+             they will not be recoverable from this cursor."
+        ),
+    }
+}
+
+/// Wrap [`coverage_gap_warning`] in a `SandboxStreamEvent` ready to send.
+pub fn coverage_gap_warning_event(
+    log_withheld: usize,
+    platform_withheld: usize,
+) -> openshell_core::proto::SandboxStreamEvent {
+    use openshell_core::proto::sandbox_stream_event::Payload;
+    openshell_core::proto::SandboxStreamEvent {
+        payload: Some(Payload::Warning(coverage_gap_warning(
+            log_withheld,
+            platform_withheld,
+        ))),
+        // Warnings are not part of the resumable log/platform sequence.
+        cursor: String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +259,35 @@ mod tests {
         let evt = lag_warning_event(3);
         match evt.payload {
             Some(Payload::Warning(w)) => assert!(w.message.contains('3')),
+            other => panic!("expected Warning payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coverage_gap_warning_reports_withheld_counts() {
+        let warning = coverage_gap_warning(2, 1);
+        assert!(
+            warning.message.contains('2'),
+            "message: {}",
+            warning.message
+        );
+        assert!(
+            warning.message.contains('1'),
+            "message: {}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn coverage_gap_warning_event_wraps_warning_payload_with_empty_cursor() {
+        use openshell_core::proto::sandbox_stream_event::Payload;
+        let evt = coverage_gap_warning_event(2, 1);
+        assert!(evt.cursor.is_empty());
+        match evt.payload {
+            Some(Payload::Warning(w)) => {
+                assert!(w.message.contains('2'));
+                assert!(w.message.contains('1'));
+            }
             other => panic!("expected Warning payload, got {other:?}"),
         }
     }
