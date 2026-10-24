@@ -38,7 +38,7 @@ Follow [Label Discovery](../../../CONTRIBUTING.md#label-discovery), retrieving a
 
 Do not scan GitHub Discussions or a dedicated security-reporting source in v1. Route suspected vulnerabilities through [SECURITY.md](../../../SECURITY.md).
 
-Use `assess-issue-routing` to decide whether an unlabelled issue is already routed and to fill intake-gap recommendations. Report its routing signals as context; never recommend adding the triage-queue label to an issue it reports as `routed` or `out of scope`. If it reports `uncertain`, or classifies the reporter as `member`, report that instead of recommending a label.
+Use `assess-issue-routing` to decide whether an unlabelled issue is already routed and to fill intake-gap recommendations. Report its routing signals as context; never recommend adding the triage-queue label to an issue it reports as `routed` or `out of scope`. If it reports `uncertain`, or classifies the reporter as `member` or `automation`, report that instead of recommending a label.
 
 ## Analyze and rank
 
