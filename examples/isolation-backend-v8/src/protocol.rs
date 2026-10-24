@@ -26,13 +26,14 @@ pub use openshell::sandbox::{backend::v1 as control, protocol::v1 as boundary};
 
 pub const BACKEND: &str = "js-sbx";
 pub const CAPABILITY: &str = "openshell.sandbox.protocol";
+pub const SUSPEND_RESUME: &str = "openshell.sandbox.suspend-resume";
 
 pub fn metadata() -> PeerMetadata {
     PeerMetadata {
         protocol_version: Some(ProtocolVersion { major: 1, minor: 0 }),
         implementation_name: BACKEND.into(),
         implementation_version: env!("CARGO_PKG_VERSION").into(),
-        supported_capabilities: vec![CAPABILITY.into()],
+        supported_capabilities: vec![CAPABILITY.into(), SUSPEND_RESUME.into()],
         required_capabilities: vec![CAPABILITY.into()],
     }
 }

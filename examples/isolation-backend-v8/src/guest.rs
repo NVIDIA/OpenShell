@@ -8,10 +8,10 @@ use std::{
     io::Read,
     path::Path,
     sync::{
-        Arc, Mutex, Once,
+        Arc, Condvar, Mutex, Once,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, ensure};
@@ -76,11 +76,21 @@ struct State {
     rejections: Vec<v8::Global<v8::Promise>>,
 }
 
+/// Freeze requests from the backend and whether the guest thread is parked.
+#[derive(Default)]
+struct Freeze {
+    requested: bool,
+    parked: bool,
+    executing: bool,
+}
+
 pub struct Guest {
     source: String,
     digest: String,
     cancelled: AtomicBool,
     isolate: Mutex<Option<v8::IsolateHandle>>,
+    freeze: Mutex<Freeze>,
+    freeze_changed: Condvar,
 }
 
 impl Guest {
@@ -91,14 +101,73 @@ impl Guest {
             digest: format!("{:x}", Sha256::digest(bytes)),
             cancelled: AtomicBool::new(false),
             isolate: Mutex::new(None),
+            freeze: Mutex::new(Freeze::default()),
+            freeze_changed: Condvar::new(),
         })
     }
 
     pub fn terminate(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        // Wake a parked guest so the termination can unwind it.
+        drop(self.freeze.lock().unwrap());
+        self.freeze_changed.notify_all();
         if let Some(handle) = self.isolate.lock().unwrap().as_ref() {
             handle.terminate_execution();
         }
+    }
+
+    /// Stop the guest at its next V8 interrupt check. Returns once JavaScript
+    /// can make no further progress: the thread is parked or not executing.
+    pub fn freeze(&self, timeout: Duration) -> Result<()> {
+        let mut freeze = self.freeze.lock().unwrap();
+        freeze.requested = true;
+        if freeze.executing && !freeze.parked {
+            let handle = self.isolate.lock().unwrap().clone();
+            // The interrupt runs on the isolate thread while execute() owns
+            // the isolate and borrows this Guest.
+            let data = std::ptr::from_ref(self).cast_mut().cast();
+            if let Some(handle) = handle {
+                handle.request_interrupt(park_interrupt, data);
+            }
+        }
+        let (mut freeze, wait) = self
+            .freeze_changed
+            .wait_timeout_while(freeze, timeout, |f| {
+                f.executing && !f.parked && !self.cancelled.load(Ordering::SeqCst)
+            })
+            .unwrap();
+        if wait.timed_out() {
+            freeze.requested = false;
+            self.freeze_changed.notify_all();
+            anyhow::bail!("guest did not reach a freeze point");
+        }
+        drop(freeze);
+        Ok(())
+    }
+
+    /// Let a frozen guest continue.
+    pub fn thaw(&self) {
+        self.freeze.lock().unwrap().requested = false;
+        self.freeze_changed.notify_all();
+    }
+
+    fn park(&self) {
+        let mut freeze = self.freeze.lock().unwrap();
+        freeze.parked = true;
+        self.freeze_changed.notify_all();
+        while freeze.requested && !self.cancelled.load(Ordering::SeqCst) {
+            freeze = self.freeze_changed.wait(freeze).unwrap();
+        }
+        freeze.parked = false;
+    }
+
+    fn set_executing(&self, executing: bool) {
+        self.freeze.lock().unwrap().executing = executing;
+        self.freeze_changed.notify_all();
+    }
+
+    fn is_parked(&self) -> bool {
+        self.freeze.lock().unwrap().parked
     }
 
     pub fn run(&self, ready: impl FnOnce(Output, Output)) -> Result<GuestResult> {
@@ -114,11 +183,23 @@ impl Guest {
         let (done, finished) = std::sync::mpsc::channel::<()>();
         let outcome = std::thread::scope(|threads| {
             threads.spawn(move || {
-                if matches!(
-                    finished.recv_timeout(DEADLINE),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                ) {
-                    self.terminate();
+                // The deadline counts running time only, not time spent frozen.
+                let mut remaining = DEADLINE;
+                let mut last = Instant::now();
+                loop {
+                    match finished.recv_timeout(Duration::from_millis(50)) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        _ => return,
+                    }
+                    let elapsed = last.elapsed();
+                    last = Instant::now();
+                    if !self.is_parked() {
+                        remaining = remaining.saturating_sub(elapsed);
+                    }
+                    if remaining.is_zero() {
+                        self.terminate();
+                        return;
+                    }
                 }
             });
             let outcome = self.execute(stdout.clone(), &stderr);
@@ -142,6 +223,20 @@ impl Guest {
     fn execute(&self, stdout: Output, stderr: &Output) -> Result<GuestStatus> {
         let mut isolate = v8::Isolate::new(v8::CreateParams::default().heap_limits(0, MAX_HEAP));
         *self.isolate.lock().unwrap() = Some(isolate.thread_safe_handle());
+        self.set_executing(true);
+        let status = self.execute_in(&mut isolate, stdout, stderr);
+        self.set_executing(false);
+        status
+    }
+
+    fn execute_in(
+        &self,
+        isolate: &mut v8::OwnedIsolate,
+        stdout: Output,
+        stderr: &Output,
+    ) -> Result<GuestStatus> {
+        // A freeze requested before the script starts holds it here.
+        self.park();
         if self.cancelled.load(Ordering::SeqCst) {
             return Ok(GuestStatus::Terminated);
         }
@@ -155,7 +250,7 @@ impl Guest {
         isolate
             .add_near_heap_limit_callback(heap_limit, std::ptr::from_ref(self).cast_mut().cast());
         let result = (|| {
-            v8::scope!(let scope, &mut isolate);
+            v8::scope!(let scope, isolate);
             let global = v8::ObjectTemplate::new(scope);
             global.set(
                 v8::String::new(scope, "fetch").unwrap().into(),
@@ -225,6 +320,13 @@ impl Guest {
     }
 }
 
+unsafe extern "C" fn park_interrupt(_isolate: v8::UnsafeRawIsolatePtr, data: *mut c_void) {
+    // SAFETY: freeze() requests this interrupt with a Guest whose execute()
+    // owns the isolate; V8 runs interrupts only while that execution is live.
+    let guest = unsafe { &*data.cast::<Guest>() };
+    guest.park();
+}
+
 extern "C" fn promise_rejected(message: v8::PromiseRejectMessage) {
     if message.get_event() != v8::PromiseRejectEvent::PromiseRejectWithNoHandler {
         return;
@@ -284,4 +386,69 @@ fn deny_network(
     let message = v8::String::new(scope, "Network access is disabled").unwrap();
     let error = v8::Exception::error(scope, message);
     scope.throw_exception(error);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timed_out_freeze_does_not_park_a_late_interrupt() {
+        let guest = Arc::new(Guest::new(b"1").unwrap());
+        guest.set_executing(true);
+        assert!(guest.freeze(Duration::ZERO).is_err());
+        let (sent, received) = std::sync::mpsc::channel();
+        let pending_interrupt = guest.clone();
+        let thread = std::thread::spawn(move || {
+            pending_interrupt.park();
+            sent.send(()).unwrap();
+        });
+        let continued = received.recv_timeout(Duration::from_secs(1)).is_ok();
+        guest.thaw();
+        thread.join().unwrap();
+        assert!(
+            continued,
+            "failed suspension left a pending interrupt parked"
+        );
+    }
+
+    #[test]
+    fn frozen_guest_makes_no_progress_until_thawed() {
+        let guest = Arc::new(
+            Guest::new(
+                b"let n = 0; let next = Date.now();\
+                  while (n < 6) { if (Date.now() >= next) { n++; next = Date.now() + 100; console.log(`n ${n}`); } }",
+            )
+            .unwrap(),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = guest.clone();
+        let thread = std::thread::spawn(move || runner.run(|out, _| tx.send(out).unwrap()));
+        let stdout = rx.recv().unwrap();
+        while stdout.contents().is_empty() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        guest.freeze(Duration::from_secs(5)).unwrap();
+        let frozen = stdout.contents();
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(stdout.contents(), frozen, "frozen guest wrote output");
+        guest.thaw();
+        let result = thread.join().unwrap().unwrap();
+        assert_eq!(result.status, GuestStatus::Exited);
+        assert!(String::from_utf8(result.stdout).unwrap().ends_with("n 6\n"));
+    }
+
+    #[test]
+    fn terminate_releases_a_frozen_guest() {
+        let guest = Arc::new(Guest::new(b"while (true) {}").unwrap());
+        let runner = guest.clone();
+        let thread = std::thread::spawn(move || runner.run(|_, _| {}));
+        while !guest.freeze.lock().unwrap().executing {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        guest.freeze(Duration::from_secs(5)).unwrap();
+        guest.terminate();
+        let result = thread.join().unwrap().unwrap();
+        assert_eq!(result.status, GuestStatus::Terminated);
+    }
 }

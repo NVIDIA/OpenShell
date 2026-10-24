@@ -19,6 +19,14 @@ pub struct Launch {
     pub rotation: SessionRotation,
     pub certificate: String,
     pub private_key: String,
+    /// Private driver-to-backend provisioning, never supervisor bootstrap.
+    pub restore: Option<Restore>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Restore {
+    pub reference: Vec<u8>,
+    pub restart_if_restore_fails: bool,
 }
 
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -33,6 +41,9 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     std::fs::rename(temporary, path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
