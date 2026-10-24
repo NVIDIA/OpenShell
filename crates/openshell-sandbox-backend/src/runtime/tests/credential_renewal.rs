@@ -10,6 +10,8 @@ struct RenewingGrpcBoundary {
     expected_token: Arc<std::sync::RwLock<String>>,
     failures: Arc<std::sync::atomic::AtomicUsize>,
     failure_code: tonic::Code,
+    confirmation: Arc<std::sync::RwLock<BoundaryConfirmation>>,
+    attach_generation: Arc<std::sync::RwLock<String>>,
 }
 
 #[tonic::async_trait]
@@ -35,6 +37,8 @@ impl SandboxProtocol for RenewingGrpcBoundary {
         }
         let mut inner = self.inner.clone();
         inner.expected_token = self.expected_token.read().unwrap().clone();
+        inner.confirmation = self.confirmation.read().unwrap().clone();
+        inner.attach_generation = self.attach_generation.read().unwrap().clone();
         inner.exchange(request).await
     }
 
@@ -62,6 +66,7 @@ async fn renewing_boundary_client(
     let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let service = RenewingGrpcBoundary {
         inner: TestGrpcBoundary {
+            attach_generation: "test-generation".to_string(),
             wait_for_half_close: false,
             expected_token: "a".repeat(32),
             requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -73,6 +78,8 @@ async fn renewing_boundary_client(
         expected_token: Arc::new(std::sync::RwLock::new("a".repeat(32))),
         failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         failure_code,
+        confirmation: Arc::new(std::sync::RwLock::new(test_confirmation())),
+        attach_generation: Arc::new(std::sync::RwLock::new("test-generation".to_string())),
     };
     let server_service = service.clone();
     let server_accepted = accepted.clone();
@@ -247,5 +254,141 @@ async fn confirmation_authenticates_captured_bearer_after_slot_changes() {
     assert!(matches!(response, Response::Confirmed { .. }));
     assert_eq!(service.inner.requests.load(Ordering::Acquire), 3);
     assert_eq!(accepted.load(Ordering::Acquire), 1);
+    server.abort();
+}
+
+type Mismatch = (&'static str, &'static str, fn(&mut BoundaryConfirmation));
+
+/// A backend that loses its launch state answers with a confirmation that no
+/// longer matches the launch. Each case names the field the error must report.
+const CONFIRMATION_MISMATCHES: &[Mismatch] = &[
+    ("identity", "identity", |c| {
+        c.identity =
+            ResolvedWorkloadIdentity::new(10_002, 10_001, Vec::new(), "test".into(), "x".into())
+                .unwrap();
+    }),
+    ("empty generation", "generation (empty)", |c| {
+        c.generation.clear();
+    }),
+    ("generation", "generation", |c| {
+        c.generation = "other-generation".into();
+    }),
+    ("session", "session", |c| {
+        c.session_id = "550e8400-e29b-41d4-a716-446655440001".parse().unwrap();
+    }),
+    ("resource claims", "resource claims", |c| {
+        c.resource_claims.insert("claim".into(), "other".into());
+    }),
+    ("provisioning evidence", "provisioning evidence", |c| {
+        c.provisioning_evidence_digest = openshell_isolation_interface::contract::ProvisioningEvidence::from_enforcement_evidence(
+            "test-generation",
+            b"other-evidence",
+        )
+        .unwrap()
+        .evidence_digest;
+    }),
+];
+
+#[tokio::test]
+async fn renewal_rejects_mismatched_confirmation() {
+    for (case, field, mutate) in CONFIRMATION_MISMATCHES {
+        let (client, service, accepted, server) =
+            renewing_boundary_client(tonic::Code::Unavailable).await;
+        let original = client.grpc_channel.lock().await.clone().unwrap();
+        mutate(&mut service.confirmation.write().unwrap());
+        let renewed_token = "b".repeat(32);
+        *service.expected_token.write().unwrap() = renewed_token.clone();
+        client
+            .sandbox_bearer
+            .update(
+                SecretJwt::parse(renewed_token).unwrap(),
+                i64::MAX,
+                openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+            )
+            .unwrap();
+
+        let result = client.ensure_current_credential_connection().await;
+        assert!(
+            matches!(&result, Err(BackendError::Confirm(message)) if message.contains(&format!("confirmation {field} does not match"))),
+            "{case}: renewal must reject the confirmation: {result:?}"
+        );
+        let failed = client.grpc_channel.lock().await.clone().unwrap();
+        assert_eq!(failed.bearer_fingerprint, original.bearer_fingerprint);
+        assert!(
+            failed.transport.is_aborted(),
+            "{case}: a mismatched renewal must close the connection's live streams"
+        );
+        assert_eq!(accepted.load(Ordering::Acquire), 1);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn reconnect_rejects_mismatched_confirmation() {
+    for (case, field, mutate) in CONFIRMATION_MISMATCHES {
+        let (client, service, accepted, server) =
+            renewing_boundary_client(tonic::Code::Unavailable).await;
+        mutate(&mut service.confirmation.write().unwrap());
+
+        // The liveness probe must not keep the connection, and the replacement
+        // connection's replayed Confirm must not be accepted either.
+        let result = client
+            .recover_after_unavailable(client.connection_generation().await)
+            .await;
+        assert!(
+            matches!(&result, Err(BackendError::Confirm(message)) if message.contains(&format!("confirmation {field} does not match"))),
+            "{case}: reconnect must reject the confirmation: {result:?}"
+        );
+        assert_eq!(accepted.load(Ordering::Acquire), 2);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn launch_checks_reject_wrong_response_variants() {
+    let (client, _service, _accepted, server) =
+        renewing_boundary_client(tonic::Code::Unavailable).await;
+    let confirmed = || Response::Confirmed {
+        confirmation: Box::new(test_confirmation()),
+    };
+    let attached = || Response::Attached {
+        snapshot: crate::boundary_protocol::SessionSnapshotWire {
+            generation: "test-generation".to_string(),
+            processes: Vec::new(),
+        },
+    };
+    assert!(client.check_attached(attached()).is_ok());
+    assert!(client.launch_confirmation(confirmed()).is_ok());
+    for wrong in [confirmed(), Response::Signaled, Response::Terminated] {
+        assert!(matches!(
+            client.check_attached(wrong),
+            Err(BackendError::Process(message)) if message.contains("\"attached\"")
+        ));
+    }
+    for wrong in [attached(), Response::Signaled, Response::Terminated] {
+        assert!(matches!(
+            client.launch_confirmation(wrong),
+            Err(BackendError::Process(message)) if message.contains("\"confirmed\"")
+        ));
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn reconnect_rejects_attach_for_another_generation() {
+    let (client, service, accepted, server) =
+        renewing_boundary_client(tonic::Code::Unavailable).await;
+    let cached = client.grpc_channel.lock().await.clone().unwrap();
+    cached.transport.abort();
+    *service.attach_generation.write().unwrap() = "other-generation".to_string();
+
+    let result = client
+        .recover_after_unavailable(client.connection_generation().await)
+        .await;
+    assert!(
+        matches!(&result, Err(BackendError::Confirm(message)) if message.contains("snapshot generation")),
+        "reconnect must reject an Attach for another generation: {result:?}"
+    );
+    assert_eq!(accepted.load(Ordering::Acquire), 2);
     server.abort();
 }
