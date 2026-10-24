@@ -156,14 +156,24 @@ retain the binary installer because their fixtures configure its system service,
 local HTTP gateway, and CLI path. The manual Integration Tests workflow defaults
 to the package installers and downloads the packages selected by its matrix.
 
-Three opt-in labels enable the long-running E2E suites:
+Four opt-in labels enable the long-running E2E suites:
 
 - `test:e2e` runs the Docker, rootless Podman, Kubernetes, and VM E2E suites
   with both managed and standalone compute drivers in `Branch E2E Checks`
 - `test:e2e-gpu` runs GPU E2E in `Branch E2E Checks`
+- `test:upgrade` runs tmachine Debian upgrade qualification in
+  `Branch E2E Checks`: the latest published release packages and matching
+  runtime images are installed first, then the PR's packages are installed and
+  both existing and new sandboxes are verified
 - `test:e2e-kubernetes` runs Kubernetes E2E with the HA Helm overlay
   (`replicaCount: 2` and bundled PostgreSQL) and the credential-driver suite
   (Kubernetes Secrets plus Vault) in `Branch E2E Checks`
+
+The `test:upgrade` label enables the Debian and RPM package builds, VM driver build,
+runtime-image preparation, and tmachine upgrade execution needed by that suite.
+It reuses the existing integration input-preparation job. Upgrade-only runs
+skip the regular integration suites; selecting both `test:e2e`
+and `test:upgrade` prepares inputs once for both sets of tests.
 
 When multiple labels are present, `Branch E2E Checks` builds each generic multi-architecture artifact set once and fans out enabled suites in parallel. Runtime-specific reusable workflows define the Docker, Podman, VM, and Kubernetes lanes. Composite actions own the replaceable Podman, KVM, kind, and mise setup. Each lane depends only on the artifact categories it consumes: VM does not wait for container-driver artifacts or supervisor images, and GPU does not wait for the gateway image. Docker, Podman, GPU, Rust, Python, MCP, and VM E2E reuse matching prebuilt gateway and CLI binaries instead of compiling debug binaries in test jobs. Standalone-driver lanes additionally reuse driver-free gateway and compute-driver artifacts. Kubernetes managed-driver lanes consume published gateway and supervisor images, while the standalone-driver lane composes its gateway image from prebuilt binaries.
 The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while Kubernetes HA and credential-driver behavior are under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
@@ -330,6 +340,10 @@ so the installer can use them while qualification runs or after it fails.
 The pre-release snap artifact is published to the `latest/beta` channel.
 The implemented `release-tag-v1` profile is an incremental subset of RFC 0014
 qualification. Failed checks fail the parent workflow and retain evidence in Actions.
+Its conformance matrix includes an Ubuntu Debian upgrade from the latest published
+stable release, checking gateway recovery, an existing sandbox's persisted marker,
+and a new sandbox. Release Dev runs the same upgrade lane. Other upgrade
+configurations remain outside this profile.
 
 Each qualification attempt writes its result to the Actions run summary and
 uploads `qualification-summary.json` as a 90-day workflow artifact. The qualification
@@ -547,7 +561,7 @@ Flow:
 
 1. Open the PR. copy-pr-bot mirrors it to `pull-request/<N>` automatically.
 2. The mirror push runs `Branch Checks` automatically. `Required CI Gates` keeps the PR blocked until the mirror exists, matches the PR head SHA, and the required push-based workflow succeeds. The first `Branch E2E Checks` run only resolves metadata and skips expensive jobs unless an E2E label is already set.
-3. A maintainer applies `test:e2e`, `test:e2e-gpu`, and/or `test:e2e-kubernetes`. `E2E Label Help` posts a comment with a link to the existing gated workflow run.
+3. A maintainer applies `test:e2e`, `test:e2e-gpu`, `test:upgrade`, and/or `test:e2e-kubernetes`. `E2E Label Help` posts a comment with a link to the existing gated workflow run.
 4. The maintainer opens that link and clicks **Re-run all jobs**. This time `pr_metadata` sees the label and the build/E2E jobs run.
 5. When the run finishes, the matching `OpenShell / ...` gate status flips to green automatically.
 6. New commits push to the mirror automatically and re-trigger `Branch Checks` plus any labeled E2E jobs in `Branch E2E Checks`.
@@ -610,7 +624,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | File | Role |
 |---|---|
 | `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `push: pull-request/[0-9]+` for PR mirrors and `merge_group` for queued merges. |
-| `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups do not run E2E. |
+| `.github/workflows/branch-e2e.yml` | Standard, GPU, Debian upgrade, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, `test:upgrade`, and `test:e2e-kubernetes` labels; merge groups do not run E2E. |
 | `.github/workflows/build-binaries.yml`, `build-vm-driver.yml` | Shared binary matrices used by branch and release workflows. The VM driver remains separate because its build consumes the runtime binaries. |
 | `.github/workflows/build-images.yml` | Builds and pushes multi-platform images, then uploads the same OCI images as workflow artifacts. |
 | `.github/workflows/package-release-binaries.yml` | Packages raw build artifacts into release tarballs without rebuilding them. |
