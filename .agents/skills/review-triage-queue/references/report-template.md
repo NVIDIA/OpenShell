@@ -12,7 +12,7 @@ Use the same fields; include the shareable deferral reason or `private reason wi
 
 ## Triage queue
 
-State total and unlisted queue counts. Show up to five recently updated items with ID, title, updated time, and a concise summary of context and material changes. Put the rest in overflow. Do not assess these issues; direct the engineer to `triage-issue`.
+State total and unlisted queue counts. Show up to five recently updated items with ID, title, updated time, and a concise summary of context and material changes. Put the rest in overflow. Do not assess these issues; direct the engineer to `triage-validate-issue`.
 
 ## Dependabot pull requests
 
