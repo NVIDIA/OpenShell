@@ -538,6 +538,9 @@ jobs:
           bash tasks/scripts/test-gateway-pull-policy.sh
           bash tasks/scripts/test-gateway-config.sh
 
+      - name: Test Kubernetes E2E reporting
+        run: bash tasks/scripts/test-e2e-kubernetes-reports.sh
+
       - name: Test release qualification summary
         run: mise run test:qualification-summary
   go:
