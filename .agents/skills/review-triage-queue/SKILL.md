@@ -54,7 +54,7 @@ Give new and carried pending/deferred recommendations separate five-item budgets
 
 ## Resume an in-progress triage pass
 
-When the on-duty engineer asks for the “next issue” without asking for a new queue review, resume from the latest local report's **Triage queue** order. Select the first item that has not been explicitly dispositioned in local duty state. Do not query live GitHub data to silently reorder an in-progress pass: newly opened or newly updated issues belong in the next queue review. Use `triage-issue` for assessment.
+When the on-duty engineer asks for the “next issue” without asking for a new queue review, resume from the latest local report's **Triage queue** order. Select the first item that has not been explicitly dispositioned in local duty state. Do not query live GitHub data to silently reorder an in-progress pass: newly opened or newly updated issues belong in the next queue review. Use `triage-validate-issue` for assessment.
 
 An engineer can explicitly request a refresh or the newest live issue; either request supersedes the continuation order. If the report has no remaining listed candidate, say so and offer a fresh queue review rather than choosing an item from an older overflow list.
 

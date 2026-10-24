@@ -109,7 +109,7 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Reviewing       | `launch-openshell-gator`  | Launch and supervise OpenShell gator agents for issue and PR monitoring                             |
 | Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Maintenance     | `release-openshell`       | Pick the latest qualified prerelease and tag its commit as stable                                   |
-| Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
+| Triage          | `triage-validate-issue`   | Assess, classify, and route community-filed issues                                                  |
 | Triage          | `review-triage-queue`     | Create a local, read-only queue report from GitHub intake                                           |
 | Triage          | `assess-issue-routing`    | Assess whether one issue has an owner driving its next decision                                     |
 | Triage          | `apply-triage-action`     | Apply, reject, or defer one explicitly selected triage recommendation                               |

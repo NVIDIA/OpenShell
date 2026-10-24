@@ -17,7 +17,7 @@ Run after adding, removing, or renaming a skill or crate; changing issue or PR c
 
 | Change | Skills to inspect |
 |---|---|
-| Issues, triage, labels, or feature proposals | `create-github-issue`, `triage-issue`, `review-triage-queue`, `apply-triage-action`, `assess-issue-routing`, `create-spike`, `build-from-issue` |
+| Issues, triage, labels, or feature proposals | `create-github-issue`, `triage-validate-issue`, `review-triage-queue`, `apply-triage-action`, `assess-issue-routing`, `create-spike`, `build-from-issue` |
 | PR template, vouch behavior, or review conventions | `create-github-pr`, `review-github-pr`, `build-from-issue` |
 | Security assessment or remediation | `review-security-issue`, `fix-security-issue` |
 | Published docs workflow | `update-docs-from-commits` |
@@ -40,7 +40,7 @@ Search both `skills/` and `.agents/skills/` for affected commands, fields, and c
 1. Compare `skills/*/SKILL.md` and `.agents/skills/*/SKILL.md` with the inventories in `CONTRIBUTING.md`. Public skills must work outside a checkout and use installed CLI help and published documentation. Contributor skills must set `metadata.internal: true`. Confirm names are unique and local links resolve.
 2. Compare `crates/` with the architecture table in `AGENTS.md`. Check the public and contributor skill rows.
 3. Follow Label Discovery in `CONTRIBUTING.md` to retrieve every page of current GitHub labels and resolve unclear descriptions, then check issue guidance for the general triage → validation → human acceptance process. Skills should mention the `state:*` namespace without enumerating exact labels, and should not depend on `agent:*` labels. A direct request authorizes only the requested phase; unattended work uses current state descriptions, maintainer assignments, and comments to establish the authorized phase.
-4. Check issue templates, `create-github-issue`, `create-spike`, and `triage-issue` for the first-hand OpenShell User Story, OpenShell-only bug reproduction, notional UX examples, and consideration of applicable extension points.
+4. Check issue templates, `create-github-issue`, `create-spike`, and `triage-validate-issue` for the first-hand OpenShell User Story, OpenShell-only bug reproduction, notional UX examples, and consideration of applicable extension points.
 5. Check the PR template, `create-github-pr`, `build-from-issue`, `fix-security-issue`, and `CONTRIBUTING.md`: every PR must close an existing issue covering its scope, except automated dependency updates and build or flaky-test fixes from authors with write access, as described in `CONTRIBUTING.md`. Multi-PR work needs an issue per PR; a separate issue may track the overall effort.
 6. Check contributor branch instructions and examples against Branch Names in `CONTRIBUTING.md`; AGENTS.md and skills should refer to that convention. Check `README.md`, `.github/ISSUE_TEMPLATE/`, `.github/workflows/`, `.agents/agents/`, and related skill cross references for stale workflow statements. Keep user-facing documentation changes minimal and avoid duplicated internal explanations.
 7. Check that PR, build, TUI, and docs contribution guidance follow the scoped verification guidance in `CONTRIBUTING.md`; they must not require full Rust, SDK, or repository CI for changes that cannot affect those areas.
