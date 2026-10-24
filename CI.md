@@ -355,7 +355,34 @@ gh workflow run release.yml --ref main \
   -f tag=v0.1.4 -f notes-only=true
 ```
 
-Dispatch Release from the intended release branch with a stable version:
+Both release workflows accept an optional `tag` input. After seeding a version
+series with a `vMAJOR.MINOR.PATCH-pre.1` tag on the intended branch, dispatch
+Pre-release without a tag to create its next candidate:
+
+```shell
+gh workflow run release-prerelease.yml --ref main
+```
+
+Pre-release chooses the highest release series reachable from the selected
+branch and requires that series' `-pre.1` seed in its history. It stops if the
+version is already stable or no series exists. Candidate numbers account for
+all tags in the same series across the repository, and tag creation is serialized
+with Release Auto-Tag. The new tag points to the branch's dispatch commit;
+build, publication, qualification, and notifications use the resolved tag.
+An explicit tag continues to build that existing candidate. Manual tagless runs
+create a candidate even without new commits, so use an explicit tag for retries.
+Release Auto-Tag continues to skip unchanged commits and inactive series on `main`.
+
+Dispatch Release from the intended release branch:
+
+```shell
+gh workflow run release.yml --ref main
+```
+
+Without `tag`, Release detects the highest prerelease version reachable from
+that branch, then selects a qualified candidate within that version. It stops
+if none qualifies or that version is already stable. Supply a stable version
+to select it explicitly or retry a stable release:
 
 ```shell
 gh workflow run release.yml --ref main -f tag=v0.4.3
@@ -364,6 +391,11 @@ gh workflow run release.yml --ref main -f tag=v0.4.3
 For a support release, replace `main` with its support branch. Release chooses
 the highest-numbered `v0.4.3-pre.N` reachable from the selected branch with a
 successful Pre-release run triggered by the tag or dispatched on that branch.
+The support branch must contain these workflow definitions. Start each new
+support patch series with an explicit seed such as `v0.4.4-pre.1`; subsequent
+Pre-release and Release dispatches can omit `tag`. If the branch's history also
+contains a higher version series, supply `tag` explicitly to choose the intended
+support version.
 The entire Pre-release run must succeed, including publication. If qualification
 passes but publication fails, rerun the failed jobs before promoting the candidate.
 It verifies the qualification summary's
@@ -641,7 +673,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
 | `.github/workflows/release.yml` | Manually promote the latest qualified prerelease for a version and branch, create its stable tag, then rebuild and publish. Support releases preserve shared latest channels. Publishes the prerelease's notes preview, retagged, or generates notes when it is unavailable. The notes-only mode generates a release notes preview artifact. |
 | `.github/workflows/release-auto-tag.yml` | Weekdays at 14:00 Europe/Zurich, tags the next `-pre.N` on `main` when commits landed since the latest one, then dispatches Pre-release. It skips when the train has no `-pre.1` or its version is already stable, so push each train's `-pre.1` tag by hand. |
-| `.github/workflows/release-prerelease.yml` | Pre-release orchestrator, triggered by prerelease tag pushes or dispatched by Release Auto-Tag or manually: build, then publish and qualify in parallel. Qualification failure fails the run and sends the failure notification; published artifacts remain available. |
+| `.github/workflows/release-prerelease.yml` | Pre-release orchestrator, triggered by prerelease tag pushes or dispatched by Release Auto-Tag or manually. A tagless dispatch creates the next candidate on its branch; explicit tags select existing candidates. Builds, then publishes and qualifies in parallel. Qualification failure fails the run and sends the failure notification; published artifacts remain available. |
 | `.github/workflows/release-build.yml` | Shared version computation, binary and image builds, and package builds. Validates that the tag matches the caller's release kind. |
 | `.github/workflows/release-publish.yml` | Shared artifact assembly, OCI image tags and Helm chart publication, and package publication. Stable releases also publish to GitHub Releases, snap, npm, PyPI, and Fern. |
 | `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by prerelease previews, notes-only previews, and stable publication when no preview is reused. |
