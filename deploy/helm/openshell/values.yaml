@@ -322,6 +322,15 @@ tolerations: []
 # -- Affinity rules for the gateway pod.
 affinity: {}
 
+# -- PriorityClass for the gateway pod. The gateway is a control-plane
+# component; when it shares nodes with the workloads it serves, the default
+# priority gives it no advantage under node pressure. Empty = omit the field.
+priorityClassName: ""
+
+# -- Topology spread constraints for the gateway pod, used to spread replicas
+# across zones or nodes. Empty = omit the field.
+topologySpreadConstraints: []
+
 # -- Non-secret gateway application configuration. Top-level keys name TOML
 # tables and are rendered into the mounted gateway.toml file. Kubernetes
 # resource inputs remain outside this map; template expressions derive the
