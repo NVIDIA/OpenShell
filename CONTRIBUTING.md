@@ -110,6 +110,7 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Maintenance     | `release-openshell`       | Pick the latest qualified prerelease and tag its commit as stable                                   |
 | Triage          | `triage-validate-issue`   | Assess, classify, and route community-filed issues                                                  |
+| Triage          | `triage-submitter-profile` | Summarize an issue submitter's identity, affiliation, and track record                             |
 | Triage          | `review-triage-queue`     | Create a local, read-only queue report from GitHub intake                                           |
 | Triage          | `assess-issue-routing`    | Assess whether one issue has an owner driving its next decision                                     |
 | Triage          | `apply-triage-action`     | Apply, reject, or defer one explicitly selected triage recommendation                               |
