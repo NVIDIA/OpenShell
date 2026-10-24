@@ -94,10 +94,13 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
 
-The gateway container uses a Distroless Debian runtime. For OS-library
-vulnerability findings, check the deployed image digest and package version;
-deploy a rebuilt gateway image with the patched base. Updating the gateway
-binary alone does not update the libraries supplied by its container image.
+The gateway and supervisor containers use Distroless Debian runtimes. For
+OS-library or CA trust-store findings, check the deployed image digests and
+their package and certificate-bundle contents. A CA bundle can be patched
+without changing the package version. Deploy rebuilt gateway and supervisor
+images with the patched bases. Updating a binary alone does not update its
+container's libraries or system CA bundle. Workload images carry their own
+trust stores and need rebuilding and redeployment separately.
 
 For stable releases, inspect the version tag or deployed digest. Promotion
 preserves the qualified prerelease's commit-SHA image tags; those tags do not

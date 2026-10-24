@@ -371,7 +371,7 @@ Symptoms: Dockerfile step failure, missing package, incompatible Codex CLI, regi
 Actions:
 
 - Confirm the build context is `scripts/agents/gator/` or the intended temporary `--from` context.
-- Confirm Docker or the selected gateway runtime can pull `nvcr.io/nvidia/base/ubuntu:noble-20251013`.
+- Confirm Docker or the selected gateway runtime can pull `nvcr.io/nvidia/base/ubuntu:noble-20260917`.
 - For Codex CLI version experiments, adjust a temporary Docker context first.
 - Do not commit Dockerfile version changes unless the repo should permanently use that version.
 
