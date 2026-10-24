@@ -1,18 +1,18 @@
 ---
 name: review-security-issue
-description: Review an authorized security issue for validity, severity, and a remediation plan.
+description: Review an authorized security issue or private GitHub advisory for validity, severity, and a remediation plan.
 metadata:
   internal: true
 ---
 
 # Review Security Issue
 
-Review a security concern through its authorized private workflow. Do not file or expand a vulnerability in a public issue; follow `SECURITY.md`. A direct request to review authorizes review only, not remediation. For unattended review, inspect current `state:*` label descriptions, maintainer assignments, and comments to verify that review is authorized.
+Review a security concern through its authorized private workflow. Do not file or expand a vulnerability in a public issue; follow `SECURITY.md`. A direct request to review authorizes review only, not remediation. For unattended review, verify authorization from maintainer direction and accessible discussion; for issues, also inspect current `state:*` label descriptions and assignments.
 
 ## Assess
 
-1. Fetch the issue and comments with `gh issue view <id> --json title,body,state,labels,comments`. Follow Label Discovery in `CONTRIBUTING.md` rather than assuming exact label names; resolve unclear meanings before interpreting authorization. Verify that this is an authorized security issue and that a prior review does not already answer the request.
-2. Inspect affected code and verify the claim. Assess impact, exploitability, prerequisites, affected surface, and a concrete attack scenario. Separate evidence from assumptions and give a severity with rationale.
+1. Fetch the requested source. For a GHSA, use `gh api --method GET repos/OWNER/REPO/security-advisories/GHSA-ID` and read any supplied private discussion or fix links. The advisory payload does not include its discussion; report inaccessible prior discussion as unverified. For an issue, use `gh issue view <id> --json title,body,state,labels,comments` and follow Label Discovery in `CONTRIBUTING.md`; GHSA lifecycle states are not issue labels. Verify authorization and check whether a prior review already answers the request.
+2. Inspect affected code and verify the claim. Assess impact, exploitability, prerequisites, affected surface, and a concrete attack scenario. Use the [advisory report fields](../create-security-advisory/assets/advisory-template.md) to identify missing evidence without requiring legacy reports to be reformatted first. Separate reported claims, code inspection, and reproduced results; check the attacker's existing authority and give a severity with rationale.
 3. If actionable, propose a remediation plan with code areas, safe rollout, and focused tests. If not actionable, explain the evidence and recommended disposition. Do not decide product acceptance or silently close the issue.
 4. Post the review only when the request authorizes posting. Begin the comment with `> **🔒 security-review-agent**` so later reviews can detect it. Keep sensitive details in the authorized private venue.
 

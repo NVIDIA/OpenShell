@@ -19,7 +19,7 @@ Run after adding, removing, or renaming a skill or crate; changing issue or PR c
 |---|---|
 | Issues, triage, labels, or feature proposals | `create-github-issue`, `triage-issue`, `review-triage-queue`, `apply-triage-action`, `create-spike`, `build-from-issue` |
 | PR template, vouch behavior, or review conventions | `create-github-pr`, `review-github-pr`, `build-from-issue` |
-| Security assessment or remediation | `review-security-issue`, `fix-security-issue` |
+| Security reports, advisories, assessment, or remediation | `create-security-advisory`, `review-security-issue`, `fix-security-issue` |
 | Published docs workflow | `update-docs-from-commits` |
 | CLI commands, flags, defaults, or workflows | `openshell-cli` |
 | Sandbox policy schema or enforcement | `generate-sandbox-policy`, `openshell-cli` |
