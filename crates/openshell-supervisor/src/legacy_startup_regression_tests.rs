@@ -294,6 +294,8 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         upstream_proxy_args:
             openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
         additional_ca_bundle: None,
+        policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress::Disabled,
+        nat64_prefixes: Vec::new(),
         backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor {
             backend_name: "test-held".into(),
             payload: Vec::new(),

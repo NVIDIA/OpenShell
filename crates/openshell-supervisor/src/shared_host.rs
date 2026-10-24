@@ -375,6 +375,10 @@ impl SharedHost {
             upstream_proxy_args:
                 openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
             additional_ca_bundle: None,
+            // Shared supervisors keep the supervisor default; the driver setting
+            // only reaches dedicated supervisors through their launch flags.
+            policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress::Auto,
+            nat64_prefixes: Vec::new(),
             backend_descriptor: descriptor,
             auth_bundle: registration.auth,
             admitted_isolation_backend: Some(openshell_sandbox_backend::BACKEND_NAME.to_string()),

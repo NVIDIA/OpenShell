@@ -817,6 +817,57 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_wrong_port_stale_generation_and_expiry_fail_closed() {
+        let store = store(2);
+        let now = Instant::now();
+        let mut ipv6 = request("db.example", 4, Duration::from_secs(2));
+        ipv6.family = AddressFamily::Ipv6;
+        ipv6.contracts[0].pinned_addresses = vec!["2001:db8::8".parse().unwrap()];
+        let record = store.publish(ipv6, 4, now).unwrap();
+        assert!(record.synthetic_address.is_ipv6());
+        assert_eq!(
+            store
+                .lookup(record.synthetic_address, 5432, 4, now)
+                .unwrap()
+                .pinned_addresses(),
+            ["2001:db8::8".parse::<IpAddr>().unwrap()]
+        );
+        assert!(matches!(
+            store.lookup(record.synthetic_address, 3306, 4, now),
+            Err(MappingLookupError::PortMismatch)
+        ));
+        assert!(matches!(
+            store.lookup(record.synthetic_address, 5432, 5, now),
+            Err(MappingLookupError::StalePolicy)
+        ));
+        assert!(matches!(
+            store.lookup(
+                record.synthetic_address,
+                5432,
+                4,
+                now + Duration::from_secs(2)
+            ),
+            Err(MappingLookupError::Expired)
+        ));
+        // An unallocated address in the IPv6 pool, and the real upstream
+        // address, have no mapping.
+        for unmapped in ["fd00:1::2", "2001:db8::8"] {
+            assert!(matches!(
+                store.lookup(unmapped.parse().unwrap(), 5432, 4, now),
+                Err(MappingLookupError::Missing)
+            ));
+        }
+    }
+
+    #[test]
+    fn ipv6_answers_cannot_publish_ipv4_pins() {
+        let store = store(2);
+        let mut mixed = request("db.example", 1, Duration::from_secs(2));
+        mixed.family = AddressFamily::Ipv6;
+        assert!(store.publish(mixed, 1, Instant::now()).is_err());
+    }
+
+    #[test]
     fn expiry_never_reassigns_synthetic_address_to_another_name() {
         let store = store(2);
         let now = Instant::now();
