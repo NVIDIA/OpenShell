@@ -20,8 +20,10 @@ use openshell_e2e::harness::output::strip_ansi;
 
 const WORKSPACE: &str = "lifecycle-test";
 const WORKSPACE_TERM: &str = "terminating-test";
+const WORKSPACE_DELETE_COMPOSE: &str = "delete-compose-test";
 const PROVIDER: &str = "lifecycle-prov";
 const PROVIDER_TERM: &str = "term-prov";
+const SANDBOX_DELETE_COMPOSE: &str = "delete-compose-sb";
 
 struct CliResult {
     output: String,
@@ -273,6 +275,76 @@ async fn workspace_terminating_rejects_creates() {
     assert!(
         res.success,
         "workspace delete should succeed after cleanup: {}",
+        res.output
+    );
+}
+
+struct DeleteCompositionCleanup;
+
+impl Drop for DeleteCompositionCleanup {
+    fn drop(&mut self) {
+        let bin = openshell_bin();
+        let _ = std::process::Command::new(&bin)
+            .args([
+                "sandbox",
+                "delete",
+                SANDBOX_DELETE_COMPOSE,
+                "--workspace",
+                WORKSPACE_DELETE_COMPOSE,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = std::process::Command::new(&bin)
+            .args(["workspace", "delete", WORKSPACE_DELETE_COMPOSE])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+#[tokio::test]
+async fn sandbox_delete_composes_with_workspace_delete() {
+    let _cleanup = DeleteCompositionCleanup;
+
+    let res = run_cli(&["workspace", "create", "--name", WORKSPACE_DELETE_COMPOSE]).await;
+    assert!(res.success, "workspace create failed: {}", res.output);
+
+    let res = run_cli(&[
+        "sandbox",
+        "create",
+        "--workspace",
+        WORKSPACE_DELETE_COMPOSE,
+        "--name",
+        SANDBOX_DELETE_COMPOSE,
+        "--detach",
+        "--",
+        "sh",
+        "-c",
+        "while true; do sleep 3600; done",
+    ])
+    .await;
+    assert!(res.success, "sandbox create failed: {}", res.output);
+
+    let res = run_cli(&[
+        "sandbox",
+        "delete",
+        SANDBOX_DELETE_COMPOSE,
+        "--workspace",
+        WORKSPACE_DELETE_COMPOSE,
+    ])
+    .await;
+    assert!(res.success, "sandbox delete failed: {}", res.output);
+    assert!(
+        res.output.contains("Deleted sandbox"),
+        "sandbox delete should report terminal deletion: {}",
+        res.output
+    );
+
+    let res = run_cli(&["workspace", "delete", WORKSPACE_DELETE_COMPOSE]).await;
+    assert!(
+        res.success,
+        "workspace delete should succeed immediately after sandbox delete: {}",
         res.output
     );
 }
