@@ -112,7 +112,7 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Triage          | `triage-validate-issue`   | Assess, classify, and route community-filed issues                                                  |
 | Triage          | `triage-submitter-profile` | Summarize an issue submitter's identity, affiliation, and track record                             |
 | Triage          | `review-triage-queue`     | Create a local, read-only queue report from GitHub intake                                           |
-| Triage          | `assess-issue-routing`    | Assess whether one issue has an owner driving its next decision                                     |
+| Triage          | `triage-recommend-actions` | Recommend acceptance, priority, labels, people, and release target for one issue                   |
 | Triage          | `apply-triage-action`     | Apply, reject, or defer one explicitly selected triage recommendation                               |
 | Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
