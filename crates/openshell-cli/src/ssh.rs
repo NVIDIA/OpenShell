@@ -1096,6 +1096,7 @@ fn append_upload_path<W: Write>(
     let file_type = metadata.file_type();
 
     if file_type.is_file() {
+        archive.sparse(!zero_blocks_hide_data(local_path, &metadata));
         archive
             .append_path_with_name(local_path, archive_path)
             .into_diagnostic()
@@ -1127,6 +1128,45 @@ fn append_upload_path<W: Write>(
         "unsupported file type for upload: {}",
         local_path.display()
     ))
+}
+
+/// Whether `tar` would store this file as all holes while it has data.
+///
+/// `tar` treats a non-empty file that reports zero allocated blocks as fully
+/// sparse without reading it. Some filesystems, such as WSL2 drive mounts,
+/// report zero blocks for ordinary files, which would then upload as NULs.
+/// A file that is really sparse holds only NULs, so it is left to `tar`.
+fn zero_blocks_hide_data(path: &Path, metadata: &fs::Metadata) -> bool {
+    reports_zero_blocks(metadata)
+        && metadata.len() > 0
+        && fs::File::open(path)
+            .and_then(|mut file| has_non_nul_byte(&mut file))
+            // If it cannot be read, send it densely so `tar` reports the error.
+            .unwrap_or(true)
+}
+
+#[cfg(any(target_os = "android", target_os = "freebsd", target_os = "linux"))]
+fn reports_zero_blocks(metadata: &fs::Metadata) -> bool {
+    std::os::unix::fs::MetadataExt::blocks(metadata) == 0
+}
+
+/// `tar` only detects sparse files on the platforms above.
+#[cfg(not(any(target_os = "android", target_os = "freebsd", target_os = "linux")))]
+fn reports_zero_blocks(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn has_non_nul_byte(reader: &mut impl std::io::Read) -> std::io::Result<bool> {
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return Ok(false),
+            Ok(n) if buf[..n].iter().any(|&byte| byte != 0) => return Ok(true),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 fn upload_archive_dir_entry_path(archive_path: &Path) -> PathBuf {
@@ -3696,6 +3736,7 @@ mod tests {
         entry_type: tar::EntryType,
         #[cfg_attr(not(unix), allow(dead_code))]
         link_name: Option<String>,
+        contents: Vec<u8>,
     }
 
     fn upload_archive_entries(source: UploadSource) -> Vec<UploadArchiveEntry> {
@@ -3705,7 +3746,7 @@ mod tests {
         let entries = archive.entries().expect("read archive entries");
         let mut entries = entries
             .map(|entry| {
-                let entry = entry.expect("read archive entry");
+                let mut entry = entry.expect("read archive entry");
                 let path = entry
                     .path()
                     .expect("read archive path")
@@ -3716,11 +3757,15 @@ mod tests {
                     .link_name()
                     .expect("read archive link")
                     .map(|link| link.to_string_lossy().into_owned());
+                let mut contents = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut contents)
+                    .expect("read archive contents");
 
                 UploadArchiveEntry {
                     path,
                     entry_type,
                     link_name,
+                    contents,
                 }
             })
             .collect::<Vec<_>>();
@@ -3735,6 +3780,84 @@ mod tests {
             .collect::<Vec<_>>();
         paths.sort();
         paths
+    }
+
+    #[test]
+    fn upload_archive_preserves_contents_of_files_with_holes() {
+        use std::io::{Seek, SeekFrom};
+
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let path = tmpdir.path().join("holes.bin");
+        let mut file = fs::File::create(&path).expect("create file");
+        file.write_all(b"head").expect("write head");
+        file.seek(SeekFrom::Start(1 << 20)).expect("seek past hole");
+        file.write_all(b"tail").expect("write tail");
+        drop(file);
+
+        let entries = upload_archive_entries(UploadSource::SinglePath {
+            local_path: path,
+            tar_name: "holes.bin".into(),
+        });
+
+        assert_eq!(entries.len(), 1, "unexpected archive entries: {entries:?}");
+        assert_eq!(entries[0].contents.len(), (1 << 20) + 4);
+        assert_eq!(&entries[0].contents[..4], b"head");
+        assert_eq!(&entries[0].contents[1 << 20..], b"tail");
+    }
+
+    #[test]
+    fn upload_archive_preserves_files_that_are_all_holes() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let path = tmpdir.path().join("empty-extent.bin");
+        fs::File::create(&path)
+            .and_then(|file| file.set_len(1 << 20))
+            .expect("create sparse file");
+
+        let entries = upload_archive_entries(UploadSource::SinglePath {
+            local_path: path,
+            tar_name: "empty-extent.bin".into(),
+        });
+
+        assert_eq!(entries.len(), 1, "unexpected archive entries: {entries:?}");
+        assert_eq!(entries[0].contents, vec![0; 1 << 20]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upload_archive_preserves_files_that_report_zero_blocks() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Like WSL2 drive mounts, sysfs reports zero blocks for files that
+        // hold data. Without a guard, tar stores such a file as all NULs.
+        let path = Path::new("/sys/kernel/notes");
+        let Ok(expected) = fs::read(path) else {
+            return;
+        };
+        let metadata = fs::metadata(path).expect("stat file");
+        if metadata.blocks() != 0 || metadata.len() != expected.len() as u64 {
+            return;
+        }
+        assert!(expected.iter().any(|&byte| byte != 0));
+
+        let entries = upload_archive_entries(UploadSource::SinglePath {
+            local_path: path.to_path_buf(),
+            tar_name: "notes".into(),
+        });
+
+        assert_eq!(entries[0].contents, expected);
+    }
+
+    #[test]
+    fn non_nul_byte_scan_covers_the_whole_stream() {
+        let scan = |bytes: Vec<u8>| has_non_nul_byte(&mut std::io::Cursor::new(bytes)).unwrap();
+
+        assert!(!scan(Vec::new()));
+        assert!(!scan(vec![0; 3 << 20]));
+        assert!(scan(b"x".to_vec()));
+        // Past the first read buffer.
+        let mut late = vec![0; (2 << 20) + 1];
+        late[2 << 20] = 1;
+        assert!(scan(late));
     }
 
     #[test]
