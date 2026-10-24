@@ -5,6 +5,30 @@
 
 use std::path::{Path, PathBuf};
 
+/// Return the first responsive local Docker API socket.
+#[must_use]
+pub fn detect_docker_socket() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(host) = std::env::var("DOCKER_HOST")
+        && let Some(path) = host.trim().strip_prefix("unix://")
+        && !path.is_empty()
+    {
+        candidates.push(PathBuf::from(path));
+    }
+    candidates.push(PathBuf::from("/var/run/docker.sock"));
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".docker/run/docker.sock"));
+    }
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        candidates.push(PathBuf::from(runtime_dir).join("docker.sock"));
+    }
+    first_responsive_socket(&candidates, |response| {
+        http_response_is_success(response)
+            && contains_ascii(response, b"Api-Version:")
+            && !contains_ascii(response, b"Libpod-Api-Version:")
+    })
+}
+
 /// Return the first candidate whose HTTP ping response is accepted.
 #[must_use]
 pub fn first_responsive_socket(
