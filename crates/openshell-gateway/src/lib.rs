@@ -284,6 +284,10 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
             .and_then(OtlpConfig::traces_endpoint)
             .map(str::to_string);
         config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+        config.supervisor_otlp_agent_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::agent_endpoint)
+            .map(str::to_string);
         config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         // With the gateway supervisor topology, the gateway owns the shared
         // supervisor's assignments and token; the driver adapts them to
@@ -362,6 +366,10 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
             .and_then(OtlpConfig::traces_endpoint)
             .map(str::to_string);
         config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+        config.supervisor_otlp_agent_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::agent_endpoint)
+            .map(str::to_string);
         config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         require_guest_tls_for_local_driver(&context, "docker")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
@@ -429,6 +437,10 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
             .and_then(OtlpConfig::traces_endpoint)
             .map(str::to_string);
         config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+        config.supervisor_otlp_agent_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::agent_endpoint)
+            .map(str::to_string);
         config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         require_guest_tls_for_local_driver(&context, "podman")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());

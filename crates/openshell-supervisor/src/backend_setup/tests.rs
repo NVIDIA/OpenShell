@@ -212,6 +212,7 @@ fn agent() -> AgentSpec {
         workdir: Some("/test-workspace".into()),
         timeout_secs: 15,
         interactive: false,
+        otlp_relay_active: false,
     }
 }
 
@@ -704,6 +705,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             provider_workload_api_socket: None,
             // The binary loads the proxy trust directory from its environment.
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
+            agent_otlp_endpoint: None,
         };
         let bindings = crate::SandboxInstanceBindings::dedicated(
             &config,

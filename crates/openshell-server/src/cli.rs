@@ -749,6 +749,7 @@ async fn run_from_args(
         info!(
             traces_endpoint = otlp.traces_endpoint().map(tracing::field::display),
             ocsf_endpoint = otlp.ocsf_endpoint().map(tracing::field::display),
+            agent_endpoint = otlp.agent_endpoint().map(tracing::field::display),
             "OTLP exporting enabled"
         );
     }

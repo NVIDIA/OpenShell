@@ -388,6 +388,9 @@ impl SharedHost {
                 ca_private_key: Some(ca_private_key),
                 directory: Some(trust_dir),
             },
+            // The shared host has no per-instance collector endpoint yet, so
+            // hosted instances do not relay agent traces.
+            agent_otlp_endpoint: None,
         };
         crate::sandbox_instance_host::sandbox_instance_launch(
             Box::new(crate::backend_setup::RoutedBackendSetup::new(

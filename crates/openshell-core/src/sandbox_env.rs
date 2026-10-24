@@ -32,6 +32,12 @@ pub const OTLP_ENDPOINT: &str = "OPENSHELL_OTLP_ENDPOINT";
 /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
 pub const OTLP_OCSF_ENDPOINT: &str = "OPENSHELL_OTLP_OCSF_ENDPOINT";
 
+/// OTLP/gRPC collector endpoint that supervisors relay workload traces to.
+///
+/// Set only when the gateway enables `[openshell.gateway.otlp.agent]`; absent
+/// keeps the relay inactive and leaves the workload environment unchanged.
+pub const OTLP_AGENT_ENDPOINT: &str = "OPENSHELL_OTLP_AGENT_ENDPOINT";
+
 /// OCSF schema version that supervisors downgrade exported events to.
 pub const OTLP_OCSF_SCHEMA_VERSION: &str = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION";
 
@@ -299,10 +305,73 @@ pub const DEFAULT_SANDBOX_GID: u32 = 1000;
 /// OCI only for the former contract.
 pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 
+/// Standard OpenTelemetry environment variable for the OTLP exporter endpoint.
+///
+/// While the supervisor serves the OTLP relay, the sandbox runtime sets it in
+/// workload processes to [`OTLP_RELAY_ENDPOINT`] as a lowest-precedence
+/// default, so agent SDKs export to the relay without configuration. It is
+/// not set when the creation request, the image, or a per-exec environment
+/// names an endpoint, generic or traces-specific, and any signal-specific
+/// endpoint the workload sets later takes precedence over it in the SDK.
+pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+
+/// Standard OpenTelemetry environment variable for the OTLP exporter protocol.
+///
+/// Set to `http/protobuf` alongside [`OTEL_EXPORTER_OTLP_ENDPOINT`].
+pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
+
+/// Signal-specific endpoint variable. Never injected; a layer that sets it
+/// has chosen where traces go, so the relay default is left out.
+pub const OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
+
+/// Reserved destination agent processes export OTLP to.
+///
+/// This address is never routed. A workload `connect()` to any non-loopback
+/// address is intercepted by the sandbox seccomp broker and staged for the
+/// supervisor, which recognises this destination and serves the OTLP
+/// receiver on the staged stream itself instead of dialing upstream. So the
+/// value is a label the supervisor switches on, and it must stay outside
+/// loopback (loopback connects complete locally without mediation) and
+/// outside `198.18.0.0/15`, which the policy DNS runtime uses for synthetic
+/// answers. `192.0.0.8` is the IPv4 dummy address (RFC 7600): reserved,
+/// unroutable, and never assigned to a real service.
+pub const OTLP_RELAY_ADDR: &str = "192.0.0.8:4318";
+
+/// [`OTLP_RELAY_ADDR`] as the URL injected through
+/// [`OTEL_EXPORTER_OTLP_ENDPOINT`].
+pub const OTLP_RELAY_ENDPOINT: &str = "http://192.0.0.8:4318";
+
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the
 // way it could bake `ENV` values.
+
+#[cfg(test)]
+mod otlp_relay_address_tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::{OTLP_RELAY_ADDR, OTLP_RELAY_ENDPOINT};
+
+    #[test]
+    fn relay_address_is_an_unroutable_non_loopback_label() {
+        let addr: SocketAddr = OTLP_RELAY_ADDR.parse().expect("relay address parses");
+        assert_eq!(addr.port(), 4318, "OTLP HTTP default port");
+        let IpAddr::V4(ip) = addr.ip() else {
+            panic!("relay address must be IPv4");
+        };
+        assert!(
+            !ip.is_loopback(),
+            "loopback would bypass seccomp mediation and never reach the supervisor"
+        );
+        assert_eq!(ip, Ipv4Addr::new(192, 0, 0, 8), "RFC 7600 dummy address");
+        let [a, b, ..] = ip.octets();
+        assert!(
+            !(a == 198 && (b == 18 || b == 19)),
+            "198.18.0.0/15 is the policy DNS synthetic answer pool"
+        );
+        assert_eq!(OTLP_RELAY_ENDPOINT, format!("http://{OTLP_RELAY_ADDR}"));
+    }
+}
 
 #[cfg(test)]
 mod tests {

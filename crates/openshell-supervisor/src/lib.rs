@@ -23,6 +23,7 @@ mod config_runtime;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
+mod otlp_relay;
 mod provider_readiness;
 pub mod sandbox_instance_host;
 pub mod shared_host;
@@ -634,6 +635,7 @@ pub async fn run_network_proxy(
         None,
         None,
         None,
+        None,
     )
     .await?;
 
@@ -791,6 +793,9 @@ pub struct SandboxInstanceConfig {
     /// SPIFFE Workload API socket for provider token grants; absent fails closed.
     pub provider_workload_api_socket: Option<std::path::PathBuf>,
     pub proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles,
+    /// OTLP/gRPC collector for relayed agent traces; `None` keeps the relay
+    /// inactive.
+    pub agent_otlp_endpoint: Option<String>,
 }
 
 impl SandboxInstanceConfig {
@@ -939,6 +944,7 @@ pub async fn run_sandbox_instance(
         trace_context,
         provider_workload_api_socket,
         proxy_tls,
+        agent_otlp_endpoint,
     } = config;
     // The owner binds the event context and log sink to the instance's
     // threads; the instance itself uses the rest.
@@ -1153,6 +1159,13 @@ pub async fn run_sandbox_instance(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
+    // The agent trace relay must exist before networking starts so the
+    // handler is installed when the first staged connection arrives, and
+    // before attach so the agent spec can tell the boundary whether to point
+    // workload SDKs at it.
+    let (mut otlp_relay, otlp_reserved_destination) =
+        otlp_relay::activate(agent_otlp_endpoint, sandbox_id.clone());
+
     // Construct the selected client only after shared policy and credential
     // setup has completed. Keep live credentials and later CA publication in
     // supervisor-owned handles shared with the backend.
@@ -1172,6 +1185,7 @@ pub async fn run_sandbox_instance(
                 workdir: workspace,
                 timeout_secs,
                 interactive,
+                otlp_relay_active: otlp_relay.is_some(),
             },
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.attach"))
@@ -1293,6 +1307,7 @@ pub async fn run_sandbox_instance(
             None,
             remote_network_source,
             proxy_listener,
+            otlp_reserved_destination,
         )
         .await?,
     );
@@ -1584,6 +1599,17 @@ pub async fn run_sandbox_instance(
         boundary_access
             .publish_main_exit(exit_code, await_main_process_attachment)
             .await;
+        // Flush relayed agent traces before the exit is reported so the last
+        // spans of a short run are not lost. Bounded; never fails. When the
+        // access plane is retained for exec sessions, the relay keeps serving
+        // them and shuts down at final teardown instead.
+        if retain_access {
+            if let Some(relay) = otlp_relay.as_ref() {
+                relay.flush(otlp_relay::FLUSH_TIMEOUT).await;
+            }
+        } else if let Some(relay) = otlp_relay.take() {
+            relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
+        }
         // `shutdown_requested` has already completed when shutdown won the
         // lifecycle select above and must not be polled again.
         let mut completion_cancelled = !retain_access;
@@ -1627,6 +1653,11 @@ pub async fn run_sandbox_instance(
         if retain_access {
             info!(backend = %backend_name, "Canonical process exited; retaining control-mode access plane");
             retain_remote_access_plane(&mut proxy_exited, &mut shutdown_requested).await?;
+        }
+        // Exec sessions served after the main exit may have exported traces;
+        // flush those too before the relay goes away.
+        if let Some(relay) = otlp_relay.take() {
+            relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
         }
         drop(instance_readiness);
         drop(running);
@@ -4367,6 +4398,7 @@ mod tests {
             trace_context: None,
             provider_workload_api_socket: None,
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
+            agent_otlp_endpoint: None,
         };
         let bindings = SandboxInstanceBindings::dedicated(
             &config,

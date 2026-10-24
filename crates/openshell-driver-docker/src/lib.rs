@@ -212,6 +212,11 @@ pub struct DockerComputeConfig {
     #[serde(skip)]
     pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
 
+    /// OTLP/gRPC collector that supervisors relay workload traces to. The
+    /// gateway supplies it from `[otlp.agent]`; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_otlp_agent_endpoint: Option<String>,
+
     /// Gateway name passed to supervisors for their telemetry. The gateway
     /// supplies its own name; driver TOML cannot set it.
     #[serde(skip)]
@@ -319,6 +324,7 @@ impl Default for DockerComputeConfig {
             supervisor_network_mode: DockerSupervisorNetworkMode::Host,
             host_gateway_ip: None,
             supervisor_ocsf_export: None,
+            supervisor_otlp_agent_endpoint: None,
             supervisor_gateway_name: None,
             sandbox_runtime_image: None,
             supervisor_bin: None,
@@ -360,6 +366,7 @@ struct DockerDriverRuntimeConfig {
     bridge_default_endpoint: Option<String>,
     host_gateway_ip: Option<IpAddr>,
     supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+    supervisor_otlp_agent_endpoint: Option<String>,
     supervisor_gateway_name: Option<String>,
     ssh_socket_path: String,
     guest_tls: Option<DockerGuestTlsPaths>,
@@ -1018,6 +1025,9 @@ impl DockerComputeDriver {
                 bridge_default_endpoint,
                 host_gateway_ip,
                 supervisor_ocsf_export: docker_config.supervisor_ocsf_export.clone(),
+                supervisor_otlp_agent_endpoint: docker_config
+                    .supervisor_otlp_agent_endpoint
+                    .clone(),
                 supervisor_gateway_name: docker_config.supervisor_gateway_name.clone(),
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 guest_tls,
@@ -5830,7 +5840,8 @@ fn docker_child_environment(sandbox: &DriverSandbox) -> HashMap<String, String> 
 }
 
 /// Environment that lets the supervisor export spans, joining the current
-/// trace, and OCSF events, identifying the gateway that launched it.
+/// trace, OCSF events, and relayed workload traces, identifying the gateway
+/// that launched it.
 fn supervisor_otlp_environment(config: &DockerDriverRuntimeConfig) -> Vec<String> {
     let traces = config.supervisor_otlp_endpoint.iter().flat_map(|endpoint| {
         std::iter::once((openshell_core::sandbox_env::OTLP_ENDPOINT, endpoint.clone()))
@@ -5840,12 +5851,22 @@ fn supervisor_otlp_environment(config: &DockerDriverRuntimeConfig) -> Vec<String
         .supervisor_ocsf_export
         .iter()
         .flat_map(openshell_core::sandbox_env::OcsfOtlpExport::environment);
+    let agent = config
+        .supervisor_otlp_agent_endpoint
+        .iter()
+        .map(|endpoint| {
+            (
+                openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT,
+                endpoint.clone(),
+            )
+        });
     let gateway_name = config
         .supervisor_gateway_name
         .iter()
         .map(|name| (openshell_core::sandbox_env::GATEWAY_NAME, name.clone()));
     traces
         .chain(ocsf)
+        .chain(agent)
         .chain(gateway_name)
         .map(|(name, value)| format!("{name}={value}"))
         .collect()
