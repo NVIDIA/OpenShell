@@ -339,6 +339,13 @@ The gateway rejects partial or invalid signing bundles at startup, including pri
 
 External compute drivers declare this requirement by adding `openshell.compute.launch-authentication` to their extension metadata's `required_capabilities`. This requires a gateway that understands the launch-signing preflight and supplies `SandboxLaunchAuthentication` on creation. Drivers that use another launch mechanism can omit the requirement. The separate `supports_sandbox_authentication` capability describes the `AuthenticateSandbox` RPC and does not require launch signing.
 
+The gateway refuses to start before binding any ports when no OIDC issuer, mTLS user authentication, operator authentication, or `gateway_jwt` is configured and `allow_unauthenticated_users` is unset or false. Configure an authentication mechanism, or explicitly opt in for trusted local development:
+
+```toml
+[openshell.gateway.auth]
+allow_unauthenticated_users = true
+```
+
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
 ## Database Pool

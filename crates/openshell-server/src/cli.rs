@@ -659,12 +659,34 @@ fn prepare_server_config_with_drivers(
     })
 }
 
+/// Reject an implicit development gateway before starting any listeners or services.
+fn validate_user_auth(config: &openshell_core::Config) -> Result<()> {
+    if !config.auth.allow_unauthenticated_users
+        && !config.mtls_auth.enabled
+        && !config.mtls_auth.operator_enabled
+        && config.oidc.is_none()
+        && config.gateway_jwt.is_none()
+    {
+        return Err(miette::miette!(
+            "gateway has no user authentication configured\n\n\
+             No OIDC issuer, mTLS user auth, operator auth, or gateway_jwt is set, so every \
+             caller would be granted platform-admin access.\n\n\
+             Configure [openshell.gateway.oidc], [openshell.gateway.mtls_auth], or \
+             [openshell.gateway.gateway_jwt], or explicitly opt in for trusted local development:\n\n\
+             [openshell.gateway.auth]\n\
+             allow_unauthenticated_users = true"
+        ));
+    }
+    Ok(())
+}
+
 async fn run_from_args(
     mut args: RunArgs,
     matches: ArgMatches,
     compute_drivers: ComputeDriverRegistry,
 ) -> Result<()> {
     let prepared = prepare_server_config_with_drivers(&mut args, &matches, &compute_drivers)?;
+    validate_user_auth(&prepared.config)?;
 
     // Initialize OCSF identity before tracing can emit gateway events.
     let gateway_identity = crate::gateway_ocsf::GatewayIdentity {
@@ -755,18 +777,6 @@ async fn run_from_args(
     if prepared.config.auth.allow_unauthenticated_users {
         warn!(
             "Unauthenticated user access enabled — only use this for trusted local development or a fully trusted fronting proxy"
-        );
-    }
-
-    if !prepared.config.auth.allow_unauthenticated_users
-        && !prepared.config.mtls_auth.enabled
-        && !prepared.config.mtls_auth.operator_enabled
-        && !has_oidc
-        && prepared.config.gateway_jwt.is_none()
-    {
-        warn!(
-            "Neither mTLS user auth nor OIDC nor sandbox JWT auth is configured — \
-             the gateway has no authentication mechanism"
         );
     }
 
@@ -1419,6 +1429,88 @@ mod tests {
     use clap::Parser;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn user_auth_requires_a_mechanism_or_explicit_opt_in() {
+        // Cover each mechanism on its own and in combination, with and without
+        // the development opt-in. Only the entirely unconfigured case fails.
+        for mechanisms in 0..32 {
+            let mut config = openshell_core::Config::new(None);
+            config.auth.allow_unauthenticated_users = mechanisms & 1 != 0;
+            config.mtls_auth.enabled = mechanisms & 2 != 0;
+            config.mtls_auth.operator_enabled = mechanisms & 4 != 0;
+            if mechanisms & 8 != 0 {
+                config.oidc = Some(
+                    toml::from_str("issuer = 'https://idp.example.com'\naudience = 'openshell'")
+                        .unwrap(),
+                );
+            }
+            if mechanisms & 16 != 0 {
+                config.gateway_jwt = Some(toml::from_str(
+                    "signing_key_path = 'key.pem'\npublic_key_path = 'public.pem'\nkid_path = 'kid'"
+                ).unwrap());
+            }
+            assert_eq!(
+                super::validate_user_auth(&config).is_ok(),
+                mechanisms != 0,
+                "authentication combination {mechanisms}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_rejects_missing_user_auth_before_starting_services() {
+        for auth in [
+            "",
+            "[openshell.gateway.auth]\nallow_unauthenticated_users = false\n",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let config_path = home.path().join("gateway.toml");
+            std::fs::write(&config_path, format!("[openshell]\nversion = 2\n{auth}")).unwrap();
+            Environment::new()
+                .set("XDG_CONFIG_HOME", home.path().to_str().unwrap())
+                .set("XDG_STATE_HOME", home.path().to_str().unwrap())
+                .set("OPENSHELL_LOCAL_TLS_DIR", home.path().join("tls"))
+                .remove("OPENSHELL_GATEWAY_CONFIG")
+                .remove("OPENSHELL_DRIVERS")
+                .run(|| {
+                    let (args, matches) = parse_with_args(&[
+                        "openshell-gateway",
+                        "--config",
+                        config_path.to_str().unwrap(),
+                        "--disable-tls",
+                        "--db-url",
+                        "sqlite::memory:",
+                        "--compute-driver",
+                        "test",
+                    ]);
+                    // The factory panics if startup reaches driver construction.
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let error = runtime
+                        .block_on(super::run_from_args(
+                            args,
+                            matches,
+                            test_registry("test", true),
+                        ))
+                        .unwrap_err()
+                        .to_string();
+                    for expected in [
+                        "gateway has no user authentication configured",
+                        "OIDC",
+                        "mTLS",
+                        "operator auth",
+                        "gateway_jwt",
+                        "[openshell.gateway.auth]",
+                        "allow_unauthenticated_users = true",
+                    ] {
+                        assert!(error.contains(expected), "missing {expected:?} in {error}");
+                    }
+                });
+        }
+    }
 
     static REGISTRY_DETECTION_CALLS: AtomicUsize = AtomicUsize::new(0);
     static REJECTING_VALIDATION_CALLS: AtomicUsize = AtomicUsize::new(0);
