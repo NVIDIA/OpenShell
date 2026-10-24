@@ -661,6 +661,10 @@ pkiInitJob:
   # Secrets. When certManager.enabled=true, cert-manager owns TLS and this same
   # hook runs in JWT-only mode even if pkiInitJob.enabled remains true.
   enabled: true
+  # -- Additional labels on both certificate hook Pods. Chart-owned labels take precedence.
+  podLabels: {}
+  # -- Additional annotations on both certificate hook Pods.
+  podAnnotations: {}
   # -- Extra DNS SANs to append to the server certificate.
   serverDnsNames: []
   # -- Extra IP SANs to append to the server certificate.
