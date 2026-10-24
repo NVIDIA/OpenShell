@@ -20,6 +20,7 @@ openshell-otel = { path = "../openshell-otel" }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
 tar = "0.4"
+tempfile = "3"
 uuid = { workspace = true }
 
 tokio = { workspace = true }
@@ -44,6 +45,7 @@ tower-http = { workspace = true }
 http = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
+sha2 = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
@@ -53,7 +55,6 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 prost-types = { workspace = true }
 rcgen = { workspace = true }
 temp-env = "0.3"
-tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

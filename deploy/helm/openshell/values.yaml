@@ -85,6 +85,9 @@ supervisor:
     seccompProfile:
       # -- Seccomp profile applied to the shared supervisor pod.
       type: RuntimeDefault
+  network:
+    # -- Name of an operator-owned ConfigMap with a `ca.crt` key containing additional destination CA certificates for sandbox supervisors. Empty disables additional destination trust.
+    additionalCaConfigMapName: ""
   sandboxRuntime:
     # -- Workload boundary TLS listener port.
     boundaryPort: 5500

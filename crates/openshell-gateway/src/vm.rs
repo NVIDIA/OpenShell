@@ -31,7 +31,7 @@ use hyper_util::rt::TokioIo;
 use openshell_core::proto::compute::v1::{
     GetCapabilitiesRequest, compute_driver_client::ComputeDriverClient,
 };
-use openshell_core::{Error, Result, UpstreamProxyConfig};
+use openshell_core::{Error, NetworkSupervisorTrustBundle, Result, UpstreamProxyConfig};
 #[cfg(unix)]
 use openshell_otel::TraceContextInterceptor;
 use openshell_server::AcquiredRemoteDriverEndpoint;
@@ -531,6 +531,7 @@ pub async fn spawn(
     gateway_name: &str,
     vm_config: &VmComputeConfig,
     otlp_config: Option<&OtlpConfig>,
+    additional_ca_bundle: Option<&NetworkSupervisorTrustBundle>,
 ) -> Result<AcquiredRemoteDriverEndpoint> {
     vm_config.validate_configuration()?;
     let driver_bin = resolve_compute_driver_bin(vm_config)?;
@@ -580,6 +581,7 @@ pub async fn spawn(
         command.arg("--guest-tls-ca").arg(tls.ca);
     }
     append_vm_proxy_and_spiffe_args(&mut command, vm_config);
+    append_vm_network_trust_args(&mut command, additional_ca_bundle);
     if vm_config.enable_bind_mounts {
         command.arg("--enable-bind-mounts");
     }
@@ -639,6 +641,25 @@ fn append_vm_rootfs_tar_args(command: &mut Command, config: &VmComputeConfig) {
 }
 
 #[cfg(unix)]
+fn append_vm_network_trust_args(
+    command: &mut Command,
+    bundle: Option<&NetworkSupervisorTrustBundle>,
+) {
+    if let Some(bundle) = bundle {
+        // Only stable, non-secret artifact metadata crosses the process
+        // boundary. The child reads and verifies the bounded artifact once,
+        // then retains its own immutable snapshot for sandbox launches.
+        command
+            .arg("--additional-ca-bundle")
+            .arg(bundle.artifact_path());
+        command.arg("--additional-ca-digest").arg(bundle.digest());
+        command
+            .arg("--additional-ca-certificate-count")
+            .arg(bundle.certificate_count().to_string());
+    }
+}
+
+#[cfg(unix)]
 fn append_vm_proxy_and_spiffe_args(command: &mut Command, config: &VmComputeConfig) {
     let proxy = &config.upstream_proxy;
     if let Some(url) = proxy.https_proxy.as_ref() {
@@ -694,6 +715,7 @@ pub async fn spawn(
     _gateway_name: &str,
     _vm_config: &VmComputeConfig,
     _otlp_config: Option<&OtlpConfig>,
+    _additional_ca_bundle: Option<&NetworkSupervisorTrustBundle>,
 ) -> Result<AcquiredRemoteDriverEndpoint> {
     Err(Error::config(
         "the vm compute driver requires unix domain socket support",
@@ -775,13 +797,13 @@ async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        VmComputeConfig, append_otlp_args, append_vm_identity_args,
+        VmComputeConfig, append_otlp_args, append_vm_identity_args, append_vm_network_trust_args,
         append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args, compute_driver_guest_tls_paths,
         compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
         prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
         validate_vm_sandbox_identity,
     };
-    use openshell_core::UpstreamProxyConfig;
+    use openshell_core::{NetworkSupervisorTrustBundle, UpstreamProxyConfig};
     use openshell_server::config_file::{
         OcsfOtlpConfig, OcsfSchemaVersion, OtlpConfig, OtlpTracesConfig,
     };
@@ -941,6 +963,45 @@ mod tests {
         let mut command = tokio::process::Command::new("openshell-driver-vm");
         append_vm_proxy_and_spiffe_args(&mut command, &VmComputeConfig::default());
         assert_eq!(command.as_std().get_args().count(), 0);
+    }
+
+    #[test]
+    fn vm_driver_command_forwards_only_network_trust_artifact_metadata() {
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        let pem =
+            b"-----BEGIN CERTIFICATE-----\nprivate-fixture-bytes\n-----END CERTIFICATE-----\n";
+        let bundle = NetworkSupervisorTrustBundle::new(
+            pem.to_vec(),
+            2,
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            PathBuf::from("/var/lib/openshell/network/additional-ca.crt"),
+        );
+        append_vm_network_trust_args(&mut command, Some(&bundle));
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--additional-ca-bundle",
+                "/var/lib/openshell/network/additional-ca.crt",
+                "--additional-ca-digest",
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "--additional-ca-certificate-count",
+                "2",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "OPENSHELL_TLS_CA"));
+        assert!(
+            !args.iter().any(|arg| arg.contains("private-fixture-bytes")),
+            "CA material must not cross the process boundary in argv: {args:?}"
+        );
+
+        let mut unset = tokio::process::Command::new("openshell-driver-vm");
+        append_vm_network_trust_args(&mut unset, None);
+        assert_eq!(unset.as_std().get_args().count(), 0);
     }
 
     #[test]

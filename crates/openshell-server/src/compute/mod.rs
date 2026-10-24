@@ -1068,6 +1068,11 @@ impl ComputeRuntime {
         if self.isolation_backend.is_some() {
             self.validate_launch_signer_configured(!launch_authentication.is_empty())?;
         }
+        // Starts may need to replace a stopped local workload/supervisor
+        // pair. Always reconstruct that input from the gateway's durable
+        // record; never let a driver derive provisioning input from mutable
+        // runtime inspection output.
+        let driver_sandbox = self.driver_sandbox_for_launch(sandbox)?;
         Ok(StartSandboxRequest {
             sandbox_id: sandbox.object_id().to_string(),
             name: sandbox.object_name().to_string(),
@@ -1077,6 +1082,7 @@ impl ComputeRuntime {
             launch_authentication,
             expected_runtime_identity,
             isolation_backend: self.isolation_backend.clone(),
+            sandbox: Some(driver_sandbox),
         })
     }
 
@@ -2226,6 +2232,10 @@ impl ComputeRuntime {
         } else {
             None
         };
+        // Starts may need to replace a stopped local workload/supervisor pair.
+        // The request (including its durable provisioning snapshot) is always
+        // reconstructed from the gateway's record; never let a driver derive
+        // provisioning input from mutable runtime inspection output.
         let request =
             self.driver_start_request(&starting, launch_authentication, expected_runtime_identity)?;
         let driver = self.driver.clone();
@@ -3641,11 +3651,13 @@ impl ComputeRuntime {
     /// Should be called once at gateway startup, before watchers spawn,
     /// so the watch loop sees the post-start state on its first poll.
     pub async fn start_persisted_sandboxes(&self) -> Result<(), String> {
-        self.start_persisted_sandboxes_with_authentication(
+        // The reconciliation futures carry full persisted sandbox records;
+        // keep them off the caller's stack (clippy::large_futures).
+        Box::pin(self.start_persisted_sandboxes_with_authentication(
             |_| async { Ok(Vec::new()) },
             |_| async { Ok(()) },
             |_| {},
-        )
+        ))
         .await
     }
 
@@ -3664,13 +3676,13 @@ impl ComputeRuntime {
         authentication_failed: Failed,
     ) -> Result<(), String>
     where
-        Authentication: Fn(&Sandbox) -> AuthenticationFuture,
-        AuthenticationFuture: Future<Output = Result<Vec<u8>, String>>,
-        Committed: Fn(&str) -> CommittedFuture,
-        CommittedFuture: Future<Output = Result<(), String>>,
-        Failed: Fn(&str),
+        Authentication: Fn(&Sandbox) -> AuthenticationFuture + Send + Sync,
+        AuthenticationFuture: Future<Output = Result<Vec<u8>, String>> + Send,
+        Committed: Fn(&str) -> CommittedFuture + Send + Sync,
+        CommittedFuture: Future<Output = Result<(), String>> + Send,
+        Failed: Fn(&str) + Send + Sync,
     {
-        self.recover_persisted_lifecycle_transitions().await?;
+        Box::pin(self.recover_persisted_lifecycle_transitions()).await?;
         if !self.driver_info.gateway_manages_lifecycle {
             return Ok(());
         }
@@ -3765,6 +3777,9 @@ impl ComputeRuntime {
                     continue;
                 }
             };
+            // Recovery is allowed to reconstruct provisioning inputs only
+            // from the persisted gateway record (the request snapshot is
+            // rebuilt by `driver_start_request`).
             let request = match self.driver_start_request(
                 &sandbox,
                 launch_authentication,
@@ -4054,8 +4069,8 @@ impl ComputeRuntime {
                     // Recovery retains the original attempt and deadline. A
                     // stalled driver must release this lifecycle gate after
                     // expiry so the deadline worker can reclaim its compute.
-                    if let Err(err) = self
-                        .await_provisioning_operation(
+                    if let Err(err) =
+                        Box::pin(self.await_provisioning_operation(
                             &sandbox,
                             self.driver.call_owned(
                                 openshell_otel::rpc::START_SANDBOX,
@@ -4064,7 +4079,7 @@ impl ComputeRuntime {
                                     driver.start_sandbox(Request::new(request)).await
                                 },
                             ),
-                        )
+                        ))
                         .await
                     {
                         warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to recover sandbox start");
@@ -4084,6 +4099,11 @@ impl ComputeRuntime {
             .map_err(|err| format!("failed to list sandboxes for {operation}: {err}"))
     }
 
+    /// Fail closed when a start/recovery cannot reconstruct a driver's durable
+    /// provisioning snapshot.  This is intentionally distinct from an
+    /// ambiguous transport failure: no start RPC has been issued, so keeping
+    /// `Starting` for a blind retry would allow a local reconciliation path to
+    /// fall back to mutable platform state.
     async fn mark_sandbox_error(&self, sandbox: &Sandbox, reason: &str, message: &str) {
         let _guard = self.lock_sandbox_local(sandbox.object_id()).await;
         let sandbox_id = sandbox.object_id().to_string();
@@ -17467,11 +17487,31 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         ));
 
         driver.clear_calls();
-        runtime.start_persisted_sandboxes().await.unwrap();
+        runtime
+            .start_persisted_sandboxes_with_authentication(
+                |_| async { Ok(b"test-launch-authentication".to_vec()) },
+                |_| async { Ok(()) },
+                |_| {},
+            )
+            .await
+            .unwrap();
         assert!(matches!(
             driver.calls().as_slice(),
-            [FakeComputeDriverCall::GetCapabilities, FakeComputeDriverCall::StartSandbox { sandbox_id, sandbox_name, .. }]
-                if sandbox_id == "sb-uds" && sandbox_name == "uds-sandbox"
+            [
+                FakeComputeDriverCall::GetCapabilities,
+                FakeComputeDriverCall::StartSandbox {
+                    sandbox_id,
+                    sandbox_name,
+                    launch_authentication,
+                    sandbox: Some(durable),
+                    ..
+                },
+            ]
+                if sandbox_id == "sb-uds"
+                    && sandbox_name == "uds-sandbox"
+                    && !launch_authentication.is_empty()
+                    && durable.id == "sb-uds"
+                    && durable.name == "uds-sandbox"
         ));
         driver.clear_calls();
         assert!(
@@ -17494,6 +17534,42 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             }
             other => panic!("expected DeleteSandbox call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn start_sandbox_request_uses_optional_wire_field_seven_for_durable_snapshot() {
+        let legacy = StartSandboxRequest {
+            sandbox_id: "sandbox-id".into(),
+            name: "sandbox-name".into(),
+            launch_authentication: b"opaque-auth".to_vec(),
+            generation_id: "generation-id".into(),
+            expected_runtime_identity: String::new(),
+            isolation_backend: None,
+            sandbox: None,
+        };
+        let with_snapshot = StartSandboxRequest {
+            sandbox: Some(DriverSandbox {
+                id: "sandbox-id".into(),
+                name: "sandbox-name".into(),
+                ..Default::default()
+            }),
+            ..legacy.clone()
+        };
+        let legacy_wire = legacy.encode_to_vec();
+        let snapshot_wire = with_snapshot.encode_to_vec();
+        // Field 7 is length-delimited, hence its protobuf key is 0x3a. The
+        // legacy form does not emit it, preserving existing fields 1–6
+        // (field 6 is the upstream isolation backend registration).
+        assert!(!legacy_wire.contains(&0x3a));
+        assert!(snapshot_wire.contains(&0x3a));
+        assert_eq!(
+            StartSandboxRequest::decode(snapshot_wire.as_slice())
+                .unwrap()
+                .sandbox
+                .as_ref()
+                .map(|sandbox| sandbox.id.as_str()),
+            Some("sandbox-id")
+        );
     }
 
     #[tokio::test]

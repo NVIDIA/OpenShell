@@ -97,7 +97,7 @@ async fn main() -> Result<()> {
             schema_version: args.otlp_ocsf_schema_version.clone(),
         }
     });
-    let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config)
+    let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config, None)
         .await
         .into_diagnostic()?;
 
