@@ -6973,9 +6973,9 @@ fn format_endpoints(rule: &openshell_core::proto::NetworkPolicyRule) -> String {
 /// `openshell rule get` useful for approval review.
 fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String {
     let host_port = if endpoint.port > 0 {
-        format!("{}:{}", endpoint.host, endpoint.port)
+        format!("{}:{}{}", endpoint.host, endpoint.port, endpoint.path)
     } else {
-        endpoint.host.clone()
+        format!("{}{}", endpoint.host, endpoint.path)
     };
 
     let mut tags: Vec<String> = Vec::new();
@@ -6999,16 +6999,65 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
         if let Some(allow) = &r.allow {
             let method = non_empty_or(&allow.method, "*");
             let path = non_empty_or(&allow.path, "*");
-            tags.push(format!("allow {method} {path}"));
+            let mut tag = format!("allow {method} {path}");
+            append_graphql(
+                &mut tag,
+                &allow.operation_type,
+                &allow.operation_name,
+                &allow.fields,
+            );
+            append_matchers(&mut tag, &allow.query);
+            append_matchers(&mut tag, &allow.params);
+            tags.push(tag);
         }
     }
     for r in &endpoint.deny_rules {
         let method = non_empty_or(&r.method, "*");
         let path = non_empty_or(&r.path, "*");
-        tags.push(format!("deny {method} {path}"));
+        let mut tag = format!("deny {method} {path}");
+        append_graphql(&mut tag, &r.operation_type, &r.operation_name, &r.fields);
+        append_matchers(&mut tag, &r.query);
+        append_matchers(&mut tag, &r.params);
+        tags.push(tag);
     }
 
     format!("{host_port} [{}]", tags.join(", "))
+}
+
+/// Append GraphQL operation selectors, such as `graphql mutation createIssue`.
+fn append_graphql(tag: &mut String, operation_type: &str, operation_name: &str, fields: &[String]) {
+    use std::fmt::Write as _;
+
+    if !operation_type.is_empty() || !operation_name.is_empty() {
+        let _ = write!(
+            tag,
+            " graphql {} {}",
+            non_empty_or(operation_type, "*"),
+            non_empty_or(operation_name, "*")
+        );
+    }
+    if !fields.is_empty() {
+        let _ = write!(tag, " fields {}", fields.join(","));
+    }
+}
+
+/// Append query or MCP params matchers in key order, so an MCP tool rule
+/// shows as `allow tools/call * name=read_wiki_structure`.
+fn append_matchers(
+    tag: &mut String,
+    matchers: &HashMap<String, openshell_core::proto::L7QueryMatcher>,
+) {
+    use std::fmt::Write as _;
+
+    let mut entries: Vec<_> = matchers.iter().collect();
+    entries.sort_by_key(|(key, _)| *key);
+    for (key, matcher) in entries {
+        if matcher.any.is_empty() {
+            let _ = write!(tag, " {key}={}", matcher.glob);
+        } else {
+            let _ = write!(tag, " {key} in [{}]", matcher.any.join(","));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8458,6 +8507,49 @@ mod tests {
         assert_eq!(
             format_endpoint(&l7_scoped),
             "host.example.test:443 [L7 rest, allow PUT /v1/example/resource, deny DELETE /v1/example/resource]"
+        );
+
+        let mcp_tool = NetworkEndpoint {
+            host: "mcp.example.test".to_string(),
+            port: 443,
+            path: "/mcp".to_string(),
+            protocol: "mcp".to_string(),
+            rules: vec![L7Rule {
+                allow: Some(L7Allow {
+                    method: "tools/call".to_string(),
+                    params: std::collections::HashMap::from([(
+                        "name".to_string(),
+                        openshell_core::proto::L7QueryMatcher {
+                            glob: "read_wiki_structure".to_string(),
+                            any: vec![],
+                        },
+                    )]),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        let graphql = NetworkEndpoint {
+            host: "api.example.test".to_string(),
+            port: 443,
+            protocol: "graphql".to_string(),
+            rules: vec![L7Rule {
+                allow: Some(L7Allow {
+                    operation_type: "query".to_string(),
+                    operation_name: "Viewer".to_string(),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            format_endpoint(&graphql),
+            "api.example.test:443 [graphql, allow * * graphql query Viewer]"
+        );
+
+        assert_eq!(
+            format_endpoint(&mcp_tool),
+            "mcp.example.test:443/mcp [mcp, allow tools/call * name=read_wiki_structure]"
         );
     }
 

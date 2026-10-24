@@ -216,9 +216,10 @@ and cannot be approved until validation succeeds.
 ## What Agents Can Propose
 
 An agent proposes endpoints and binaries. An endpoint can include an access
-preset, method and path allow rules, deny rules, `allowed_ips`, and
-`allow_encoded_slash`. A good proposal allows one method on the narrowest path
-the task needs:
+preset, allow and deny rules, `allowed_ips`, `allow_encoded_slash`, and
+`mcp.versions`. Allow and deny rules take the same fields as in a policy file,
+including query matchers and MCP `tool` and `params`. A good proposal allows
+one method on the narrowest path the task needs:
 
 ```json
 {
@@ -258,9 +259,10 @@ the task needs:
 ```
 
 Agents cannot propose `protocol: tcp` or `tls: skip`, because OpenShell cannot
-inspect that traffic. The API also has no fields for GraphQL operation rules,
-MCP tool rules, query matchers, credential settings, or endpoint path selectors,
-and it ignores them if an agent sends them. Review the rule that
+inspect that traffic. The API also has no fields for endpoint path selectors,
+credential settings, GraphQL persisted queries, or MCP options other than
+`versions`, and it rejects a proposal that sends a field it does not support or
+a rule the sandbox could not load. Review the rule that
 `openshell rule get` shows, not the agent's description of it. Add rules that
 need those fields yourself, as described in [Manage Sandbox
 Policies](/how-it-works/policies/manage-policies).
