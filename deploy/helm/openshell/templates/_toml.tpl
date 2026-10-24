@@ -304,6 +304,41 @@ owner: server.*. Override any gatewayConfig copies before serializing TOML. */}}
 {{- end -}}
 {{- $_ := set $config "openshell.gateway.tls" $gatewayTls -}}
 {{- end -}}
+{{/* Metrics TLS is opt-in and deliberately uses a separate configuration
+boundary from the gateway listener so its client CA can stay independent. */}}
+{{- $metrics := .Values.metrics | default dict -}}
+{{- $metricsTls := get $metrics "tls" | default dict -}}
+{{- if get $metricsTls "enabled" -}}
+{{- if not .Values.service.metricsPort -}}
+{{- fail "metrics.tls.enabled requires service.metricsPort to be non-zero" -}}
+{{- end -}}
+{{- if and (get $metricsTls "requireClientCert") (not (get $metricsTls "clientCaSecretName")) -}}
+{{- fail "metrics.tls.requireClientCert requires metrics.tls.clientCaSecretName" -}}
+{{- end -}}
+{{- $gatewayClientCaSecretName := "" -}}
+{{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" -}}
+{{- if or (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) -}}
+{{- $gatewayClientCaSecretName = .Values.server.tls.certSecretName -}}
+{{- else -}}
+{{- $gatewayClientCaSecretName = .Values.server.tls.clientCaSecretName -}}
+{{- end -}}
+{{- end -}}
+{{- if and (get $metricsTls "clientCaSecretName") (eq (get $metricsTls "clientCaSecretName") $gatewayClientCaSecretName) -}}
+{{- fail "metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret" -}}
+{{- end -}}
+{{- $metricsTlsConfig := get $config "openshell.gateway.metrics_tls" | default dict -}}
+{{- $_ := set $metricsTlsConfig "cert_path" "/etc/openshell-metrics/server/tls.crt" -}}
+{{- $_ := set $metricsTlsConfig "key_path" "/etc/openshell-metrics/server/tls.key" -}}
+{{- if get $metricsTls "clientCaSecretName" -}}
+{{- $_ := set $metricsTlsConfig "client_ca_path" "/etc/openshell-metrics/client-ca/ca.crt" -}}
+{{- else -}}
+{{- $_ := unset $metricsTlsConfig "client_ca_path" -}}
+{{- end -}}
+{{- $_ := set $metricsTlsConfig "require_client_auth" (get $metricsTls "requireClientCert") -}}
+{{- $_ := set $config "openshell.gateway.metrics_tls" $metricsTlsConfig -}}
+{{- else -}}
+{{- $_ := unset $config "openshell.gateway.metrics_tls" -}}
+{{- end -}}
 {{/* A nested YAML map and its dotted top-level table would serialize to
 conflicting TOML definitions. Fail before rendering an invalid ConfigMap. */}}
 {{- range $tableName := keys $config | sortAlpha -}}
