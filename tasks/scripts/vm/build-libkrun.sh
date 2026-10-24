@@ -8,8 +8,9 @@
 # with OpenShell's custom kernel configuration for sandbox enforcement.
 #
 # In addition to the platform's native .so artifacts, this script exports
-# kernel.c and ABI_VERSION metadata so that other platforms (e.g. macOS) can
-# compile their own libkrunfw wrapper without rebuilding the kernel.
+# kernel.c, ABI_VERSION, and provenance.json (libkrunfw commit, kernel version,
+# final kernel config hash) so that other platforms (e.g. macOS) can compile
+# their own libkrunfw wrapper without rebuilding the kernel.
 #
 # Prerequisites:
 #   - Linux (aarch64 or x86_64)
@@ -272,6 +273,14 @@ for artifact in kernel.c ABI_VERSION; do
   cp "$artifact" "$OUTPUT_DIR/"
 done
 echo "    Built: $(ls "$OUTPUT_DIR"/libkrunfw.so* | xargs -n1 basename | tr '\n' ' ')"
+
+# Record the kernel inputs for package-vm-runtime.sh. The macOS job reuses
+# kernel.c without a libkrunfw checkout, so it reads this file instead.
+kernel_config_sha256="$(sha256sum "${KERNEL_SOURCES}/.config" | awk '{print $1}')"
+printf '{"libkrunfw_commit":"%s","kernel_version":"%s","kernel_config_sha256":"%s"}\n' \
+  "$(git rev-parse HEAD)" "$KERNEL_VERSION" "$kernel_config_sha256" \
+  > "$OUTPUT_DIR/provenance.json"
+echo "    Kernel config sha256: ${kernel_config_sha256}"
 
 cd "$BUILD_DIR"
 
