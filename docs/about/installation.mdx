@@ -256,6 +256,13 @@ systemctl --user enable --now snap.openshell.user-gateway.service
 
 For an installation upgraded from a legacy system gateway, use `sudo systemctl reset-failed snap.openshell.system-gateway.service` and `sudo snap restart openshell.system-gateway` instead.
 
+## Windows
+
+Native Windows x64 and ARM64 use MXC. Build from the
+[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows) and follow
+its [Windows guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md).
+The shell installer above does not install native Windows binaries.
+
 ## Kubernetes
 
 Deploy the gateway to a cluster with the OpenShell Helm chart. See [Kubernetes Setup](/kubernetes/setup).

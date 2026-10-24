@@ -1030,43 +1030,35 @@ the SPIRE OIDC discovery endpoint or its TLS CA.
 
 ### MXC
 
-The MXC driver runs Windows workloads through `wxc-exec`. Enable ETW auditing to
-map Windows Sandboxing provider events into the gateway's OCSF stream.
+The MXC driver runs native Windows workloads through `wxc-exec`. Use this
+configuration with a build from the
+[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows). Keep
+`openshell-supervisor.exe` and `openshell-windows-sandbox.exe` beside the gateway.
 
 ```toml
 [openshell]
 version = 2
 
 [openshell.gateway]
-bind_address    = "127.0.0.1:17670"
-log_level       = "info"
+bind_address = "127.0.0.1:17670"
 compute_driver = "mxc"
+# Required when gateway TLS is enabled.
+guest_tls_ca = "C:\\OpenShell\\certs\\ca.pem"
 
 [openshell.drivers.mxc]
-wxc_exec_path           = "C:\\mxc-kit\\bin\\wxc-exec.exe"
-backend                 = "process_container"
-default_configuration_id = "composable"
-pc_least_privilege      = false
-pc_capabilities         = []
-debug                   = false
-etw_audit               = true
+wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
+backend = "process_container"
+# Administrator opt-in for per-sandbox commands and working directories.
+allow_driver_config = true
+etw_audit = true
 ```
 
-`etw_audit` defaults to `false`. When enabled, the gateway account must be an
-administrator or belong to the Windows Performance Log Users group. Workload
-commands and working directories remain sandbox-scoped and must be supplied in
-the `mxc` driver configuration when creating a sandbox.
+`etw_audit` defaults to `false`. Enabling it requires an administrator account
+or membership in Windows Performance Log Users. See
+[OCSF JSON Export](/observability/ocsf-json-export) for durable audit output.
 
-`OPENSHELL_OCSF_JSON=1` enables the gateway's JSONL audit
-sink independently of the selected compute driver. Set `OPENSHELL_OCSF_LOG_DIR`
-to override the default `%PROGRAMDATA%\OpenShell\logs` directory on Windows
-or `$XDG_STATE_HOME/openshell/logs` on Unix. Prefer the gateway's configured
-`ocsf_log` output for retention controls and loss metrics.
-
-The driver records executable identity in process audit events and omits raw
-command arguments because they can contain credentials or personal data. See
-[OCSF JSON Export](/observability/ocsf-json-export) for durable Windows audit
-output.
+Follow the [Windows configuration guide](https://github.com/NVIDIA/OpenShell/blob/windows/docs/how-it-works/gateways/configuration.mdx#mxc)
+for host prerequisites, TLS setup, sandbox creation, and runtime limitations.
 
 ### Docker
 

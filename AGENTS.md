@@ -51,7 +51,8 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
 | `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
-| `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |
+| [`crates/openshell-driver-mxc/`](https://github.com/NVIDIA/OpenShell/tree/windows/crates/openshell-driver-mxc) (`windows` branch) | Microsoft MXC compute driver | Native Windows ProcessContainer backend; see the Windows branch for the maintained implementation |
+| [`crates/openshell-mxc-boundary/`](https://github.com/NVIDIA/OpenShell/tree/windows/crates/openshell-mxc-boundary) (`windows` branch) | Windows sandbox boundary | Dedicated Windows workload boundary paired with the host supervisor |
 | `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
 | `crates/openshell-prover-cli/` | Policy prover CLI | Standalone local policy boundary checks |
 | `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |

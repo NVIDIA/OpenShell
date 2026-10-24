@@ -67,11 +67,25 @@ For an intentional minor-train incompatibility, record the Buf finding,
 linked issue, consumer impact, and migration plan in the PR. Keep the finding
 visible; do not disable the job or add a broad Buf ignore rule.
 
-Windows PR checks are opt-in: add `test:windows`, then select **Re-run all jobs**
+### Windows validation
+
+Native Windows implementation and releases use the
+[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows), independently
+of the `main` release train described in this document. Shared documentation on
+`main` must retain that branch placement. See [WINDOWS.md](WINDOWS.md) for the
+native MSVC build and MXC runtime requirements.
+
+The [Windows MSVC workflow on `windows`](https://github.com/NVIDIA/OpenShell/blob/windows/.github/workflows/windows-msvc.yml)
+runs native x64 and ARM64 lanes. Windows PR checks are opt-in: add
+`test:windows`, then select **Re-run all jobs**
 on the current Windows MSVC run. Subsequent mirrored commits run them automatically.
 Windows checks are not required for merging and do not run in merge queues.
-Main and manual runs also build release binaries, with `continue-on-error: true`
-so Windows failures do not fail the workflow.
+Pushes to `windows` and manual runs on that branch seed the lint/test caches and run dependent
+release binary builds. Those jobs use `continue-on-error: true`, so inspect
+their individual results rather than treating a green workflow as qualification.
+The jobs do not upload or publish the binaries. Native Windows packages are
+not supplied through the `main` installer or release train. Real MXC runtime qualification requires a
+capable host and the [Windows runtime tests](https://github.com/NVIDIA/OpenShell/blob/windows/TESTING.md#native-windows-validation).
 
 ### Advisory compatibility review
 
