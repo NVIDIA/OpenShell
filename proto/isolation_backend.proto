@@ -44,6 +44,11 @@ service IsolationBackend {
   // Reopening the same session and generation returns the same result. The
   // descriptor must bind to the same provisioned resource; a different resource
   // binding fails.
+  // A trusted driver may provision a restored boundary through its native
+  // backend integration. In that case OpenBoundary reports RESTORED, or
+  // COLD_START_FALLBACK only when the driver explicitly permitted it. The
+  // backend enforces this choice; reference handoff is private to the driver
+  // and backend and does not require supervisor bootstrap fields.
   // Driver deletion invalidates all handles and retained-state references,
   // including abandoned launches and suspended boundaries.
   rpc OpenBoundary(OpenBoundaryRequest) returns (OpenBoundaryResponse);
@@ -127,5 +132,5 @@ message ResumeBoundaryRequest {
   // boot from the image and persistent volumes is permitted and reported as
   // LAUNCH_OUTCOME_COLD_START_FALLBACK. This never permits unauthorized or
   // superseded references to select a new launch.
-  bool allow_cold_start_fallback = 3;
+  bool restart_if_restore_fails = 3;
 }

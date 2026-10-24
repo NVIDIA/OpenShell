@@ -82,6 +82,25 @@ trust directory uses its private directory. Hosted processes must install
 `LogPushLayer::thread_bound` and an `OcsfShorthandLayer` writing to
 `SandboxInstanceDenialWriter`.
 
+## Suspend and resume
+
+The supervisor installs a `SIGUSR1` handler at startup. After the workload
+starts, the signal requests suspension when the backend advertises
+`openshell.sandbox.suspend-resume`; otherwise the supervisor ignores it.
+
+While suspending, the supervisor stops waiting on the workload so a fenced
+generation's stream failure cannot race the request. The backend retains the
+state and hands its handle to the compute driver through their native
+integration. On success the supervisor exits with status 0 without writing a
+reference file, calling `TerminateBoundary`, or reporting a main-process exit.
+On failure it resumes waiting on the workload. Both outcomes emit OCSF events
+without reference bytes.
+
+Resume is provisioned by the driver and backend. The supervisor's ordinary
+`OpenBoundary` call can attach to a restored boundary, and records the backend's
+reported outcome before normal admission and `StartAgent`. No retention state
+or policy is carried in the shared supervisor bootstrap metadata.
+
 ## Console logging
 
 Diagnostics and OCSF shorthand share a bounded, nonblocking stderr writer. With `ocsf_json_enabled=true`, the same writer also receives timestamped `OCSF-JSON` records. Each formatter submits a complete line in one write so concurrent producers cannot interleave records in the queue. The 1,024-line queue drops new lines when full rather than waiting for stderr.

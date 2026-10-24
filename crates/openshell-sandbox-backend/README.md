@@ -26,6 +26,36 @@ negotiator checks major versions and each peer's required capabilities. The
 built-in runtime does not advertise `openshell.sandbox.suspend-resume` and
 returns `UNIMPLEMENTED` for those optional RPCs.
 
+## Suspend and resume
+
+The supervisor's `Describe` metadata lists `openshell.sandbox.suspend-resume`
+as supported but not required. The client keeps the backend's negotiated
+metadata from each opening and exposes whether it advertised the capability.
+
+`RunningBoundary::suspend` sends one `SuspendBoundary` call with the boundary
+handle, session ID, and generation, and returns the restore reference. It
+fails with `Unsupported` when the backend did not advertise the capability and
+rejects empty references or references larger than
+`MAX_RESTORE_REFERENCE_BYTES` (64 KiB). The supervisor retries only when the
+driver signals it again.
+
+`DelegatedLaunch` contains identity and transport metadata only. A driver can
+provision a restored resource through its backend's native integration. For a
+backend advertising state retention, an ordinary `OpenBoundary` can report a
+restored or explicitly permitted cold-start outcome. The backend enforces the
+driver's restore policy; the supervisor does not manage the retained-state handle.
+
+`OpenShellRuntimeBackend::with_resume` and
+`discover_registered_policy_with_resume` take a `ResumeLaunch`. Every boundary
+opening for that launch, including policy discovery and transport recovery,
+sends `ResumeBoundary` with the same launch request instead of `OpenBoundary`.
+Opening fails with `Unsupported` when the backend lacks the capability. A
+resume accepts `RESTORED`, or `COLD_START_FALLBACK` only when fallback is
+allowed; a fresh launch accepts only `FRESH`. A replay that reports a different
+handle or outcome is denied. `BoundBoundary::launch_outcome` reports the
+validated outcome. Attach accepts a snapshot that already lists restored
+processes, and StartAgent proceeds as for a fresh launch.
+
 `SandboxProtocol.Exchange` and `.Mediate` begin with the handle from
 `OpenBoundary`. The server authenticates the stream's bearer, checks the handle
 against its provisioned sandbox and generation, then accepts typed protobuf

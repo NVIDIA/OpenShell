@@ -11,6 +11,8 @@ use crate::boundary_protocol::{BoundaryConfig, SandboxRuntimeDescriptor};
 use crate::proto::{ExchangeFrame, exchange_frame::Payload};
 
 pub const SANDBOX_PROTOCOL_CAPABILITY: &str = "openshell.sandbox.protocol";
+/// Optional backend support for `SuspendBoundary` and `ResumeBoundary`.
+pub const SUSPEND_RESUME_CAPABILITY: &str = "openshell.sandbox.suspend-resume";
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
 
 /// The built-in runtime supports fresh launches; suspend/resume is optional.
@@ -26,11 +28,38 @@ pub fn metadata(implementation: &str) -> PeerMetadata {
     }
 }
 
+/// Supervisor metadata: the base contract is required, and the supervisor can
+/// drive optional suspend/resume when a backend advertises it.
+#[must_use]
+pub fn supervisor_metadata(implementation: &str) -> PeerMetadata {
+    let mut metadata = metadata(implementation);
+    metadata
+        .supported_capabilities
+        .push(SUSPEND_RESUME_CAPABILITY.to_string());
+    metadata
+}
+
 /// Use the shared extension rules: equal majors and both peers' requirements.
 pub fn negotiate(local: &PeerMetadata, remote: Option<PeerMetadata>) -> Result<(), tonic::Status> {
+    negotiate_peer(local, remote).map(drop)
+}
+
+/// Negotiate like [`negotiate`] and return the remote peer's normalized
+/// metadata so callers can check its optional capabilities.
+pub fn negotiate_peer(
+    local: &PeerMetadata,
+    remote: Option<PeerMetadata>,
+) -> Result<PeerMetadata, tonic::Status> {
     negotiate_metadata("isolation", "sandbox-protocol", local, remote)
-        .map(drop)
         .map_err(|error| tonic::Status::failed_precondition(error.to_string()))
+}
+
+/// Whether negotiated peer metadata advertises suspend/resume support.
+#[must_use]
+pub fn supports_suspend_resume(peer: &PeerMetadata) -> bool {
+    peer.supported_capabilities
+        .iter()
+        .any(|capability| capability == SUSPEND_RESUME_CAPABILITY)
 }
 
 /// Check native driver coordinates against the protected runtime bootstrap.

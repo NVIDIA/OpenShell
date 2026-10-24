@@ -11,8 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::backend_proto::{
-    DescribeIsolationBackendRequest, OpenBoundaryRequest,
-    isolation_backend_client::IsolationBackendClient, open_boundary_response::LaunchOutcome,
+    DescribeIsolationBackendRequest, OpenBoundaryRequest, ResumeBoundaryRequest,
+    SuspendBoundaryRequest, isolation_backend_client::IsolationBackendClient,
+    open_boundary_response::LaunchOutcome,
 };
 #[cfg(test)]
 use crate::isolation_protocol::{chunk_data, data_chunk};
@@ -193,7 +194,106 @@ impl BoundaryTransport {
     }
 }
 
-/// Host-side `OpenShell` Sandbox Protocol implementation registered with the supervisor.
+/// Largest restore reference the supervisor accepts from a backend or driver.
+pub const MAX_RESTORE_REFERENCE_BYTES: usize = 64 * 1024;
+
+/// Restore a suspended boundary instead of opening a fresh one.
+///
+/// Every boundary opening for this launch, including policy discovery and
+/// transport recovery, replays the same `ResumeBoundary` request.
+#[derive(Clone)]
+pub struct ResumeLaunch {
+    restore_reference: Vec<u8>,
+    restart_if_restore_fails: bool,
+}
+
+impl ResumeLaunch {
+    /// Reject empty or oversized references before any backend call.
+    pub fn new(
+        restore_reference: Vec<u8>,
+        restart_if_restore_fails: bool,
+    ) -> Result<Self, BackendError> {
+        if restore_reference.is_empty() {
+            return Err(BackendError::Descriptor(
+                "restore reference is empty".to_string(),
+            ));
+        }
+        if restore_reference.len() > MAX_RESTORE_REFERENCE_BYTES {
+            return Err(BackendError::Descriptor(format!(
+                "restore reference exceeds {MAX_RESTORE_REFERENCE_BYTES} bytes"
+            )));
+        }
+        Ok(Self {
+            restore_reference,
+            restart_if_restore_fails,
+        })
+    }
+
+    pub fn restart_if_restore_fails(&self) -> bool {
+        self.restart_if_restore_fails
+    }
+}
+
+impl std::fmt::Debug for ResumeLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResumeLaunch")
+            .field("restore_reference", &"[REDACTED]")
+            .field("restart_if_restore_fails", &self.restart_if_restore_fails)
+            .finish()
+    }
+}
+
+/// How the backend reported the boundary it opened for this launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryLaunchOutcome {
+    Fresh,
+    Restored,
+    ColdStartFallback,
+}
+
+impl BoundaryLaunchOutcome {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Restored => "restored",
+            Self::ColdStartFallback => "cold_start_fallback",
+        }
+    }
+}
+
+/// Accept only the outcomes the requested launch mode permits.
+fn validate_launch_outcome(
+    outcome: i32,
+    resume: Option<&ResumeLaunch>,
+    driver_managed_restore: bool,
+) -> Result<BoundaryLaunchOutcome, BackendError> {
+    let outcome = LaunchOutcome::try_from(outcome).unwrap_or(LaunchOutcome::Unspecified);
+    match (resume, outcome) {
+        (None, LaunchOutcome::Fresh) => Ok(BoundaryLaunchOutcome::Fresh),
+        (None, LaunchOutcome::Restored) if driver_managed_restore => {
+            Ok(BoundaryLaunchOutcome::Restored)
+        }
+        (None, LaunchOutcome::ColdStartFallback) if driver_managed_restore => {
+            Ok(BoundaryLaunchOutcome::ColdStartFallback)
+        }
+        (None, _) => Err(BackendError::Descriptor(
+            "invalid fresh boundary opening response".to_string(),
+        )),
+        (Some(_), LaunchOutcome::Restored) => Ok(BoundaryLaunchOutcome::Restored),
+        (Some(resume), LaunchOutcome::ColdStartFallback) if resume.restart_if_restore_fails => {
+            Ok(BoundaryLaunchOutcome::ColdStartFallback)
+        }
+        (Some(_), LaunchOutcome::ColdStartFallback) => Err(BackendError::Descriptor(
+            "backend reported a cold-start fallback that was not permitted".to_string(),
+        )),
+        (Some(_), _) => Err(BackendError::Descriptor(
+            "invalid boundary resume response outcome".to_string(),
+        )),
+    }
+}
+
+/// Concrete RPC client used for both in-tree and endpoint-registered backends.
 #[derive(Debug)]
 pub struct OpenShellRuntimeBackend {
     transport: BoundaryTransport,
@@ -201,6 +301,7 @@ pub struct OpenShellRuntimeBackend {
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     delegated: Option<DelegatedRuntime>,
+    resume: Option<ResumeLaunch>,
 }
 
 #[derive(Clone)]
@@ -242,7 +343,15 @@ impl OpenShellRuntimeBackend {
             provider_credentials,
             sandbox_bearer,
             delegated: None,
+            resume: None,
         }
+    }
+
+    /// Restore a suspended boundary rather than opening a fresh one.
+    #[must_use]
+    pub fn with_resume(mut self, resume: Option<ResumeLaunch>) -> Self {
+        self.resume = resume;
+        self
     }
 
     /// Construct the same RPC client for an operator-registered backend.
@@ -272,10 +381,29 @@ impl OpenShellRuntimeBackend {
         driver_descriptor: Vec<u8>,
         bearer: openshell_core::jwt::SessionBearerTokenSlot,
     ) -> Result<(Option<String>, bool), BackendError> {
+        Self::discover_registered_policy_with_resume(
+            backend_name,
+            descriptor,
+            driver_descriptor,
+            bearer,
+            None,
+        )
+        .await
+    }
+
+    /// Discover policy for a launch that may restore a suspended boundary.
+    pub async fn discover_registered_policy_with_resume(
+        backend_name: String,
+        descriptor: SandboxRuntimeDescriptor,
+        driver_descriptor: Vec<u8>,
+        bearer: openshell_core::jwt::SessionBearerTokenSlot,
+        resume: Option<ResumeLaunch>,
+    ) -> Result<(Option<String>, bool), BackendError> {
         crate::delegated::validate_backend_name(&backend_name)?;
         validate_runtime_coordinates(&descriptor)?;
-        let client =
+        let mut client =
             BoundaryClient::with_backend(descriptor, bearer, backend_name, driver_descriptor);
+        client.resume = resume;
         client.discover_policy().await
     }
 
@@ -327,6 +455,7 @@ impl OpenShellRuntimeBackend {
             descriptor.payload.clone(),
         );
         client.transport = self.transport.clone();
+        client.resume.clone_from(&self.resume);
         let client = Arc::new(client);
         let response = client
             .call_idempotent(Request::Attach {
@@ -476,6 +605,16 @@ impl BoundBoundary {
         self.host_gateway_ip
     }
 
+    /// The validated outcome of the boundary opening used for attachment.
+    pub fn launch_outcome(&self) -> Option<BoundaryLaunchOutcome> {
+        self.client.launch_outcome.get().copied()
+    }
+
+    /// Whether the negotiated backend advertised suspend/resume support.
+    pub fn supports_suspend(&self) -> bool {
+        self.client.backend_supports_suspend.load(Ordering::Acquire)
+    }
+
     pub async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
         let response = self.client.call_idempotent(Request::Confirm).await?;
         let Response::Confirmed { confirmation } = response else {
@@ -614,6 +753,21 @@ impl RunningBoundary {
             .call_idempotent(Request::TerminateBoundary)
             .await?;
         expect_response(response, "boundary_terminated")
+    }
+
+    /// Whether the negotiated backend advertised suspend/resume support.
+    pub fn supports_suspend(&self) -> bool {
+        self.process
+            .client
+            .backend_supports_suspend
+            .load(Ordering::Acquire)
+    }
+
+    /// Freeze and fence this generation, returning the backend's opaque
+    /// restore reference. The caller must not terminate the boundary after a
+    /// successful suspension.
+    pub async fn suspend(&self) -> Result<Vec<u8>, BackendError> {
+        self.process.client.suspend_boundary().await
     }
 }
 
@@ -1185,6 +1339,9 @@ struct BoundaryClient {
     backend_name: String,
     driver_descriptor: Vec<u8>,
     boundary_handle: std::sync::OnceLock<String>,
+    resume: Option<ResumeLaunch>,
+    launch_outcome: std::sync::OnceLock<BoundaryLaunchOutcome>,
+    backend_supports_suspend: AtomicBool,
     supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     grpc_channel: tokio::sync::Mutex<Option<CachedGrpcChannel>>,
@@ -1378,6 +1535,9 @@ impl BoundaryClient {
             backend_name,
             driver_descriptor,
             boundary_handle: std::sync::OnceLock::new(),
+            resume: None,
+            launch_outcome: std::sync::OnceLock::new(),
+            backend_supports_suspend: AtomicBool::new(false),
             supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId::new(),
             sandbox_bearer,
             grpc_channel: tokio::sync::Mutex::new(None),
@@ -2081,9 +2241,9 @@ impl BoundaryClient {
         credential: &BoundaryCredential,
     ) -> Result<(), BackendError> {
         let mut client = IsolationBackendClient::new(channel)
-            .max_decoding_message_size(64 * 1024)
-            .max_encoding_message_size(64 * 1024);
-        let supervisor = crate::isolation_protocol::metadata("openshell/supervisor");
+            .max_decoding_message_size(64 * 1024 + MAX_RESTORE_REFERENCE_BYTES)
+            .max_encoding_message_size(64 * 1024 + MAX_RESTORE_REFERENCE_BYTES);
+        let supervisor = crate::isolation_protocol::supervisor_metadata("openshell/supervisor");
         let response = client
             .describe(DescribeIsolationBackendRequest {
                 supervisor: Some(supervisor.clone()),
@@ -2091,27 +2251,50 @@ impl BoundaryClient {
             .await
             .map_err(control_rpc_error)?
             .into_inner();
-        crate::isolation_protocol::negotiate(&supervisor, response.backend)
+        let backend = crate::isolation_protocol::negotiate_peer(&supervisor, response.backend)
             .map_err(control_rpc_error)?;
-        let mut request = tonic::Request::new(OpenBoundaryRequest {
+        let supports_suspend = crate::isolation_protocol::supports_suspend_resume(&backend);
+        let launch = OpenBoundaryRequest {
             session_id: self.runtime_descriptor.session_id.to_string(),
             backend_name: self.backend_name.clone(),
             driver_descriptor: self.driver_descriptor.clone(),
-        });
-        request
-            .metadata_mut()
-            .insert("authorization", credential.authorization.clone());
-        let response = client
-            .open_boundary(request)
-            .await
-            .map_err(control_rpc_error)?
-            .into_inner();
-        if response.outcome != LaunchOutcome::Fresh as i32
-            || response.boundary_id.is_empty()
-            || response.boundary_id.len() > 128
-        {
+        };
+        let response = if let Some(resume) = &self.resume {
+            if !supports_suspend {
+                return Err(BackendError::Unsupported(format!(
+                    "isolation backend does not advertise {}; cannot resume a suspended boundary",
+                    crate::isolation_protocol::SUSPEND_RESUME_CAPABILITY
+                )));
+            }
+            let mut request = tonic::Request::new(ResumeBoundaryRequest {
+                launch: Some(launch),
+                restore_reference: resume.restore_reference.clone(),
+                restart_if_restore_fails: resume.restart_if_restore_fails,
+            });
+            request
+                .metadata_mut()
+                .insert("authorization", credential.authorization.clone());
+            client
+                .resume_boundary(request)
+                .await
+                .map_err(control_rpc_error)?
+                .into_inner()
+        } else {
+            let mut request = tonic::Request::new(launch);
+            request
+                .metadata_mut()
+                .insert("authorization", credential.authorization.clone());
+            client
+                .open_boundary(request)
+                .await
+                .map_err(control_rpc_error)?
+                .into_inner()
+        };
+        let outcome =
+            validate_launch_outcome(response.outcome, self.resume.as_ref(), supports_suspend)?;
+        if response.boundary_id.is_empty() || response.boundary_id.len() > 128 {
             return Err(BackendError::Descriptor(
-                "invalid fresh boundary opening response".to_string(),
+                "invalid boundary opening response handle".to_string(),
             ));
         }
         let handle = self
@@ -2122,7 +2305,54 @@ impl BoundaryClient {
                 "boundary handle changed during launch recovery".to_string(),
             ));
         }
+        // Replays of the same launch must report the same outcome.
+        if *self.launch_outcome.get_or_init(|| outcome) != outcome {
+            return Err(BackendError::Denied(
+                "boundary launch outcome changed during launch recovery".to_string(),
+            ));
+        }
+        self.backend_supports_suspend
+            .store(supports_suspend, Ordering::Release);
         Ok(())
+    }
+
+    /// Ask the backend to freeze and fence this generation. A single attempt:
+    /// the compute driver retries by signalling the supervisor again.
+    async fn suspend_boundary(&self) -> Result<Vec<u8>, BackendError> {
+        if !self.backend_supports_suspend.load(Ordering::Acquire) {
+            return Err(BackendError::Unsupported(format!(
+                "isolation backend does not advertise {}",
+                crate::isolation_protocol::SUSPEND_RESUME_CAPABILITY
+            )));
+        }
+        let boundary_id = self.boundary_handle()?.to_string();
+        self.ensure_current_credential_connection().await?;
+        let credential = BoundaryCredential::capture(&self.sandbox_bearer)?;
+        let channel = self.grpc_channel().await?;
+        let mut client = IsolationBackendClient::new(channel)
+            .max_decoding_message_size(64 * 1024 + MAX_RESTORE_REFERENCE_BYTES)
+            .max_encoding_message_size(64 * 1024);
+        let mut request = tonic::Request::new(SuspendBoundaryRequest {
+            boundary_id,
+            session_id: self.runtime_descriptor.session_id.to_string(),
+            generation_id: self.runtime_descriptor.generation.clone(),
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", credential.authorization);
+        let response = tokio::time::timeout(REQUEST_TIMEOUT, client.suspend_boundary(request))
+            .await
+            .map_err(|_| BackendError::Unavailable("boundary suspension timed out".to_string()))?
+            .map_err(control_rpc_error)?
+            .into_inner();
+        if response.restore_reference.is_empty()
+            || response.restore_reference.len() > MAX_RESTORE_REFERENCE_BYTES
+        {
+            return Err(BackendError::Descriptor(format!(
+                "backend restore reference must be 1 to {MAX_RESTORE_REFERENCE_BYTES} bytes"
+            )));
+        }
+        Ok(response.restore_reference)
     }
 
     #[cfg(test)]
@@ -2539,6 +2769,9 @@ mod tests {
         opens: Arc<std::sync::atomic::AtomicUsize>,
         backend_name: String,
         driver_descriptor: Option<Vec<u8>>,
+        resumes: Arc<std::sync::Mutex<Vec<ResumeBoundaryRequest>>>,
+        suspends: Arc<std::sync::Mutex<Vec<SuspendBoundaryRequest>>>,
+        suspend_reference: Result<Vec<u8>, tonic::Code>,
     }
 
     impl Default for TestIsolationBackend {
@@ -2549,6 +2782,25 @@ mod tests {
                 opens: Arc::default(),
                 backend_name: crate::BACKEND_NAME.to_string(),
                 driver_descriptor: None,
+                resumes: Arc::default(),
+                suspends: Arc::default(),
+                suspend_reference: Err(tonic::Code::Unimplemented),
+            }
+        }
+    }
+
+    impl TestIsolationBackend {
+        /// A backend that advertises optional suspend/resume support.
+        fn suspendable(outcome: LaunchOutcome) -> Self {
+            let mut metadata = crate::isolation_protocol::metadata("test/backend");
+            metadata
+                .supported_capabilities
+                .push(crate::isolation_protocol::SUSPEND_RESUME_CAPABILITY.to_string());
+            Self {
+                metadata: Some(metadata),
+                outcome: outcome as i32,
+                suspend_reference: Ok(b"opaque-restore-reference".to_vec()),
+                ..Self::default()
             }
         }
     }
@@ -2593,16 +2845,295 @@ mod tests {
 
         async fn suspend_boundary(
             &self,
-            _request: tonic::Request<SuspendBoundaryRequest>,
+            request: tonic::Request<SuspendBoundaryRequest>,
         ) -> Result<tonic::Response<SuspendBoundaryResponse>, tonic::Status> {
-            Err(tonic::Status::unimplemented("test backend"))
+            assert!(request.metadata().get("authorization").is_some());
+            self.suspends.lock().unwrap().push(request.into_inner());
+            match &self.suspend_reference {
+                Ok(reference) => Ok(tonic::Response::new(SuspendBoundaryResponse {
+                    restore_reference: reference.clone(),
+                })),
+                Err(code) => Err(tonic::Status::new(*code, "test backend")),
+            }
         }
 
         async fn resume_boundary(
             &self,
-            _request: tonic::Request<ResumeBoundaryRequest>,
+            request: tonic::Request<ResumeBoundaryRequest>,
         ) -> Result<tonic::Response<OpenBoundaryResponse>, tonic::Status> {
-            Err(tonic::Status::unimplemented("test backend"))
+            assert!(request.metadata().get("authorization").is_some());
+            let request = request.into_inner();
+            let launch = request.launch.as_ref().expect("resume carries a launch");
+            assert_eq!(launch.backend_name, self.backend_name);
+            assert!(!launch.session_id.is_empty());
+            self.resumes.lock().unwrap().push(request);
+            Ok(tonic::Response::new(OpenBoundaryResponse {
+                boundary_id: TEST_BOUNDARY_HANDLE.to_string(),
+                outcome: self.outcome,
+            }))
+        }
+    }
+
+    /// Serve one TLS connection with `service` and return a client for it.
+    async fn isolation_control_client(
+        service: TestIsolationBackend,
+        resume: Option<ResumeLaunch>,
+    ) -> (BoundaryClient, tokio::task::JoinHandle<()>) {
+        let certificate = test_certificate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client_tls = certificate.client_tls.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let stream = tokio_rustls::TlsAcceptor::from(certificate.server_config)
+                .accept(stream)
+                .await
+                .unwrap();
+            tonic::transport::Server::builder()
+                .add_service(IsolationBackendServer::new(service))
+                .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
+                    Box::new(stream),
+                ))]))
+                .await
+                .unwrap();
+        });
+        let mut client = BoundaryClient::new(
+            tls_runtime_descriptor(address, client_tls),
+            test_bearer(&"a".repeat(32)),
+        );
+        client.resume = resume;
+        (client, server)
+    }
+
+    fn resume_launch(restart_if_restore_fails: bool) -> ResumeLaunch {
+        ResumeLaunch::new(
+            b"opaque-restore-reference".to_vec(),
+            restart_if_restore_fails,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn launch_outcome_validation_matches_launch_mode() {
+        let strict = resume_launch(false);
+        let fallback = resume_launch(true);
+        let cases = [
+            (
+                LaunchOutcome::Fresh,
+                None,
+                Some(BoundaryLaunchOutcome::Fresh),
+            ),
+            (LaunchOutcome::Restored, None, None),
+            (LaunchOutcome::ColdStartFallback, None, None),
+            (LaunchOutcome::Unspecified, None, None),
+            (
+                LaunchOutcome::Restored,
+                Some(&strict),
+                Some(BoundaryLaunchOutcome::Restored),
+            ),
+            (LaunchOutcome::ColdStartFallback, Some(&strict), None),
+            (
+                LaunchOutcome::ColdStartFallback,
+                Some(&fallback),
+                Some(BoundaryLaunchOutcome::ColdStartFallback),
+            ),
+            (LaunchOutcome::Fresh, Some(&fallback), None),
+            (LaunchOutcome::Unspecified, Some(&fallback), None),
+        ];
+        for (outcome, resume, expected) in cases {
+            let result = validate_launch_outcome(outcome as i32, resume, false);
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap(), expected, "{outcome:?}"),
+                None => assert!(
+                    matches!(result, Err(BackendError::Descriptor(_))),
+                    "{outcome:?} {resume:?}: {result:?}"
+                ),
+            }
+        }
+        assert!(validate_launch_outcome(99, Some(&fallback), true).is_err());
+        assert_eq!(
+            validate_launch_outcome(LaunchOutcome::Restored as i32, None, true).unwrap(),
+            BoundaryLaunchOutcome::Restored
+        );
+        assert_eq!(
+            validate_launch_outcome(LaunchOutcome::ColdStartFallback as i32, None, true).unwrap(),
+            BoundaryLaunchOutcome::ColdStartFallback
+        );
+    }
+
+    #[test]
+    fn resume_launch_rejects_empty_and_oversized_references() {
+        assert!(ResumeLaunch::new(Vec::new(), false).is_err());
+        assert!(ResumeLaunch::new(vec![0; MAX_RESTORE_REFERENCE_BYTES + 1], false).is_err());
+        assert!(ResumeLaunch::new(vec![0; MAX_RESTORE_REFERENCE_BYTES], false).is_ok());
+        let debug = format!("{:?}", resume_launch(true));
+        assert!(!debug.contains("opaque-restore-reference"), "{debug}");
+    }
+
+    #[tokio::test]
+    async fn driver_provisioned_restore_uses_normal_boundary_opening() {
+        let service = TestIsolationBackend::suspendable(LaunchOutcome::Restored);
+        let resumes = service.resumes.clone();
+        let opens = service.opens.clone();
+        let (client, server) = isolation_control_client(service, None).await;
+        client.grpc_channel().await.unwrap();
+        assert_eq!(
+            client.launch_outcome.get().copied(),
+            Some(BoundaryLaunchOutcome::Restored)
+        );
+        assert_eq!(opens.load(Ordering::Acquire), 1);
+        assert!(resumes.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn resume_sends_resume_boundary_and_records_restored_outcome() {
+        let service = TestIsolationBackend::suspendable(LaunchOutcome::Restored);
+        let resumes = service.resumes.clone();
+        let opens = service.opens.clone();
+        let (client, server) = isolation_control_client(service, Some(resume_launch(false))).await;
+        client.grpc_channel().await.unwrap();
+        assert_eq!(
+            client.launch_outcome.get().copied(),
+            Some(BoundaryLaunchOutcome::Restored)
+        );
+        assert!(client.backend_supports_suspend.load(Ordering::Acquire));
+        assert_eq!(
+            opens.load(Ordering::Acquire),
+            0,
+            "resume must not open fresh"
+        );
+        let resumes = resumes.lock().unwrap().clone();
+        assert_eq!(resumes.len(), 1);
+        assert_eq!(resumes[0].restore_reference, b"opaque-restore-reference");
+        assert!(!resumes[0].restart_if_restore_fails);
+        assert_eq!(
+            resumes[0].launch.as_ref().unwrap().session_id,
+            test_session_id().to_string()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn resume_accepts_cold_start_fallback_only_when_allowed() {
+        let service = TestIsolationBackend::suspendable(LaunchOutcome::ColdStartFallback);
+        let resumes = service.resumes.clone();
+        let (client, server) = isolation_control_client(service, Some(resume_launch(true))).await;
+        client.grpc_channel().await.unwrap();
+        assert_eq!(
+            client.launch_outcome.get().copied(),
+            Some(BoundaryLaunchOutcome::ColdStartFallback)
+        );
+        assert!(resumes.lock().unwrap()[0].restart_if_restore_fails);
+        server.abort();
+
+        let service = TestIsolationBackend::suspendable(LaunchOutcome::ColdStartFallback);
+        let (client, server) = isolation_control_client(service, Some(resume_launch(false))).await;
+        let result = client.grpc_channel().await;
+        assert!(
+            matches!(result, Err(BackendError::Descriptor(_))),
+            "{result:?}"
+        );
+        assert!(client.boundary_handle.get().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_fresh_and_unspecified_outcomes() {
+        for outcome in [LaunchOutcome::Fresh, LaunchOutcome::Unspecified] {
+            let service = TestIsolationBackend::suspendable(outcome);
+            let (client, server) =
+                isolation_control_client(service, Some(resume_launch(true))).await;
+            let result = client.grpc_channel().await;
+            assert!(
+                matches!(result, Err(BackendError::Descriptor(_))),
+                "{outcome:?}: {result:?}"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_requires_backend_suspend_resume_capability() {
+        let service = TestIsolationBackend {
+            outcome: LaunchOutcome::Restored as i32,
+            ..TestIsolationBackend::default()
+        };
+        let resumes = service.resumes.clone();
+        let opens = service.opens.clone();
+        let (client, server) = isolation_control_client(service, Some(resume_launch(true))).await;
+        let result = client.grpc_channel().await;
+        assert!(
+            matches!(result, Err(BackendError::Unsupported(_))),
+            "{result:?}"
+        );
+        assert!(resumes.lock().unwrap().is_empty());
+        assert_eq!(opens.load(Ordering::Acquire), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn supervisor_advertises_suspend_resume_as_optional() {
+        let metadata = crate::isolation_protocol::supervisor_metadata("openshell/supervisor");
+        assert!(crate::isolation_protocol::supports_suspend_resume(
+            &metadata
+        ));
+        assert!(
+            !metadata.required_capabilities.iter().any(
+                |capability| capability == crate::isolation_protocol::SUSPEND_RESUME_CAPABILITY
+            )
+        );
+        // Backends that do not advertise the capability still negotiate.
+        let (client, server) =
+            isolation_control_client(TestIsolationBackend::default(), None).await;
+        client.grpc_channel().await.unwrap();
+        assert_eq!(
+            client.launch_outcome.get().copied(),
+            Some(BoundaryLaunchOutcome::Fresh)
+        );
+        assert!(!client.backend_supports_suspend.load(Ordering::Acquire));
+        let result = client.suspend_boundary().await;
+        assert!(
+            matches!(result, Err(BackendError::Unsupported(_))),
+            "{result:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn suspend_sends_boundary_coordinates_and_returns_reference() {
+        let service = TestIsolationBackend::suspendable(LaunchOutcome::Fresh);
+        let suspends = service.suspends.clone();
+        let (client, server) = isolation_control_client(service, None).await;
+        client.grpc_channel().await.unwrap();
+        assert!(client.backend_supports_suspend.load(Ordering::Acquire));
+        let reference = client.suspend_boundary().await.unwrap();
+        assert_eq!(reference, b"opaque-restore-reference");
+        let suspends = suspends.lock().unwrap().clone();
+        assert_eq!(suspends.len(), 1);
+        assert_eq!(suspends[0].boundary_id, TEST_BOUNDARY_HANDLE);
+        assert_eq!(suspends[0].session_id, test_session_id().to_string());
+        assert_eq!(suspends[0].generation_id, "test-generation");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn suspend_rejects_backend_failures_and_invalid_references() {
+        for reference in [
+            Err(tonic::Code::FailedPrecondition),
+            Err(tonic::Code::Unavailable),
+            Ok(Vec::new()),
+            Ok(vec![0; MAX_RESTORE_REFERENCE_BYTES + 1]),
+        ] {
+            let service = TestIsolationBackend {
+                suspend_reference: reference.clone(),
+                ..TestIsolationBackend::suspendable(LaunchOutcome::Fresh)
+            };
+            let (client, server) = isolation_control_client(service, None).await;
+            client.grpc_channel().await.unwrap();
+            let result = client.suspend_boundary().await;
+            assert!(result.is_err(), "{:?}", reference.map(|bytes| bytes.len()));
+            server.abort();
         }
     }
 

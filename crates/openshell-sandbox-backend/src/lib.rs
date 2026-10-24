@@ -24,9 +24,10 @@ pub mod stream_adapter;
 
 pub use openshell_core::proto::sandbox::backend::v1 as backend_proto;
 pub use runtime::{
-    BoundBoundary, BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess, BoundaryTerminal,
-    ConfirmedBoundary, ExecSession, NetworkMediationSource, OpenShellRuntimeBackend,
-    ProcessAttachment, ReadyBoundary, RunningBoundary,
+    BoundBoundary, BoundaryExec, BoundaryLaunchOutcome, BoundaryLoopbackConnector, BoundaryProcess,
+    BoundaryTerminal, ConfirmedBoundary, ExecSession, MAX_RESTORE_REFERENCE_BYTES,
+    NetworkMediationSource, OpenShellRuntimeBackend, ProcessAttachment, ReadyBoundary,
+    ResumeLaunch, RunningBoundary,
 };
 pub use runtime::{BoundaryTransport, BoundaryTransportConnector, validate_runtime_coordinates};
 

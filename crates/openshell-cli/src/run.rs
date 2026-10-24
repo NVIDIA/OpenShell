@@ -57,12 +57,13 @@ use openshell_core::proto::{
     GetSandboxTemplateRequest, GetServiceRequest, GpuResourceRequirements,
     ListSandboxPoliciesRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest, ResourceRequirements,
-    RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
-    SandboxResources, SandboxRestartPolicy, SandboxServiceExposure, SandboxServiceLevel,
-    SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate,
-    SandboxWorkloadTemplateSpec, ServiceAuthorizationMode, ServiceEndpointResponse, SettingScope,
-    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
+    ResumeSandboxRequest, RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase,
+    SandboxPolicy, SandboxResources, SandboxRestartPolicy, SandboxServiceExposure,
+    SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig,
+    SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
+    ServiceEndpointResponse, SettingScope, StartSandboxRequest, StopSandboxRequest,
+    SuspendSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
+    WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -2970,8 +2971,8 @@ pub async fn sandbox_list(
             {
                 phase.red().to_string()
             }
-            Ok(SandboxPhase::Provisioning) => phase.yellow().to_string(),
-            Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
+            Ok(SandboxPhase::Provisioning | SandboxPhase::Suspending) => phase.yellow().to_string(),
+            Ok(SandboxPhase::Deleting | SandboxPhase::Suspended) => phase.dimmed().to_string(),
             _ => phase.to_string(),
         };
         let created = format_epoch_ms(
@@ -4146,6 +4147,110 @@ pub async fn sandbox_start(
     Ok(())
 }
 
+/// Suspend a ready sandbox, retaining its memory state, and wait until it is suspended.
+pub async fn sandbox_suspend(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .suspend_sandbox(SuspendSandboxRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("gateway returned no sandbox after suspend"))?;
+    wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Suspended).await?;
+    if let Ok(stopped) = stop_forwards_for_sandbox(workspace, name) {
+        for port in stopped {
+            eprintln!(
+                "{} Stopped forward of port {port} for sandbox {name}",
+                "✓".green().bold(),
+            );
+        }
+    }
+
+    println!("{} Suspended sandbox {name}", "✓".green().bold());
+    Ok(())
+}
+
+/// Resume a suspended sandbox and wait until it is ready.
+pub async fn sandbox_resume(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .resume_sandbox(ResumeSandboxRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+            restart_if_restore_fails: false,
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("gateway returned no sandbox after resume"))?;
+    wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Ready).await?;
+    println!("{} Resumed sandbox {name}", "✓".green().bold());
+    Ok(())
+}
+
+/// Whether `phase` means a lifecycle wait for `target` can no longer succeed
+/// without another lifecycle request.
+fn lifecycle_phase_blocks_target(target: SandboxPhase, phase: SandboxPhase) -> bool {
+    match target {
+        SandboxPhase::Ready => matches!(
+            phase,
+            SandboxPhase::Suspending | SandboxPhase::Suspended | SandboxPhase::Deleting
+        ),
+        SandboxPhase::Suspended => matches!(
+            phase,
+            SandboxPhase::Ready
+                | SandboxPhase::Starting
+                | SandboxPhase::Stopping
+                | SandboxPhase::Stopped
+                | SandboxPhase::Deleting
+        ),
+        SandboxPhase::Stopped => phase == SandboxPhase::Deleting,
+        _ => false,
+    }
+}
+
+fn lifecycle_phase_error(
+    sandbox: &Sandbox,
+    target: SandboxPhase,
+    phase: SandboxPhase,
+) -> Option<miette::Report> {
+    if phase == SandboxPhase::Error {
+        let detail = ready_false_condition_message(sandbox.status.as_ref())
+            .unwrap_or_else(|| "sandbox entered Error".to_string());
+        return Some(miette!(
+            "{detail} while waiting for {}",
+            phase_name(target as i32)
+        ));
+    }
+    if lifecycle_phase_blocks_target(target, phase) {
+        return Some(miette!(
+            "sandbox entered {} while waiting for {}",
+            phase_name(phase as i32),
+            phase_name(target as i32)
+        ));
+    }
+    None
+}
+
 async fn wait_for_lifecycle_phase(
     client: &mut crate::tls::GrpcClient,
     sandbox: Sandbox,
@@ -4155,10 +4260,8 @@ async fn wait_for_lifecycle_phase(
     if current == target {
         return Ok(sandbox);
     }
-    if current == SandboxPhase::Error {
-        let detail = ready_false_condition_message(sandbox.status.as_ref())
-            .unwrap_or_else(|| "sandbox entered Error".to_string());
-        return Err(miette!("{detail} while waiting for {target:?}"));
+    if let Some(err) = lifecycle_phase_error(&sandbox, target, current) {
+        return Err(err);
     }
 
     let timeout = Duration::from_secs(
@@ -4214,10 +4317,8 @@ async fn wait_for_lifecycle_phase(
             if phase == target {
                 return Ok(sandbox);
             }
-            if phase == SandboxPhase::Error {
-                let detail = ready_false_condition_message(sandbox.status.as_ref())
-                    .unwrap_or_else(|| "sandbox entered Error".to_string());
-                return Err(miette!(detail));
+            if let Some(err) = lifecycle_phase_error(&sandbox, target, phase) {
+                return Err(err);
             }
         }
     }
@@ -7025,6 +7126,41 @@ mod tests {
         service_url_for_gateway, workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
+
+    #[test]
+    fn lifecycle_wait_fails_fast_on_phases_that_block_the_target() {
+        use super::lifecycle_phase_blocks_target;
+        use openshell_core::proto::SandboxPhase;
+
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Ready,
+            SandboxPhase::Suspended
+        ));
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Ready,
+            SandboxPhase::Suspending
+        ));
+        assert!(!lifecycle_phase_blocks_target(
+            SandboxPhase::Ready,
+            SandboxPhase::Starting
+        ));
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Suspended,
+            SandboxPhase::Stopped
+        ));
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Suspended,
+            SandboxPhase::Ready
+        ));
+        assert!(!lifecycle_phase_blocks_target(
+            SandboxPhase::Suspended,
+            SandboxPhase::Suspending
+        ));
+        assert!(!lifecycle_phase_blocks_target(
+            SandboxPhase::Stopped,
+            SandboxPhase::Suspended
+        ));
+    }
 
     #[test]
     fn draft_approval_error_explains_refreshed_evaluation() {

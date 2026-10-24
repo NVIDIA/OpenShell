@@ -279,11 +279,14 @@ async fn load_identity(
         })?;
 
     let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+    // A suspending runtime stays live until its supervisor captures the
+    // workload and exits; a suspended runtime's identity is never reused.
     if !matches!(
         phase,
         SandboxPhase::Provisioning
             | SandboxPhase::Ready
             | SandboxPhase::Starting
+            | SandboxPhase::Suspending
             | SandboxPhase::Completed
             | SandboxPhase::Error
     ) {
@@ -530,6 +533,26 @@ mod tests {
             .await
             .expect_err("stopped runtime must reject its token");
         assert_eq!(error.status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.reason, AuthFailureReason::StaleIdentity);
+    }
+
+    #[tokio::test]
+    async fn suspension_revokes_runtime_identity_only_once_settled() {
+        let store = Store::connect("sqlite::memory:").await.expect("store");
+        persist_sandbox(&store, SandboxPhase::Suspending).await;
+        authorize_persisted(&store, &principal(1, Uuid::from_u128(1)))
+            .await
+            .expect("suspending runtime is still live");
+
+        store
+            .update_message_cas::<Sandbox, _>("sandbox-a", 0, |sandbox| {
+                sandbox.set_phase(SandboxPhase::Suspended as i32);
+            })
+            .await
+            .expect("suspend sandbox");
+        let error = authorize_persisted(&store, &principal(1, Uuid::from_u128(1)))
+            .await
+            .expect_err("suspended runtime must reject its token");
         assert_eq!(error.reason, AuthFailureReason::StaleIdentity);
     }
 

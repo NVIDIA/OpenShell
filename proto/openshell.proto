@@ -195,6 +195,26 @@ service OpenShell {
     };
   }
 
+  // Freeze a ready sandbox and retain its memory state for a later resume.
+  // Requires a compute driver and isolation backend that support state
+  // retention.
+  rpc SuspendSandbox(SuspendSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
+  // Restore a suspended sandbox in a new runtime generation.
+  rpc ResumeSandbox(ResumeSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
   // Create a short-lived SSH session for a sandbox.
   rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse) {
     option (openshell.options.v1.authorization) = {
@@ -1258,6 +1278,11 @@ enum SandboxPhase {
   SANDBOX_PHASE_COMPLETED = 9;
   reserved 10;
   reserved "SANDBOX_PHASE_RESTARTING";
+  // The gateway requested suspension and the driver has not confirmed it.
+  SANDBOX_PHASE_SUSPENDING = 11;
+  // The workload is frozen and its memory state is retained by the isolation
+  // backend. ResumeSandbox restores it; StartSandbox discards it.
+  SANDBOX_PHASE_SUSPENDED = 12;
 }
 
 // Public platform event exposed on the sandbox watch stream.
@@ -1488,6 +1513,23 @@ message StartSandboxRequest {
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 3;
+}
+
+// Suspend sandbox request.
+message SuspendSandboxRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+  string name = 1;
+}
+
+// Resume sandbox request.
+message ResumeSandboxRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+  string name = 1;
+  // If true, the isolation backend may boot the workload cleanly when it
+  // cannot restore the retained memory state. If false, resume fails instead.
+  bool restart_if_restore_fails = 3;
 }
 
 // Sandbox response.
