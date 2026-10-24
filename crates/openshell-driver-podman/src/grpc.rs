@@ -679,11 +679,18 @@ mod tests {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "forward-id",
             vec![
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // companion
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // channel
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // companion
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // channel
                 // list_containers returns empty (container already gone)
                 StubResponse::new(StatusCode::OK, "[]"),
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // control volume
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // control volume
+                StubResponse::new(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "Name": volume_name, "Labels": {container::LABEL_SANDBOX_ID: sandbox_id}
+                    })
+                    .to_string(),
+                ),
                 // remove_volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
@@ -712,7 +719,7 @@ mod tests {
             .clone();
         assert!(requests[2].contains("/libpod/containers/json"));
         assert_eq!(
-            requests[4],
+            requests[5],
             format!(
                 "DELETE {}",
                 api_path(&format!("/libpod/volumes/{volume_name}"))
