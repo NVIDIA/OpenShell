@@ -55,7 +55,7 @@ client, err := gateway.NewClient("staging",
 )
 ```
 
-**Errors**: `ErrGatewayNotFound`, `ErrConfigParse`, `ErrTokenLoad`,
+**Errors**: `ErrGatewayNotFound`, `ErrConfigParse`,
 `ErrUnsupportedAuthMode`, `ErrInvalidGatewayName`, `ErrNoActiveGateway`
 
 ### LoadConfig
@@ -124,7 +124,7 @@ type Info struct {
 | `""` or `"none"` | `AuthModeNone` | `v1.NoAuth()` |
 | `"plaintext"` | `AuthModePlaintext` | `v1.NoAuth()` + insecure TLS |
 | `"cloudflare_jwt"` | `AuthModeCloudflareJWT` | Lazy edge token auth |
-| `"oidc"` | `AuthModeOIDC` | `v1.RefreshableToken` with disk source |
+| `"oidc"` | `AuthModeOIDC` | `v1.RefreshableToken` that reads `oidc_token.json` near expiry and fails once the token has expired |
 | `"mtls"` | `AuthModeMTLS` | Unsupported (use `WithAuth`) |
 
 ### ClientOption
@@ -146,10 +146,12 @@ client, err := gateway.NewClient("my-gateway")
 if errors.Is(err, gateway.ErrGatewayNotFound) {
     fmt.Println("Gateway not configured. Run: openshell gateway add my-gateway")
 }
-if errors.Is(err, gateway.ErrTokenLoad) {
-    fmt.Println("Token expired or missing. Run: openshell gateway login my-gateway")
-}
 ```
+
+Tokens load lazily, so `NewClient` does not return `ErrTokenLoad`. For `oidc`
+gateways, a missing, malformed, or expired `oidc_token.json` surfaces on RPCs as
+an error for which `v1.IsUnauthenticated(err)` is true, and its message includes
+``run `openshell gateway login <name>` ``.
 
 | Error | Meaning |
 |-------|---------|

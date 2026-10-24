@@ -22,6 +22,7 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/gateway"
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/oidctoken"
 )
 
 // --- T021: Login entry point tests ---
@@ -88,9 +89,9 @@ func TestLogin_MissingClientID(t *testing.T) {
 	assert.True(t, errors.Is(err, ErrOIDCConfig), "expected ErrOIDCConfig, got: %v", err)
 }
 
-// TestLogin_ReusesValidToken verifies FR-019: when a valid token exists
-// on disk in the token directory, Login returns it without starting an
-// interactive flow.
+// TestLogin_ReusesValidToken verifies FR-019: when a valid token for the
+// same issuer (ignoring a trailing slash) and client ID exists on disk,
+// Login returns it without starting an interactive flow.
 func TestLogin_ReusesValidToken(t *testing.T) {
 	resetDiscoveryCache()
 
@@ -102,7 +103,8 @@ func TestLogin_ReusesValidToken(t *testing.T) {
 		TokenType:    "Bearer",
 		Expiry:       time.Now().Add(1 * time.Hour),
 	}
-	err := writeToken(tokenDir, existingToken)
+	err := writeToken(tokenDir, oidctoken.FromToken(existingToken,
+		"https://issuer-should-not-be-called.example.com/", "test-client"))
 	require.NoError(t, err)
 
 	// Login with explicit issuer/clientID and WithTokenDir (internal)
@@ -135,7 +137,7 @@ func TestLogin_ExpiredTokenTriggersFlow(t *testing.T) {
 		TokenType:    "Bearer",
 		Expiry:       time.Now().Add(-1 * time.Hour), // expired
 	}
-	err := writeToken(tokenDir, expiredToken)
+	err := writeToken(tokenDir, oidctoken.FromToken(expiredToken, provider.URL, "test-client"))
 	require.NoError(t, err)
 
 	// Start a callback server ourselves to simulate the auth code callback.
@@ -157,6 +159,51 @@ func TestLogin_ExpiredTokenTriggersFlow(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "login-access-token", tok.AccessToken)
 	assert.Equal(t, "login-refresh-token", tok.RefreshToken)
+}
+
+// TestLogin_ReplacesMismatchedStoredToken verifies that a valid stored
+// token issued for another client or issuer, or written by an earlier Go
+// SDK build, is not reused: Login runs the flow and rewrites the file in
+// the CLI format.
+func TestLogin_ReplacesMismatchedStoredToken(t *testing.T) {
+	resetDiscoveryCache()
+
+	provider := setupMockProvider(t)
+	expiresAt := fmt.Sprint(time.Now().Add(time.Hour).Unix())
+	expiry := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	stored := map[string]string{
+		"different client ID": `{"access_token": "stored-token", "expires_at": ` + expiresAt +
+			`, "issuer": "` + provider.URL + `", "client_id": "other-client"}`,
+		"different issuer": `{"access_token": "stored-token", "expires_at": ` + expiresAt +
+			`, "issuer": "https://other-issuer.example.com", "client_id": "test-client"}`,
+		"earlier Go SDK format": `{"access_token": "stored-token", "refresh_token": "stored-refresh", "expiry": "` +
+			expiry + `", "expires_in": 3600}`,
+	}
+
+	for name, content := range stored {
+		t.Run(name, func(t *testing.T) {
+			tokenDir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(tokenDir, oidctoken.FileName), []byte(content), 0o600))
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			tok, err := Login(ctx, "",
+				WithIssuer(provider.URL),
+				WithClientID("test-client"),
+				withTokenDir(tokenDir),
+				WithKeyboardFlow(),
+				withInput(strings.NewReader("auth-code\n")),
+			)
+			require.NoError(t, err)
+			assert.Equal(t, "login-access-token", tok.AccessToken)
+
+			diskTok, err := readToken(tokenDir)
+			require.NoError(t, err)
+			require.NotNil(t, diskTok)
+			assert.Equal(t, "login-access-token", diskTok.AccessToken)
+		})
+	}
 }
 
 // TestLogin_KeyboardFlow verifies that Login completes using the
@@ -215,7 +262,7 @@ func TestLogin_InMemorySkipsPersistence(t *testing.T) {
 	assert.Equal(t, "login-access-token", tok.AccessToken)
 
 	// Verify NO token file on disk.
-	_, err = os.Stat(filepath.Join(tokenDir, oidcTokenFile))
+	_, err = os.Stat(filepath.Join(tokenDir, oidctoken.FileName))
 	assert.True(t, os.IsNotExist(err), "token file should not exist in in-memory mode")
 }
 
@@ -275,6 +322,8 @@ func TestLogin_GatewayResolution(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, diskTok)
 	assert.Equal(t, "login-access-token", diskTok.AccessToken)
+	assert.Equal(t, provider.URL, diskTok.Issuer)
+	assert.Equal(t, "gateway-client-id", diskTok.ClientID)
 }
 
 // TestLogin_GatewayMissingOIDCFields verifies that Login returns

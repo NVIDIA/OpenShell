@@ -5,6 +5,7 @@ package v1
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -194,22 +195,53 @@ func TestGetRequestMetadata_RefreshFailureReturnsStaleCachedToken(t *testing.T) 
 		tokenFunc: func() (*oauth2.Token, error) {
 			n := callNum.Add(1)
 			if n == 1 {
-				return &oauth2.Token{AccessToken: "stale", Expiry: time.Now().Add(-time.Minute)}, nil
+				return &oauth2.Token{AccessToken: "stale", Expiry: time.Now().Add(5 * time.Second)}, nil
 			}
 			return nil, fmt.Errorf("idp unavailable")
 		},
 	}
-	provider, err := RefreshableToken(src, WithLeeway(0))
+	provider, err := RefreshableToken(src) // default 10s leeway
 	require.NoError(t, err)
 
-	// First call succeeds but returns already-expired token.
+	// First call succeeds with a token inside the leeway window.
 	_, err = provider.GetRequestMetadata(context.Background())
 	require.NoError(t, err)
 
-	// Second call: refresh fails, should return stale token.
+	// Second call: refresh fails, should return the unexpired stale token.
 	md, err := provider.GetRequestMetadata(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, "Bearer stale", md["authorization"])
+}
+
+func TestGetRequestMetadata_RefreshFailureWithExpiredCachedTokenReturnsError(t *testing.T) {
+	errIDP := errors.New("idp unavailable")
+	var callNum atomic.Int32
+	src := &mockTokenSource{
+		tokenFunc: func() (*oauth2.Token, error) {
+			n := callNum.Add(1)
+			if n == 1 {
+				return &oauth2.Token{AccessToken: "expired", Expiry: time.Now().Add(-time.Minute)}, nil
+			}
+			return nil, errIDP
+		},
+	}
+	logger := &captureLogger{}
+	provider, err := RefreshableToken(src, WithLeeway(0), WithLogger(logger))
+	require.NoError(t, err)
+
+	_, err = provider.GetRequestMetadata(context.Background())
+	require.NoError(t, err)
+
+	md, err := provider.GetRequestMetadata(context.Background())
+	require.ErrorIs(t, err, errIDP)
+	assert.Nil(t, md)
+	assert.Empty(t, logger.errors)
+
+	// During backoff, the same error is returned without calling the source.
+	md, err = provider.GetRequestMetadata(context.Background())
+	require.ErrorIs(t, err, errIDP)
+	assert.Nil(t, md)
+	assert.Equal(t, 2, src.calls())
 }
 
 func TestGetRequestMetadata_RefreshFailureLogsWarning(t *testing.T) {
@@ -218,14 +250,14 @@ func TestGetRequestMetadata_RefreshFailureLogsWarning(t *testing.T) {
 		tokenFunc: func() (*oauth2.Token, error) {
 			n := callNum.Add(1)
 			if n == 1 {
-				return &oauth2.Token{AccessToken: "stale", Expiry: time.Now().Add(-time.Minute)}, nil
+				return &oauth2.Token{AccessToken: "stale", Expiry: time.Now().Add(5 * time.Second)}, nil
 			}
 			return nil, fmt.Errorf("idp unavailable")
 		},
 	}
 
 	logger := &captureLogger{}
-	provider, err := RefreshableToken(src, WithLeeway(0), WithLogger(logger))
+	provider, err := RefreshableToken(src, WithLogger(logger))
 	require.NoError(t, err)
 
 	_, _ = provider.GetRequestMetadata(context.Background())
@@ -255,12 +287,12 @@ func TestGetRequestMetadata_RefreshFailureNoLoggerNoPanic(t *testing.T) {
 		tokenFunc: func() (*oauth2.Token, error) {
 			n := callNum.Add(1)
 			if n == 1 {
-				return &oauth2.Token{AccessToken: "stale", Expiry: time.Now().Add(-time.Minute)}, nil
+				return &oauth2.Token{AccessToken: "stale", Expiry: time.Now().Add(5 * time.Second)}, nil
 			}
 			return nil, fmt.Errorf("idp unavailable")
 		},
 	}
-	provider, err := RefreshableToken(src, WithLeeway(0))
+	provider, err := RefreshableToken(src)
 	require.NoError(t, err)
 
 	_, _ = provider.GetRequestMetadata(context.Background())
@@ -348,12 +380,12 @@ func TestGetRequestMetadata_BackoffSkipsRefreshDuringWindow(t *testing.T) {
 		tokenFunc: func() (*oauth2.Token, error) {
 			n := callNum.Add(1)
 			if n == 1 {
-				return &oauth2.Token{AccessToken: "stale", Expiry: time.Now().Add(-time.Minute)}, nil
+				return &oauth2.Token{AccessToken: "stale", Expiry: time.Now().Add(5 * time.Second)}, nil
 			}
 			return nil, fmt.Errorf("idp down")
 		},
 	}
-	provider, err := RefreshableToken(src, WithLeeway(0))
+	provider, err := RefreshableToken(src)
 	require.NoError(t, err)
 
 	_, err = provider.GetRequestMetadata(context.Background())
@@ -372,6 +404,24 @@ func TestGetRequestMetadata_BackoffSkipsRefreshDuringWindow(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "Bearer stale", md["authorization"])
 	assert.Equal(t, beforeCount, src.calls(), "should not call Token() during backoff window")
+}
+
+func TestGetRequestMetadata_BackoffWithoutCachedTokenReturnsLastError(t *testing.T) {
+	errIDP := errors.New("idp down")
+	src := &mockTokenSource{
+		tokenFunc: func() (*oauth2.Token, error) {
+			return nil, errIDP
+		},
+	}
+	provider, err := RefreshableToken(src)
+	require.NoError(t, err)
+
+	_, err = provider.GetRequestMetadata(context.Background())
+	require.ErrorIs(t, err, errIDP)
+
+	_, err = provider.GetRequestMetadata(context.Background())
+	require.ErrorIs(t, err, errIDP)
+	assert.Equal(t, 1, src.calls(), "should not call Token() during backoff window")
 }
 
 func TestGetRequestMetadata_BackoffResetsOnSuccess(t *testing.T) {

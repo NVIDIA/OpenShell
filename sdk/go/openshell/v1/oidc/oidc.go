@@ -13,6 +13,7 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/gateway"
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/oidctoken"
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
 )
 
@@ -20,14 +21,16 @@ import (
 //
 // When gatewayName is non-empty, Login resolves OIDC configuration
 // (issuer URL and client ID) from the gateway's metadata.json file and
-// persists tokens to the gateway directory.
+// persists tokens to the gateway directory as oidc_token.json, in the
+// same format as `openshell gateway login`.
 //
 // When gatewayName is empty, the caller must provide [WithIssuer] and
 // [WithClientID] options explicitly.
 //
 // Before starting an interactive flow, Login checks for an existing
-// valid token on disk (FR-019). If a valid, non-expired token is found,
-// it is returned immediately without user interaction.
+// token on disk (FR-019). If the stored token is valid and was issued
+// for the same issuer and client ID, it is returned immediately without
+// user interaction.
 //
 // The flow attempts to open a browser for authorization. If the browser
 // cannot be opened, or if [WithKeyboardFlow] is set, the keyboard
@@ -53,13 +56,16 @@ func Login(ctx context.Context, gatewayName string, opts ...LoginOption) (*oauth
 	// FR-019: Check for existing valid token on disk before starting
 	// an interactive flow.
 	if tokenDir != "" {
-		tok, readErr := readToken(tokenDir)
-		if readErr == nil && tok != nil && tok.Valid() {
-			return tok, nil
+		stored, readErr := readToken(tokenDir)
+		if readErr == nil && stored != nil &&
+			normalizeIssuer(stored.Issuer) == normalizeIssuer(cfg.issuer) &&
+			stored.ClientID == cfg.clientID {
+			if tok := stored.Token(); tok.Valid() {
+				return tok, nil
+			}
 		}
-		// If readErr is a non-NotExist error, we log and proceed.
-		// Stale/expired tokens or missing files are not errors; we
-		// simply proceed to the interactive flow.
+		// Unreadable, mismatched, or expired tokens and missing files
+		// are not errors; we simply proceed to the interactive flow.
 	}
 
 	// Run OIDC discovery to get provider endpoints.
@@ -106,7 +112,7 @@ func Login(ctx context.Context, gatewayName string, opts ...LoginOption) (*oauth
 
 	// Persist token to disk unless in-memory mode is requested.
 	if !cfg.inMemory && tokenDir != "" {
-		if writeErr := writeToken(tokenDir, tok); writeErr != nil {
+		if writeErr := writeToken(tokenDir, oidctoken.FromToken(tok, cfg.issuer, cfg.clientID)); writeErr != nil {
 			return nil, writeErr
 		}
 	}
