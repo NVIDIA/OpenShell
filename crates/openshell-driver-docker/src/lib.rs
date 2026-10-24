@@ -3116,6 +3116,9 @@ fn validate_docker_outer_fence(
     Ok(())
 }
 #[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for ComputeDriverService {}
+
+#[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
     type WatchSandboxesStream = WatchStream;
 
@@ -3267,6 +3270,9 @@ impl ComputeDriver for ComputeDriverService {
             .await
     }
 }
+
+#[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for DockerComputeDriver {}
 
 #[tonic::async_trait]
 impl ComputeDriver for DockerComputeDriver {

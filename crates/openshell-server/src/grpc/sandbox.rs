@@ -315,6 +315,112 @@ pub(super) async fn handle_create_sandbox(
     result
 }
 
+/// Only the workload image is mutable in the first update contract. Runtime
+/// replacement is an explicit Stop/Update/Start workflow, never Delete/Create.
+pub(super) async fn handle_update_sandbox(
+    state: &Arc<ServerState>,
+    request: Request<openshell_core::proto::UpdateSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let request = request.into_inner();
+    validate_image_update_request(&request)?;
+    let sandbox = resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &request.name,
+        crate::auth::workspace_authz::selected_workspace_name(request.workspace_scope.as_ref())?,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    super::workspace::resolve_workspace(state.store.as_ref(), sandbox.object_workspace())
+        .await?
+        .ensure_active()?;
+    let mut candidate = sandbox.clone();
+    let spec = candidate
+        .spec
+        .as_mut()
+        .ok_or_else(|| Status::failed_precondition("sandbox has no spec"))?;
+    if let Some(image) = &request.image {
+        spec.template
+            .get_or_insert_with(Default::default)
+            .image
+            .clone_from(image);
+    }
+    openshell_core::sandbox_update::apply_configuration(
+        &mut candidate,
+        request.command.as_ref(),
+        request.environment.as_ref(),
+        request.labels.as_ref(),
+        request.annotations.as_ref(),
+    );
+    let candidate_spec = candidate.spec.as_ref().expect("spec checked above");
+    validate_sandbox_spec(&request.name, candidate_spec)?;
+
+    let sandbox = Box::pin(
+        state
+            .compute
+            .update_sandbox_configuration(sandbox.object_id(), &request),
+    )
+    .await?;
+    Ok(Response::new(SandboxResponse {
+        sandbox: Some(sandbox),
+        service_urls: HashMap::new(),
+    }))
+}
+
+fn validate_image_update_request(
+    request: &openshell_core::proto::UpdateSandboxRequest,
+) -> Result<(), Status> {
+    if request.name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+    if request.expected_resource_version == 0 {
+        return Err(Status::invalid_argument(
+            "expected_resource_version must be nonzero",
+        ));
+    }
+    if request.image.is_none()
+        && request.command.is_none()
+        && request.environment.is_none()
+        && request.labels.is_none()
+        && request.annotations.is_none()
+    {
+        return Err(Status::invalid_argument(
+            "at least one update field is required",
+        ));
+    }
+    if let Some(image) = &request.image
+        && (image.is_empty()
+            || image.len() > super::MAX_TEMPLATE_STRING_LEN
+            || image.chars().any(|c| c.is_whitespace() || c.is_control()))
+    {
+        return Err(Status::invalid_argument(
+            "image must be a nonempty bounded OCI reference without whitespace or control characters",
+        ));
+    }
+    for map in [request.labels.as_ref(), request.annotations.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        super::validation::validate_annotations(&map.values, "metadata")?;
+        if map
+            .values
+            .keys()
+            .any(|key| openshell_core::sandbox_update::is_system_metadata_key(key))
+        {
+            return Err(Status::invalid_argument(
+                "system metadata cannot be updated",
+            ));
+        }
+    }
+    if let Some(labels) = &request.labels {
+        for value in labels.values.values() {
+            super::validation::validate_label_value(value)?;
+        }
+    }
+    Ok(())
+}
+
 /// Allocate a gateway-owned staging slot for a local rootfs tar archive.
 ///
 /// The caller writes the archive to the returned path and then names the token
@@ -10366,3 +10472,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod image_update_tests;

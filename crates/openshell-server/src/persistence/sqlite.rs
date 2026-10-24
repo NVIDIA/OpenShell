@@ -48,7 +48,7 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
-    pool: SqlitePool,
+    pub(super) pool: SqlitePool,
     /// Pool for writes whose loss after a crash is harmless; see
     /// [`SqliteStore::create_relaxed`]. On-disk stores open it with
     /// `synchronous=NORMAL`; in-memory stores share `pool`.

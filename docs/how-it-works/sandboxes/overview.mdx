@@ -1004,6 +1004,104 @@ If an infrastructure failure leaves a sandbox in `Error`, fix the reported cause
 
 For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
 
+### Update the Image of a Stopped Sandbox
+
+Use `openshell.v1.SandboxUpdates/UpdateSandbox` to change a stopped sandbox's
+workload image, command, environment overrides, labels, and annotations together. This separate service uses the same gateway listener
+and authentication as `OpenShell`; it requires `sandbox:write` and workspace
+user access. This operation initially supports the Kubernetes compute driver
+only; other drivers return `UNIMPLEMENTED` after activation. There is no
+`sandbox update` CLI command or curated SDK update method.
+
+Image updates default to disabled. Ask the operator to complete the
+[compatible deployment rollout](/kubernetes/high-availability#activate-sandbox-updates)
+before enabling `enable_sandbox_updates` in the
+[gateway configuration](/how-it-works/gateways/configuration#sandbox-updates).
+
+The update preserves the sandbox ID, Kubernetes custom resource, and persistent
+volume claim. It does not delete and recreate the sandbox, reseed its existing
+workspace from the new image, or change the trusted supervisor and sandbox
+runtime images. Omitted fields retain their current values. A supplied command
+replaces the argv list without shell expansion; an empty list restores the default
+login shell resolved from the workload image. A supplied environment map replaces
+sandbox-level overrides; clearing it restores any template-provided defaults.
+Labels and annotations replace user metadata on the gateway resource, preserve
+system-owned keys, and do not set Kubernetes pod metadata. Attempts to supply
+system-owned keys are rejected. At least one update field is required.
+Annotation changes accepted through `UpdateConfig` after the sandbox update is
+accepted remain in place when the update completes, including after a retry.
+
+Without a pending update, a request whose target values already match is a no-op.
+Use a different image tag or an immutable digest to select new image content.
+Configuration updates require the driver's
+`openshell.compute.update-sandbox-configuration` capability; image-only clients
+can continue using `openshell.compute.update-sandbox-image`. Upgrade every gateway
+before enabling updates: older gateways can ignore new request fields.
+
+Follow this sequence through the CLI and a generated/raw RPC client.
+
+1. Run `openshell sandbox stop my-sandbox` and wait for `Stopped`.
+2. Call `GetSandbox` with the named `workspace_scope` and sandbox `name`. Read
+   `sandbox.metadata.resource_version` after stop completes.
+3. Call `UpdateSandbox` with the same scope and name, the selected update fields,
+   and `expected_resource_version` set to that current, nonzero
+   version. The response is a `SandboxResponse`; the sandbox remains stopped.
+4. After the update succeeds, run `openshell sandbox start my-sandbox` to launch
+   the new image.
+
+With an authenticated Rust SDK `OpenShellClient`, use the separate raw client
+and the `current_resource_version` read in step 2:
+
+```rust
+use openshell_sdk::raw::{UpdateSandboxRequest, proto};
+
+let mut updates = client.raw_sandbox_updates_fresh().await?;
+let response = updates.update_sandbox(UpdateSandboxRequest {
+    workspace_scope: Some(proto::workspace_selector("default")),
+    name: "my-sandbox".into(),
+    image: Some("registry.example.com/agents/my-agent:2.0".into()),
+    command: Some(proto::SandboxCommandUpdate {
+        argv: vec!["/usr/local/bin/start-agent".into(), "--new-option".into()],
+    }),
+    environment: Some(proto::SandboxMapUpdate {
+        values: [("AGENT_MODE".into(), "updated".into())].into_iter().collect(),
+    }),
+    expected_resource_version: current_resource_version,
+    request_id: String::new(),
+    ..Default::default()
+}).await?;
+```
+
+The helper shares the main client's transport and live authentication slot.
+Generated clients use the `SandboxUpdates` service, not `OpenShell`.
+
+If the new image fails to start and provisioning times out, wait until
+`provisioning.cleanup_completed_time` is present and
+`provisioning.driver_operation_pending` is false. Run `sandbox stop` to move the
+reclaimed sandbox from `Error` to `Stopped`, then repeat the update sequence with
+a working image. Stop retains the timeout record and storage; it does not stop
+compute again. Cleanup that is still pending cannot be bypassed.
+
+An `ABORTED` version conflict requires another read before you construct a new
+conditional request. An update failure or disconnected response can leave a
+pending operation, even when `sandbox.spec.template.image` already names the
+target image. Start, stop, provisioning retry, and delete reject the pending
+operation.
+The public `SandboxStatus` shape is unchanged; image intent and revision remain
+private. Use the operation-pending error to guide recovery, not a status image
+field. Read the current version and retry `UpdateSandbox` with the same selected fields and target values
+you originally requested. Do not select another configuration or delete the sandbox to
+bypass reconciliation. Only a successful retry clears the pending operation.
+
+The optional `request_id` uses [durable request admission](/sdk/api-errors#durable-request-admission).
+A retry with the same ID must keep the original payload, including its expected
+version. An unresolved admission returns `REQUEST_OUTCOME_UNCERTAIN` rather than
+executing again. Reconcile against the sandbox state and your original requested
+configuration, then submit a new conditional request for the same target with a fresh version
+and a new ID, or no ID.
+Do not change the expected version under the original ID or blindly switch IDs
+after a timeout.
+
 ## Delete Sandboxes
 
 Deleting a sandbox stops all processes, releases resources, and purges injected credentials.

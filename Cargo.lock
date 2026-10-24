@@ -4511,6 +4511,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rcgen",
+ "regex",
  "rustls",
  "serde",
  "serde_json",

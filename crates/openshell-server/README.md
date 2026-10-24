@@ -18,6 +18,29 @@ Retries reuse that generation and session, including after gateway restart.
 Credential renewal retains both; credentials for an older launch cannot
 authorize the new one.
 
+## Optional in-process sandbox updates
+
+`SharedComputeDriver` retains the generated baseline compute-driver trait, and
+`ComputeDriverInstance` retains its existing variants. Existing compiled drivers
+and factories need no new trait implementation or registration method.
+
+A supporting factory overrides `ComputeDriverFactory::build_with_image_updates`
+to return its ordinary instance plus a separately registered image updater. The
+default calls the existing `build` method and returns no updater. The gateway
+requires both this opt-in and the negotiated capability before recording image
+intent. Remote drivers register the separate `ComputeDriverImageUpdates` service
+on their existing endpoint instead.
+
+Command, environment, label, and annotation selections use the same stopped-only
+transaction and durable interlock. Extended requests require the separate
+configuration-update driver capability and RPC; unsupported combinations fail
+before admission. User metadata replacement preserves system domains, and labels
+are indexed in the same SQL transaction as the payload. The existing activation
+flag now requires deployment protocol 2. Old private image-only intents remain
+readable, and completion verifies the selected workload targets and labels before
+clearing the fence. Annotation replacement commits at acceptance; completion
+preserves later annotation writes accepted through `UpdateConfig`.
+
 ## Operator credential export
 
 `GetProviderCredentials` exports selected profile-declared runtime environment

@@ -3551,3 +3551,119 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 	},
 	Metadata: "openshell.proto",
 }
+
+const (
+	SandboxUpdates_UpdateSandbox_FullMethodName = "/openshell.v1.SandboxUpdates/UpdateSandbox"
+)
+
+// SandboxUpdatesClient is the client API for SandboxUpdates service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Optional sandbox mutations are separate from OpenShell so existing generated
+// OpenShell server implementations remain source-compatible.
+type SandboxUpdatesClient interface {
+	// Update the workload image, command, environment, labels, or annotations of a
+	// stopped sandbox while preserving its identity and retained storage. Requires
+	// compute-driver support for the selected changes and explicit gateway activation
+	// of sandbox updates.
+	UpdateSandbox(ctx context.Context, in *UpdateSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
+}
+
+type sandboxUpdatesClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewSandboxUpdatesClient(cc grpc.ClientConnInterface) SandboxUpdatesClient {
+	return &sandboxUpdatesClient{cc}
+}
+
+func (c *sandboxUpdatesClient) UpdateSandbox(ctx context.Context, in *UpdateSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SandboxResponse)
+	err := c.cc.Invoke(ctx, SandboxUpdates_UpdateSandbox_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SandboxUpdatesServer is the server API for SandboxUpdates service.
+// All implementations must embed UnimplementedSandboxUpdatesServer
+// for forward compatibility.
+//
+// Optional sandbox mutations are separate from OpenShell so existing generated
+// OpenShell server implementations remain source-compatible.
+type SandboxUpdatesServer interface {
+	// Update the workload image, command, environment, labels, or annotations of a
+	// stopped sandbox while preserving its identity and retained storage. Requires
+	// compute-driver support for the selected changes and explicit gateway activation
+	// of sandbox updates.
+	UpdateSandbox(context.Context, *UpdateSandboxRequest) (*SandboxResponse, error)
+	mustEmbedUnimplementedSandboxUpdatesServer()
+}
+
+// UnimplementedSandboxUpdatesServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedSandboxUpdatesServer struct{}
+
+func (UnimplementedSandboxUpdatesServer) UpdateSandbox(context.Context, *UpdateSandboxRequest) (*SandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateSandbox not implemented")
+}
+func (UnimplementedSandboxUpdatesServer) mustEmbedUnimplementedSandboxUpdatesServer() {}
+func (UnimplementedSandboxUpdatesServer) testEmbeddedByValue()                        {}
+
+// UnsafeSandboxUpdatesServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to SandboxUpdatesServer will
+// result in compilation errors.
+type UnsafeSandboxUpdatesServer interface {
+	mustEmbedUnimplementedSandboxUpdatesServer()
+}
+
+func RegisterSandboxUpdatesServer(s grpc.ServiceRegistrar, srv SandboxUpdatesServer) {
+	// If the following call panics, it indicates UnimplementedSandboxUpdatesServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&SandboxUpdates_ServiceDesc, srv)
+}
+
+func _SandboxUpdates_UpdateSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxUpdatesServer).UpdateSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxUpdates_UpdateSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxUpdatesServer).UpdateSandbox(ctx, req.(*UpdateSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// SandboxUpdates_ServiceDesc is the grpc.ServiceDesc for SandboxUpdates service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var SandboxUpdates_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "openshell.v1.SandboxUpdates",
+	HandlerType: (*SandboxUpdatesServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "UpdateSandbox",
+			Handler:    _SandboxUpdates_UpdateSandbox_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "openshell.proto",
+}
