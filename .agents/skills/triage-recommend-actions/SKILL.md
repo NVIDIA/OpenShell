@@ -40,7 +40,7 @@ Also read:
 
 ## Pre-checks
 
-Each of these that applies gets one line before the output. Then run in full anyway; none of them ends the run.
+Each of these that applies gets one line after the output block. Then run in full anyway; none of them ends the run.
 
 - Validation has not run, or the issue failed it: say so and suggest `/triage-validate-issue`.
 - Already `state:accepted`: say so.
@@ -73,7 +73,7 @@ Check write access for each person you name:
 gh api repos/NVIDIA/OpenShell/collaborators/<login>/permission --jq .permission
 ```
 
-On HTTP 403, add one line after the output saying write access is unknown, and still name two people. If the issue raises a design question, append "Possibly an RFC as well."
+On HTTP 403, add one line after the output saying write access is unknown, and still name two people. Append "Possibly an RFC as well." only when the issue needs a cross-cutting decision with broad consensus, per "When to use an RFC" in `rfc/README.md`. Never for anything under "When NOT to use an RFC" there, such as bug fixes or a feature scoped to one component.
 
 Write people as Name (`@login`), with the login in backticks so it notifies no one. Never write a bare `@login`. Never use gendered pronouns for anyone; use they/them or repeat the name.
 
@@ -103,7 +103,7 @@ Good reasons to name someone: they are working on similar things, or they want t
 
 ## Output
 
-The pre-check lines, then exactly this block, then the write-access line if any. Nothing else: no summary, no routing block, no related-issue lists, no stale-bot analysis. Line 1 is the four-emoji code, in the order Priority, Recommendation, Confidence, Evidence, and must match the bold values below it. Link every issue and PR as `[#N](https://github.com/NVIDIA/OpenShell/issues/N)` and every docs page as `[Page title](https://docs.nvidia.com/openshell/<path>)`, where `<path>` is the page's path under `docs/` without `.mdx`.
+Exactly this block, then the pre-check lines, then the write-access line if any. Nothing else: no summary, no routing block, no related-issue lists, no stale-bot analysis. Line 1 is the four-emoji code, in the order Priority, Recommendation, Confidence, Evidence, and must match the bold values below it. Link every issue and PR as `[#N](https://github.com/NVIDIA/OpenShell/issues/N)` and every docs page as `[Page title](https://docs.nvidia.com/openshell/<path>)`, where `<path>` is the page's path under `docs/` without `.mdx`.
 
 Confidence is how sure you are of the Priority and Recommendation: 🧠 high when the signals agree and a validation result or reproduction confirms the facts; 🤔 medium when claims are unverified, signals conflict, or the scope has moved since filing; 🤷 low when key facts are missing or contradictory.
 
@@ -115,7 +115,7 @@ Evidence is 💪 strong with several independent dated signals, such as maintain
 **Priority: <🔴/🔵/⚪️> <high/normal/low>**
 
 **Recommendation: <👍/❓/👎> <accept/ask/decline>**
-- Acceptance: ask Name (`@login`) or Name (`@login`). Possibly an RFC as well.
+- Acceptance: ask Name (`@login`) or Name (`@login`). Possibly an RFC as well.   ← last sentence only when an RFC fits (see People)
 - Labels: <comma-separated list only, no discussion, no "maybe">
   - Existing labels with no `REVIEWERS.md` heading: <list>   ← only when there are some
 - Release: hold for next minor (breaks Stable <interface>)   ← only when it must wait
@@ -139,7 +139,7 @@ Do not print an item number, an issue identifier, "Classification", or "Disposit
 |---|---|
 | Printing the old routing block or a custom wrapper | Print only the Output block, four-emoji code first |
 | "The skill forbids recommending an assignee or release" | Recommend both, by the rules above |
-| Stopping at "maintainer-authored" or "already routed" | One line, then the full output |
+| Stopping at "maintainer-authored" or "already routed" | The full output, then one line |
 | Keeping `area:sandbox` or inventing `area:gateway` | Only `REVIEWERS.md` headings; unknowns in a sub-bullet |
 | Recommending `state:accepted` as a label | Acceptance is the Recommendation line, not a label |
 | Bare `@login`, bare `#N`, he/she | Name (`@login`), linked `#N`, they/them |
