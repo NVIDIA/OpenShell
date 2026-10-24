@@ -586,6 +586,7 @@ discovery endpoint or its TLS CA.
 | server.sandboxJwt.ttlSecs | int | `3600` | Token TTL in seconds. Defaults to 3600 (1h). |
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |
 | server.sandboxUid | string | `""` | UID for sandbox pods (`sandbox_uid`). Empty (default) = use the OpenShift SCC namespace annotation if present, otherwise the driver default. Must be an integer between 1 and 4294967294. |
+| server.serviceRoutingGatewayName | string | `""` | Optional routing name that disambiguates exposed-service hostnames when multiple gateways share one service base domain behind a single ingress and wildcard certificate. Must be unique among those gateways. When set, exposed-service hostnames become opaque fixed-length hashed labels (for example enh47uqyj7bpyttz.apps.example.com) instead of the readable workspace--sandbox--service composite. Unset preserves the composite hostnames. |
 | server.telemetryEnabled | bool | `true` | Enable anonymous OpenShell telemetry from the gateway and the sandbox supervisors it launches. |
 | server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
 | server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Only used when enableMtls is true. Set to "" to disable client certificate verification for HTTPS-only mode. |

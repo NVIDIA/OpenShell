@@ -155,8 +155,14 @@ pub(super) async fn expose_service_endpoint(
         authorization_mode: authorization_mode as i32,
     };
 
-    // Single-attempt CAS write: fails with ABORTED on concurrent modification
-    let result = state
+    let route_reserved = state
+        .service_route_index
+        .reserve(workspace, sandbox_name, service)
+        .map_err(|_| Status::already_exists("service routing hostname hash collision"))?;
+
+    // Single-attempt CAS write: fails with ABORTED on concurrent modification.
+    // Release a newly reserved route if the durable write did not succeed.
+    let result = match state
         .store
         .put_if(
             ServiceEndpoint::object_type(),
@@ -168,7 +174,17 @@ pub(super) async fn expose_service_endpoint(
             condition,
         )
         .await
-        .map_err(|e| super::persistence_error_to_status(e, "expose service"))?;
+    {
+        Ok(result) => result,
+        Err(error) => {
+            if route_reserved {
+                state
+                    .service_route_index
+                    .remove(workspace, sandbox_name, service);
+            }
+            return Err(super::persistence_error_to_status(error, "expose service"));
+        }
+    };
 
     let mut endpoint = endpoint;
     if let Some(ref mut meta) = endpoint.metadata {
@@ -341,6 +357,9 @@ pub(super) async fn handle_delete_service(
         .map_err(|e| super::persistence_error_to_status(e, "delete endpoint"))?;
 
     if deleted {
+        state
+            .service_route_index
+            .remove(workspace, sandbox_name, &req.name);
         service_routing::emit_service_endpoint_delete_event(&endpoint);
     }
 
@@ -505,6 +524,56 @@ mod tests {
                 .unwrap_err()
                 .code(),
             tonic::Code::InvalidArgument
+        );
+    }
+
+    #[tokio::test]
+    async fn expose_service_rejects_route_hash_collision_before_persistence() {
+        let mut state = test_server_state().await;
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.config = state_mut
+            .config
+            .clone()
+            .with_service_routing_gateway_name(Some("gateway-a"));
+        state_mut.service_route_index = Arc::new(service_routing::ServiceRouteIndex::new(Some(
+            "gateway-a".to_string(),
+        )));
+        seed_sandbox(&state, "my-sandbox").await;
+
+        let label = service_routing::service_route_hash_label(
+            "gateway-a",
+            "default",
+            "my-sandbox",
+            Some("web"),
+        );
+        state.service_route_index.seed_for_test(
+            label,
+            service_routing::ServiceRouteTarget {
+                workspace: "other".to_string(),
+                sandbox: "sandbox".to_string(),
+                service: Some("web".to_string()),
+            },
+        );
+
+        let error = handle_expose_service(
+            &state,
+            authed_request(ExposeServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: "web".to_string(),
+                target_port: 8080,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::AlreadyExists);
+        assert!(
+            get_service_endpoint(&state, "default", "my-sandbox", "web")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

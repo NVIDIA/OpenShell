@@ -286,6 +286,12 @@ struct RunArgs {
     )]
     server_sans: Vec<String>,
 
+    /// Gateway name used to derive opaque hashed sandbox service route
+    /// labels. Unset keeps readable `<workspace>--<sandbox>[--<service>]`
+    /// service hostnames.
+    #[arg(long, env = "OPENSHELL_SERVICE_ROUTING_GATEWAY_NAME")]
+    service_routing_gateway_name: Option<String>,
+
     /// Enable plaintext HTTP routing for loopback sandbox service URLs.
     #[arg(
         long,
@@ -568,8 +574,13 @@ fn prepare_server_config_with_drivers(
                 .unwrap_or_default(),
         )
         .with_server_sans(args.server_sans.clone())
+        .with_service_routing_gateway_name(args.service_routing_gateway_name.clone())
         .with_loopback_service_http(args.enable_loopback_service_http)
         .with_websocket_tunnel(args.enable_websocket_tunnel);
+    config
+        .service_routing
+        .validate()
+        .map_err(|error| miette::miette!("invalid service routing configuration: {error}"))?;
     if let Some(sources) = file
         .as_ref()
         .and_then(|file| file.openshell.gateway.provider_profile_sources.clone())
@@ -1044,6 +1055,10 @@ fn validate_preflight_semantics(
         args.grpc_rate_limit_requests,
         args.grpc_rate_limit_window_seconds,
     )?;
+    openshell_core::config::ServiceRoutingConfig::validate_gateway_name(
+        args.service_routing_gateway_name.as_deref(),
+    )
+    .map_err(|error| miette::miette!("invalid service routing configuration: {error}"))?;
     GuestTlsPaths::validate_configuration(Some(gateway), args.disable_tls)
         .map_err(|error| miette::miette!("invalid gateway guest TLS configuration: {error}"))?;
 
@@ -1251,6 +1266,12 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         && arg_defaulted(matches, "server_sans")
     {
         args.server_sans.clone_from(sans);
+    }
+    if let Some(name) = &file.service_routing_gateway_name
+        && args.service_routing_gateway_name.is_none()
+        && arg_defaulted(matches, "service_routing_gateway_name")
+    {
+        args.service_routing_gateway_name = Some(name.clone());
     }
     if let Some(enabled) = file.enable_loopback_service_http
         && arg_defaulted(matches, "enable_loopback_service_http")
@@ -2510,6 +2531,10 @@ mod tests {
                 "[openshell]\nversion = 2\n[openshell.gateway]\nname = 'secret-semantic-marker'\ngrpc_rate_limit_requests = 10\n",
             ),
             (
+                "service-routing",
+                "[openshell]\nversion = 2\n[openshell.gateway]\nservice_routing_gateway_name = 'Not A Label'\n",
+            ),
+            (
                 "guest-tls",
                 "[openshell]\nversion = 2\n[openshell.gateway]\nguest_tls_ca = '/tls/ca.pem'\ndisable_tls = true\n",
             ),
@@ -3653,6 +3678,131 @@ enable_loopback_service_http = false
                 assert!(
                     args.enable_loopback_service_http,
                     "env var must win over file"
+                );
+            });
+    }
+
+    #[test]
+    fn file_populates_service_routing_gateway_name() {
+        Environment::new()
+            .remove("OPENSHELL_SERVICE_ROUTING_GATEWAY_NAME")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+                let file = config_file_from_toml(
+                    "[openshell.gateway]\nservice_routing_gateway_name = \"gateway-west\"\n",
+                );
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+                assert_eq!(
+                    args.service_routing_gateway_name.as_deref(),
+                    Some("gateway-west")
+                );
+            });
+    }
+
+    #[test]
+    fn service_routing_gateway_name_cli_and_env_override_file_value() {
+        // CLI flag wins over the file value.
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--service-routing-gateway-name",
+            "gateway-cli",
+        ]);
+        let file = config_file_from_toml(
+            "[openshell.gateway]\nservice_routing_gateway_name = \"gateway-west\"\n",
+        );
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+        assert_eq!(
+            args.service_routing_gateway_name.as_deref(),
+            Some("gateway-cli"),
+            "CLI flag must win over file value"
+        );
+
+        // Env var wins over the file value.
+        Environment::new()
+            .set("OPENSHELL_SERVICE_ROUTING_GATEWAY_NAME", "gateway-env")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+                let file = config_file_from_toml(
+                    "[openshell.gateway]\nservice_routing_gateway_name = \"gateway-west\"\n",
+                );
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert_eq!(
+                    args.service_routing_gateway_name.as_deref(),
+                    Some("gateway-env"),
+                    "env var must win over file value"
+                );
+            });
+    }
+
+    #[test]
+    fn server_config_preparation_applies_and_validates_service_routing_gateway_name() {
+        let state = tempfile::tempdir().unwrap();
+        let local_tls = tempfile::tempdir().unwrap();
+
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set(
+                "OPENSHELL_LOCAL_TLS_DIR",
+                local_tls.path().to_str().unwrap(),
+            )
+            .remove("OPENSHELL_SERVICE_ROUTING_GATEWAY_NAME")
+            .run(|| {
+                let config_path = state.path().join("gateway.toml");
+                std::fs::write(
+                    &config_path,
+                    "[openshell]\nversion = 2\n\n[openshell.gateway]\nservice_routing_gateway_name = \"gateway-west\"\n",
+                )
+                .unwrap();
+
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--config",
+                    config_path.to_str().unwrap(),
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--compute-driver",
+                    "local",
+                    "--disable-tls",
+                ]);
+
+                let prepared = super::prepare_server_config(&mut args, &matches)
+                    .expect("server config is prepared");
+                assert_eq!(
+                    prepared
+                        .config
+                        .service_routing
+                        .service_routing_gateway_name
+                        .as_deref(),
+                    Some("gateway-west")
+                );
+
+                let invalid_path = state.path().join("invalid-gateway-name.toml");
+                std::fs::write(
+                    &invalid_path,
+                    "[openshell]\nversion = 2\n\n[openshell.gateway]\nservice_routing_gateway_name = \"Gateway West\"\n",
+                )
+                .unwrap();
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--config",
+                    invalid_path.to_str().unwrap(),
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--compute-driver",
+                    "local",
+                    "--disable-tls",
+                ]);
+                let error = super::prepare_server_config(&mut args, &matches)
+                    .err()
+                    .expect("invalid routing gateway name must fail preparation");
+                assert!(
+                    error.to_string().contains("service_routing_gateway_name"),
+                    "unexpected error: {error}"
                 );
             });
     }

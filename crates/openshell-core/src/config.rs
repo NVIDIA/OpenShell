@@ -346,6 +346,51 @@ pub struct ServiceRoutingConfig {
     /// Enable TLS-enabled loopback gateway listeners to also accept plaintext
     /// HTTP for sandbox service hostnames.
     pub enable_loopback_service_http: bool,
+
+    /// Optional gateway name used to derive opaque hashed service route
+    /// labels.
+    ///
+    /// When `None` (the default), the gateway keeps generating readable
+    /// `<workspace>--<sandbox>[--<service>]` service hostnames. When set,
+    /// newly generated service hostnames use a stable, one-label hash derived
+    /// from this name plus the workspace, sandbox, and service instead.
+    ///
+    /// This value is unrelated to [`Config::name`] and
+    /// [`GatewayJwtConfig::gateway_id`]; it is never derived from them.
+    pub service_routing_gateway_name: Option<String>,
+}
+
+impl ServiceRoutingConfig {
+    /// Validate the service-routing configuration.
+    ///
+    /// Currently validates [`Self::service_routing_gateway_name`]: `None` is
+    /// always valid, while `Some(name)` must be a DNS-1123 label — 1–63 ASCII
+    /// bytes of lowercase `a-z`, `0-9`, or `-`, with no leading or trailing
+    /// `-`. An empty string is rejected; the setting is represented as
+    /// disabled only by `None`.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        Self::validate_gateway_name(self.service_routing_gateway_name.as_deref())
+    }
+
+    /// Validate an optional service-routing gateway name.
+    ///
+    /// `None` is always valid. `Some(name)` must be a DNS-1123 label — 1–63
+    /// ASCII bytes of lowercase `a-z`, `0-9`, or `-`, with no leading or
+    /// trailing `-`. An empty string is rejected; the setting is represented
+    /// as disabled only by `None`.
+    pub fn validate_gateway_name(name: Option<&str>) -> crate::error::Result<()> {
+        if let Some(name) = name
+            && !is_dns_label(name)
+        {
+            return Err(crate::error::Error::Config {
+                message: format!(
+                    "service_routing_gateway_name must be a DNS label (1-63 lowercase \
+                     ASCII alphanumeric or '-' bytes, no leading/trailing '-'): {name:?}"
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// TLS configuration.
@@ -1125,6 +1170,17 @@ impl Config {
         self
     }
 
+    /// Set the service-routing gateway name used to derive hashed service
+    /// route labels.
+    ///
+    /// `None` preserves readable service hostnames. `Some(name)` must pass
+    /// [`ServiceRoutingConfig::validate`].
+    #[must_use]
+    pub fn with_service_routing_gateway_name(mut self, name: Option<impl Into<String>>) -> Self {
+        self.service_routing.service_routing_gateway_name = name.map(Into::into);
+        self
+    }
+
     /// Enable or disable plaintext HTTP routing for loopback sandbox service
     /// hostnames on TLS-enabled gateway listeners.
     #[must_use]
@@ -1146,6 +1202,7 @@ impl Default for ServiceRoutingConfig {
         Self {
             base_domains: default_service_routing_domains(),
             enable_loopback_service_http: default_enable_loopback_service_http(),
+            service_routing_gateway_name: None,
         }
     }
 }
@@ -1698,6 +1755,67 @@ mod tests {
             ]
         );
         assert!(!cfg.service_routing.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn service_routing_gateway_name_defaults_to_none() {
+        let cfg = Config::new(None);
+        assert!(cfg.service_routing.service_routing_gateway_name.is_none());
+        cfg.service_routing.validate().expect("unset is valid");
+    }
+
+    #[test]
+    fn service_routing_gateway_name_accepts_dns_label() {
+        for name in ["gateway-west", "g", &"g".repeat(63), "gateway-1-west"] {
+            let cfg = Config::new(None).with_service_routing_gateway_name(Some(name));
+            assert_eq!(
+                cfg.service_routing.service_routing_gateway_name.as_deref(),
+                Some(name)
+            );
+            cfg.service_routing
+                .validate()
+                .unwrap_or_else(|e| panic!("{name:?} must be valid: {e}"));
+        }
+    }
+
+    #[test]
+    fn service_routing_gateway_name_rejects_empty_uppercase_invalid_hyphen_and_overlong_values() {
+        for name in [
+            "",
+            "Gateway-West",
+            "-gateway",
+            "gateway-",
+            "gateway_west",
+            "gateway west",
+            &"g".repeat(64),
+        ] {
+            let cfg = Config::new(None).with_service_routing_gateway_name(Some(name));
+            let error = cfg
+                .service_routing
+                .validate()
+                .expect_err(&format!("{name:?} must be rejected"));
+            let message = error.to_string();
+            assert!(message.contains("service_routing_gateway_name"), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn server_sans_update_preserves_service_routing_gateway_name() {
+        let cfg = Config::new(None)
+            .with_service_routing_gateway_name(Some("gateway-west"))
+            .with_server_sans(["*.apps.example.com"]);
+
+        assert_eq!(
+            cfg.service_routing.service_routing_gateway_name.as_deref(),
+            Some("gateway-west")
+        );
+        assert_eq!(
+            cfg.service_routing.base_domains,
+            vec![
+                "apps.example.com".to_string(),
+                DEFAULT_SERVICE_ROUTING_DOMAIN.to_string()
+            ]
+        );
     }
 
     #[test]

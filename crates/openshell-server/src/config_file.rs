@@ -159,6 +159,11 @@ pub struct GatewayFileSection {
     /// Enable plaintext HTTP routing for loopback sandbox service URLs.
     #[serde(default)]
     pub enable_loopback_service_http: Option<bool>,
+    /// Gateway name used to derive opaque hashed sandbox service route
+    /// labels. Unset keeps readable `<workspace>--<sandbox>[--<service>]`
+    /// service hostnames.
+    #[serde(default)]
+    pub service_routing_gateway_name: Option<String>,
     /// Enable the WebSocket tunnel for an authenticated edge proxy.
     #[serde(default)]
     pub enable_websocket_tunnel: Option<bool>,
@@ -1092,6 +1097,41 @@ compute_driver = 42
 
         let serialized = toml::to_string(&file).expect("config serializes");
         assert!(serialized.contains("compute_driver = \"docker\""));
+    }
+
+    #[test]
+    fn service_routing_gateway_name_parses_and_serializes() {
+        let file = toml::from_str::<ConfigFile>(
+            r#"
+[openshell]
+version = 2
+
+[openshell.gateway]
+service_routing_gateway_name = "gateway-west"
+"#,
+        )
+        .expect("service routing gateway name parses");
+
+        assert_eq!(
+            file.openshell
+                .gateway
+                .service_routing_gateway_name
+                .as_deref(),
+            Some("gateway-west")
+        );
+
+        let serialized = toml::to_string(&file).expect("config serializes");
+        assert!(serialized.contains("service_routing_gateway_name = \"gateway-west\""));
+
+        let unset = toml::from_str::<ConfigFile>("[openshell]\nversion = 2\n")
+            .expect("file without the field parses");
+        assert!(
+            unset
+                .openshell
+                .gateway
+                .service_routing_gateway_name
+                .is_none()
+        );
     }
 
     #[test]

@@ -364,6 +364,9 @@ pub struct ServerState {
     /// relay instead of opening one per request.
     pub service_upstreams: Arc<service_routing::ServiceUpstreamPool>,
 
+    /// In-memory hostname-to-service index for opaque service routing labels.
+    pub service_route_index: Arc<service_routing::ServiceRouteIndex>,
+
     /// Latest placement ring, refreshed from live gateway membership. Decides
     /// which replica *should* own a sandbox; the owner record in the store
     /// remains authoritative for which one does.
@@ -477,6 +480,10 @@ impl ServerState {
     ) -> Self {
         let replica_id = compute::lease::replica_id();
         compute.configure_ssh_identities(credentials.clone());
+        let service_route_index = Arc::new(service_routing::ServiceRouteIndex::new(
+            config.service_routing.service_routing_gateway_name.clone(),
+        ));
+        compute.configure_service_route_index(Arc::clone(&service_route_index));
         let peer_endpoint = derive_peer_endpoint(&config);
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         let reflection_service = reflection::build_gateway_reflection_service(&config)
@@ -505,6 +512,7 @@ impl ServerState {
             peer_endpoint,
             peer_routes: Arc::new(supervisor_session::PeerRouteCache::default()),
             service_upstreams: Arc::new(service_routing::ServiceUpstreamPool::default()),
+            service_route_index,
             gateway_ring: Arc::new(std::sync::RwLock::new(gateway_ring::GatewayRing::default())),
             gateway_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
@@ -945,6 +953,11 @@ pub(crate) async fn run_server(
     // first snapshots observe the post-start backend state. Explicitly stopped
     // sandboxes remain stopped.
     ensure_default_workspace(&store).await?;
+    state
+        .service_route_index
+        .rebuild(&state.store)
+        .await
+        .map_err(|error| Error::config(format!("service routing index rebuild failed: {error}")))?;
     grpc::policy::validate_provider_composition_startup_preflight(&state)
         .await
         .map_err(|error| {

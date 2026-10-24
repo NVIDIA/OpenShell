@@ -199,6 +199,12 @@ config_delivery_mode = "poll"
 server_sans                  = ["openshell", "*.dev.openshell.localhost"]
 # Allow plaintext HTTP routing for loopback sandbox service URLs.
 enable_loopback_service_http = true
+# Disambiguate service hostnames when multiple gateways share one service
+# base domain behind a single ingress. When set, service URLs use opaque
+# hashed labels (https://<hash>.<base-domain>/) instead of the readable
+# <workspace>--<sandbox>--<service> composite. Changing the name changes
+# every issued URL.
+service_routing_gateway_name = "gateway-west"
 # Serve the WebSocket tunnel for CLI clients behind an authenticating edge proxy.
 enable_websocket_tunnel = false
 
@@ -340,6 +346,46 @@ The gateway rejects partial or invalid signing bundles at startup, including pri
 External compute drivers declare this requirement by adding `openshell.compute.launch-authentication` to their extension metadata's `required_capabilities`. This requires a gateway that understands the launch-signing preflight and supplies `SandboxLaunchAuthentication` on creation. Drivers that use another launch mechanism can omit the requirement. The separate `supports_sandbox_authentication` capability describes the `AuthenticateSandbox` RPC and does not require launch signing.
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
+
+## Service Routing
+
+Sandbox service URLs default to a readable composite hostname:
+`https://<workspace>--<sandbox>--<service>.<base-domain>/` for named services
+and `https://<workspace>--<sandbox>.<base-domain>/` for the unnamed endpoint.
+The base domain is the first wildcard DNS SAN in `server_sans`; gateways
+without SANs use the built-in `openshell.localhost`.
+
+`service_routing_gateway_name` disambiguates service hostnames when multiple
+gateways share one service base domain behind a single ingress and wildcard
+certificate. Identically named workspaces, sandboxes, and services on two such
+gateways produce identical composite hostnames, so the shared ingress cannot
+select the correct gateway. Assign each gateway a distinct routing name with
+`[openshell.gateway].service_routing_gateway_name`,
+`--service-routing-gateway-name`, or
+`OPENSHELL_SERVICE_ROUTING_GATEWAY_NAME`. The field is unset by default. Its
+precedence is `--service-routing-gateway-name` >
+`OPENSHELL_SERVICE_ROUTING_GATEWAY_NAME` > TOML > unset.
+
+The value must match `[a-z0-9]([-a-z0-9]*[a-z0-9])?` and be at most 63 bytes.
+It is a hostname label only: it is unrelated to the gateway installation
+`name` (used for telemetry identity) and to `gateway_jwt.gateway_id` (the
+sandbox JWT issuer and Kubernetes ownership identity).
+
+When set, service URLs replace the readable composite label with a
+deterministic 16-character hash of the routing name, workspace, sandbox, and
+service name: `https://<hash>.<base-domain>/` (for example,
+`https://enh47uqyj7bpyttz.apps.example.com/`, the label a gateway named
+`gateway-a` issues for workspace `default`, sandbox `my-sandbox`, service
+`web`). The hash stays one DNS label
+deep, so the existing single wildcard certificate keeps working, and it is
+unique per gateway, so exact-host ingress rules can route it unambiguously.
+The gateway still accepts requests for legacy composite hostnames while a
+routing name is configured.
+
+Service URLs are recomputed from the current configuration, not persisted.
+Changing or removing the routing name changes every hash URL issued before
+the change; previously issued URLs stop resolving until callers request a
+fresh URL.
 
 ## Database Pool
 

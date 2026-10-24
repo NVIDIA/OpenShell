@@ -317,6 +317,7 @@ The most commonly changed values are:
 | `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
 | `server.auth.allowUnauthenticatedUsers` | Accept user-facing calls without OIDC or mTLS credentials. Use only for trusted local development or a fully trusted access proxy. |
 | `server.enableLoopbackServiceHttp` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
+| `server.serviceRoutingGatewayName` | Optional routing name that makes exposed-service hostnames unique per gateway when multiple gateways share one service base domain behind a single ingress. Unset keeps the readable composite hostnames. Refer to [Ingress](/kubernetes/ingress#multiple-gateways-behind-one-ingress). |
 | `pkiInitJob.serverDnsNames` / `certManager.serverDnsNames` | Additional gateway server DNS SANs. Wildcard SANs also enable sandbox service URLs under that domain. |
 | `supervisor.sandboxRuntime.boundaryPort` | Non-privileged TLS port used between paired supervisor and sandbox Pods. |
 | `upstreamProxy` | Operator-owned corporate HTTP forward proxy for policy-approved TLS egress. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |

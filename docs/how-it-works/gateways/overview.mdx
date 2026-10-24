@@ -42,13 +42,15 @@ For driver setup, including Docker, Podman, MicroVM, and Kubernetes paths, refer
 
 Sandbox service routing is enabled for gateways by default. Users expose long-running sandbox services with `openshell service expose`, and the gateway routes browser traffic from the printed service URL to the loopback port inside the sandbox.
 
-Loopback gateways use `openshell.localhost` service URLs. OpenShell prints a URL in the form `http://<sandbox>.openshell.localhost:<port>/` or `http://<sandbox>--<service>.openshell.localhost:<port>/` when a service name is provided.
+Loopback gateways use `openshell.localhost` service URLs. OpenShell prints a URL in the form `http://<workspace>--<sandbox>.openshell.localhost:<port>/`, or `http://<workspace>--<sandbox>--<service>.openshell.localhost:<port>/` when a service name is provided.
 
 Browser traffic enters the same gateway listener as mTLS-protected gRPC, but plaintext HTTP is accepted only from loopback clients and only for sandbox service hostnames. Gateway APIs, auth routes, health endpoints, and non-service hostnames remain unavailable over plaintext HTTP. Cross-origin and sibling-subdomain browser requests are rejected before reaching the sandbox service.
 
 Disable the local browser path with `--enable-loopback-service-http=false` or `OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP=false`.
 
 Custom HTTPS service domains use the gateway server SAN configuration. Add a wildcard DNS SAN such as `*.apps.example.com` to the gateway certificate and pass the same SAN to the gateway with `--server-san` or `OPENSHELL_SERVER_SAN`.
+
+When multiple gateways share one service domain behind a single ingress, each gateway can set a service routing name with `--service-routing-gateway-name` or `[openshell.gateway].service_routing_gateway_name`. With a routing name set, service URLs use an opaque fixed-length hashed label — `https://<hash>.apps.example.com/` — that is unique per gateway, instead of the readable composite hostname. See [Configuration](/how-it-works/gateways/configuration#service-routing) for the field, its validation, and the effects of changing it.
 
 For remote or non-loopback gateways, browser service URLs remain HTTPS and require normal gateway authentication.
 

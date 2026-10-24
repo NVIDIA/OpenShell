@@ -29,6 +29,34 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?m)^enable_websocket_tunnel\s*=\s*true$'
 
+  - it: omits service_routing_gateway_name unless a routing name is configured
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'service_routing_gateway_name\s*='
+
+  - it: renders service_routing_gateway_name from server.serviceRoutingGatewayName
+    template: templates/gateway-config.yaml
+    set:
+      server.serviceRoutingGatewayName: gateway-west
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_routing_gateway_name\s*=\s*"gateway-west"$'
+
+  - it: preserves an explicit gatewayConfig service_routing_gateway_name over the legacy value
+    template: templates/gateway-config.yaml
+    set:
+      server.serviceRoutingGatewayName: gateway-west
+      gatewayConfig:
+        openshell.gateway:
+          service_routing_gateway_name: gateway-east
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_routing_gateway_name\s*=\s*"gateway-east"$'
+
   - it: defaults to label admission with caller driver config disabled
     template: templates/gateway-config.yaml
     asserts:

@@ -9,24 +9,25 @@ use axum::{
 };
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
-use openshell_core::ObjectId;
 use openshell_core::config::ServiceRoutingConfig;
 use openshell_core::proto::{
     Sandbox, SandboxPhase, ServiceAuthorizationMode, ServiceEndpoint, TcpRelayTarget, relay_open,
 };
+use openshell_core::{ObjectId, ObjectWorkspace};
 use openshell_ocsf::{
     ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint, EventContext,
     HttpActivityBuilder, HttpRequest, HttpResponse as OcsfHttpResponse, NetworkActivityBuilder,
     OcsfEvent, SeverityId, StateId, StatusId, Url as OcsfUrl,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
 use crate::ServerState;
-use crate::persistence::{ObjectType, Store};
+use crate::persistence::{ObjectListQuery, ObjectType, Store};
 
 const ENDPOINT_OBJECT_TYPE: &str = "service_endpoint";
 const ROUTING_RULE_NAME: &str = "sandbox_service_routing";
@@ -190,11 +191,221 @@ fn endpoint_host(
     service: &str,
 ) -> Option<String> {
     let base_domain = config.base_domains.first()?;
-    Some(if service.is_empty() {
-        format!("{workspace}--{sandbox}.{base_domain}")
-    } else {
-        format!("{workspace}--{sandbox}--{service}.{base_domain}")
-    })
+    Some(config.service_routing_gateway_name.as_deref().map_or_else(
+        || {
+            if service.is_empty() {
+                format!("{workspace}--{sandbox}.{base_domain}")
+            } else {
+                format!("{workspace}--{sandbox}--{service}.{base_domain}")
+            }
+        },
+        |gateway_name| {
+            format!(
+                "{}.{}",
+                service_route_hash_label(
+                    gateway_name,
+                    workspace,
+                    sandbox,
+                    (!service.is_empty()).then_some(service),
+                ),
+                base_domain
+            )
+        },
+    ))
+}
+
+/// Returns the stable, one-label DNS name for a service route.
+pub fn service_route_hash_label(
+    gateway_name: &str,
+    workspace: &str,
+    sandbox: &str,
+    service: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(gateway_name.as_bytes());
+    hasher.update([0]);
+    hasher.update(workspace.as_bytes());
+    hasher.update([0]);
+    hasher.update(sandbox.as_bytes());
+    hasher.update([0]);
+    hasher.update(service.unwrap_or("").as_bytes());
+    let digest = hasher.finalize();
+    base32_lower_no_padding(&digest[..10])
+}
+
+fn base32_lower_no_padding(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut output = String::with_capacity(16);
+    let mut accumulator = 0_u32;
+    let mut bits = 0_u8;
+    for byte in bytes {
+        accumulator = (accumulator << 8) | u32::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            output.push(char::from(
+                ALPHABET[((accumulator >> bits) & 0x1f) as usize],
+            ));
+        }
+    }
+    if bits > 0 {
+        output.push(char::from(
+            ALPHABET[((accumulator << (5 - bits)) & 0x1f) as usize],
+        ));
+    }
+    output
+}
+
+/// A resolved service-route destination.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceRouteTarget {
+    pub workspace: String,
+    pub sandbox: String,
+    pub service: Option<String>,
+}
+
+impl ServiceRouteTarget {
+    fn new(workspace: &str, sandbox: &str, service: &str) -> Self {
+        Self {
+            workspace: workspace.to_string(),
+            sandbox: sandbox.to_string(),
+            service: (!service.is_empty()).then(|| service.to_string()),
+        }
+    }
+}
+
+/// A collision between two service routes with the same hashed hostname.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CollisionError {
+    label: String,
+}
+
+impl std::fmt::Display for CollisionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "service routing hostname hash collision for {}",
+            self.label
+        )
+    }
+}
+
+impl std::error::Error for CollisionError {}
+
+/// In-memory lookup table for opaque service-routing host labels.
+#[derive(Debug)]
+pub struct ServiceRouteIndex {
+    gateway_name: Option<String>,
+    entries: Arc<RwLock<HashMap<String, ServiceRouteTarget>>>,
+}
+
+impl ServiceRouteIndex {
+    pub fn new(gateway_name: Option<String>) -> Self {
+        Self {
+            gateway_name,
+            entries: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn route_label(&self, target: &ServiceRouteTarget) -> Option<String> {
+        self.gateway_name.as_deref().map(|gateway_name| {
+            service_route_hash_label(
+                gateway_name,
+                &target.workspace,
+                &target.sandbox,
+                target.service.as_deref(),
+            )
+        })
+    }
+
+    pub fn register(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+        service: &str,
+    ) -> Result<(), CollisionError> {
+        self.reserve(workspace, sandbox, service).map(|_| ())
+    }
+
+    /// Reserves a route and returns whether this call inserted it.
+    pub(crate) fn reserve(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+        service: &str,
+    ) -> Result<bool, CollisionError> {
+        let target = ServiceRouteTarget::new(workspace, sandbox, service);
+        let Some(label) = self.route_label(&target) else {
+            return Ok(false);
+        };
+        let mut entries = self.entries.write().unwrap();
+        if let Some(existing) = entries.get(&label) {
+            return if existing == &target {
+                Ok(false)
+            } else {
+                Err(CollisionError { label })
+            };
+        }
+        entries.insert(label, target);
+        Ok(true)
+    }
+
+    pub fn remove(&self, workspace: &str, sandbox: &str, service: &str) {
+        let target = ServiceRouteTarget::new(workspace, sandbox, service);
+        let Some(label) = self.route_label(&target) else {
+            return;
+        };
+        let mut entries = self.entries.write().unwrap();
+        if entries.get(&label) == Some(&target) {
+            entries.remove(&label);
+        }
+    }
+
+    pub fn lookup(&self, label: &str) -> Option<ServiceRouteTarget> {
+        self.entries.read().unwrap().get(label).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_for_test(&self, label: String, target: ServiceRouteTarget) {
+        self.entries.write().unwrap().insert(label, target);
+    }
+
+    pub async fn rebuild(&self, store: &Store) -> Result<(), CollisionError> {
+        let Some(gateway_name) = self.gateway_name.as_deref() else {
+            return Ok(());
+        };
+        let endpoints = store
+            .collect_messages::<ServiceEndpoint>(ObjectListQuery::AllWorkspaces)
+            .await
+            .map_err(|error| {
+                warn!(error = %error, "failed to rebuild service routing index");
+                CollisionError {
+                    label: "persistence error".to_string(),
+                }
+            })?;
+        let mut rebuilt = HashMap::new();
+        for endpoint in endpoints {
+            let target = ServiceRouteTarget::new(
+                endpoint.object_workspace(),
+                &endpoint.sandbox,
+                &endpoint.name,
+            );
+            let label = service_route_hash_label(
+                gateway_name,
+                &target.workspace,
+                &target.sandbox,
+                target.service.as_deref(),
+            );
+            if let Some(existing) = rebuilt.get(&label)
+                && existing != &target
+            {
+                return Err(CollisionError { label });
+            }
+            rebuilt.insert(label, target);
+        }
+        *self.entries.write().unwrap() = rebuilt;
+        Ok(())
+    }
 }
 
 // The `--` delimiter is unambiguous because both workspace and sandbox name
@@ -231,22 +442,91 @@ pub fn parse_host(host: &str, config: &ServiceRoutingConfig) -> Option<(String, 
     None
 }
 
+/// Resolve either a legacy readable service host or an opaque hashed host.
+pub async fn resolve_service_host(state: &ServerState, host: &str) -> Option<ServiceRouteTarget> {
+    if let Some((workspace, sandbox, service)) = parse_host(host, &state.config.service_routing) {
+        return Some(ServiceRouteTarget::new(&workspace, &sandbox, &service));
+    }
+
+    let gateway_name = state
+        .config
+        .service_routing
+        .service_routing_gateway_name
+        .as_deref()?;
+    let label = service_host_label(host, &state.config.service_routing)?;
+    if !is_hash_label(label) {
+        return None;
+    }
+    if let Some(target) = state.service_route_index.lookup(label) {
+        return Some(target);
+    }
+
+    // A gateway can begin receiving traffic before an endpoint is exposed on
+    // this replica, so reload once from durable state before treating it as a
+    // normal, non-service request.
+    if let Err(error) = state.service_route_index.rebuild(&state.store).await {
+        warn!(error = %error, gateway_name, "failed to refresh service routing index");
+        return None;
+    }
+    state.service_route_index.lookup(label)
+}
+
+fn service_host_label<'a>(host: &'a str, config: &ServiceRoutingConfig) -> Option<&'a str> {
+    let host = host.split_once(':').map_or(host, |(name, _)| name);
+    for base_domain in &config.base_domains {
+        let suffix = format!(".{base_domain}");
+        if let Some(label) = host.strip_suffix(&suffix)
+            && !label.is_empty()
+            && !label.contains('.')
+        {
+            return Some(label);
+        }
+    }
+    None
+}
+
+fn is_hash_label(label: &str) -> bool {
+    label.len() == 16
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'2'..=b'7'))
+}
+
+#[cfg(test)]
 pub fn is_sandbox_service_request<B>(req: &Request<B>, config: &ServiceRoutingConfig) -> bool {
     request_host(req).is_some_and(|host| parse_host(host, config).is_some())
+}
+
+pub fn service_request_host<B>(req: &Request<B>) -> Option<String> {
+    request_host(req).map(str::to_string)
+}
+
+pub async fn is_sandbox_service_request_with_state(
+    host: Option<String>,
+    state: &ServerState,
+) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    resolve_service_host(state, &host).await.is_some()
 }
 
 pub async fn proxy_sandbox_service_request(
     state: Arc<ServerState>,
     req: Request<Body>,
 ) -> impl IntoResponse {
-    let Some(host) = request_host(&req) else {
+    let Some(host) = request_host(&req).map(str::to_string) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((workspace, sandbox_name, service_name)) =
-        parse_host(host, &state.config.service_routing)
-    else {
+    let Some(target) = resolve_service_host(&state, &host).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let ServiceRouteTarget {
+        workspace,
+        sandbox: sandbox_name,
+        service,
+    } = target;
+    let service_name = service.unwrap_or_default();
 
     match proxy_to_endpoint(state, req, &workspace, sandbox_name, service_name).await {
         Ok(response) => response.into_response(),
@@ -851,8 +1131,7 @@ pub fn emit_cross_origin_service_http_rejection(state: &ServerState, req: &Reque
     let Some(host) = request_host(req) else {
         return;
     };
-    let Some((_workspace, sandbox_name, service_name)) =
-        parse_host(host, &state.config.service_routing)
+    let Some((_, sandbox_name, service_name)) = parse_host(host, &state.config.service_routing)
     else {
         return;
     };
@@ -1162,6 +1441,122 @@ mod tests {
         assert_eq!(
             endpoint_url(&cfg, "staging", "my-sandbox", "web").as_deref(),
             Some("http://staging--my-sandbox--web.dev.openshell.localhost:8080/")
+        );
+    }
+
+    #[test]
+    fn service_route_hash_label_uses_stable_fixed_vectors() {
+        assert_eq!(
+            service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web")),
+            "enh47uqyj7bpyttz"
+        );
+        assert_eq!(
+            service_route_hash_label("gateway-a", "default", "my-sandbox", None),
+            "eiud2z5apv3yeucg"
+        );
+        assert_eq!(
+            service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web")),
+            service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web"))
+        );
+    }
+
+    #[test]
+    fn endpoint_url_uses_hash_label_when_gateway_name_is_configured() {
+        let cfg = openshell_core::Config::new(Some(tls_config()))
+            .with_bind_address("127.0.0.1:8080".parse().unwrap())
+            .with_server_sans(["*.dev.openshell.localhost"])
+            .with_service_routing_gateway_name(Some("gateway-a"));
+
+        assert_eq!(
+            endpoint_url(&cfg, "default", "my-sandbox", "web").as_deref(),
+            Some("http://enh47uqyj7bpyttz.dev.openshell.localhost:8080/")
+        );
+        assert_eq!(
+            endpoint_url(&cfg, "default", "my-sandbox", "").as_deref(),
+            Some("http://eiud2z5apv3yeucg.dev.openshell.localhost:8080/")
+        );
+    }
+
+    #[test]
+    fn service_route_index_is_idempotent_and_removes_matching_target() {
+        let index = ServiceRouteIndex::new(Some("gateway-a".to_string()));
+        index.register("default", "my-sandbox", "web").unwrap();
+        index.register("default", "my-sandbox", "web").unwrap();
+        let label = service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web"));
+        assert!(index.lookup(&label).is_some());
+        index.remove("default", "other-sandbox", "web");
+        assert!(index.lookup(&label).is_some());
+        index.remove("default", "my-sandbox", "web");
+        assert!(index.lookup(&label).is_none());
+    }
+
+    #[tokio::test]
+    async fn service_route_index_rebuilds_persisted_endpoints() {
+        use prost::Message;
+
+        let store = crate::persistence::test_store().await;
+        let endpoint = endpoint();
+        store
+            .put_if(
+                ServiceEndpoint::object_type(),
+                endpoint.object_id(),
+                "my-sandbox--web",
+                "default",
+                &endpoint.encode_to_vec(),
+                None,
+                crate::persistence::WriteCondition::MustCreate,
+            )
+            .await
+            .unwrap();
+        let index = ServiceRouteIndex::new(Some("gateway-a".to_string()));
+        index.rebuild(&store).await.unwrap();
+        let label = service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web"));
+        assert_eq!(
+            index.lookup(&label),
+            Some(ServiceRouteTarget::new("default", "my-sandbox", "web"))
+        );
+    }
+
+    #[test]
+    fn service_route_index_rejects_seeded_collision() {
+        let index = ServiceRouteIndex::new(Some("gateway-a".to_string()));
+        let label = service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web"));
+        index
+            .entries
+            .write()
+            .unwrap()
+            .insert(label, ServiceRouteTarget::new("other", "sandbox", "web"));
+        assert!(index.register("default", "my-sandbox", "web").is_err());
+    }
+
+    #[tokio::test]
+    async fn hashed_hosts_resolve_and_unknown_hashes_are_not_service_requests() {
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.config = state_mut
+            .config
+            .clone()
+            .with_server_sans(["*.dev.openshell.localhost"])
+            .with_service_routing_gateway_name(Some("gateway-a"));
+        state_mut.service_route_index =
+            Arc::new(ServiceRouteIndex::new(Some("gateway-a".to_string())));
+        state
+            .service_route_index
+            .register("default", "my-sandbox", "web")
+            .unwrap();
+
+        let hash = service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web"));
+        assert_eq!(
+            resolve_service_host(&state, &format!("{hash}.dev.openshell.localhost")).await,
+            Some(ServiceRouteTarget::new("default", "my-sandbox", "web"))
+        );
+        assert_eq!(
+            resolve_service_host(&state, "aaaaaaaaaaaaaaaa.dev.openshell.localhost").await,
+            None
+        );
+        assert_eq!(
+            resolve_service_host(&state, "default--my-sandbox--web.dev.openshell.localhost").await,
+            Some(ServiceRouteTarget::new("default", "my-sandbox", "web"))
         );
     }
 
