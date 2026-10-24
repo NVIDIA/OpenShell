@@ -58,6 +58,8 @@ The gateway emits an API Activity (`class_uid: 6003`) event with Medium severity
 
 When a sandbox principal is refused with `method_not_permitted`, `cross_sandbox`, or `platform_admin_required`, the gateway also emits a High-severity Detection Finding (`class_uid: 2004`) with `finding_info.uid` `sandbox-authorization-boundary`. Supervisors never make these requests, so the sandbox's credential may be compromised. Both events carry the same `metadata.correlation_uid`. Some methods answer a refused request with "not found" so callers cannot probe for resources; the event still records the denial.
 
+The gateway also emits a Device Config State Change (`class_uid: 5019`) event for each attempt to read secret-bearing material through `GetSandboxProviderEnvironment`, which a sandbox supervisor calls to load its provider environment, or `GetProviderCredentials`, the operator credential export. The state is `disclosed`, `denied`, `failed`, or `cancelled`. `unmapped` holds `operation`, `actor` (the authenticated principal as `type:id`, or `unknown`), `outcome`, and `status_code` for denied or failed attempts. It also names what was requested: `requested_sandbox_id` and `providers` for the sandbox environment, or `workspace`, `provider`, and `credential_keys` for the export. Events about a sandbox carry it in `container`, and `metadata.correlation_uid` holds the request ID as described above. These events never include credential values or error text.
+
 Without JSONL enabled, gateway OCSF events still appear as shorthand in console output, subject to the diagnostic log filter. Events associated with a sandbox also appear in its gateway log stream; gateway-wide events have no sandbox association.
 
 ## Enable Sandbox JSON Export

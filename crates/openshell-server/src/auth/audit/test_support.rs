@@ -43,6 +43,18 @@ pub async fn audited<F: Future>(path: &str, handler: F) -> (F::Output, Vec<Value
     (output, capture.json_events())
 }
 
+/// The credential disclosure events in `capture`, in emission order.
+///
+/// Handlers also emit authorization events, so tests that count disclosures
+/// select by class (Device Config State Change).
+pub fn disclosure_events(capture: &OcsfCapture) -> Vec<Value> {
+    capture
+        .json_events()
+        .into_iter()
+        .filter(|event| event["class_uid"] == 5019)
+        .collect()
+}
+
 /// Assert that `event` records the request from [`origin`].
 pub fn assert_origin(event: &Value) {
     assert_eq!(event["src_endpoint"]["ip"], PEER_IP, "{event}");

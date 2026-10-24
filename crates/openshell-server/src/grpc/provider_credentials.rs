@@ -18,6 +18,7 @@ use openshell_core::proto::{
 use tonic::{Request, Response, Status};
 
 use crate::ServerState;
+use crate::auth::audit::DisclosureAudit;
 use crate::storage_proto::StoredProviderCredentialRefreshStateV2;
 
 #[cfg(test)]
@@ -39,6 +40,17 @@ pub(super) async fn handle(
     state: &Arc<ServerState>,
     request: Request<GetProviderCredentialsRequest>,
 ) -> Result<Response<GetProviderCredentialsResponse>, Status> {
+    let mut audit = DisclosureAudit::begin("GetProviderCredentials", &request);
+    let result = handle_audited(state, request, &mut audit).await;
+    audit.finish(&result);
+    result
+}
+
+async fn handle_audited(
+    state: &Arc<ServerState>,
+    request: Request<GetProviderCredentialsRequest>,
+    audit: &mut DisclosureAudit,
+) -> Result<Response<GetProviderCredentialsResponse>, Status> {
     let operator = crate::auth::guard::require_operator(&request)?;
     let subject = operator.identity.subject.clone();
     let fingerprint = operator.certificate_sha256.clone();
@@ -55,6 +67,9 @@ pub(super) async fn handle(
             return Err(error);
         }
     };
+    audit.resource("workspace", workspace);
+    audit.resource("provider", request.name.clone());
+    audit.resource("credential_keys", request.credential_keys.join(","));
     // Admission survives RPC cancellation, while completion records the refresh
     // effects even if the final all-or-nothing delivery fails.
     tracing::info!(

@@ -133,6 +133,55 @@ async fn audits_exports_and_invalid_attempts_without_values() {
 }
 
 #[tokio::test]
+async fn emits_one_disclosure_event_per_attempt_without_values() {
+    let (state, _) = fixture().await;
+    let capture = openshell_ocsf::test_support::OcsfCapture::default();
+    let _guard = capture.install();
+    handle(&state, authenticated(request(&["STATIC_KEY"])))
+        .await
+        .unwrap();
+    handle(
+        &state,
+        crate::grpc::test_support::authed_request(request(&["STATIC_KEY"])),
+    )
+    .await
+    .unwrap_err();
+    handle(
+        &state,
+        authenticated(request(&["API_KEY=secret-from-invalid-input"])),
+    )
+    .await
+    .unwrap_err();
+
+    let events = crate::auth::audit::test_support::disclosure_events(&capture);
+    assert_eq!(events.len(), 3, "{events:?}");
+    let outcomes: Vec<_> = events
+        .iter()
+        .map(|event| event["unmapped"]["outcome"].as_str().unwrap())
+        .collect();
+    assert_eq!(outcomes, ["disclosed", "denied", "failed"]);
+    let delivered = &events[0]["unmapped"];
+    assert_eq!(delivered["operation"], "GetProviderCredentials");
+    assert_eq!(delivered["actor"], "operator:operator-test");
+    assert_eq!(delivered["workspace"], "other");
+    assert_eq!(delivered["provider"], "provider");
+    assert_eq!(delivered["credential_keys"], "STATIC_KEY");
+    assert!(events[2]["unmapped"].get("provider").is_none());
+    let recorded = serde_json::to_string(&events).unwrap();
+    for secret in [
+        "old-access-token",
+        "static-secret",
+        "must-not-export",
+        "secret-from-invalid-input",
+    ] {
+        assert!(
+            !recorded.contains(secret),
+            "{secret} leaked into {recorded}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn exports_only_selected_runtime_keys_across_workspaces() {
     let (state, _) = fixture().await;
     let response = handle(&state, authenticated(request(&["STATIC_KEY"])))

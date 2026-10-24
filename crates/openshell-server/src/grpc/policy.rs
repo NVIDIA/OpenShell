@@ -28,6 +28,7 @@ pub use endpoint_status::{
 };
 
 use crate::ServerState;
+use crate::auth::audit::DisclosureAudit;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{
     MinWorkspaceRole, require_platform_admin, selected_workspace_name,
@@ -3803,6 +3804,18 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     state: &Arc<ServerState>,
     request: Request<GetSandboxProviderEnvironmentRequest>,
 ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
+    let mut audit = DisclosureAudit::begin("GetSandboxProviderEnvironment", &request);
+    audit.resource("requested_sandbox_id", request.get_ref().sandbox_id.clone());
+    let result = disclose_sandbox_provider_environment(state, request, &mut audit).await;
+    audit.finish(&result);
+    result
+}
+
+async fn disclose_sandbox_provider_environment(
+    state: &Arc<ServerState>,
+    request: Request<GetSandboxProviderEnvironmentRequest>,
+    audit: &mut DisclosureAudit,
+) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
     let sandbox_id = request.get_ref().sandbox_id.clone();
     let supports_static_credential_bindings = request.get_ref().supports_static_credential_bindings;
     let supports_stable_placeholder_environment_keys = request
@@ -3813,6 +3826,10 @@ pub(super) async fn handle_get_sandbox_provider_environment(
 
     let sandbox =
         super::sandbox::fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
+    audit.sandbox(sandbox.object_id(), sandbox.object_name());
+    if let Some(spec) = &sandbox.spec {
+        audit.resource("providers", spec.providers.join(","));
+    }
     let environment = load_sandbox_provider_environment(
         state,
         &sandbox,
@@ -14124,6 +14141,78 @@ mod tests {
                 .get("/run/openshell/providers/work-config/client.toml"),
             Some(&"endpoint = 'https://config.example'".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn provider_environment_disclosure_is_audited_without_values() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-audited",
+                "audited",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+        let request = |sandbox_id: &str| GetSandboxProviderEnvironmentRequest {
+            sandbox_id: sandbox_id.to_string(),
+            supports_static_credential_bindings: true,
+            supports_stable_placeholder_environment_keys: false,
+        };
+
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_sandbox(Request::new(request("sb-audited")), "sb-audited"),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            response.environment.get("GITHUB_TOKEN"),
+            Some(&"ghp-test".to_string())
+        );
+        handle_get_sandbox_provider_environment(
+            &state,
+            with_sandbox(Request::new(request("sb-audited")), "sb-other"),
+        )
+        .await
+        .unwrap_err();
+        handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(request("sb-missing"))),
+        )
+        .await
+        .unwrap_err();
+
+        let events = crate::auth::audit::test_support::disclosure_events(&capture);
+        assert_eq!(events.len(), 3, "{events:?}");
+        let outcomes: Vec<_> = events
+            .iter()
+            .map(|event| event["unmapped"]["outcome"].as_str().unwrap())
+            .collect();
+        assert_eq!(outcomes, ["disclosed", "denied", "failed"]);
+        let disclosed = &events[0];
+        assert_eq!(
+            disclosed["unmapped"]["operation"],
+            "GetSandboxProviderEnvironment"
+        );
+        assert_eq!(disclosed["unmapped"]["actor"], "sandbox:sb-audited");
+        assert_eq!(disclosed["unmapped"]["providers"], "work-github");
+        assert_eq!(disclosed["container"]["uid"], "sb-audited");
+        assert_eq!(events[1]["unmapped"]["actor"], "sandbox:sb-other");
+        assert_eq!(events[2]["unmapped"]["actor"], "user:test-user");
+        assert_eq!(events[2]["unmapped"]["status_code"], "NotFound");
+        let recorded = serde_json::to_string(&events).unwrap();
+        assert!(!recorded.contains("ghp-test"), "{recorded}");
     }
 
     #[tokio::test]
