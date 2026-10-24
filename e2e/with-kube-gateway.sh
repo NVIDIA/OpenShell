@@ -94,6 +94,8 @@ PORTFORWARD_LOG="${WORKDIR}/portforward.log"
 PORTFORWARD_HEALTH_PID=""
 PORTFORWARD_HEALTH_LOG="${WORKDIR}/portforward-health.log"
 HELM_INSTALLED=0
+KATA_RUNTIME_CLASS_LABEL_RESTORE=0
+KATA_RUNTIME_CLASS_PREVIOUS_LABEL=""
 EXTERNAL_PG_FIXTURE_DEPLOYED=0
 EXTERNAL_PG_FIXTURE_SECRET=""
 EXTERNAL_PG_FIXTURE_MANIFEST="${ROOT}/e2e/kubernetes/postgres-fixture.yaml"
@@ -507,6 +509,16 @@ cleanup() {
 
   stop_gateway_portforward
 
+  if [ "${KATA_RUNTIME_CLASS_LABEL_RESTORE}" = "1" ]; then
+    if ! kctl label runtimeclass "${KATA_CONTAINERS_RUNTIME_CLASS}" \
+      "${KATA_RUNTIME_CLASS_PREVIOUS_LABEL}" --overwrite; then
+      echo "ERROR: failed to restore admission label on RuntimeClass ${KATA_CONTAINERS_RUNTIME_CLASS}" >&2
+      if [ "${exit_code}" -eq 0 ]; then
+        exit_code=1
+      fi
+    fi
+  fi
+
   if [ "${exit_code}" -ne 0 ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
     if command -v kubectl >/dev/null 2>&1 \
        && kctl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
@@ -644,6 +656,7 @@ cleanup() {
   fi
 
   rm -rf "${WORKDIR}" 2>/dev/null || true
+  exit "${exit_code}"
 }
 trap cleanup EXIT
 
@@ -1225,6 +1238,18 @@ helm_extra_args=()
 helm_post_renderer_args=()
 helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
 helm_extra_args+=(--set supervisor.sandboxRuntime.networkPolicyEnforced=true)
+if [ -n "${KATA_CONTAINERS_RUNTIME_CLASS:-}" ]; then
+  # Admission approval is cluster-wide; preserve even an explicitly empty label.
+  # shellcheck disable=SC2016 # These variables belong to kubectl's Go template.
+  KATA_RUNTIME_CLASS_PREVIOUS_LABEL="$(kctl get runtimeclass "${KATA_CONTAINERS_RUNTIME_CLASS}" \
+    -o 'go-template={{range $key, $value := .metadata.labels}}{{if eq $key "openshell.ai/sandbox-attachable"}}{{$key}}={{$value}}{{end}}{{end}}')"
+  KATA_RUNTIME_CLASS_PREVIOUS_LABEL="${KATA_RUNTIME_CLASS_PREVIOUS_LABEL:-openshell.ai/sandbox-attachable-}"
+  # Arm cleanup before mutation so a failed or interrupted label request is covered.
+  KATA_RUNTIME_CLASS_LABEL_RESTORE=1
+  kctl label runtimeclass "${KATA_CONTAINERS_RUNTIME_CLASS}" \
+    openshell.ai/sandbox-attachable=true --overwrite
+  helm_extra_args+=(--set-string "server.defaultRuntimeClassName=${KATA_CONTAINERS_RUNTIME_CLASS}")
+fi
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" != "1" ]; then
     echo "ERROR: external Kubernetes driver e2e requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=1." >&2

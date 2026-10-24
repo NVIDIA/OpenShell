@@ -319,6 +319,13 @@ above) instead of relying only on `OPENSHELL_GATEWAY_ENDPOINT`; some tests call
 ### Kubernetes E2E Notes
 
 Use `mise run e2e:kubernetes` for the standard Helm-backed Kubernetes suite.
+Set `KATA_CONTAINERS_RUNTIME_CLASS` to the desired RuntimeClass name (for example,
+`kata-qemu`) to pass it as `server.defaultRuntimeClassName` to Helm. The wrapper
+labels that RuntimeClass `openshell.ai/sandbox-attachable=true` before installation;
+the class must exist and the caller must have permission to label it. Cleanup
+restores the original label value, or removes the label if it was absent, even
+when the test run fails.
+
 The kube e2e wrapper creates only one port-forward, to `svc/openshell`; it no
 longer forwards the unauthenticated health listener or runs a `/readyz` e2e
 target. `/readyz` remains covered by server unit/integration tests.
