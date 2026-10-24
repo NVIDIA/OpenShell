@@ -137,6 +137,7 @@ impl OpenShellClient {
 
     /// Create a new sandbox from a curated [`SandboxSpec`].
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
+        let frozen = spec.frozen;
         let request = create_sandbox_request(spec);
         let response = self
             .unary(|mut grpc| {
@@ -144,7 +145,7 @@ impl OpenShellClient {
                 async move { grpc.create_sandbox(request).await }
             })
             .await?;
-        sandbox_from_create_response(response)
+        sandbox_from_create_response(response, frozen)
     }
 
     /// Create a new sandbox from a workspace-scoped workload template name.
@@ -152,6 +153,7 @@ impl OpenShellClient {
         &self,
         spec: SandboxTemplateCreateSpec,
     ) -> Result<SandboxRef> {
+        let frozen = spec.frozen;
         let request = create_sandbox_from_template_request(spec);
         let response = self
             .unary(|mut grpc| {
@@ -159,7 +161,7 @@ impl OpenShellClient {
                 async move { grpc.create_sandbox(request).await }
             })
             .await?;
-        sandbox_from_create_response(response)
+        sandbox_from_create_response(response, frozen)
     }
 
     /// Create a reusable sandbox template in the default workspace.
@@ -884,6 +886,7 @@ impl WorkspaceScopedClient {
 
     /// Create a new sandbox in this workspace.
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
+        let frozen = spec.frozen;
         let mut request = create_sandbox_request(spec);
         request.workspace_scope = Some(proto::workspace_selector(&self.workspace));
         let response = self
@@ -893,7 +896,7 @@ impl WorkspaceScopedClient {
                 async move { grpc.create_sandbox(request).await }
             })
             .await?;
-        sandbox_from_create_response(response)
+        sandbox_from_create_response(response, frozen)
     }
 
     /// Create a new sandbox from a template in this workspace.
@@ -901,6 +904,7 @@ impl WorkspaceScopedClient {
         &self,
         spec: SandboxTemplateCreateSpec,
     ) -> Result<SandboxRef> {
+        let frozen = spec.frozen;
         let mut request = create_sandbox_from_template_request(spec);
         request.workspace_scope = Some(proto::workspace_selector(&self.workspace));
         let response = self
@@ -910,7 +914,7 @@ impl WorkspaceScopedClient {
                 async move { grpc.create_sandbox(request).await }
             })
             .await?;
-        sandbox_from_create_response(response)
+        sandbox_from_create_response(response, frozen)
     }
 
     /// Create a reusable sandbox template in this workspace.
@@ -1323,6 +1327,8 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         labels,
         environment,
         providers,
+        policy,
+        frozen,
         gpu,
         command,
         tty,
@@ -1342,6 +1348,8 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
             environment,
             template,
             providers,
+            policy,
+            frozen,
             resource_requirements,
             command,
             tty,
@@ -1378,6 +1386,7 @@ fn create_sandbox_from_template_request(
         command,
         tty,
         policy,
+        frozen,
         service_exposures,
     } = spec;
     proto::CreateSandboxRequest {
@@ -1387,6 +1396,7 @@ fn create_sandbox_from_template_request(
             command,
             tty,
             policy,
+            frozen,
             ..proto::SandboxSpec::default()
         }),
         name: name.unwrap_or_default(),
@@ -1414,8 +1424,17 @@ fn sandbox_from_response(sandbox: Option<proto::Sandbox>) -> Result<SandboxRef> 
         .ok_or_else(|| SdkError::invalid_config("sandbox missing from gateway response"))
 }
 
-fn sandbox_from_create_response(response: proto::SandboxResponse) -> Result<SandboxRef> {
+fn sandbox_from_create_response(
+    response: proto::SandboxResponse,
+    frozen: bool,
+) -> Result<SandboxRef> {
     let mut sandbox = sandbox_from_response(response.sandbox)?;
+    if frozen && !sandbox.frozen {
+        return Err(SdkError::invalid_config(format!(
+            "gateway did not honor frozen=true for sandbox '{}' (ID '{}', workspace '{}'); it may already be running. Upgrade the gateway and remove the sandbox before retrying",
+            sandbox.name, sandbox.id, sandbox.workspace,
+        )));
+    }
     sandbox.service_urls = response.service_urls;
     Ok(sandbox)
 }

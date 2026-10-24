@@ -561,6 +561,82 @@ pub fn spawn_refresh(state: Arc<ServerState>) {
 }
 
 impl EffectiveProviderProfileCatalog {
+    /// Rebuild the profiles captured for a frozen sandbox without consulting
+    /// the live profile sources or store.
+    pub(crate) fn from_frozen_profiles(profiles: &[ProviderProfile]) -> Result<Self, Status> {
+        let mut captured: BTreeMap<(String, String, String), ScopedSnapshotProfile> =
+            BTreeMap::new();
+        for profile in profiles {
+            let scope = match profile.scope.as_str() {
+                "" => ProfileScope::Static,
+                "platform" => ProfileScope::Platform,
+                "workspace" => ProfileScope::Workspace,
+                _ => {
+                    return Err(Status::failed_precondition(format!(
+                        "frozen provider profile '{}' has invalid scope '{}'",
+                        profile.id, profile.scope
+                    )));
+                }
+            };
+            if profile.source.trim().is_empty()
+                || profile.source.trim() != profile.source
+                || (profile.source == USER_SOURCE_ID) == (scope == ProfileScope::Static)
+            {
+                return Err(Status::failed_precondition(format!(
+                    "frozen provider profile '{}' has inconsistent source and scope",
+                    profile.id
+                )));
+            }
+            let id = normalize_profile_id(&profile.id).ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "frozen provider profile '{}' has invalid id",
+                    profile.id
+                ))
+            })?;
+            let key = (profile.source.clone(), profile.scope.clone(), id);
+            if let Some(existing) = captured.get(&key) {
+                if existing.profile != *profile {
+                    return Err(Status::failed_precondition(format!(
+                        "conflicting frozen provider profile '{}' in scope '{}'",
+                        profile.id, profile.scope
+                    )));
+                }
+                continue;
+            }
+            captured.insert(
+                key,
+                ScopedSnapshotProfile {
+                    scope,
+                    profile: profile.clone(),
+                },
+            );
+        }
+
+        let mut snapshots: BTreeMap<String, CollectedProviderProfileSnapshot> = BTreeMap::new();
+        for ((source_id, _, _), profile) in captured {
+            snapshots
+                .entry(source_id.clone())
+                .or_insert_with(|| CollectedProviderProfileSnapshot {
+                    user_managed: source_id == USER_SOURCE_ID,
+                    source_id,
+                    revision: String::new(),
+                    profiles: Vec::new(),
+                    allow_empty: true,
+                })
+                .profiles
+                .push(profile);
+        }
+        for snapshot in snapshots.values_mut() {
+            let mut hasher = Sha256::new();
+            hasher.update(b"openshell-frozen-provider-profile-source-v1");
+            for profile in &snapshot.profiles {
+                hasher.update(canonical_provider_profile_bytes(&profile.profile));
+            }
+            snapshot.revision = format!("sha256:{:x}", hasher.finalize());
+        }
+        build_effective_profiles(snapshots.into_values().collect())
+    }
+
     pub(crate) fn revision(&self) -> &str {
         &self.revision
     }
@@ -611,6 +687,15 @@ impl EffectiveProviderProfileCatalog {
     ) -> Option<ProviderTypeProfile> {
         self.scoped_type_profile_for_scope(id, profile_workspace)
             .map(|entry| entry.profile.clone())
+    }
+
+    pub(crate) fn get_profile_for_scope(
+        &self,
+        id: &str,
+        profile_workspace: &str,
+    ) -> Option<ProviderProfile> {
+        self.scoped_type_profile_for_scope(id, profile_workspace)
+            .map(|entry| entry.response.clone())
     }
 
     /// Resolve a profile by its exact normalized ID.
@@ -1318,6 +1403,92 @@ mod tests {
                 .contains("duplicate MCP protocol version '2025-11-25'"),
             "validation must reject the preserved duplicate before the later unsupported alias: {error}"
         );
+    }
+
+    #[test]
+    fn frozen_catalog_preserves_scoped_resolution_and_deduplicates_captures() {
+        let mut workspace_profile = profile("shared");
+        workspace_profile.display_name = "Workspace override".to_string();
+        let live = build_effective_profiles(vec![
+            CollectedProviderProfileSnapshot {
+                source_id: USER_SOURCE_ID.to_string(),
+                revision: "user-revision".to_string(),
+                profiles: vec![
+                    scoped(ProfileScope::Platform, "shared"),
+                    ScopedSnapshotProfile {
+                        scope: ProfileScope::Workspace,
+                        profile: workspace_profile,
+                    },
+                    scoped(ProfileScope::Workspace, "workspace-only"),
+                ],
+                user_managed: true,
+                allow_empty: true,
+            },
+            CollectedProviderProfileSnapshot {
+                source_id: "interceptor/governance".to_string(),
+                revision: "external-revision".to_string(),
+                profiles: vec![scoped(ProfileScope::Static, "managed")],
+                user_managed: false,
+                allow_empty: false,
+            },
+        ])
+        .unwrap();
+        let mut captured = vec![
+            live.get_profile_for_scope("shared", "").unwrap(),
+            live.get_profile_for_scope("shared", "default").unwrap(),
+            live.get_profile_for_scope("workspace-only", "default")
+                .unwrap(),
+            live.get_profile_for_scope("managed", "default").unwrap(),
+        ];
+        captured.push(captured[0].clone());
+        let frozen = EffectiveProviderProfileCatalog::from_frozen_profiles(&captured).unwrap();
+        for (id, workspace) in [
+            ("shared", ""),
+            ("shared", "default"),
+            ("workspace-only", ""),
+            ("workspace-only", "default"),
+            ("managed", ""),
+            ("managed", "default"),
+        ] {
+            assert_eq!(
+                frozen.get_profile_for_scope(id, workspace),
+                live.get_profile_for_scope(id, workspace),
+                "profile {id} in workspace '{workspace}'"
+            );
+        }
+        captured.reverse();
+        let reordered = EffectiveProviderProfileCatalog::from_frozen_profiles(&captured).unwrap();
+        assert_eq!(frozen.revision(), reordered.revision());
+    }
+
+    #[test]
+    fn frozen_catalog_rejects_conflicting_or_invalid_captures() {
+        let mut first = profile("shared");
+        first.source = USER_SOURCE_ID.to_string();
+        first.scope = "platform".to_string();
+        let mut conflicting = first.clone();
+        conflicting.endpoints[0].host = "changed.example.com".to_string();
+        let error =
+            EffectiveProviderProfileCatalog::from_frozen_profiles(&[first.clone(), conflicting])
+                .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .contains("conflicting frozen provider profile")
+        );
+
+        for (source, scope) in [
+            ("", "platform"),
+            (USER_SOURCE_ID, ""),
+            ("interceptor/governance", "workspace"),
+            (USER_SOURCE_ID, "unknown"),
+        ] {
+            let mut invalid = first.clone();
+            invalid.source = source.to_string();
+            invalid.scope = scope.to_string();
+            assert!(EffectiveProviderProfileCatalog::from_frozen_profiles(&[invalid]).is_err());
+        }
     }
 
     #[tokio::test]

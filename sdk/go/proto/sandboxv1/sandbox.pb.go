@@ -255,6 +255,8 @@ const (
 	PolicySource_POLICY_SOURCE_UNSPECIFIED PolicySource = 0
 	PolicySource_POLICY_SOURCE_SANDBOX     PolicySource = 1
 	PolicySource_POLICY_SOURCE_GLOBAL      PolicySource = 2
+	// The gateway serves the durable first-accepted snapshot without recomposing.
+	PolicySource_POLICY_SOURCE_FROZEN PolicySource = 3
 )
 
 // Enum value maps for PolicySource.
@@ -263,11 +265,13 @@ var (
 		0: "POLICY_SOURCE_UNSPECIFIED",
 		1: "POLICY_SOURCE_SANDBOX",
 		2: "POLICY_SOURCE_GLOBAL",
+		3: "POLICY_SOURCE_FROZEN",
 	}
 	PolicySource_value = map[string]int32{
 		"POLICY_SOURCE_UNSPECIFIED": 0,
 		"POLICY_SOURCE_SANDBOX":     1,
 		"POLICY_SOURCE_GLOBAL":      2,
+		"POLICY_SOURCE_FROZEN":      3,
 	}
 )
 
@@ -2695,11 +2699,12 @@ const file_sandbox_proto_rawDesc = "" +
 	"\fSettingScope\x12\x1d\n" +
 	"\x19SETTING_SCOPE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15SETTING_SCOPE_SANDBOX\x10\x01\x12\x18\n" +
-	"\x14SETTING_SCOPE_GLOBAL\x10\x02*b\n" +
+	"\x14SETTING_SCOPE_GLOBAL\x10\x02*|\n" +
 	"\fPolicySource\x12\x1d\n" +
 	"\x19POLICY_SOURCE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15POLICY_SOURCE_SANDBOX\x10\x01\x12\x18\n" +
-	"\x14POLICY_SOURCE_GLOBAL\x10\x02b\x06proto3"
+	"\x14POLICY_SOURCE_GLOBAL\x10\x02\x12\x18\n" +
+	"\x14POLICY_SOURCE_FROZEN\x10\x03b\x06proto3"
 
 var (
 	file_sandbox_proto_rawDescOnce sync.Once

@@ -95,6 +95,18 @@ pub fn project_policy_revision_onto_sandbox(
         .map_err(|e| PersistenceError::Decode(format!("decode sandbox payload failed: {e}")))?;
     sandbox.set_resource_version(current_resource_version);
 
+    // Check inside the policy transaction as well as at the RPC boundary:
+    // first acceptance may have frozen the sandbox since a writer read it.
+    if sandbox
+        .status
+        .as_ref()
+        .is_some_and(|status| status.frozen_policy.is_some())
+    {
+        return Err(PersistenceError::Conflict {
+            current_resource_version: Some(current_resource_version),
+        });
+    }
+
     let mut changed = false;
     let startup_blocked = permits_initial_static_policy_repair(&sandbox);
     if let Some(backfill_policy) = write.backfill_policy.as_ref() {

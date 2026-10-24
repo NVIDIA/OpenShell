@@ -430,6 +430,7 @@ async fn finalize_sandbox_create_session(
 /// on the function signature, following the `provider_refresh_config(server, input, tls)`
 /// precedent. This struct captures sandbox-specific options.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)] // Independent command-line switches.
 pub struct SandboxCreateConfig<'a> {
     pub name: Option<&'a str>,
     pub template: Option<&'a str>,
@@ -443,6 +444,7 @@ pub struct SandboxCreateConfig<'a> {
     pub editor: Option<Editor>,
     pub providers: &'a [String],
     pub policy: Option<&'a str>,
+    pub frozen: bool,
     pub forward: Option<ForwardSpec>,
     pub expose: Option<u16>,
     pub expose_authorization_mode: ServiceAuthorizationMode,
@@ -474,6 +476,7 @@ impl Default for SandboxCreateConfig<'_> {
             editor: None,
             providers: &[],
             policy: None,
+            frozen: false,
             forward: None,
             expose: None,
             expose_authorization_mode: ServiceAuthorizationMode::Strip,
@@ -513,6 +516,7 @@ pub async fn sandbox_create(
         editor,
         providers,
         policy,
+        frozen,
         forward,
         expose,
         expose_authorization_mode,
@@ -681,6 +685,7 @@ pub async fn sandbox_create(
                 HashMap::new()
             },
             policy,
+            frozen,
             providers: configured_providers,
             template: inline_template,
             command: main_command,
@@ -737,6 +742,11 @@ pub async fn sandbox_create(
     } else {
         sandbox.object_name().to_string()
     };
+    if frozen && !sandbox.spec.as_ref().is_some_and(|spec| spec.frozen) {
+        return Err(miette::miette!(
+            "gateway did not honor --frozen for sandbox '{sandbox_name}'; upgrade the gateway before retrying. The sandbox may already be running; remove it with: openshell --workspace {workspace} sandbox delete {sandbox_name}"
+        ));
+    }
 
     // Record this sandbox as the last-used for the active gateway only when it
     // is expected to persist beyond the initial session.
@@ -1687,6 +1697,19 @@ where
     println!("  {} {}", "Id:".dimmed(), id);
     println!("  {} {}", "Name:".dimmed(), name);
     println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase()));
+    if let Some(frozen) = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.frozen_policy.as_ref())
+    {
+        println!("  {} frozen", "Policy state:".dimmed());
+        println!("  {} {}", "Frozen hash:".dimmed(), frozen.policy_hash);
+        if let Some(time) = &frozen.frozen_time {
+            println!("  {} {}", "Frozen at:".dimmed(), time);
+        }
+    } else if sandbox.spec.as_ref().is_some_and(|spec| spec.frozen) {
+        println!("  {} pending freeze", "Policy state:".dimmed());
+    }
     if let Some(status) = sandbox.status.as_ref() {
         for condition in &status.conditions {
             if matches!(
@@ -1824,11 +1847,7 @@ where
     println!(
         "  {} {}",
         "Policy source:".dimmed(),
-        if policy_from_global {
-            "global"
-        } else {
-            "sandbox"
-        }
+        policy_source_name(config.policy_source)
     );
     let revision = if policy_from_global {
         if config.global_policy_version > 0 {
@@ -3001,6 +3020,14 @@ pub async fn sandbox_list(
     Ok(())
 }
 
+fn policy_source_name(source: i32) -> &'static str {
+    match PolicySource::try_from(source) {
+        Ok(PolicySource::Frozen) => "frozen",
+        Ok(PolicySource::Global) => "global",
+        _ => "sandbox",
+    }
+}
+
 fn configuration_failure_message(sandbox: &Sandbox) -> Option<&str> {
     sandbox
         .status
@@ -3084,6 +3111,19 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
                 "provider_env_revision": admission.provider_env_revision,
             })
         });
+    let frozen_policy = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.frozen_policy.as_ref())
+        .map(|frozen| {
+            serde_json::json!({
+                "version": frozen.version,
+                "policy_hash": frozen.policy_hash,
+                "frozen_time": frozen.frozen_time.as_ref().map(ToString::to_string),
+                "policy_source": policy_source_name(frozen.policy_source),
+                "global_policy_version": frozen.global_policy_version,
+            })
+        });
     let provisioning = sandbox.status.as_ref().and_then(|status| status.provisioning.as_ref())
         .map(|record| serde_json::json!({
             "attempt_id": record.attempt_id,
@@ -3123,6 +3163,8 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "endpoint_statuses": endpoint_statuses,
         "last_token_grant_failure": last_token_grant_failure,
         "configuration_admission": admission,
+        "frozen": sandbox.spec.as_ref().is_some_and(|spec| spec.frozen),
+        "frozen_policy": frozen_policy,
         "provisioning": provisioning,
         "created_from_workload_template": created_from_workload_template,
     })
@@ -3339,11 +3381,7 @@ fn sandbox_detail_to_json(
         );
     }
 
-    let policy_source = if config.policy_source == PolicySource::Global as i32 {
-        "global"
-    } else {
-        "sandbox"
-    };
+    let policy_source = policy_source_name(config.policy_source);
     obj.insert("policy_source".into(), serde_json::json!(policy_source));
 
     let policy_from_global = config.policy_source == PolicySource::Global as i32;
@@ -5340,6 +5378,12 @@ pub async fn sandbox_policy_set_global(
         },
         response.settings_revision,
     );
+    if !response.frozen_sandboxes.is_empty() {
+        eprintln!(
+            "Frozen sandboxes retain their policy: {}",
+            response.frozen_sandboxes.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -5368,11 +5412,7 @@ pub async fn sandbox_settings_get(
         return Ok(());
     }
 
-    let policy_source = if response.policy_source == PolicySource::Global as i32 {
-        "global"
-    } else {
-        "sandbox"
-    };
+    let policy_source = policy_source_name(response.policy_source);
 
     println!("Sandbox:       {name}");
     println!("Config Rev:    {}", response.config_revision);
@@ -5444,11 +5484,7 @@ fn settings_to_json_sandbox(
     workspace: &str,
     response: &GetSandboxConfigResponse,
 ) -> serde_json::Value {
-    let policy_source = if response.policy_source == PolicySource::Global as i32 {
-        "global"
-    } else {
-        "sandbox"
-    };
+    let policy_source = policy_source_name(response.policy_source);
 
     let mut settings = serde_json::Map::new();
     let mut keys: Vec<_> = response.settings.keys().cloned().collect();
@@ -5598,6 +5634,12 @@ pub async fn gateway_setting_delete(
         );
     } else {
         println!("{} Global setting {} not found", "!".yellow(), key);
+    }
+    if !response.frozen_sandboxes.is_empty() {
+        println!(
+            "Frozen sandboxes retain their policy: {}",
+            response.frozen_sandboxes.join(", ")
+        );
     }
     Ok(())
 }
@@ -6116,6 +6158,7 @@ where
         PolicySource::try_from(config.policy_source).unwrap_or(PolicySource::Sandbox);
     let policy_source_label = match policy_source {
         PolicySource::Global => "global",
+        PolicySource::Frozen => "frozen",
         PolicySource::Sandbox => "sandbox",
         PolicySource::Unspecified => "unspecified",
     };
@@ -8646,6 +8689,48 @@ mod tests {
             super::sandbox_to_json(&sandbox)["provisioning"]["phase"],
             "admission"
         );
+    }
+
+    #[test]
+    fn sandbox_json_distinguishes_pending_and_frozen_policy() {
+        let mut sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                frozen: true,
+                ..Default::default()
+            }),
+            status: Some(SandboxStatus::default()),
+            ..Default::default()
+        };
+        let pending = super::sandbox_to_json(&sandbox);
+        assert_eq!(pending["frozen"], true);
+        assert!(pending["frozen_policy"].is_null());
+        sandbox.status.as_mut().unwrap().frozen_policy = Some(
+            openshell_core::proto::FrozenSandboxPolicy {
+                version: 3,
+                policy_hash: "accepted-hash".into(),
+                frozen_time: openshell_core::time::timestamp_from_millis(600_000).ok(),
+                policy_source: PolicySource::Global as i32,
+                global_policy_version: 7,
+                ..Default::default()
+            }
+            .into(),
+        );
+        let frozen = super::sandbox_to_json(&sandbox);
+        assert_eq!(frozen["frozen_policy"]["policy_hash"], "accepted-hash");
+        assert_eq!(
+            frozen["frozen_policy"]["frozen_time"],
+            "1970-01-01T00:10:00Z"
+        );
+        assert_eq!(frozen["frozen_policy"]["policy_source"], "global");
+        let detail = super::sandbox_detail_to_json(
+            &sandbox,
+            &GetSandboxConfigResponse {
+                policy_source: PolicySource::Frozen as i32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(detail["policy_source"], "frozen");
     }
 
     #[test]

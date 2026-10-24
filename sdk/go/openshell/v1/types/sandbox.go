@@ -27,6 +27,8 @@ type Sandbox struct {
 
 // SandboxSpec holds the desired state of a sandbox.
 type SandboxSpec struct {
+	// Frozen preserves the effective policy after initialization for this sandbox's lifetime.
+	Frozen      bool
 	LogLevel    string
 	Environment map[string]string
 	Template    *SandboxTemplate
@@ -115,6 +117,8 @@ type SandboxWorkloadTemplateProvenance struct {
 
 // SandboxStatus holds the observed state of a sandbox.
 type SandboxStatus struct {
+	// FrozenPolicy is nil until a requested freeze has initialized successfully.
+	FrozenPolicy         *FrozenSandboxPolicy
 	AgentPod             string
 	AgentFd              string
 	SandboxFd            string
@@ -136,6 +140,17 @@ type SandboxStatus struct {
 	RestartCount           uint32
 	NextRestartAtMs        int64
 	MainProcessStartedAtMs int64
+}
+
+// FrozenSandboxPolicy is the accepted effective policy and its immutable identity.
+// Gateway-owned provider authorization snapshots remain available through the raw API.
+type FrozenSandboxPolicy struct {
+	Policy              *SandboxPolicy
+	Version             uint32
+	PolicyHash          string
+	FrozenAt            time.Time
+	PolicySource        PolicySource
+	GlobalPolicyVersion uint32
 }
 
 // TokenGrantFailureObservation records a refused grant's destination and cause.

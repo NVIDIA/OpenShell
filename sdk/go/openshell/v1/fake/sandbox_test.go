@@ -1007,3 +1007,15 @@ func TestSandbox_GetLogs_ClosedReturnsUnavailable(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, types.IsUnavailable(err))
 }
+
+func TestFrozenPolicySnapshotIsCopied(t *testing.T) {
+	original := types.SandboxStatus{FrozenPolicy: &types.FrozenSandboxPolicy{
+		PolicyHash: "accepted-hash",
+		Policy:     &types.SandboxPolicy{Filesystem: &types.FilesystemPolicy{ReadOnly: []string{"/etc"}}},
+	}}
+	copied := copySandboxStatus(original)
+	copied.FrozenPolicy.PolicyHash = "changed"
+	copied.FrozenPolicy.Policy.Filesystem.ReadOnly[0] = "/changed"
+	assert.Equal(t, "accepted-hash", original.FrozenPolicy.PolicyHash)
+	assert.Equal(t, []string{"/etc"}, original.FrozenPolicy.Policy.Filesystem.ReadOnly)
+}

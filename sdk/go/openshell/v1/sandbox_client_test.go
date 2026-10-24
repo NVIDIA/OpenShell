@@ -5,6 +5,7 @@ package v1
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -29,6 +30,7 @@ type mockSandboxServer struct {
 	sandboxes            map[string]*pb.Sandbox
 	providers            map[string][]*dm.Provider
 	createErr            error
+	createResponse       *pb.SandboxResponse
 	getErr               error
 	listErr              error
 	listPages            [][]*pb.Sandbox
@@ -67,6 +69,13 @@ func (s *mockSandboxServer) CreateSandbox(_ context.Context, req *pb.CreateSandb
 	s.createRequest = proto.Clone(req).(*pb.CreateSandboxRequest)
 	if s.createErr != nil {
 		return nil, s.createErr
+	}
+	if s.createResponse != nil {
+		sb := s.createResponse.GetSandbox()
+		if sb != nil {
+			s.sandboxes[sb.GetMetadata().GetName()] = sb
+		}
+		return proto.Clone(s.createResponse).(*pb.SandboxResponse), nil
 	}
 	sb := &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{
@@ -1485,4 +1494,53 @@ func TestSandboxGetLogs_SinceZeroNotSent(t *testing.T) {
 	mock.mu.Lock()
 	assert.Nil(t, mock.getLogsRequest.GetSinceTime())
 	mock.mu.Unlock()
+}
+
+func TestSandboxFrozenCreateRequiresAcknowledgement(t *testing.T) {
+	for _, mode := range []struct {
+		name string
+		spec *pb.SandboxSpec
+	}{
+		{name: "absent"},
+		{name: "false", spec: &pb.SandboxSpec{}},
+		{name: "pending", spec: &pb.SandboxSpec{Frozen: true}},
+	} {
+		for _, template := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/template=%t", mode.name, template), func(t *testing.T) {
+				mock := newMockSandboxServer()
+				mock.createResponse = &pb.SandboxResponse{Sandbox: &pb.Sandbox{
+					Metadata: &dm.ObjectMeta{Id: "created-id", Name: "created-frozen", Workspace: "staging"},
+					Spec:     mode.spec,
+				}}
+				client, cleanup := setupSandboxTest(t, mock)
+				defer cleanup()
+				var result *Sandbox
+				var err error
+				if template {
+					result, err = client.CreateFromTemplate(context.Background(), "staging", "", "agent", &SandboxSpec{Frozen: true})
+				} else {
+					result, err = client.Create(context.Background(), "staging", "", &SandboxSpec{Frozen: true})
+				}
+				if mode.spec.GetFrozen() {
+					require.NoError(t, err)
+					require.NotNil(t, result)
+					assert.True(t, result.Spec.Frozen)
+					assert.Nil(t, result.Status.FrozenPolicy)
+				} else {
+					require.Error(t, err)
+					assert.Nil(t, result)
+					assert.True(t, IsUnimplemented(err))
+					assert.ErrorContains(t, err, "gateway did not honor frozen=true")
+					assert.ErrorContains(t, err, "created-frozen")
+					assert.ErrorContains(t, err, "created-id")
+					assert.ErrorContains(t, err, "staging")
+				}
+				mock.mu.Lock()
+				defer mock.mu.Unlock()
+				assert.True(t, mock.createRequest.GetSpec().GetFrozen())
+				assert.Contains(t, mock.sandboxes, "created-frozen", "the SDK must leave cleanup to the caller")
+				assert.Nil(t, mock.deleteRequest)
+			})
+		}
+	}
 }

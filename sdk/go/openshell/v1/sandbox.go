@@ -21,6 +21,9 @@ type SandboxTemplate = types.SandboxTemplate
 // SandboxStatus holds the observed state of a sandbox.
 type SandboxStatus = types.SandboxStatus
 
+// FrozenSandboxPolicy is the effective policy captured at initialization.
+type FrozenSandboxPolicy = types.FrozenSandboxPolicy
+
 // SandboxCondition describes an observed condition of a sandbox.
 type SandboxCondition = types.SandboxCondition
 

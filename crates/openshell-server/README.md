@@ -18,6 +18,23 @@ Retries reuse that generation and session, including after gateway restart.
 Credential renewal retains both; credentials for an older launch cannot
 authorize the new one.
 
+## Frozen sandbox policy
+
+`SandboxSpec.frozen` captures the first accepted configuration's effective
+policy and non-secret provider authorization in `SandboxStatus.frozen_policy`.
+The snapshot and activation marker are written in one sandbox CAS; driver
+observations preserve both. Configuration and credential delivery use that
+snapshot and its captured profile catalog, without consulting live profile
+sources.
+Credential values remain fresh, while changed provider identities,
+configuration or refresh authorization withhold credentials. Direct policy
+mutations are rejected at admission and fenced again at policy persistence.
+
+`PolicySource::Frozen` keeps runtime filesystem enrichment local on subsequent
+starts. Global-policy and profile validation skip frozen readers, so obsolete
+live inputs cannot prevent gateway startup. The feature trusts gateway storage;
+it does not add a supervisor pin, signature verifier or live policy refresh.
+
 ## Operator credential export
 
 `GetProviderCredentials` exports selected profile-declared runtime environment

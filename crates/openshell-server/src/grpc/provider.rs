@@ -2059,6 +2059,11 @@ pub async fn validate_provider_update_against_attached_sandboxes_with_catalog(
 ) -> Result<(), Status> {
     let provider_name = provider.object_name().to_string();
     for sandbox in sandboxes_using_provider_records(store, workspace, &provider_name).await? {
+        if super::policy::frozen::snapshot(&sandbox).is_some() {
+            // Frozen readers use their captured catalog and withhold credentials
+            // when this provider no longer matches their authorization.
+            continue;
+        }
         let sandbox_name = sandbox.object_name().to_string();
         let Some(spec) = sandbox.spec.as_ref() else {
             continue;
@@ -3848,6 +3853,29 @@ async fn profile_attached_sandbox_diagnostics(
     let validate_policy_composition =
         super::policy::provider_policy_composition_enabled(store).await?;
     for sandbox in sandboxes {
+        if let Some(frozen) = super::policy::frozen::snapshot(&sandbox) {
+            for provider in &frozen.providers {
+                let same_scope = if is_platform_scope {
+                    provider.profile_workspace.is_empty()
+                } else {
+                    provider.profile_workspace == workspace
+                };
+                if same_scope && let Some((source, _)) = candidate_profiles.get(&provider.r#type) {
+                    diagnostics.push(ProfileValidationDiagnostic {
+                        source: source.clone(),
+                        profile_id: provider.r#type.clone(),
+                        field: "sandbox".to_string(),
+                        message: format!(
+                            "sandbox '{}/{}' is frozen and retains its initialized provider policy",
+                            sandbox.object_workspace(),
+                            sandbox.object_name()
+                        ),
+                        severity: "warning".to_string(),
+                    });
+                }
+            }
+            continue;
+        }
         let sandbox_name = sandbox.object_name().to_string();
         let sandbox_workspace = sandbox.object_workspace().to_string();
         let spec = sandbox.spec.as_ref().expect("filtered by scan_sandboxes");
@@ -4279,6 +4307,50 @@ fn token_grant_dependency_status(status: Status) -> Status {
     TokenGrantFailure::new(kind, TokenGrantStage::GatewayRpc).to_status_with_code(status.code())
 }
 
+async fn load_provider_subject_token_context(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    provider_name: &str,
+) -> Result<(Provider, ProviderProfile), Status> {
+    let (provider, catalog) = if super::policy::frozen::snapshot(sandbox).is_some() {
+        let context = super::policy::frozen::provider_context(state, sandbox)
+            .await
+            .map_err(token_grant_dependency_status)?;
+        if context.withheld_providers.contains(provider_name) {
+            return Err(token_grant_authorization_required_status());
+        }
+        let provider = context
+            .records
+            .into_iter()
+            .find(|record| record.name == provider_name)
+            .ok_or_else(|| token_grant_configuration_status(tonic::Code::PermissionDenied))?
+            .provider;
+        (provider, context.catalog)
+    } else {
+        let workspace = sandbox.object_workspace();
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>(workspace, provider_name)
+            .await
+            .map_err(|_| token_grant_store_status())?
+            .ok_or_else(|| token_grant_configuration_status(tonic::Code::NotFound))?;
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), workspace)
+            .await
+            .map_err(token_grant_dependency_status)?;
+        (provider, catalog)
+    };
+    let profile = get_provider_type_profile_for_scope(
+        &catalog,
+        &provider.r#type,
+        &provider.profile_workspace,
+    )
+    .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?
+    .to_proto();
+    Ok((provider, profile))
+}
+
 async fn exchange_provider_subject_token_inner(
     state: &Arc<ServerState>,
     request: Request<ExchangeProviderSubjectTokenRequest>,
@@ -4322,7 +4394,6 @@ async fn exchange_provider_subject_token_inner(
         .await
         .map_err(|_| token_grant_store_status())?
         .ok_or_else(|| token_grant_configuration_status(tonic::Code::NotFound))?;
-    let workspace = sandbox.object_workspace().to_string();
     let spec = sandbox
         .spec
         .as_ref()
@@ -4337,24 +4408,8 @@ async fn exchange_provider_subject_token_inner(
         ));
     }
 
-    let provider = state
-        .store
-        .get_message_by_name::<Provider>(&workspace, &req.provider)
-        .await
-        .map_err(|_| token_grant_store_status())?
-        .ok_or_else(|| token_grant_configuration_status(tonic::Code::NotFound))?;
-    let catalog = state
-        .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref(), &workspace)
-        .await
-        .map_err(token_grant_dependency_status)?;
-    let profile = get_provider_type_profile_for_scope(
-        &catalog,
-        &provider.r#type,
-        &provider.profile_workspace,
-    )
-    .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
-    let profile_proto = profile.to_proto();
+    let (provider, profile_proto) =
+        load_provider_subject_token_context(state, &sandbox, &req.provider).await?;
     let credential = profile_proto
         .credentials
         .iter()
@@ -5753,6 +5808,272 @@ mod tests {
                 assert_generic(&expired, Code::FailedPrecondition).kind(),
                 TokenGrantFailureKind::ProviderAuthorizationRequired
             );
+        }
+
+        fn frozen_exchange_profile(endpoint: &str, subject: &str) -> ProviderProfile {
+            let mut profile = custom_profile("frozen-exchange");
+            profile.credentials = vec![
+                ProviderProfileCredential {
+                    name: subject.to_string(),
+                    ..Default::default()
+                },
+                ProviderProfileCredential {
+                    name: "access_token".to_string(),
+                    auth_style: "bearer".to_string(),
+                    header_name: "Authorization".to_string(),
+                    token_grant: Some(ProviderCredentialTokenGrant {
+                        grant_type: ProviderCredentialTokenGrantType::TokenExchange.into(),
+                        token_endpoint: endpoint.to_string(),
+                        subject_token: Some(ProviderCredentialTokenGrantSubjectToken {
+                            source: "provider_credential".to_string(),
+                            credential: subject.to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ];
+            profile
+        }
+
+        async fn frozen_exchange_state(
+            next_profiles: Vec<ProviderProfile>,
+        ) -> (
+            Arc<ServerState>,
+            Sandbox,
+            Provider,
+            Arc<std::sync::atomic::AtomicUsize>,
+        ) {
+            use openshell_core::proto::{
+                FrozenSandboxPolicy, FrozenSandboxProvider, SandboxStatus,
+            };
+            let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut state = test_server_state_without_provider_profiles().await;
+            Arc::get_mut(&mut state).unwrap().provider_profile_sources =
+                ProviderProfileSources::from_test_snapshot_sequence(
+                    vec![
+                        (
+                            "original".to_string(),
+                            vec![frozen_exchange_profile(
+                                "https://original.example/token",
+                                "subject_token",
+                            )],
+                        ),
+                        ("replacement".to_string(), next_profiles),
+                    ],
+                    Arc::clone(&fetches),
+                );
+            let mut provider = provider_with_values("frozen-exchange-provider", "frozen-exchange");
+            provider.metadata.as_mut().unwrap().id = "frozen-exchange-provider-id".to_string();
+            provider.credentials = HashMap::from([
+                ("subject_token".to_string(), "original-subject".to_string()),
+                ("live_subject".to_string(), "live-subject".to_string()),
+            ]);
+            state.store.put_message(&provider).await.unwrap();
+            let catalog = state
+                .provider_profile_sources
+                .snapshot_catalog(state.store.as_ref(), "default")
+                .await
+                .unwrap();
+            let captured_profile = catalog
+                .get_profile_for_scope(&provider.r#type, &provider.profile_workspace)
+                .unwrap();
+            let sandbox = Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "frozen-exchange-sandbox".to_string(),
+                    name: "frozen-exchange-sandbox".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                spec: Some(SandboxSpec {
+                    frozen: true,
+                    providers: vec![provider.object_name().to_string()],
+                    ..Default::default()
+                }),
+                status: Some(SandboxStatus {
+                    frozen_policy: Some(
+                        FrozenSandboxPolicy {
+                            providers: vec![FrozenSandboxProvider {
+                                provider: provider.object_name().to_string(),
+                                provider_id: provider.object_id().to_string(),
+                                r#type: provider.r#type.clone(),
+                                config: provider.config.clone(),
+                                profile_workspace: provider.profile_workspace.clone(),
+                                profile: Some(captured_profile),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }
+                        .into(),
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            state.store.put_message(&sandbox).await.unwrap();
+            (state, sandbox, provider, fetches)
+        }
+
+        fn frozen_exchange_request(
+            sandbox: &Sandbox,
+            provider: &Provider,
+        ) -> Request<ExchangeProviderSubjectTokenRequest> {
+            let mut request = Request::new(ExchangeProviderSubjectTokenRequest {
+                sandbox_id: sandbox.object_id().to_string(),
+                provider: provider.object_name().to_string(),
+                credential_key: "access_token".to_string(),
+                supervisor_jwt_svid: "unused-before-subject-authorization".to_string(),
+            });
+            request
+                .extensions_mut()
+                .insert(Principal::Sandbox(SandboxPrincipal {
+                    sandbox_id: sandbox.object_id().to_string(),
+                    source: SandboxIdentitySource::BootstrapJwt {
+                        issuer: "test".to_string(),
+                    },
+                    trust_domain: None,
+                }));
+            request
+        }
+
+        #[tokio::test]
+        async fn frozen_exchange_uses_captured_profile_and_rotated_subject_without_live_sources() {
+            use std::sync::atomic::Ordering;
+            for next_profiles in [
+                vec![frozen_exchange_profile(
+                    "https://changed.example/token",
+                    "live_subject",
+                )],
+                Vec::new(),
+            ] {
+                let (state, sandbox, mut provider, fetches) =
+                    frozen_exchange_state(next_profiles).await;
+                provider
+                    .credentials
+                    .insert("subject_token".to_string(), "rotated-subject".to_string());
+                state.store.put_message(&provider).await.unwrap();
+                let (selected_provider, selected_profile) =
+                    load_provider_subject_token_context(&state, &sandbox, provider.object_name())
+                        .await
+                        .unwrap();
+                let grant = selected_profile
+                    .credentials
+                    .iter()
+                    .find(|credential| credential.name == "access_token")
+                    .unwrap()
+                    .token_grant
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(grant.token_endpoint, "https://original.example/token");
+                assert_eq!(
+                    grant.subject_token.as_ref().unwrap().credential,
+                    "subject_token"
+                );
+                assert_eq!(
+                    resolve_subject_token_credential(
+                        &state.credentials,
+                        &selected_provider,
+                        "subject_token"
+                    )
+                    .await
+                    .unwrap(),
+                    "rotated-subject"
+                );
+                assert_eq!(selected_provider.object_id(), provider.object_id());
+                assert_eq!(selected_provider.config, provider.config);
+
+                // The actual RPC selects the captured, now-expired subject;
+                // it must stop before SPIFFE acquisition or an HTTP exchange.
+                provider
+                    .credential_expiration_times
+                    .insert("subject_token".to_string(), ts(0));
+                state.store.put_message(&provider).await.unwrap();
+                let error = handle_exchange_provider_subject_token(
+                    &state,
+                    frozen_exchange_request(&sandbox, &provider),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    assert_generic(&error, Code::FailedPrecondition).kind(),
+                    TokenGrantFailureKind::ProviderAuthorizationRequired
+                );
+                assert_eq!(
+                    fetches.load(Ordering::SeqCst),
+                    1,
+                    "frozen exchange must never fetch the live source"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn frozen_exchange_rejects_changed_authorization_before_subject_lookup() {
+            use std::sync::atomic::Ordering;
+            for change in ["configuration", "identity", "refresh authorization"] {
+                let (state, sandbox, mut provider, fetches) =
+                    frozen_exchange_state(Vec::new()).await;
+                provider.credentials.clear();
+                provider.credential_handles.insert(
+                    "subject_token".to_string(),
+                    CredentialHandle {
+                        driver: "unconfigured-driver-must-not-be-called".to_string(),
+                        handle: "unresolved-subject".to_string(),
+                        ..Default::default()
+                    },
+                );
+                match change {
+                    "configuration" => {
+                        provider
+                            .config
+                            .insert("region".to_string(), "changed".to_string());
+                    }
+                    "identity" => {
+                        state
+                            .store
+                            .delete(Provider::object_type(), provider.object_id())
+                            .await
+                            .unwrap();
+                        provider.metadata.as_mut().unwrap().id = "replacement-provider".to_string();
+                    }
+                    _ => {
+                        crate::provider_refresh::put_refresh_state(
+                            state.store.as_ref(),
+                            &StoredProviderCredentialRefreshState {
+                                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                                    id: "new-refresh-authorization".to_string(),
+                                    name: crate::provider_refresh::refresh_state_name(
+                                        provider.object_id(),
+                                        "subject_token",
+                                    ),
+                                    workspace: "default".to_string(),
+                                    ..Default::default()
+                                }),
+                                provider_id: provider.object_id().to_string(),
+                                provider_name: provider.object_name().to_string(),
+                                credential_key: "subject_token".to_string(),
+                                authorization_epoch: "new-authorization".to_string(),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+                state.store.put_message(&provider).await.unwrap();
+                let error = handle_exchange_provider_subject_token(
+                    &state,
+                    frozen_exchange_request(&sandbox, &provider),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    assert_generic(&error, Code::FailedPrecondition).kind(),
+                    TokenGrantFailureKind::ProviderAuthorizationRequired,
+                    "{change}"
+                );
+                assert_eq!(fetches.load(Ordering::SeqCst), 1, "{change}");
+            }
         }
 
         #[test]

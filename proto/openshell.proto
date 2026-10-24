@@ -1074,6 +1074,9 @@ message SandboxSpec {
   // Gateway-owned policy for replacing the sandbox runtime after the canonical
   // main process exits. Unspecified is normalized to Never before persistence.
   SandboxRestartPolicy restart_policy = 15;
+  // Keep the first accepted effective policy until this sandbox is deleted.
+  // Chosen only at creation; a different policy requires a new sandbox.
+  bool frozen = 16;
 }
 
 message ResourceRequirements {
@@ -1222,6 +1225,34 @@ message SandboxStatus {
   // failures before a configured endpoint or credential could be selected.
   // Matching grant success or a policy, provider, or supervisor reset clears it.
   TokenGrantFailureObservation last_token_grant_failure = 17;
+  // Read-only, non-secret policy and provider authorization captured atomically
+  // with first configuration acceptance. Retained across runtime replacement.
+  FrozenSandboxPolicy frozen_policy = 18;
+}
+
+// Authoritative policy for a sandbox created with frozen=true.
+message FrozenSandboxPolicy {
+  openshell.sandbox.v1.SandboxPolicy policy = 1;
+  uint32 version = 2;
+  string policy_hash = 3;
+  google.protobuf.Timestamp frozen_time = 4;
+  // Original selection before the policy became frozen.
+  openshell.sandbox.v1.PolicySource policy_source = 5;
+  uint32 global_policy_version = 6;
+  repeated FrozenSandboxProvider providers = 7;
+}
+
+// Provider authorization only. Credential values and handles are never copied.
+message FrozenSandboxProvider {
+  string provider = 1;
+  // Internal immutable identity prevents same-name provider replacement.
+  string provider_id = 2;
+  string type = 3;
+  string profile_workspace = 4;
+  map<string, string> config = 5;
+  ProviderProfile profile = 6;
+  // Automatic token rotation preserves these epochs; reauthorization does not.
+  map<string, string> refresh_authorization_epochs = 7;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -2926,6 +2957,9 @@ message UpdateConfigResponse {
   bool deleted = 4;
   // Sandbox metadata annotations after the update. Empty for global updates.
   map<string, string> annotations = 5;
+  // Workspace-qualified sandbox names that retain a frozen policy after a
+  // gateway-global policy update or deletion. Empty for other mutations.
+  repeated string frozen_sandboxes = 6;
 }
 
 // Get sandbox policy status request.

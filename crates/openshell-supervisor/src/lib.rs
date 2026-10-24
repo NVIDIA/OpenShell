@@ -5989,14 +5989,24 @@ network_policies:
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_global_policy_skips_baseline_write_back() {
+        for source in [
+            openshell_core::proto::PolicySource::Global,
+            openshell_core::proto::PolicySource::Frozen,
+        ] {
+            assert_fixed_policy_skips_baseline_write_back(source).await;
+        }
+    }
+
+    async fn assert_fixed_policy_skips_baseline_write_back(
+        source: openshell_core::proto::PolicySource,
+    ) {
         use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
         // The gateway serves a global policy that has network rules but lacks
         // the proxy baseline paths. It refuses every sandbox policy write while
         // that policy is active, so startup must add the paths locally and
         // install the policy without writing it back.
-        let mut global =
-            settings_poll_result(Some(proto_tcp_policy_fixture()), 1, PolicySource::Global);
-        global.global_policy_version = 1;
+        let mut global = settings_poll_result(Some(proto_tcp_policy_fixture()), 1, source);
+        global.global_policy_version = u32::from(source == PolicySource::Global);
         let global_generation = report_generation(&global);
         let mut enriched = proto_tcp_policy_fixture();
         assert!(enrich_proto_baseline_paths(&mut enriched));
@@ -6024,10 +6034,10 @@ network_policies:
             ),
         )
         .await
-        .expect("startup must not wait for repair under a global policy")
+        .expect("startup must not wait for repair under a fixed policy")
         .unwrap_or_else(|error| {
             panic!(
-                "startup exited under a global policy: {}",
+                "startup exited under a fixed policy: {}",
                 startup_error_chain(&error)
             )
         });
@@ -6050,21 +6060,21 @@ network_policies:
                 StartupCall::Snapshot,
                 report(ConfigurationAdmissionState::Accepted),
             ],
-            "startup must not write a global policy back as a sandbox policy"
+            "startup must not write a fixed policy back as a sandbox policy"
         );
         assert_eq!(
             bundle.2,
             Some(enriched),
-            "startup installs the global policy with the baseline paths added"
+            "startup installs the fixed policy with the baseline paths added"
         );
         let LoadedPolicyOrigin::Gateway {
             revision: Some(revision),
             ..
         } = bundle.4
         else {
-            panic!("startup must bind the global policy to its gateway revision");
+            panic!("startup must bind the fixed policy to its gateway revision");
         };
-        assert_eq!(revision.policy_source, PolicySource::Global);
+        assert_eq!(revision.policy_source, source);
     }
 
     #[tokio::test(start_paused = true)]

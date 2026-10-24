@@ -46,11 +46,7 @@ func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
-	sandbox := converter.SandboxFromProto(resp.GetSandbox())
-	if sandbox != nil {
-		sandbox.ServiceURLs = converter.CopyStringMap(resp.GetServiceUrls())
-	}
-	return sandbox, nil
+	return sandboxFromCreateResponse(resp, req)
 }
 
 func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error) {
@@ -78,7 +74,22 @@ func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name,
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
+	return sandboxFromCreateResponse(resp, req)
+}
+
+func sandboxFromCreateResponse(resp *pb.SandboxResponse, req *pb.CreateSandboxRequest) (*Sandbox, error) {
 	sandbox := converter.SandboxFromProto(resp.GetSandbox())
+	if req.GetSpec().GetFrozen() && (sandbox == nil || !sandbox.Spec.Frozen) {
+		metadata := resp.GetSandbox().GetMetadata()
+		name := metadata.GetName()
+		if name == "" {
+			name = req.GetName()
+		}
+		return nil, &StatusError{Code: ErrorUnimplemented, Message: fmt.Sprintf(
+			"gateway did not honor frozen=true for sandbox %q (ID %q, workspace %q); it may already be running. Upgrade the gateway and remove the sandbox before retrying",
+			name, metadata.GetId(), req.GetWorkspaceScope().GetWorkspace(),
+		)}
+	}
 	if sandbox != nil {
 		sandbox.ServiceURLs = converter.CopyStringMap(resp.GetServiceUrls())
 	}

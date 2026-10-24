@@ -10,12 +10,14 @@
 //! independent, not one database transaction, and credential values are
 //! resolved later by the provider builder alone.
 
+use std::collections::BTreeSet;
+
 use openshell_core::proto::Sandbox;
 use tonic::Status;
 
 use super::super::StoredSettings;
 use super::super::provider::{ProviderEnvironmentRecord, load_provider_environment_records};
-use super::load_global_settings;
+use super::{frozen, load_global_settings};
 use crate::ServerState;
 use crate::persistence::{ObjectId, ObjectWorkspace, PolicyRecord};
 use crate::policy_store::PolicyStoreExt as _;
@@ -34,6 +36,9 @@ pub struct SandboxConfigInputs {
     /// Observed for its version metadata even under a global policy, whose
     /// dormant sandbox payload is never decoded.
     pub(super) latest_policy: Option<PolicyRecord>,
+    /// Frozen providers whose current authorization no longer matches the
+    /// captured one. Always empty for live sandboxes.
+    pub(super) withheld_providers: BTreeSet<String>,
 }
 
 impl SandboxConfigInputs {
@@ -49,6 +54,22 @@ pub async fn load_sandbox_config_inputs(
     sandbox: Sandbox,
 ) -> Result<SandboxConfigInputs, Status> {
     let store = state.store.as_ref();
+    if frozen::snapshot(&sandbox).is_some() {
+        // A frozen sandbox reads its captured catalog and provider identities,
+        // and never the live policy history.
+        let (context, global_settings) = tokio::try_join!(
+            frozen::provider_context(state, &sandbox),
+            load_global_settings(store),
+        )?;
+        return Ok(SandboxConfigInputs {
+            sandbox,
+            catalog: context.catalog,
+            provider_records: context.records,
+            global_settings,
+            latest_policy: None,
+            withheld_providers: context.withheld_providers,
+        });
+    }
     let workspace = sandbox.object_workspace();
     let provider_names = sandbox
         .spec
@@ -74,5 +95,6 @@ pub async fn load_sandbox_config_inputs(
         provider_records,
         global_settings,
         latest_policy,
+        withheld_providers: BTreeSet::new(),
     })
 }

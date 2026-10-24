@@ -42,6 +42,7 @@ const (
 	PolicySourceUnspecified PolicySource = ""
 	PolicySourceSandbox     PolicySource = "sandbox"
 	PolicySourceGlobal      PolicySource = "global"
+	PolicySourceFrozen      PolicySource = "frozen"
 )
 
 // EffectiveSetting is a setting value paired with the scope it was resolved from.
@@ -63,7 +64,7 @@ type SandboxConfig struct {
 	Settings map[string]EffectiveSetting
 	// ConfigRevision is the fingerprint for effective config (policy + settings).
 	ConfigRevision uint64
-	// PolicySource indicates where the policy came from (sandbox or global).
+	// PolicySource indicates where the policy came from (sandbox, global, or frozen).
 	PolicySource PolicySource
 	// GlobalPolicyVersion is the global policy version (0 if not applicable).
 	GlobalPolicyVersion uint32
@@ -119,4 +120,6 @@ type ConfigUpdateResult struct {
 	Deleted bool
 	// Annotations contains sandbox metadata annotations after the update.
 	Annotations map[string]string
+	// FrozenSandboxes names sandboxes retaining a frozen policy after a global policy change.
+	FrozenSandboxes []string
 }

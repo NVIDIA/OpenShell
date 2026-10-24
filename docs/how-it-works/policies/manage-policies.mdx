@@ -37,6 +37,36 @@ openshell sandbox create --name my-sandbox
 Without either, the sandbox uses a policy from its image or the restrictive
 [default policy](/how-it-works/policies/default-policy).
 
+## Freeze a Sandbox Policy
+
+Use `--frozen` to keep a sandbox's first accepted effective policy for its lifetime:
+
+```shell
+openshell sandbox create --name review-bot \
+  --policy ./approved-policy.yaml --provider github --frozen --detach
+openshell sandbox get review-bot
+openshell policy get review-bot --full
+```
+
+The snapshot includes any global override and attached provider profiles and
+authorization. Later global-policy or profile changes leave it unchanged, even
+across restarts.
+
+After the configuration is accepted, policy edits, proposal approvals, and
+provider attach or detach fail. Recreate the sandbox to change its policy or
+providers. You cannot enable or disable freezing on an existing sandbox.
+
+Credentials and tokens still rotate. Changing a provider's identity,
+configuration, or refresh authorization withholds that provider's credentials
+without changing the frozen policy.
+
+`sandbox get` shows a pending freeze before initialization and the frozen hash
+and timestamp afterward. `policy get --full` returns the saved effective policy.
+
+Verify approved policy and profile artifacts in a trusted deployment step.
+Freezing preserves the accepted policy; it does not verify approval or
+provide a pre-launch approval gate.
+
 ## Ship a Policy in an Image
 
 To include a policy in a sandbox image, add it at `/etc/openshell/policy.yaml`:

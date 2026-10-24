@@ -24,6 +24,46 @@ async fn protected_state() -> (tempfile::TempDir, Arc<ServerState>) {
     (directory, state)
 }
 
+#[tokio::test]
+async fn global_policy_replay_preserves_frozen_sandbox_report() {
+    let (_directory, state) = protected_state().await;
+    let policy = openshell_policy::restrictive_default_policy();
+    let sandbox = Sandbox {
+        metadata: Some(meta("frozen-report")),
+        spec: Some(SandboxSpec {
+            frozen: true,
+            ..Default::default()
+        }),
+        status: Some(openshell_core::proto::SandboxStatus {
+            frozen_policy: Some(
+                openshell_core::proto::FrozenSandboxPolicy {
+                    policy: Some(policy.clone()),
+                    policy_hash: openshell_core::policy_identity::deterministic_policy_hash(
+                        &policy,
+                    ),
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    state.store.put_message(&sandbox).await.unwrap();
+    let request = UpdateConfigRequest {
+        request_id: id(),
+        global: true,
+        policy: Some(policy),
+        ..Default::default()
+    };
+    let original = run(&state, authed_request(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(original.frozen_sandboxes, ["default/frozen-report"]);
+    assert_eq!(replay(&state, request).await, original);
+}
+
 fn configure_key(state: &mut Arc<ServerState>, directory: &tempfile::TempDir) {
     let key = directory.path().join("private-key");
     std::fs::write(&key, b"test-only stable private fingerprint material").unwrap();

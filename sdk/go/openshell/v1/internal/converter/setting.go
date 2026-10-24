@@ -95,6 +95,8 @@ func PolicySourceFromProto(ps sbv1.PolicySource) v1.PolicySource {
 		return v1.PolicySourceSandbox
 	case sbv1.PolicySource_POLICY_SOURCE_GLOBAL:
 		return v1.PolicySourceGlobal
+	case sbv1.PolicySource_POLICY_SOURCE_FROZEN:
+		return v1.PolicySourceFrozen
 	default:
 		return v1.PolicySource("")
 	}
@@ -330,5 +332,6 @@ func ConfigUpdateResultFromProto(resp *pb.UpdateConfigResponse) *v1.ConfigUpdate
 		SettingsRevision: resp.GetSettingsRevision(),
 		Deleted:          resp.GetDeleted(),
 		Annotations:      CopyStringMap(resp.GetAnnotations()),
+		FrozenSandboxes:  CopyStringSlice(resp.GetFrozenSandboxes()),
 	}
 }

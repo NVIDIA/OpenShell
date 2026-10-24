@@ -2070,13 +2070,15 @@ class _FakeSandboxStub:
     ) -> Any:
         self.create_request = request
         _ = timeout
+        sandbox = _make_sandbox_proto(
+            "sandbox-1",
+            request.name or "generated",
+            dict(request.labels),
+            workspace=_request_workspace(request) or "default",
+        )
+        sandbox.spec.CopyFrom(request.spec)
         return SimpleNamespace(
-            sandbox=_make_sandbox_proto(
-                "sandbox-1",
-                request.name or "generated",
-                dict(request.labels),
-                workspace=_request_workspace(request) or "default",
-            ),
+            sandbox=sandbox,
             service_urls={
                 exposure.service: f"https://{exposure.service}.example.test/"
                 for exposure in request.service_exposures
@@ -2198,16 +2200,74 @@ class _RecordingHighLevelClient:
         )
 
 
+@pytest.mark.parametrize("echoed", [None, False, True])
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "create",
+        "create_from_template",
+        "create_session",
+        "create_session_from_template",
+    ],
+)
+def test_frozen_create_requires_gateway_acknowledgement(
+    echoed: bool | None, operation: str
+) -> None:
+    class LegacySandboxStub(_FakeSandboxStub):
+        def CreateSandbox(
+            self,
+            request: openshell_pb2.CreateSandboxRequest,
+            timeout: float | None = None,
+        ) -> Any:
+            response = super().CreateSandbox(request, timeout)
+            if echoed is None:
+                response.sandbox.ClearField("spec")
+            else:
+                response.sandbox.spec.frozen = echoed
+            return response
+
+    stub = LegacySandboxStub()
+    client = _client_with_fake_stub(stub)
+    kwargs: dict[str, Any] = {
+        "workspace": "staging",
+        "spec": openshell_pb2.SandboxSpec(frozen=True),
+    }
+    if "template" in operation:
+        kwargs["workload_template"] = "agent"
+    create = getattr(client, operation)
+    if echoed:
+        result = create(**kwargs)
+        ref = result.sandbox if "session" in operation else result
+        assert ref.frozen is True
+        assert ref.status.frozen_policy is None
+    else:
+        with pytest.raises(
+            SandboxError, match="gateway did not honor frozen=True"
+        ) as error:
+            create(**kwargs)
+        message = str(error.value)
+        assert "generated" in message
+        assert "sandbox-1" in message
+        assert "staging" in message
+    assert stub.create_request is not None
+    assert stub.create_request.spec.frozen is True
+    assert stub.delete_request is None
+
+
 def test_create_forwards_name_and_labels() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
     ref = client.create(
-        workspace="default", name="job-1", labels={"aiq": "deep-research"}
+        workspace="default",
+        name="job-1",
+        labels={"aiq": "deep-research"},
+        spec=openshell_pb2.SandboxSpec(frozen=True),
     )
 
     assert stub.create_request is not None
     assert stub.create_request.name == "job-1"
+    assert stub.create_request.spec.frozen is True
     assert dict(stub.create_request.labels) == {"aiq": "deep-research"}
     assert dict(ref.labels) == {"aiq": "deep-research"}
 
@@ -2252,6 +2312,7 @@ def test_create_from_template_forwards_workload_template() -> None:
     client = _client_with_fake_stub(stub)
     spec = openshell_pb2.SandboxSpec(
         providers=["github"],
+        frozen=True,
         command=["/opt/worker", "--serve"],
         tty=True,
     )
@@ -2271,6 +2332,7 @@ def test_create_from_template_forwards_workload_template() -> None:
     assert list(stub.create_request.spec.providers) == ["github"]
     assert list(stub.create_request.spec.command) == ["/opt/worker", "--serve"]
     assert stub.create_request.spec.tty is True
+    assert stub.create_request.spec.frozen is True
     assert dict(ref.labels) == {"team": "runtime"}
 
 
@@ -2727,6 +2789,23 @@ def test_sandbox_ref_retains_gateway_labels() -> None:
     ref = _sandbox_ref(proto)
 
     assert dict(ref.labels) == {"aiq": "deep-research", "env": "dev"}
+
+
+def test_sandbox_ref_distinguishes_pending_and_frozen_policy() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1")
+    assert _sandbox_ref(proto).frozen is False
+    proto.spec.frozen = True
+    pending = _sandbox_ref(proto)
+    assert pending.frozen is True
+    assert pending.status.frozen_policy is None
+    proto.status.frozen_policy.version = 3
+    proto.status.frozen_policy.policy_hash = "accepted-hash"
+    proto.status.frozen_policy.frozen_time.FromMilliseconds(600_000)
+    frozen = _sandbox_ref(proto).status.frozen_policy
+    assert frozen is not None
+    assert frozen.version == 3
+    assert frozen.policy_hash == "accepted-hash"
+    assert frozen.frozen_at_ms == 600_000
 
 
 def test_sandbox_ref_exposes_host_identity_and_accepts_legacy_response() -> None:

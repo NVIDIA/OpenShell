@@ -1780,6 +1780,55 @@ async fn sandbox_create_tolerates_an_unreachable_profile_catalog() {
 }
 
 #[tokio::test]
+async fn sandbox_create_rejects_gateway_that_ignores_frozen() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            // This server records the requested spec but returns no spec,
+            // matching a gateway that ignores the new frozen field.
+            let error = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("legacy-frozen"),
+                    frozen: true,
+                    command: &["/opt/agent".into()],
+                    ..test_config()
+                },
+                "default",
+                &test_tls(&server),
+            )
+            .await
+            .expect_err("an unsupported freeze must stop the client workflow");
+
+            let message = error.to_string();
+            assert!(message.contains("gateway did not honor --frozen"));
+            assert!(message.contains("openshell --workspace default sandbox delete legacy-frozen"));
+            assert!(
+                create_requests(&server).await[0]
+                    .spec
+                    .as_ref()
+                    .unwrap()
+                    .frozen
+            );
+            assert_eq!(
+                server
+                    .openshell
+                    .state
+                    .ssh_session_requests
+                    .load(Ordering::SeqCst),
+                0
+            );
+            assert!(deleted_names(&server).await.is_empty());
+            assert_eq!(load_last_sandbox("openshell", "default"), None);
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn sandbox_create_keeps_command_sessions_by_default() {
     let server = run_server().await;
     let fake_ssh_dir = helpers::tempdir().unwrap();

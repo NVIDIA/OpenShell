@@ -232,6 +232,7 @@ func TestSandboxTemplate_CreateSandboxFromTemplateResolvesWorkloadAndGovernance(
 		&types.SandboxSpec{
 			Providers: []string{"github"},
 			Policy:    policy,
+			Frozen:    true,
 		},
 		types.WithLabels(map[string]string{"team": "runtime"}),
 	)
@@ -248,6 +249,7 @@ func TestSandboxTemplate_CreateSandboxFromTemplateResolvesWorkloadAndGovernance(
 	require.NotNil(t, created.Spec.GPUCount)
 	assert.Equal(t, uint32(1), *created.Spec.GPUCount)
 	assert.Equal(t, []string{"github"}, created.Spec.Providers)
+	assert.True(t, created.Spec.Frozen)
 	require.NotNil(t, created.Spec.Policy)
 	assert.Equal(t, uint32(1), created.Spec.Policy.Version)
 	require.NotNil(t, created.CreatedFromWorkloadTemplate)

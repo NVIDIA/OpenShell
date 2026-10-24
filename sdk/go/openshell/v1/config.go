@@ -56,6 +56,7 @@ const (
 	PolicySourceUnspecified = types.PolicySourceUnspecified
 	PolicySourceSandbox     = types.PolicySourceSandbox
 	PolicySourceGlobal      = types.PolicySourceGlobal
+	PolicySourceFrozen      = types.PolicySourceFrozen
 )
 
 // ConfigInterface defines operations for reading and updating gateway and

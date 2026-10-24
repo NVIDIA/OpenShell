@@ -228,6 +228,11 @@ func copyAnyValue(v any) any {
 }
 
 func copySandboxStatus(s types.SandboxStatus) types.SandboxStatus {
+	if s.FrozenPolicy != nil {
+		frozen := *s.FrozenPolicy
+		frozen.Policy = copySandboxPolicy(frozen.Policy)
+		s.FrozenPolicy = &frozen
+	}
 	if s.Conditions != nil {
 		conds := make([]types.SandboxCondition, len(s.Conditions))
 		copy(conds, s.Conditions)
@@ -370,6 +375,7 @@ func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, nam
 	resolvedSpec := sandboxSpecFromWorkloadTemplate(template)
 	resolvedSpec.Providers = copyStringSlice(spec.Providers)
 	resolvedSpec.Policy = copySandboxPolicy(spec.Policy)
+	resolvedSpec.Frozen = spec.Frozen
 	resolvedSpec.Command = copyStringSlice(spec.Command)
 	resolvedSpec.TTY = spec.TTY
 

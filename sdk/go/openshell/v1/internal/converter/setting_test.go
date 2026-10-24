@@ -199,6 +199,7 @@ func TestPolicySourceFromProto(t *testing.T) {
 		{sbv1.PolicySource_POLICY_SOURCE_UNSPECIFIED, v1.PolicySourceUnspecified},
 		{sbv1.PolicySource_POLICY_SOURCE_SANDBOX, v1.PolicySourceSandbox},
 		{sbv1.PolicySource_POLICY_SOURCE_GLOBAL, v1.PolicySourceGlobal},
+		{sbv1.PolicySource_POLICY_SOURCE_FROZEN, v1.PolicySourceFrozen},
 		{sbv1.PolicySource(999), v1.PolicySource("")},
 	}
 	for _, tt := range tests {
@@ -538,6 +539,7 @@ func TestConfigUpdateResultFromProto(t *testing.T) {
 		SettingsRevision: 55,
 		Deleted:          true,
 		Annotations:      map[string]string{"sandbox_id": "sb-123"},
+		FrozenSandboxes:  []string{"default/frozen-agent"},
 	}
 
 	result := ConfigUpdateResultFromProto(resp)
@@ -549,6 +551,9 @@ func TestConfigUpdateResultFromProto(t *testing.T) {
 	assert.True(t, result.Deleted)
 	assert.Equal(t, map[string]string{"sandbox_id": "sb-123"}, result.Annotations)
 
+	assert.Equal(t, []string{"default/frozen-agent"}, result.FrozenSandboxes)
+	resp.FrozenSandboxes[0] = "changed"
+	assert.Equal(t, []string{"default/frozen-agent"}, result.FrozenSandboxes, "frozen sandbox names must be copied")
 	resp.Annotations["sandbox_id"] = "MUTATED"
 	assert.Equal(t, "sb-123", result.Annotations["sandbox_id"], "annotations must be deep copied")
 }

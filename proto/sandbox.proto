@@ -402,6 +402,8 @@ enum PolicySource {
   POLICY_SOURCE_UNSPECIFIED = 0;
   POLICY_SOURCE_SANDBOX = 1;
   POLICY_SOURCE_GLOBAL = 2;
+  // The gateway serves the durable first-accepted snapshot without recomposing.
+  POLICY_SOURCE_FROZEN = 3;
 }
 
 // Complete effective sandbox configuration delivered to a supervisor. Fields

@@ -258,6 +258,9 @@ async fn current_endpoint_context(
     state: &ServerState,
     sandbox: &Sandbox,
 ) -> Result<EndpointContext, Status> {
+    if super::frozen::snapshot(sandbox).is_some() {
+        return frozen_endpoint_context(state, sandbox).await;
+    }
     let workspace = sandbox.object_workspace();
     let catalog = state
         .provider_profile_sources
@@ -298,6 +301,9 @@ async fn endpoint_context_for_loaded_policy(
     sandbox: &Sandbox,
     version: i64,
 ) -> Result<EndpointContext, Status> {
+    if super::frozen::snapshot(sandbox).is_some() {
+        return frozen_endpoint_context(state, sandbox).await;
+    }
     let workspace = sandbox.object_workspace();
     let catalog = state
         .provider_profile_sources
@@ -313,6 +319,25 @@ async fn endpoint_context_for_loaded_policy(
         global_policy.as_ref(),
     )
     .await
+}
+
+async fn frozen_endpoint_context(
+    state: &ServerState,
+    sandbox: &Sandbox,
+) -> Result<EndpointContext, Status> {
+    let snapshot = super::frozen::snapshot(sandbox).expect("frozen snapshot checked by caller");
+    let policy = super::frozen::policy(snapshot)?;
+    let providers = super::frozen::provider_context(state, sandbox).await?;
+    let bindings = policy_static_credential_endpoint_bindings(Some(&policy))?;
+    let provider_env_revision = providers.revision(
+        &bindings,
+        super::frozen::uses_global_policy(sandbox, PolicySource::Frozen).then_some(&policy),
+    )?;
+    Ok(EndpointContext {
+        policy_hash: snapshot.policy_hash.clone(),
+        provider_env_revision,
+        endpoints: expected_endpoint_statuses(&policy),
+    })
 }
 
 async fn endpoint_context_for_loaded_policy_with_inputs(
@@ -993,6 +1018,16 @@ pub(super) async fn endpoint_status_reset_for_loaded_policy(
     sandbox: &Sandbox,
     version: i64,
 ) -> Result<Option<BTreeMap<String, EndpointStatus>>, Status> {
+    let current_version = i64::from(sandbox.current_policy_version());
+    if super::frozen::snapshot(sandbox).is_some() {
+        // Every acknowledged revision of an initialized frozen sandbox resolves
+        // to the captured authorization. Never consult today's profile source
+        // or global override when replacing its supervisor.
+        let context = frozen_endpoint_context(state, sandbox).await?;
+        let same_configuration =
+            current_version != 0 || endpoint_cursor_matches_context(state, sandbox, &context);
+        return Ok((!same_configuration).then(|| unknown_endpoint_reports(&context.endpoints)));
+    }
     // Both policy versions must use one provider/profile and global-policy view;
     // an external catalog can change between independent snapshot requests.
     let catalog = state
@@ -1009,7 +1044,6 @@ pub(super) async fn endpoint_status_reset_for_loaded_policy(
         global_policy.as_ref(),
     )
     .await?;
-    let current_version = i64::from(sandbox.current_policy_version());
     let same_configuration = if current_version == version {
         // An acknowledgement can be retried after endpoint reports have already
         // committed. Repeating activation must not erase their accepted evidence.
@@ -1031,20 +1065,28 @@ pub(super) async fn endpoint_status_reset_for_loaded_policy(
         // The first endpoint report and load acknowledgement travel independently.
         // Only the current session's accepted report proves which configuration
         // produced evidence before any loaded policy version has been recorded.
-        state
-            .supervisor_sessions
-            .current_session_id(sandbox.object_id())
-            .and_then(|session_id| {
-                state
-                    .supervisor_sessions
-                    .endpoint_report_cursor(sandbox.object_id(), &session_id)
-            })
-            .is_some_and(|cursor| {
-                cursor.policy_hash == context.policy_hash
-                    && cursor.provider_env_revision == context.provider_env_revision
-            })
+        endpoint_cursor_matches_context(state, sandbox, &context)
     };
     Ok((!same_configuration).then(|| unknown_endpoint_reports(&context.endpoints)))
+}
+
+fn endpoint_cursor_matches_context(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    context: &EndpointContext,
+) -> bool {
+    state
+        .supervisor_sessions
+        .current_session_id(sandbox.object_id())
+        .and_then(|session_id| {
+            state
+                .supervisor_sessions
+                .endpoint_report_cursor(sandbox.object_id(), &session_id)
+        })
+        .is_some_and(|cursor| {
+            cursor.policy_hash == context.policy_hash
+                && cursor.provider_env_revision == context.provider_env_revision
+        })
 }
 
 /// Clear all supervised network evidence without changing lifecycle state.

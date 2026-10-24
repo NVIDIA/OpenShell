@@ -462,6 +462,15 @@ class SandboxConditionRef:
 
 
 @dataclass(frozen=True)
+class FrozenSandboxPolicyRef:
+    """Accepted immutable policy identity from the gateway."""
+
+    version: int
+    policy_hash: str
+    frozen_at_ms: int | None = None
+
+
+@dataclass(frozen=True)
 class SandboxStatusRef:
     phase: int
     current_policy_version: int
@@ -470,6 +479,7 @@ class SandboxStatusRef:
     next_restart_at_ms: int | None = None
     main_process_started_at_ms: int | None = None
     conditions: tuple[SandboxConditionRef, ...] = ()
+    frozen_policy: FrozenSandboxPolicyRef | None = None
 
 
 class ServiceAuthorizationMode(IntEnum):
@@ -535,6 +545,8 @@ class SandboxRef:
     )
     # Stable SSH host identity; absent on older runtimes.
     host_key_fingerprint: str | None = None
+    # True while a freeze is pending and after it has initialized successfully.
+    frozen: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "labels", _ImmutableLabels(self.labels))
@@ -856,19 +868,23 @@ class SandboxClient:
         service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
-        response = self._stub.CreateSandbox(
-            openshell_pb2.CreateSandboxRequest(
-                workspace_scope=_workspace_scope(workspace),
-                spec=request_spec,
-                name=name or "",
-                labels=dict(labels) if labels else {},
-                service_exposures=_service_exposure_messages(service_exposures),
-            ),
-            timeout=self._timeout,
+        request = openshell_pb2.CreateSandboxRequest(
+            workspace_scope=_workspace_scope(workspace),
+            spec=request_spec,
+            name=name or "",
+            labels=dict(labels) if labels else {},
+            service_exposures=_service_exposure_messages(service_exposures),
         )
+        response = self._stub.CreateSandbox(request, timeout=self._timeout)
         sandbox_ref = _sandbox_ref(response.sandbox, response.service_urls)
         if sandbox_ref.id == "":
             raise SandboxError("CreateSandbox returned empty sandbox id")
+        if request.spec.frozen and not sandbox_ref.frozen:
+            raise SandboxError(
+                "gateway did not honor frozen=True for sandbox "
+                f"'{sandbox_ref.name}' (ID '{sandbox_ref.id}', workspace '{workspace}'); "
+                "it may already be running. Upgrade the gateway and remove the sandbox before retrying"
+            )
         return sandbox_ref
 
     def create_from_template(
@@ -884,20 +900,24 @@ class SandboxClient:
         if not workload_template.strip():
             raise SandboxError("workload_template is required")
         request_spec = spec if spec is not None else openshell_pb2.SandboxSpec()
-        response = self._stub.CreateSandbox(
-            openshell_pb2.CreateSandboxRequest(
-                workspace_scope=_workspace_scope(workspace),
-                spec=request_spec,
-                name=name or "",
-                labels=dict(labels) if labels else {},
-                workload_template=workload_template,
-                service_exposures=_service_exposure_messages(service_exposures),
-            ),
-            timeout=self._timeout,
+        request = openshell_pb2.CreateSandboxRequest(
+            workspace_scope=_workspace_scope(workspace),
+            spec=request_spec,
+            name=name or "",
+            labels=dict(labels) if labels else {},
+            workload_template=workload_template,
+            service_exposures=_service_exposure_messages(service_exposures),
         )
+        response = self._stub.CreateSandbox(request, timeout=self._timeout)
         sandbox_ref = _sandbox_ref(response.sandbox, response.service_urls)
         if sandbox_ref.id == "":
             raise SandboxError("CreateSandbox returned empty sandbox id")
+        if request.spec.frozen and not sandbox_ref.frozen:
+            raise SandboxError(
+                "gateway did not honor frozen=True for sandbox "
+                f"'{sandbox_ref.name}' (ID '{sandbox_ref.id}', workspace '{workspace}'); "
+                "it may already be running. Upgrade the gateway and remove the sandbox before retrying"
+            )
         return sandbox_ref
 
     def create_session(
@@ -1847,7 +1867,17 @@ def _sandbox_ref(
             if status is not None and status.HasField("main_process_started_time")
             else None,
             conditions=_sandbox_conditions(status),
+            frozen_policy=FrozenSandboxPolicyRef(
+                version=status.frozen_policy.version,
+                policy_hash=status.frozen_policy.policy_hash,
+                frozen_at_ms=status.frozen_policy.frozen_time.ToMilliseconds()
+                if status.frozen_policy.HasField("frozen_time")
+                else None,
+            )
+            if status is not None and status.HasField("frozen_policy")
+            else None,
         ),
+        frozen=sandbox.spec.frozen if sandbox.HasField("spec") else False,
         labels=sandbox.metadata.labels if sandbox.metadata else {},
         created_from_workload_template=provenance,
         service_urls=service_urls or {},

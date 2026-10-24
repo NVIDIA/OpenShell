@@ -49,6 +49,7 @@ struct MockState {
     last_get_name: Mutex<Option<String>>,
     last_get_workspace: Mutex<Option<String>>,
     last_create: Mutex<Option<proto::CreateSandboxRequest>>,
+    create_response_spec: Option<proto::SandboxSpec>,
     last_template_create: Mutex<Option<proto::CreateSandboxTemplateRequest>>,
     last_template_get: Mutex<Option<proto::GetSandboxTemplateRequest>>,
     last_template_list: Mutex<Option<proto::ListSandboxTemplatesRequest>>,
@@ -358,9 +359,15 @@ impl OpenShell for TestOpenShell {
                 )
             })
             .collect();
+        let mut sandbox = sandbox_with_phase_ws(
+            &name,
+            proto::SandboxPhase::Provisioning,
+            selected_workspace(&req.workspace_scope).unwrap_or("default"),
+        );
+        sandbox.spec = self.state.create_response_spec.clone();
         *self.state.last_create.lock().await = Some(req);
         Ok(Response::new(proto::SandboxResponse {
-            sandbox: Some(sandbox_with_phase(&name, proto::SandboxPhase::Provisioning)),
+            sandbox: Some(sandbox),
             service_urls,
         }))
     }
@@ -2410,5 +2417,77 @@ async fn watch_logs_addresses_the_sandbox_by_canonical_name() {
             selected_workspace(&reqs[0].workspace_scope),
             Some(workspace)
         );
+    }
+}
+
+#[tokio::test]
+async fn frozen_create_requires_gateway_acknowledgement() {
+    for echoed in [None, Some(false), Some(true)] {
+        let state = Arc::new(MockState {
+            create_response_spec: echoed.map(|frozen| proto::SandboxSpec {
+                frozen,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let endpoint = start_mock(state.clone()).await;
+        let client = connect(&endpoint).await;
+        let policy = proto::SandboxPolicy {
+            version: 1,
+            ..Default::default()
+        };
+        for (workspace, template) in [
+            ("default", false),
+            ("default", true),
+            ("staging", false),
+            ("staging", true),
+        ] {
+            let spec = SandboxSpec {
+                name: Some("created-frozen".into()),
+                frozen: true,
+                policy: Some(policy.clone()),
+                ..Default::default()
+            };
+            let template_spec = SandboxTemplateCreateSpec {
+                name: Some("created-frozen".into()),
+                template_name: "agent".into(),
+                frozen: true,
+                policy: Some(policy.clone()),
+                ..Default::default()
+            };
+            let result = match (workspace, template) {
+                ("default", false) => client.create_sandbox(spec).await,
+                ("default", true) => client.create_sandbox_from_template(template_spec).await,
+                (_, false) => client.workspace(workspace).create_sandbox(spec).await,
+                (_, true) => {
+                    client
+                        .workspace(workspace)
+                        .create_sandbox_from_template(template_spec)
+                        .await
+                }
+            };
+            if echoed == Some(true) {
+                let sandbox = result.expect("an acknowledged freeze may still be pending");
+                assert!(sandbox.frozen);
+                assert!(sandbox.frozen_policy.is_none());
+            } else {
+                let error = result.expect_err("ignored freezing must fail the create operation");
+                assert_eq!(error.code(), "invalid_config");
+                let message = error.to_string();
+                assert!(message.contains("gateway did not honor frozen=true"));
+                assert!(message.contains("created-frozen"));
+                assert!(message.contains("id-created-frozen"));
+                assert!(message.contains(workspace));
+            }
+            let request = state.last_create.lock().await.clone().unwrap();
+            let requested = request.spec.unwrap();
+            assert!(requested.frozen);
+            assert_eq!(requested.policy.as_ref(), Some(&policy));
+            assert_eq!(
+                selected_workspace(&request.workspace_scope),
+                Some(workspace)
+            );
+            assert!(state.last_delete_name.lock().await.is_none());
+        }
     }
 }

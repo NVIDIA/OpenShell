@@ -276,6 +276,10 @@ pub struct SandboxSpec {
     pub environment: HashMap<String, String>,
     /// Provider names to attach.
     pub providers: Vec<String>,
+    /// Initial security policy. Omit to use the image's policy.
+    pub policy: Option<proto::SandboxPolicy>,
+    /// Freeze the effective policy after initialization for the sandbox's lifetime.
+    pub frozen: bool,
     /// Request a GPU. Driver-specific device selection is configured via
     /// driver config on the raw proto surface (see [`crate::raw`]).
     pub gpu: bool,
@@ -339,6 +343,8 @@ pub struct SandboxTemplateCreateSpec {
     /// Create-time sandbox policy. The named workload template supplies runtime
     /// workload fields; policy remains part of the sandbox's governance spec.
     pub policy: Option<proto::SandboxPolicy>,
+    /// Freeze the effective policy after initialization for the sandbox's lifetime.
+    pub frozen: bool,
 }
 
 /// Reusable sandbox workload template resource.
@@ -381,6 +387,9 @@ pub struct SandboxRef {
     pub name: String,
     pub workspace: String,
     pub phase: SandboxPhase,
+    /// Whether freezing was requested; `frozen_policy` is absent until initialization succeeds.
+    pub frozen: bool,
+    pub frozen_policy: Option<FrozenSandboxPolicy>,
     pub labels: HashMap<String, String>,
     pub resource_version: u64,
     pub exit_code: Option<i32>,
@@ -393,6 +402,15 @@ pub struct SandboxRef {
     pub restart_count: u32,
     pub next_restart_at_ms: Option<i64>,
     pub main_process_started_at_ms: Option<i64>,
+}
+
+/// Accepted immutable policy identity. Read the policy body through sandbox configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct FrozenSandboxPolicy {
+    pub version: u32,
+    pub policy_hash: String,
+    pub frozen_at_ms: Option<i64>,
 }
 
 /// Reusable workload template revision used to create a sandbox.
@@ -430,12 +448,27 @@ impl SandboxRef {
                         .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok()),
                 )
             });
+        let frozen = sandbox.spec.as_ref().is_some_and(|spec| spec.frozen);
+        let frozen_policy = sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.frozen_policy.as_ref())
+            .map(|policy| FrozenSandboxPolicy {
+                version: policy.version,
+                policy_hash: policy.policy_hash.clone(),
+                frozen_at_ms: policy
+                    .frozen_time
+                    .as_ref()
+                    .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok()),
+            });
         let meta = sandbox.metadata.unwrap_or_default();
         Self {
             id: meta.id,
             name: meta.name,
             workspace: meta.workspace,
             phase,
+            frozen,
+            frozen_policy,
             labels: meta.labels,
             resource_version: meta.resource_version,
             exit_code,
@@ -515,4 +548,32 @@ pub struct ExecResult {
     pub exit_code: i32,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+
+#[test]
+fn sandbox_ref_distinguishes_pending_and_frozen_policy() {
+    let mut sandbox = proto::Sandbox {
+        spec: Some(proto::SandboxSpec {
+            frozen: true,
+            ..Default::default()
+        }),
+        status: Some(proto::SandboxStatus::default()),
+        ..Default::default()
+    };
+    let pending = SandboxRef::from_proto(sandbox.clone());
+    assert!(pending.frozen);
+    assert!(pending.frozen_policy.is_none());
+    sandbox.status.as_mut().unwrap().frozen_policy = Some(
+        proto::FrozenSandboxPolicy {
+            version: 3,
+            policy_hash: "accepted-hash".into(),
+            frozen_time: openshell_core::time::timestamp_from_millis(600_000).ok(),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let frozen = SandboxRef::from_proto(sandbox).frozen_policy.unwrap();
+    assert_eq!(frozen.version, 3);
+    assert_eq!(frozen.policy_hash, "accepted-hash");
+    assert_eq!(frozen.frozen_at_ms, Some(600_000));
 }

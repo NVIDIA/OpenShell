@@ -156,12 +156,15 @@ mod tests {
     // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
     // closures and TokenGrantStatus to public reports. Older rows have no grant
     // record; absent report extensions retain compatibility without a rewrite.
+    // Frozen creation defaults to false in legacy specs, with no status snapshot.
+    // Captured effective policy/provider authorization is durable; no secrets
+    // or credential handles are added to the persisted sandbox snapshot.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "a91e2244a2c1a8e369efe85bd0e4f2769f0f29f6263137280fe38e8a8da3cc6e";
+        "ea6706c72c7f342d76058912fafc8ac0b417794fec54a95aac34478c3f3c1313";
     const DURABLE_SCHEMA_SHA256: &str =
-        "d4dc7abdb91b919db1f7be0d4652e30cbfda86f3b2ed9b59d5de1f76a2bf691d";
+        "be37396a265cf0fe478fcd6247092562c39bb59ee897e497c845d63cce96f156";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "ac1ffc4b5b81467de27270a4e33f6db1e31eeb2c52f79750dbaaf19515eadbb2";
+        "4f42365b9bb44c83410d79d23a10ff3ce09c7863336ce044c737eb7359769090";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -695,9 +698,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (328, 29),
-                (95, 22),
-                (83, 22),
+                (332, 29),
+                (99, 22),
+                (87, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -740,6 +743,7 @@ mod tests {
         assert_eq!(spec.providers, ["synthetic-provider"]);
         assert_eq!(spec.command, ["echo"]);
         assert!(spec.provider_attachment_epoch.is_empty());
+        assert!(!spec.frozen);
     }
 
     #[test]
@@ -755,6 +759,7 @@ mod tests {
         assert!(status.configuration_admission.is_none());
         assert_eq!(status.configuration_activated, None);
         assert!(status.provisioning.is_none());
+        assert!(status.frozen_policy.is_none());
         assert!(!crate::policy_store::permits_initial_static_policy_repair(
             &sandbox
         ));

@@ -503,6 +503,7 @@ async fn handle_create_sandbox_inner(
         resolved.command = governance_spec.command;
         resolved.tty = governance_spec.tty;
         resolved.restart_policy = governance_spec.restart_policy;
+        resolved.frozen = governance_spec.frozen;
         (resolved, Some(provenance))
     };
 
@@ -1413,6 +1414,7 @@ pub(super) async fn handle_attach_sandbox_provider(
                 err
             }
         })?;
+    super::policy::frozen::ensure_mutable_by_id(state.store.as_ref(), sandbox.object_id()).await?;
     let sandbox_name = sandbox.object_name().to_string();
     let sandbox_id = sandbox
         .metadata
@@ -1585,6 +1587,7 @@ pub(super) async fn handle_detach_sandbox_provider(
         .await
         .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
     let sandbox_name = sandbox.object_name().to_string();
+    super::policy::frozen::ensure_mutable_by_id(state.store.as_ref(), sandbox.object_id()).await?;
     let sandbox_id = sandbox
         .metadata
         .as_ref()
@@ -8451,7 +8454,14 @@ mod tests {
     fn template_create_sandbox_spec_field_policy_is_exhaustive() {
         assert_proto_fields_classified(
             "openshell.v1.SandboxSpec",
-            &["policy", "providers", "command", "tty", "restart_policy"],
+            &[
+                "policy",
+                "providers",
+                "command",
+                "tty",
+                "restart_policy",
+                "frozen",
+            ],
             &[
                 "log_level",
                 "environment",

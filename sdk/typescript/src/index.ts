@@ -19,6 +19,7 @@ export type {
   ExecStreamEvent,
   ForwardHandle,
   ForwardOptions,
+  FrozenSandboxPolicy,
   Health,
   HealthStatus,
   ListOptions,

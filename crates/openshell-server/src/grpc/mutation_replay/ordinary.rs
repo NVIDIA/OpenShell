@@ -188,6 +188,8 @@ pub(in crate::grpc) enum Outcome {
         settings_revision: u64,
         deleted: bool,
         annotations: HashMap<String, String>,
+        #[serde(default)]
+        frozen_sandboxes: Vec<String>,
     },
     Policy {
         sandbox_id: String,
@@ -913,6 +915,7 @@ mutation!(
             settings_revision: value.settings_revision,
             deleted: value.deleted,
             annotations: value.annotations.clone(),
+            frozen_sandboxes: value.frozen_sandboxes.clone(),
         })
     },
     async |store: &Store, outcome: Outcome| {
@@ -923,6 +926,7 @@ mutation!(
             settings_revision,
             deleted,
             annotations,
+            frozen_sandboxes,
         } = outcome
         else {
             return Err(replay_unavailable());
@@ -936,6 +940,7 @@ mutation!(
             settings_revision,
             deleted,
             annotations,
+            frozen_sandboxes,
         })
     }
 );

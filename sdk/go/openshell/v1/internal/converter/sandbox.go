@@ -56,6 +56,7 @@ func SandboxFromProto(s *pb.Sandbox) *types.Sandbox {
 
 func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 	result := types.SandboxSpec{
+		Frozen:        spec.GetFrozen(),
 		LogLevel:      spec.GetLogLevel(),
 		Environment:   CopyStringMap(spec.GetEnvironment()),
 		Providers:     CopyStringSlice(spec.GetProviders()),
@@ -130,6 +131,16 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			DestinationHost: observation.GetDestinationHost(),
 			DestinationPort: observation.GetDestinationPort(),
 			Failure:         endpointFailureFromProto(observation.GetFailure()),
+		}
+	}
+	if frozen := status.GetFrozenPolicy(); frozen != nil {
+		result.FrozenPolicy = &types.FrozenSandboxPolicy{
+			Policy:              SandboxPolicyFromProto(frozen.GetPolicy()),
+			Version:             frozen.GetVersion(),
+			PolicyHash:          frozen.GetPolicyHash(),
+			FrozenAt:            TimeFromProto(frozen.GetFrozenTime()),
+			PolicySource:        PolicySourceFromProto(frozen.GetPolicySource()),
+			GlobalPolicyVersion: frozen.GetGlobalPolicyVersion(),
 		}
 	}
 	result.ExitCode = CopyInt32Ptr(status.ExitCode)
@@ -287,6 +298,7 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 	}
 
 	result := &pb.SandboxSpec{
+		Frozen:      spec.Frozen,
 		LogLevel:    spec.LogLevel,
 		Environment: CopyStringMap(spec.Environment),
 		Providers:   CopyStringSlice(spec.Providers),

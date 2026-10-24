@@ -50,10 +50,11 @@ pub use error::SdkError;
 pub use pagination::{Page, Pager};
 pub use refresh::{Refresh, RefreshError, RefreshedToken, TokenSource};
 pub use types::{
-    DeleteOptions, DeletionOutcome, DeletionResult, ExecOptions, ExecResult, Health, ListOptions,
-    LogLine, PlatformEvent, SandboxPhase, SandboxRef, SandboxResources, SandboxRestartPolicy,
-    SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplateCreateSpec,
-    SandboxTemplateListOptions, SandboxWorkloadConfig, SandboxWorkloadTemplate,
-    SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
-    ServiceExposure, ServiceStatus, WatchEvent, WatchOptions, WorkspaceRef,
+    DeleteOptions, DeletionOutcome, DeletionResult, ExecOptions, ExecResult, FrozenSandboxPolicy,
+    Health, ListOptions, LogLine, PlatformEvent, SandboxPhase, SandboxRef, SandboxResources,
+    SandboxRestartPolicy, SandboxServiceLevel, SandboxSpec, SandboxStartup,
+    SandboxTemplateCreateSpec, SandboxTemplateListOptions, SandboxWorkloadConfig,
+    SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec,
+    ServiceAuthorizationMode, ServiceExposure, ServiceStatus, WatchEvent, WatchOptions,
+    WorkspaceRef,
 };
