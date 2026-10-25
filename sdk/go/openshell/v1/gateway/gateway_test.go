@@ -387,11 +387,27 @@ func TestNewClient_ActiveGateway(t *testing.T) {
 func TestNewClient_NoActiveGateway(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv(systemGatewayDirEnv, t.TempDir())
 	require.NoError(t, os.MkdirAll(filepath.Join(tmp, "openshell"), 0o755))
 
 	_, err := NewClient("")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrNoActiveGateway)
+}
+
+func TestLoadConfig_SystemActiveGateway(t *testing.T) {
+	user, system := t.TempDir(), t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", user)
+	t.Setenv(systemGatewayDirEnv, system)
+	writeFile(t, system, "active_gateway", "corp")
+	gwDir := filepath.Join(system, "gateways", "corp")
+	require.NoError(t, os.MkdirAll(gwDir, 0o755))
+	writeFile(t, gwDir, "metadata.json", `{"gateway_endpoint":"host:443"}`)
+
+	cfg, err := LoadConfig("")
+	require.NoError(t, err)
+	assert.Equal(t, "corp", cfg.Name)
+	assert.Equal(t, SourceSystem, cfg.Source)
 }
 
 func TestLoadConfig_ActiveGateway(t *testing.T) {
