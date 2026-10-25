@@ -489,6 +489,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_member_remediation_handles_hyphen_leading_subject() {
+        // OIDC subjects are opaque strings and can start with '-'. The hint is
+        // meant to be copied verbatim, so the quoted value must stay intact and
+        // parse as one --subject value on the CLI side.
+        let store = test_store().await;
+        let principal = user_principal("-oAbC123", &["openshell-user"]);
+        let result = authorize_workspace(
+            &store,
+            "openshell-admin",
+            &principal,
+            "default",
+            MinWorkspaceRole::User,
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains(
+            "openshell workspace member add --workspace 'default' --subject '-oAbC123' --role user"
+        ));
+    }
+
+    #[tokio::test]
     async fn anonymous_principal_rejected() {
         let store = test_store().await;
         let result = authorize_workspace(

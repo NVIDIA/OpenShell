@@ -2545,7 +2545,7 @@ enum WorkspaceMemberCommands {
         workspace: String,
 
         /// OIDC subject claim identifying the principal.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         subject: String,
 
         /// Role to assign (user or admin).
@@ -2561,7 +2561,7 @@ enum WorkspaceMemberCommands {
         workspace: String,
 
         /// OIDC subject claim identifying the principal.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         subject: String,
     },
 
@@ -5446,6 +5446,60 @@ mod tests {
                 })),
             })
         ));
+    }
+
+    #[test]
+    fn workspace_member_parses_hyphen_leading_subject() {
+        // OIDC subjects are opaque strings and can start with '-'. The remediation
+        // hint printed by the server quotes them (`--subject '-…'`), so that form
+        // must parse verbatim instead of failing with "unexpected argument".
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "workspace",
+            "member",
+            "add",
+            "--workspace",
+            "default",
+            "--subject",
+            "-oAbC123",
+            "--role",
+            "user",
+        ])
+        .expect("hyphen-leading subject should parse on add");
+        let Some(Commands::Workspace {
+            command:
+                Some(WorkspaceCommands::Member(WorkspaceMemberCommands::Add {
+                    workspace,
+                    subject,
+                    role,
+                })),
+        }) = cli.command
+        else {
+            panic!("expected workspace member add");
+        };
+        assert_eq!(workspace, "default");
+        assert_eq!(subject, "-oAbC123");
+        assert_eq!(role, "user");
+
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "workspace",
+            "member",
+            "remove",
+            "--workspace",
+            "default",
+            "--subject",
+            "-oAbC123",
+        ])
+        .expect("hyphen-leading subject should parse on remove");
+        let Some(Commands::Workspace {
+            command:
+                Some(WorkspaceCommands::Member(WorkspaceMemberCommands::Remove { subject, .. })),
+        }) = cli.command
+        else {
+            panic!("expected workspace member remove");
+        };
+        assert_eq!(subject, "-oAbC123");
     }
 
     #[test]
