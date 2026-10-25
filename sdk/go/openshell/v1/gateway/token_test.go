@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -83,41 +84,37 @@ func TestReadEdgeToken_EmptyFallbackFile(t *testing.T) {
 	assert.Contains(t, err.Error(), "empty")
 }
 
-func TestEdgeTokenLoader_Lazy(t *testing.T) {
+func TestLazyEdgeAuth_ReloadsRewrittenToken(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, dir, edgeTokenFile, "lazy-token")
+	writeFile(t, dir, edgeTokenFile, "old-token")
 
-	loader := &edgeTokenLoader{dir: dir}
+	auth := &lazyEdgeAuth{dir: dir}
 
-	// First call reads from disk.
-	token1, err := loader.load()
+	md, err := auth.GetRequestMetadata(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, "lazy-token", token1)
+	assert.Equal(t, "Bearer old-token", md["authorization"])
 
-	// Remove the file. Second call should return cached value.
-	require.NoError(t, os.Remove(filepath.Join(dir, edgeTokenFile)))
+	writeFile(t, dir, edgeTokenFile, "new-token")
 
-	token2, err := loader.load()
+	md, err = auth.GetRequestMetadata(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, "lazy-token", token2, "should return cached token")
+	assert.Equal(t, "Bearer new-token", md["authorization"])
 }
 
-func TestEdgeTokenLoader_LazyError(t *testing.T) {
+func TestLazyEdgeAuth_PicksUpLateToken(t *testing.T) {
 	dir := t.TempDir()
 	// No token files exist.
 
-	loader := &edgeTokenLoader{dir: dir}
+	auth := &lazyEdgeAuth{dir: dir}
 
-	// First call fails.
-	_, err1 := loader.load()
-	require.Error(t, err1)
+	_, err := auth.GetRequestMetadata(context.Background())
+	require.ErrorIs(t, err, ErrTokenLoad)
 
-	// Write the file now. A transient load failure must not be cached.
 	writeFile(t, dir, edgeTokenFile, "late-token")
 
-	token, err2 := loader.load()
-	require.NoError(t, err2)
-	assert.Equal(t, "late-token", token)
+	md, err := auth.GetRequestMetadata(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer late-token", md["authorization"])
 }
 
 // --- T015: diskTokenSource tests ---
