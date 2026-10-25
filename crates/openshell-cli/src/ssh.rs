@@ -1406,6 +1406,23 @@ fn validate_sandbox_source_path(workspace_root: &str, path: &str) -> Result<Stri
     Ok(cleaned)
 }
 
+/// Build the one-shot SSH probe that discovers the workspace root and resolves
+/// `path` to a canonical absolute path.
+///
+/// The probe must stay POSIX-compatible: `realpath -e --` is GNU-only, and
+/// busybox `realpath` treats `-e` and `--` as filenames (printing errors and
+/// exiting 1), which breaks `sandbox download` on Alpine-based images. The
+/// portable form is `test -e` plus bare `realpath`; because `--` is gone,
+/// relative paths get a `./` prefix so a leading-dash name cannot be parsed as
+/// an option.
+fn sandbox_source_resolve_command(path: &str) -> String {
+    format!(
+        "p={path} && case \"$p\" in /*) ;; *) p=\"./$p\" ;; esac; \
+         pwd -P && test -e \"$p\" && realpath \"$p\"",
+        path = shell_escape(path)
+    )
+}
+
 /// Discover the workspace root and resolve every symlink in `sandbox_path` in
 /// one SSH probe, then refuse the result if it lands outside the workspace.
 ///
@@ -1420,10 +1437,7 @@ async fn resolve_sandbox_source_path(
     session: &SshSessionConfig,
     sandbox_path: &str,
 ) -> Result<String> {
-    let resolve_cmd = format!(
-        "pwd -P && realpath -e -- {path}",
-        path = shell_escape(sandbox_path)
-    );
+    let resolve_cmd = sandbox_source_resolve_command(sandbox_path);
     let output = ssh_run_capture_stdout(session, &resolve_cmd)
         .await
         .wrap_err_with(|| format!("failed to resolve sandbox source path '{sandbox_path}'"))?;
@@ -3882,5 +3896,60 @@ mod tests {
         assert_eq!(split_sandbox_path("/.bashrc"), ("/", ".bashrc"));
         // No directory component at all
         assert_eq!(split_sandbox_path("file.txt"), (".", "file.txt"));
+    }
+
+    #[test]
+    fn sandbox_source_resolve_probe_is_posix_and_resolves_symlinks() {
+        // The probe must work with a POSIX /bin/sh and a minimal `realpath`
+        // (busybox treats `realpath -e --` as filenames and exits 1, which
+        // broke `sandbox download` on Alpine images), so run the exact command
+        // under sh and assert its two-line output contract.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("real")).unwrap();
+        fs::write(dir.path().join("real/probe.txt"), b"hello").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+        fs::write(dir.path().join("-dash.txt"), b"dash").unwrap();
+        fs::write(dir.path().join("with space.txt"), b"space").unwrap();
+
+        let run = |path: &str| {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(sandbox_source_resolve_command(path))
+                .current_dir(dir.path())
+                .output()
+                .expect("probe should run under sh");
+            (
+                output.status.success(),
+                String::from_utf8(output.stdout).expect("probe output is UTF-8"),
+            )
+        };
+
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let root = root.to_str().unwrap();
+
+        // Absolute and relative paths through a symlink resolve every hop.
+        let expected = format!("{root}\n{root}/real/probe.txt\n");
+        let (ok, out) = run(&format!("{root}/link/probe.txt"));
+        assert!(ok);
+        assert_eq!(out, expected);
+        let (ok, out) = run("link/probe.txt");
+        assert!(ok);
+        assert_eq!(out, expected);
+
+        // Without `--`, a relative path starting with '-' must not be parsed
+        // as an option.
+        let (ok, out) = run("-dash.txt");
+        assert!(ok);
+        assert_eq!(out, format!("{root}\n{root}/-dash.txt\n"));
+
+        // Names with spaces survive quoting.
+        let (ok, out) = run("with space.txt");
+        assert!(ok);
+        assert_eq!(out, format!("{root}\n{root}/with space.txt\n"));
+
+        // Missing path keeps the historical failure: non-zero exit, root only.
+        let (ok, out) = run("missing.txt");
+        assert!(!ok);
+        assert_eq!(out, format!("{root}\n"));
     }
 }
