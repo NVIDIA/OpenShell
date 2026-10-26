@@ -170,6 +170,53 @@ Project requirements:
 - Python 3.11+
 - Docker (running)
 
+### Nix setup
+
+The `nix develop` shell and `nix run .#…` apps, such as tmachine and the test
+guests, need Nix with flakes. Install
+[Determinate Nix](https://docs.determinate.systems/), which CI also uses and
+which enables flakes by default:
+
+```shell
+curl -fsSL https://install.determinate.systems/nix | sh -s -- install
+```
+
+Other installers work if you enable the `nix-command` and `flakes` experimental
+features and Nix can find a CA certificate bundle.
+
+Configure the OpenShell binary cache once per machine. Without it, Nix builds
+the cross-compilation toolchains from source, which can take hours. Append the
+cache settings to `/etc/nix/nix.custom.conf` and restart the Nix daemon. With
+other installers, use `/etc/nix/nix.conf` instead.
+
+```shell
+printf '%s\n' \
+  'extra-substituters = https://openshell.cachix.org' \
+  'extra-trusted-public-keys = openshell.cachix.org-1:OAr5MunsfH5PZvUsfD08OtGx5RtcwdNZGJdU5FqLm5w=' \
+  | sudo tee -a /etc/nix/nix.custom.conf
+
+# macOS with Determinate Nix
+sudo launchctl kickstart -k system/systems.determinate.nix-daemon
+
+# Linux with systemd
+sudo systemctl restart nix-daemon
+```
+
+The repository's `flake.nix` declares the same cache, but the Nix daemon
+ignores flake-supplied substituters unless the user is in `trusted-users`.
+Configure the cache system-wide instead of adding yourself to `trusted-users`,
+which effectively grants root access through the daemon. Nix still prints `ignoring untrusted flake
+configuration setting` warnings; they are harmless once the cache is
+configured.
+
+Confirm that the cache is active:
+
+```shell
+nix config show substituters
+```
+
+The output must include `https://openshell.cachix.org`.
+
 ### Z3 installation
 
 The `openshell-prover` crate and standalone `openshell-prover-cli` binary link

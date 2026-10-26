@@ -341,6 +341,9 @@ Run the Podman-backed Rust CLI e2e suite:
 mise run e2e:podman
 ```
 
+The `nix run` commands below need the local Nix setup in
+[CONTRIBUTING.md](CONTRIBUTING.md#nix-setup).
+
 `nix run .#build-artifacts` also builds
 `artifacts/packages/openshell.deb` for tmachine's `deb` installer, targeting the
 host's Linux architecture (`arm64` or `amd64`). Set `OPENSHELL_DEB_VERSION` to
