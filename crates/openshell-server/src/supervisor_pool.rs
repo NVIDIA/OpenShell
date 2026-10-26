@@ -2591,7 +2591,7 @@ impl SupervisorPool {
                         from = %record.payload.member_id,
                         to = %intent.payload.member_id,
                         term = intent.payload.auth_epoch,
-                        cause,
+                        cause = %cause,
                         "taking over a shared sandbox instance from a failed supervisor"
                     );
                     return self.complete_takeover(*intent).await;
