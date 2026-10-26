@@ -199,8 +199,37 @@ def _eligible_reviewers(repository: str, logins: set[str]) -> set[str]:
 
 
 def _accepted_work(repository: str, number: int, pr: dict) -> bool:
-    """Accept write access or a reference to an accepted issue filed by the author."""
+    """Accept write access or a referenced accepted issue filed by the PR author."""
+    owner, repo = repository.split("/")
     author = pr["user"]["login"].lower()
+    variables = {"owner": owner, "repo": repo}
+    cursor = None
+    while True:
+        result = _api("graphql", method="POST", data={
+            "query": """query($owner: String!, $repo: String!, $author: String!, $cursor: String) {
+              repository(owner: $owner, name: $repo) {
+                collaborators(first: 100, query: $author, after: $cursor) {
+                  edges { permission node { login } }
+                  pageInfo { hasNextPage endCursor }
+                }
+              }
+            }""",
+            "variables": variables | {"author": author, "cursor": cursor},
+        })
+        members = result["data"]["repository"]["collaborators"]
+        member = next(
+            (edge for edge in members["edges"]
+             if edge["node"]["login"].lower() == author),
+            None,
+        )
+        if member:
+            if member["permission"] in {"WRITE", "MAINTAIN", "ADMIN"}:
+                return True
+            break
+        if not members["pageInfo"]["hasNextPage"]:
+            break
+        cursor = members["pageInfo"]["endCursor"]
+
     escaped = re.escape(repository)
     references = (
         rf"https://github\.com/{escaped}/issues/(\d+)\b"
@@ -210,71 +239,65 @@ def _accepted_work(repository: str, number: int, pr: dict) -> bool:
         int(url_number or short_number)
         for url_number, short_number in re.findall(references, pr.get("body") or "", re.I)
     }
-
-    owner, repo = repository.split("/")
-    cursors = dict.fromkeys(("acceptedCursor", "linkedCursor", "collaboratorCursor"))
-    accepted = set()
+    cursor = None
     while True:
-        result = _api(
-            "graphql",
-            method="POST",
-            data={
-                "query": """
-                query($owner: String!, $repo: String!, $number: Int!, $author: String!,
-                      $acceptedCursor: String, $linkedCursor: String, $collaboratorCursor: String) {
-                  repository(owner: $owner, name: $repo) {
-                    collaborators(first: 100, query: $author, after: $collaboratorCursor) {
-                      edges { permission node { login } }
-                      pageInfo { hasNextPage endCursor }
-                    }
-                    issues(first: 100, after: $acceptedCursor, states: [OPEN, CLOSED],
-                           labels: ["state:accepted"], filterBy: {createdBy: $author}) {
-                      nodes { number }
-                      pageInfo { hasNextPage endCursor }
-                    }
-                    pullRequest(number: $number) {
-                      closingIssuesReferences(first: 100, after: $linkedCursor) {
-                        nodes { number repository { nameWithOwner } }
-                        pageInfo { hasNextPage endCursor }
-                      }
-                    }
+        result = _api("graphql", method="POST", data={
+            "query": """query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+              repository(owner: $owner, name: $repo) {
+                pullRequest(number: $number) {
+                  closingIssuesReferences(first: 100, after: $cursor) {
+                    nodes { number repository { nameWithOwner } }
+                    pageInfo { hasNextPage endCursor }
                   }
                 }
-                """,
-                "variables": {
-                    "owner": owner,
-                    "repo": repo,
-                    "number": number,
-                    "author": author,
-                    **cursors,
-                },
-            },
-        )
-        data = result["data"]["repository"]
-        if any(
-            edge["node"]["login"].lower() == author
-            and edge["permission"] in {"WRITE", "MAINTAIN", "ADMIN"}
-            for edge in data["collaborators"]["edges"]
-        ):
-            return True
-        linked = data["pullRequest"]["closingIssuesReferences"]
+              }
+            }""",
+            "variables": variables | {"number": number, "cursor": cursor},
+        })
+        linked = result["data"]["repository"]["pullRequest"]["closingIssuesReferences"]
         referenced.update(
             issue["number"]
             for issue in linked["nodes"]
             if issue["repository"]["nameWithOwner"].lower() == repository.lower()
         )
-        accepted.update(issue["number"] for issue in data["issues"]["nodes"])
-        if referenced & accepted:
-            return True
-        pages = {
-            "acceptedCursor": data["issues"],
-            "linkedCursor": linked,
-            "collaboratorCursor": data["collaborators"],
-        }
-        if not any(page["pageInfo"]["hasNextPage"] for page in pages.values()):
-            return False
-        for key, page in pages.items():
-            cursors[key] = page["pageInfo"]["endCursor"] or cursors[key]
+        if not linked["pageInfo"]["hasNextPage"]:
+            break
+        cursor = linked["pageInfo"]["endCursor"]
+
+    for issue_number in sorted(referenced):
+        cursor = None
+        while True:
+            try:
+                result = _api("graphql", method="POST", data={
+                    "query": """query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                      repository(owner: $owner, name: $repo) {
+                        issueOrPullRequest(number: $number) {
+                          ... on Issue {
+                            author { login }
+                            labels(first: 100, after: $cursor) {
+                              nodes { name }
+                              pageInfo { hasNextPage endCursor }
+                            }
+                          }
+                        }
+                      }
+                    }""",
+                    "variables": variables | {"number": issue_number, "cursor": cursor},
+                })
+            except subprocess.CalledProcessError as exc:
+                errors = json.loads(exc.stdout or "{}").get("errors", [])
+                if errors and all(error.get("type") == "NOT_FOUND" for error in errors):
+                    break
+                raise
+            issue = result["data"]["repository"]["issueOrPullRequest"]
+            if not issue or (issue.get("author") or {}).get("login", "").lower() != author:
+                break
+            if any(label["name"] == "state:accepted" for label in issue["labels"]["nodes"]):
+                return True
+            if not issue["labels"]["pageInfo"]["hasNextPage"]:
+                break
+            cursor = issue["labels"]["pageInfo"]["endCursor"]
+    return False
 
 
 def _routing_key(pr: dict):
@@ -291,13 +314,16 @@ def check_review_readiness(
     number: int,
     *,
     apply=False,
+    event="opened",
 ) -> ReviewPlan | None:
     """Validate acceptance, then route. Callers must serialize runs for the same PR."""
     pull = f"repos/{repository}/pulls/{number}"
     pr = _api(pull)
     if pr["state"] != "open" or pr["draft"]:
         return None
-    if not _accepted_work(repository, number, pr):
+    if event in {"opened", "ready_for_review"} and not _accepted_work(
+        repository, number, pr
+    ):
         if apply:
             _api(
                 "graphql",
@@ -344,6 +370,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", required=True, help="target OWNER/REPO")
     parser.add_argument("--pr", required=True, type=int, help="pull request number")
     parser.add_argument(
+        "--event", default="opened",
+        choices=("opened", "ready_for_review", "labeled", "unlabeled"),
+        help="PR event; acceptance is checked on opened and ready_for_review",
+    )
+    parser.add_argument(
         "--apply", action="store_true", help="update requests or draft unaccepted work"
     )
     args = parser.parse_args(argv)
@@ -351,7 +382,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--repo must be OWNER/REPO and --pr must be positive")
     try:
         categories = parse_reviewers(args.reviewers.read_text(encoding="utf-8"))
-        plan = check_review_readiness(categories, args.repo, args.pr, apply=args.apply)
+        plan = check_review_readiness(
+            categories, args.repo, args.pr, apply=args.apply, event=args.event
+        )
     except (OSError, UnicodeError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"Review readiness: {exc}", file=sys.stderr)
         return 1
