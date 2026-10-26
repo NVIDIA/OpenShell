@@ -48,14 +48,14 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use openshell_core::ObjectWorkspace as _;
 use openshell_core::jwt::{SandboxId, SupervisorTakeover};
 use openshell_core::proto::datamodel::v1::{CredentialHandle, ObjectMeta, Provider};
 use openshell_core::proto::{Sandbox, SandboxPhase};
 use openshell_core::time::now_ms;
+use openshell_core::{ObjectId as _, ObjectWorkspace as _};
 use openshell_supervisor_control::pool_timing::RECORD_WRITE_BOUND;
 use openshell_supervisor_control::proto::{
-    SandboxInstanceAssignment, SandboxInstanceStatus, SandboxInstanceTakeover,
+    SandboxInstanceAssignment, SandboxInstancePhase, SandboxInstanceStatus, SandboxInstanceTakeover,
 };
 use openshell_supervisor_control::{
     ConnectedMember, InstanceOwner, InstancePlacement, MAX_ASSIGNED_INSTANCES, MAX_POOL_INSTANCES,
@@ -485,6 +485,96 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Revalidate an application endpoint against durable pool authority, rather
+/// than a replica's eventually refreshed placement cache. Never treats the
+/// member's runtime port as an application port.
+pub async fn app_endpoint_current(
+    store: &Store,
+    sandbox: &Sandbox,
+    endpoint: &openshell_core::proto::compute::v1::SupervisorAppEndpoint,
+) -> Result<bool, PersistenceError> {
+    let Some(metadata) = &sandbox.metadata else {
+        return Ok(false);
+    };
+    let identity = PersistedSandboxIdentity::read(&metadata.annotations)
+        .map_err(|error| PersistenceError::Decode(error.to_string()))?;
+    let Some(assignment_row) = store
+        .get_by_name(ASSIGNMENT_OBJECT_TYPE, "", &endpoint.pool_route)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let assignment: AssignmentPayload = serde_json::from_slice(&assignment_row.payload)
+        .map_err(|error| PersistenceError::Decode(error.to_string()))?;
+    if assignment.route != endpoint.pool_route
+        || assignment.sandbox_id != sandbox.object_id()
+        || assignment.generation != identity.runtime_generation.as_str()
+        || assignment.phase != RecordPhase::Published
+    {
+        return Ok(false);
+    }
+    let Some(row) = store
+        .get(OWNER_OBJECT_TYPE, &owner_object_id(&endpoint.pool_route))
+        .await?
+    else {
+        return Ok(false);
+    };
+    let owner: OwnerPayload = serde_json::from_slice(&row.payload)
+        .map_err(|error| PersistenceError::Decode(error.to_string()))?;
+    if owner.route != endpoint.pool_route
+        || owner.sandbox_id != sandbox.object_id()
+        || owner.generation != identity.runtime_generation.as_str()
+        || owner.phase != OwnerPhase::Granted
+        || owner.auth_epoch != endpoint.ownership_epoch
+        || owner.auth_epoch != identity.auth_epoch.get()
+    {
+        return Ok(false);
+    }
+    let Some(member_row) = store
+        .get(MEMBER_OBJECT_TYPE, &member_object_id(&owner.member_id))
+        .await?
+    else {
+        return Ok(false);
+    };
+    if now_ms().saturating_sub(member_row.updated_at_ms)
+        >= i64::try_from(MEMBER_TTL.as_millis()).expect("bounded member TTL")
+    {
+        return Ok(false);
+    }
+    let member: MemberPayload = serde_json::from_slice(&member_row.payload)
+        .map_err(|error| PersistenceError::Decode(error.to_string()))?;
+    if member.member_id != owner.member_id
+        || member.process_id != owner.process_id
+        || member.leaving
+        || member
+            .runtime_address
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|a| a.ip())
+            != endpoint.host.parse::<std::net::IpAddr>().ok()
+    {
+        return Ok(false);
+    }
+    let Some(report_row) = store
+        .get(
+            REPORT_OBJECT_TYPE,
+            &report_object_id(&owner.route, owner.auth_epoch),
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    let report: ReportPayload = serde_json::from_slice(&report_row.payload)
+        .map_err(|error| PersistenceError::Decode(error.to_string()))?;
+    Ok(report.route == owner.route
+        && report.sandbox_id == owner.sandbox_id
+        && report.member_id == owner.member_id
+        && report.process_id == owner.process_id
+        && report.auth_epoch == owner.auth_epoch
+        && report.ready
+        && report.phase == SandboxInstancePhase::Supervising as i32)
 }
 
 /// The ring over live members that are not leaving.
@@ -5122,6 +5212,104 @@ mod tests {
         stale.reconcile_once().await.unwrap();
         let row = fixture.report_rows(&route).await.remove(&1).unwrap();
         assert_eq!((row.ready, row.connected_at_ms), (true, 2_000));
+    }
+
+    #[tokio::test]
+    async fn application_endpoints_require_current_acknowledged_owner_and_live_member() {
+        let fixture = Fixture::new().await;
+        fixture.member("m1", "p1", false).await;
+        let route = fixture.fill("m1", "p1", 1).await.remove(0);
+        let sandbox_id = fixture.owner(&route).await.unwrap().sandbox_id;
+        let mut sandbox = fixture
+            .store
+            .get_message::<Sandbox>(&sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut endpoint = openshell_core::proto::compute::v1::SupervisorAppEndpoint {
+            host: "10.0.0.1".into(),
+            port: 9443,
+            pool_route: route.clone(),
+            ownership_epoch: 1,
+            ..Default::default()
+        };
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        let report = ReportPayload {
+            route: route.clone(),
+            member_id: "m1".into(),
+            process_id: "p1".into(),
+            auth_epoch: 1,
+            sandbox_id: sandbox_id.clone(),
+            phase: SandboxInstancePhase::Supervising as i32,
+            ready: true,
+            exit_code: 0,
+            connected_at_ms: now_ms(),
+        };
+        fixture.write_report(report.clone()).await;
+        assert!(
+            app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        endpoint.host = "10.0.0.2".into();
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        endpoint.host = "10.0.0.1".into();
+        fixture.member("m1", "p1", true).await;
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        fixture.member("m1", "p1", false).await;
+        // Returning to the same host process is still a new ownership term.
+        grant_next_term(&fixture, &route, "m1", "p1").await;
+        sandbox.metadata.as_mut().unwrap().annotations.insert(
+            crate::auth::sandbox_session::AUTH_EPOCH_ANNOTATION.into(),
+            "2".into(),
+        );
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        endpoint.ownership_epoch = 2;
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap(),
+            "old acknowledged report cannot authorize the new term"
+        );
+        fixture
+            .write_report(ReportPayload {
+                auth_epoch: 2,
+                ..report
+            })
+            .await;
+        assert!(
+            app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        fixture.member("m1", "p2", false).await;
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
+        fixture.remove_owner_record(&route).await;
+        assert!(
+            !app_endpoint_current(&fixture.store, &sandbox, &endpoint)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

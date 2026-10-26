@@ -120,6 +120,7 @@ fn unapplied_update(update_id: String, code: &str, message: &str) -> ConfigUpdat
 
 /// Runtime identity and status channel shared with a supervisor session task.
 pub struct SessionRuntimeContext {
+    pub app_installations: Option<openshell_core::app_listener::InstallationSource>,
     /// Identifies the local supervisor process across gateway reconnects.
     pub instance_id: String,
     /// Publishes the currently accepted gateway session to sibling reporters.
@@ -413,6 +414,7 @@ pub fn spawn_with_readiness(
 ) -> (tokio::task::JoinHandle<()>, watch::Receiver<bool>) {
     let (ready_tx, ready_rx) = watch::channel(false);
     let config = SessionConfig {
+        app_installations: runtime.app_installations,
         gateway,
         sandbox_id,
         ssh_socket_path,
@@ -429,6 +431,7 @@ pub fn spawn_with_readiness(
 }
 
 struct SessionConfig {
+    app_installations: Option<openshell_core::app_listener::InstallationSource>,
     gateway: grpc_client::GatewayEndpoint,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
@@ -443,6 +446,26 @@ struct SessionConfig {
     /// reconnect to a gateway that does not push resumes polling.
     config_push_updates: watch::Sender<bool>,
     ready_tx: watch::Sender<bool>,
+}
+
+fn service_route_lease_remaining(
+    lease: &openshell_core::proto::ServiceRouteLease,
+) -> Option<Duration> {
+    let duration = lease
+        .duration
+        .as_ref()
+        .and_then(|d| openshell_core::time::duration_to_std(d).ok())?;
+    if duration.is_zero() || duration > Duration::from_secs(15) {
+        return None;
+    }
+    let expiry = lease
+        .expires_at
+        .as_ref()
+        .and_then(|t| openshell_core::time::timestamp_to_millis(t).ok())?;
+    let remaining = expiry.checked_sub(openshell_core::time::now_ms())?;
+    let remaining = Duration::from_millis(u64::try_from(remaining).ok()?);
+    let duration = duration.min(remaining);
+    (!duration.is_zero() && duration <= Duration::from_secs(15)).then_some(duration)
 }
 
 async fn run_session_loop(config: SessionConfig) {
@@ -611,6 +634,7 @@ async fn run_single_session(
             redirected,
             supports_session_redirect: true,
             supports_config_push: true,
+            supports_service_advertisements: config.app_installations.is_some(),
         })),
     })
     .await
@@ -715,6 +739,18 @@ async fn run_single_session(
                         peer_endpoint: r.peer_endpoint.clone(),
                         owner_replica_id: r.owner_replica_id.clone(),
                     });
+                }
+                if let Some(gateway_message::Payload::ServiceRouteLease(lease)) = &msg.payload {
+                    if let Some(source) = &config.app_installations {
+                        let duration = service_route_lease_remaining(lease);
+                        if let Some(duration) = duration.filter(|d| !d.is_zero() && *d <= Duration::from_secs(15)) {
+                            let mut report = source(duration);
+                            report.lease_sequence = lease.sequence;
+                            tx.send(SupervisorMessage { payload: Some(supervisor_message::Payload::ServiceAdvertisement(report)) })
+                                .await.map_err(|_| "outbound channel closed")?;
+                        }
+                    }
+                    continue;
                 }
                 let context = GatewayMessageContext {
                     sandbox_id: &config.sandbox_id,
@@ -1848,5 +1884,29 @@ mod ocsf_event_tests {
             .await
             .unwrap()
             .expect("bridge should finish cleanly on an ordinary round trip");
+    }
+}
+
+#[cfg(test)]
+mod app_lease_tests {
+    use super::*;
+
+    #[test]
+    fn queued_or_expired_challenges_never_get_a_new_full_lease() {
+        let mut lease = openshell_core::proto::ServiceRouteLease {
+            sequence: 1,
+            duration: openshell_core::time::duration_from_std(Duration::from_secs(15)).ok(),
+            expires_at: openshell_core::time::timestamp_from_millis(
+                openshell_core::time::now_ms() + 1000,
+            )
+            .ok(),
+        };
+        let remaining = service_route_lease_remaining(&lease).unwrap();
+        assert!(remaining <= Duration::from_secs(1));
+        lease.expires_at =
+            openshell_core::time::timestamp_from_millis(openshell_core::time::now_ms() - 1).ok();
+        assert!(service_route_lease_remaining(&lease).is_none());
+        lease.expires_at = None;
+        assert!(service_route_lease_remaining(&lease).is_none());
     }
 }

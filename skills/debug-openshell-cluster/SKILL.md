@@ -1510,3 +1510,20 @@ renew a 30-second lease; rejected configuration or expired freshness closes
 routes. App traffic uses application/edge authentication independently of gateway
 user authentication. This listener stage does not add service discovery or
 change the public URLs printed by the CLI.
+
+When enabled application routes are not published, check the authenticated
+supervisor session and installed configuration before checking ingress. The
+gateway requests installation evidence every five seconds with a fifteen-second
+lease measured from challenge issuance. Instances report only when their serving
+freshness covers that lease. Replayed, late, stale-configuration, and replaced
+session reports cannot renew evidence. Endpoint resolution comes from the
+compute driver; ambiguous shared member ownership must not publish an address.
+
+For shared pools, compare the discovered endpoint to the
+acknowledged owner's Pod IP and configured app port, not its runtime port or a
+load-balanced supervisor Service. Publication requires a current ownership term,
+live member, and acknowledged ready report. During takeover old streams may close;
+verify workload identity/memory survives and new connections reach the replacement.
+Shared serving leases last at most fifteen seconds from issuance, independently
+of configuration renewal; include membership failure detection when measuring a
+partition's stale-owner interval. Storage failures prevent renewal.

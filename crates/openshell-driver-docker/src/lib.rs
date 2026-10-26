@@ -3346,6 +3346,7 @@ impl ComputeDriver for DockerComputeDriver {
         }
 
         Ok(Response::new(GetSandboxResponse {
+            supervisor_app_endpoint: None,
             sandbox: Some(sandbox),
         }))
     }

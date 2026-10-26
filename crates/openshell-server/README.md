@@ -189,3 +189,16 @@ runs under `mise run test:rust:postgres` (see `TESTING.md`) and still accepts
 `OPENSHELL_REFRESH_TEST_DATABASE_URL` pointing to a disposable PostgreSQL database.
 It exercises independent sessions without the local mutex. Do not point this
 fixture at an existing deployment database.
+
+## Application route installation records
+
+Supervisor installation reports arrive only through the authenticated sandbox
+session. The gateway issues bounded, single-use lease challenges and validates
+reports under the sandbox mutation guard. Accepted records contain current
+service declarations, configuration/runtime identity, session fencing, a
+trusted driver-resolved app endpoint, and gateway lease expiry. The generic
+store key is prefixed `service-installation:`; records are ephemeral and do not
+change durable sandbox protobufs. Reads revalidate owner, configuration,
+generation, and expiry. Cleanup scans bounded pages and uses conditional deletes
+so concurrent renewals are preserved. Discovery consumers must not treat these
+records as application health or external ingress readiness.

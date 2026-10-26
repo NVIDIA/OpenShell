@@ -6521,6 +6521,33 @@ impl ComputeRuntime {
             .await
     }
 
+    /// Resolve app endpoints exclusively across the trusted compute boundary.
+    pub(crate) async fn supervisor_app_endpoint(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<Option<openshell_core::proto::compute::v1::SupervisorAppEndpoint>, Status> {
+        let id = sandbox.object_id().to_string();
+        let request = GetSandboxRequest {
+            sandbox_id: id.clone(),
+            name: sandbox.object_name().to_string(),
+        };
+        let response = self
+            .driver
+            .call(
+                openshell_otel::rpc::GET_SANDBOX,
+                Some(&id),
+                |driver| async move { driver.get_sandbox(Request::new(request)).await },
+            )
+            .await?
+            .into_inner();
+        if response.sandbox.as_ref().is_none_or(|s| s.id != id) {
+            return Err(Status::failed_precondition(
+                "driver returned a different sandbox",
+            ));
+        }
+        Ok(response.supervisor_app_endpoint)
+    }
+
     async fn get_driver_sandbox(
         &self,
         sandbox_id: &str,
@@ -8073,6 +8100,7 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub struct NoopTestDriver {
+    app_endpoint: Option<openshell_core::proto::compute::v1::SupervisorAppEndpoint>,
     workspace_delete_failures: std::sync::atomic::AtomicUsize,
     sandbox_authentication: Option<Result<(String, String), (Code, String)>>,
 }
@@ -8080,8 +8108,19 @@ pub struct NoopTestDriver {
 #[cfg(any(test, feature = "test-support"))]
 impl NoopTestDriver {
     #[cfg(test)]
+    pub fn with_app_endpoint(
+        endpoint: openshell_core::proto::compute::v1::SupervisorAppEndpoint,
+    ) -> Self {
+        Self {
+            app_endpoint: Some(endpoint),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
     pub fn failing_workspace_deletes(count: usize) -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(count),
             sandbox_authentication: None,
         }
@@ -8090,6 +8129,7 @@ impl NoopTestDriver {
     #[cfg(test)]
     pub fn authenticating_sandbox(sandbox_id: impl Into<String>) -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: Some(Ok((sandbox_id.into(), "test-runtime".to_string()))),
         }
@@ -8101,6 +8141,7 @@ impl NoopTestDriver {
         runtime_identity: impl Into<String>,
     ) -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: Some(Ok((sandbox_id.into(), runtime_identity.into()))),
         }
@@ -8109,6 +8150,7 @@ impl NoopTestDriver {
     #[cfg(test)]
     pub fn failing_sandbox_authentication(code: Code, message: impl Into<String>) -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: Some(Err((code, message.into()))),
         }
@@ -8119,6 +8161,7 @@ impl NoopTestDriver {
 impl Default for NoopTestDriver {
     fn default() -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: None,
         }
@@ -8194,10 +8237,23 @@ impl ComputeDriver for NoopTestDriver {
 
     async fn get_sandbox(
         &self,
-        _request: Request<GetSandboxRequest>,
+        request: Request<GetSandboxRequest>,
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::GetSandboxResponse>, Status>
     {
-        Err(Status::not_found("sandbox not found"))
+        let Some(endpoint) = self.app_endpoint.clone() else {
+            return Err(Status::not_found("sandbox not found"));
+        };
+        let request = request.into_inner();
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::GetSandboxResponse {
+                sandbox: Some(DriverSandbox {
+                    id: request.sandbox_id,
+                    name: request.name,
+                    ..Default::default()
+                }),
+                supervisor_app_endpoint: Some(endpoint),
+            },
+        ))
     }
 
     async fn list_sandboxes(
@@ -8853,6 +8909,7 @@ mod tests {
             }
 
             Ok(tonic::Response::new(GetSandboxResponse {
+                supervisor_app_endpoint: None,
                 sandbox: Some(sandbox),
             }))
         }
@@ -9296,6 +9353,7 @@ mod tests {
             match outcome {
                 ControlledGetOutcome::Sandbox(sandbox) => {
                     Ok(tonic::Response::new(GetSandboxResponse {
+                        supervisor_app_endpoint: None,
                         sandbox: Some(*sandbox),
                     }))
                 }

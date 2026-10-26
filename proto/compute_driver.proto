@@ -421,6 +421,20 @@ message GetSandboxRequest {
 message GetSandboxResponse {
   // Platform-observed sandbox snapshot returned by the driver.
   DriverSandbox sandbox = 1;
+  // Trusted, generation-bound endpoint of the supervisor application listener.
+  SupervisorAppEndpoint supervisor_app_endpoint = 2;
+}
+
+// Driver-owned app endpoint; absent when unsupported or not safely resolvable.
+message SupervisorAppEndpoint {
+  string host = 1;
+  uint32 port = 2;
+  string runtime_identity = 3;
+  // Shared supervisors only: the pool route and acknowledged ownership term
+  // used to resolve this member-specific endpoint. Empty/zero for dedicated
+  // supervisors. The gateway revalidates these against durable pool authority.
+  string pool_route = 4;
+  uint64 ownership_epoch = 5;
 }
 
 message ListSandboxesRequest {}

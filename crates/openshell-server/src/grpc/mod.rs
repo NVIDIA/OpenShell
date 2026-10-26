@@ -13,6 +13,7 @@ mod sandbox;
 pub mod supervisor_host;
 pub use sandbox::mint_persisted_authentication;
 mod service;
+pub mod service_advertisement;
 mod validation;
 pub mod workspace;
 
@@ -1097,6 +1098,7 @@ pub mod test_support {
         outbound
             .send(SupervisorMessage {
                 payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+                    supports_service_advertisements: false,
                     sandbox_id: sandbox_id.into(),
                     instance_id: "instance".into(),
                     supports_config_push: features == StreamFeatures::Apply,

@@ -89,6 +89,7 @@ impl ComputeDriver for ComputeDriverService {
             ));
         }
         Ok(Response::new(GetSandboxResponse {
+            supervisor_app_endpoint: None,
             sandbox: Some(sandbox),
         }))
     }

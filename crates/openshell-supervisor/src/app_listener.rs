@@ -125,7 +125,10 @@ struct Snapshot {
     generations: BTreeMap<String, u64>,
     next_generation: u64,
     expires: Option<Instant>,
+    authority_expires: Option<Instant>,
     workspace: String,
+    configuration_instance_id: String,
+    config_revision: u64,
     // Whole-sandbox suspension fence, independent of individual service edits.
     epoch: u64,
 }
@@ -141,8 +144,10 @@ struct RouteToken {
 #[derive(Clone)]
 pub struct Routes {
     registration: Option<Arc<Registration>>,
+    requires_authority: bool,
     sender: watch::Sender<Snapshot>,
     stopped: Arc<AtomicBool>,
+    serving: Arc<AtomicBool>,
 }
 
 impl Default for Routes {
@@ -150,7 +155,9 @@ impl Default for Routes {
         Self {
             sender: watch::channel(Snapshot::default()).0,
             stopped: Arc::new(AtomicBool::new(false)),
+            serving: Arc::new(AtomicBool::new(false)),
             registration: None,
+            requires_authority: false,
         }
     }
 }
@@ -163,14 +170,63 @@ impl Drop for ConfigurationGuard {
 }
 
 impl Routes {
+    pub(crate) fn installation_source(&self) -> openshell_core::app_listener::InstallationSource {
+        let routes = self.clone();
+        Arc::new(move |duration| {
+            let snapshot = routes.sender.borrow();
+            if routes.stopped.load(Ordering::Acquire)
+                || !routes.serving.load(Ordering::Acquire)
+                || snapshot.expires.is_none_or(|expiry| {
+                    expiry.saturating_duration_since(Instant::now()) < duration
+                })
+            {
+                return openshell_core::proto::SupervisorServiceAdvertisement::default();
+            }
+            drop(snapshot);
+            if routes.requires_authority {
+                routes.sender.send_modify(|snapshot| {
+                    if snapshot
+                        .authority_expires
+                        .is_none_or(|expiry| expiry <= Instant::now())
+                    {
+                        // A later lease cannot revive a stream that already lost authority.
+                        snapshot.epoch = snapshot.epoch.wrapping_add(1);
+                    }
+                    snapshot.authority_expires = Some(Instant::now() + duration);
+                });
+            }
+            let snapshot = routes.sender.borrow();
+            openshell_core::proto::SupervisorServiceAdvertisement {
+                service_domain: routes
+                    .registration
+                    .as_ref()
+                    .map_or_else(String::new, |registration| {
+                        registration.router.domain.clone()
+                    }),
+                configuration_instance_id: snapshot.configuration_instance_id.clone(),
+                config_revision: snapshot.config_revision,
+                routes: snapshot.routes.values().cloned().collect(),
+                ..Default::default()
+            }
+        })
+    }
+
     pub(crate) fn configuration_guard(self) -> ConfigurationGuard {
         ConfigurationGuard(self)
     }
 
+    fn serving_expiry(&self, snapshot: &Snapshot) -> Option<Instant> {
+        let config = snapshot.expires?;
+        if self.requires_authority {
+            Some(config.min(snapshot.authority_expires?))
+        } else {
+            Some(config)
+        }
+    }
+
     fn valid(&self, route: &SandboxServiceRoute, token: RouteToken) -> bool {
         let snapshot = self.sender.borrow();
-        snapshot
-            .expires
+        self.serving_expiry(&snapshot)
             .is_some_and(|expiry| expiry > Instant::now())
             && snapshot.epoch == token.epoch
             && snapshot.generations.get(&route.name) == Some(&token.generation)
@@ -246,6 +302,10 @@ impl Routes {
                 snapshot.epoch = snapshot.epoch.wrapping_add(1);
             }
             snapshot.workspace.clone_from(&result.workspace);
+            snapshot
+                .configuration_instance_id
+                .clone_from(&result.configuration_instance_id);
+            snapshot.config_revision = result.config_revision;
             snapshot.routes = routes;
             snapshot.generations = generations;
             snapshot.expires = Some(Instant::now() + FRESHNESS);
@@ -282,6 +342,7 @@ impl Routes {
             snapshot.routes.clear();
             snapshot.generations.clear();
             snapshot.expires = None;
+            snapshot.authority_expires = None;
             snapshot.epoch = snapshot.epoch.wrapping_add(1);
         });
     }
@@ -299,7 +360,7 @@ impl Routes {
             encoded.strip_prefix(&format!("{prefix}--"))?
         };
         let snapshot = self.sender.borrow();
-        if snapshot.expires? <= Instant::now() {
+        if self.serving_expiry(&snapshot)? <= Instant::now() {
             return None;
         }
         Some((
@@ -322,7 +383,7 @@ impl Routes {
                 {
                     return;
                 }
-                let Some(expiry) = snapshot.expires else {
+                let Some(expiry) = self.serving_expiry(&snapshot) else {
                     return;
                 };
                 expiry
@@ -346,6 +407,7 @@ pub struct BoundListener {
 #[derive(Clone, Default)]
 pub struct Router {
     domain: String,
+    requires_authority: bool,
     registrations: Arc<Mutex<BTreeMap<String, mpsc::Sender<Accepted>>>>,
 }
 
@@ -423,6 +485,14 @@ impl HostHandle {
     pub fn router(&self) -> Router {
         self.router.clone()
     }
+
+    /// Shared members require short gateway-issued ownership leases as well as
+    /// accepted configuration; configuration renewal alone cannot extend service.
+    pub(crate) fn leased_router(&self) -> Router {
+        let mut router = self.router.clone();
+        router.requires_authority = true;
+        router
+    }
 }
 
 impl Drop for HostHandle {
@@ -470,6 +540,7 @@ impl Router {
         Ok(InstanceListener {
             routes: Routes {
                 registration: Some(registration),
+                requires_authority: self.requires_authority,
                 ..Default::default()
             },
             receiver,
@@ -526,6 +597,7 @@ impl InstanceListener {
     /// Called on the sandbox instance runtime, preserving its OCSF/logging
     /// identity even when multiple sandboxes share one listener process.
     pub(crate) fn start(mut self, connector: Arc<BoundaryLoopbackConnector>) -> Handle {
+        self.routes.serving.store(true, Ordering::Release);
         let retained_routes = self.routes.clone();
         let task = tokio::spawn(async move {
             let routes = self.routes.clone();
@@ -843,6 +915,93 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    #[test]
+    fn installation_evidence_requires_a_serving_instance_and_sufficient_freshness() {
+        let routes = Routes::default();
+        let source = routes.installation_source();
+        let route = SandboxServiceRoute {
+            endpoint_id: "endpoint".into(),
+            name: "web".into(),
+            target_port: 8080,
+            authorization_mode: 1,
+            resource_version: 1,
+        };
+        let mut config = installed(vec![route.clone()]);
+        config.config_revision = 42;
+        config.configuration_instance_id = "generation-a".into();
+        routes.install(&config);
+        assert!(source(Duration::from_secs(15)).routes.is_empty());
+        routes.serving.store(true, Ordering::Release);
+        let report = source(Duration::from_secs(15));
+        assert_eq!(report.routes, vec![route]);
+        assert_eq!(report.config_revision, 42);
+        assert_eq!(report.configuration_instance_id, "generation-a");
+        routes.sender.send_modify(|snapshot| {
+            snapshot.expires = Some(Instant::now() + Duration::from_secs(5));
+        });
+        assert!(source(Duration::from_secs(15)).routes.is_empty());
+        routes.renew();
+        assert!(!source(Duration::from_secs(15)).routes.is_empty());
+        routes.suspend();
+        routes.renew();
+        assert!(source(Duration::from_secs(15)).routes.is_empty());
+        routes.install(&config);
+        routes.stopped.store(true, Ordering::Release);
+        assert!(source(Duration::from_secs(15)).routes.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_authority_expires_despite_config_renewal_and_fences_old_streams() {
+        let routes = Routes {
+            requires_authority: true,
+            ..Default::default()
+        };
+        routes.serving.store(true, Ordering::Release);
+        let route = SandboxServiceRoute {
+            endpoint_id: "endpoint".into(),
+            name: "web".into(),
+            target_port: 8080,
+            authorization_mode: 1,
+            resource_version: 1,
+        };
+        routes.install(&installed(vec![route.clone()]));
+        assert!(
+            routes
+                .resolve(HOST, "default--sandbox-a", "svc.openshell.internal")
+                .is_none()
+        );
+        let source = routes.installation_source();
+        assert_eq!(source(Duration::from_secs(15)).routes, vec![route.clone()]);
+        let (_, token) = routes
+            .resolve(HOST, "default--sandbox-a", "svc.openshell.internal")
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        routes.renew();
+        assert!(routes.valid(&route, token));
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(!routes.valid(&route, token));
+        assert!(
+            routes
+                .resolve(HOST, "default--sandbox-a", "svc.openshell.internal")
+                .is_none()
+        );
+        tokio::time::timeout(Duration::from_secs(1), routes.revoked(&route, token))
+            .await
+            .unwrap();
+        source(Duration::from_secs(15));
+        assert!(
+            !routes.valid(&route, token),
+            "renewal cannot revive a prior stream"
+        );
+        assert!(
+            routes
+                .resolve(HOST, "default--sandbox-a", "svc.openshell.internal")
+                .is_some()
+        );
+        routes.suspend();
+        assert!(source(Duration::from_secs(15)).routes.is_empty());
+    }
 
     #[test]
     fn listener_requires_explicit_enablement_and_complete_configuration() {

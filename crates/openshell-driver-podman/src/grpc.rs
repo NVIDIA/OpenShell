@@ -119,6 +119,7 @@ impl ComputeDriver for ComputeDriverService {
                     .map_err(Status::from)?
                     .ok_or_else(|| Status::not_found("sandbox not found"))?;
                 Ok(Response::new(GetSandboxResponse {
+                    supervisor_app_endpoint: None,
                     sandbox: Some(sandbox),
                 }))
             })
