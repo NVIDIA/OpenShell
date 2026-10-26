@@ -251,6 +251,24 @@ service OpenShell {
     };
   }
 
+  // Read installed, unexpired application routes in one explicit workspace.
+  rpc GetServiceRouteSnapshot(GetServiceRouteSnapshotRequest) returns (GetServiceRouteSnapshotResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
+  // Full replacement views; reauthorize during the bounded watch lifetime.
+  rpc WatchServiceRoutes(WatchServiceRoutesRequest) returns (stream WatchServiceRoutesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
   // Delete one sandbox HTTP service endpoint.
   rpc DeleteService(DeleteServiceRequest) returns (DeleteServiceResponse) {
     option (openshell.options.v1.authorization) = {
@@ -4243,4 +4261,48 @@ message SupervisorServiceAdvertisement {
   repeated openshell.sandbox.v1.SandboxServiceRoute routes = 4;
   // Domain actually installed by the process listener, not the gateway URL.
   string service_domain = 5;
+}
+
+// One explicit active workspace is required. Omitted and all-workspaces
+// selectors are rejected; discovery-only machine grants are separate work.
+message GetServiceRouteSnapshotRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+}
+message GetServiceRouteSnapshotResponse {
+  ServiceRouteSnapshot snapshot = 1;
+}
+// Same workspace authorization as GetServiceRouteSnapshot. A watch sends an
+// initial replacement and later replacements, including lease-only renewal.
+// Clients reconnect/relist when the bounded stream ends and expire cached
+// routes during discovery errors; errors are not empty replacements.
+message WatchServiceRoutesRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+}
+message WatchServiceRoutesResponse {
+  ServiceRouteSnapshot snapshot = 1;
+}
+message ServiceRouteSnapshot {
+  repeated DiscoveredServiceRoute routes = 1;
+  // Opaque equality token for this complete view, including lease expiries.
+  // No ordering across replicas or server restarts is implied.
+  string revision = 2;
+}
+// Trusted supervisor TLS endpoint. Preserve DiscoveredServiceRoute.hostname
+// as SNI and HTTP authority; this endpoint never addresses a workload port.
+message ServiceRouteEndpoint {
+  string host = 1;
+  uint32 port = 2;
+}
+// Accepted installation evidence, not application health or ingress readiness.
+message DiscoveredServiceRoute {
+  string workspace = 1;
+  string sandbox = 2;
+  // Canonical service name; empty identifies the existing unnamed service.
+  string name = 3;
+  string hostname = 4;
+  ServiceRouteEndpoint endpoint = 5;
+  // Changes on owner/backend/declaration replacement, but not lease renewal.
+  string installation_version = 6;
+  uint64 declaration_revision = 7;
+  google.protobuf.Timestamp expires_at = 8;
 }

@@ -253,3 +253,27 @@ change durable sandbox protobufs. Reads revalidate owner, configuration,
 generation, and expiry. Cleanup scans bounded pages and uses conditional deletes
 so concurrent renewals are preserved. Discovery consumers must not treat these
 records as application health or external ingress readiness.
+
+## Workspace service discovery
+
+`GetServiceRouteSnapshot` and `WatchServiceRoutes` expose accepted installations
+for one explicit active workspace. They require `sandbox:read` and workspace
+user access; omitted/all-workspaces selectors and sandbox principals are rejected.
+Dedicated discovery machine grants are separate work.
+
+Each successful response replaces the complete view. Consumers preserve the
+returned hostname as TLS SNI and HTTP authority when dialing the supervisor
+endpoint, remove absent routes, and expire cached entries at `expires_at` even
+when discovery is unavailable. An error is not an empty replacement. The opaque
+snapshot revision includes lease renewals; `installation_version` remains stable
+across those renewals and changes when installation identity changes. These
+records establish neither application health nor ingress readiness.
+
+Collection checks installation resource versions across two scans, retrying once
+if changed. This is a verified view, not a transaction across configuration and
+owner resources. Reads are bounded to 1,000 installation records, 4,096 routes,
+4 MiB, and ten seconds. Overflow, corruption, or storage failure returns an error.
+Watches refresh and reauthorize each second, use a one-message buffer, and end
+after one minute or a five-second blocked send. Each gateway process accepts at
+most 32 watches. Reconnect and relist on stream termination; revisions are opaque
+equality tokens, not resumable cursors or an ordering across gateway replicas.
