@@ -227,14 +227,13 @@ pub(super) async fn expose_service_endpoint(
         meta.resource_version = result.resource_version;
     }
 
-    let url = service_routing::endpoint_url(&state.config, workspace, sandbox_name, service)
-        .unwrap_or_default();
-    service_routing::emit_service_endpoint_config_event(&endpoint, &url, created);
-
-    Ok(Response::new(ServiceEndpointResponse {
-        endpoint: Some(endpoint),
-        url,
-    }))
+    let response = service_endpoint_response(state, endpoint);
+    service_routing::emit_service_endpoint_config_event(
+        response.endpoint.as_ref().expect("endpoint populated"),
+        &response.url,
+        created,
+    );
+    Ok(Response::new(response))
 }
 
 pub(super) async fn handle_get_service(
@@ -438,6 +437,12 @@ pub(super) async fn configured_app_routes(
             target_port: ep.target_port,
             authorization_mode: ep.authorization_mode,
             resource_version: ep.metadata.as_ref().map_or(0, |m| m.resource_version),
+            application_hostname: state.config.supervisor_app_listener.service_hostname(
+                sandbox.object_workspace(),
+                sandbox.object_name(),
+                &ep.name,
+                state.config.service_routing_discriminator(),
+            ),
         })
         .collect();
     service_routes.sort_by(|a, b| a.name.cmp(&b.name));
@@ -495,14 +500,41 @@ fn service_endpoint_response(
             Ok(ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip)
             | Err(_) => ServiceAuthorizationMode::Strip as i32,
         };
-    let workspace = endpoint.object_workspace();
-    let url =
-        service_routing::endpoint_url(&state.config, workspace, &endpoint.sandbox, &endpoint.name)
-            .unwrap_or_default();
-    ServiceEndpointResponse {
+    let mut response = ServiceEndpointResponse {
         endpoint: Some(endpoint),
-        url,
-    }
+        ..Default::default()
+    };
+    refresh_response_urls(state, &mut response);
+    response
+}
+
+/// Recompute presentation from current configuration, including durable replays.
+pub(super) fn refresh_response_urls(state: &ServerState, response: &mut ServiceEndpointResponse) {
+    let Some(endpoint) = response.endpoint.as_ref() else {
+        return;
+    };
+    response.gateway_url = service_routing::endpoint_url(
+        &state.config,
+        endpoint.object_workspace(),
+        &endpoint.sandbox,
+        &endpoint.name,
+    )
+    .unwrap_or_default();
+    response.application_url = state
+        .config
+        .supervisor_app_listener
+        .service_url(
+            endpoint.object_workspace(),
+            &endpoint.sandbox,
+            &endpoint.name,
+            state.config.service_routing_discriminator(),
+        )
+        .unwrap_or_default();
+    response.url = if response.application_url.is_empty() {
+        response.gateway_url.clone()
+    } else {
+        response.application_url.clone()
+    };
 }
 
 #[allow(clippy::result_large_err)]
@@ -590,6 +622,7 @@ mod tests {
             enabled: true,
             port: 9443,
             domain: "services.example.com".into(),
+            public_url: None,
         };
         seed_sandbox(&state, "limited").await;
         state
@@ -705,6 +738,99 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn configured_application_origin_is_published_before_installation() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+            enabled: true,
+            port: 9443,
+            domain: "services.example.com".into(),
+            public_url: Some("https://services.example.com:10443".into()),
+        };
+        seed_sandbox(&state, "demo").await;
+        for name in ["", "web"] {
+            let created = handle_expose_service(
+                &state,
+                authed_request(ExposeServiceRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    sandbox: "demo".into(),
+                    name: name.into(),
+                    target_port: 8080,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            let label = if name.is_empty() {
+                "default--demo"
+            } else {
+                "default--demo--web"
+            };
+            assert_eq!(
+                created.url,
+                format!("https://{label}.services.example.com:10443/")
+            );
+            assert_eq!(created.application_url, created.url);
+            assert!(created.gateway_url.contains("openshell.localhost"));
+            let fetched = handle_get_service(
+                &state,
+                authed_request(GetServiceRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    sandbox: "demo".into(),
+                    name: name.into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(created, fetched);
+        }
+    }
+
+    #[tokio::test]
+    async fn hashed_gateway_url_keeps_the_independent_application_origin() {
+        let mut state = test_server_state().await;
+        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+        config.name = "gateway-a".into();
+        config.service_routing.service_hostname_format = ServiceHostnameFormat::Hashed;
+        config.service_routing.base_domains = vec!["gateway.example.com".into()];
+        config.supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+            enabled: true,
+            port: 9443,
+            domain: "services.example.com".into(),
+            public_url: Some("https://services.example.com:10443".into()),
+        };
+        let mut response = ServiceEndpointResponse {
+            endpoint: Some(ServiceEndpoint {
+                metadata: Some(ObjectMeta {
+                    workspace: "default".into(),
+                    ..Default::default()
+                }),
+                sandbox: "demo".into(),
+                name: "web".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        refresh_response_urls(&state, &mut response);
+        let gateway = url::Url::parse(&response.gateway_url).unwrap();
+        let label =
+            service_routing::service_route_hash_label("gateway-a", "default", "demo", Some("web"));
+        assert_eq!(
+            gateway.host_str(),
+            Some(format!("{label}.gateway.example.com").as_str())
+        );
+        assert_eq!(
+            response.application_url,
+            format!("https://{label}.services.example.com:10443/")
+        );
+        assert_eq!(response.url, response.application_url);
+    }
+
     #[test]
     fn validates_good_endpoint_name() {
         validate_endpoint_name("service", "web-api", 28).unwrap();
@@ -717,6 +843,7 @@ mod tests {
             .expect("unshared test state")
             .config
             .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+            public_url: None,
             enabled: true,
             port: 9443,
             domain: "services.example.com".into(),

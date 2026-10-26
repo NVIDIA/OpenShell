@@ -335,7 +335,7 @@ async fn profile_scope(
 }
 
 macro_rules! mutation {
-    ($req:ty, $resp:ty, $method:literal, $handler:path, $auth:expr, $capture:expr, $restore:expr $(, $replay_method:literal)?) => {
+    ($req:ty, $resp:ty, $method:literal, $handler:path, $auth:expr, $capture:expr, $restore:expr $(, refresh = $refresh:expr)? $(, replay_method = $replay_method:literal)?) => {
         impl Mutation for $req {
             type Output = $resp;
             const METHOD: &'static str = $method;
@@ -363,12 +363,15 @@ macro_rules! mutation {
             async fn restore(store: &Store, success: Success) -> Result<Self::Output, Status> {
                 ($restore)(store, outcome(success)?).await
             }
+            fn refresh_replay(_state: &ServerState, _response: &mut Self::Output) {
+                $(($refresh)(_state, _response);)?
+            }
         }
     };
 }
 
 macro_rules! scoped_mutation {
-    ($req:ty, $resp:ty, $method:literal, $handler:path, $role:ident, $capture:expr, $restore:expr) => {
+    ($req:ty, $resp:ty, $method:literal, $handler:path, $role:ident, $capture:expr, $restore:expr $(, refresh = $refresh:expr)?) => {
         mutation!(
             $req,
             $resp,
@@ -384,13 +387,13 @@ macro_rules! scoped_mutation {
                 .await
             },
             $capture,
-            $restore
+            $restore $(, refresh = $refresh)?
         );
     };
 }
 
 macro_rules! sandbox_scoped_mutation {
-    ($req:ty, $resp:ty, $method:literal, $handler:path, $role:ident, $capture:expr, $restore:expr $(, $replay_method:literal)?) => {
+    ($req:ty, $resp:ty, $method:literal, $handler:path, $role:ident, $capture:expr, $restore:expr $(, refresh = $refresh:expr)? $(, replay_method = $replay_method:literal)?) => {
         mutation!(
             $req,
             $resp,
@@ -407,7 +410,8 @@ macro_rules! sandbox_scoped_mutation {
             },
             $capture,
             $restore
-            $(, $replay_method)?
+            $(, refresh = $refresh)?
+            $(, replay_method = $replay_method)?
         );
     };
 }
@@ -442,11 +446,13 @@ macro_rules! sandbox_mutation {
                     return Err(replay_unavailable());
                 };
                 Ok(SandboxResponse {
+                    application_service_urls: HashMap::new(),
+                    gateway_service_urls: HashMap::new(),
                     sandbox: Some(live(store, &id).await?),
                     service_urls: HashMap::new(),
                 })
             }
-            $(, $replay_method)?
+            $(, replay_method = $replay_method)?
         );
     };
 }
@@ -469,10 +475,13 @@ scoped_mutation!(
             return Err(replay_unavailable());
         };
         Ok(SandboxResponse {
+            application_service_urls: HashMap::new(),
+            gateway_service_urls: HashMap::new(),
             sandbox: Some(live(store, &id).await?),
             service_urls,
         })
-    }
+    },
+    refresh = sandbox::refresh_response_urls
 );
 sandbox_mutation!(
     openshell_core::proto::UpdateSandboxRequest,
@@ -594,10 +603,13 @@ sandbox_scoped_mutation!(
         };
         let _: Sandbox = live(store, &sandbox_id).await?;
         Ok(ServiceEndpointResponse {
+            application_url: String::new(),
+            gateway_url: String::new(),
             endpoint: Some(reference.restore(store).await?),
             url,
         })
-    }
+    },
+    refresh = service::refresh_response_urls
 );
 
 macro_rules! provider_mutation {

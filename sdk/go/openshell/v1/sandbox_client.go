@@ -51,6 +51,8 @@ func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec
 	sandbox := converter.SandboxFromProto(resp.GetSandbox())
 	if sandbox != nil {
 		sandbox.ServiceURLs = converter.CopyStringMap(resp.GetServiceUrls())
+		sandbox.ApplicationServiceURLs = converter.CopyStringMap(resp.GetApplicationServiceUrls())
+		sandbox.GatewayServiceURLs = converter.CopyStringMap(resp.GetGatewayServiceUrls())
 	}
 	return sandbox, nil
 }
@@ -83,6 +85,8 @@ func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name,
 	sandbox := converter.SandboxFromProto(resp.GetSandbox())
 	if sandbox != nil {
 		sandbox.ServiceURLs = converter.CopyStringMap(resp.GetServiceUrls())
+		sandbox.ApplicationServiceURLs = converter.CopyStringMap(resp.GetApplicationServiceUrls())
+		sandbox.GatewayServiceURLs = converter.CopyStringMap(resp.GetGatewayServiceUrls())
 	}
 	return sandbox, nil
 }

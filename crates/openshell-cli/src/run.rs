@@ -723,10 +723,17 @@ pub async fn sandbox_create(
         Err(status) => return Err(miette::miette!(status.to_string())),
     };
     let response = response.into_inner();
+    let application_service_urls = response.application_service_urls;
     let service_urls = response
         .service_urls
         .into_iter()
-        .map(|(service, url)| (service, service_url_for_gateway(&url, &effective_server)))
+        .map(|(service, url)| {
+            let url = application_service_urls
+                .get(&service)
+                .cloned()
+                .unwrap_or_else(|| service_url_for_gateway(&url, &effective_server));
+            (service, url)
+        })
         .collect::<HashMap<_, _>>();
     let sandbox = response
         .sandbox
@@ -1115,10 +1122,7 @@ pub async fn sandbox_create(
                     "\u{2713}".green().bold(),
                 );
                 if let Some(url) = service_urls.get("").filter(|url| !url.is_empty()) {
-                    eprintln!(
-                        "  Access at: {}",
-                        service_url_for_gateway(url, &effective_server)
-                    );
+                    eprintln!("  Access at: {url}");
                 }
             }
 
@@ -4369,7 +4373,7 @@ pub async fn service_expose(
         );
     }
     if !response.url.is_empty() {
-        let url = service_url_for_gateway(&response.url, server);
+        let url = preferred_service_url(&response, server);
         println!("  URL: {}", url.cyan());
     }
     Ok(())
@@ -4582,7 +4586,7 @@ fn print_service_endpoint_table(
             let url = if response.url.is_empty() {
                 String::new()
             } else {
-                service_url_for_gateway(&response.url, gateway_endpoint)
+                preferred_service_url(response, gateway_endpoint)
             };
             Some((
                 workspace.to_string(),
@@ -4673,7 +4677,7 @@ fn service_endpoint_to_json(
     let url = if response.url.is_empty() {
         String::new()
     } else {
-        service_url_for_gateway(&response.url, gateway_endpoint)
+        preferred_service_url(response, gateway_endpoint)
     };
 
     Some(serde_json::json!({
@@ -4683,6 +4687,8 @@ fn service_endpoint_to_json(
         "target_port": endpoint.target_port,
         "authorization_mode": service_authorization_mode_name(endpoint.authorization_mode),
         "url": url,
+        "application_url": response.application_url,
+        "gateway_url": service_url_for_gateway(&response.gateway_url, gateway_endpoint),
     }))
 }
 
@@ -4697,13 +4703,16 @@ fn service_authorization_mode_name(mode: i32) -> &'static str {
     }
 }
 
-/// Read gcloud Application Default Credentials from disk.
-///
-/// Returns `(client_id, client_secret, refresh_token)`.
-///
-/// Checks `GOOGLE_APPLICATION_CREDENTIALS` first; falls back to
-/// `$CLOUDSDK_CONFIG/application_default_credentials.json` when set, then to
-/// `~/.config/gcloud/application_default_credentials.json`.
+/// Application origins are independent of the gateway transport. Only legacy
+/// gateway URLs inherit a caller's external gateway port.
+fn preferred_service_url(response: &ServiceEndpointResponse, gateway: &str) -> String {
+    if response.application_url.is_empty() {
+        service_url_for_gateway(&response.url, gateway)
+    } else {
+        response.application_url.clone()
+    }
+}
+
 fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String {
     let (Ok(mut service_url), Ok(gateway_endpoint)) = (
         url::Url::parse(service_url),
@@ -7332,6 +7341,8 @@ mod tests {
     #[test]
     fn service_endpoint_json_has_raw_fields_and_normalized_url() {
         let response = ServiceEndpointResponse {
+            application_url: String::new(),
+            gateway_url: String::new(),
             endpoint: Some(ServiceEndpoint {
                 metadata: Some(ObjectMeta {
                     workspace: "team-a".to_string(),
@@ -7357,6 +7368,8 @@ mod tests {
                 "target_port": 8080,
                 "authorization_mode": "bearer_passthrough",
                 "url": "https://api.openshell.localhost:17670/",
+                "application_url": "",
+                "gateway_url": "",
             })
         );
         assert!(service_endpoint_to_json(&ServiceEndpointResponse::default(), "unused").is_none());
@@ -8114,6 +8127,20 @@ mod tests {
 
         assert!(rootfs_tar_sources_supported_for_gateway(Some(&metadata)));
         assert!(rootfs_tar_sources_supported_for_gateway(None));
+    }
+
+    #[test]
+    fn application_origin_is_preserved_when_gateway_uses_a_port_forward() {
+        let response = ServiceEndpointResponse {
+            application_url: "https://default--demo--web.services.example.com:10443/".into(),
+            gateway_url: "https://default--demo--web.api.example.com:8080/".into(),
+            url: "https://default--demo--web.services.example.com:10443/".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::preferred_service_url(&response, "https://localhost:29092"),
+            response.application_url
+        );
     }
 
     #[test]

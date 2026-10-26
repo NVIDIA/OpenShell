@@ -26,7 +26,9 @@ func TestServiceEndpointFromProto(t *testing.T) {
 			Domain:            true,
 			AuthorizationMode: pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH,
 		},
-		Url: "https://svc-1.example.com",
+		Url:            "https://svc-1.example.com",
+		ApplicationUrl: "https://svc-1.example.com",
+		GatewayUrl:     "https://gateway-svc.example.com:8080",
 	}
 
 	se := ServiceEndpointFromProto(resp)
@@ -40,6 +42,9 @@ func TestServiceEndpointFromProto(t *testing.T) {
 	assert.True(t, se.Domain)
 	assert.Equal(t, v1.ServiceAuthorizationModeBearerPassthrough, se.AuthorizationMode)
 	assert.Equal(t, "https://svc-1.example.com", se.URL)
+	assert.Equal(t, resp.ApplicationUrl, se.ApplicationURL)
+	assert.Equal(t, resp.GatewayUrl, se.GatewayURL)
+	assert.Equal(t, resp, ServiceEndpointToProto(se))
 }
 
 func TestServiceEndpointFromProto_NilEndpoint(t *testing.T) {

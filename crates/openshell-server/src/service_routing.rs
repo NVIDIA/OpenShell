@@ -9,6 +9,8 @@ use axum::{
 };
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
+pub use openshell_core::app_listener::service_route_hash_label;
+use openshell_core::app_listener::service_route_label;
 use openshell_core::config::ServiceRoutingConfig;
 use openshell_core::proto::{
     Sandbox, SandboxPhase, ServiceAuthorizationMode, ServiceEndpoint, TcpRelayTarget, relay_open,
@@ -19,7 +21,6 @@ use openshell_ocsf::{
     HttpActivityBuilder, HttpRequest, HttpResponse as OcsfHttpResponse, NetworkActivityBuilder,
     OcsfEvent, SeverityId, StateId, StatusId, Url as OcsfUrl,
 };
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -198,69 +199,10 @@ fn endpoint_host(
     service: &str,
 ) -> Option<String> {
     let base_domain = config.base_domains.first()?;
-    Some(discriminator.map_or_else(
-        || {
-            if service.is_empty() {
-                format!("{workspace}--{sandbox}.{base_domain}")
-            } else {
-                format!("{workspace}--{sandbox}--{service}.{base_domain}")
-            }
-        },
-        |gateway_name| {
-            format!(
-                "{}.{}",
-                service_route_hash_label(
-                    gateway_name,
-                    workspace,
-                    sandbox,
-                    (!service.is_empty()).then_some(service),
-                ),
-                base_domain
-            )
-        },
+    Some(format!(
+        "{}.{base_domain}",
+        service_route_label(discriminator, workspace, sandbox, service)
     ))
-}
-
-/// Returns the stable, one-label DNS name for a service route.
-pub fn service_route_hash_label(
-    gateway_name: &str,
-    workspace: &str,
-    sandbox: &str,
-    service: Option<&str>,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(gateway_name.as_bytes());
-    hasher.update([0]);
-    hasher.update(workspace.as_bytes());
-    hasher.update([0]);
-    hasher.update(sandbox.as_bytes());
-    hasher.update([0]);
-    hasher.update(service.unwrap_or("").as_bytes());
-    let digest = hasher.finalize();
-    base32_lower_no_padding(&digest[..10])
-}
-
-fn base32_lower_no_padding(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-    let mut output = String::with_capacity(16);
-    let mut accumulator = 0_u32;
-    let mut bits = 0_u8;
-    for byte in bytes {
-        accumulator = (accumulator << 8) | u32::from(*byte);
-        bits += 8;
-        while bits >= 5 {
-            bits -= 5;
-            output.push(char::from(
-                ALPHABET[((accumulator >> bits) & 0x1f) as usize],
-            ));
-        }
-    }
-    if bits > 0 {
-        output.push(char::from(
-            ALPHABET[((accumulator << (5 - bits)) & 0x1f) as usize],
-        ));
-    }
-    output
 }
 
 /// A resolved service-route destination.
@@ -1526,6 +1468,48 @@ mod tests {
             endpoint_url(&cfg, "staging", "my-sandbox", "web").as_deref(),
             Some("http://staging--my-sandbox--web.dev.openshell.localhost:8080/")
         );
+    }
+
+    #[test]
+    fn switching_ingress_preserves_public_urls_in_both_hostname_modes() {
+        for format in [
+            ServiceHostnameFormat::Readable,
+            ServiceHostnameFormat::Hashed,
+        ] {
+            let mut cfg = openshell_core::Config::new(Some(tls_config()))
+                .with_bind_address("0.0.0.0:443".parse().unwrap())
+                .with_server_sans(["*.apps.example.com"])
+                .with_name("gateway-a")
+                .with_service_hostname_format(format);
+            cfg.supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+                enabled: true,
+                port: 9443,
+                domain: "apps.example.com".into(),
+                public_url: Some("https://apps.example.com".into()),
+            };
+            for workspace in ["default", "team-a"] {
+                for service in ["", "web"] {
+                    let application_url = cfg
+                        .supervisor_app_listener
+                        .service_url(
+                            workspace,
+                            "my-sandbox",
+                            service,
+                            cfg.service_routing_discriminator(),
+                        )
+                        .unwrap();
+                    // Switching to gateway ingress removes listener configuration,
+                    // but preserves the installation identity and public origin.
+                    let listener = std::mem::take(&mut cfg.supervisor_app_listener);
+                    let gateway_url = endpoint_url(&cfg, workspace, "my-sandbox", service).unwrap();
+                    assert_eq!(
+                        application_url, gateway_url,
+                        "{format:?}: {workspace}/{service}"
+                    );
+                    cfg.supervisor_app_listener = listener;
+                }
+            }
+        }
     }
 
     #[test]

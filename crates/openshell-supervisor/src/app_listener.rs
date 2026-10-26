@@ -69,6 +69,7 @@ impl Config {
         };
         let address: SocketAddr = address.parse().into_diagnostic()?;
         openshell_core::app_listener::AppListenerConfig {
+            public_url: None,
             enabled: true,
             port: address.port(),
             domain: domain.clone(),
@@ -280,7 +281,7 @@ impl Routes {
             return;
         }
         if let Some(registration) = &self.registration
-            && !registration.bind(&result.workspace, &self.stopped)
+            && !registration.bind(&result.workspace, &routes, &self.stopped)
         {
             self.suspend();
             return;
@@ -366,15 +367,19 @@ impl Routes {
         domain: &str,
     ) -> Option<(SandboxServiceRoute, RouteToken)> {
         let encoded = sni.strip_suffix(&format!(".{domain}"))?;
-        let service = if encoded == prefix {
-            ""
-        } else {
-            encoded.strip_prefix(&format!("{prefix}--"))?
-        };
         let snapshot = self.sender.borrow();
         if self.serving_expiry(&snapshot)? <= Instant::now() {
             return None;
         }
+        let service = if let Some(route) = snapshot.routes.values().find(|route| {
+            !route.application_hostname.is_empty() && route.application_hostname == sni
+        }) {
+            route.name.as_str()
+        } else if encoded == prefix {
+            ""
+        } else {
+            encoded.strip_prefix(&format!("{prefix}--"))?
+        };
         Some((
             snapshot.routes.get(service)?.clone(),
             RouteToken {
@@ -432,12 +437,38 @@ struct Registration {
     router: Router,
     sandbox: String,
     prefix: Mutex<String>,
+    hostnames: Mutex<Vec<String>>,
     sender: mpsc::Sender<Accepted>,
 }
 
 impl Registration {
-    fn bind(&self, workspace: &str, stopped: &AtomicBool) -> bool {
+    fn bind(
+        &self,
+        workspace: &str,
+        routes: &BTreeMap<String, SandboxServiceRoute>,
+        stopped: &AtomicBool,
+    ) -> bool {
         let next = format!("{workspace}--{}", self.sandbox);
+        let mut names = vec![next.clone()];
+        for route in routes.values() {
+            if route.application_hostname.is_empty() {
+                continue; // Older gateways only supplied the readable route identity.
+            }
+            let Some(label) = route
+                .application_hostname
+                .strip_suffix(&format!(".{}", self.router.domain))
+            else {
+                return false;
+            };
+            if !valid_label(label) || route.application_hostname.len() > 253 {
+                return false;
+            }
+            names.push(route.application_hostname.clone());
+        }
+        names.sort();
+        if names.windows(2).any(|pair| pair[0] == pair[1]) {
+            return false;
+        }
         let mut prefix = self
             .prefix
             .lock()
@@ -448,33 +479,48 @@ impl Registration {
         if stopped.load(Ordering::Acquire) {
             return false;
         }
+        let mut hostnames = self
+            .hostnames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut entries = self
             .router
             .registrations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if entries
-            .get(&next)
-            .is_some_and(|sender| !sender.same_channel(&self.sender))
-        {
+        // Check the whole replacement before changing any registration. An exact
+        // hashed label must never select an arbitrary sandbox on a shared host.
+        if names.iter().any(|name| {
+            entries
+                .get(name)
+                .is_some_and(|sender| !sender.same_channel(&self.sender))
+        }) {
             return false;
         }
-        if *prefix != next {
+        for name in hostnames.iter() {
             if entries
-                .get(&*prefix)
-                .is_some_and(|s| s.same_channel(&self.sender))
+                .get(name)
+                .is_some_and(|sender| sender.same_channel(&self.sender))
             {
-                entries.remove(&*prefix);
+                entries.remove(name);
             }
-            prefix.clone_from(&next);
         }
-        entries.insert(next, self.sender.clone());
+        for name in &names {
+            entries.insert(name.clone(), self.sender.clone());
+        }
+        *prefix = next;
+        *hostnames = names;
         true
     }
 
     fn remove(&self) {
-        let prefix = self
+        // Use the same lock as bind's stopped check, including exact aliases.
+        let _prefix = self
             .prefix
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hostnames = self
+            .hostnames
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut entries = self
@@ -482,11 +528,13 @@ impl Registration {
             .registrations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if entries
-            .get(&*prefix)
-            .is_some_and(|s| s.same_channel(&self.sender))
-        {
-            entries.remove(&*prefix);
+        for name in hostnames.iter() {
+            if entries
+                .get(name)
+                .is_some_and(|sender| sender.same_channel(&self.sender))
+            {
+                entries.remove(name);
+            }
         }
     }
 }
@@ -553,6 +601,7 @@ impl Router {
             router: self.clone(),
             sandbox: sandbox.to_string(),
             prefix: Mutex::new(String::new()),
+            hostnames: Mutex::new(Vec::new()),
             sender,
         });
         Ok(InstanceListener {
@@ -592,10 +641,15 @@ impl BoundListener {
                             let Ok(Ok(tls)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await else { return; };
                             let Some(sni) = tls.get_ref().1.server_name() else { return; };
                             let Some(label) = sni.strip_suffix(&format!(".{domain}")) else { return; };
-                            let mut segments = label.split("--");
-                            let (Some(workspace), Some(sandbox)) = (segments.next(), segments.next()) else { return; };
-                            let prefix = format!("{workspace}--{sandbox}");
-                            let sender = dispatch.registrations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&prefix).cloned();
+                            let sender = {
+                                let entries = dispatch.registrations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                entries.get(sni).cloned().or_else(|| {
+                                    // Keep readable aliases during migration, as gateway routing does.
+                                    let mut segments = label.split("--");
+                                    let (Some(workspace), Some(sandbox)) = (segments.next(), segments.next()) else { return None; };
+                                    entries.get(&format!("{workspace}--{sandbox}")).cloned()
+                                })
+                            };
                             if let Some(sender) = sender { let _ = sender.try_send(Accepted { tls, permit }); }
                         });
                     }
@@ -945,6 +999,7 @@ mod tests {
             target_port: 8080,
             authorization_mode: 1,
             resource_version: 1,
+            application_hostname: String::new(),
         };
         let mut config = installed(vec![route.clone()]);
         config.config_revision = 42;
@@ -983,6 +1038,7 @@ mod tests {
             target_port: 8080,
             authorization_mode: 1,
             resource_version: 1,
+            application_hostname: String::new(),
         };
         routes.install(&installed(vec![route.clone()]));
         assert!(
@@ -1209,6 +1265,7 @@ mod tests {
             target_port: 8080,
             authorization_mode: 1,
             resource_version: 1,
+            application_hostname: String::new(),
         };
         routes.install(&installed(vec![route.clone()]));
         let connector = Arc::new(Connector {
@@ -1279,6 +1336,96 @@ mod tests {
         assert!(
             response.contains(&format!("/hello?x=1 {authority} stripped {origin}")),
             "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hashed_sni_routes_to_the_correct_instance_and_replacement_withdraws_old_names() {
+        let f = fixture();
+        let hostname = |gateway, sandbox, service| {
+            format!(
+                "{}.svc.openshell.internal",
+                openshell_core::app_listener::service_route_hash_label(
+                    gateway,
+                    "default",
+                    sandbox,
+                    Some(service)
+                )
+            )
+        };
+        let first_host = hostname("gateway-a", "sandbox-a", "web");
+        let mut first = f.route.clone();
+        first.application_hostname.clone_from(&first_host);
+        f.routes.install(&installed(vec![first.clone()]));
+        assert!(
+            request(&f, &first_host, &first_host, "")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        assert!(
+            request(&f, &first_host, HOST, "")
+                .await
+                .starts_with("HTTP/1.1 421")
+        );
+        // Readable migration aliases remain usable, as with gateway-mediated hosts.
+        assert!(
+            request(&f, HOST, HOST, "")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        let before = f.connector.calls.load(Ordering::SeqCst);
+        let foreign = hostname("gateway-b", "sandbox-a", "web");
+        assert!(
+            !request(&f, &foreign, &foreign, "")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        assert_eq!(f.connector.calls.load(Ordering::SeqCst), before);
+
+        let second = f.host.router().instance("sandbox-b").unwrap();
+        let second_routes = second.routes.clone();
+        let connector = Arc::new(Connector {
+            calls: AtomicUsize::new(0),
+        });
+        let handle = second.start(rpc_test::loopback(connector.clone()));
+        // A canonical hostname collision cannot steal another instance's mapping.
+        second_routes.install(&installed(vec![first.clone()]));
+        assert!(second_routes.sender.borrow().routes.is_empty());
+        let second_host = hostname("gateway-a", "sandbox-b", "web");
+        second_routes.install(&installed(vec![SandboxServiceRoute {
+            application_hostname: second_host.clone(),
+            endpoint_id: "endpoint-b".into(),
+            ..first.clone()
+        }]));
+        assert!(
+            request(&f, &second_host, &second_host, "")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
+        let (_, token) = f
+            .routes
+            .resolve(&first_host, "default--sandbox-a", "svc.openshell.internal")
+            .unwrap();
+        let mut replacement = first.clone();
+        replacement.application_hostname.clone_from(&foreign);
+        f.routes.install(&installed(vec![replacement]));
+        assert!(!f.routes.valid(&first, token));
+        assert!(
+            !request(&f, &first_host, &first_host, "")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        assert!(
+            request(&f, &foreign, &foreign, "")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        drop(handle);
+        assert!(
+            !request(&f, &second_host, &second_host, "")
+                .await
+                .starts_with("HTTP/1.1 200")
         );
     }
 
@@ -1364,7 +1511,18 @@ mod tests {
         });
         let mut installing_routes = f.routes.clone();
         installing_routes.install_probe = Some(probe.clone());
-        let snapshot = installed(vec![f.route.clone()]);
+        let hostname = format!(
+            "{}.svc.openshell.internal",
+            openshell_core::app_listener::service_route_hash_label(
+                "gateway-a",
+                "default",
+                "sandbox-a",
+                Some("web")
+            )
+        );
+        let mut route = f.route.clone();
+        route.application_hostname.clone_from(&hostname);
+        let snapshot = installed(vec![route.clone()]);
         let installer = std::thread::spawn(move || installing_routes.install(&snapshot));
         probe.checked_running.wait();
         // Complete shutdown after install's optimistic stopped check but
@@ -1380,12 +1538,20 @@ mod tests {
                 .unwrap()
                 .contains_key("default--sandbox-a")
         );
+        assert!(
+            !f.host
+                .router()
+                .registrations
+                .lock()
+                .unwrap()
+                .contains_key(&hostname)
+        );
         let replacement = f.host.router().instance("sandbox-a").unwrap();
-        replacement.routes.install(&installed(vec![f.route]));
+        replacement.routes.install(&installed(vec![route]));
         assert!(
             replacement
                 .routes
-                .resolve(HOST, "default--sandbox-a", "svc.openshell.internal")
+                .resolve(&hostname, "default--sandbox-a", "svc.openshell.internal")
                 .is_some(),
             "the stopped instance must not prevent its replacement from serving"
         );
@@ -1400,6 +1566,7 @@ mod tests {
             target_port: 8080,
             authorization_mode: 1,
             resource_version: 1,
+            application_hostname: String::new(),
         };
         routes.install(&installed(vec![route.clone()]));
         for _ in 0..10 {
@@ -1512,47 +1679,68 @@ mod tests {
         assert!(!headers.contains_key("x-internal"));
     }
     #[tokio::test]
-    async fn websocket_echo_closes_on_route_withdrawal() {
-        let f = fixture();
-        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[f.address])
-            .await
-            .unwrap();
-        let name = rustls::pki_types::ServerName::try_from(HOST.to_string()).unwrap();
-        let tls = tokio_rustls::TlsConnector::from(f.tls.clone())
-            .connect(name, stream)
-            .await
-            .unwrap();
-        let mut request = format!("wss://{HOST}/echo").into_client_request().unwrap();
-        request
-            .headers_mut()
-            .insert(header::ORIGIN, format!("https://{HOST}").parse().unwrap());
-        let (mut ws, response) = tokio_tungstenite::client_async(request, tls).await.unwrap();
-        assert_eq!(response.headers()["x-test-upstream-host"], HOST);
-        assert_eq!(
-            response.headers()["x-test-upstream-origin"],
-            format!("https://{HOST}")
-        );
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            "hello".into(),
-        ))
-        .await
-        .unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), ws.next())
+    async fn readable_and_hashed_websocket_echo_closes_on_route_withdrawal() {
+        for hashed in [false, true] {
+            let f = fixture();
+            let hostname = if hashed {
+                format!(
+                    "{}.svc.openshell.internal",
+                    openshell_core::app_listener::service_route_hash_label(
+                        "gateway-a",
+                        "default",
+                        "sandbox-a",
+                        Some("web")
+                    )
+                )
+            } else {
+                HOST.to_string()
+            };
+            let mut route = f.route.clone();
+            route.application_hostname.clone_from(&hostname);
+            f.routes.install(&installed(vec![route]));
+            let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[f.address])
                 .await
-                .unwrap()
-                .unwrap()
-                .unwrap()
-                .to_text()
-                .unwrap(),
-            "hello"
-        );
-        f.routes.suspend();
-        let closed = tokio::time::timeout(Duration::from_secs(2), ws.next())
+                .unwrap();
+            let name = rustls::pki_types::ServerName::try_from(hostname.clone()).unwrap();
+            let tls = tokio_rustls::TlsConnector::from(f.tls.clone())
+                .connect(name, stream)
+                .await
+                .unwrap();
+            let mut request = format!("wss://{hostname}/echo")
+                .into_client_request()
+                .unwrap();
+            request.headers_mut().insert(
+                header::ORIGIN,
+                format!("https://{hostname}").parse().unwrap(),
+            );
+            let (mut ws, response) = tokio_tungstenite::client_async(request, tls).await.unwrap();
+            assert_eq!(response.headers()["x-test-upstream-host"], hostname);
+            assert_eq!(
+                response.headers()["x-test-upstream-origin"],
+                format!("https://{hostname}")
+            );
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                "hello".into(),
+            ))
             .await
             .unwrap();
-        assert!(closed.is_none() || closed.unwrap().is_err());
-        assert_eq!(f.connector.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), ws.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .to_text()
+                    .unwrap(),
+                "hello"
+            );
+            f.routes.suspend();
+            let closed = tokio::time::timeout(Duration::from_secs(2), ws.next())
+                .await
+                .unwrap();
+            assert!(closed.is_none() || closed.unwrap().is_err());
+            assert_eq!(f.connector.calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     type TestWebSocket =
