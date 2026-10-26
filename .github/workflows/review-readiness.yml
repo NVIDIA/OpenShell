@@ -47,12 +47,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_ACTION: ${{ github.event.action }}
-        shell: bash
+          PR_EVENT: ${{ github.event.action }}
         run: |
-          set -euo pipefail
-          args=(--repo "$GH_REPO" --pr "$PR_NUMBER" --apply)
-          if [ "$PR_ACTION" = opened ]; then
-            args+=(--label-accepted-work)
-          fi
-          python3 tasks/scripts/check_review_readiness.py "${args[@]}"
+          python3 tasks/scripts/check_review_readiness.py \
+            --repo "$GH_REPO" --pr "$PR_NUMBER" --event "$PR_EVENT" --apply
