@@ -1107,8 +1107,9 @@ enum ReconcileJob {
     Retry,
 }
 
-/// A finished registry job of stream `stream`; `revision` is the snapshot
-/// revision it applied, if any.
+/// A finished registry job of stream `stream`; `revision` is the newest
+/// snapshot revision applied on that stream so far, by this job or an
+/// earlier one, if any.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Applied {
     sequence: u64,
@@ -1218,7 +1219,7 @@ impl Reconciler {
                 self.wake.notified().await;
                 continue;
             };
-            let (revision, ok) = match job {
+            let (newly_applied, ok) = match job {
                 ReconcileJob::Snapshot(snapshot) => match host.reconcile(&snapshot).await {
                     Ok(()) => (Some(snapshot.revision), true),
                     Err(error) => {
@@ -1232,11 +1233,15 @@ impl Reconciler {
                 }
             };
             self.state().busy = false;
+            // The watch keeps only the latest job, so each one carries its
+            // stream's last applied revision; a stream that reads it after a
+            // later retry or refusal still learns what it applied.
             self.done.send_modify(|applied| {
+                let carried = applied.revision.filter(|_| applied.stream == stream);
                 *applied = Applied {
                     sequence: applied.sequence + 1,
                     stream,
-                    revision,
+                    revision: newly_applied.or(carried),
                     ok,
                 };
             });
@@ -1452,13 +1457,18 @@ async fn run_stream(
                     break lost(accepted);
                 }
                 let applied = *finished.borrow_and_update();
-                if applied.stream == stream
+                let advanced = if applied.stream == stream
                     && let Some(revision) = applied.revision
+                    && revision != applied_revision
                 {
                     applied_revision = revision;
-                }
-                // A refused snapshot changes nothing to report.
-                if applied.ok {
+                    true
+                } else {
+                    false
+                };
+                // A refused snapshot changes nothing to report, but one
+                // applied just before it, unseen until now, is acknowledged.
+                if applied.ok || advanced {
                     changes.mark_unchanged();
                     if accepted && !send(status_message(host, applied_revision), send_deadline(last_heard)).await {
                         break lost(accepted);
@@ -1711,6 +1721,10 @@ mod tests {
     async fn assignment_lifecycle_lines_name_their_route_in_shorthand_output() {
         use tracing_subscriber::layer::SubscriberExt as _;
         let captured = Captured::default();
+        // Keep two dispatchers alive so tracing consults registered subscribers
+        // when caching callsite interest. With only one, a parallel test thread
+        // without a default subscriber can cache `Interest::never` for our events.
+        let _other_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let _logging =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(
                 openshell_ocsf::OcsfShorthandLayer::new(captured.clone()).with_non_ocsf(true),
@@ -1735,6 +1749,19 @@ mod tests {
             admit_supervising(&host, route, stop);
             stops.push(stops_of);
         }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while host
+                .list()
+                .iter()
+                .filter(|status| status.phase == SandboxInstancePhaseReport::Supervising)
+                .count()
+                < 2
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("instances supervise");
         host.reconcile(&AssignmentSnapshot {
             revision: 1,
             pool: true,
@@ -2294,6 +2321,155 @@ mod tests {
                 .peak
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
+        );
+    }
+
+    /// What the worker published once `sequence` jobs have finished, read
+    /// without marking the watch seen, as a stream that is busy elsewhere
+    /// would find it.
+    async fn applied_after(reconciler: &Reconciler, sequence: u64) -> Applied {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let applied = *reconciler.done.borrow();
+                if applied.sequence >= sequence {
+                    return applied;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the worker finishes its jobs")
+    }
+
+    /// A retry or a refused snapshot finishing before the stream reads the
+    /// worker's watch keeps the stream's acknowledged revision, and a new
+    /// stream never inherits one acknowledged on an older stream, even from
+    /// a job that finished after the new stream began.
+    #[tokio::test]
+    async fn applied_revisions_survive_later_jobs_of_their_stream_only() {
+        let root = tempfile::tempdir().unwrap();
+        let host = SharedHost::start(SharedHostConfig {
+            gateway_endpoint: "https://gateway.invalid".to_string(),
+            instance_root: root.path().join("instances"),
+            runtime_listen: "127.0.0.1:0".parse().unwrap(),
+            removal_grace: Duration::from_secs(10),
+            pool: PoolIdentity {
+                member_id: "member-1".to_string(),
+                member_uid: "uid-1".to_string(),
+                runtime_address: "127.0.0.1:5500".parse().unwrap(),
+            },
+        })
+        .unwrap();
+        let reconciler = Reconciler::start(host.clone());
+        let snapshot = |revision, pool| AssignmentSnapshot {
+            revision,
+            pool,
+            ..AssignmentSnapshot::default()
+        };
+
+        let first = reconciler.begin_stream();
+        reconciler.submit(first, snapshot(3, true));
+        assert_eq!(applied_after(&reconciler, 1).await.revision, Some(3));
+        // A retry finishes before the stream looks: revision 3 stays acked.
+        reconciler.submit_retry(first);
+        let retried = applied_after(&reconciler, 2).await;
+        assert_eq!(
+            (retried.stream, retried.revision, retried.ok),
+            (first, Some(3), true)
+        );
+        // A refused snapshot acknowledges nothing new and forgets nothing.
+        reconciler.submit(first, snapshot(4, false));
+        let refused = applied_after(&reconciler, 3).await;
+        assert_eq!(
+            (refused.stream, refused.revision, refused.ok),
+            (first, Some(3), false)
+        );
+
+        // A snapshot of the first stream still in flight when the second
+        // begins finishes under the first stream's name.
+        let (release, gate) = tokio::sync::oneshot::channel();
+        *host.reconcile_probe.gate.lock().unwrap() = Some(gate);
+        reconciler.submit(first, snapshot(5, true));
+        while host
+            .reconcile_probe
+            .running
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let second = reconciler.begin_stream();
+        release.send(()).unwrap();
+        let late = applied_after(&reconciler, 4).await;
+        assert_eq!((late.stream, late.revision), (first, Some(5)));
+        // The second stream's retry acknowledges nothing of the first's.
+        reconciler.submit_retry(second);
+        let fresh = applied_after(&reconciler, 5).await;
+        assert_eq!(
+            (fresh.stream, fresh.revision, fresh.ok),
+            (second, None, true)
+        );
+        reconciler.submit(second, snapshot(1, true));
+        applied_after(&reconciler, 6).await;
+        reconciler.submit_retry(second);
+        let kept = applied_after(&reconciler, 7).await;
+        assert_eq!((kept.stream, kept.revision), (second, Some(1)));
+        reconciler.shut_down().await;
+        host.shut_down().await;
+    }
+
+    /// A snapshot applied just before a malformed one is refused is still
+    /// acknowledged, though the stream only sees the refusal finish; the
+    /// malformed revision never is.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_right_after_an_applied_snapshot_still_reports_its_revision() {
+        let (host, _gateway, mut streams, _root) = attach_pool_host(vec![Attempt::Now]);
+        let (release, gate) = tokio::sync::oneshot::channel();
+        *host.reconcile_probe.gate.lock().unwrap() = Some(gate);
+        let (mut reported, gateway) = serve(streams.recv().await.unwrap());
+        assert_eq!(reported.recv().await.unwrap().applied_revision, 0);
+        gateway.send(Ok(pool_snapshot(7))).await.unwrap();
+        while host
+            .reconcile_probe
+            .running
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The malformed snapshot waits behind the stalled one, then is
+        // refused without the worker yielding in between.
+        gateway
+            .send(Ok(gateway_message(
+                host_gateway_message::Payload::Assignments(AssignmentSnapshot {
+                    revision: 8,
+                    ..AssignmentSnapshot::default()
+                }),
+            )))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        release.send(()).unwrap();
+        let acknowledged = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let status = reported.recv().await.unwrap();
+                assert_ne!(
+                    status.applied_revision, 8,
+                    "acknowledged a refused snapshot"
+                );
+                if status.applied_revision == 7 {
+                    break status;
+                }
+            }
+        })
+        .await
+        .expect("the applied snapshot is acknowledged");
+        assert_eq!(acknowledged.applied_revision, 7);
+        assert_eq!(
+            host.reconcile_probe
+                .entered
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
         );
     }
 

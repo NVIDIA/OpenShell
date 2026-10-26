@@ -595,14 +595,19 @@ fn decode_owner(record: &ObjectRecord) -> Option<OwnerRecord> {
     })
 }
 
-/// The report row of each route's current, granted owner term.
+/// The report row of each route's current, granted owner term, except of
+/// routes whose owner's process is not confirmed live.
 fn reports_of_owners(
     owners: &BTreeMap<String, OwnerRecord>,
     rows: &ReportRows,
+    unconfirmed: &BTreeSet<String>,
 ) -> BTreeMap<String, SandboxInstanceStatus> {
     owners
         .values()
-        .filter(|owner| owner.payload.phase == OwnerPhase::Granted)
+        .filter(|owner| {
+            owner.payload.phase == OwnerPhase::Granted
+                && !unconfirmed.contains(&owner.payload.route)
+        })
         .filter_map(|owner| {
             let (report, _) = rows.get(&report_object_id(
                 &owner.payload.route,
@@ -2078,6 +2083,10 @@ impl SupervisorPool {
         let mut charges = charges_of(&self.capacities().await?);
         let stopping = self.controller.stopping_routes();
         self.forget_owned(&desired, &owners);
+        // Routes whose granted owner's process is not confirmed live: its
+        // report describes a process that may be gone, so it renders no
+        // verdict until a new term is granted.
+        let mut unconfirmed = BTreeSet::new();
         for (route, instance) in &desired {
             if stopping.contains(route) {
                 continue;
@@ -2093,13 +2102,17 @@ impl SupervisorPool {
                 Some(record) if record.payload.phase == OwnerPhase::Granting => {
                     self.complete_takeover(record.clone()).await
                 }
-                Some(record) if takeovers_allowed && !owner_alive(&record.payload, &members) => {
-                    match self.owner_failure(&record.payload).await {
-                        Ok(Some(cause)) => {
+                Some(record) if !owner_alive(&record.payload, &members) => {
+                    let failure = self.owner_failure(&record.payload).await;
+                    if !matches!(failure, Ok(None)) {
+                        unconfirmed.insert(route.clone());
+                    }
+                    match failure {
+                        Ok(Some(cause)) if takeovers_allowed => {
                             self.take_over(record, cause, &ring, &members, &charges)
                                 .await
                         }
-                        Ok(None) => Ok(Reconciled::Unchanged),
+                        Ok(_) => Ok(Reconciled::Unchanged),
                         Err(error) => Err(error),
                     }
                 }
@@ -2109,6 +2122,7 @@ impl SupervisorPool {
             };
             match outcome {
                 Ok(Reconciled::Changed(record)) => {
+                    unconfirmed.remove(route);
                     recharge(
                         &mut charges,
                         route,
@@ -2140,7 +2154,7 @@ impl SupervisorPool {
         self.sweep_ended_instances(&desired).await;
         self.record_reports(&owners, &report_rows).await;
         self.remove_stale_reports(&owners, &report_rows).await;
-        let reports = reports_of_owners(&owners, &report_rows);
+        let reports = reports_of_owners(&owners, &report_rows, &unconfirmed);
         let materials = self.load_materials(&owners, &desired).await;
         // Only granted terms are served; pending intents stay recorded for
         // the next pass.
@@ -4027,6 +4041,66 @@ mod tests {
         );
     }
 
+    /// A ready report of an owner whose process failed claims nothing while
+    /// no member can take the instance over, whether the survivors are full
+    /// or none is left; the owner record stays for the takeover, and the
+    /// new term's report counts once one is granted.
+    #[tokio::test]
+    async fn a_failed_owner_awaiting_capacity_is_not_reported_ready() {
+        for survivors_full in [true, false] {
+            let fixture = Fixture::new().await;
+            fixture.member("m1", "p1", false).await;
+            let route = fixture.fill("m1", "p1", 1).await.remove(0);
+            if survivors_full {
+                fixture.member("m2", "p2", false).await;
+                fixture.fill("m2", "p2", MAX_ASSIGNED_INSTANCES).await;
+            }
+            let report = |member: &str, process: &str, auth_epoch| ReportPayload {
+                route: route.clone(),
+                member_id: member.to_string(),
+                process_id: process.to_string(),
+                auth_epoch,
+                sandbox_id: "sandbox-m1-0".to_string(),
+                phase: 2,
+                ready: true,
+                exit_code: 0,
+                connected_at_ms: 0,
+            };
+            fixture.write_report(report("m1", "p1", 1)).await;
+            let pool = fixture.replica("gw-a");
+            pool.reconcile_once().await.unwrap();
+            assert_eq!(published_report(&pool, &route), Some((2, true)));
+
+            // m1's process dies and its member record expires.
+            fixture.remove_member("m1").await;
+            pool.reconcile_once().await.unwrap();
+            let owner = fixture.owner(&route).await.unwrap();
+            assert_eq!(
+                (owner.member_id.as_str(), owner.auth_epoch, owner.phase),
+                ("m1", 1, OwnerPhase::Granted),
+                "the owner record waits for capacity"
+            );
+            assert_eq!(fixture.report_rows(&route).await.len(), 1);
+            assert_eq!(published_report(&pool, &route), None);
+            assert_eq!(
+                pool.controller.observed(&route),
+                openshell_supervisor_control::ObservedInstance::NoHost
+            );
+
+            // A member with room joins and takes the instance over.
+            fixture.member("m3", "p3", false).await;
+            pool.reconcile_once().await.unwrap();
+            let owner = fixture.owner(&route).await.unwrap();
+            assert_eq!(
+                (owner.member_id.as_str(), owner.auth_epoch, owner.phase),
+                ("m3", 2, OwnerPhase::Granted)
+            );
+            fixture.write_report(report("m3", "p3", 2)).await;
+            pool.reconcile_once().await.unwrap();
+            assert_eq!(published_report(&pool, &route), Some((2, true)));
+        }
+    }
+
     /// One more instance than a listing page, the live one listed last and
     /// owned by `m1`; returns the routes and a replica that places nothing,
     /// whose first pass has loaded the view.
@@ -4127,9 +4201,13 @@ mod tests {
 
     /// A pass on `gw-a` that listed members while `m1` was the only one,
     /// then paused in its report listing while `m2` joined and `gw-b`
-    /// admitted a route on it; `after` then happens to `m2`, and the pass
-    /// resumes. Returns the route.
-    async fn pass_after_a_member_joined(fixture: &Fixture, after: AfterJoin) -> String {
+    /// admitted a route on it, whose launch term `m2` reported ready; `after`
+    /// then happens to `m2`, and the pass resumes. Returns the route and the
+    /// replica.
+    async fn pass_after_a_member_joined(
+        fixture: &Fixture,
+        after: AfterJoin,
+    ) -> (String, Arc<SupervisorPool>) {
         fixture.member("m1", "p1", false).await;
         // A full first page, so the report listing pauses after the
         // membership listing and before the owner listing.
@@ -4171,6 +4249,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fixture.owner(&route).await.unwrap().member_id, "m2");
+        fixture
+            .write_report(ReportPayload {
+                route: route.clone(),
+                member_id: "m2".to_string(),
+                process_id: "p2".to_string(),
+                auth_epoch: 1,
+                sandbox_id: sandbox.clone(),
+                phase: 2,
+                ready: true,
+                exit_code: 0,
+                connected_at_ms: 0,
+            })
+            .await;
         match after {
             AfterJoin::Stays => {}
             AfterJoin::Restarts => fixture.member("m2", "p3", false).await,
@@ -4180,7 +4271,7 @@ mod tests {
         }
         resume.send(()).unwrap();
         pass.await.unwrap().unwrap();
-        route
+        (route, pool)
     }
 
     async fn gw_b_members(fixture: &Fixture) -> Vec<LiveMember> {
@@ -4190,7 +4281,7 @@ mod tests {
     #[tokio::test]
     async fn a_member_that_joined_mid_pass_keeps_the_route_it_was_given() {
         let fixture = Fixture::new().await;
-        let route = pass_after_a_member_joined(&fixture, AfterJoin::Stays).await;
+        let (route, pool) = pass_after_a_member_joined(&fixture, AfterJoin::Stays).await;
         let owner = fixture.owner(&route).await.unwrap();
         assert_eq!(
             (owner.member_id.as_str(), owner.process_id.as_str()),
@@ -4203,12 +4294,17 @@ mod tests {
             1,
             "the healthy owner's credentials are not revoked"
         );
+        assert_eq!(
+            published_report(&pool, &route),
+            Some((2, true)),
+            "the healthy owner's report still counts"
+        );
     }
 
     #[tokio::test]
     async fn an_unreadable_member_record_never_moves_its_route() {
         let fixture = Fixture::new().await;
-        let route = pass_after_a_member_joined(&fixture, AfterJoin::ReadFails).await;
+        let (route, _) = pass_after_a_member_joined(&fixture, AfterJoin::ReadFails).await;
         let owner = fixture.owner(&route).await.unwrap();
         assert_eq!((owner.member_id.as_str(), owner.auth_epoch), ("m2", 1));
         assert_eq!(fixture.auth_epoch(&owner.sandbox_id).await, 1);
@@ -4218,7 +4314,7 @@ mod tests {
     async fn a_member_that_failed_after_joining_mid_pass_loses_its_route() {
         for after in [AfterJoin::Restarts, AfterJoin::Leaves, AfterJoin::Expires] {
             let fixture = Fixture::new().await;
-            let route = pass_after_a_member_joined(&fixture, after).await;
+            let (route, _) = pass_after_a_member_joined(&fixture, after).await;
             let owner = fixture.owner(&route).await.unwrap();
             assert_eq!(
                 (owner.member_id.as_str(), owner.auth_epoch, owner.phase),

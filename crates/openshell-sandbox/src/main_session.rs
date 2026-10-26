@@ -314,7 +314,8 @@ impl MainOutputCursor {
     }
 }
 
-enum MainInput {
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub(crate) enum MainInput {
     Data(Vec<u8>),
     Close,
 }
@@ -325,6 +326,7 @@ pub(crate) struct MainInputSender {
 }
 
 impl MainInputSender {
+    #[cfg(test)]
     pub(crate) async fn send(&self, data: Vec<u8>) -> Result<(), &'static str> {
         self.sender
             .send(MainInput::Data(data))
@@ -332,8 +334,24 @@ impl MainInputSender {
             .map_err(|_| "canonical process stdin closed")
     }
 
-    async fn close(&self) {
-        let _ = self.sender.send(MainInput::Close).await;
+    /// Wait for room in the input queue. Delivering through the permit
+    /// cannot block, so it can be admitted under a short guard after the
+    /// wait.
+    pub(crate) async fn reserve(&self) -> Result<MainInputPermit<'_>, &'static str> {
+        self.sender
+            .reserve()
+            .await
+            .map(MainInputPermit)
+            .map_err(|_| "canonical process stdin closed")
+    }
+}
+
+/// Room for one input in a main process's queue.
+pub(crate) struct MainInputPermit<'a>(tokio::sync::mpsc::Permit<'a, MainInput>);
+
+impl MainInputPermit<'_> {
+    pub(crate) fn send(self, data: Vec<u8>) {
+        self.0.send(MainInput::Data(data));
     }
 }
 
@@ -362,8 +380,14 @@ impl MainSession {
     const CONTAINER_LOG_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     #[cfg(test)]
     pub fn inert() -> Arc<Self> {
-        let (input, _input_rx) = tokio::sync::mpsc::channel(64);
-        Arc::new(Self {
+        Self::inert_with_input().0
+    }
+
+    /// [`Self::inert`], and the queue its stdin is delivered to.
+    #[cfg(test)]
+    pub(crate) fn inert_with_input() -> (Arc<Self>, tokio::sync::mpsc::Receiver<MainInput>) {
+        let (input, input_rx) = tokio::sync::mpsc::channel(64);
+        let session = Arc::new(Self {
             pid: 1,
             terminal: false,
             input: MainInputSender { sender: input },
@@ -385,7 +409,8 @@ impl MainSession {
             terminal_attachments_done: Notify::new(),
             container_log: None,
             container_log_released: watch::channel(false).0,
-        })
+        });
+        (session, input_rx)
     }
 
     #[cfg(test)]
@@ -925,7 +950,16 @@ impl MainSession {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn close_input(&self, id: u64) {
+        let permit = self.input.reserve().await.ok();
+        self.close_input_reserved(id, permit);
+    }
+
+    /// Close stdin for input owner `id` through room reserved in the input
+    /// queue, or without delivering the close once the queue is gone.
+    /// Nothing here waits, so a caller can hold a short guard across it.
+    pub(crate) fn close_input_reserved(&self, id: u64, permit: Option<MainInputPermit<'_>>) {
         let owns_input = {
             let mut owner = self.input_owner.lock().expect("main input lock poisoned");
             if *owner == Some(id) {
@@ -935,8 +969,11 @@ impl MainSession {
                 false
             }
         };
-        if owns_input && !self.input_closed.swap(true, Ordering::AcqRel) {
-            self.input.close().await;
+        if owns_input
+            && !self.input_closed.swap(true, Ordering::AcqRel)
+            && let Some(MainInputPermit(permit)) = permit
+        {
+            permit.send(MainInput::Close);
         }
     }
 

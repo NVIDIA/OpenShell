@@ -2039,7 +2039,7 @@ mod linux {
 
     fn serve_one(
         mut stream: ControlStream,
-        runtime: &BoundaryRuntime,
+        runtime: &Arc<BoundaryRuntime>,
         principal: &SandboxProtocolPrincipal,
     ) -> Result<(), String> {
         stream
@@ -2110,7 +2110,7 @@ mod linux {
                 ) {
                     return Err(format!("write exec start response: {error}"));
                 }
-                return runtime.stream_process(stream, started.attachment);
+                return runtime.stream_process(stream, started.attachment, principal);
             }
             Request::AttachProcess { process_id } => {
                 let attachment = runtime.attach_process(&process_id);
@@ -2136,7 +2136,7 @@ mod linux {
                     },
                 )
                 .map_err(|error| format!("write process attachment response: {error}"))?;
-                return runtime.stream_process(stream, attachment);
+                return runtime.stream_process(stream, attachment, principal);
             }
             Request::LoopbackConnect { host, port } => {
                 let target = LoopbackTarget::new(host, port)
@@ -2476,6 +2476,9 @@ mod linux {
         /// runtime worker: an operation may hold it across `block_on`, which
         /// needs the workers to make progress.
         ownership: tokio::sync::RwLock<()>,
+        /// Changes whenever a connection is promoted, so attachments of the
+        /// connection it replaced stop at once; see [`InputFence`].
+        owner_changes: tokio::sync::watch::Sender<u64>,
         /// Runs between a promotion and the supervisory state recording it.
         #[cfg(test)]
         promotion_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -2794,6 +2797,7 @@ mod linux {
                 scheduled_recoveries: Mutex::new(Vec::new()),
                 admission: Mutex::new(()),
                 ownership: tokio::sync::RwLock::new(()),
+                owner_changes: tokio::sync::watch::Sender::new(0),
                 #[cfg(test)]
                 promotion_hook: Mutex::new(None),
                 binary_pins: crate::binary_pins::BinaryIdentityPins::default(),
@@ -3081,6 +3085,8 @@ mod linux {
             }
             *connection = SupervisorConnectionState::Connected(principal.connection_id());
             drop(connection);
+            self.owner_changes
+                .send_modify(|changes| *changes = changes.wrapping_add(1));
             if let Some(takeover) = takeover {
                 // Every connection of the replaced owner term is stale now,
                 // including ones that never attached.
@@ -3651,14 +3657,21 @@ mod linux {
             Ok((acquire_exec_attachment(handle)?, handle.terminal.is_some()))
         }
 
+        /// Bridge an attachment of `principal`'s connection, whose input
+        /// reaches the process only while that connection is in force.
         fn stream_process(
-            &self,
+            self: &Arc<Self>,
             stream: ControlStream,
             attachment: MainAttachment,
+            principal: &SandboxProtocolPrincipal,
         ) -> Result<(), String> {
+            let fence = InputFence {
+                runtime: self.clone(),
+                principal: principal.clone(),
+            };
             self.process_runtime.block_on(async move {
                 let stream = stream.into_tokio()?;
-                bridge_main_stream(stream, attachment).await
+                bridge_main_stream(stream, attachment, fence).await
             })
         }
 
@@ -4472,9 +4485,50 @@ mod linux {
         }
     }
 
+    /// Fences an attachment to the supervisor connection it was opened on.
+    /// Its stdin and EOF are delivered only under an owner operation of that
+    /// connection, after room in the input queue was reserved without one, so
+    /// queue backpressure never holds up a promotion; and the attachment ends,
+    /// releasing its input lease, once another connection is promoted, even
+    /// while it waits for room.
+    struct InputFence {
+        runtime: Arc<BoundaryRuntime>,
+        principal: SandboxProtocolPrincipal,
+    }
+
+    impl InputFence {
+        /// Resolves once another connection is in force. A terminating
+        /// session is not replaced, so its attachments still relay the exit.
+        async fn revoked(&self) {
+            let mut changes = self.runtime.owner_changes.subscribe();
+            loop {
+                if matches!(
+                    *lock(&self.runtime.supervisor_connection),
+                    SupervisorConnectionState::Connected(active)
+                        if active != self.principal.connection_id()
+                ) {
+                    return;
+                }
+                if changes.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+
+        /// Admit one delivery while this attachment's connection is the
+        /// owner in force; the delivery must not wait while admitted.
+        async fn admit(&self) -> Option<OwnershipGuard<'_>> {
+            self.runtime
+                .owner_operation_async(&self.principal)
+                .await
+                .ok()
+        }
+    }
+
     async fn bridge_main_stream(
         stream: openshell_isolation_interface::contract::BoundaryDuplexStream,
         attachment: MainAttachment,
+        fence: InputFence,
     ) -> Result<(), String> {
         let session = attachment.session.clone();
         let (mut reader, writer) = tokio::io::split(stream);
@@ -4483,26 +4537,50 @@ mod linux {
         let owner = input.as_ref().map(|(owner, _)| *owner);
         let mut output = session.subscribe();
         let input_session = session.clone();
+        let fence = Arc::new(fence);
+        let input_fence = fence.clone();
+        // Ended at once when another connection is promoted, which drops a
+        // reservation still waiting for room.
         let mut input_task = tokio::spawn(async move {
+            let fence = input_fence;
             let mut input = input.map(|(_, input)| input);
             while let Some((channel, payload)) = read_stream_frame(&mut reader).await? {
                 match channel {
                     STREAM_STDIN => {
+                        let Some(sender) = input.as_ref() else {
+                            continue;
+                        };
                         // A process may close stdin before the client has
-                        // finished sending it. Keep relaying stdout, stderr,
-                        // and the final status after that write fails.
-                        if let Some(sender) = input.as_ref()
-                            && sender.send(payload).await.is_err()
-                        {
-                            input.take();
+                        // finished sending it, and an attachment no longer
+                        // of the owner in force delivers nothing more. Keep
+                        // relaying stdout, stderr, and the final status.
+                        let delivered = {
+                            let permit = sender.reserve().await;
+                            if let Ok(permit) = permit
+                                && let Some(_owner) = fence.admit().await
+                            {
+                                permit.send(payload);
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if !delivered {
+                            input = None;
                         }
                     }
                     // Keep reading after stdin closes so transport EOF still
                     // releases this control process's attachment lease.
                     STREAM_STDIN_CLOSED => {
-                        input.take();
+                        let sender = input.take();
                         if let Some(owner) = owner {
-                            input_session.close_input(owner).await;
+                            let permit = match &sender {
+                                Some(sender) => sender.reserve().await.ok(),
+                                None => None,
+                            };
+                            if let Some(_owner) = fence.admit().await {
+                                input_session.close_input_reserved(owner, permit);
+                            }
                         }
                     }
                     _ => {
@@ -4515,6 +4593,8 @@ mod linux {
             }
             Ok::<(), io::Error>(())
         });
+        let revoked = fence.revoked();
+        tokio::pin!(revoked);
         let result = loop {
             let output_message = tokio::select! {
                 input_result = &mut input_task => {
@@ -4524,6 +4604,7 @@ mod linux {
                         Err(error) => Err(format!("join main process input stream: {error}")),
                     };
                 }
+                () = &mut revoked => break Ok(()),
                 output_message = output.recv() => output_message,
             };
             let (channel, payload) = match output_message {
@@ -7884,6 +7965,7 @@ mod linux {
                 .build()
                 .expect("test process runtime");
             let (network_broker, workload_launcher) = test_network_broker();
+            let gateway = TestGateway::new();
             let boundary = Arc::new(
                 BoundaryRuntime::new(
                     BoundaryConfig {
@@ -7894,7 +7976,7 @@ mod linux {
                             .expect("session rotation"),
                         auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
                         gateway_id: "test-gateway".to_string(),
-                        verification_keys: vec![test_verification_key()],
+                        verification_keys: vec![gateway.verification_key.clone()],
                         listener: BoundaryListenerConfig::TlsTcp {
                             address: "127.0.0.1:5500".parse().expect("control address"),
                             tls: placeholder_server_tls(),
@@ -7995,10 +8077,23 @@ mod linux {
             assert!(boundary.attach_process(&process_id).is_err());
             let (boundary_stream, control_stream) =
                 std::os::unix::net::UnixStream::pair().expect("main attachment socket pair");
+            let principal = boundary
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request(
+                        (),
+                        &gateway.token("sandbox-reconnect", "generation-reconnect", 1),
+                    )
+                    .metadata(),
+                )
+                .expect("principal");
             let stream_boundary = boundary.clone();
             let stream_thread = std::thread::spawn(move || {
-                stream_boundary
-                    .stream_process(ControlStream::TestUnix(boundary_stream), first_attachment)
+                stream_boundary.stream_process(
+                    ControlStream::TestUnix(boundary_stream),
+                    first_attachment,
+                    &principal,
+                )
             });
             drop(control_stream);
             stream_thread
@@ -8550,7 +8645,7 @@ mod linux {
         /// Send one control request through `serve_one`, as a connection of
         /// `principal`, and return the boundary's response.
         fn serve_request(
-            runtime: &BoundaryRuntime,
+            runtime: &Arc<BoundaryRuntime>,
             principal: &SandboxProtocolPrincipal,
             request: Request,
         ) -> Response {
@@ -8963,6 +9058,180 @@ mod linux {
                     && process.status.is_none()
             }));
             assert_eq!(boundary.terminate(&process_id), Response::Terminated);
+        }
+
+        /// Input the replaced owner's attachment was still waiting to queue
+        /// never reaches the process after a promotion. A full input queue
+        /// holds the old owner's next stdin, or its EOF; the promotion
+        /// completes without waiting for room, the old attachment ends and
+        /// releases its input lease, and once the queue drains only the new
+        /// owner's stdin and EOF arrive. Exec and main-process attachments
+        /// share this bridge.
+        #[test]
+        fn a_promotion_fences_input_the_replaced_owner_was_waiting_to_queue() {
+            use crate::main_session::MainInput;
+            const SANDBOX: &str = "sandbox-input-fence";
+            const GENERATION: &str = "generation-input-fence";
+            const QUEUED: usize = 64;
+            for blocked_eof in [false, true] {
+                let gateway = TestGateway::new();
+                let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .expect("single-worker process runtime");
+                let _entered = process_runtime.enter();
+                let boundary =
+                    takeover_test_runtime(&gateway, SANDBOX, GENERATION, &process_runtime);
+                let principal = |epoch| {
+                    boundary
+                        .authenticate_request(
+                            SandboxConnectionId::new(),
+                            bearer_request((), &gateway.token(SANDBOX, GENERATION, epoch))
+                                .metadata(),
+                        )
+                        .expect("principal")
+                };
+                let policy = takeover_test_policy();
+                let old = principal(1);
+                assert!(matches!(
+                    boundary.attach(policy.clone(), false),
+                    Response::Attached { .. }
+                ));
+                boundary
+                    .commit_attach(&old, test_supervisor_instance_id(), None, None)
+                    .expect("attach");
+                assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
+                boundary.commit_confirm(&old).expect("confirm");
+
+                let (session, mut queued) = MainSession::inert_with_input();
+                let attached = Arc::new(AtomicBool::new(false));
+                let bridge = |principal: &SandboxProtocolPrincipal| {
+                    let attachment = acquire_attachment(
+                        session.clone(),
+                        attached.clone(),
+                        AttachmentStatus::Exec(Arc::new(Mutex::new(None))),
+                    )
+                    .expect("attachment");
+                    let (server, client) =
+                        std::os::unix::net::UnixStream::pair().expect("attachment socket pair");
+                    client.set_nonblocking(true).expect("nonblocking client");
+                    let client = process_runtime
+                        .block_on(async { tokio::net::UnixStream::from_std(client) })
+                        .expect("tokio client");
+                    let (done_tx, done) = std::sync::mpsc::channel();
+                    let streaming = boundary.clone();
+                    let principal = principal.clone();
+                    std::thread::spawn(move || {
+                        let _ = done_tx.send(streaming.stream_process(
+                            ControlStream::TestUnix(server),
+                            attachment,
+                            &principal,
+                        ));
+                    });
+                    (client, done)
+                };
+                let send = |client: &mut tokio::net::UnixStream, channel, payload: &[u8]| {
+                    process_runtime
+                        .block_on(write_stream_frame(client, channel, payload))
+                        .expect("write attachment frame");
+                };
+
+                // The old owner fills the queue; its next delivery waits.
+                let (mut old_client, old_done) = bridge(&old);
+                for index in 0..QUEUED {
+                    send(
+                        &mut old_client,
+                        STREAM_STDIN,
+                        format!("old-{index}").as_bytes(),
+                    );
+                }
+                if blocked_eof {
+                    send(&mut old_client, STREAM_STDIN_CLOSED, &[]);
+                } else {
+                    send(&mut old_client, STREAM_STDIN, b"old-blocked");
+                }
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while queued.len() < QUEUED {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the queue never filled"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+
+                // The replacement is promoted while the old delivery waits.
+                let replacement = test_supervisor_instance_id();
+                let candidate = principal(2);
+                let grant = boundary
+                    .authenticator
+                    .verify_takeover(&gateway.grant(SANDBOX, GENERATION, 2, replacement))
+                    .expect("grant");
+                assert!(matches!(
+                    boundary.attach(policy.clone(), true),
+                    Response::Attached { .. }
+                ));
+                boundary
+                    .commit_attach(&candidate, replacement, Some(&grant), None)
+                    .expect("stage takeover");
+                assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
+                let (promoted_tx, promoted) = std::sync::mpsc::channel();
+                let promoting = boundary.clone();
+                let promoting_candidate = candidate.clone();
+                std::thread::spawn(move || {
+                    let _ = promoted_tx.send(promoting.commit_confirm(&promoting_candidate));
+                });
+                promoted
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the promotion never waits for queue room")
+                    .expect("promotion");
+                old_done
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the replaced owner's attachment ends while its delivery waits")
+                    .expect("the replaced owner's attachment ends cleanly");
+                assert_eq!(queued.len(), QUEUED);
+
+                // The new owner takes the input lease; stdin is still open.
+                let (mut new_client, new_done) = bridge(&candidate);
+                send(&mut new_client, STREAM_STDIN, b"new");
+                // A late frame of the old owner goes nowhere.
+                let _ = process_runtime.block_on(write_stream_frame(
+                    &mut old_client,
+                    STREAM_STDIN,
+                    b"old-late",
+                ));
+                let received = process_runtime.block_on(async {
+                    let mut received = Vec::new();
+                    for _ in 0..=QUEUED {
+                        received.push(
+                            tokio::time::timeout(Duration::from_secs(10), queued.recv())
+                                .await
+                                .expect("queued input")
+                                .expect("input queue open"),
+                        );
+                    }
+                    received
+                });
+                let mut expected = (0..QUEUED)
+                    .map(|index| MainInput::Data(format!("old-{index}").into_bytes()))
+                    .collect::<Vec<_>>();
+                expected.push(MainInput::Data(b"new".to_vec()));
+                assert_eq!(received, expected, "blocked EOF: {blocked_eof}");
+                send(&mut new_client, STREAM_STDIN_CLOSED, &[]);
+                assert_eq!(
+                    process_runtime.block_on(async {
+                        tokio::time::timeout(Duration::from_secs(10), queued.recv()).await
+                    }),
+                    Ok(Some(MainInput::Close))
+                );
+                drop(new_client);
+                new_done
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the new owner's attachment ends at transport EOF")
+                    .expect("the new owner's attachment ends cleanly");
+                assert!(queued.try_recv().is_err(), "nothing else was queued");
+            }
         }
 
         /// Run one test alone in a child process, failing it if it does not
