@@ -450,7 +450,9 @@ hand-written table in either TOML form.
 {{- fail "supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds" -}}
 {{- end -}}
 {{- if include "openshell.supervisorEnabled" . -}}
+{{- if ne (include "openshell.supervisorAutoscalingEnabled" .) "true" -}}
 {{- $_ := include "openshell.supervisorReplicas" . -}}
+{{- end -}}
 {{- $recoveryTimeout := include "openshell.supervisorRecoveryTimeoutSeconds" . -}}
 {{- if $recoveryTimeout -}}
 {{- toYaml (dict "recovery_timeout_secs" (int64 $recoveryTimeout)) -}}
@@ -725,6 +727,7 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if hasKey (get (.Values.gatewayConfig | default dict) "openshell.drivers.kubernetes" | default dict) "shared_supervisor" -}}
 {{- fail "shared_supervisor is rendered by the chart; set only supervisor_topology" -}}
 {{- end -}}
+{{- include "openshell.validateSupervisorAutoscaling" . -}}
 {{- $_ := include "openshell.supervisorPoolConfig" . -}}
 {{- $workloadKind := include "openshell.workloadKind" . -}}
 {{- $workload := .Values.workload | default dict -}}

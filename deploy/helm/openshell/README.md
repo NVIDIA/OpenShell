@@ -207,6 +207,7 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
 - [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - CI overlay for multi-replica external PostgreSQL testing
 - [`ci/values-autoscaling.yaml`](ci/values-autoscaling.yaml) - CI overlay for rendering the optional gateway HorizontalPodAutoscaler
+- [`ci/values-supervisor-autoscaling.yaml`](ci/values-supervisor-autoscaling.yaml) - CI overlay for rendering the optional shared supervisor memory HorizontalPodAutoscaler
 - [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE provider token grants
 - [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
 
@@ -376,6 +377,19 @@ including the scale-down `behavior`, when that release predates them. For backgr
 Disabling autoscaling renders `spec.replicas` from `replicaCount` again,
 which defaults to 1, so set `replicaCount` to the replica count you want in
 that upgrade.
+
+Set `supervisor.autoscaling.enabled=true` with the shared supervisor topology
+to autoscale its Deployment independently of the gateway. It uses average
+memory per Pod (`supervisor.autoscaling.targetMemoryAverageValue`, default
+`512Mi`) through the resource metrics API, usually provided by Metrics Server.
+Defaults keep two to four members and remove at most one member every two
+minutes after a five-minute stabilization window. The HPA owns replicas, so
+`supervisor.replicas` is ignored. Enabling it on an existing Deployment has
+the same temporary reset-to-one risk described above; pick up new defaults
+with `--reset-then-reuse-values`. When disabling it, set `supervisor.replicas`
+explicitly. Existing sandboxes stay on their owners when scaling up, and
+memory-based scaling does not guarantee spare capacity for handoff. See the
+[shared supervisor autoscaling guide](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#autoscale-shared-supervisors-by-memory).
 
 ## Secret bootstrap
 
@@ -600,6 +614,11 @@ discovery endpoint or its TLS CA.
 | serviceAccount.annotations | object | `{}` | Annotations to add to the generated service account. |
 | serviceAccount.create | bool | `true` | Create a service account for the gateway. |
 | serviceAccount.name | string | `""` | Existing service account name to use when serviceAccount.create is false. |
+| supervisor.autoscaling.behavior | object | `{"scaleDown":{"policies":[{"periodSeconds":120,"type":"Pods","value":1}],"stabilizationWindowSeconds":300}}` | HPA scaling behavior. Remove at most one member every two minutes, after a five-minute stabilization window, to allow ownership handoff. |
+| supervisor.autoscaling.enabled | bool | `false` | Enable memory-based autoscaling of the shared supervisor Deployment. Requires supervisor_topology = "gateway" and the Kubernetes resource metrics API (usually Metrics Server). When enabled, the HPA owns the replica count and supervisor.replicas is ignored. |
+| supervisor.autoscaling.maxReplicas | int | `4` | Maximum supervisor replicas. |
+| supervisor.autoscaling.minReplicas | int | `2` | Minimum supervisor replicas. Keep at least 2 for failover capacity. |
+| supervisor.autoscaling.targetMemoryAverageValue | string | `"512Mi"` | Target average memory working set per supervisor Pod, as a positive Kubernetes quantity. This is an absolute value, not a percentage of requests. Scaling up adds capacity for new sandboxes; it does not move existing sandboxes away from a busy member. |
 | supervisor.image.digest | string | `""` | Supervisor image digest. When set, this takes precedence over tag. |
 | supervisor.image.pullPolicy | string | `nil` | Supervisor image pull policy. Empty uses global.image.pullPolicy. Prefer always, if_not_present, or never; the chart also accepts legacy Kubernetes spellings Always, IfNotPresent, and Never. |
 | supervisor.image.registry | string | `""` | Supervisor image registry. Empty uses global.image.registry. |
@@ -611,7 +630,7 @@ discovery endpoint or its TLS CA.
 | supervisor.podSecurityContext.runAsUser | int | `65534` | UID assigned to the shared supervisor pod. |
 | supervisor.podSecurityContext.seccompProfile.type | string | `"RuntimeDefault"` | Seccomp profile applied to the shared supervisor pod. |
 | supervisor.recoveryTimeoutSeconds | int | `60` | Seconds a sandbox workload stays frozen after losing its pool member's supervision before the sandbox runtime terminates it, rendered as [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an integer from 10 to 300. Null leaves the gateway's pool default of 60 seconds. |
-| supervisor.replicas | int | `1` | Shared supervisor pool members, used only when gatewayConfig selects supervisor_topology = "gateway". The gateway always coordinates the shared supervisor as a high-availability pool: when a member fails or leaves, another member takes over its sandboxes without restarting their workloads. 1 has no failover; use 2 or more to survive losing a member. Only the supervisor Deployment's replica count depends on this value, so changing it neither restarts the gateway nor replaces running members. |
+| supervisor.replicas | int | `1` | Shared supervisor pool members, used only when gatewayConfig selects supervisor_topology = "gateway". The gateway always coordinates the shared supervisor as a high-availability pool: when a member fails or leaves, another member takes over its sandboxes without restarting their workloads. 1 has no failover; use 2 or more to survive losing a member. Only the supervisor Deployment's replica count depends on this value, so changing it neither restarts the gateway nor replaces running members. Ignored when supervisor.autoscaling.enabled is true. |
 | supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
 | upstreamProxy | object | `{"authAllowInsecure":false,"authSecret":{"key":"","name":""},"caBundle":{"configMapName":"","key":"ca.crt"},"connectByHostname":false,"noProxy":"","url":""}` | Operator-owned corporate forward proxy for policy-approved TLS egress from Kubernetes sandboxes. The workload cannot select or override it. |

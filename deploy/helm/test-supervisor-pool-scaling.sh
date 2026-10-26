@@ -30,7 +30,8 @@ render() {
 without_replica_count() {
   yq ea -P \
     'select(. != null and .kind != "Secret")
-     | (select(.kind == "Deployment" and .metadata.name == "scaling-openshell-supervisor") | .spec) |= del(.replicas)' \
+     | (select(.kind == "Deployment" and .metadata.name == "scaling-openshell-supervisor") | .spec) |= del(.replicas)
+     | ... comments = ""' \
     "${work_dir}/$1.yaml" >"${work_dir}/$1.normalized.yaml"
 }
 
@@ -76,3 +77,24 @@ for name in one two three; do
 done
 
 echo "supervisor pool scaling: only the replica count changes across 1, 2, and 3 replicas"
+
+# Enabling the HPA changes only replica ownership and adds the HPA. It must
+# not roll the gateway or replace supervisor Pods. Tuning its target and
+# bounds must likewise leave every other resource unchanged.
+for name in autoscaled tuned; do
+  extra=()
+  if [[ "${name}" == tuned ]]; then
+    extra+=(--set supervisor.autoscaling.minReplicas=3
+      --set supervisor.autoscaling.maxReplicas=6
+      --set supervisor.autoscaling.targetMemoryAverageValue=768Mi)
+  fi
+  render "${name}" --set supervisor.autoscaling.enabled=true "${extra[@]}"
+  yq ea -e 'select(.kind == "Deployment" and .metadata.name == "scaling-openshell-supervisor") | .spec | has("replicas") == false' \
+    "${work_dir}/${name}.yaml" >/dev/null || fail "the HPA does not own supervisor replicas"
+  yq ea -P 'select(. != null and .kind != "HorizontalPodAutoscaler")' \
+    "${work_dir}/${name}.yaml" >"${work_dir}/${name}.without-hpa.yaml"
+  without_replica_count "${name}.without-hpa"
+  diff -u "${work_dir}/one.normalized.yaml" "${work_dir}/${name}.without-hpa.normalized.yaml" \
+    || fail "supervisor autoscaling changed the gateway or supervisor Pod template"
+done
+echo "supervisor autoscaling: enabling and tuning the HPA preserves gateway and supervisor Pod templates"

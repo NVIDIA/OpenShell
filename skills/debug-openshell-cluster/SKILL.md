@@ -1146,6 +1146,18 @@ OpenShell chart rather than treating missing workload Pods as Pod failures.
 
 #### Shared supervisor high availability
 
+`supervisor.autoscaling.enabled=true` gives replica ownership to a separate
+memory HPA named `<fullname>-supervisor`; `supervisor.replicas` is then ignored.
+The default target is `512Mi` average memory per Pod, with two to four members.
+Check `kubectl describe hpa <fullname>-supervisor -n <namespace>` and
+`kubectl top pods -n <namespace> -l app.kubernetes.io/component=supervisor`.
+An unknown memory target or `ScalingActive=False` can mean the resource metrics
+API (usually Metrics Server) is unavailable. The top-level `autoscaling` values
+control the gateway HPA separately. Scaling up adds capacity for new sandboxes
+and does not redistribute existing owners; check individual Pod memory as well
+as the average. See the published High Availability guide for configuration
+and enabling or disabling autoscaling on an existing release.
+
 With `supervisor_topology = "gateway"`, the gateway always coordinates the
 shared supervisor as a pool, and the `<release>-supervisor` Deployment runs
 `supervisor.replicas` members (default 1, which has no failover). The chart

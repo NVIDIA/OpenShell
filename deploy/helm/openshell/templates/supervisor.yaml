@@ -12,7 +12,6 @@
 {{- $endpoint := get $kubernetes "grpc_endpoint" }}
 {{- $endpointUrl := urlParse $endpoint }}
 {{- $gatewayTls := and (not .Values.server.disableTls) .Values.server.tls.clientTlsSecretName }}
-{{- $replicas := int64 (include "openshell.supervisorReplicas" .) }}
 # One supervisor process per replica hosts a sandbox instance for each sandbox
 # generation placed on it. The process dials the gateway over TLS with the
 # supervisor token the gateway mints for it and receives its assignments from
@@ -35,7 +34,9 @@ spec:
   # but scales like any other count: only the replica count depends on the
   # pool's size, so scaling changes nothing else here or in the gateway
   # configuration.
-  replicas: {{ $replicas }}
+  {{- if ne (include "openshell.supervisorAutoscalingEnabled" .) "true" }}
+  replicas: {{ include "openshell.supervisorReplicas" . }}
+  {{- end }}
   strategy:
     type: RollingUpdate
     rollingUpdate:

@@ -100,7 +100,17 @@ OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
 ### Shared supervisor high availability
 
 The shared supervisor is always a pool of `supervisor.replicas` members
-(default 1). With the gateway topology the chart renders the gateway's
+(default 1), or an HPA-managed pool when `supervisor.autoscaling.enabled=true`.
+`ci/values-supervisor-autoscaling.yaml` enables the memory HPA (default `512Mi`
+average per Pod, two to four members, one removal every two minutes after five
+minutes of stabilization). It requires the resource metrics API, usually
+Metrics Server. The HPA omits the Deployment's fixed replica count and ignores
+`supervisor.replicas`; top-level `autoscaling` still controls only the gateway.
+Do not combine the HPA overlay with the manual 1→2→1 scaling E2E: that test
+expects Helm to own replicas. Changing HPA bounds or target must leave the
+gateway config and supervisor Pod template unchanged, as checked by
+`deploy/helm/test-supervisor-pool-scaling.sh`. With the gateway topology the
+chart renders the gateway's
 `[openshell.gateway.supervisor_pool]` tuning table (only
 `recovery_timeout_secs` from `supervisor.recoveryTimeoutSeconds`, default 60;
 the driver's `shared_supervisor` table stays unchanged), a

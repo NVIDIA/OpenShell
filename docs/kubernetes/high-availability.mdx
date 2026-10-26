@@ -582,6 +582,48 @@ kubectl -n openshell get pods -l app.kubernetes.io/name=openshell-supervisor -o 
 If you changed the chart's generated names with `nameOverride` or
 `fullnameOverride`, use the rendered `<fullname>-supervisor` name instead.
 
+### Autoscale shared supervisors by memory
+
+Set `supervisor.autoscaling.enabled` to let a separate HPA manage the supervisor
+Deployment. Your cluster must provide the Kubernetes resource metrics API,
+usually through Metrics Server. Gateway autoscaling remains controlled by the
+top-level `autoscaling` settings.
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    supervisor_topology: gateway
+supervisor:
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+    targetMemoryAverageValue: 512Mi
+```
+
+The target is average memory usage per supervisor Pod, not a percentage of its
+memory request. When enabled, the chart omits the Deployment's `spec.replicas`
+and ignores `supervisor.replicas`. The default scale-down behavior waits through
+a five-minute stabilization window and removes at most one member every two
+minutes. Override it with `supervisor.autoscaling.behavior`.
+
+Scaling up adds room for new sandboxes; existing sandboxes stay with their
+owners, so adding a member does not reduce a busy member's memory usage.
+Keep enough spare capacity for the remaining members to accept sandboxes during
+scale-down and failover. A memory target alone does not guarantee that capacity.
+
+Enable the HPA when installing the chart, or during a maintenance window:
+removing `spec.replicas` from an existing Deployment can temporarily reset it
+to one Pod before the HPA restores the minimum. For older release values, use
+`--reset-then-reuse-values` to pick up the autoscaling defaults. When disabling
+it, set `supervisor.replicas` to the desired fixed count in the same upgrade.
+
+```shell
+kubectl -n openshell get hpa openshell-supervisor
+kubectl -n openshell describe hpa openshell-supervisor
+kubectl -n openshell top pods -l app.kubernetes.io/component=supervisor
+```
+
 ## Next Steps
 
 - To expose the gateway through a highly available data path, refer to
