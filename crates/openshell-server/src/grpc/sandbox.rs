@@ -276,13 +276,6 @@ pub(super) async fn resolve_and_authorize_sandbox_name(
     Ok(sandbox)
 }
 
-fn require_ready_sandbox(sandbox: &Sandbox) -> Result<(), Status> {
-    match SandboxPhase::try_from(sandbox.phase()).ok() {
-        Some(SandboxPhase::Ready) => Ok(()),
-        _ => Err(Status::failed_precondition("sandbox is not ready")),
-    }
-}
-
 fn generate_routable_name() -> String {
     let name = petname::petname(2, "-").unwrap_or_else(generate_name);
     let mut truncated = &name[..name.len().min(MAX_ROUTABLE_NAME_LEN)];
@@ -2738,7 +2731,7 @@ pub(super) async fn handle_exec_sandbox(
         completion.ensure_target(sandbox.object_id())?;
     }
 
-    require_ready_sandbox(&sandbox)?;
+    require_relay_reachable(state, &sandbox).await?;
 
     // Open a relay channel through the supervisor session. Use a 15s
     // session-wait timeout, enough to cover a transient supervisor reconnect
@@ -2872,9 +2865,7 @@ pub(super) async fn handle_forward_tcp(
     // The main process may finish between minting the SSH token and opening
     // its transport. Keep the relay reachable until terminal delivery is
     // finalized so fast commands can attach without a readiness race.
-    if !sandbox_relay_reachable(state, &sandbox) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
-    }
+    require_relay_reachable(state, &sandbox).await?;
 
     let connection_guard =
         acquire_forward_connection_guard(state, &principal, &init, &sandbox).await?;
@@ -3317,7 +3308,7 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
         completion.ensure_target(sandbox.object_id())?;
     }
 
-    require_ready_sandbox(&sandbox)?;
+    require_relay_reachable(state, &sandbox).await?;
 
     let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
         state,
@@ -3385,11 +3376,17 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
 // SSH session handlers
 // ---------------------------------------------------------------------------
 
-fn sandbox_relay_reachable(state: &ServerState, sandbox: &Sandbox) -> bool {
-    let phase = SandboxPhase::try_from(sandbox.phase()).ok();
-    matches!(phase, Some(SandboxPhase::Ready))
-        || (matches!(phase, Some(SandboxPhase::Completed | SandboxPhase::Error))
-            && state.supervisor_sessions.has_session(sandbox.object_id()))
+/// Exec, SSH, and port forwarding share one access rule: a Completed or
+/// Error sandbox stays reachable while its supervisor retains the access plane.
+async fn require_relay_reachable(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+) -> Result<(), Status> {
+    if crate::supervisor_session::sandbox_relay_reachable(state, sandbox).await? {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition("sandbox is not ready"))
+    }
 }
 
 pub(super) async fn handle_create_ssh_session(
@@ -3408,9 +3405,7 @@ pub(super) async fn handle_create_ssh_session(
     .await?;
     let sandbox_id = sandbox.object_id().to_string();
 
-    if !sandbox_relay_reachable(state, &sandbox) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
-    }
+    require_relay_reachable(state, &sandbox).await?;
 
     let token = uuid::Uuid::new_v4().to_string();
     let now_ms = current_time_ms();
@@ -9484,10 +9479,18 @@ mod tests {
                 .supervisor_sessions
                 .finalize_main_process_exit("sandbox-work")
         );
-        assert!(sandbox_relay_reachable(&state, &sandbox));
+        assert!(
+            crate::supervisor_session::sandbox_relay_reachable(&state, &sandbox)
+                .await
+                .unwrap()
+        );
 
         assert!(state.supervisor_sessions.disconnect("sandbox-work"));
-        assert!(!sandbox_relay_reachable(&state, &sandbox));
+        assert!(
+            !crate::supervisor_session::sandbox_relay_reachable(&state, &sandbox)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

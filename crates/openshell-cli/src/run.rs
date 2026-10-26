@@ -2014,8 +2014,9 @@ pub async fn sandbox_exec_grpc(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
-    // Verify the sandbox is ready before issuing the exec.
-    if SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready) {
+    // Reject phases where the relay can never be open. The gateway decides
+    // whether a Completed or Error sandbox still has a reachable supervisor.
+    if !relay_phase_may_be_reachable(sandbox.phase()) {
         return Err(miette::miette!(
             "sandbox '{}' is not ready (phase: {}); wait for it to reach Ready state",
             name,
@@ -2169,7 +2170,7 @@ pub async fn service_forward_tcp(
     let (bind_addr, bind_port) = parse_tcp_forward_spec(local, target_port)?;
     let mut client = grpc_client(server, tls).await?;
 
-    let mut replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+    let mut replica = fetch_reachable_sandbox_for_forward(&mut client, name, workspace).await?;
 
     let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), bind_port))
         .await
@@ -2203,7 +2204,7 @@ pub async fn service_forward_tcp(
             }
 
             _ = health_check.tick() => {
-                replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+                replica = fetch_reachable_sandbox_for_forward(&mut client, name, workspace).await?;
             }
 
             accepted = listener.accept() => {
@@ -2269,8 +2270,18 @@ fn forward_requires_session_token(status: &Status) -> bool {
         && status.message().contains("authorization_token is required")
 }
 
-/// Confirm the sandbox is still ready, returning the replica that owns it.
-async fn fetch_ready_sandbox_for_forward(
+/// Whether the gateway may still relay into a sandbox in this phase. A
+/// Completed or Error sandbox keeps its access plane while its supervisor
+/// stays connected; only the gateway can tell whether it still is.
+fn relay_phase_may_be_reachable(phase: i32) -> bool {
+    matches!(
+        SandboxPhase::try_from(phase),
+        Ok(SandboxPhase::Ready | SandboxPhase::Completed | SandboxPhase::Error)
+    )
+}
+
+/// Confirm the sandbox is still reachable, returning the replica that owns it.
+async fn fetch_reachable_sandbox_for_forward(
     client: &mut crate::tls::GrpcClient,
     name: &str,
     workspace: &str,
@@ -2299,7 +2310,7 @@ async fn fetch_ready_sandbox_for_forward(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox '{name}' not found"))?;
 
-    if SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready) {
+    if !relay_phase_may_be_reachable(sandbox.phase()) {
         return Err(miette::miette!(
             "sandbox '{}' is no longer ready (phase: {}); stopping service forward",
             name,

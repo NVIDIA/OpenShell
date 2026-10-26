@@ -46,6 +46,7 @@ struct Calls {
 #[derive(Clone)]
 struct MockGateway {
     scenario: Scenario,
+    phase: proto::SandboxPhase,
     calls: Arc<Mutex<Calls>>,
 }
 
@@ -189,7 +190,7 @@ macro_rules! mock_gateway {
                             ..Default::default()
                         }),
                         status: Some(proto::SandboxStatus {
-                            phase: proto::SandboxPhase::Ready.into(),
+                            phase: self.phase.into(),
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -326,6 +327,10 @@ impl Drop for TestGateway {
 
 impl TestGateway {
     async fn start(scenario: Scenario) -> Self {
+        Self::start_in_phase(scenario, proto::SandboxPhase::Ready).await
+    }
+
+    async fn start_in_phase(scenario: Scenario, phase: proto::SandboxPhase) -> Self {
         let (ca, ca_key) = build_ca();
         let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
         let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
@@ -346,6 +351,7 @@ impl TestGateway {
         let calls = Arc::new(Mutex::new(Calls::default()));
         let service = MockGateway {
             scenario,
+            phase,
             calls: Arc::clone(&calls),
         };
         let task = tokio::spawn(async move {
@@ -476,6 +482,39 @@ async fn default_remote_exit_does_not_wait_for_idle_open_stdin() {
     assert!(output.stderr.is_empty());
     gateway.assert_one_stream();
     drop(held_open);
+}
+
+#[tokio::test]
+async fn exec_reaches_gateway_for_completed_and_error_sandboxes() {
+    // The supervisor keeps its access plane after the main process exits, so
+    // the gateway, not the CLI, decides whether the relay is still reachable.
+    for phase in [proto::SandboxPhase::Completed, proto::SandboxPhase::Error] {
+        let gateway = TestGateway::start_in_phase(Scenario::EarlyExit, phase).await;
+        let mut child = gateway.spawn();
+        let held_open = child.stdin.take().unwrap();
+        let output = finish(child).await;
+        drop(held_open);
+        assert!(
+            output.status.success(),
+            "{phase:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"before-exit\n");
+        gateway.assert_one_stream();
+    }
+}
+
+#[tokio::test]
+async fn exec_is_refused_before_starting_for_stopped_sandbox() {
+    let gateway =
+        TestGateway::start_in_phase(Scenario::EarlyExit, proto::SandboxPhase::Stopped).await;
+    let mut child = gateway.spawn();
+    drop(child.stdin.take());
+    let output = finish(child).await;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("is not ready (phase: Stopped)"), "{stderr}");
+    assert!(gateway.calls.lock().unwrap().starts.is_empty());
 }
 
 #[tokio::test]

@@ -1825,6 +1825,34 @@ fn owner_is_fresh(owner: &crate::supervisor_owner::OwnerRecord) -> bool {
     owner.is_fresh(OWNER_TTL)
 }
 
+/// Whether the gateway can relay a new connection into this sandbox.
+///
+/// A Ready sandbox always qualifies; relay opening waits for and routes to its
+/// owner. After the main process exits, the supervisor keeps its access plane,
+/// so a Completed or Error sandbox qualifies while its supervisor session is
+/// live on this replica or a fresh owner record names a peer replica.
+pub async fn sandbox_relay_reachable(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+) -> Result<bool, Status> {
+    match SandboxPhase::try_from(sandbox.phase()).ok() {
+        Some(SandboxPhase::Ready) => Ok(true),
+        Some(SandboxPhase::Completed | SandboxPhase::Error) => {
+            let sandbox_id = sandbox.object_id();
+            if state.supervisor_sessions.has_session(sandbox_id) {
+                return Ok(true);
+            }
+            let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+            Ok(resolve_owner(state, &owner_index, sandbox_id)
+                .await?
+                .is_some_and(|owner| {
+                    owner_is_fresh(&owner) && owner.owner_replica_id != state.replica_id
+                }))
+        }
+        _ => Ok(false),
+    }
+}
+
 /// The replica currently holding this sandbox's supervisor session, if known.
 pub async fn owner_replica_id(state: &Arc<ServerState>, sandbox_id: &str) -> Option<String> {
     if state.store.is_single_replica() {
@@ -3692,6 +3720,87 @@ mod tests {
         config
             .load()
             .expect("complete chart peer TLS materials should configure tonic");
+    }
+
+    #[tokio::test]
+    async fn relay_reachability_after_exit_follows_the_live_session_on_any_replica() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let reachable = |sandbox: Sandbox| {
+            let state = state.clone();
+            async move { sandbox_relay_reachable(&state, &sandbox).await.unwrap() }
+        };
+        let in_phase = |id: &str, phase: SandboxPhase| {
+            let mut sandbox = sandbox_record(id, id);
+            sandbox.set_phase(phase as i32);
+            sandbox
+        };
+
+        // Ready routes to the owner during relay opening; never-started or
+        // stopped sandboxes are refused regardless of sessions.
+        assert!(reachable(in_phase("relay-ready", SandboxPhase::Ready)).await);
+        for phase in [
+            SandboxPhase::Provisioning,
+            SandboxPhase::Stopped,
+            SandboxPhase::Deleting,
+        ] {
+            assert!(
+                !reachable(in_phase("relay-local", phase)).await,
+                "{phase:?}"
+            );
+        }
+
+        for phase in [SandboxPhase::Completed, SandboxPhase::Error] {
+            // No session anywhere.
+            assert!(!reachable(in_phase("relay-none", phase)).await, "{phase:?}");
+
+            // Session held by this replica.
+            let (tx, _rx) = mpsc::channel(1);
+            let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+            state.supervisor_sessions.register(
+                "relay-local".to_string(),
+                "session".to_string(),
+                tx,
+                shutdown_tx,
+            );
+            assert!(reachable(in_phase("relay-local", phase)).await, "{phase:?}");
+            assert!(state.supervisor_sessions.disconnect("relay-local"));
+            assert!(
+                !reachable(in_phase("relay-local", phase)).await,
+                "{phase:?}"
+            );
+        }
+
+        // Session held by a peer replica, known only through its owner record.
+        let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+        owner_index
+            .publish(
+                "relay-peer",
+                "session",
+                "supervisor",
+                1,
+                "peer-replica",
+                "https://peer",
+            )
+            .await
+            .unwrap();
+        for phase in [SandboxPhase::Completed, SandboxPhase::Error] {
+            assert!(reachable(in_phase("relay-peer", phase)).await, "{phase:?}");
+        }
+
+        // An owner record naming this replica without a local session is a
+        // leftover from a lost session, not a live supervisor.
+        owner_index
+            .publish(
+                "relay-self",
+                "session",
+                "supervisor",
+                1,
+                &state.replica_id,
+                "https://self",
+            )
+            .await
+            .unwrap();
+        assert!(!reachable(in_phase("relay-self", SandboxPhase::Completed)).await);
     }
 
     fn sandbox_record(id: &str, name: &str) -> Sandbox {

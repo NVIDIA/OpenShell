@@ -167,6 +167,17 @@ async fn receive_relay(state: &ServerState, messages: &mut mpsc::Receiver<Gatewa
         .fail_pending_relay(&open.channel_id, "test relay ended".into());
 }
 
+async fn set_phase(state: &ServerState, req: &ExecSandboxRequest, phase: SandboxPhase) {
+    let mut sandbox = state
+        .store
+        .get_message_by_name::<Sandbox>("default", &req.sandbox)
+        .await
+        .unwrap()
+        .unwrap();
+    sandbox.set_phase(phase as i32);
+    state.store.put_message(&sandbox).await.unwrap();
+}
+
 async fn completion(state: &ServerState) -> Completion {
     let rows = state
         .store
@@ -208,6 +219,36 @@ fn interactive_fingerprint_uses_start_schema_and_ignores_request_id() {
             .code(),
         tonic::Code::InvalidArgument
     );
+}
+
+#[tokio::test]
+async fn exec_reaches_terminal_sandbox_only_while_supervisor_is_connected() {
+    // A supervisor retains its access plane after the main process exits.
+    // Exec follows the same reachability rule as SSH and port forwarding.
+    for interactive in [false, true] {
+        for phase in [SandboxPhase::Completed, SandboxPhase::Error] {
+            let directory = tempfile::tempdir().unwrap();
+            let state = setup("sqlite::memory:", &directory).await;
+            let req = request(&state).await;
+            set_phase(&state, &req, phase).await;
+            let (mut client, server) = wire_client(state.clone(), None, None).await;
+
+            let status = exec_rpc(&mut client, req.clone(), interactive)
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{phase:?}");
+            assert_eq!(status.message(), "sandbox is not ready");
+
+            let mut messages = register(&state, &sandbox_id(&state, &req).await);
+            let mut retry = req;
+            retry.request_id = uuid::Uuid::new_v4().to_string();
+            exec_rpc(&mut client, retry, interactive)
+                .await
+                .unwrap_or_else(|status| panic!("{phase:?} interactive={interactive}: {status}"));
+            receive_relay(&state, &mut messages).await;
+            server.abort();
+        }
+    }
 }
 
 #[tokio::test]
