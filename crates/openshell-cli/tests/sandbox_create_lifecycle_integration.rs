@@ -166,6 +166,8 @@ impl OpenShell for TestOpenShell {
             },
         );
         Ok(Response::new(SandboxResponse {
+            application_service_urls: HashMap::new(),
+            gateway_service_urls: HashMap::new(),
             sandbox: Some(sandbox),
             service_urls,
         }))
@@ -209,6 +211,8 @@ impl OpenShell for TestOpenShell {
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         Ok(Response::new(SandboxResponse {
+            application_service_urls: HashMap::new(),
+            gateway_service_urls: HashMap::new(),
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
         }))
@@ -427,6 +431,8 @@ impl OpenShell for TestOpenShell {
             .push(request.into_inner());
         Ok(Response::new(
             openshell_core::proto::ServiceEndpointResponse {
+                application_url: String::new(),
+                gateway_url: String::new(),
                 url: "https://default--sandbox.openshell.localhost:17670/".to_string(),
                 ..Default::default()
             },
@@ -439,6 +445,8 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
         Ok(Response::new(
             openshell_core::proto::ServiceEndpointResponse {
+                application_url: String::new(),
+                gateway_url: String::new(),
                 url: "https://default--sandbox.openshell.localhost:17670/".to_string(),
                 ..Default::default()
             },

@@ -129,6 +129,7 @@ pub(super) trait Mutation: Message + Default + Send + Sync + 'static {
         request: Request<Self>,
     ) -> impl Future<Output = Result<Response<Self::Output>, Status>> + Send;
     fn capture(response: &Response<Self::Output>) -> Result<Success, Status>;
+    fn refresh_replay(_state: &ServerState, _response: &mut Self::Output) {}
     fn restore(
         store: &Store,
         success: Success,
@@ -320,7 +321,9 @@ async fn execute_owned<M: Mutation>(
                 return Err(replay_unavailable());
             }
             let success = previous.success.ok_or_else(uncertain)?;
-            let mut response = Response::new(M::restore(&state.store, success).await?);
+            let mut output = M::restore(&state.store, success).await?;
+            M::refresh_replay(state, &mut output);
+            let mut response = Response::new(output);
             response
                 .metadata_mut()
                 .insert(REPLAYED_HEADER, "true".parse().expect("static metadata"));
