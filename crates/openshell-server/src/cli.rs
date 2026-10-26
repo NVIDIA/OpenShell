@@ -669,8 +669,8 @@ fn validate_user_auth(config: &openshell_core::Config) -> Result<()> {
     {
         return Err(miette::miette!(
             "gateway has no user authentication configured\n\n\
-             No OIDC issuer, mTLS user auth, operator auth, or gateway_jwt is set, so every \
-             caller would be granted platform-admin access.\n\n\
+             No OIDC issuer, mTLS user auth, operator auth, or gateway_jwt is set. \
+             Authenticated RPCs require credentials unless unauthenticated users are explicitly allowed.\n\n\
              Configure [openshell.gateway.oidc], [openshell.gateway.mtls_auth], or \
              [openshell.gateway.gateway_jwt], or explicitly opt in for trusted local development:\n\n\
              [openshell.gateway.auth]\n\
