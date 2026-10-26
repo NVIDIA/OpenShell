@@ -111,6 +111,116 @@ async fn cli_stop_start_delete(cx: &mut Context) -> testkit::Result {
     cx.expect_absent(&sandbox).await
 }
 
+/// An ephemeral (`--no-keep`) sandbox streams its main process output, returns
+/// the main process's exit code, and is deleted afterwards, whether the main
+/// process succeeds or fails.
+#[testkit::test]
+async fn cli_ephemeral_sandbox_is_deleted_after_exit(cx: &mut Context) -> testkit::Result {
+    for exit_code in [0, 3] {
+        let name = cx.name(&format!("e{exit_code}"));
+        cx.track(&name);
+        let create = cx
+            .cli([
+                "sandbox",
+                "create",
+                "--name",
+                &name,
+                "--no-keep",
+                "--no-tty",
+                "--",
+                "sh",
+                "-c",
+                &format!("echo ephemeral-done; exit {exit_code}"),
+            ])
+            .await?;
+        testkit::ensure!(
+            create.exit_code == exit_code,
+            "sandbox create exited {}; expected {exit_code}; stderr: {}",
+            create.exit_code,
+            create.stderr
+        );
+        testkit::ensure!(
+            create.stdout.contains("ephemeral-done"),
+            "sandbox create stdout {:?} lacks the main process output",
+            create.stdout
+        );
+
+        wait_unlisted(cx, &name).await?;
+        let get = cx.cli(["sandbox", "get", &name]).await?.failure()?;
+        testkit::ensure!(
+            get.stderr.to_lowercase().contains("not found"),
+            "sandbox get {name} failed without reporting it missing: {}",
+            get.stderr
+        );
+    }
+    Ok(())
+}
+
+/// A retained sandbox records Completed or Error with the main process's exit
+/// code, and still accepts `sandbox exec` after the main process has exited.
+#[testkit::test]
+async fn cli_retained_sandbox_accepts_exec_after_exit(cx: &mut Context) -> testkit::Result {
+    let result_path = "/sandbox/.openshell-retained-result";
+    for exit_code in [0, 3] {
+        let name = cx.name(&format!("r{exit_code}"));
+        let result = format!("openshell-retained-{}-{exit_code}", cx.run_id());
+        cx.track(&name);
+        cx.cli([
+            "sandbox",
+            "create",
+            "--name",
+            &name,
+            "--detach",
+            "--no-tty",
+            "--",
+            "sh",
+            "-c",
+            &format!("printf '%s\\n' '{result}' > '{result_path}' && sync; exit {exit_code}"),
+        ])
+        .await?
+        .success()?;
+        let sandbox = cx.adopt(&name).await?;
+
+        let finished = sandbox.wait_finished().await?;
+        let expected = if exit_code == 0 {
+            testkit::sdk::SandboxPhase::Completed
+        } else {
+            testkit::sdk::SandboxPhase::Error
+        };
+        testkit::ensure!(
+            finished.phase == expected && finished.exit_code == Some(exit_code),
+            "sandbox {name} finished in phase {:?} with exit code {:?}; expected {expected:?} with {exit_code}",
+            finished.phase,
+            finished.exit_code
+        );
+
+        let exec = cx
+            .cli([
+                "sandbox",
+                "exec",
+                "--name",
+                &name,
+                "--no-tty",
+                "--",
+                "cat",
+                result_path,
+            ])
+            .await?
+            .success()?;
+        testkit::ensure!(
+            exec.stdout == format!("{result}\n"),
+            "sandbox exec stdout was {:?}; expected {:?}",
+            exec.stdout,
+            format!("{result}\n")
+        );
+
+        cx.cli(["sandbox", "delete", &name]).await?.success()?;
+        wait_unlisted(cx, &name).await?;
+        cx.expect_absent(&sandbox).await?;
+    }
+    Ok(())
+}
+
 /// Wait until `sandbox list` no longer shows the sandbox.
 async fn wait_unlisted(cx: &Context, name: &str) -> testkit::Result {
     testkit::poll_until(
