@@ -13,6 +13,8 @@ pub struct AppListenerConfig {
     pub enabled: bool,
     pub port: u16,
     pub domain: String,
+    /// Public HTTPS origin, independently of the supervisor's listener port.
+    pub public_url: Option<String>,
 }
 
 impl Default for AppListenerConfig {
@@ -21,6 +23,7 @@ impl Default for AppListenerConfig {
             enabled: false,
             port: 8443,
             domain: String::new(),
+            public_url: None,
         }
     }
 }
@@ -28,6 +31,9 @@ impl Default for AppListenerConfig {
 impl AppListenerConfig {
     pub fn validate(&self) -> Result<(), String> {
         if !self.enabled {
+            if self.public_url.is_some() {
+                return Err("supervisor.app_listener.public_url requires enabled = true".into());
+            }
             return Ok(());
         }
         if self.port < 1024 {
@@ -46,7 +52,39 @@ impl AppListenerConfig {
         {
             return Err("supervisor.app_listener.domain must be a lowercase DNS name".into());
         }
+        if let Some(origin) = &self.public_url {
+            let parsed = url::Url::parse(origin)
+                .map_err(|_| "supervisor.app_listener.public_url must be an HTTPS origin")?;
+            if parsed.scheme() != "https"
+                || parsed.host_str() != Some(self.domain.as_str())
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.path() != "/"
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || parsed.port() == Some(0)
+            {
+                return Err("supervisor.app_listener.public_url must be an HTTPS origin matching domain, without credentials, path, query, or fragment".into());
+            }
+        }
         Ok(())
+    }
+
+    /// Configured address only; this does not imply installation or readiness.
+    pub fn service_url(&self, workspace: &str, sandbox: &str, service: &str) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        let mut origin = url::Url::parse(self.public_url.as_deref()?).ok()?;
+        let label = if service.is_empty() {
+            format!("{workspace}--{sandbox}")
+        } else {
+            format!("{workspace}--{sandbox}--{service}")
+        };
+        origin
+            .set_host(Some(&format!("{label}.{}", self.domain)))
+            .ok()?;
+        Some(origin.into())
     }
 }
 
@@ -59,6 +97,43 @@ pub type InstallationSource = std::sync::Arc<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_origin_is_explicit_https_and_matches_listener_domain() {
+        let mut config = AppListenerConfig {
+            enabled: true,
+            domain: "services.example.com".into(),
+            public_url: Some("https://services.example.com:10443".into()),
+            ..Default::default()
+        };
+        config.validate().unwrap();
+        assert_eq!(
+            config.service_url("default", "demo", "web").as_deref(),
+            Some("https://default--demo--web.services.example.com:10443/")
+        );
+        config.public_url = Some("https://services.example.com:443/".into());
+        assert_eq!(
+            config.service_url("default", "demo", "").as_deref(),
+            Some("https://default--demo.services.example.com/")
+        );
+        for bad in [
+            "http://services.example.com",
+            "https://other.example.com",
+            "https://user:password@services.example.com",
+            "https://services.example.com/path",
+            "https://services.example.com/?query",
+            "https://services.example.com/#fragment",
+            "https://services.example.com:0",
+            "not-a-url",
+        ] {
+            config.public_url = Some(bad.into());
+            assert!(config.validate().is_err(), "{bad}");
+        }
+        config.public_url = Some("https://services.example.com".into());
+        config.enabled = false;
+        assert!(config.validate().is_err());
+        assert!(config.service_url("default", "demo", "web").is_none());
+    }
 
     #[test]
     fn only_explicit_enablement_requires_a_valid_endpoint() {

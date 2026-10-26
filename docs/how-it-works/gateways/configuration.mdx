@@ -1571,6 +1571,7 @@ ingress remains available independently.
 enabled = true
 port = 9443
 domain = "services.example.com"
+public_url = "https://services.example.com"
 
 [openshell.drivers.kubernetes.sandbox_runtime.app_listener]
 tls_secret_name = "openshell-app-tls"
@@ -1603,9 +1604,8 @@ Expose services with the existing commands. For direct listener testing, an
 unnamed service on sandbox `demo` in workspace `default` uses SNI and Host
 `default--demo.services.example.com`; a service named `web` uses
 `default--demo--web.services.example.com`. Configure DNS or your ingress to reach
-the owning supervisor while preserving that hostname. The discovery API supplies accepted supervisor endpoints. Application URL
-publication is separate work; current CLI URLs still identify the existing
-gateway path.
+the owning supervisor while preserving that hostname. The discovery API supplies accepted supervisor endpoints. Configure `public_url`
+to publish the application origin; otherwise CLI URLs retain the gateway path.
 
 Enabled supervisors report installed service routes through their authenticated
 gateway sessions. The gateway accepts only current configuration and ownership,
@@ -1635,3 +1635,23 @@ and HTTP authority when routing directly to the endpoint. Remove absent routes
 and expire cached entries even during discovery errors. An API error does not
 mean the workspace has no routes. Watches end after one minute; reconnect and
 relist when they end. Discovery-only machine credentials are separate work.
+
+Set `public_url` to the external HTTPS origin of your application ingress. Its
+hostname must match `domain`; it cannot contain credentials, a path, query, or
+fragment. A nondefault public port is supported, for example
+`https://services.example.com:10443`. This port is independent of the internal
+listener `port` and the gateway API address. Setting `public_url` requires
+explicit listener enablement and does not create DNS, certificates, or ingress.
+
+When configured, service responses return the application address as `url` and
+`application_url`, with `gateway_url` available as a separate alternative.
+Create-time exposure returns corresponding preferred, application, and gateway
+URL maps. CLI and SDK callers preserve the application origin, including its
+port, when the gateway is reached through a port-forward. Without `public_url`,
+the existing gateway URL behavior remains. Replayed mutations retain their
+original resource identities and use the current URL configuration. A configured
+URL does not mean that a supervisor installed the route or ingress is ready.
+
+Upgrade the CLI alongside the gateway when enabling `public_url`. Older CLI
+versions can replace the public application port with the gateway connection's
+port.

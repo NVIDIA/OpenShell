@@ -198,14 +198,13 @@ pub(super) async fn expose_service_endpoint(
         meta.resource_version = result.resource_version;
     }
 
-    let url = service_routing::endpoint_url(&state.config, workspace, sandbox_name, service)
-        .unwrap_or_default();
-    service_routing::emit_service_endpoint_config_event(&endpoint, &url, created);
-
-    Ok(Response::new(ServiceEndpointResponse {
-        endpoint: Some(endpoint),
-        url,
-    }))
+    let response = service_endpoint_response(state, endpoint);
+    service_routing::emit_service_endpoint_config_event(
+        response.endpoint.as_ref().expect("endpoint populated"),
+        &response.url,
+        created,
+    );
+    Ok(Response::new(response))
 }
 
 pub(super) async fn handle_get_service(
@@ -459,14 +458,40 @@ fn service_endpoint_response(
             Ok(ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip)
             | Err(_) => ServiceAuthorizationMode::Strip as i32,
         };
-    let workspace = endpoint.object_workspace();
-    let url =
-        service_routing::endpoint_url(&state.config, workspace, &endpoint.sandbox, &endpoint.name)
-            .unwrap_or_default();
-    ServiceEndpointResponse {
+    let mut response = ServiceEndpointResponse {
         endpoint: Some(endpoint),
-        url,
-    }
+        ..Default::default()
+    };
+    refresh_response_urls(state, &mut response);
+    response
+}
+
+/// Recompute presentation from current configuration, including durable replays.
+pub(super) fn refresh_response_urls(state: &ServerState, response: &mut ServiceEndpointResponse) {
+    let Some(endpoint) = response.endpoint.as_ref() else {
+        return;
+    };
+    response.gateway_url = service_routing::endpoint_url(
+        &state.config,
+        endpoint.object_workspace(),
+        &endpoint.sandbox,
+        &endpoint.name,
+    )
+    .unwrap_or_default();
+    response.application_url = state
+        .config
+        .supervisor_app_listener
+        .service_url(
+            endpoint.object_workspace(),
+            &endpoint.sandbox,
+            &endpoint.name,
+        )
+        .unwrap_or_default();
+    response.url = if response.application_url.is_empty() {
+        response.gateway_url.clone()
+    } else {
+        response.application_url.clone()
+    };
 }
 
 #[allow(clippy::result_large_err)]
@@ -544,6 +569,59 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn configured_application_origin_is_published_before_installation() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+            enabled: true,
+            port: 9443,
+            domain: "services.example.com".into(),
+            public_url: Some("https://services.example.com:10443".into()),
+        };
+        seed_sandbox(&state, "demo").await;
+        for name in ["", "web"] {
+            let created = handle_expose_service(
+                &state,
+                authed_request(ExposeServiceRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    sandbox: "demo".into(),
+                    name: name.into(),
+                    target_port: 8080,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            let label = if name.is_empty() {
+                "default--demo"
+            } else {
+                "default--demo--web"
+            };
+            assert_eq!(
+                created.url,
+                format!("https://{label}.services.example.com:10443/")
+            );
+            assert_eq!(created.application_url, created.url);
+            assert!(created.gateway_url.contains("openshell.localhost"));
+            let fetched = handle_get_service(
+                &state,
+                authed_request(GetServiceRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    sandbox: "demo".into(),
+                    name: name.into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(created, fetched);
+        }
+    }
+
     #[test]
     fn validates_good_endpoint_name() {
         validate_endpoint_name("service", "web-api", 28).unwrap();
@@ -556,6 +634,7 @@ mod tests {
             .expect("unshared test state")
             .config
             .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+            public_url: None,
             enabled: true,
             port: 9443,
             domain: "services.example.com".into(),

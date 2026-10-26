@@ -1556,6 +1556,11 @@ message SandboxResponse {
   // Service URLs created by CreateSandbox, keyed by service name. The empty
   // key identifies the unnamed service. Other sandbox RPCs return an empty map.
   map<string, string> service_urls = 2;
+  // Configured application origins for the same services. These are
+  // authoritative public addresses, not installation or health evidence.
+  map<string, string> application_service_urls = 3;
+  // Gateway-routed alternatives, independent of application ingress.
+  map<string, string> gateway_service_urls = 4;
 }
 
 // List sandboxes response.
@@ -1938,10 +1943,15 @@ message ServiceEndpoint {
   ServiceAuthorizationMode authorization_mode = 7;
 }
 
-// Response containing a service endpoint and, when available, its local URL.
+// Service addresses. A configured address does not establish readiness.
 message ServiceEndpointResponse {
   ServiceEndpoint endpoint = 1;
+  // Preferred address: application_url when configured, otherwise gateway_url.
   string url = 2;
+  // Authoritative configured public application address. Preserve its port.
+  string application_url = 3;
+  // Gateway-routed alternative; existing gateway routing remains available.
+  string gateway_url = 4;
 }
 
 // Revoke SSH session request.

@@ -1508,8 +1508,8 @@ Service changes arrive through polling or push configuration. Only admitted
 service declarations are installed. Polling and accepted live push sessions
 renew a 30-second lease; rejected configuration or expired freshness closes
 routes. App traffic uses application/edge authentication independently of gateway
-user authentication. The discovery API publishes accepted listener installations; public URLs
-printed by the CLI continue to use the gateway path.
+user authentication. The discovery API publishes accepted listener installations. CLI URLs use the
+configured application origin when `public_url` is set, otherwise the gateway path.
 
 When enabled application routes are not published, check the authenticated
 supervisor session and installed configuration before checking ingress. The
@@ -1534,3 +1534,11 @@ verify workload identity/memory survives and new connections reach the replaceme
 Shared serving leases last at most fifteen seconds from issuance, independently
 of configuration renewal; include membership failure detection when measuring a
 partition's stale-owner interval. Storage failures prevent renewal.
+
+For incorrect public service URLs, inspect
+`[openshell.supervisor.app_listener].public_url`. It is an external HTTPS origin
+whose hostname matches `domain`; its port is independent of the listener port.
+Service responses identify the application and gateway paths separately. A
+configured application URL must retain its public port even when the CLI uses a
+gateway port-forward. Inspect discovery and ingress acceptance separately:
+URL publication alone proves neither installation nor public reachability.

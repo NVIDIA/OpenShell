@@ -188,6 +188,8 @@ macro_rules! mock_gateway {
             async fn get_sandbox(&self, _: Request<proto::GetSandboxRequest>) -> Result<Response<proto::SandboxResponse>, Status> {
                 self.calls.lock().unwrap().lookups += 1;
                 Ok(Response::new(proto::SandboxResponse {
+application_service_urls: std::collections::HashMap::new(),
+gateway_service_urls: std::collections::HashMap::new(),
                     sandbox: Some(proto::Sandbox {
                         metadata: Some(proto::datamodel::v1::ObjectMeta {
                             id: "test-id".to_string(),

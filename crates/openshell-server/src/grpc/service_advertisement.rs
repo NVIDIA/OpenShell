@@ -631,6 +631,7 @@ pub mod tests {
             .unwrap()
             .config
             .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+            public_url: None,
             enabled: true,
             port: 9443,
             domain: "services.example.com".into(),

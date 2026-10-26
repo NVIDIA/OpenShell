@@ -226,3 +226,13 @@ Watches refresh and reauthorize each second, use a one-message buffer, and end
 after one minute or a five-second blocked send. Each gateway process accepts at
 most 32 watches. Reconnect and relist on stream termination; revisions are opaque
 equality tokens, not resumable cursors or an ordering across gateway replicas.
+
+## Application URL publication
+
+`supervisor.app_listener.public_url` is an optional HTTPS origin matching the
+listener domain. It requires explicit listener enablement. Service responses
+return preferred `url`, configured `application_url`, and a gateway alternative
+`gateway_url`. Sandbox creation supplies equivalent service-name maps. Current
+deployment origins are recomputed for durable replay without repeating the
+mutation or changing resource identities. These are configured addresses, not
+installation, ingress acceptance, or application health signals.

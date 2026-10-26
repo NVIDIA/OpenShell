@@ -255,6 +255,7 @@ mod tests {
                 let config = KubernetesAppListenerConfig {
                     create_service: true,
                     common: openshell_core::app_listener::AppListenerConfig {
+                        public_url: None,
                         enabled,
                         port: 9443,
                         domain: "services.example.com".into(),

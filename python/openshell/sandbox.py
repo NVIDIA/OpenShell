@@ -535,10 +535,24 @@ class SandboxRef:
     )
     # Stable SSH host identity; absent on older runtimes.
     host_key_fingerprint: str | None = None
+    application_service_urls: Mapping[str, str] = field(
+        default_factory=_ImmutableLabels, compare=False
+    )
+    gateway_service_urls: Mapping[str, str] = field(
+        default_factory=_ImmutableLabels, compare=False
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "labels", _ImmutableLabels(self.labels))
         object.__setattr__(self, "service_urls", _ImmutableLabels(self.service_urls))
+        object.__setattr__(
+            self,
+            "application_service_urls",
+            _ImmutableLabels(self.application_service_urls),
+        )
+        object.__setattr__(
+            self, "gateway_service_urls", _ImmutableLabels(self.gateway_service_urls)
+        )
 
     @property
     def phase(self) -> int:
@@ -880,7 +894,12 @@ class SandboxClient:
             ),
             timeout=self._timeout,
         )
-        sandbox_ref = _sandbox_ref(response.sandbox, response.service_urls)
+        sandbox_ref = _sandbox_ref(
+            response.sandbox,
+            response.service_urls,
+            response.application_service_urls,
+            response.gateway_service_urls,
+        )
         if sandbox_ref.id == "":
             raise SandboxError("CreateSandbox returned empty sandbox id")
         return sandbox_ref
@@ -909,7 +928,12 @@ class SandboxClient:
             ),
             timeout=self._timeout,
         )
-        sandbox_ref = _sandbox_ref(response.sandbox, response.service_urls)
+        sandbox_ref = _sandbox_ref(
+            response.sandbox,
+            response.service_urls,
+            response.application_service_urls,
+            response.gateway_service_urls,
+        )
         if sandbox_ref.id == "":
             raise SandboxError("CreateSandbox returned empty sandbox id")
         return sandbox_ref
@@ -1887,6 +1911,8 @@ def _sandbox_conditions(
 def _sandbox_ref(
     sandbox: openshell_pb2.Sandbox,
     service_urls: Mapping[str, str] | None = None,
+    application_service_urls: Mapping[str, str] | None = None,
+    gateway_service_urls: Mapping[str, str] | None = None,
 ) -> SandboxRef:
     status = sandbox.status if sandbox.HasField("status") else None
     provenance = (
@@ -1919,6 +1945,8 @@ def _sandbox_ref(
         labels=sandbox.metadata.labels if sandbox.metadata else {},
         created_from_workload_template=provenance,
         service_urls=service_urls or {},
+        application_service_urls=application_service_urls or {},
+        gateway_service_urls=gateway_service_urls or {},
         host_key_fingerprint=sandbox.host_key_fingerprint or None,
     )
 

@@ -68,6 +68,7 @@ impl Config {
         };
         let address: SocketAddr = address.parse().into_diagnostic()?;
         openshell_core::app_listener::AppListenerConfig {
+            public_url: None,
             enabled: true,
             port: address.port(),
             domain: domain.clone(),

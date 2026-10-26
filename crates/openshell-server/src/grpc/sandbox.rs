@@ -726,6 +726,8 @@ async fn handle_create_sandbox_inner(
     .await?;
 
     let mut service_urls = HashMap::with_capacity(request.service_exposures.len());
+    let mut application_service_urls = HashMap::new();
+    let mut gateway_service_urls = HashMap::new();
     for exposure in &request.service_exposures {
         let endpoint = match super::service::expose_service_endpoint(
             state,
@@ -767,7 +769,12 @@ async fn handle_create_sandbox_inner(
                 return Err(exposure_error);
             }
         };
-        service_urls.insert(exposure.service.clone(), endpoint.into_inner().url);
+        let endpoint = endpoint.into_inner();
+        if !endpoint.application_url.is_empty() {
+            application_service_urls.insert(exposure.service.clone(), endpoint.application_url);
+        }
+        gateway_service_urls.insert(exposure.service.clone(), endpoint.gateway_url);
+        service_urls.insert(exposure.service.clone(), endpoint.url);
     }
 
     info!(
@@ -776,6 +783,8 @@ async fn handle_create_sandbox_inner(
         "CreateSandbox request completed successfully"
     );
     Ok(Response::new(SandboxResponse {
+        application_service_urls,
+        gateway_service_urls,
         sandbox: Some(sandbox),
         service_urls,
     }))
@@ -957,6 +966,8 @@ pub(super) async fn handle_get_sandbox(
         None
     };
     let mut response = Response::new(SandboxResponse {
+        application_service_urls: HashMap::new(),
+        gateway_service_urls: HashMap::new(),
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
     });
@@ -1780,6 +1791,8 @@ async fn handle_stop_sandbox_inner(
     let sandbox = state.compute.stop_sandbox(workspace, name).await?;
     info!(sandbox_name = %name, "StopSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
+        application_service_urls: HashMap::new(),
+        gateway_service_urls: HashMap::new(),
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
     }))
@@ -1835,6 +1848,8 @@ async fn handle_start_sandbox_inner(
         .project_endpoint_status(&mut sandbox, remote_authority);
     info!(sandbox_name = %name, "StartSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
+        application_service_urls: HashMap::new(),
+        gateway_service_urls: HashMap::new(),
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
     }))
@@ -1876,6 +1891,8 @@ async fn handle_suspend_sandbox_inner(
     let sandbox = state.compute.suspend_sandbox(workspace, name).await?;
     info!(sandbox_name = %name, "SuspendSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
+        application_service_urls: HashMap::new(),
+        gateway_service_urls: HashMap::new(),
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
     }))
@@ -1932,6 +1949,8 @@ async fn handle_resume_sandbox_inner(
         .project_endpoint_status(&mut sandbox, remote_authority);
     info!(sandbox_name = %name, "ResumeSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
+        application_service_urls: HashMap::new(),
+        gateway_service_urls: HashMap::new(),
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
     }))
@@ -4184,6 +4203,39 @@ async fn run_exec_with_russh(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Replays preserve original service names and sandbox identity while using
+/// current deployment origins. No service mutation is performed here.
+pub(super) fn refresh_response_urls(state: &ServerState, response: &mut SandboxResponse) {
+    let Some(sandbox) = response.sandbox.as_ref() else {
+        return;
+    };
+    response.application_service_urls.clear();
+    response.gateway_service_urls.clear();
+    for (service, url) in &mut response.service_urls {
+        let gateway = crate::service_routing::endpoint_url(
+            &state.config,
+            sandbox.object_workspace(),
+            sandbox.object_name(),
+            service,
+        )
+        .unwrap_or_default();
+        let application = state.config.supervisor_app_listener.service_url(
+            sandbox.object_workspace(),
+            sandbox.object_name(),
+            service,
+        );
+        response
+            .gateway_service_urls
+            .insert(service.clone(), gateway.clone());
+        *url = application.clone().unwrap_or(gateway);
+        if let Some(application) = application {
+            response
+                .application_service_urls
+                .insert(service.clone(), application);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
