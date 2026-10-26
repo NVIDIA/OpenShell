@@ -230,17 +230,48 @@ an explicit matrix and runs the runner once per row. Branch E2E calls it when
 the `test:e2e` label is set, and a failure fails the Core E2E result. To run
 a suite in another environment on CI, add a row.
 
-**Environments with services.** A suite that needs something besides the
+### Adding a feature suite
+
+A feature suite tests one OpenShell feature and lives in the
+`tests/suites/features` workspace. `tests/suites/features/keycloak` is the
+example to copy.
+
+1. Add a crate under `tests/suites/features/<name>` that depends on
+   `openshell-testkit`, and add it to `members` in
+   `tests/suites/features/Cargo.toml`.
+2. Write the tests in `tests/*.rs` as `#[testkit::test]` functions.
+3. Re-lock the workspace: `cargo metadata --manifest-path
+   tests/suites/features/Cargo.toml`, then
+   `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`.
+4. Add a row for the suite to the matrix in `.github/workflows/e2e-suites.yml`.
+
+If the feature only needs the gateway, run the suite in an existing
+environment such as `ubuntu-docker-rootful`, and skip the rest of this
+section.
+
+**Suites that need a service.** A feature that needs something besides the
 gateway, such as an OIDC issuer, runs in a tmachine environment that provides
-it. The environment's setup starts the service (with a restart policy, since
-setup is cached as a disk) and writes how to reach it as `OPENSHELL_TEST_*`
-lines in `/etc/openshell-test/env.d/<service>.env`. The runner passes those
-variables to the tests and rejects names without that prefix. A suite-local
-fixture reads them with plain environment variables, so you can run the suite
-against your own deployment by setting them yourself. See the
-`ubuntu-docker-rootful-keycloak` environment in `tests/tmachine/config.nix`,
-`tests/tmachine/ansible/playbooks/keycloak.yaml` and
-`tests/suites/features/keycloak`:
+it. The environment and the suite share a contract: a set of
+`OPENSHELL_TEST_<SERVICE>_*` environment variables that say how to reach the
+service.
+
+- **Environment.** Add an environment to `tests/tmachine/config.nix` whose
+  setup playbook starts the service (with a restart policy, since setup is
+  cached as a disk) and writes the variables as `KEY=VALUE` lines to
+  `/etc/openshell-test/env.d/<service>.env`. Pass files the playbook needs
+  through the environment's setup `inputs`, and add them to the tmachine disk
+  cache key in `e2e-suites.yml`. The runner passes the variables to the tests
+  and rejects names without the `OPENSHELL_TEST_` prefix.
+- **Fixture.** In the suite's `src/lib.rs`, define the variable names as
+  constants and a `<Service>Context::new(cx)` that reads them, waits for the
+  service, and wraps the testkit `Context`. Each test calls it on its first
+  line. Nextest runs each test in its own process, so the fixture builds its
+  clients there from the variables. A missing variable fails the test; it
+  never skips it.
+- **Documentation.** Document the variables in the fixture's module docs, so
+  anyone can run the suite against their own deployment by setting them.
+
+Run the Keycloak suite with:
 
 ```shell
 nix run .#openshell-test-runner -- \
