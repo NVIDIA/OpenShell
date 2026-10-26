@@ -1140,9 +1140,23 @@ fn zero_blocks_hide_data(path: &Path, metadata: &fs::Metadata) -> bool {
     reports_zero_blocks(metadata)
         && metadata.len() > 0
         && fs::File::open(path)
-            .and_then(|mut file| has_non_nul_byte(&mut file))
+            .and_then(|mut file| Ok(!is_all_hole(&file) && has_non_nul_byte(&mut file)?))
             // If it cannot be read, send it densely so `tar` reports the error.
             .unwrap_or(true)
+}
+
+/// `SEEK_DATA` fails with ENXIO only if the file system knows there is no
+/// data. This avoids reading every hole of a large sparse file.
+#[cfg(target_os = "linux")]
+fn is_all_hole(file: &fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    let seek = nix::unistd::lseek(file.as_raw_fd(), 0, nix::unistd::Whence::SeekData);
+    seek == Err(nix::errno::Errno::ENXIO)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_all_hole(_file: &fs::File) -> bool {
+    false
 }
 
 #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "linux"))]
@@ -3845,6 +3859,16 @@ mod tests {
         });
 
         assert_eq!(entries[0].contents, expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn all_hole_check_ignores_files_with_data() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let path = tmpdir.path().join("data.bin");
+        fs::write(&path, b"data").expect("write file");
+
+        assert!(!is_all_hole(&fs::File::open(&path).expect("open file")));
     }
 
     #[test]
