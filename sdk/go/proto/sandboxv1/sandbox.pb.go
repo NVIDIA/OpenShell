@@ -2497,8 +2497,12 @@ type SandboxServiceRoute struct {
 	TargetPort        uint32                 `protobuf:"varint,3,opt,name=target_port,json=targetPort,proto3" json:"target_port,omitempty"`
 	AuthorizationMode int32                  `protobuf:"varint,4,opt,name=authorization_mode,json=authorizationMode,proto3" json:"authorization_mode,omitempty"`
 	ResourceVersion   uint64                 `protobuf:"varint,5,opt,name=resource_version,json=resourceVersion,proto3" json:"resource_version,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Canonical application SNI/Host selected by the gateway's hostname format.
+	// Includes the application domain, without a scheme or port. An empty value
+	// from an older gateway retains readable workspace--sandbox[--service] routing.
+	ApplicationHostname string `protobuf:"bytes,6,opt,name=application_hostname,json=applicationHostname,proto3" json:"application_hostname,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *SandboxServiceRoute) Reset() {
@@ -2564,6 +2568,13 @@ func (x *SandboxServiceRoute) GetResourceVersion() uint64 {
 		return x.ResourceVersion
 	}
 	return 0
+}
+
+func (x *SandboxServiceRoute) GetApplicationHostname() string {
+	if x != nil {
+		return x.ApplicationHostname
+	}
+	return ""
 }
 
 // Connection details for one operator-registered supervisor middleware service.
@@ -2898,7 +2909,7 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x0eservice_routes\x18\x12 \x03(\v2).openshell.sandbox.v1.SandboxServiceRouteR\rserviceRoutes\x1ac\n" +
 	"\rSettingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
-	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\xc5\x01\n" +
+	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\xf8\x01\n" +
 	"\x13SandboxServiceRoute\x12\x1f\n" +
 	"\vendpoint_id\x18\x01 \x01(\tR\n" +
 	"endpointId\x12\x12\n" +
@@ -2906,7 +2917,8 @@ const file_sandbox_proto_rawDesc = "" +
 	"\vtarget_port\x18\x03 \x01(\rR\n" +
 	"targetPort\x12-\n" +
 	"\x12authorization_mode\x18\x04 \x01(\x05R\x11authorizationMode\x12)\n" +
-	"\x10resource_version\x18\x05 \x01(\x04R\x0fresourceVersion\"\x81\x04\n" +
+	"\x10resource_version\x18\x05 \x01(\x04R\x0fresourceVersion\x121\n" +
+	"\x14application_hostname\x18\x06 \x01(\tR\x13applicationHostname\"\x81\x04\n" +
 	"\x1bSupervisorMiddlewareService\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12#\n" +
 	"\rgrpc_endpoint\x18\x02 \x01(\tR\fgrpcEndpoint\x12*\n" +

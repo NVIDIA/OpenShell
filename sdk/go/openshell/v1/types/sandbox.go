@@ -22,7 +22,9 @@ type Sandbox struct {
 	Status                      SandboxStatus
 	// ServiceURLs is populated by create operations and keyed by service name.
 	// The empty key identifies the unnamed service.
-	ServiceURLs map[string]string
+	ServiceURLs            map[string]string
+	ApplicationServiceURLs map[string]string
+	GatewayServiceURLs     map[string]string
 }
 
 // SandboxSpec holds the desired state of a sandbox.

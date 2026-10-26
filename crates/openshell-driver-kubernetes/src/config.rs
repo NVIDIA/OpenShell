@@ -1151,6 +1151,7 @@ mod tests {
         assert!(!config.app_listener.common.enabled);
         assert!(config.validate().is_ok());
         config.app_listener.common = openshell_core::app_listener::AppListenerConfig {
+            public_url: None,
             enabled: true,
             port: 9443,
             domain: "services.example.com".into(),

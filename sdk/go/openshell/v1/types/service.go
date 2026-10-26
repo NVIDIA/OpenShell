@@ -28,6 +28,8 @@ type ServiceEndpoint struct {
 	Name              string
 	TargetPort        uint32
 	Domain            bool
+	ApplicationURL    string
+	GatewayURL        string
 	URL               string
 	Workspace         string
 	AuthorizationMode ServiceAuthorizationMode
