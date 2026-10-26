@@ -10,27 +10,8 @@ driver must provide. It is a member of the `conformance` workspace. Each file in
 
 ## Running it
 
-Against a local Docker gateway:
-
-```shell
-mise run e2e:testkit
-```
-
-Against any gateway the CLI can reach, with the testkit environment variables
-described in [tests/testkit/README.md](../../../testkit/README.md):
-
-```shell
-OPENSHELL_GATEWAY=<name> cargo nextest run --locked \
-  --manifest-path tests/suites/conformance/Cargo.toml -p sandbox --test-threads 1
-```
-
-In a tmachine VM, as CI runs it (see [TESTING.md](../../../../TESTING.md)):
-
-```shell
-nix run .#openshell-test-runner -- \
-  --environment ubuntu-docker-rootful --installer deb \
-  --family conformance --package sandbox
-```
+[TESTING.md](../../../../TESTING.md) covers running it against a local Docker
+gateway and in a tmachine VM, as CI does.
 
 ## Adding a test
 

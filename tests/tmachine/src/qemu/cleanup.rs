@@ -3,47 +3,45 @@
 
 //! Keeping QEMU from outliving tmachine.
 //!
-//! Dropping a VM handle stops QEMU, but a destructor never runs when the
-//! process is killed by a signal. Two mechanisms cover that:
+//! Dropping a VM handle stops QEMU (`kill_on_drop`). Two mechanisms make sure
+//! that happens, or that QEMU dies anyway:
 //!
+//! - [`until_signal`] drops the work it runs on `SIGTERM`, `SIGINT` or
+//!   `SIGHUP`, and with it every VM handle the work holds.
 //! - On Linux, QEMU asks the kernel to kill it when its parent dies
-//!   (`PR_SET_PDEATHSIG`), whatever the reason, including `SIGKILL`.
-//! - [`cleanup_on_signals`] kills every tracked QEMU on `SIGTERM`, `SIGINT`
-//!   and `SIGHUP` and exits, which also covers hosts without that kernel
-//!   feature.
+//!   (`PR_SET_PDEATHSIG`), which also covers `SIGKILL`.
 //!
 //! A leaked QEMU holds the SSH forward port, so the next run on that host
 //! fails until someone kills it by hand.
 
-use std::sync::Mutex;
+use std::future::Future;
 
 use tokio::process::Command;
 use tokio::signal::unix::{SignalKind, signal};
 
-static LIVE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-
-pub(super) fn track(pid: u32) {
-    if let Ok(mut live) = LIVE.lock() {
-        live.push(pid);
-    }
-}
-
-pub(super) fn forget(pid: u32) {
-    if let Ok(mut live) = LIVE.lock() {
-        live.retain(|candidate| *candidate != pid);
-    }
-}
-
-/// Kill every QEMU this process started and has not yet reaped.
-fn kill_all() {
-    let pids = LIVE.lock().map(|live| live.clone()).unwrap_or_default();
-    for pid in pids {
-        if let Ok(pid) = libc::pid_t::try_from(pid) {
-            // SAFETY: `kill` has no memory-safety preconditions. A recycled
-            // PID is not a concern: entries are removed when the VM handle
-            // that owns the child is dropped, and the child is reaped by it.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
+/// Run `work` to completion, or until the process receives `SIGTERM`,
+/// `SIGINT` or `SIGHUP`. On a signal, `work` is dropped, which stops any VM
+/// it started, and the result is the conventional exit status, 128 plus the
+/// signal number.
+///
+/// Wrap a binary's `main` body in this. Blocking calls in `work` must run off
+/// the runtime thread, or the signal is not noticed until they return.
+///
+/// # Panics
+///
+/// If the runtime can't install the signal handlers.
+pub async fn until_signal<T>(work: impl Future<Output = T>) -> Result<T, i32> {
+    let stream = |kind| signal(kind).expect("install tmachine signal handler");
+    let (mut term, mut int, mut hup) = (
+        stream(SignalKind::terminate()),
+        stream(SignalKind::interrupt()),
+        stream(SignalKind::hangup()),
+    );
+    tokio::select! {
+        result = work => Ok(result),
+        _ = term.recv() => Err(128 + libc::SIGTERM),
+        _ = int.recv() => Err(128 + libc::SIGINT),
+        _ = hup.recv() => Err(128 + libc::SIGHUP),
     }
 }
 
@@ -68,60 +66,24 @@ pub(super) fn die_with_parent(command: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 pub(super) fn die_with_parent(_command: &mut Command) {}
 
-/// Kill every VM started through tmachine when the process receives
-/// `SIGTERM`, `SIGINT` or `SIGHUP`, then exit with the conventional status.
-///
-/// Call once from a binary's `main`, inside the Tokio runtime.
-pub fn cleanup_on_signals() {
-    for (kind, number) in [
-        (SignalKind::terminate(), libc::SIGTERM),
-        (SignalKind::interrupt(), libc::SIGINT),
-        (SignalKind::hangup(), libc::SIGHUP),
-    ] {
-        let Ok(mut stream) = signal(kind) else {
-            eprintln!("tmachine: could not install the signal {number} handler; VMs may leak");
-            continue;
-        };
-        tokio::spawn(async move {
-            stream.recv().await;
-            kill_all();
-            std::process::exit(128 + number);
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn tracks_and_forgets_pids() {
-        // Out of range for a `pid_t`, so a concurrent `kill_all` skips them.
-        let (kept, dropped) = (u32::MAX - 1, u32::MAX - 2);
-        track(kept);
-        track(dropped);
-        forget(dropped);
-        let live = LIVE.lock().unwrap().clone();
-        assert!(live.contains(&kept));
-        assert!(!live.contains(&dropped));
-        forget(kept);
+    #[tokio::test(flavor = "current_thread")]
+    async fn returns_the_work_result_without_a_signal() {
+        assert_eq!(until_signal(async { 7 }).await, Ok(7));
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn kill_all_stops_tracked_children_and_handlers_install() {
-        // Installing handlers must not change behavior until a signal arrives.
-        cleanup_on_signals();
-        let child = Command::new("sleep")
-            .arg("60")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let pid = child.id().unwrap();
-        track(pid);
-        kill_all();
-        let mut child = child;
-        let status = child.wait().await.unwrap();
-        assert!(!status.success());
-        forget(pid);
+    async fn a_signal_ends_the_work_with_the_conventional_status() {
+        let result = until_signal(async {
+            // SAFETY: the handlers are installed before `work` is polled, so
+            // this signal reaches them instead of terminating the test.
+            unsafe { libc::raise(libc::SIGHUP) };
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert_eq!(result, Err(128 + libc::SIGHUP));
     }
 }

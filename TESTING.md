@@ -189,10 +189,6 @@ gateway with:
 mise run e2e:testkit
 ```
 
-That task runs `e2e/with-docker-gateway.sh`, which starts a gateway and exports
-`OPENSHELL_GATEWAY` and `OPENSHELL_BIN`, so the suite runs the same way the
-runner runs it in a guest.
-
 Workspaces that build root crates through path dependencies must lock shared
 crates at the versions in the root `Cargo.lock`; otherwise CI can build against
 dependencies the Nix toolchain doesn't support. `mise run rust:lockfiles:check`
@@ -211,27 +207,18 @@ nix run .#openshell-test-runner -- \
   --family conformance --package sandbox
 ```
 
-It:
+It needs KVM, and tmachine only boots guests of the host's architecture. The
+runner points the tests at the installed CLI and the gateway the installer
+registered (`--gateway`, default `openshell`). A run passes if nextest
+succeeds; nextest fails a run with no tests. The runner writes `junit.xml`,
+`nextest.log` and, after a failure, the guest's diagnostics to
+`artifacts/test-results/` (`--results`).
 
-1. builds the family's packages on the host as a nextest archive for the
-   guest's musl target, with `testkit-ready`;
-2. boots the tmachine environment with the installer (this needs KVM, and
-   tmachine only boots guests of the host's architecture);
-3. copies the archive in, waits for the gateway with `testkit-ready`, and runs
-   the tests with the guest's `cargo-nextest`, pointing them at the installed
-   CLI (`OPENSHELL_BIN`) and the gateway the installer registered
-   (`OPENSHELL_GATEWAY`, `--gateway`, default `openshell`);
-4. writes `junit.xml`, `nextest.log` and, after a failure, the guest's
-   diagnostics to `artifacts/test-results/` (`--results`);
-5. shuts the VM down, also on failure or SIGTERM.
-
-A run passes if nextest succeeds and its JUnit report shows at least one test
-and no failures. `--filter <filterset>` narrows the tests with a nextest
-filterset, and `--keep` leaves the VM running until you press Enter. Every SSH
-and nextest step has a timeout. Two runs on one host need different
-`TMACHINE_SSH_PORT` values (default 2222). The installer inputs, such as the
-Debian package and the images, come from `artifacts/`, built by
-`nix run .#build-artifacts` or downloaded by CI.
+`--filter <filterset>` narrows the tests with a nextest filterset, and
+`--keep` leaves the VM running until you press Enter. Two runs on one host
+need different `TMACHINE_SSH_PORT` values (default 2222). The installer
+inputs, such as the Debian package and the images, come from `artifacts/`,
+built by `nix run .#build-artifacts` or downloaded by CI.
 
 A flaky or broken test is marked `#[ignore = "<issue link>"]`, which takes it
 out of every environment until it's fixed.

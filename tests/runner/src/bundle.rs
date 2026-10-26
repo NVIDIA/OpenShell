@@ -3,7 +3,7 @@
 
 //! Building a family's test bundle for the guest, on the host.
 //!
-//! A bundle is a tar holding a nextest archive built for the guest target,
+//! A bundle is a directory holding a nextest archive built for the guest target,
 //! the family workspace's `Cargo.toml` files (for `--workspace-remap`), a
 //! `nextest` config with the runner's `JUnit` profile, and `testkit-ready`,
 //! which waits for the gateway before the tests run. The guest needs only the
@@ -34,9 +34,13 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 path = "junit.xml"
 "#;
 
-pub struct Bundle {
-    pub path: PathBuf,
-    _dir: TempDir,
+/// The bundle directory, removed when this is dropped.
+pub struct Bundle(TempDir);
+
+impl Bundle {
+    pub fn path(&self) -> &Path {
+        self.0.path()
+    }
 }
 
 /// The Rust target for guests. tmachine only boots guests of the host's
@@ -106,8 +110,7 @@ fn built_executable(messages: &[u8], name: &str) -> Option<PathBuf> {
 /// the guest's `testkit-ready`.
 pub fn build(workspace: &Path, packages: &[String], target: &str, ready: &Path) -> Result<Bundle> {
     let dir = tempfile::tempdir().context("create bundle directory")?;
-    let stage = dir.path().join("stage");
-    std::fs::create_dir(&stage)?;
+    let stage = dir.path();
     let manifest = workspace.join("Cargo.toml");
     ensure!(
         manifest.is_file(),
@@ -130,20 +133,11 @@ pub fn build(workspace: &Path, packages: &[String], target: &str, ready: &Path) 
     }
     run(&mut command).with_context(|| format!("build the {} test archive", workspace.display()))?;
 
-    copy_manifests(workspace, &stage)?;
+    copy_manifests(workspace, stage)?;
     std::fs::write(stage.join("nextest.toml"), NEXTEST_CONFIG)?;
     std::fs::copy(ready, stage.join(READY_BINARY))
         .with_context(|| format!("copy {}", ready.display()))?;
-
-    let path = dir.path().join("tests.tar");
-    run(Command::new("tar")
-        .arg("-C")
-        .arg(&stage)
-        .arg("-cf")
-        .arg(&path)
-        .arg("."))
-    .context("pack test bundle")?;
-    Ok(Bundle { path, _dir: dir })
+    Ok(Bundle(dir))
 }
 
 /// Copy every `Cargo.toml` under `workspace` into `stage`, keeping relative

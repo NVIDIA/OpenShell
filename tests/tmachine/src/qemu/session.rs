@@ -3,9 +3,8 @@
 
 //! A running machine that callers act on over SSH.
 
-use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -17,7 +16,6 @@ use crate::config::{Environment, Installer, Machine};
 
 use super::img::QemuImage;
 use super::install::install;
-use super::layer::run_playbooks;
 use super::vm::{QemuVm, ssh_port};
 
 // The port is the QEMU forward in `vm.rs`; `ansible.rs` passes the same port
@@ -65,7 +63,7 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 /// panics cannot leak it. Call [`Session::down`] for a clean shutdown.
 pub struct Session {
     // Declared before `_dir` so the VM stops before its disk is removed.
-    vm: Option<QemuVm>,
+    vm: QemuVm,
     _image: QemuImage,
     _dir: TempDir,
 }
@@ -83,7 +81,7 @@ impl Session {
         let image = QemuImage::create(&install_disk, dir.path().join("session.qcow2")).await;
         let vm = QemuVm::start(&image).await?;
         let mut session = Self {
-            vm: Some(vm),
+            vm,
             _image: image,
             _dir: dir,
         };
@@ -94,7 +92,7 @@ impl Session {
     async fn wait_for_ssh(&mut self) -> Result<()> {
         let started = Instant::now();
         loop {
-            if let Some(status) = self.vm.as_mut().and_then(QemuVm::try_wait) {
+            if let Some(status) = self.vm.try_wait() {
                 bail!(
                     "QEMU exited with {status} before SSH was ready; is another tmachine VM using port {}?",
                     ssh_port()
@@ -116,15 +114,6 @@ impl Session {
                 }
             }
         }
-    }
-
-    /// Run Ansible playbooks against the machine.
-    pub async fn run_playbooks(
-        &self,
-        playbooks: &[PathBuf],
-        inputs: &BTreeMap<String, PathBuf>,
-    ) -> Result<()> {
-        run_playbooks(playbooks, inputs).await
     }
 
     /// Run a command in the machine as the `tmachine` user and capture its
@@ -172,29 +161,6 @@ impl Session {
             .with_context(|| format!("copy {src} from tmachine VM to {}", dst.display()))
     }
 
-    /// Write the OpenShell gateway's journal to `dir/gateway.log`.
-    pub async fn collect_diagnostics(&self, dir: &Path) -> Result<()> {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("create diagnostics directory {}", dir.display()))?;
-        let output = self
-            .exec(&[
-                "sudo",
-                "-n",
-                "journalctl",
-                "--no-pager",
-                "--lines",
-                "2000",
-                "_SYSTEMD_UNIT=openshell-gateway.service",
-                "+",
-                "_SYSTEMD_USER_UNIT=openshell-gateway.service",
-            ])
-            .await?;
-        let log = dir.join("gateway.log");
-        let mut contents = output.stdout;
-        contents.extend_from_slice(&output.stderr);
-        std::fs::write(&log, contents).with_context(|| format!("write {}", log.display()))
-    }
-
     /// Open an interactive SSH shell in the machine.
     pub async fn shell(&self) -> Result<ExitStatus> {
         ssh_command("ssh", &["-tt", "-p", &ssh_port().to_string()])
@@ -212,10 +178,8 @@ impl Session {
     /// This never panics and never fails: teardown has no useful recovery,
     /// so a guest that does not power off cleanly is killed and the problem
     /// is logged to stderr.
-    pub async fn down(mut self) {
-        if let Some(vm) = self.vm.take() {
-            vm.power_off_or_kill().await;
-        }
+    pub async fn down(self) {
+        self.vm.power_off_or_kill().await;
     }
 }
 

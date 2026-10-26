@@ -5,6 +5,7 @@ use anyhow::Result;
 
 use crate::config::{Environment, Installer, Machine, Testsuite};
 
+use super::layer::run_playbooks;
 use super::session::Session;
 
 pub async fn test(
@@ -14,9 +15,7 @@ pub async fn test(
     testsuite: &Testsuite,
 ) -> Result<()> {
     let session = Session::up(machine, environment, installer).await?;
-    session
-        .run_playbooks(&testsuite.playbooks, &testsuite.inputs)
-        .await?;
+    run_playbooks(&testsuite.playbooks, &testsuite.inputs).await?;
 
     if testsuite.interactive {
         println!("Opening an SSH shell in the tmachine VM.");

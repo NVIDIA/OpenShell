@@ -11,9 +11,9 @@ mod setup;
 mod test;
 mod vm;
 
-pub use cleanup::cleanup_on_signals;
+pub use cleanup::until_signal;
 pub use install::install;
 pub use session::Session;
 pub use setup::setup;
 pub use test::test;
-pub use vm::{DEFAULT_SSH_PORT, ssh_port};
+pub use vm::ssh_port;

@@ -3,12 +3,12 @@
 
 #[cfg(target_arch = "aarch64")]
 use std::fs;
-use std::net::{Ipv4Addr, TcpListener};
 #[cfg(target_arch = "aarch64")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -22,7 +22,7 @@ use super::img::QemuImage;
 
 /// The host port forwarded to the guest's SSH server unless
 /// `TMACHINE_SSH_PORT` says otherwise.
-pub const DEFAULT_SSH_PORT: u16 = 2222;
+const DEFAULT_SSH_PORT: u16 = 2222;
 
 /// How long the QMP power-off request has to be acknowledged. A guest or QEMU
 /// that stops answering must not hang teardown.
@@ -42,52 +42,33 @@ pub(super) const LAYER_POWER_OFF_TIMEOUT: Duration = Duration::from_secs(600);
 ///
 /// Concurrent tmachine runs on one host need different ports; set
 /// `TMACHINE_SSH_PORT` to run them side by side.
+///
+/// # Panics
+///
+/// If `TMACHINE_SSH_PORT` is set but is not a port from 1 to 65535.
 pub fn ssh_port() -> u16 {
-    let value = std::env::var("TMACHINE_SSH_PORT").ok();
-    let port = parse_ssh_port(value.as_deref());
-    if let Some(value) = value.as_deref().filter(|_| port == DEFAULT_SSH_PORT)
-        && value.trim() != DEFAULT_SSH_PORT.to_string()
-    {
-        eprintln!(
-            "tmachine: ignoring TMACHINE_SSH_PORT={value:?}, which is not a port from 1 to 65535; using {DEFAULT_SSH_PORT}"
-        );
-    }
-    port
+    static PORT: OnceLock<u16> = OnceLock::new();
+    *PORT.get_or_init(|| {
+        let value = std::env::var("TMACHINE_SSH_PORT").ok();
+        parse_ssh_port(value.as_deref())
+            .unwrap_or_else(|| panic!("TMACHINE_SSH_PORT={value:?} is not a port from 1 to 65535"))
+    })
 }
 
-fn parse_ssh_port(value: Option<&str>) -> u16 {
-    value
-        .and_then(|value| value.trim().parse().ok())
-        .filter(|port| *port != 0)
-        .unwrap_or(DEFAULT_SSH_PORT)
+fn parse_ssh_port(value: Option<&str>) -> Option<u16> {
+    match value {
+        None => Some(DEFAULT_SSH_PORT),
+        Some(value) => value.trim().parse().ok().filter(|port| *port != 0),
+    }
 }
 
 pub(super) struct QemuVm {
     child: Child,
     runtime_dir: TempDir,
-    pid: Option<u32>,
-}
-
-impl Drop for QemuVm {
-    fn drop(&mut self) {
-        // `kill_on_drop` stops QEMU; stop tracking it for signal cleanup.
-        if let Some(pid) = self.pid.take() {
-            cleanup::forget(pid);
-        }
-    }
 }
 
 impl QemuVm {
     pub(super) async fn start(image: &QemuImage) -> Result<Self> {
-        let port = ssh_port();
-        // QEMU reports a taken port only by exiting, which is slow to notice
-        // and hard to diagnose.
-        TcpListener::bind((Ipv4Addr::LOCALHOST, port)).with_context(|| {
-            format!(
-                "host port {port} is not available for the VM's SSH forward; is another tmachine VM running? Set TMACHINE_SSH_PORT to use another port"
-            )
-        })?;
-
         let runtime_dir = tempdir().context("create VM runtime directory")?;
         let qmp_socket = runtime_dir.path().join("qmp.sock");
         ensure!(
@@ -95,20 +76,12 @@ impl QemuVm {
             "QMP socket path is too long: {} (set TMPDIR to a shorter path)",
             qmp_socket.display()
         );
-        let firmware_vars = prepare_firmware(runtime_dir.path());
-        let child = command(image, &qmp_socket, firmware_vars.as_deref(), port)
+        let firmware = prepare_firmware(runtime_dir.path())?;
+        let child = command(image, &qmp_socket, firmware.as_ref(), ssh_port())
             .spawn()
             .context("start QEMU")?;
-        let pid = child.id();
-        if let Some(pid) = pid {
-            cleanup::track(pid);
-        }
 
-        Ok(Self {
-            child,
-            runtime_dir,
-            pid,
-        })
+        Ok(Self { child, runtime_dir })
     }
 
     /// The exit status, if QEMU has already exited.
@@ -213,7 +186,7 @@ impl QemuVm {
 fn command(
     image: &QemuImage,
     qmp_socket: &Path,
-    firmware_vars: Option<&Path>,
+    firmware: Option<&Firmware>,
     ssh_port: u16,
 ) -> Command {
     let qemu = if cfg!(target_arch = "aarch64") {
@@ -253,21 +226,12 @@ fn command(
         .arg("-qmp")
         .arg(format!("unix:{},server=on,wait=off", qmp_socket.display()));
 
-    if let Some(firmware_vars) = firmware_vars {
-        let firmware_code = firmware_path(
-            "TMACHINE_FIRMWARE_CODE",
-            option_env!("TMACHINE_FIRMWARE_CODE"),
-        );
+    if let Some(Firmware { code, vars }) = firmware {
         command
             .arg("-drive")
-            .arg(format!(
-                "if=pflash,format=raw,readonly=on,file={firmware_code}"
-            ))
+            .arg(format!("if=pflash,format=raw,readonly=on,file={code}"))
             .arg("-drive")
-            .arg(format!(
-                "if=pflash,format=raw,file={}",
-                firmware_vars.display()
-            ));
+            .arg(format!("if=pflash,format=raw,file={}", vars.display()));
     }
 
     command
@@ -296,33 +260,33 @@ fn command(
     command
 }
 
-/// A firmware path from the runtime environment, falling back to the value
-/// compiled in. The fallback lets library users built outside Nix (such as
-/// the test runner) supply firmware at runtime.
-fn firmware_path(name: &str, compiled: Option<&'static str>) -> String {
-    std::env::var(name)
-        .ok()
-        .or_else(|| compiled.map(str::to_string))
-        .unwrap_or_else(|| panic!("{name} must be set for ARM builds"))
+/// UEFI firmware for ARM guests: the read-only code and a writable copy of
+/// the variable store.
+struct Firmware {
+    code: &'static str,
+    vars: PathBuf,
 }
 
-fn prepare_firmware(runtime_dir: &Path) -> Option<PathBuf> {
+/// The firmware paths are compiled in by the Nix build.
+fn prepare_firmware(runtime_dir: &Path) -> Result<Option<Firmware>> {
     #[cfg(target_arch = "aarch64")]
     {
-        let template = firmware_path(
-            "TMACHINE_FIRMWARE_VARS",
-            option_env!("TMACHINE_FIRMWARE_VARS"),
-        );
-        let firmware_vars = runtime_dir.join("firmware-vars.fd");
-        fs::copy(template, &firmware_vars).unwrap();
-        fs::set_permissions(&firmware_vars, fs::Permissions::from_mode(0o600)).unwrap();
-        Some(firmware_vars)
+        let missing =
+            |name: &str| format!("{name} was not set when tmachine was built; build it with Nix");
+        let code = option_env!("TMACHINE_FIRMWARE_CODE")
+            .with_context(|| missing("TMACHINE_FIRMWARE_CODE"))?;
+        let template = option_env!("TMACHINE_FIRMWARE_VARS")
+            .with_context(|| missing("TMACHINE_FIRMWARE_VARS"))?;
+        let vars = runtime_dir.join("firmware-vars.fd");
+        fs::copy(template, &vars).context("copy the firmware variable store")?;
+        fs::set_permissions(&vars, fs::Permissions::from_mode(0o600))?;
+        Ok(Some(Firmware { code, vars }))
     }
 
     #[cfg(not(target_arch = "aarch64"))]
     {
         let _ = runtime_dir;
-        None
+        Ok(None)
     }
 }
 
@@ -332,11 +296,9 @@ mod tests {
 
     #[test]
     fn ssh_port_defaults_and_overrides() {
-        assert_eq!(parse_ssh_port(None), DEFAULT_SSH_PORT);
-        assert_eq!(parse_ssh_port(Some("2300")), 2300);
-        assert_eq!(parse_ssh_port(Some(" 2301 ")), 2301);
-        assert_eq!(parse_ssh_port(Some("0")), DEFAULT_SSH_PORT);
-        assert_eq!(parse_ssh_port(Some("not-a-port")), DEFAULT_SSH_PORT);
-        assert_eq!(parse_ssh_port(Some("70000")), DEFAULT_SSH_PORT);
+        assert_eq!(parse_ssh_port(None), Some(DEFAULT_SSH_PORT));
+        assert_eq!(parse_ssh_port(Some(" 2301 ")), Some(2301));
+        assert_eq!(parse_ssh_port(Some("0")), None);
+        assert_eq!(parse_ssh_port(Some("70000")), None);
     }
 }

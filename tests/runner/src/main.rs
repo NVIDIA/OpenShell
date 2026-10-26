@@ -12,8 +12,11 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
-use openshell_test_runner::bundle;
-use openshell_test_runner::execute::{self, Run};
+
+use crate::execute::Run;
+
+mod bundle;
+mod execute;
 
 /// Build a test family for the guest, boot a tmachine environment with
 /// OpenShell installed, run the tests in it, and check the results.
@@ -51,11 +54,14 @@ struct Cli {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    let cli = Cli::parse();
     // A SIGTERM from CI cancellation must not leave QEMU holding the SSH port.
-    tmachine::cleanup_on_signals();
-    match run(Cli::parse()).await {
-        Ok(code) => code,
-        Err(error) => {
+    match tmachine::until_signal(run(cli)).await {
+        // Exit at once: a blocking build or stdin read would otherwise hold
+        // up the runtime's shutdown.
+        Err(status) => std::process::exit(status),
+        Ok(Ok(code)) => code,
+        Ok(Err(error)) => {
             eprintln!("error: {error:#}");
             ExitCode::FAILURE
         }
@@ -99,7 +105,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         &Run {
             environment: &cli.environment,
             installer: &cli.installer,
-            gateway: Some(&cli.gateway),
+            gateway: &cli.gateway,
             bundle: &bundle,
             filter: cli.filter.as_deref(),
             results: &results,
@@ -120,10 +126,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     })
 }
 
-/// Load the tmachine configuration and prepare the process to drive it.
-///
-/// tmachine configs name playbooks and inputs relative to `tests/tmachine/`,
-/// and its Ansible runs read `ANSIBLE_CONFIG`.
+/// Load the tmachine configuration and enter `tests/tmachine/`, which its
+/// playbook and input paths are relative to.
 fn load_tmachine(root: &Path) -> Result<tmachine::config::Config> {
     let path = std::env::var_os("TMACHINE_CONFIG").context(
         "TMACHINE_CONFIG is not set; run through `nix run .#openshell-test-runner`, which provides it",
@@ -132,13 +136,6 @@ fn load_tmachine(root: &Path) -> Result<tmachine::config::Config> {
     let tmachine_dir = root.join("tests/tmachine");
     std::env::set_current_dir(&tmachine_dir)
         .with_context(|| format!("enter {}", tmachine_dir.display()))?;
-    if std::env::var_os("ANSIBLE_CONFIG").is_none() {
-        // SAFETY: single-threaded at this point; no other thread reads the
-        // environment concurrently.
-        unsafe {
-            std::env::set_var("ANSIBLE_CONFIG", tmachine_dir.join("ansible/ansible.cfg"));
-        };
-    }
     Ok(config)
 }
 

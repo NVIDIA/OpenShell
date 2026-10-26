@@ -38,7 +38,12 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     // A SIGTERM from CI cancellation must not leave QEMU holding the SSH port.
-    tmachine::cleanup_on_signals();
+    tmachine::until_signal(run(cli))
+        .await
+        .unwrap_or_else(|status| std::process::exit(status))
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let config = Config::load(&cli.config)?;
 
     match cli.command {

@@ -65,8 +65,6 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `proto/` | Protobuf definitions | gRPC service contracts |
 | `tests/testkit/` | E2E testkit | Support library and `#[testkit::test]` attribute for SDK-driven E2E suites |
 | `tests/suites/` | E2E suites | One directory per test family, such as `conformance` |
-| `tests/tmachine/` | Test machines | QEMU machines provisioned with Ansible, and the `Session` API that drives them |
-| `tests/runner/` | Test runner | `openshell-test-runner`: runs a test family in a tmachine environment and checks the results |
 | `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |
 | `docs/` | Published docs | MDX pages, navigation, and content assets |
 | `fern/` | Docs site config | Fern site config, components, and theme assets |

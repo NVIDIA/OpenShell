@@ -25,7 +25,6 @@ lockfile.
 from __future__ import annotations
 
 import argparse
-import re
 import shutil
 import subprocess
 import sys
@@ -48,27 +47,6 @@ class Mismatch:
     version: str
     root_versions: tuple[str, ...]
 
-    def target(self) -> str | None:
-        """The root version semver-compatible with the locked one, if any."""
-        key = compat_key(self.version)
-        candidates = [v for v in self.root_versions if compat_key(v) == key]
-        return max(candidates, key=version_tuple) if candidates else None
-
-
-def version_tuple(version: str) -> tuple[int, ...]:
-    core = re.split(r"[-+]", version, maxsplit=1)[0]
-    return tuple(int(part) for part in core.split("."))
-
-
-def compat_key(version: str) -> tuple[int, ...]:
-    """Cargo's caret-compatibility class: the leftmost non-zero component."""
-    major, minor, patch = (*version_tuple(version), 0, 0, 0)[:3]
-    if major:
-        return (major,)
-    if minor:
-        return (0, minor)
-    return (0, 0, patch)
-
 
 def registry_versions(lockfile: Path) -> dict[str, set[str]]:
     """Versions of registry (non-path) packages in a lockfile, by name."""
@@ -89,12 +67,8 @@ def mismatches(root: Path, workspace: str) -> list[Mismatch]:
         shared = root_versions.get(name)
         if shared is None:
             continue
-        for version in sorted(versions - shared, key=version_tuple):
-            found.append(
-                Mismatch(
-                    workspace, name, version, tuple(sorted(shared, key=version_tuple))
-                )
-            )
+        for version in sorted(versions - shared):
+            found.append(Mismatch(workspace, name, version, tuple(sorted(shared))))
     return found
 
 
@@ -125,14 +99,9 @@ def fix(root: Path, workspace: str) -> list[Mismatch]:
 
 def report(problems: list[Mismatch]) -> None:
     for m in problems:
-        target = m.target()
-        hint = (
-            f"; root has {target}"
-            if target
-            else f"; root has {', '.join(m.root_versions)}"
-        )
         print(
-            f"error: {m.workspace}: {m.name} {m.version} is not in the root Cargo.lock{hint}",
+            f"error: {m.workspace}: {m.name} {m.version} is not in the root Cargo.lock;"
+            f" root has {', '.join(m.root_versions)}",
             file=sys.stderr,
         )
 

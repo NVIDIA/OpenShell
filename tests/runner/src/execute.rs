@@ -9,8 +9,9 @@
 //! the one the installer registered with `OPENSHELL_GATEWAY` and at the
 //! installed CLI with `OPENSHELL_BIN`.
 
+use std::fmt;
 use std::path::Path;
-use std::process::Output;
+use std::process::{ExitStatus, Output};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -18,7 +19,6 @@ use tmachine::Session;
 use tmachine::config::Config;
 
 use crate::bundle::{Bundle, PROFILE, READY_BINARY};
-use crate::report::{Status, decide_status};
 
 const GUEST_DIR: &str = "/var/tmp/openshell-tests";
 /// How long the gateway has to become healthy after the environment is up.
@@ -31,6 +31,51 @@ const READY_TIMEOUT_SECS: u64 = 300;
 const RUN_TIMEOUT: Duration = Duration::from_mins(45);
 /// Slack beyond the readiness check's own timeout for SSH and process start.
 const READY_SLACK: Duration = Duration::from_mins(1);
+/// nextest's exit code when a test failed, as opposed to nextest itself
+/// failing.
+const NEXTEST_TEST_FAILED: i32 = 100;
+/// How much of the end of the nextest log to print after a failure. nextest
+/// ends its output with a summary that names the failed tests.
+const LOG_TAIL_LINES: usize = 40;
+
+/// How a run ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Status {
+    Passed,
+    /// At least one test failed.
+    Failed,
+    /// The runner or nextest could not complete the run.
+    Error(String),
+}
+
+impl Status {
+    pub const fn is_failure(&self) -> bool {
+        !matches!(self, Self::Passed)
+    }
+
+    /// The status of a nextest run that exited with `status`. nextest fails
+    /// a run that finds no tests.
+    fn of_nextest(status: ExitStatus, log: &Path) -> Self {
+        match status.code() {
+            Some(0) => Self::Passed,
+            Some(NEXTEST_TEST_FAILED) => Self::Failed,
+            _ => Self::Error(format!(
+                "nextest exited with {status}; see {}",
+                log.display()
+            )),
+        }
+    }
+}
+
+impl fmt::Display for Status {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Passed => write!(f, "PASS"),
+            Self::Failed => write!(f, "FAIL"),
+            Self::Error(error) => write!(f, "ERROR: {error}"),
+        }
+    }
+}
 
 /// One run: a bundle in one tmachine environment.
 pub struct Run<'a> {
@@ -38,9 +83,8 @@ pub struct Run<'a> {
     pub environment: &'a str,
     /// The tmachine installer, e.g. `deb`.
     pub installer: &'a str,
-    /// The gateway name the installer registers with the CLI. Without one,
-    /// tests use the CLI's active gateway.
-    pub gateway: Option<&'a str>,
+    /// The gateway name the installer registers with the CLI.
+    pub gateway: &'a str,
     pub bundle: &'a Bundle,
     /// A nextest filterset (`-E`) narrowing the tests in the bundle.
     pub filter: Option<&'a str>,
@@ -69,9 +113,7 @@ pub async fn run(config: &Config, run: &Run<'_>) -> Status {
         Err(error) => Status::Error(format!("{error:#}")),
     };
     if status.is_failure()
-        && let Err(error) = session
-            .collect_diagnostics(&run.results.join("diagnostics"))
-            .await
+        && let Err(error) = collect_diagnostics(&session, &run.results.join("diagnostics")).await
     {
         eprintln!("==> {label}: collecting diagnostics failed: {error:#}");
     }
@@ -124,17 +166,6 @@ async fn provision(config: &Config, environment: &str, installer: &str) -> Resul
     Session::up(machine, environment, installer).await
 }
 
-/// The environment variables that point the tests at the system under test:
-/// the registered gateway, if known, and the installed CLI.
-pub fn guest_env(gateway: Option<&str>, openshell_bin: &str) -> Vec<String> {
-    let mut vars = Vec::new();
-    if let Some(gateway) = gateway {
-        vars.push(format!("OPENSHELL_GATEWAY={gateway}"));
-    }
-    vars.push(format!("OPENSHELL_BIN={openshell_bin}"));
-    vars
-}
-
 /// Create the results directory, and remove an earlier run's results so they
 /// can't pass for this one's.
 fn prepare_results(results: &Path) -> Result<()> {
@@ -165,26 +196,21 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
         !openshell_bin.is_empty(),
         "the installer did not put openshell on the guest's PATH"
     );
-    let env = guest_env(run.gateway, openshell_bin);
+    let env = [
+        format!("OPENSHELL_GATEWAY={}", run.gateway),
+        format!("OPENSHELL_BIN={openshell_bin}"),
+    ];
 
     let guest = GUEST_DIR;
     checked(
+        "clear guest directory",
+        session.exec(&["rm", "-rf", guest]).await?,
+    )?;
+    session.copy_in(run.bundle.path(), guest).await?;
+    checked(
         "prepare guest directory",
         session
-            .exec(&[
-                "sh",
-                "-c",
-                &format!("rm -rf {guest} && mkdir -p {guest}/extract"),
-            ])
-            .await?,
-    )?;
-    session
-        .copy_in(&run.bundle.path, &format!("{guest}/bundle.tar"))
-        .await?;
-    checked(
-        "unpack bundle",
-        session
-            .exec(&["tar", "-C", guest, "-xf", &format!("{guest}/bundle.tar")])
+            .exec(&["mkdir", "-p", &format!("{guest}/extract")])
             .await?,
     )?;
 
@@ -231,6 +257,8 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
         // whatever --no-capture implies.
         "--test-threads",
         "1",
+        "--no-tests",
+        "fail",
     ]);
     if let Some(filter) = run.filter {
         nextest.extend(["-E", filter]);
@@ -241,24 +269,49 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
     let log_path = results.join("nextest.log");
     std::fs::write(&log_path, &log)?;
 
-    let junit = results.join("junit.xml");
+    // The JUnit report is uploaded with the results; the status comes from
+    // nextest's exit code.
     let found = checked(
         "find JUnit report",
         session.exec(&["find", guest, "-name", "junit.xml"]).await?,
     )?;
-    let xml = match found.lines().next() {
-        Some(path) => {
-            session.copy_out(path, &junit).await?;
-            Some(std::fs::read_to_string(&junit)?)
-        }
-        None => None,
-    };
+    match found.lines().next() {
+        Some(path) => session.copy_out(path, &results.join("junit.xml")).await?,
+        None => eprintln!("==> nextest wrote no JUnit report"),
+    }
 
-    Ok(decide_status(
-        output.status.success(),
-        xml.as_deref(),
-        &log_path,
-    ))
+    let status = Status::of_nextest(output.status, &log_path);
+    if status.is_failure() {
+        let log = String::from_utf8_lossy(&log);
+        let lines: Vec<_> = log.lines().collect();
+        eprintln!("==> the end of {}:", log_path.display());
+        for line in &lines[lines.len().saturating_sub(LOG_TAIL_LINES)..] {
+            eprintln!("{line}");
+        }
+    }
+    Ok(status)
+}
+
+/// Write the OpenShell gateway's journal to `dir/gateway.log`.
+async fn collect_diagnostics(session: &Session, dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let output = session
+        .exec(&[
+            "sudo",
+            "-n",
+            "journalctl",
+            "--no-pager",
+            "--lines",
+            "2000",
+            "_SYSTEMD_UNIT=openshell-gateway.service",
+            "+",
+            "_SYSTEMD_USER_UNIT=openshell-gateway.service",
+        ])
+        .await?;
+    let log = dir.join("gateway.log");
+    let mut contents = output.stdout;
+    contents.extend_from_slice(&output.stderr);
+    std::fs::write(&log, contents).with_context(|| format!("write {}", log.display()))
 }
 
 fn checked(step: &str, output: Output) -> Result<String> {
@@ -273,20 +326,16 @@ fn checked(step: &str, output: Output) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::process::ExitStatusExt;
+
     use super::*;
 
     #[test]
-    fn points_tests_at_the_gateway_and_the_cli() {
-        assert_eq!(
-            guest_env(Some("openshell"), "/usr/bin/openshell"),
-            [
-                "OPENSHELL_GATEWAY=openshell",
-                "OPENSHELL_BIN=/usr/bin/openshell",
-            ]
-        );
-        assert_eq!(
-            guest_env(None, "/usr/bin/openshell"),
-            ["OPENSHELL_BIN=/usr/bin/openshell"]
-        );
+    fn status_follows_the_nextest_exit_code() {
+        let status = |code| Status::of_nextest(ExitStatus::from_raw(code << 8), Path::new("log"));
+        assert_eq!(status(0), Status::Passed);
+        assert_eq!(status(NEXTEST_TEST_FAILED), Status::Failed);
+        // No tests ran, or nextest itself failed.
+        assert!(matches!(status(4), Status::Error(_)));
     }
 }
