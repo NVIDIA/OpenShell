@@ -3,6 +3,7 @@
 
 #[cfg(target_arch = "aarch64")]
 use std::fs;
+use std::net::{Ipv4Addr, TcpListener};
 #[cfg(target_arch = "aarch64")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -69,6 +70,16 @@ pub(super) struct QemuVm {
 
 impl QemuVm {
     pub(super) async fn start(image: &QemuImage) -> Result<Self> {
+        let port = ssh_port();
+        // QEMU reports a taken port only by exiting, and Ansible would then
+        // provision whatever VM already holds the port. The check can race
+        // another process, but it catches a second tmachine run.
+        TcpListener::bind((Ipv4Addr::LOCALHOST, port)).with_context(|| {
+            format!(
+                "host port {port} is not available for the VM's SSH forward; is another tmachine VM running? Set TMACHINE_SSH_PORT to use another port"
+            )
+        })?;
+
         let runtime_dir = tempdir().context("create VM runtime directory")?;
         let qmp_socket = runtime_dir.path().join("qmp.sock");
         ensure!(
@@ -77,7 +88,7 @@ impl QemuVm {
             qmp_socket.display()
         );
         let firmware = prepare_firmware(runtime_dir.path())?;
-        let child = command(image, &qmp_socket, firmware.as_ref(), ssh_port())
+        let child = command(image, &qmp_socket, firmware.as_ref(), port)
             .spawn()
             .context("start QEMU")?;
 

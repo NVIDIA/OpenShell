@@ -34,6 +34,8 @@ const READY_SLACK: Duration = Duration::from_mins(1);
 /// nextest's exit code when a test failed, as opposed to nextest itself
 /// failing.
 const NEXTEST_TEST_FAILED: i32 = 100;
+/// nextest's exit code when `--no-tests fail` found no tests to run.
+const NEXTEST_NO_TESTS_RUN: i32 = 4;
 /// How much of the end of the nextest log to print after a failure. nextest
 /// ends its output with a summary that names the failed tests.
 const LOG_TAIL_LINES: usize = 40;
@@ -59,6 +61,9 @@ impl Status {
         match status.code() {
             Some(0) => Self::Passed,
             Some(NEXTEST_TEST_FAILED) => Self::Failed,
+            Some(NEXTEST_NO_TESTS_RUN) => {
+                Self::Error(format!("no test ran; see {}", log.display()))
+            }
             _ => Self::Error(format!(
                 "nextest exited with {status}; see {}",
                 log.display()
@@ -335,7 +340,10 @@ mod tests {
         let status = |code| Status::of_nextest(ExitStatus::from_raw(code << 8), Path::new("log"));
         assert_eq!(status(0), Status::Passed);
         assert_eq!(status(NEXTEST_TEST_FAILED), Status::Failed);
-        // No tests ran, or nextest itself failed.
-        assert!(matches!(status(4), Status::Error(_)));
+        assert_eq!(
+            status(NEXTEST_NO_TESTS_RUN),
+            Status::Error("no test ran; see log".to_string())
+        );
+        assert!(matches!(status(1), Status::Error(_)));
     }
 }
