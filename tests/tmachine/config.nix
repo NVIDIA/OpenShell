@@ -164,20 +164,6 @@ let
         interactive = true;
       }
       {
-        name = "conformance";
-        playbooks = [ "ansible/playbooks/conformance/cli.yaml" ];
-        inputs = {
-          openshell_conformance_test_bundle = "../../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
-        };
-      }
-      {
-        name = "policy-advisor";
-        playbooks = [ "ansible/playbooks/conformance/policy-advisor.yaml" ];
-        inputs = {
-          openshell_conformance_test_bundle = "../../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
-        };
-      }
-      {
         name = "provider-refresh";
         playbooks = [ "ansible/playbooks/features/provider-refresh/keycloak.yaml" ];
         inputs = {

@@ -358,9 +358,8 @@ Suites:
 - CLI conformance (`tests/suites/conformance`) - portable Cargo tests for
   lifecycle, mechanistic drafts, file transfer, and the sandbox-local API,
   including agent-authored permission requests. Driver E2E runs the complete
-  Cargo test package. The installed-artifact conformance suite runs the same
-  tests from a nextest archive and offers a focused `policy-advisor` testsuite
-  for manual integration runs.
+  Cargo test package. The installed-artifact conformance lanes run the `sandbox`
+  package through `openshell-test-runner` (see below).
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
   `e2e-vm`) - CLI conformance plus the common and driver-specific coverage for
   the selected deployment.
@@ -470,7 +469,9 @@ rebuilds only the RPMs. Run conformance against the installed RPMs:
 
 ```shell
 nix run .#build-artifacts
-nix run .#tmachine -- test fedora-podman-rootful rpm conformance
+nix run .#openshell-test-runner -- \
+  --environment fedora-podman-rootful --installer rpm \
+  --family conformance --package sandbox
 ```
 
 Run the portable subset in a disposable rootless Podman guest:

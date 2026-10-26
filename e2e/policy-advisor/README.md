@@ -55,19 +55,21 @@ contents write on the repository. The test auto-resolves the token from
 
 ## Conformance coverage
 
-The portable CLI conformance suite may include policy-related scenarios. The
+The portable conformance suite may include policy-related scenarios. The
 current coverage checks draft generation for denied IP addresses and hostnames
 absent from policy, plus sandbox-local policy inspection and permission
 requests through `policy.local`. See [TESTING.md](../../TESTING.md#rust-cli-e2e)
 for the supported source and installed-artifact test paths.
 
-A manual `Integration Tests` workflow run can select the `policy-advisor`
-testsuite to run the policy-related subset against an installed candidate. Set
-`artifact-run-id` to the candidate build's workflow run ID and `test-matrix`
-to:
+To run only the policy-related conformance tests against an installed
+candidate, run the `policy-advisor` suite of the `sandbox` package through the
+test runner:
 
-```json
-[{"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"policy-advisor"}]
+```bash
+nix run .#openshell-test-runner -- \
+  --environment ubuntu-docker-rootful --installer deb \
+  --family conformance --package sandbox \
+  --filter 'binary_id(=sandbox::policy_advisor)'
 ```
 
 The GitHub write test above and the regressions below still exercise distinct

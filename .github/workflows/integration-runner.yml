@@ -24,11 +24,8 @@ on:
         type: string
         default: >-
           [
-            {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
-            {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
-            {"environment":"ubuntu-k3s","installer":"k3s-ha","testsuite":"conformance"},
-            {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
-            {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
+            {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
+            {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"}
           ]
 
 permissions:

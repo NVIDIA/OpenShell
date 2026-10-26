@@ -82,14 +82,6 @@ let
       '';
     };
 
-  conformanceTestArchive = mkTestArchive {
-    name = "openshell-conformance";
-    workspacePath = "tests/suites/conformance";
-    manifestPath = "tests/suites/conformance/Cargo.toml";
-    package = "openshell-test-conformance-cli";
-    target = muslToolchain.target;
-    output = "artifacts/test-archives/${muslToolchain.target}/openshell-conformance-tests.tar";
-  };
   providerRefreshKeycloakArchive = mkTestArchive {
     name = "provider-refresh-keycloak";
     workspacePath = "tests/suites/features";
@@ -203,7 +195,6 @@ let
 in
 rec {
   inherit
-    conformanceTestArchive
     providerRefreshKeycloakArchive
     ociImageArchive
     podmanDriverArchive
@@ -316,14 +307,12 @@ rec {
   testArchives = pkgs.writeShellApplication {
     name = "build-artifacts-test-archives";
     runtimeInputs = [
-      conformanceTestArchive
       providerRefreshKeycloakArchive
       ociImageArchive
       podmanDriverArchive
       podmanE2eArchive
     ];
     text = ''
-      build-openshell-conformance-test-archive
       build-provider-refresh-keycloak-test-archive
       build-oci-image-test-archive
       build-podman-driver-test-archive
