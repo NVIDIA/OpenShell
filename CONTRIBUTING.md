@@ -173,20 +173,15 @@ Project requirements:
 ### Nix setup
 
 The `nix develop` shell and `nix run .#…` apps, such as tmachine and the test
-guests, need Nix with flakes. Install
+guests, need Nix with flakes. We recommend
 [Determinate Nix](https://docs.determinate.systems/), which CI also uses and
-which enables flakes by default:
+which enables flakes by default. With another installer,
+[enable flakes](https://wiki.nixos.org/wiki/Flakes#Enabling_flakes_permanently)
+yourself.
 
-```shell
-curl -fsSL https://install.determinate.systems/nix | sh -s -- install
-```
-
-Other installers work if you enable the `nix-command` and `flakes` experimental
-features and Nix can find a CA certificate bundle.
-
-Configure the OpenShell binary cache once per machine. Without it, Nix builds
-the cross-compilation toolchains from source, which can take hours. Append the
-cache settings to `/etc/nix/nix.custom.conf` and restart the Nix daemon. With
+Optionally, configure the OpenShell binary cache once per machine. Without it,
+Nix builds the cross-compilation toolchains from source, which can take hours.
+Append the cache settings to `/etc/nix/nix.custom.conf` and restart the Nix daemon. With
 other installers, use `/etc/nix/nix.conf` instead.
 
 ```shell

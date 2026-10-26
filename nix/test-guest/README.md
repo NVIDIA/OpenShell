@@ -9,7 +9,7 @@ This prototype uses Nix, QEMU, and Ansible to boot and configure disposable Linu
 
 ## Requirements
 
-- Nix with flakes enabled and the OpenShell binary cache configured. See [Nix setup](../../CONTRIBUTING.md#nix-setup).
+- Nix with flakes enabled, optionally with the OpenShell binary cache. See [Nix setup](../../CONTRIBUTING.md#nix-setup).
 - Apple Silicon macOS with HVF, or a native-architecture Linux host. Linux uses KVM when `/dev/kvm` is available and falls back to QEMU TCG otherwise.
 - Enough local capacity for a four-vCPU, 4 GiB guest and a disposable disk overlay.
 - Native-architecture artifacts. TCG emulates the guest CPU on Linux but does not enable cross-architecture guests.
