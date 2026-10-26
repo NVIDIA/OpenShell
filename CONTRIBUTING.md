@@ -180,11 +180,18 @@ which enables flakes by default. With another installer,
 yourself.
 
 To download prebuilt dependencies instead of building them from source, add
-the `openshell` Cachix cache to your Nix configuration by following the
-[Cachix instructions](https://docs.cachix.org/getting-started#using-binaries-with-nix).
-To configure it by hand, use the substituter `https://openshell.cachix.org`
-and public key
-`openshell.cachix.org-1:OAr5MunsfH5PZvUsfD08OtGx5RtcwdNZGJdU5FqLm5w=`.
+the OpenShell binary cache to your Nix configuration. With Determinate Nix, add
+these lines to
+[`/etc/nix/nix.custom.conf`](https://docs.determinate.systems/determinate-nix#configuration)
+and restart the Nix daemon:
+
+```text
+extra-substituters = https://openshell.cachix.org
+extra-trusted-public-keys = openshell.cachix.org-1:OAr5MunsfH5PZvUsfD08OtGx5RtcwdNZGJdU5FqLm5w=
+```
+
+With other installers, follow the setup instructions for the
+[`openshell` Cachix cache](https://app.cachix.org/cache/openshell).
 
 ### Z3 installation
 
