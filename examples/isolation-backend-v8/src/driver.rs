@@ -422,6 +422,7 @@ impl compute_driver_server::ComputeDriver for DriverService {
             .filter(|e| e.sandbox.id == q.get_ref().sandbox_id)
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
         Ok(Response::new(GetSandboxResponse {
+            supervisor_app_endpoint: None,
             sandbox: Some(Driver::observation(entry)),
         }))
     }
