@@ -5087,6 +5087,7 @@ dependencies = [
 name = "openshell-supervisor"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "bytes",
  "clap",
  "futures",
@@ -5114,6 +5115,7 @@ dependencies = [
  "prost-types",
  "rustix 1.1.4",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "socket2",

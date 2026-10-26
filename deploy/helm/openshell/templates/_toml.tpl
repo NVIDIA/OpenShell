@@ -127,6 +127,9 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- $_ := set $config "openshell.gateway.gateway_jwt" $gatewayJwt -}}
 {{- $kubernetesCompat := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
 {{- $_ := set $config "openshell.drivers.kubernetes" $kubernetesCompat -}}
+{{/* Runtime children are merged above: do not extend a sealed inline table. */}}
+{{- $_ := unset $config "openshell.drivers.kubernetes.sandbox_runtime" -}}
+{{- $_ := unset $config "openshell.drivers.kubernetes.sandbox_runtime.app_listener" -}}
 {{- $legacyDrivers := get $legacyServer "drivers" | default dict -}}
 {{- $legacyKubernetes := get $legacyDrivers "kubernetes" | default dict -}}
 {{- if hasKey $kubernetesCompat "resource_admission" -}}

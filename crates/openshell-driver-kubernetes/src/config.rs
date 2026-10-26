@@ -118,6 +118,7 @@ impl FromStr for KubernetesControlConnection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSandboxRuntimeConfig {
+    pub app_listener: KubernetesAppListenerConfig,
     /// TCP port of the Sandbox Protocol listener: the workload boundary for
     /// supervisor-initiated sandboxes, the supervisor for runtime-initiated ones.
     pub boundary_port: u16,
@@ -127,12 +128,33 @@ impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
         Self {
             boundary_port: 5500,
+            app_listener: KubernetesAppListenerConfig::default(),
         }
     }
 }
 
+/// Driver-owned TLS and Service deployment inputs. Common listener settings
+/// are injected by the gateway so there is only one port/domain source.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesAppListenerConfig {
+    pub tls_secret_name: String,
+    pub create_service: bool,
+    #[serde(skip)]
+    pub common: openshell_core::app_listener::AppListenerConfig,
+}
+
 impl KubernetesSandboxRuntimeConfig {
     pub fn validate(&self) -> Result<(), String> {
+        self.app_listener.common.validate()?;
+        if self.app_listener.common.enabled {
+            if !is_dns_subdomain(&self.app_listener.tls_secret_name) {
+                return Err("sandbox_runtime.app_listener.tls_secret_name is required when the app listener is enabled".into());
+            }
+            if [self.boundary_port, 5501].contains(&self.app_listener.common.port) {
+                return Err("supervisor.app_listener.port conflicts with a supervisor runtime or health port".into());
+            }
+        }
         if self.boundary_port < 1024 {
             return Err("sandbox_runtime.boundary_port must be at least 1024".to_string());
         }
@@ -552,6 +574,11 @@ impl KubernetesComputeConfig {
                     "supervisor_topology=gateway requires shared_supervisor".to_string()
                 })?;
                 shared.validate()?;
+                if self.sandbox_runtime.app_listener.common.enabled
+                    && self.sandbox_runtime.app_listener.common.port == shared.runtime_port
+                {
+                    return Err("supervisor.app_listener.port conflicts with shared_supervisor.runtime_port".into());
+                }
                 if self.provider_spiffe_enabled() {
                     return Err("supervisor_topology=gateway does not support provider_spiffe_workload_api_socket_path; a shared supervisor has no per-sandbox workload identity".into());
                 }
@@ -1112,6 +1139,26 @@ fn validate_provider_spiffe_workload_api_socket_path_value(
 mod tests {
     use super::*;
     use std::collections::BTreeMap as HashMap;
+
+    #[test]
+    fn app_endpoint_configuration_has_one_port_source_and_explicit_enablement() {
+        let mut config = KubernetesSandboxRuntimeConfig::default();
+        config.app_listener.tls_secret_name = "app-tls".into();
+        config.app_listener.create_service = true;
+        assert!(!config.app_listener.common.enabled);
+        assert!(config.validate().is_ok());
+        config.app_listener.common = openshell_core::app_listener::AppListenerConfig {
+            enabled: true,
+            port: 9443,
+            domain: "services.example.com".into(),
+        };
+        assert!(config.validate().is_ok());
+        config.app_listener.common.port = config.boundary_port;
+        assert!(config.validate().is_err());
+        config.app_listener.common.port = 9443;
+        config.app_listener.tls_secret_name.clear();
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn gateway_supervisor_topology_requires_its_connection_and_refuses_unsupported_inputs() {

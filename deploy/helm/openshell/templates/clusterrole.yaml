@@ -101,7 +101,7 @@ rules:
   {{- if ne $workspaceMode "shared" }}
   - apiGroups: [""]
     resources: ["services"]
-    verbs: ["create", "get"]
+    verbs: ["create", "get"{{ if and (get (include "openshell.appListenerDeployment" . | fromYaml) "create_service") (not (include "openshell.supervisorEnabled" .)) }}, "patch", "delete"{{ end }}]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get"]

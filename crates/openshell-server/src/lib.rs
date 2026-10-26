@@ -1664,6 +1664,14 @@ pub struct ComputeDriverConfigContext<'a> {
 
 impl ComputeDriverConfigContext<'_> {
     #[must_use]
+    pub fn app_listener_config(&self) -> openshell_core::app_listener::AppListenerConfig {
+        self.driver_startup
+            .file
+            .map(|file| file.openshell.supervisor.app_listener.clone())
+            .unwrap_or_default()
+    }
+
+    #[must_use]
     pub fn driver_name(&self) -> &str {
         self.driver_name
     }

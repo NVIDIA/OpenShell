@@ -570,6 +570,14 @@ fn prepare_server_config_with_drivers(
         .with_server_sans(args.server_sans.clone())
         .with_loopback_service_http(args.enable_loopback_service_http)
         .with_websocket_tunnel(args.enable_websocket_tunnel);
+    config.supervisor_app_listener = file
+        .as_ref()
+        .map(|f| f.openshell.supervisor.app_listener.clone())
+        .unwrap_or_default();
+    config
+        .supervisor_app_listener
+        .validate()
+        .map_err(|e| miette::miette!(e))?;
     if let Some(sources) = file
         .as_ref()
         .and_then(|file| file.openshell.gateway.provider_profile_sources.clone())

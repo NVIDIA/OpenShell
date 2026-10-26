@@ -332,6 +332,7 @@ pub struct Config {
 
     /// Browser-facing sandbox service routing configuration.
     pub service_routing: ServiceRoutingConfig,
+    pub supervisor_app_listener: crate::app_listener::AppListenerConfig,
 }
 
 /// Browser-facing sandbox service routing configuration.
@@ -953,6 +954,7 @@ impl Config {
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
+            supervisor_app_listener: crate::app_listener::AppListenerConfig::default(),
         }
     }
 

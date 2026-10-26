@@ -58,7 +58,7 @@ rules:
       - watch
   - apiGroups: [""]
     resources: ["services"]
-    verbs: ["create", "get"]
+    verbs: ["create", "get"{{ if and (get (include "openshell.appListenerDeployment" . | fromYaml) "create_service") (not (include "openshell.supervisorEnabled" .)) }}, "patch", "delete"{{ end }}]
   - apiGroups: [""]
     resources: ["secrets"]
     # Bootstrap Secrets are generation-scoped. Recovery deletes them by exact

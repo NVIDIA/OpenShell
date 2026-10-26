@@ -608,3 +608,13 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass and BackendTrafficPolicy for Envoy Gateway (`mise run helm:gateway:apply`) |
 | `tasks/scripts/helm-k3s-local.sh` | k3d cluster create/delete/start/stop/status |
 | `tasks/scripts/keycloak-k8s-setup.sh` | Keycloak deploy, realm import, and development TLS trust anchor |
+
+## App listener fixture
+
+The opt-in `deploy/helm/openshell/ci/values-app-listener.yaml` enables the
+supervisor listener at port 9443 without discovery or a proxy. Provision the
+operator TLS Secret and an ingress-client NetworkPolicy first. Follow
+`e2e/kubernetes/app-listener/README.md` for direct in-cluster verification,
+shared-member selection, and the HA follow-up checks. Keep the fixture disabled
+in default profiles. Shared headless app Services enumerate members and must not
+be treated as load-balanced routes for sandboxes with different owners.

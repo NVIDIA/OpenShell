@@ -455,6 +455,8 @@ impl TryFrom<RawOtlpConfig> for OtlpConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupervisorFileSection {
+    #[serde(default)]
+    pub app_listener: openshell_core::app_listener::AppListenerConfig,
     /// Operator-owned external isolation routes, reachable by supervisors.
     #[serde(default)]
     pub isolation_backends: Vec<openshell_core::isolation_registration::BackendRegistration>,

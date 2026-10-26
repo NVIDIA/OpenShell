@@ -904,6 +904,9 @@ impl ConfigRuntime {
         let requested_revision = sandbox_config_revision(&snapshot);
         let desired_environment = EnvironmentIdentity::from_settings(&snapshot);
         let provider = if !snapshot.configuration_admitted {
+            if let Some(routes) = &ctx.app_routes {
+                routes.suspend();
+            }
             if !self.reloads_gateway_policy {
                 return DeliveredResult {
                     outcome: ConfigApplyOutcome::FailedRetainedLastKnownGood,
@@ -938,6 +941,9 @@ impl ConfigRuntime {
             {
                 Ok(prepared) => Some(prepared),
                 Err(failure) => {
+                    if let Some(routes) = &ctx.app_routes {
+                        routes.suspend();
+                    }
                     // Static credentials were revoked, so this configuration
                     // is not applied until its environment installs.
                     let outcome = if self.applied_revision.is_some() {
@@ -968,6 +974,9 @@ impl ConfigRuntime {
                 outcome,
                 policy_status,
             }) => {
+                if let Some(routes) = &ctx.app_routes {
+                    routes.install(&snapshot);
+                }
                 self.stream.rejected_sandbox = None;
                 let _ = ctx.workspace_tx.send(snapshot.workspace.clone());
                 let outcome = if !self.reloads_gateway_policy {
@@ -987,6 +996,9 @@ impl ConfigRuntime {
                 };
             }
             Err(error) => {
+                if let Some(routes) = &ctx.app_routes {
+                    routes.suspend();
+                }
                 // Polling ends its loop on this error; session delivery
                 // reports it instead, so record it here.
                 ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -1013,6 +1025,9 @@ impl ConfigRuntime {
             }
         };
 
+        if let Some(routes) = &ctx.app_routes {
+            routes.suspend();
+        }
         // The previous revision is retained only while its policy is enforced.
         let retained_revision = self
             .applied_revision
@@ -1214,6 +1229,10 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     client: C,
 ) -> Result<()> {
     let mut config_apply_rx = ctx.config_apply_rx.take();
+    let _app_configuration = ctx
+        .app_routes
+        .clone()
+        .map(crate::app_listener::Routes::configuration_guard);
     let (status_sender, status_receiver) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(run_policy_status_reporter(
         client.clone(),
@@ -1296,6 +1315,9 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                         ctx.provider_credentials.snapshot().revision,
                     )
                     .await;
+                    if let Some(routes) = &ctx.app_routes {
+                        routes.install(&result);
+                    }
                     runtime.middleware_services = result.supervisor_middleware_services;
                     runtime.extension_authentication_enabled =
                         result.extension_authentication_enabled;
@@ -1351,7 +1373,20 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             // The session's bootstrap supersedes a polled result that was
             // not reconciled yet.
             pending_result = None;
+            // A quiet push stream still has authenticated session freshness.
+            // Renew only installed, unexpired routes. Poll mode renews by
+            // successfully applying a complete configuration instead.
+            if ctx.supervisor_session_id.borrow().is_some()
+                && let Some(routes) = &ctx.app_routes
+            {
+                routes.renew();
+            }
             let delay = next_poll_delay(&ctx.extension_credentials, interval);
+            let delay = if ctx.app_routes.is_some() {
+                delay.min(Duration::from_secs(5))
+            } else {
+                delay
+            };
             tokio::select! {
                 changed = async {
                     match config_push_updates.as_mut() {
@@ -1413,9 +1448,25 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             }
         };
 
-        let reconciled = runtime
+        let reconciled = match runtime
             .reconcile(&ctx, &client, &result, ProviderSource::Fetch)
-            .await?;
+            .await
+        {
+            Ok(reconciled) => reconciled,
+            Err(error) => {
+                if let Some(routes) = &ctx.app_routes {
+                    routes.suspend();
+                }
+                return Err(error);
+            }
+        };
+        if let Some(routes) = &ctx.app_routes {
+            if matches!(reconciled.outcome, ReconcileOutcome::Rejected(_)) {
+                routes.suspend();
+            } else {
+                routes.install(&result);
+            }
+        }
         if let Some(status) = reconciled.policy_status {
             enqueue_policy_status(&status_sender, status);
         }
@@ -2710,6 +2761,7 @@ mod tests {
             );
         }
         PolicyPollLoopContext {
+            app_routes: None,
             gateway: test_gateway(),
             sandbox_id: "sandbox-test".to_string(),
             sandbox: "sandbox-test-name".to_string(),

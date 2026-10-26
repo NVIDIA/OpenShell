@@ -287,6 +287,8 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(openshell_core::config::default_supervisor_image),
             supervisor_image_pull_policy: args.supervisor_image_pull_policy,
             sandbox_runtime: KubernetesSandboxRuntimeConfig {
+                app_listener:
+                    openshell_driver_kubernetes::config::KubernetesAppListenerConfig::default(),
                 boundary_port: args.sandbox_runtime_boundary_port,
             },
             https_proxy: args.https_proxy,

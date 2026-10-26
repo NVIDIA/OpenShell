@@ -296,7 +296,7 @@ pub enum KubernetesDriverError {
 }
 
 impl KubernetesDriverError {
-    fn from_kube(err: KubeError) -> Self {
+    pub(crate) fn from_kube(err: KubeError) -> Self {
         match err {
             KubeError::Api(api) if api.code == 409 && api.reason == "AlreadyExists" => {
                 Self::AlreadyExists
@@ -3037,6 +3037,16 @@ impl KubernetesComputeDriver {
         owner: OwnerReference,
     ) -> Result<(), KubernetesDriverError> {
         let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        if self.shared_supervisor.is_none() {
+            crate::app_listener::ensure_service(
+                self.client.clone(),
+                namespace,
+                sandbox_id,
+                &self.config.sandbox_runtime.app_listener,
+                owner.clone(),
+            )
+            .await?;
+        }
         let expected = boundary_service(
             namespace,
             names,
@@ -3124,41 +3134,44 @@ impl KubernetesComputeDriver {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         pods.create(
             &PostParams::default(),
-            &supervisor_pod(
-                namespace,
-                names,
-                sandbox_id,
-                sandbox_name,
-                &self.config.gateway_id,
-                &self.config.supervisor_image,
-                self.config.supervisor_image_pull_policy,
-                &self.config.service_account_name,
-                agent_uid,
-                agent_gid,
-                &self.generation_image_pull_secret_names(names),
-                &self.config.grpc_endpoint,
-                self.config.supervisor_client_tls(),
-                main_process_spec,
-                log_level,
-                self.config.effective_sa_token_ttl_secs(),
-                self.config.https_proxy.as_deref(),
-                self.config.no_proxy.as_deref(),
-                self.config
-                    .proxy_auth_secret_name
-                    .as_deref()
-                    .zip(self.config.proxy_auth_secret_key.as_deref()),
-                self.config.proxy_auth_allow_insecure == Some(true),
-                self.config.proxy_connect_by_hostname == Some(true),
-                upstream_proxy_ca_bundle_staged,
-                self.config.provider_spiffe_enabled().then_some(
+            &crate::app_listener::configure_supervisor_pod(
+                supervisor_pod(
+                    namespace,
+                    names,
+                    sandbox_id,
+                    sandbox_name,
+                    &self.config.gateway_id,
+                    &self.config.supervisor_image,
+                    self.config.supervisor_image_pull_policy,
+                    &self.config.service_account_name,
+                    agent_uid,
+                    agent_gid,
+                    &self.generation_image_pull_secret_names(names),
+                    &self.config.grpc_endpoint,
+                    self.config.supervisor_client_tls(),
+                    main_process_spec,
+                    log_level,
+                    self.config.effective_sa_token_ttl_secs(),
+                    self.config.https_proxy.as_deref(),
+                    self.config.no_proxy.as_deref(),
                     self.config
-                        .provider_spiffe_workload_api_socket_path
-                        .as_str(),
-                ),
-                owner,
-                &self.supervisor_otlp_environment(),
-            )
-            .map_err(KubernetesDriverError::Message)?,
+                        .proxy_auth_secret_name
+                        .as_deref()
+                        .zip(self.config.proxy_auth_secret_key.as_deref()),
+                    self.config.proxy_auth_allow_insecure == Some(true),
+                    self.config.proxy_connect_by_hostname == Some(true),
+                    upstream_proxy_ca_bundle_staged,
+                    self.config.provider_spiffe_enabled().then_some(
+                        self.config
+                            .provider_spiffe_workload_api_socket_path
+                            .as_str(),
+                    ),
+                    owner,
+                    &self.supervisor_otlp_environment(),
+                )
+                .map_err(KubernetesDriverError::Message)?,
+                &self.config.sandbox_runtime.app_listener,
+            ),
         )
         .await
         .map_err(KubernetesDriverError::from_kube)?

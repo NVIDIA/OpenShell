@@ -182,6 +182,7 @@ pub struct SharedHostConfig {
 /// The sandbox instance registry and the routed runtime listener its
 /// instances claim routes on, reconciled to the gateway's assignments.
 pub struct SharedHost {
+    app_listener: Option<crate::app_listener::HostHandle>,
     host: SandboxInstanceHost,
     router: Arc<RuntimeRouter>,
     gateway_endpoint: String,
@@ -287,10 +288,15 @@ impl From<SandboxInstanceHostError> for ControlError {
 impl SharedHost {
     /// Bind the routed runtime listener and prepare the instance root.
     pub fn start(config: SharedHostConfig) -> Result<Arc<Self>> {
+        let app_listener = crate::app_listener::Config::from_env()?
+            .map(crate::app_listener::Config::bind)
+            .transpose()?
+            .map(crate::app_listener::BoundListener::start);
         let host = SandboxInstanceHost::new(config.instance_root)?;
         let router = RuntimeRouter::bind(config.runtime_listen)
             .map_err(|error| miette::miette!("{error}"))?;
         Ok(Arc::new(Self {
+            app_listener,
             host,
             router,
             gateway_endpoint: config.gateway_endpoint,
@@ -776,6 +782,10 @@ impl SharedHost {
         crate::sandbox_instance_host::prepare_private_dir(&trust_dir).map_err(failure)?;
         let ssh_socket = dir.join("ssh.sock");
         let config = crate::SandboxInstanceConfig {
+            app_router: self
+                .app_listener
+                .as_ref()
+                .map(crate::app_listener::HostHandle::router),
             command: main_process.command,
             workdir: registration.workdir,
             timeout_secs: 0,

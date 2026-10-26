@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+suite: app endpoint reconciliation permissions
+templates:
+  - templates/role.yaml
+  - templates/clusterrole.yaml
+tests:
+  - it: keeps default Service permissions unchanged
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["services"]
+            verbs: ["create", "get"]
+        template: templates/role.yaml
+  - it: permits dedicated endpoint reconciliation and cleanup even when disabled
+    set:
+      gatewayConfig:
+        openshell.supervisor.app_listener:
+          enabled: false
+        openshell.drivers.kubernetes.sandbox_runtime.app_listener:
+          create_service: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["services"]
+            verbs: ["create", "get", "patch", "delete"]
+        template: templates/role.yaml
+  - it: grants managed workspace endpoint reconciliation permissions
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: managed
+        openshell.drivers.kubernetes.sandbox_runtime.app_listener:
+          create_service: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["services"]
+            verbs: ["create", "get", "patch", "delete"]
+        template: templates/clusterrole.yaml
+  - it: does not grant dedicated endpoint mutation permissions to a shared supervisor deployment
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.drivers.kubernetes.sandbox_runtime.app_listener:
+          create_service: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["services"]
+            verbs: ["create", "get"]
+        template: templates/role.yaml

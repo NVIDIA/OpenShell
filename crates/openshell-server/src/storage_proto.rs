@@ -164,7 +164,7 @@ mod tests {
     // SandboxPhase enum. Stored rows never carried those values, so prior
     // payloads decode unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "f24c9b77a85f59ae9ab60f783d45654d78bf566fcf260f9131f1aba39fa4b59b";
+        "73e29104ad78d7682b859edfc15ebe2c7319f53d72948cab4dd2c99daed8d11c";
     const DURABLE_SCHEMA_SHA256: &str =
         "ffb20595e36032a9476d1c6956e2dcdc814f85286fc4735751e5ec6f499ea9ed";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -702,7 +702,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (330, 31),
+                (331, 31),
                 (95, 22),
                 (83, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
