@@ -28,8 +28,6 @@ The maintainers and reporter agree on a disclosure date after assessment. Keep d
 
 We aim to publish an advisory with a fix or mitigation. Active exploitation or details already being public may require earlier notification. Advisories explain when a fix is unavailable and identify known mitigations.
 
-When applicable, maintainers coordinate a CVE with the appropriate numbering authority and reuse an existing identifier.
-
 ## Supported versions
 
 In line with [RFC 0014](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0014-release-stability/README.md#maintenance-and-backports), security support applies to the newest patch of each maintained line:
