@@ -179,38 +179,12 @@ which enables flakes by default. With another installer,
 [enable flakes](https://wiki.nixos.org/wiki/Flakes#Enabling_flakes_permanently)
 yourself.
 
-Optionally, configure the OpenShell binary cache once per machine. Without it,
-Nix builds the cross-compilation toolchains from source, which can take hours.
-Append the cache settings to `/etc/nix/nix.custom.conf` and restart the Nix daemon. With
-other installers, use `/etc/nix/nix.conf` instead.
-
-```shell
-printf '%s\n' \
-  'extra-substituters = https://openshell.cachix.org' \
-  'extra-trusted-public-keys = openshell.cachix.org-1:OAr5MunsfH5PZvUsfD08OtGx5RtcwdNZGJdU5FqLm5w=' \
-  | sudo tee -a /etc/nix/nix.custom.conf
-
-# macOS with Determinate Nix
-sudo launchctl kickstart -k system/systems.determinate.nix-daemon
-
-# Linux with systemd
-sudo systemctl restart nix-daemon
-```
-
-The repository's `flake.nix` declares the same cache, but the Nix daemon
-ignores flake-supplied substituters unless the user is in `trusted-users`.
-Configure the cache system-wide instead of adding yourself to `trusted-users`,
-which effectively grants root access through the daemon. Nix still prints `ignoring untrusted flake
-configuration setting` warnings; they are harmless once the cache is
-configured.
-
-Confirm that the cache is active:
-
-```shell
-nix config show substituters
-```
-
-The output must include `https://openshell.cachix.org`.
+To download prebuilt dependencies instead of building them from source, add
+the `openshell` Cachix cache to your Nix configuration by following the
+[Cachix instructions](https://docs.cachix.org/getting-started#using-binaries-with-nix).
+To configure it by hand, use the substituter `https://openshell.cachix.org`
+and public key
+`openshell.cachix.org-1:OAr5MunsfH5PZvUsfD08OtGx5RtcwdNZGJdU5FqLm5w=`.
 
 ### Z3 installation
 
