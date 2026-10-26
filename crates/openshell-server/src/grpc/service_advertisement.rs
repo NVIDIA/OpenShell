@@ -958,6 +958,7 @@ pub mod tests {
             target_port: 8080,
             authorization_mode: 1,
             resource_version: 2,
+            application_hostname: String::new(),
         }
     }
 
@@ -1074,6 +1075,17 @@ pub mod tests {
 
     pub async fn installed_fixture()
     -> (Arc<ServerState>, OwnerGuard, SupervisorServiceAdvertisement) {
+        installed_fixture_for_gateway(
+            "gateway-a",
+            openshell_core::config::ServiceHostnameFormat::Readable,
+        )
+        .await
+    }
+
+    pub async fn installed_fixture_for_gateway(
+        gateway: &str,
+        format: openshell_core::config::ServiceHostnameFormat,
+    ) -> (Arc<ServerState>, OwnerGuard, SupervisorServiceAdvertisement) {
         use openshell_core::proto::datamodel::v1::ObjectMeta;
         use openshell_core::proto::{SandboxPolicy, SandboxSpec, ServiceEndpoint};
         let endpoint = openshell_core::proto::compute::v1::SupervisorAppEndpoint {
@@ -1099,11 +1111,15 @@ pub mod tests {
             .unwrap()
             .config
             .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+            public_url: None,
             enabled: true,
             port: 9443,
             domain: "services.example.com".into(),
         };
-        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".into();
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.config.name = gateway.into();
+        inner.config.service_routing.service_hostname_format = format;
+        inner.admin_role = "openshell-admin".into();
         let sandbox = Sandbox {
             metadata: Some(ObjectMeta {
                 id: "sandbox".into(),

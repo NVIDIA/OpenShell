@@ -378,6 +378,8 @@ impl OpenShell for TestOpenShell {
         let name = request.name;
         // Return a minimal sandbox with metadata for CAS operations
         Ok(Response::new(SandboxResponse {
+            application_service_urls: HashMap::new(),
+            gateway_service_urls: HashMap::new(),
             sandbox: Some(Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: format!("sb-{name}"),
