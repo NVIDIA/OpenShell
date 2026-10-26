@@ -4625,6 +4625,7 @@ async fn provider_create_from_existing_uses_profile_discovery() {
             }],
             discovery: Some(ProviderProfileDiscovery {
                 credentials: vec!["api_key".to_string()],
+                config_env_vars: Vec::new(),
             }),
             ..Default::default()
         },
@@ -4812,6 +4813,7 @@ async fn provider_create_from_existing_fails_when_profile_discovery_finds_nothin
             }],
             discovery: Some(ProviderProfileDiscovery {
                 credentials: vec!["api_key".to_string()],
+                config_env_vars: Vec::new(),
             }),
             ..Default::default()
         },
@@ -4861,6 +4863,7 @@ async fn provider_update_from_existing_uses_profile_discovery() {
             }],
             discovery: Some(ProviderProfileDiscovery {
                 credentials: vec!["api_key".to_string()],
+                config_env_vars: Vec::new(),
             }),
             ..Default::default()
         },
@@ -4935,6 +4938,7 @@ async fn provider_update_from_existing_preserves_global_profile_scope() {
                 }],
                 discovery: Some(ProviderProfileDiscovery {
                     credentials: vec!["api_key".to_string()],
+                    config_env_vars: Vec::new(),
                 }),
                 ..Default::default()
             },
@@ -5996,7 +6000,7 @@ async fn provider_create_from_gcloud_adc_rolls_back_provider_when_initial_rotate
 }
 
 #[tokio::test]
-async fn provider_create_from_existing_vertex_config_only_reports_missing_vertex_credentials() {
+async fn provider_create_from_existing_vertex_config_only_reports_missing_credentials() {
     let ts = run_server().await;
 
     Environment::from_pairs(&[
@@ -6020,8 +6024,7 @@ async fn provider_create_from_existing_vertex_config_only_reports_missing_vertex
 
         let msg = err.to_string();
         assert!(
-            msg.contains("GOOGLE_VERTEX_AI_TOKEN")
-                && msg.contains("VERTEX_AI_SERVICE_ACCOUNT_TOKEN"),
+            msg.contains("no credentials resolved") && msg.contains("--credential KEY[=VALUE]"),
             "unexpected error: {msg}"
         );
         assert!(

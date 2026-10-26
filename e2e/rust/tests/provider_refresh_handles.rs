@@ -9,6 +9,8 @@
 //! retains its original environment while the gateway rotates the provider 12
 //! times. The shell must continue reaching the resource with the newest token,
 //! and explicit refresh reconfiguration must revoke its old handle.
+//! Declared non-secret defaults must reach the shell as literal values, while
+//! caller environment takes precedence in both main and exec processes.
 
 use std::io::Write;
 use std::process::Stdio;
@@ -113,6 +115,13 @@ fn write_profile(resource_port: u16, token_port: u16) -> Result<NamedTempFile, S
         r"id: {PROFILE_ID}
 display_name: Stable refresh handle E2E
 category: other
+environment:
+  config:
+    REFRESH_E2E_PROJECT: project
+    REFRESH_E2E_DEFAULT_PROJECT: project
+  fixed:
+    REFRESH_E2E_MODE: native
+    REFRESH_E2E_DEFAULT_MODE: native
 credentials:
   - name: access_token
     env_vars: [{TOKEN_ENV}]
@@ -208,6 +217,8 @@ async fn configure_refresh(profile: &NamedTempFile) -> Result<(), String> {
             PROFILE_ID,
             "--credential",
             TOKEN_ENV,
+            "--config",
+            "project=custom-profile-project",
         ],
         &[(TOKEN_ENV, "bootstrap-token")],
     )
@@ -301,8 +312,9 @@ async fn long_running_process_survives_rotations_and_reconfigure_revokes() -> Re
     delete_provider_resources().await;
     let fixture_port = find_free_port();
     let fixture_script = FIXTURE_SCRIPT.replace("__PORT__", &fixture_port.to_string());
-    let fixture =
-        HostSupportContainer::start_python_on_host_network(&fixture_script, fixture_port).await?;
+    // Publish the fixture for both the native gateway and the supervisor. On
+    // macOS, Podman's host network is inside its VM, not the gateway's host.
+    let fixture = HostSupportContainer::start_python(&fixture_script, fixture_port).await?;
     let profile = write_profile(fixture.port, fixture.port)?;
     let policy = write_policy(fixture.port)?;
     configure_refresh(&profile).await?;
@@ -314,6 +326,10 @@ async fn long_running_process_survives_rotations_and_reconfigure_revokes() -> Re
   openshell:resolve:env:s*_REFRESH_E2E_ACCESS_TOKEN) ;;
   *) exit 64 ;;
 esac
+test "$REFRESH_E2E_PROJECT" = caller-project || exit 65
+test "${{REFRESH_E2E_MODE+x}}" = x && test -z "$REFRESH_E2E_MODE" || exit 66
+test "$REFRESH_E2E_DEFAULT_PROJECT" = custom-profile-project || exit 67
+test "$REFRESH_E2E_DEFAULT_MODE" = native || exit 68
 echo {READY_MARKER}
 while true; do
   if [ -f /sandbox/probe-trigger ]; then
@@ -328,13 +344,36 @@ while true; do
 done"#
     );
     let mut sandbox = SandboxGuard::create_keep_with_args(
-        &["--provider", PROVIDER_NAME, "--policy", &policy_path],
+        &[
+            "--provider",
+            PROVIDER_NAME,
+            "--policy",
+            &policy_path,
+            "--env",
+            "REFRESH_E2E_PROJECT=caller-project",
+            "--env",
+            "REFRESH_E2E_MODE=",
+            "--env",
+            "REFRESH_E2E_ACCESS_TOKEN=caller-token",
+        ],
         &["sh", "-c", &parent_script],
         READY_MARKER,
     )
     .await?;
 
     let result = async {
+        sandbox
+            .exec(&[
+                "sh",
+                "-c",
+                r#"test "$REFRESH_E2E_PROJECT" = caller-project &&
+test "${REFRESH_E2E_MODE+x}" = x && test -z "$REFRESH_E2E_MODE" &&
+test "$REFRESH_E2E_DEFAULT_PROJECT" = custom-profile-project &&
+test "$REFRESH_E2E_DEFAULT_MODE" = native &&
+case "$REFRESH_E2E_ACCESS_TOKEN" in openshell:resolve:env:s*_REFRESH_E2E_ACCESS_TOKEN) true;; *) false;; esac"#,
+            ])
+            .await?;
+
         if trigger_probe(&sandbox).await? != "ok" {
             return Err(format!(
                 "initial long-running credential probe failed; fixture logs:\n{}",
