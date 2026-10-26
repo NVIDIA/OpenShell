@@ -11,7 +11,7 @@ use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header
 use hyper_util::rt::TokioIo;
 use openshell_core::config::ServiceRoutingConfig;
 use openshell_core::proto::{
-    Sandbox, SandboxPhase, ServiceAuthorizationMode, ServiceEndpoint, TcpRelayTarget, relay_open,
+    Sandbox, ServiceAuthorizationMode, ServiceEndpoint, TcpRelayTarget, relay_open,
 };
 use openshell_core::{ObjectId, ObjectWorkspace};
 use openshell_ocsf::{
@@ -727,7 +727,25 @@ async fn proxy_to_endpoint(
             return Err(route_err);
         }
     };
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
+    // Services follow the same access rule as exec, SSH, and port forwarding.
+    let reachable = match crate::supervisor_session::sandbox_relay_reachable(&state, &sandbox).await
+    {
+        Ok(reachable) => reachable,
+        Err(err) => {
+            warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "sandbox service routing: failed to resolve supervisor owner");
+            let route_err = ServiceRouteError::internal_error();
+            emit_service_http_failure(
+                &state,
+                &req,
+                &sandbox_name,
+                &service_name,
+                Some(&endpoint),
+                &route_err,
+            );
+            return Err(route_err);
+        }
+    };
+    if !reachable {
         let err = ServiceRouteError::sandbox_not_ready();
         emit_service_http_failure(
             &state,
@@ -2269,6 +2287,72 @@ mod tests {
         );
         assert_eq!(upstream.headers()[header::CONNECTION], "Upgrade");
         assert_eq!(upstream.headers()[header::UPGRADE], "websocket");
+    }
+
+    #[tokio::test]
+    async fn completed_sandbox_routes_services_only_while_supervisor_is_live() {
+        use openshell_core::proto::{GatewayMessage, SandboxPhase, gateway_message};
+
+        let state = crate::grpc::test_support::test_server_state().await;
+        let mut ep = endpoint();
+        ep.metadata.as_mut().unwrap().id = "svc-completed-endpoint".to_string();
+        ep.metadata.as_mut().unwrap().name = "svc-completed--web".to_string();
+        ep.sandbox_id = "svc-completed".to_string();
+        ep.sandbox = "svc-completed".to_string();
+        state.store.put_message(&ep).await.unwrap();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "svc-completed".to_string(),
+                name: "svc-completed".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Completed as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+        let route = |state: Arc<ServerState>| async move {
+            let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+            proxy_to_endpoint(
+                state,
+                req,
+                "default",
+                "svc-completed".to_string(),
+                "web".to_string(),
+            )
+            .await
+        };
+
+        let Err(err) = route(state.clone()).await else {
+            panic!("a Completed sandbox without a supervisor must not route");
+        };
+        assert_eq!(err.reason, ServiceRouteError::sandbox_not_ready().reason);
+
+        // With the supervisor retaining its access plane, the request passes
+        // the gate and asks the supervisor for a relay.
+        let (tx, mut messages) = tokio::sync::mpsc::channel::<GatewayMessage>(1);
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+        state.supervisor_sessions.register(
+            "svc-completed".to_string(),
+            "session".to_string(),
+            tx,
+            shutdown_tx,
+        );
+        let routed = tokio::spawn(route(state.clone()));
+        let message = tokio::time::timeout(Duration::from_secs(5), messages.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(gateway_message::Payload::RelayOpen(open)) = message.payload else {
+            panic!("expected relay open");
+        };
+        state
+            .supervisor_sessions
+            .fail_pending_relay(&open.channel_id, "test relay ended".into());
+        let Err(err) = routed.await.unwrap() else {
+            panic!("a failed relay must not produce a response");
+        };
+        assert_eq!(err.reason, ServiceRouteError::service_unreachable().reason);
     }
 
     #[tokio::test]

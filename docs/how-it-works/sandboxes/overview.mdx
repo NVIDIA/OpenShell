@@ -1209,7 +1209,12 @@ temporarily while its supervisor reconnects. Wait for the phase to return to
 The gateway records a successful canonical main-process exit as `Ready=False`
 with reason `MainProcessCompleted`. Nonzero and signal-normalized results use
 `MainProcessFailed` and the `Error` phase. It also sets `status.exit_code`;
-signal exits use the standard `128 + signal` convention. When restart policy
+signal exits use the standard `128 + signal` convention. After the main
+process of a retained sandbox exits, you can still connect, execute commands,
+transfer files, forward ports, and reach exposed services while the sandbox
+supervisor stays connected. An ephemeral (`--no-keep`) sandbox is deleted after its main process
+exits, and an `Error` caused by an infrastructure failure usually has no
+connected supervisor, so neither accepts new sessions. When restart policy
 selects replacement, `status.restart_count` and `status.next_restart_time`
 show the attempt number and next deadline. Inspect them with
 `openshell sandbox get <name>`. `sandbox stop` cancels a pending replacement;
