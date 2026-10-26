@@ -101,6 +101,21 @@ struct TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn get_service_route_snapshot(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetServiceRouteSnapshotRequest>,
+    ) -> Result<Response<openshell_core::proto::GetServiceRouteSnapshotResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    type WatchServiceRoutesStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::WatchServiceRoutesResponse, Status>,
+    >;
+    async fn watch_service_routes(
+        &self,
+        _: tonic::Request<openshell_core::proto::WatchServiceRoutesRequest>,
+    ) -> Result<Response<Self::WatchServiceRoutesStream>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
     async fn peer_notify_config_update(
         &self,
         _request: tonic::Request<openshell_core::proto::PeerNotifyConfigUpdateRequest>,

@@ -164,7 +164,7 @@ mod tests {
     // SandboxPhase enum. Stored rows never carried those values, so prior
     // payloads decode unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "ef8a86dbefbde690c1159c4b2756b4b881513bc3f65e578ee5eb10d0a3f94640";
+        "b289c550eee1fe2fcadd6bb5fc59d6625a940af44eca277fbcd9ee256447f2de";
     const DURABLE_SCHEMA_SHA256: &str =
         "ffb20595e36032a9476d1c6956e2dcdc814f85286fc4735751e5ec6f499ea9ed";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -631,7 +631,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            106 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            108 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -641,7 +641,7 @@ mod tests {
         );
         assert_eq!(
             methods.len(),
-            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            82 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
@@ -651,7 +651,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            82 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
@@ -702,7 +702,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (333, 31),
+                (340, 31),
                 (95, 22),
                 (83, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

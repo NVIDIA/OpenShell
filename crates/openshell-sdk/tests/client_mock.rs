@@ -236,6 +236,20 @@ fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloa
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn get_service_route_snapshot(
+        &self,
+        _: tonic::Request<proto::GetServiceRouteSnapshotRequest>,
+    ) -> Result<Response<proto::GetServiceRouteSnapshotResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    type WatchServiceRoutesStream =
+        tokio_stream::wrappers::ReceiverStream<Result<proto::WatchServiceRoutesResponse, Status>>;
+    async fn watch_service_routes(
+        &self,
+        _: tonic::Request<proto::WatchServiceRoutesRequest>,
+    ) -> Result<Response<Self::WatchServiceRoutesStream>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
     async fn peer_notify_config_update(
         &self,
         _request: tonic::Request<proto::PeerNotifyConfigUpdateRequest>,

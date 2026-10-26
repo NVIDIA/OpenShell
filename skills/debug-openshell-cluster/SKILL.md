@@ -1508,8 +1508,8 @@ Service changes arrive through polling or push configuration. Only admitted
 service declarations are installed. Polling and accepted live push sessions
 renew a 30-second lease; rejected configuration or expired freshness closes
 routes. App traffic uses application/edge authentication independently of gateway
-user authentication. This listener stage does not add service discovery or
-change the public URLs printed by the CLI.
+user authentication. The discovery API publishes accepted listener installations; public URLs
+printed by the CLI continue to use the gateway path.
 
 When enabled application routes are not published, check the authenticated
 supervisor session and installed configuration before checking ingress. The
@@ -1519,7 +1519,14 @@ freshness covers that lease. Replayed, late, stale-configuration, and replaced
 session reports cannot renew evidence. Endpoint resolution comes from the
 compute driver; ambiguous shared member ownership must not publish an address.
 
-For shared pools, compare the discovered endpoint to the
+For discovery troubleshooting, request `GetServiceRouteSnapshot` for an explicit
+active workspace using an identity with `sandbox:read` and workspace user access.
+`WatchServiceRoutes` rechecks access every second and ends after one minute;
+clients must reconnect/relist. Compare installation versions separately from
+snapshot revisions: lease renewal changes expiry and the snapshot revision while
+preserving installation identity. Treat unavailable/corrupt/over-limit results as
+errors, and expire cached routes independently. Do not turn an error into an
+empty replacement. For shared pools, compare the discovered endpoint to the
 acknowledged owner's Pod IP and configured app port, not its runtime port or a
 load-balanced supervisor Service. Publication requires a current ownership term,
 live member, and acknowledged ready report. During takeover old streams may close;

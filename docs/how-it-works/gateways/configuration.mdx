@@ -1603,9 +1603,9 @@ Expose services with the existing commands. For direct listener testing, an
 unnamed service on sandbox `demo` in workspace `default` uses SNI and Host
 `default--demo.services.example.com`; a service named `web` uses
 `default--demo--web.services.example.com`. Configure DNS or your ingress to reach
-the owning supervisor while preserving that hostname. Automatic discovery and
-application URL publication are separate work; current CLI URLs still identify
-the existing gateway path.
+the owning supervisor while preserving that hostname. The discovery API supplies accepted supervisor endpoints. Application URL
+publication is separate work; current CLI URLs still identify the existing
+gateway path.
 
 Enabled supervisors report installed service routes through their authenticated
 gateway sessions. The gateway accepts only current configuration and ownership,
@@ -1626,3 +1626,12 @@ application streams even if configuration continues renewing. Under a partition,
 allow for pool membership failure detection before the last serving lease expires.
 Storage errors prevent lease renewal. Discovery expiry and serving expiry are
 separate from external ingress readiness.
+
+Discovery clients can call `GetServiceRouteSnapshot` or `WatchServiceRoutes` with
+one explicit workspace selector, `sandbox:read`, and workspace user access. Each
+response replaces the workspace route view and includes the hostname, supervisor
+TLS endpoint, installation version, and expiry. Preserve the hostname as TLS SNI
+and HTTP authority when routing directly to the endpoint. Remove absent routes
+and expire cached entries even during discovery errors. An API error does not
+mean the workspace has no routes. Watches end after one minute; reconnect and
+relist when they end. Discovery-only machine credentials are separate work.
