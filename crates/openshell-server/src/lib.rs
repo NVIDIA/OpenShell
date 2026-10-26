@@ -310,6 +310,8 @@ pub(crate) struct ServerStartupConfig {
 /// Server state shared across handlers.
 #[derive(Debug)]
 pub struct ServerState {
+    /// Process-local bound on active discovery streams.
+    pub discovery_watches: Arc<tokio::sync::Semaphore>,
     /// Server configuration.
     pub config: Config,
 
@@ -519,6 +521,7 @@ impl ServerState {
             service_route_index,
             gateway_ring: Arc::new(std::sync::RwLock::new(gateway_ring::GatewayRing::default())),
             gateway_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            discovery_watches: Arc::new(tokio::sync::Semaphore::new(32)),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
