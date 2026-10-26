@@ -14,6 +14,12 @@ Include:
 
 The [OpenShell maintainers](https://github.com/NVIDIA/OpenShell/blob/main/MAINTAINERS.md) acknowledge and assess reports, request additional details when needed, and coordinate remediation. Follow-up discussions, decisions, and progress updates remain in the private report or advisory thread.
 
+### Report quality and agent skills
+
+AI tools are welcome for investigation and drafting, consistent with our [AI usage guidelines](CONTRIBUTING.md#ai-usage). You remain responsible for understanding the finding and verifying the report's accuracy. Explain the issue in your own words, distinguish reproduced behavior, code inspection, and unverified claims, and include concise evidence excerpts. Raw scanner output or agent transcripts alone are not sufficient.
+
+Use the optional [advisory template](.agents/skills/create-security-advisory/assets/advisory-template.md) to structure the report. With a source checkout, [create-security-advisory](.agents/skills/create-security-advisory/SKILL.md) helps prepare it; maintainers can use [review-security-issue](.agents/skills/review-security-issue/SKILL.md) for assessment. Submit reports through the private form above.
+
 ## Coordinated disclosure
 
 The maintainers and reporter agree on a disclosure date after assessment. Keep details confidential until that date; any extension is discussed with the reporter. Access is limited to people involved in investigation, remediation, or coordination.
