@@ -163,6 +163,13 @@ macro_rules! mock_gateway {
     ) => {
         #[tonic::async_trait]
         impl OpenShell for MockGateway {
+    async fn get_service_route_snapshot(&self, _: Request<openshell_core::proto::GetServiceRouteSnapshotRequest>) -> Result<Response<openshell_core::proto::GetServiceRouteSnapshotResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    type WatchServiceRoutesStream = tokio_stream::wrappers::ReceiverStream<Result<openshell_core::proto::WatchServiceRoutesResponse, Status>>;
+    async fn watch_service_routes(&self, _: Request<openshell_core::proto::WatchServiceRoutesRequest>) -> Result<Response<Self::WatchServiceRoutesStream>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
             $(async fn $method(&self, _: Request<$request>) -> Result<Response<$response>, Status> {
                 Err(Status::unimplemented("unused test RPC"))
             })*
