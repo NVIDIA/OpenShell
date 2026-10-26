@@ -40,8 +40,10 @@ pub const SUPERVISOR_AUTH_BUNDLE_KEY: &str = "auth.json";
 pub const PROXY_CA_CERTIFICATE_KEY: &str = "proxy-ca.crt";
 pub const PROXY_CA_PRIVATE_KEY: &str = "proxy-ca.key";
 /// Optional bootstrap-Secret key holding the operator's corporate proxy CA
-/// bundle (`proxy_ca_bundle`). Distinct from [`PROXY_CA_CERTIFICATE_KEY`],
-/// which is the sandbox's own generated TLS-interception CA.
+/// bundle (`proxy_ca_bundle`).
+///
+/// Distinct from [`PROXY_CA_CERTIFICATE_KEY`], which is the sandbox's own
+/// generated TLS-interception CA.
 pub const UPSTREAM_PROXY_CA_BUNDLE_KEY: &str = "upstream-proxy-ca.pem";
 /// JSON sandbox instance registration of a generation on the shared supervisor.
 pub const SHARED_INSTANCE_KEY: &str = "instance.json";
@@ -205,8 +207,10 @@ pub fn workload_fence(
 }
 
 /// Per-sandbox Sandbox Protocol endpoint. Its stable `ClusterIP` is allocated
-/// before either Pod runs. Each connection mode has a separate Service name
-/// and fixed selector, so legacy gateways keep their workload endpoint.
+/// before either Pod runs.
+///
+/// Each connection mode has a separate Service name and fixed selector, so
+/// legacy gateways keep their workload endpoint.
 #[must_use]
 pub fn boundary_service(
     namespace: &str,
@@ -692,7 +696,9 @@ pub fn supervisor_bootstrap_secret(
 
 /// Durable launch material of one shared-supervisor sandbox instance, under
 /// the generation's supervisor Secret name so the existing generation cleanup
-/// deletes it. The gateway reads it back to rebuild the host's assignments.
+/// deletes it.
+///
+/// The gateway reads it back to rebuild the host's assignments.
 #[must_use]
 pub fn shared_instance_secret(
     namespace: &str,
