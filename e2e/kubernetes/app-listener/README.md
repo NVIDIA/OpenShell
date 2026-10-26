@@ -20,10 +20,12 @@ this stage. Use these direct-listener hostnames instead:
 - `default--<sandbox>.services.example.com` for the unnamed service.
 - `default--<sandbox>--web.services.example.com` for the named service.
 
-Inspect supervisor Pods and the app Service's EndpointSlices. For dedicated
-supervisors, use `os-app-<sandbox-id>`. For shared supervisors, enumerate members
-through `<supervisor-name>-app` and select the Pod IP actually owning the sandbox.
-Do not select an arbitrary address when more than one member is present.
+Inspect supervisor Pods. Dedicated supervisors optionally expose
+`os-app-<sandbox-id>`; inspect that Service's EndpointSlices. Shared supervisors
+have no app Service: select the Pod IP actually owning the sandbox and use its
+configured app port. Do not select an arbitrary member when more than one is
+present. Check ownership through supervisor admission/release logs in this
+stage; automated owner selection belongs to the later discovery API.
 
 From a permitted client Pod, mount only the public app certificate/CA and run:
 

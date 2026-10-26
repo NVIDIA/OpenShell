@@ -280,7 +280,7 @@ This path uses application or trusted-edge authentication independently from
 gateway authentication. It validates Host against SNI, preserves public
 Host/Origin and application cookies, strips gateway/edge identity material, and
 retains service-specific bearer passthrough. It has no discovery API or public
-URL selection. A shared pool's headless Service enumerates member addresses;
-clients must select the member owning their sandbox rather than connect to an
-arbitrary member. HA takeover may preserve the workload generation; existing ingress streams
+URL selection. Shared supervisors expose the app listener on each member's Pod
+IP without a shared app Service. Clients must select the member owning their
+sandbox. HA takeover may preserve the workload generation; existing ingress streams
 are not migrated. Runtime ownership fencing must reject stale connectors.

@@ -1490,9 +1490,9 @@ mount or app port. TLS material is mounted only in supervisors and reloads on
 supervisor restart.
 
 Inspect supervisor Pods, app Services, and EndpointSlices with `kubectl`. A
-dedicated endpoint is `os-app-<sandbox-id>`; a shared endpoint is
-`<supervisor-name>-app`. Headless shared endpoints enumerate members: select the
-current sandbox owner, not an arbitrary member IP. Preserve service SNI and Host
+dedicated endpoint is `os-app-<sandbox-id>`. Shared supervisors have no app
+Service: connect to the current sandbox owner's Pod IP and configured app port.
+Preserve service SNI and Host
 when using curl's `--connect-to`, and verify the application certificate. A
 port-forward bypasses Service and NetworkPolicy forwarding; also test from a
 permitted in-cluster client. Operators provide ingress network rules.

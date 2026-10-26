@@ -616,5 +616,6 @@ supervisor listener at port 9443 without discovery or a proxy. Provision the
 operator TLS Secret and an ingress-client NetworkPolicy first. Follow
 `e2e/kubernetes/app-listener/README.md` for direct in-cluster verification,
 shared-member selection, and the HA follow-up checks. Keep the fixture disabled
-in default profiles. Shared headless app Services enumerate members and must not
-be treated as load-balanced routes for sandboxes with different owners.
+in default profiles. Shared supervisors expose app ports on their Pod IPs
+without a shared app Service. Select the member owning the sandbox; automatic
+owner selection belongs to the later discovery API.

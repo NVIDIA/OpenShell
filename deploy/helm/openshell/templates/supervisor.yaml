@@ -202,26 +202,4 @@ spec:
               - key: ca.crt
                 path: ca.crt
         {{- end }}
-{{- if and (get $app "enabled") (get $appDeployment "create_service") }}
----
-# Enumerates supervisor member addresses. Select the current owner before
-# connecting; this is not a load-balanced app endpoint for arbitrary members.
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ $name }}-app
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "openshell.labels" . | nindent 4 }}
-    app.kubernetes.io/component: supervisor-app
-spec:
-  clusterIP: None
-  selector:
-    {{- include "openshell.supervisorSelectorLabels" . | nindent 4 }}
-  ports:
-    - name: app
-      port: {{ $appPort }}
-      targetPort: app
-      protocol: TCP
-{{- end }}
 {{- end }}

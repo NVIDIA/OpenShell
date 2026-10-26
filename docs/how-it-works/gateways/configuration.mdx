@@ -1587,10 +1587,10 @@ On Kubernetes, provide a TLS Secret with `tls.crt` and `tls.key` matching
 clients to reach the app port through NetworkPolicy. The driver mounts the Secret
 only in supervisor containers. Restart supervisors after changing certificates.
 With `create_service = true`, dedicated supervisors get a sandbox-owned headless
-`os-app-<sandbox-id>` Service; shared supervisors get a separate
-`<supervisor-name>-app` headless Service. Shared endpoints enumerate members:
-select the supervisor owning the sandbox, rather than load-balancing requests
-across different owners.
+`os-app-<sandbox-id>` Service. This option applies only to dedicated supervisors.
+Shared supervisors expose the app listener directly on each member's Pod IP;
+no shared app Service is created. Select the supervisor owning the sandbox
+when routing application traffic.
 
 The Helm chart grants dedicated endpoint management the Service `patch` and
 `delete` permissions when `create_service` is set. If you supply RBAC separately,
