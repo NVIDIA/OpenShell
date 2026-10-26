@@ -205,6 +205,45 @@ pub fn normalize_compute_driver_name(value: &str) -> Result<String, String> {
     Ok(value.to_ascii_lowercase())
 }
 
+/// Gateway-owned SPIRE delegation for sandbox provider grants.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpiffeDelegationConfig {
+    pub admin_socket_path: String,
+    pub spiffe_id_prefix: String,
+    /// Supplementary group permitted to open the admin socket.
+    ///
+    /// The gateway validates it but
+    /// never changes its own groups; the Helm chart adds it to the gateway
+    /// Pod's `supplementalGroups`, and other deployments must run the gateway
+    /// with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_socket_group: Option<u32>,
+}
+
+impl SpiffeDelegationConfig {
+    /// Reject ambiguous host paths and identities before opening the SPIRE socket.
+    pub fn validate(&self, gateway_id: &str) -> Result<(), String> {
+        let path = std::path::Path::new(&self.admin_socket_path);
+        if !path.is_absolute()
+            || path
+                .parent()
+                .is_none_or(|parent| parent == std::path::Path::new("/"))
+            || self
+                .admin_socket_path
+                .split('/')
+                .skip(1)
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            || self.admin_socket_group == Some(0)
+        {
+            return Err("spiffe_delegation requires a canonical absolute admin socket path in a dedicated directory and a non-root socket group".into());
+        }
+        openshell_spiffe::SandboxSpiffeIdPrefix::parse(&self.spiffe_id_prefix)?
+            .sandbox_spiffe_id(gateway_id, "sandbox")?;
+        Ok(())
+    }
+}
+
 /// Server configuration.
 ///
 /// Built programmatically in [`crate::Config::new`] and the gateway CLI from
@@ -269,6 +308,8 @@ pub struct Config {
     /// JWTs as `Principal::Sandbox`. Required for the per-sandbox identity
     /// flow (issue #1354).
     pub gateway_jwt: Option<GatewayJwtConfig>,
+    /// Gateway-only access to SPIRE; shared supervisors receive access tokens.
+    pub spiffe_delegation: Option<SpiffeDelegationConfig>,
 
     /// Database URL for persistence.
     pub database_url: String,
@@ -940,6 +981,7 @@ impl Config {
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
+            spiffe_delegation: None,
             database_url: String::new(),
             database_max_connections: None,
             database_lock_max_connections: None,

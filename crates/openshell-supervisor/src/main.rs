@@ -590,11 +590,14 @@ fn main() -> Result<()> {
                     admitted_isolation_backend: Some(admitted_backend),
                     main_exit_marker: args.main_exit_marker,
                     trace_context: openshell_supervisor::trace_context_from_environment(),
-                    provider_workload_api_socket: std::env::var_os(
-                        openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
-                    )
-                    .filter(|path| !path.is_empty())
-                    .map(PathBuf::from),
+                    provider_identity:
+                        openshell_supervisor_network::run::ProviderIdentitySource::WorkloadApi(
+                            std::env::var_os(
+                                openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+                            )
+                            .filter(|path| !path.is_empty())
+                            .map(PathBuf::from),
+                        ),
                     proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
                 };
                 // Log push already shares these credentials and the logging

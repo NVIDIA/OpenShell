@@ -647,6 +647,14 @@ impl OpenShell for OpenShellService {
         policy::handle_get_sandbox_provider_environment(&self.state, request).await
     }
 
+    async fn get_sandbox_provider_access_token(
+        &self,
+        request: Request<openshell_core::proto::GetSandboxProviderAccessTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderAccessTokenResponse>, Status>
+    {
+        provider::access_token::handle(&self.state, request).await
+    }
+
     async fn exchange_provider_subject_token(
         &self,
         request: Request<ExchangeProviderSubjectTokenRequest>,

@@ -687,6 +687,23 @@ returns `UNAVAILABLE` with "lock sandbox SSH identity failed", and neither
 `openshell_server_mutation_lock_timeouts_total` nor
 `openshell_server_mutation_lock_errors_total` counts it.
 
+With `supervisor_topology = "gateway"` and replicated gateway storage, the
+shared supervisor's assignment stream belongs to the existing sandbox
+reconciler lease holder. Look for `acquired reconciler lease` and `supervisor
+host attached` on the same gateway Pod. A standby returns `UNAVAILABLE` with
+`reconnect to the gateway reconciler leader`; the supervisor retries using a
+fresh connection. Its gateway endpoint must balance across eligible replicas;
+remove session affinity that pins retries to a standby. Hosted workloads
+continue running during reconnection. After takeover, the new leader recovers
+durable assignments before sending its first snapshot.
+
+Creates through a standby can take an extra driver reconciliation interval
+before the leader assigns their instances. The standby reads readiness from
+observations carried by the reconciler lease, refreshed on renewal (10
+seconds) and polled every 5 seconds. An expired or unreadable lease means
+unknown supervision, not instance failure. Check gateway storage connectivity
+and lease-renewal logs when readiness lags across all sandboxes.
+
 For multi-replica gateway installs, supervisor and client session traffic may
 be served by a non-owner gateway replica and relayed to the current supervisor
 owner over the internal `PeerRelay` RPC. Check the headless peer Service,
@@ -837,6 +854,17 @@ client CA matches the CA that signed the client certificate:
 kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec.volumes[?(@.name=="tls-client-ca")]}' | jq .
 # Should show items filter for ca.crt from openshell-server-tls
 ```
+
+With `gatewayConfig.openshell.gateway.spiffe_delegation`, the gateway brokers
+provider tokens for shared-supervisor sandboxes using the SPIRE admin socket.
+Check that config table and the gateway's `spire-agent-admin` mount; the shared
+supervisor receives final access tokens and does not mount the SPIRE socket.
+That mount is a `hostPath` volume of type `Directory`: the namespace needs a Pod
+Security exception or custom admission policy, the SPIRE agent must create the
+directory first, and on OpenShift the SCC must admit `admin_socket_group`. The
+gateway asks the agent on its own node, so sandbox registrations must cover
+every agent that may run a gateway Pod. `helm status <release>` prints these
+prerequisites when delegation is enabled.
 
 If `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
 is set, the gateway should still render `[openshell.gateway.gateway_jwt]` and
@@ -1284,6 +1312,10 @@ credential failures.
 | OpenShift gateway pod fails to start with an SCC/`runAsUser` error (e.g. `unable to validate against any security context constraint`) | Chart's default `podSecurityContext`/`securityContext` hardcodes `runAsUser`/`fsGroup`, which the restricted-v2 SCC rejects; it must instead inject the namespace-assigned UID/GID range | `oc -n openshell describe pod <pod>`; deploy with `podSecurityContext: null` and clear `securityContext.runAsUser` (see `deploy/helm/openshell/ci/values-openshift-scc.yaml`) |
 | OpenShift `<release>-supervisor` Deployment never creates pods after setting `supervisor_topology = "gateway"` (SCC `runAsUser`/`fsGroup` not in the namespace range) | `supervisor.podSecurityContext` defaults `runAsUser`, `runAsGroup`, and `fsGroup` to 65534, outside the namespace's assigned UID/GID ranges | `kubectl -n openshell get events --field-selector reason=FailedCreate`; compare with the `openshift.io/sa.scc.*` annotations from `oc describe ns openshell`; set `supervisor.podSecurityContext.runAsUser`, `.runAsGroup`, and `.fsGroup` to `null`, as `deploy/helm/openshell/ci/values-openshift-scc.yaml` does, and keep `runAsNonRoot` and `seccompProfile` |
 | Shared sandboxes stay `Starting` or report `unavailable` readiness with `supervisor_topology = "gateway"`, gateway logs say no shared supervisor host is connected | The `<release>-supervisor` Pod cannot reach or authenticate to the gateway: wrong `OPENSHELL_TLS_CA`, the `<release>-supervisor-token` Secret is missing or still empty (gateway logs `wrote the supervisor token Secret` once it has delivered a token; `no usable supervisor token` in the supervisor means it has not), or the gateway was deployed without TLS or without the sandbox-JWT signing key | `kubectl -n openshell logs deployment/<release>-supervisor` for `gateway accepted the supervisor host` or a refusal; gateway logs for `supervisor host attached`, `wrote the supervisor token Secret`, or `failed to write the supervisor token Secret`; `kubectl -n openshell get secret <release>-supervisor-token -o jsonpath='{.metadata.annotations}'` shows the token expiry; the gateway refuses to start the topology without TLS or `gateway_jwt` |
+| Gateway pod rejected with `violates PodSecurity` (`hostPath volumes`) or an SCC error naming `supplementalGroups` after enabling `spiffe_delegation` | The SPIRE admin socket mount is a `hostPath` volume, which Baseline and Restricted forbid; OpenShift restricted-v2 also rejects an `admin_socket_group` outside the namespace range | `kubectl -n openshell get events --field-selector reason=FailedCreate`; add a Pod Security exception or custom admission policy (or custom SCC) for the gateway; do not remove the gateway's security context |
+| Gateway pod stays `ContainerCreating` with `hostPath type check failed` for the SPIRE admin directory | The SPIRE agent on that node has not created its admin socket directory | `kubectl -n openshell describe pod <gateway-pod>`; start the agent with its admin socket on the host before the gateway |
+| Shared-sandbox grants fail with `code=unavailable stage=workload_identity` | The gateway cannot open the admin socket: the agent is down, or the gateway lacks the socket's group (the gateway never changes its own groups) | Gateway logs for `dynamic token grant failed`; check the agent and the gateway Pod's `supplementalGroups`, or the process groups outside Helm |
+| Shared-sandbox grants fail with `code=workload_identity_rejected stage=workload_identity` after the gateway moves to another node | The new node's SPIRE agent has no registration for the sandbox identities | `kubectl -n openshell get pod -o wide`; register sandboxes for every agent that may run a gateway Pod, for example with a node alias; capping replicas does not cover rescheduling |
 | OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | An explicit sandbox UID/GID override or custom security context conflicts with the namespace's SCC range | Inspect pod events and the namespace's `openshift.io/sa.scc.uid-range` and `openshift.io/sa.scc.supplemental-groups` annotations; remove incompatible `sandbox_uid` / `sandbox_gid` overrides so the driver uses the namespace-assigned identity. Current sandbox pods use `restricted-v2` without a privileged SCC grant; see the [OpenShift guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) and [RFC 0012](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0012-isolation-backend/README.md#motivation). |
 | OpenShift self-hosted Vault/OpenBao credential store pod never schedules (waits time out with `no matching resources found`) | The store's Helm chart pins `runAsUser`/`fsGroup`/seccomp, which restricted-v2 rejects, so the StatefulSet controller never creates the pod | Deploy the store's chart in its OpenShift mode (`--set global.openshift=true` for the OpenBao/Vault chart) so the namespace SCC assigns a compliant security context — no manual SCC grant needed |
 | Vault credential driver returns HTTP 403 / `Vault Kubernetes auth denied the configured role` on provider create | Vault's `auth/kubernetes` method or the gateway login role is not provisioned, or the role is not bound to the gateway service account and namespace | In Vault: `bao auth enable kubernetes` and `bao write auth/kubernetes/config kubernetes_host=... kubernetes_ca_cert=@...`; ensure the login role's `bound_service_account_names`/`bound_service_account_namespaces` match the gateway SA and namespace and its policy grants the credential paths |

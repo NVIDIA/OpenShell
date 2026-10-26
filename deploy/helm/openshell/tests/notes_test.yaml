@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+suite: install notes
+templates:
+  - templates/NOTES.txt
+release:
+  name: openshell
+  namespace: gateway
+tests:
+  - it: lists SPIRE delegation prerequisites
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.spiffe_delegation:
+          admin_socket_path: /run/spire/admin/admin.sock
+          spiffe_id_prefix: spiffe://example.org/openshell
+          admin_socket_group: 10035
+    asserts:
+      - matchRegexRaw:
+          pattern: "admin socket directory\\s+/run/spire/admin as a hostPath volume"
+      - matchRegexRaw:
+          pattern: "namespace\\s+gateway needs an explicit policy exception"
+      - matchRegexRaw:
+          pattern: "supplemental group 10035"
+      - matchRegexRaw:
+          pattern: "every SPIRE agent that may run a gateway Pod"

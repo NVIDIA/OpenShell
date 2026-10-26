@@ -43,6 +43,7 @@ mod reflection;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
+mod spiffe_delegation;
 mod ssh_identity;
 mod ssh_sessions;
 mod storage_proto;
@@ -61,10 +62,12 @@ mod ws_tunnel;
 
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
+use openshell_core::token_grant_failure::TokenGrantFailure;
 use openshell_core::{Config, Error, ObjectLabels, Result};
 use openshell_extension_core::{
     BearerTokenSlot, ExtensionAudience, ExtensionCallerKind, ExtensionKind, MAX_EXTENSION_TOKEN_TTL,
 };
+use openshell_spiffe::SandboxIdentityProvider;
 use openshell_supervisor_middleware::MiddlewareRegistry;
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
@@ -252,33 +255,46 @@ fn spawn_supervisor_token_refresh(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
+        let mut next_mint = tokio::time::Instant::now();
+        let mut credential = controller.credential();
         loop {
-            let delay = match authority.mint_supervisor_token(ttl) {
-                Ok(minted) => {
-                    let remaining = minted.expires_at.saturating_sub(
-                        i64::try_from(
-                            SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map_or(0, |elapsed| elapsed.as_secs()),
-                        )
-                        .unwrap_or(i64::MAX),
-                    );
-                    controller.publish_credential(
-                        openshell_supervisor_control::SupervisorCredential {
-                            token: minted.token,
-                            expires_at: minted.expires_at,
-                        },
-                    );
-                    Duration::from_secs(u64::try_from(remaining).unwrap_or(0) / 2)
-                        .max(Duration::from_secs(1))
-                }
-                Err(error) => {
-                    warn!(%error, "failed to mint the supervisor token; retrying");
-                    Duration::from_secs(10)
-                }
-            };
+            if credential.has_changed().unwrap_or(false) && credential.borrow_and_update().is_none()
+            {
+                next_mint = tokio::time::Instant::now();
+            }
+            if !controller.is_publisher() {
+                // Mint promptly when this replica acquires the existing lease;
+                // standbys never compete to overwrite the supervisor's token.
+                next_mint = tokio::time::Instant::now();
+            } else if tokio::time::Instant::now() >= next_mint {
+                let delay = match authority.mint_supervisor_token(ttl) {
+                    Ok(minted) => {
+                        let remaining = minted.expires_at.saturating_sub(
+                            i64::try_from(
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map_or(0, |elapsed| elapsed.as_secs()),
+                            )
+                            .unwrap_or(i64::MAX),
+                        );
+                        controller.publish_credential(
+                            openshell_supervisor_control::SupervisorCredential {
+                                token: minted.token,
+                                expires_at: minted.expires_at,
+                            },
+                        );
+                        Duration::from_secs(u64::try_from(remaining).unwrap_or(0) / 2)
+                            .max(Duration::from_secs(1))
+                    }
+                    Err(error) => {
+                        warn!(%error, "failed to mint the supervisor token; retrying");
+                        Duration::from_secs(10)
+                    }
+                };
+                next_mint = tokio::time::Instant::now() + delay;
+            }
             tokio::select! {
-                () = tokio::time::sleep(delay) => {}
+                () = tokio::time::sleep(Duration::from_secs(1)) => {}
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() {
                         return;
@@ -288,6 +304,7 @@ fn spawn_supervisor_token_refresh(
         }
     });
 }
+
 pub use auth::audit::ConnectionSource;
 pub use multiplex::{MultiplexService, MultiplexedService};
 pub use persistence::Store;
@@ -414,6 +431,11 @@ pub struct ServerState {
     /// on demand when the user source is configured.
     pub(crate) provider_profile_sources: provider_profile_sources::ProviderProfileSources,
 
+    /// Source of sandbox JWT-SVIDs for brokered provider tokens, built once
+    /// from the SPIRE delegation settings. `None` when disabled.
+    pub(crate) sandbox_identity:
+        Option<Arc<dyn SandboxIdentityProvider<Error = TokenGrantFailure>>>,
+
     /// OIDC admin role name for workspace-level authorization.
     /// Empty when OIDC is not configured — `authorize_workspace()` treats
     /// every authenticated user as Platform Admin in that case.
@@ -433,6 +455,12 @@ fn is_benign_connection_close(error: &(dyn std::error::Error + 'static)) -> bool
 
 impl ServerState {
     /// Create new server state.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `config` holds credential-driver or SPIRE delegation
+    /// settings that startup validation would reject. Gateway startup uses
+    /// [`Self::new_with_credentials`], which reports those as errors.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -459,10 +487,18 @@ impl ServerState {
             oidc_cache,
             credentials,
         )
+        .expect("server config should be validated before ServerState::new")
     }
 
     /// Create new server state with an already-initialized credential runtime.
-    #[must_use]
+    ///
+    /// Parses the SPIRE delegation settings into the state that serves every
+    /// provider access-token request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when the SPIRE delegation settings are
+    /// invalid.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_credentials(
         config: Config,
@@ -474,7 +510,9 @@ impl ServerState {
         supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
         credentials: credentials::CredentialRuntime,
-    ) -> Self {
+    ) -> Result<Self> {
+        let sandbox_identity =
+            spiffe_delegation::sandbox_identity_provider(&config).map_err(Error::config)?;
         let replica_id = compute::lease::replica_id();
         compute.configure_ssh_identities(credentials.clone());
         let peer_endpoint = derive_peer_endpoint(&config);
@@ -487,7 +525,7 @@ impl ServerState {
             .map_or_else(String::new, |oidc| oidc.admin_role.clone());
         let config_delivery =
             config_delivery::ConfigDelivery::for_db_connections(store.max_connections());
-        Self {
+        Ok(Self {
             config,
             store,
             compute,
@@ -520,8 +558,9 @@ impl ServerState {
             gateway_interceptors: None,
             provider_profile_sources:
                 provider_profile_sources::ProviderProfileSources::with_default_sources(),
+            sandbox_identity,
             admin_role,
-        }
+        })
     }
 }
 
@@ -782,7 +821,7 @@ pub(crate) async fn run_server(
         supervisor_sessions,
         oidc_cache,
         credentials,
-    );
+    )?;
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;

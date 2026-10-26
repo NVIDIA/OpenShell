@@ -701,7 +701,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             admitted_isolation_backend: Some(TEST_BACKEND.into()),
             main_exit_marker: Some(marker.clone()),
             trace_context: None,
-            provider_workload_api_socket: None,
+            provider_identity: openshell_supervisor_network::run::ProviderIdentitySource::default(),
             // The binary loads the proxy trust directory from its environment.
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
         };

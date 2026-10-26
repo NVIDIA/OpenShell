@@ -4380,6 +4380,7 @@ dependencies = [
  "openshell-extension-core",
  "openshell-otel",
  "openshell-policy-schema",
+ "openshell-spiffe",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
@@ -5031,6 +5032,8 @@ dependencies = [
  "openshell-policy",
  "openshell-prover",
  "openshell-providers",
+ "openshell-spiffe",
+ "openshell-spire",
  "openshell-supervisor-control",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
@@ -5066,6 +5069,7 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "toml",
  "tonic",
+ "tonic-prost",
  "tonic-prost-build",
  "tonic-reflection",
  "tower",
@@ -5079,6 +5083,33 @@ dependencies = [
  "uuid",
  "wiremock",
  "x509-parser 0.16.0",
+]
+
+[[package]]
+name = "openshell-spiffe"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "openshell-spire"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "http 1.4.0",
+ "openshell-core",
+ "openshell-crypto",
+ "openshell-spiffe",
+ "prost",
+ "spiffe",
+ "tokio",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]
@@ -5211,6 +5242,7 @@ dependencies = [
  "openshell-policy",
  "openshell-policy-schema",
  "openshell-sandbox-backend",
+ "openshell-spiffe",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "opentelemetry_sdk",

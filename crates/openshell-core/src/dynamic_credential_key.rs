@@ -109,6 +109,27 @@ pub fn credential_identity(key: &str) -> Option<&str> {
     Some(decode(key)?.1)
 }
 
+/// The key a gateway encoded, recovered from an owned key the supervisor may
+/// have scoped with [`ProviderCredentialSnapshot::scoped_key`].
+///
+/// Only the revision and installation are removed, so their spelling never
+/// distinguishes two keys. Keys without an endpoint selector or owner, and
+/// malformed keys, return `None`. The result still names a configured
+/// credential only if it equals one of the gateway's keys exactly.
+#[must_use]
+pub fn unscoped_owned_key(key: &str) -> Option<String> {
+    decode(key)?.0?;
+    let fields = key.split('\t').collect::<Vec<_>>();
+    match fields.as_slice() {
+        [selector @ .., owner, identity] | [selector @ .., owner, _, _, identity]
+            if selector.len() == 3 =>
+        {
+            Some(format!("{}\t{owner}\t{identity}", selector.join("\t")))
+        }
+        _ => None,
+    }
+}
+
 fn decode(key: &str) -> Option<(Option<EndpointSelector<'_>>, &str)> {
     // A stack buffer bounds parsing and avoids allocating on each request.
     let mut fields = [""; 7];
@@ -314,6 +335,22 @@ mod tests {
             Some("/v1/**")
         );
         assert_eq!(credential_identity(&scoped), Some("provider:access_token"));
+        // Only the generation is removed; its spelling cannot select another key.
+        assert_eq!(unscoped_owned_key(&scoped), Some(key()));
+        assert_eq!(unscoped_owned_key(&key()), Some(key()));
+        assert_eq!(
+            unscoped_owned_key(&scoped.replace("rev:7", "rev:007")),
+            Some(key())
+        );
+        for unowned in [
+            "provider:access_token",
+            "rev:7\tinstallation:install\tprovider:access_token",
+            "api.example.com\t443\t/v1/**\tprovider:access_token",
+            "api.example.com\t443\t/v1/**\trev:7\tinstallation:install\tprovider:access_token",
+            "api.example.com\t443\t/v1/**\towner-a\trev:x\tinstallation:install\tprovider:access_token",
+        ] {
+            assert_eq!(unscoped_owned_key(unowned), None, "{unowned:?}");
+        }
         assert_eq!(
             snapshot.scoped_key("provider:access_token"),
             "rev:7\tinstallation:install\tprovider:access_token"

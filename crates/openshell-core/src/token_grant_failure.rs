@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::time::Duration;
 
 use prost::Message;
 use tonic::{Code, Status};
@@ -21,6 +22,32 @@ use crate::rpc_error::{ERROR_DOMAIN, ErrorDetails, StatusExt};
 /// request, so every party can name the same exchange. The value is an opaque
 /// random ID and grants nothing.
 pub const REQUEST_ID_HEADER: &str = "x-openshell-request-id";
+
+// Time limits of a grant. Exceeding one is a `Timeout` failure.
+
+/// One token-service request, including its connection.
+pub const TOKEN_SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One SPIFFE Workload API or SPIRE agent call, including its connection.
+pub const WORKLOAD_IDENTITY_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One gateway-brokered provider access token request on the gateway,
+/// including waiting for a concurrent acquisition of the same token.
+///
+/// A miss makes at most three SPIRE agent calls for the sandbox SVID, one
+/// Workload API acquisition of the gateway's own SVID, and two token-service
+/// requests. The remainder covers authorization and store reads.
+pub const BROKERED_TOKEN_GATEWAY_DEADLINE: Duration = Duration::from_secs(
+    4 * WORKLOAD_IDENTITY_CALL_TIMEOUT.as_secs() + 2 * TOKEN_SERVICE_REQUEST_TIMEOUT.as_secs() + 20,
+);
+
+/// Deadline for one brokered token request on the supervisor.
+///
+/// Covers waiting for and connecting the gateway channel (bounded at 10
+/// seconds), then the gateway's deadline, so its classified timeout normally
+/// arrives first.
+pub const BROKERED_TOKEN_CLIENT_DEADLINE: Duration =
+    Duration::from_secs(BROKERED_TOKEN_GATEWAY_DEADLINE.as_secs() + 15);
 
 const FAILURE_MESSAGE: &str = "dynamic token grant failed";
 const FAILURE_REASON: &str = "TOKEN_GRANT_FAILURE";

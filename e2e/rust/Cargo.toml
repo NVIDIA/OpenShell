@@ -38,6 +38,8 @@ e2e-kubernetes-workspace-managed = ["e2e-kubernetes"]
 e2e-kubernetes-workspace-operator = ["e2e-kubernetes"]
 # One supervisor process shared by the gateway's sandboxes.
 e2e-kubernetes-shared-supervisor = ["e2e-kubernetes", "e2e-host-gateway"]
+# The shared supervisor acting as sandbox identities delegated by SPIRE.
+e2e-kubernetes-shared-supervisor-spiffe = ["e2e-kubernetes-shared-supervisor"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
 e2e-oidc-pkce = []

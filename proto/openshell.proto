@@ -537,6 +537,13 @@ service OpenShell {
     };
   }
 
+  // Obtain the final provider token for the authenticated sandbox session.
+  // SPIFFE assertions and intermediate credentials remain in the gateway.
+  rpc GetSandboxProviderAccessToken(GetSandboxProviderAccessTokenRequest)
+      returns (GetSandboxProviderAccessTokenResponse) {
+    option (openshell.options.v1.authorization) = { auth_mode: "sandbox" };
+  }
+
   // Fetch recent sandbox logs (one-shot).
   rpc GetSandboxLogs(GetSandboxLogsRequest) returns (GetSandboxLogsResponse) {
     option (openshell.options.v1.authorization) = {
@@ -2781,6 +2788,19 @@ message ProviderEnvironmentSnapshot {
   ProviderReadinessReason readiness_reason = 6;
   // Complete desired set of non-secret managed files, keyed by absolute path.
   map<string, string> files = 7;
+}
+
+// Supervisor-only request. Sandbox/workspace are derived from the verified
+// session JWT. No caller-selected identity, endpoint, audience, or scope.
+message GetSandboxProviderAccessTokenRequest {
+  // Endpoint-bound dynamic credential key supplied by gateway configuration.
+  string credential_key = 1;
+}
+
+message GetSandboxProviderAccessTokenResponse {
+  string access_token = 1 [(openshell.options.v1.secret) = true];
+  google.protobuf.Duration expires_after = 2;
+  string token_type = 3;
 }
 
 message ExchangeProviderSubjectTokenRequest {

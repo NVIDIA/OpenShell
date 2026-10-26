@@ -22,7 +22,8 @@
 //!
 //! The private wire protocol is generated in `openshell-core` and re-exported
 //! as [`proto`]. The supervisor process consumes the registration and status
-//! types; it never links the controller or coordinator.
+//! types and the private standby refusal marker ([`is_standby_refusal`]); it
+//! never uses the controller's desired state or the coordinator.
 
 pub mod controller;
 pub mod coordinator;
@@ -38,7 +39,8 @@ pub mod proto {
 
 pub use controller::{
     AssignmentError, HOST_HEARTBEAT_INTERVAL, HostIdentity, MAX_ASSIGNED_INSTANCES,
-    MAX_REPORTED_INSTANCES, ObservedInstance, SupervisorCredential, SupervisorHostController,
+    MAX_REPORTED_INSTANCES, ObservedInstance, STANDBY_REFUSAL_METADATA, STANDBY_REFUSAL_VALUE,
+    SharedObservation, SupervisorCredential, SupervisorHostController, is_standby_refusal,
 };
 pub use coordinator::{
     InstanceSupervision, LaunchError, RecoverableInstance, RecoveryBaseline, RecoveryOutcome,

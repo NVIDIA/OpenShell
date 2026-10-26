@@ -24,6 +24,8 @@ openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-prover = { path = "../openshell-prover" }
 openshell-providers = { path = "../openshell-providers" }
+openshell-spiffe = { path = "../openshell-spiffe" }
+openshell-spire = { path = "../openshell-spire" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
 openshell-supervisor-control = { path = "../openshell-supervisor-control" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
@@ -43,6 +45,7 @@ libc = "0.2"
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tonic-reflection = { workspace = true }
 prost = { workspace = true }
+tonic-prost = { workspace = true }
 prost-reflect = { workspace = true }
 prost-types = { workspace = true }
 
