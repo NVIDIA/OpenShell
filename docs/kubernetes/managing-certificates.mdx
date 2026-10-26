@@ -60,6 +60,126 @@ The chart also runs a pre-install hook in JWT-only mode to create the gateway's
 sandbox JWT signing Secret. That Secret is separate from the cert-manager TLS
 certificate Secrets and is mounted at `/etc/openshell-jwt`.
 
+## Issue an operator client certificate
+
+An operator client certificate gives an operator application or user an
+administrative principal for managing an OpenShell gateway across all
+workspaces. The following example issues that identity with a standalone
+cert-manager `Certificate` managed outside the Helm release.
+
+Save these Helm values as `operator-values.yaml`:
+
+```yaml
+certManager:
+  enabled: true
+server:
+  disableTls: false
+  tls:
+    enableMtls: true
+
+gatewayConfig:
+  openshell.gateway.mtls_auth:
+    operator_enabled: true
+```
+
+Install or upgrade using your deployment's other values files as well:
+
+```shell
+helm upgrade --install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> --namespace openshell \
+  --values operator-values.yaml
+```
+
+The gateway must trust the CA issuing the client certificate. Keep the default
+`certManager.clientCaFromServerTlsSecret: true` and a non-empty
+`server.tls.clientCaSecretName`. Alternatively, set
+`certManager.clientCaFromServerTlsSecret: false` and point
+`server.tls.clientCaSecretName` at `certManager.caSecretName`.
+
+Save this standalone manifest as `operator-certificate.yaml`. It assumes a
+release named `openshell` in namespace `openshell`; adjust the namespace and
+`issuerRef.name` to match the chart's `<fullname>-ca-issuer` Issuer.
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: openshell-operator-client
+  namespace: openshell
+spec:
+  secretName: openshell-operator-client-tls
+  commonName: platform-operator
+  subject:
+    organizationalUnits:
+      - operator
+  duration: 168h
+  renewBefore: 24h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - client auth
+    - digital signature
+  issuerRef:
+    name: openshell-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+```
+
+Apply it and wait for issuance:
+
+```shell
+kubectl apply -f operator-certificate.yaml
+kubectl -n openshell wait certificate/openshell-operator-client --for=condition=Ready --timeout=120s
+```
+
+The exact `OU=operator` grants gateway-wide administration and access to
+`GetProviderCredentials` when operator authentication is enabled. Restrict
+access to the dedicated Secret and permission to issue certificates under the
+trusted client CA. See [mTLS operators](/how-it-works/gateways/authentication#mtls-operators)
+for the authorization and trust boundary.
+
+### Verify the certificate
+
+If you have `kubectl` access and want to verify that the certificate
+authenticates correctly, use the following example. Export the certificate,
+key, and server trust bundle:
+
+```shell
+umask 077
+mkdir -p operator-tls
+kubectl -n openshell get secret openshell-operator-client-tls -o jsonpath='{.data.tls\.crt}' | base64 --decode > operator-tls/tls.crt
+kubectl -n openshell get secret openshell-operator-client-tls -o jsonpath='{.data.tls\.key}' | base64 --decode > operator-tls/tls.key
+kubectl -n openshell get secret openshell-server-tls -o jsonpath='{.data.ca\.crt}' | base64 --decode > operator-tls/ca.crt
+```
+
+Keep a direct Service port-forward running:
+
+```shell
+kubectl -n openshell port-forward svc/openshell 8090:8080
+```
+
+In another terminal, use `grpcurl` to check the authenticated identity:
+
+```shell
+grpcurl -cacert operator-tls/ca.crt \
+  -cert operator-tls/tls.crt -key operator-tls/tls.key \
+  -d '{}' localhost:8090 openshell.v1.OpenShell/GetCurrentUser
+```
+
+The response should identify `platform-operator`, include the `operator` role,
+and report `identityProvider: "mtls"`. This confirms that the gateway recognizes
+the certificate as an operator identity. Send requests without an
+`Authorization` header, through a direct or TLS-passthrough connection.
+
+If the gateway presents an external server certificate, use that issuer's server
+trust bundle for `ca.crt` instead of the chart CA. The operator client
+certificate remains signed by the chart CA in this example.
+
+cert-manager renews the Kubernetes Secret according to the Certificate's
+`duration` and `renewBefore`. Refresh any exported certificate and key files
+after renewal and reconnect the application with the updated pair.
+
 ## Using a real Issuer for the server certificate
 
 By default, cert-manager issues both the server and client certificates from
