@@ -67,11 +67,12 @@ For an intentional minor-train incompatibility, record the Buf finding,
 linked issue, consumer impact, and migration plan in the PR. Keep the finding
 visible; do not disable the job or add a broad Buf ignore rule.
 
-Windows PR checks are opt-in: add `test:windows`, then select **Re-run all jobs**
-on the current Windows MSVC run. Subsequent mirrored commits run them automatically.
-Windows checks are not required for merging and do not run in merge queues.
-Main and manual runs also build release binaries, with `continue-on-error: true`
-so Windows failures do not fail the workflow.
+Windows MSVC lint and tests run on every mirrored PR commit. They are not
+required for merging and do not run in merge queues. Pushes to `main` run the
+same lint and tests to seed the Rust caches that PR runs restore; PR runs do not
+save caches. Pushes to `windows` and manual runs on that branch also build
+release binaries, with `continue-on-error: true` so Windows failures do not fail
+the workflow.
 
 ### Advisory compatibility review
 
