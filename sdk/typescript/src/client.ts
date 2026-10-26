@@ -247,6 +247,8 @@ export interface SandboxRef {
   createdFromWorkloadTemplate?: SandboxWorkloadTemplateProvenance;
   /** Service URLs returned by creation, keyed by service name. */
   serviceUrls: Record<string, string>;
+  applicationServiceUrls: Record<string, string>;
+  gatewayServiceUrls: Record<string, string>;
   restartCount: number;
   /** Creation time in epoch milliseconds; absent when the gateway omits it. */
   createdAtMs?: number;
@@ -625,7 +627,12 @@ function policySourceName(s: PolicySource): PolicySourceName {
   return POLICY_SOURCE_NAMES[s] ?? 'unspecified';
 }
 
-function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, string> = {}): SandboxRef {
+function sandboxRef(
+  sandbox: Sandbox | undefined,
+  serviceUrls: Record<string, string> = {},
+  applicationServiceUrls: Record<string, string> = {},
+  gatewayServiceUrls: Record<string, string> = {},
+): SandboxRef {
   if (!sandbox) throw new SdkError('invalid_config', 'sandbox missing from gateway response');
   const meta = sandbox.metadata;
   if (!meta?.id || !meta.name) {
@@ -648,6 +655,8 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
         }
       : undefined,
     serviceUrls,
+    applicationServiceUrls,
+    gatewayServiceUrls,
     restartCount: sandbox.status?.restartCount ?? 0,
     createdAtMs: timestampEpochMs(meta.createdTime),
     nextRestartAtMs: timestampEpochMs(sandbox.status?.nextRestartTime),
@@ -1251,7 +1260,7 @@ export class SandboxClient {
             authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
           })) ?? [],
       });
-      return sandboxRef(resp.sandbox, resp.serviceUrls);
+      return sandboxRef(resp.sandbox, resp.serviceUrls, resp.applicationServiceUrls, resp.gatewayServiceUrls);
     } catch (e) {
       throw fromConnect(e);
     }
@@ -1278,7 +1287,7 @@ export class SandboxClient {
             authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
           })) ?? [],
       });
-      return sandboxRef(resp.sandbox, resp.serviceUrls);
+      return sandboxRef(resp.sandbox, resp.serviceUrls, resp.applicationServiceUrls, resp.gatewayServiceUrls);
     } catch (e) {
       throw fromConnect(e);
     }

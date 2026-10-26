@@ -1719,8 +1719,8 @@ renew a 30-second lease; rejected configuration or expired freshness closes
 routes. When the listener is enabled, polling delays are capped at five seconds
 even if the configured interval is longer; failed polls do not renew the lease.
 App traffic uses application/edge authentication independently of gateway
-user authentication. The discovery API publishes accepted listener installations; public URLs
-printed by the CLI continue to use the gateway path.
+user authentication. The discovery API publishes accepted listener installations. CLI URLs use the
+configured application origin when `public_url` is set, otherwise the gateway path.
 
 When enabled application routes are not published, check the authenticated
 supervisor session and installed configuration before checking ingress. The
@@ -1759,3 +1759,19 @@ admits 16 unary requests (four per principal, eight per workspace), and 32 watch
 record/route/byte limits; `UNAVAILABLE` means storage or collection timeout.
 Watches recheck bearer credentials and membership every second. Allow one refresh
 interval for withdrawals; route lease expiry remains independently enforced.
+
+For incorrect public service URLs, inspect
+`[openshell.supervisor.app_listener].public_url`. It is an external HTTPS origin
+whose hostname matches `domain`; its port is independent of the listener port.
+Service responses identify the application and gateway paths separately. A
+configured application URL must retain its public port even when the CLI uses a
+gateway port-forward. Inspect discovery and ingress acceptance separately:
+URL publication alone proves neither installation nor public reachability.
+
+Application URLs and discovery follow the gateway's `service_hostname_format`.
+In hashed mode, check the returned hostname against the supervisor's accepted
+`application_hostname` route, and preserve that exact SNI/Host through ingress.
+Do not reconstruct it from sandbox names. Distinct gateway installations sharing
+an app domain need distinct gateway names; replicas of one installation share
+its name. Changing the mode or installation name requires fresh route
+installation before discovery can advertise the replacement.

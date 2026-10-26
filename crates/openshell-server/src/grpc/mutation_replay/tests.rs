@@ -94,6 +94,65 @@ fn canonical_payload_ignores_map_order_and_id_but_preserves_presence() {
 }
 
 #[tokio::test]
+async fn service_url_replay_uses_current_origin_without_repeating_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = directory.path().join("private-key");
+    std::fs::write(&key, b"test-only stable private fingerprint material").unwrap();
+    let mut state = test_server_state().await;
+    let config = &mut Arc::get_mut(&mut state).unwrap().config;
+    config.gateway_jwt = Some(openshell_core::config::GatewayJwtConfig {
+        signing_key_path: key,
+        public_key_path: directory.path().join("public"),
+        kid_path: directory.path().join("kid"),
+        gateway_id: "test".into(),
+        ttl_secs: None,
+    });
+    let request = CreateSandboxRequest {
+        name: "origin-replay".into(),
+        spec: Some(SandboxSpec::default()),
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        service_exposures: vec![SandboxServiceExposure {
+            service: "web".into(),
+            target_port: 8080,
+            ..Default::default()
+        }],
+        request_id: uuid::Uuid::new_v4().to_string(),
+        ..Default::default()
+    };
+    let original = run(&state, authed_request(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .config
+        .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+        enabled: true,
+        port: 9443,
+        domain: "services.example.com".into(),
+        public_url: Some("https://services.example.com:10443".into()),
+    };
+    let replay = run(&state, authed_request(request)).await.unwrap();
+    assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
+    assert_eq!(
+        original.sandbox.as_ref().unwrap().metadata,
+        replay.get_ref().sandbox.as_ref().unwrap().metadata
+    );
+    assert_eq!(
+        replay.get_ref().service_urls["web"],
+        "https://default--origin-replay--web.services.example.com:10443/"
+    );
+    assert_eq!(
+        replay.get_ref().application_service_urls,
+        replay.get_ref().service_urls
+    );
+    assert_eq!(
+        replay.get_ref().gateway_service_urls,
+        original.gateway_service_urls
+    );
+}
+
+#[tokio::test]
 async fn create_sandbox_replay_preserves_service_urls() {
     let directory = tempfile::tempdir().unwrap();
     let key = directory.path().join("private-key");
