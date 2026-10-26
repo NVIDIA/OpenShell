@@ -26,6 +26,8 @@ CATEGORIES = {
 }
 REPO = "owner/repo"
 PULL = "repos/owner/repo/pulls/42"
+ROSTER = Path("REVIEWERS.md")
+DRAFTED = {"data": {"convertPullRequestToDraft": {"pullRequest": {"isDraft": True}}}}
 
 
 def pr(*labels, requested=(), author="author", draft=False, state="open", body=""):
@@ -195,6 +197,14 @@ class TimelineTests(unittest.TestCase):
 
 
 class GitHubTests(unittest.TestCase):
+    def test_graphql_passes_variables_and_unwraps_response(self):
+        with mock.patch.object(routing, "_api", return_value={"data": {"value": 1}}) as api:
+            self.assertEqual(routing._graphql("query", number=42), {"value": 1})
+        api.assert_called_once_with(
+            "graphql", method="POST",
+            data={"query": "query", "variables": {"number": 42}},
+        )
+
     def test_api_reads_all_pages(self):
         with mock.patch.object(routing.subprocess, "run") as run:
             run.return_value.stdout = json.dumps(
@@ -278,6 +288,20 @@ class AcceptanceTests(unittest.TestCase):
         ]):
             self.assertFalse(routing._accepted_work(REPO, 42, pr()))
 
+    def test_qualifying_description_reference_skips_all_closing_link_queries(self):
+        with mock.patch.object(routing, "_api", side_effect=[
+            self.member(), self.issue(),
+        ]) as api:
+            self.assertTrue(routing._accepted_work(REPO, 42, pr(body="Related to #1")))
+        self.assertEqual(api.call_count, 2)
+
+    def test_qualifying_closing_reference_skips_later_pages(self):
+        with mock.patch.object(routing, "_api", side_effect=[
+            self.member(), self.linked(1, cursor="unneeded-page"), self.issue(),
+        ]) as api:
+            self.assertTrue(routing._accepted_work(REPO, 42, pr()))
+        self.assertEqual(api.call_count, 3)
+
     def test_description_and_closing_references_require_same_submitter_and_label(self):
         for body in (
             "", "Related to #1", "Related to owner/repo#1", "Related to OWNER/REPO#1",
@@ -288,19 +312,23 @@ class AcceptanceTests(unittest.TestCase):
             ):
                 with (
                     self.subTest(body=body, author=author, accepted=accepted),
-                    mock.patch.object(routing, "_api", side_effect=[
-                        self.member(), self.linked() if body else self.linked(1),
-                        self.issue(author=author, accepted=accepted),
-                    ]) as api,
+                    mock.patch.object(routing, "_api", side_effect=(
+                        [self.member(), self.linked(1), self.issue(author, accepted)]
+                        if not body else
+                        [self.member(), self.issue(author, accepted)] + ([] if expected else [self.linked()])
+                    )) as api,
                 ):
                     self.assertEqual(routing._accepted_work(REPO, 42, pr(body=body)), expected)
-                    self.assertEqual(api.call_args.kwargs["data"]["variables"]["number"], 1)
+                    lookups = [call.kwargs["data"]["variables"]["number"]
+                               for call in api.call_args_list
+                               if "issueOrPullRequest" in call.kwargs["data"]["query"]]
+                    self.assertEqual(lookups, [1])
 
     def test_one_qualifying_issue_is_enough_and_duplicate_references_are_read_once(self):
         with mock.patch.object(routing, "_api", side_effect=[
-            self.member(), self.linked(1, 2), self.issue(accepted=False), self.issue(),
+            self.member(), self.issue(accepted=False), self.linked(1, 2), self.issue(),
         ]) as api:
-            self.assertTrue(routing._accepted_work(REPO, 42, pr(body="Related to #1 and #2")))
+            self.assertTrue(routing._accepted_work(REPO, 42, pr(body="Related to #1")))
         self.assertEqual(api.call_count, 4)
 
     def test_paginates_permission_lookup_before_querying_issues(self):
@@ -343,7 +371,7 @@ class AcceptanceTests(unittest.TestCase):
             with (
                 self.subTest(error_type=error_type),
                 mock.patch.object(routing, "_api", side_effect=[
-                    self.member(), self.linked(), error,
+                    self.member(), error, self.linked(),
                 ]),
             ):
                 if error_type == "NOT_FOUND":
@@ -354,22 +382,31 @@ class AcceptanceTests(unittest.TestCase):
 
     def test_pull_request_references_do_not_qualify(self):
         with mock.patch.object(routing, "_api", side_effect=[
-            self.member(), self.linked(),
-            {"data": {"repository": {"issueOrPullRequest": {}}}},
+            self.member(), {"data": {"repository": {"issueOrPullRequest": {}}}},
+            self.linked(),
         ]):
             self.assertFalse(routing._accepted_work(REPO, 42, pr(body="See #1")))
+
+    def test_missing_description_reference_falls_back_to_qualifying_closing_link(self):
+        missing = subprocess.CalledProcessError(
+            1, "gh", output=json.dumps({"errors": [{"type": "NOT_FOUND"}]}),
+        )
+        with mock.patch.object(routing, "_api", side_effect=[
+            self.member(), missing, self.linked(2), self.issue(),
+        ]):
+            self.assertTrue(routing._accepted_work(REPO, 42, pr(body="Related to #1")))
 
     def test_creation_and_ready_transition_reject_before_reviewer_changes(self):
         for event in ("opened", "ready_for_review"):
             for apply in (False, True):
                 with (
                     self.subTest(event=event, apply=apply),
-                    mock.patch.object(routing, "_api", side_effect=[pr(), None]) as api,
+                    mock.patch.object(routing, "_api", side_effect=[pr(), DRAFTED]) as api,
                     mock.patch.object(routing, "_accepted_work", return_value=False),
                     mock.patch.object(routing, "_load_reviewers") as load,
                 ):
                     with self.assertRaisesRegex(ValueError, "not accepted work"):
-                        routing.check_review_readiness(CATEGORIES, REPO, 42, apply=apply, event=event)
+                        routing.check_review_readiness(ROSTER, REPO, 42, apply=apply, event=event)
                     load.assert_not_called()
                     self.assertEqual(api.call_count, 2 if apply else 1)
                     if apply:
@@ -384,7 +421,7 @@ class AcceptanceTests(unittest.TestCase):
             mock.patch.object(routing, "_load_reviewers") as load,
             self.assertRaises(subprocess.CalledProcessError),
         ):
-            routing.check_review_readiness(CATEGORIES, REPO, 42, apply=True)
+            routing.check_review_readiness(ROSTER, REPO, 42, apply=True)
         self.assertEqual(api.call_count, 2)
         load.assert_not_called()
 
@@ -394,7 +431,7 @@ class AcceptanceTests(unittest.TestCase):
             mock.patch.object(routing, "_accepted_work", return_value=False),
             self.assertRaises(subprocess.CalledProcessError),
         ):
-            routing.check_review_readiness(CATEGORIES, REPO, 42, apply=True)
+            routing.check_review_readiness(ROSTER, REPO, 42, apply=True)
 
 
 class ReconciliationTests(unittest.TestCase):
@@ -402,8 +439,14 @@ class ReconciliationTests(unittest.TestCase):
         self.accepted = mock.patch.object(routing, "_accepted_work", return_value=True)
         self.accepted.start()
         self.addCleanup(self.accepted.stop)
+        self.roster = mock.Mock(spec=Path)
+        self.roster.read_text.return_value = DOCUMENT
+        parser = mock.patch.object(routing, "parse_reviewers", return_value=CATEGORIES)
+        self.parser = parser.start()
+        self.addCleanup(parser.stop)
 
     def run_routing(self, categories, *, snapshots, responses, apply=True, event="opened"):
+        self.parser.return_value = categories
         with (
             mock.patch.object(routing, "_api", side_effect=responses) as api,
             mock.patch.object(routing, "_load_reviewers", side_effect=snapshots) as load,
@@ -411,7 +454,7 @@ class ReconciliationTests(unittest.TestCase):
                 routing, "_eligible_reviewers", side_effect=lambda _repo, logins: logins
             ) as eligible,
         ):
-            plan = routing.check_review_readiness(categories, REPO, 42, apply=apply, event=event)
+            plan = routing.check_review_readiness(self.roster, REPO, 42, apply=apply, event=event)
         return plan, api, load, eligible
 
     def test_initial_assignment_excludes_author_without_extra_refresh(self):
@@ -514,7 +557,7 @@ class ReconciliationTests(unittest.TestCase):
                 mock.patch.object(routing, "_eligible_reviewers", return_value={"dave"}),
             ):
                 with self.assertRaisesRegex(ValueError, "routing changed"):
-                    routing.check_review_readiness(CATEGORIES, REPO, 42, apply=True)
+                    routing.check_review_readiness(self.roster, REPO, 42, apply=True)
                 self.assertTrue(all(
                     call.kwargs.get("method", "GET") == "GET"
                     for call in api.call_args_list
@@ -552,6 +595,68 @@ class ReconciliationTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_rejected_pr_does_not_need_a_readable_valid_roster(self):
+        for contents in (None, "not a registry"):
+            for apply in (False, True):
+                with self.subTest(contents=contents, apply=apply), tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "REVIEWERS.md"
+                    if contents is not None:
+                        path.write_text(contents, encoding="utf-8")
+                    output, errors = io.StringIO(), io.StringIO()
+                    with (
+                        mock.patch.object(routing, "_api", side_effect=[pr(), DRAFTED]) as api,
+                        mock.patch.object(routing, "_accepted_work", return_value=False),
+                        mock.patch.object(routing, "parse_reviewers") as parse,
+                        mock.patch.object(routing, "_load_reviewers") as load,
+                        contextlib.redirect_stdout(output),
+                        contextlib.redirect_stderr(errors),
+                    ):
+                        argv = ["--reviewers", str(path), "--repo", REPO, "--pr", "42"]
+                        self.assertEqual(routing.main(argv + (["--apply"] if apply else [])), 1)
+                    self.assertIn("not accepted work", errors.getvalue())
+                    self.assertEqual(output.getvalue(), "")
+                    parse.assert_not_called()
+                    load.assert_not_called()
+                    self.assertEqual(api.call_count, 2 if apply else 1)
+                    if apply:
+                        self.assertIn("convertPullRequestToDraft", api.call_args.kwargs["data"]["query"])
+
+    def test_accepted_pr_reads_real_roster_and_previews_reviewers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "REVIEWERS.md"
+            path.write_text(DOCUMENT, encoding="utf-8")
+            output = io.StringIO()
+            with (
+                mock.patch.object(routing, "_api", return_value=pr("area:runtime")) as api,
+                mock.patch.object(routing, "_accepted_work", return_value=True) as accepted,
+                mock.patch.object(routing, "_eligible_reviewers", return_value={"alice"}),
+                mock.patch.object(routing, "_load_reviewers", return_value=reviewers()),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(routing.main([
+                    "--reviewers", str(path), "--repo", REPO, "--pr", "42",
+                ]), 0)
+            accepted.assert_called_once()
+            api.assert_called_once_with(PULL)
+            self.assertEqual(json.loads(output.getvalue()), {"add": ["alice"], "remove": []})
+
+    def test_closed_and_draft_prs_skip_missing_roster_and_acceptance(self):
+        for value in (pr(draft=True), pr(state="closed")):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "missing.md"
+                output = io.StringIO()
+                with (
+                    mock.patch.object(routing, "_api", return_value=value) as api,
+                    mock.patch.object(routing, "_accepted_work") as accepted,
+                    contextlib.redirect_stdout(output),
+                ):
+                    self.assertEqual(routing.main([
+                        "--reviewers", str(path), "--repo", REPO, "--pr", "42",
+                    ]), 0)
+                api.assert_called_once_with(PULL)
+                accepted.assert_not_called()
+                self.assertEqual(json.loads(output.getvalue()), {"skipped": "closed or draft PR"})
+
     def test_passes_label_event_to_reconciliation(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "REVIEWERS.md"
@@ -592,16 +697,17 @@ class CliTests(unittest.TestCase):
                 json.loads(output.getvalue()), {"add": ["alice"], "remove": []}
             )
             check.assert_called_once_with(
-                {"area:runtime": {"alice"}}, REPO, 42, apply=True, event="opened"
+                path, REPO, 42, apply=True, event="opened"
             )
 
-    def test_invalid_registry_fails_before_contacting_github(self):
+    def test_accepted_pr_with_invalid_registry_fails_before_reviewer_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "REVIEWERS.md"
             path.write_text("not a registry", encoding="utf-8")
             output, errors = io.StringIO(), io.StringIO()
             with (
-                mock.patch.object(routing, "_api") as api,
+                mock.patch.object(routing, "_api", return_value=pr("area:runtime")) as api,
+                mock.patch.object(routing, "_accepted_work", return_value=True),
                 contextlib.redirect_stdout(output),
                 contextlib.redirect_stderr(errors),
             ):
@@ -611,7 +717,7 @@ class CliTests(unittest.TestCase):
                     ]),
                     1,
                 )
-            api.assert_not_called()
+            api.assert_called_once_with(PULL)
             self.assertEqual(output.getvalue(), "")
             self.assertIn("no area/topic", errors.getvalue())
 
