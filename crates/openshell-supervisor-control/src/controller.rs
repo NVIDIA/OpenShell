@@ -779,6 +779,14 @@ impl SupervisorHostController {
         let Some(status) = &session.status else {
             return ObservedInstance::Pending;
         };
+        // As for [`Self::member_reports`]: a status renders a verdict only
+        // once the stream acknowledged the owner's current term; one from
+        // before describes an earlier term, even from the same process.
+        if !session.terms.get(route).is_some_and(|(auth_epoch, since)| {
+            *auth_epoch == owner.auth_epoch && status.applied_revision >= *since
+        }) {
+            return ObservedInstance::Pending;
+        }
         if let Some(instance) = status
             .instances
             .iter()
@@ -1376,7 +1384,7 @@ mod tests {
         assert!(controller.record_status(first, status(0, &[])).is_err());
 
         // Acks are bounded by what this stream was sent and never regress.
-        let revision = controller.revision();
+        let revision = controller.snapshot(current).unwrap().revision;
         assert!(
             controller
                 .record_status(current, status(revision, &[]))
@@ -1398,7 +1406,7 @@ mod tests {
         controller.place_owner("rt-b", owner("m1", "boot-1", 1));
         assert_eq!(controller.observed("rt-b"), ObservedInstance::Pending);
         assert_eq!(controller.observed("rt-unknown"), ObservedInstance::NoHost);
-        let next = controller.revision();
+        let next = controller.snapshot(current).unwrap().revision;
         controller.record_sent(current, next);
         controller
             .record_status(current, status(next, &[]))
@@ -1646,7 +1654,10 @@ mod tests {
 
     #[test]
     fn reports_count_only_for_the_term_their_stream_acknowledged() {
-        let controller = SupervisorHostController::new();
+        use crate::coordinator::{InstanceSupervision, SharedSupervision};
+        let supervision = SharedSupervision::new();
+        let controller = supervision.controller();
+        let supervised = || supervision.supervision("rt-a", "sandbox-rt-a");
         let (one, _) = controller
             .begin_session(identity(), &member_hello("m1", "p1", 1))
             .unwrap();
@@ -1684,14 +1695,32 @@ mod tests {
             .record_status(one, status(first, &["rt-a"]))
             .unwrap();
         assert!(terms().is_empty());
+        assert_eq!(controller.observed("rt-a"), ObservedInstance::Pending);
+        assert_eq!(supervised(), InstanceSupervision::Degraded);
+        // Nor does term 1 ending, or no longer listing rt-a, end term 3.
+        let mut ended = status(first, &["rt-a"]);
+        ended.instances[0].phase = crate::proto::SandboxInstancePhase::Exited as i32;
+        ended.instances[0].ready = false;
+        controller.record_status(one, ended).unwrap();
+        assert_eq!(controller.observed("rt-a"), ObservedInstance::Pending);
+        assert_eq!(supervised(), InstanceSupervision::Degraded);
+        controller.record_status(one, status(first, &[])).unwrap();
+        assert_eq!(controller.observed("rt-a"), ObservedInstance::Pending);
+        assert_eq!(supervised(), InstanceSupervision::Degraded);
         controller
             .record_status(one, status(third, &["rt-a"]))
             .unwrap();
         assert_eq!(terms(), [("rt-a".to_string(), 3)]);
+        assert_eq!(supervised(), InstanceSupervision::Available);
         // A later snapshot that repeats the term keeps it installed.
         let later = send(owner("m1", "p1", 3));
         assert!(later >= third);
         assert_eq!(terms(), [("rt-a".to_string(), 3)]);
+        // Once the current term is acknowledged, a process that no longer
+        // hosts rt-a reports it absent.
+        controller.record_status(one, status(later, &[])).unwrap();
+        assert_eq!(controller.observed("rt-a"), ObservedInstance::Absent);
+        assert_eq!(supervised(), InstanceSupervision::Unavailable);
     }
 
     #[test]

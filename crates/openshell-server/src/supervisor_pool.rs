@@ -458,6 +458,8 @@ struct TestHooks {
     fail_admission: Mutex<Option<()>>,
     /// Fails the next removal of a refused launch's record.
     fail_give_up: Mutex<Option<()>>,
+    /// Fails the next read of an owner's member record before a takeover.
+    fail_member_read: Mutex<Option<()>>,
     /// Pauses the next reconciliation pass before it does anything.
     reconcile_gate: Mutex<Option<Gate>>,
     /// Replaces the members whose streams the controller serves.
@@ -573,16 +575,15 @@ fn owner_alive(owner: &OwnerPayload, members: &[LiveMember]) -> bool {
     })
 }
 
-/// Why `owner`, which [`owner_alive`] rejects, loses its instance: its
-/// member is leaving, runs a new process, or has no live record.
-fn takeover_cause(owner: &OwnerPayload, members: &[LiveMember]) -> &'static str {
-    match members
-        .iter()
-        .find(|member| member.member_id == owner.member_id)
-    {
-        Some(member) if member.process_id != owner.process_id => "restarted",
-        Some(_) => "leaving",
-        None => "expired",
+/// Why `owner` loses its instance, given its member's live record: its
+/// member runs a new process, is leaving, or has no live record. `None`
+/// when the owner's process still serves its member.
+fn takeover_cause(owner: &OwnerPayload, member: Option<&LiveMember>) -> Option<&'static str> {
+    match member {
+        Some(member) if member.process_id != owner.process_id => Some("restarted"),
+        Some(member) if member.leaving => Some("leaving"),
+        Some(_) => None,
+        None => Some("expired"),
     }
 }
 
@@ -2093,7 +2094,14 @@ impl SupervisorPool {
                     self.complete_takeover(record.clone()).await
                 }
                 Some(record) if takeovers_allowed && !owner_alive(&record.payload, &members) => {
-                    self.take_over(record, &ring, &members, &charges).await
+                    match self.owner_failure(&record.payload).await {
+                        Ok(Some(cause)) => {
+                            self.take_over(record, cause, &ring, &members, &charges)
+                                .await
+                        }
+                        Ok(None) => Ok(Reconciled::Unchanged),
+                        Err(error) => Err(error),
+                    }
                 }
                 // A live owner keeps its instance; nothing is placed or
                 // taken over during the startup grace.
@@ -2510,10 +2518,43 @@ impl SupervisorPool {
         Ok(Reconciled::Unchanged)
     }
 
-    /// Move an instance whose owner failed or left to the ring's choice.
+    /// Why the owner a pass's member listing shows failed loses its
+    /// instance, read from its member's record now, or `None` when its
+    /// process still serves the member. Members are listed before owners,
+    /// so a member that joined, or refreshed, meanwhile and was given the
+    /// route is missing from the listing yet healthy. A failed read fails
+    /// the decision, so no healthy owner loses its credentials.
+    async fn owner_failure(
+        &self,
+        owner: &OwnerPayload,
+    ) -> Result<Option<&'static str>, PersistenceError> {
+        #[cfg(test)]
+        if lock(&self.hooks.fail_member_read).take().is_some() {
+            return Err(PersistenceError::Database(
+                "test: the member read failed".to_string(),
+            ));
+        }
+        let member = self
+            .store
+            .get(MEMBER_OBJECT_TYPE, &member_object_id(&owner.member_id))
+            .await?
+            .filter(|record| self.fresh(record))
+            .and_then(|record| serde_json::from_slice::<MemberPayload>(&record.payload).ok())
+            .map(|payload| LiveMember {
+                member_id: payload.member_id,
+                process_id: payload.process_id,
+                runtime_address: payload.runtime_address,
+                leaving: payload.leaving,
+            });
+        Ok(takeover_cause(owner, member.as_ref()))
+    }
+
+    /// Move an instance whose owner failed or left, for `cause`, to the
+    /// ring's choice.
     async fn take_over(
         &self,
         record: &OwnerRecord,
+        cause: &'static str,
         ring: &GatewayRing,
         members: &[LiveMember],
         charges: &BTreeMap<String, BTreeSet<String>>,
@@ -2550,7 +2591,7 @@ impl SupervisorPool {
                         from = %record.payload.member_id,
                         to = %intent.payload.member_id,
                         term = intent.payload.auth_epoch,
-                        cause = %takeover_cause(&record.payload, members),
+                        cause,
                         "taking over a shared sandbox instance from a failed supervisor"
                     );
                     return self.complete_takeover(*intent).await;
@@ -4073,6 +4114,121 @@ mod tests {
         );
     }
 
+    /// What happens to `m2` after it joined and was given a route while a
+    /// pass that listed members without it was paused.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AfterJoin {
+        Stays,
+        Restarts,
+        Leaves,
+        Expires,
+        ReadFails,
+    }
+
+    /// A pass on `gw-a` that listed members while `m1` was the only one,
+    /// then paused in its report listing while `m2` joined and `gw-b`
+    /// admitted a route on it; `after` then happens to `m2`, and the pass
+    /// resumes. Returns the route.
+    async fn pass_after_a_member_joined(fixture: &Fixture, after: AfterJoin) -> String {
+        fixture.member("m1", "p1", false).await;
+        // A full first page, so the report listing pauses after the
+        // membership listing and before the owner listing.
+        for index in 0..LIST_LIMIT {
+            fixture
+                .write_report(ReportPayload {
+                    route: format!("rt-filler-{index:05}"),
+                    member_id: "m1".to_string(),
+                    process_id: "p1".to_string(),
+                    auth_epoch: 1,
+                    sandbox_id: "sandbox-filler".to_string(),
+                    phase: 2,
+                    ready: true,
+                    exit_code: 0,
+                    connected_at_ms: 0,
+                })
+                .await;
+        }
+        let pool = fixture.replica("gw-a");
+        let (paused, resume) = pool.pause_listing_after_first_page(REPORT_OBJECT_TYPE);
+        let pass = {
+            let pool = pool.clone();
+            tokio::spawn(async move { pool.reconcile_once().await })
+        };
+        paused.await.unwrap();
+        fixture.member("m2", "p2", false).await;
+        let ring = ring_of(&gw_b_members(fixture).await);
+        let sandbox = (0..64)
+            .map(|index| format!("sandbox-{index}"))
+            .find(|sandbox| ring.owner_for(sandbox) == Some("m2"))
+            .expect("a sandbox the ring places on m2");
+        let route = "rt-joined-0123".to_string();
+        fixture
+            .sandbox(&sandbox, "generation-1", SandboxPhase::Ready)
+            .await;
+        fixture
+            .replica("gw-b")
+            .place_launch(launch(&route, &sandbox, "generation-1"))
+            .await
+            .unwrap();
+        assert_eq!(fixture.owner(&route).await.unwrap().member_id, "m2");
+        match after {
+            AfterJoin::Stays => {}
+            AfterJoin::Restarts => fixture.member("m2", "p3", false).await,
+            AfterJoin::Leaves => fixture.member("m2", "p2", true).await,
+            AfterJoin::Expires => fixture.remove_member("m2").await,
+            AfterJoin::ReadFails => *lock(&pool.hooks.fail_member_read) = Some(()),
+        }
+        resume.send(()).unwrap();
+        pass.await.unwrap().unwrap();
+        route
+    }
+
+    async fn gw_b_members(fixture: &Fixture) -> Vec<LiveMember> {
+        fixture.replica("gw-b").live_members().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_member_that_joined_mid_pass_keeps_the_route_it_was_given() {
+        let fixture = Fixture::new().await;
+        let route = pass_after_a_member_joined(&fixture, AfterJoin::Stays).await;
+        let owner = fixture.owner(&route).await.unwrap();
+        assert_eq!(
+            (owner.member_id.as_str(), owner.process_id.as_str()),
+            ("m2", "p2")
+        );
+        assert_eq!(owner.auth_epoch, 1);
+        assert_eq!(owner.phase, OwnerPhase::Granted);
+        assert_eq!(
+            fixture.auth_epoch(&owner.sandbox_id).await,
+            1,
+            "the healthy owner's credentials are not revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_member_record_never_moves_its_route() {
+        let fixture = Fixture::new().await;
+        let route = pass_after_a_member_joined(&fixture, AfterJoin::ReadFails).await;
+        let owner = fixture.owner(&route).await.unwrap();
+        assert_eq!((owner.member_id.as_str(), owner.auth_epoch), ("m2", 1));
+        assert_eq!(fixture.auth_epoch(&owner.sandbox_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_member_that_failed_after_joining_mid_pass_loses_its_route() {
+        for after in [AfterJoin::Restarts, AfterJoin::Leaves, AfterJoin::Expires] {
+            let fixture = Fixture::new().await;
+            let route = pass_after_a_member_joined(&fixture, after).await;
+            let owner = fixture.owner(&route).await.unwrap();
+            assert_eq!(
+                (owner.member_id.as_str(), owner.auth_epoch, owner.phase),
+                ("m1", 2, OwnerPhase::Granted)
+            );
+            assert_eq!(owner.previous_member_id.as_deref(), Some("m2"));
+            assert_eq!(fixture.auth_epoch(&owner.sandbox_id).await, 2);
+        }
+    }
+
     #[tokio::test]
     async fn a_route_a_listing_misses_is_confirmed_before_it_is_stopped() {
         let fixture = Fixture::new().await;
@@ -4184,7 +4340,7 @@ mod tests {
         taking.pause_next_transition(barrier.clone());
         launching.pause_next_transition(barrier);
         let (taken, launched) = tokio::join!(
-            taking.take_over(&record, &ring, &members, &charges),
+            taking.take_over(&record, "expired", &ring, &members, &charges),
             launching.place_launch(launch("rt-route-new0", "sandbox-new", "generation-1")),
         );
         taken.unwrap();
@@ -5011,9 +5167,20 @@ mod tests {
             runtime_address: "10.0.0.1:5500".to_string(),
             leaving,
         };
-        assert_eq!(takeover_cause(&owner, &[]), "expired");
-        assert_eq!(takeover_cause(&owner, &[member("p1", true)]), "leaving");
-        assert_eq!(takeover_cause(&owner, &[member("p2", false)]), "restarted");
+        assert_eq!(takeover_cause(&owner, None), Some("expired"));
+        assert_eq!(
+            takeover_cause(&owner, Some(&member("p1", true))),
+            Some("leaving")
+        );
+        assert_eq!(
+            takeover_cause(&owner, Some(&member("p2", false))),
+            Some("restarted")
+        );
+        assert_eq!(
+            takeover_cause(&owner, Some(&member("p2", true))),
+            Some("restarted")
+        );
+        assert_eq!(takeover_cause(&owner, Some(&member("p1", false))), None);
     }
 
     #[test]
