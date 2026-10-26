@@ -23,7 +23,8 @@ pub use ocsf::{OcsfOtlp, OcsfOtlpLayer};
 pub use propagation::{
     HeaderMapExtractor, MetadataMapInjector, TRACEPARENT_ENV, TRACESTATE_ENV,
     TraceContextInterceptor, current_trace_context_carrier, current_trace_context_environment,
-    set_parent_from_environment, set_parent_from_trace_context, trace_context_environment,
+    set_parent_from_environment, set_parent_from_headers, set_parent_from_trace_context,
+    trace_context_environment,
 };
 
 use opentelemetry::KeyValue;
@@ -36,6 +37,7 @@ use opentelemetry_sdk::trace::SdkTracer;
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::Subscriber;
 use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::registry::LookupSpan;
@@ -69,6 +71,12 @@ pub fn gateway_resource_attributes(
 /// records for fields a span does not have.
 pub fn mark_error(span: &tracing::Span) {
     span.record("otel.status_code", "ERROR");
+}
+
+/// Run `operation` with `span` as the active OpenTelemetry context.
+pub fn with_span_context<T>(span: &tracing::Span, operation: impl FnOnce() -> T) -> T {
+    let _guard = span.context().attach();
+    operation()
 }
 
 /// Marks the current span when an instrumented operation returns an error.

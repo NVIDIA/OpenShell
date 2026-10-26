@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use openshell_ocsf::{OCSF_TARGET, OcsfEvent, SeverityId, clone_current_event};
-use opentelemetry::InstrumentationScope;
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity};
+use opentelemetry::trace::{SpanContext, TraceContextExt as _};
+use opentelemetry::{Context as OtelContext, InstrumentationScope};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::logs::{LogBatch, LogExporter, SdkLogRecord, SdkLogger, SdkLoggerProvider};
@@ -34,6 +35,7 @@ const MAX_EXPORT_ATTEMPTS: usize = 4;
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(2);
 const GAP_EVENT: &str = "openshell.ocsf.gap";
+const CORRELATION_UID_ATTRIBUTE: &str = "ocsf.metadata.correlation_uid";
 
 /// Exports OCSF events to an OTLP collector as log records.
 pub struct OcsfOtlp {
@@ -113,10 +115,16 @@ impl<S: Subscriber> Layer<S> for OcsfOtlpLayer {
         if event.metadata().target() != OCSF_TARGET {
             return;
         }
+        let span_context = active_span_context();
         let Some(event) = clone_current_event() else {
             return;
         };
-        let Ok(record) = log_record(&self.logger, &event, SystemTime::now()) else {
+        let Ok(record) = log_record(
+            &self.logger,
+            &event,
+            SystemTime::now(),
+            span_context.as_ref(),
+        ) else {
             self.gap.record_loss("serialization", 1);
             return;
         };
@@ -367,6 +375,12 @@ fn logger() -> SdkLogger {
     SdkLoggerProvider::builder().build().logger(SCOPE)
 }
 
+fn active_span_context() -> Option<SpanContext> {
+    let context = OtelContext::current();
+    let span_context = context.span().span_context().clone();
+    span_context.is_valid().then_some(span_context)
+}
+
 /// Map one OCSF event onto an OTLP log record.
 ///
 /// The body is the OCSF JSON record. Attributes repeat identifiers from the
@@ -375,6 +389,7 @@ fn log_record(
     logger: &SdkLogger,
     event: &OcsfEvent,
     observed: SystemTime,
+    span_context: Option<&SpanContext>,
 ) -> Result<SdkLogRecord, serde_json::Error> {
     let base = event.base();
     let mut record = logger.create_log_record();
@@ -389,6 +404,16 @@ fn log_record(
     record.add_attribute("ocsf.severity_id", i64::from(base.severity.as_u8()));
     if let Some(uid) = &base.metadata.uid {
         record.add_attribute("ocsf.metadata.uid", uid.clone());
+    }
+    if let Some(correlation_uid) = &base.metadata.correlation_uid {
+        record.add_attribute(CORRELATION_UID_ATTRIBUTE, correlation_uid.clone());
+    }
+    if let Some(span_context) = span_context.filter(|context| context.is_valid()) {
+        record.set_trace_context(
+            span_context.trace_id(),
+            span_context.span_id(),
+            Some(span_context.trace_flags()),
+        );
     }
     if let Some(sandbox_id) = base
         .container
@@ -474,7 +499,7 @@ mod tests {
     }
 
     fn record(event: &OcsfEvent) -> SdkLogRecord {
-        log_record(&logger(), event, SystemTime::UNIX_EPOCH).unwrap()
+        log_record(&logger(), event, SystemTime::UNIX_EPOCH, None).unwrap()
     }
 
     #[test]
@@ -487,7 +512,7 @@ mod tests {
     fn timestamps_are_event_time_and_observed_time() {
         let event = event("sandbox-1", SeverityId::Informational);
         let observed = SystemTime::UNIX_EPOCH + Duration::from_secs(42);
-        let record = log_record(&logger(), &event, observed).unwrap();
+        let record = log_record(&logger(), &event, observed, None).unwrap();
         let time_ms = native(&event)["time"].as_u64().unwrap();
         assert_eq!(
             record.timestamp(),
@@ -542,6 +567,19 @@ mod tests {
         assert_eq!(
             attribute(&record, "openshell.sandbox.id"),
             Some(AnyValue::String("sandbox-1".into()))
+        );
+    }
+
+    #[test]
+    fn correlation_uid_is_a_stable_otlp_attribute() {
+        let mut event = event("sandbox-1", SeverityId::Informational);
+        event.set_correlation_uid("request-123");
+
+        let record = record(&event);
+
+        assert_eq!(
+            attribute(&record, CORRELATION_UID_ATTRIBUTE),
+            Some(AnyValue::String("request-123".into()))
         );
     }
 
@@ -684,6 +722,45 @@ mod tests {
         assert_eq!(body(&records[0].record), expected);
         assert_eq!(records[0].scope, SCOPE);
         assert_eq!(exporter.service_name().as_deref(), Some("openshell-test"));
+    }
+
+    #[tokio::test]
+    async fn active_unsampled_span_context_is_attached_without_dropping_the_log() {
+        use opentelemetry::trace::TraceContextExt as _;
+        use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+        let exporter = RecordingExporter::default();
+        let otlp = OcsfOtlp::start(exporter.clone(), exporter_resource());
+        let trace_provider = SdkTracerProvider::builder()
+            .with_sampler(Sampler::AlwaysOff)
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(crate::layer(&trace_provider, "ocsf-test"))
+            .with(otlp.layer());
+
+        let expected = tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("request");
+            let context = span.context();
+            let span_context = context.span().span_context().clone();
+            assert!(span_context.is_valid());
+            assert!(!span_context.is_sampled());
+            crate::with_span_context(&span, || {
+                span.in_scope(|| ocsf_emit!(event("sandbox-1", SeverityId::Informational)));
+            });
+            span_context
+        });
+        otlp.shutdown().await;
+
+        let records = exporter.exported();
+        assert_eq!(records.len(), 1);
+        let actual = records[0]
+            .record
+            .trace_context()
+            .expect("active span context is attached to the log record");
+        assert_eq!(actual.trace_id, expected.trace_id());
+        assert_eq!(actual.span_id, expected.span_id());
+        assert_eq!(actual.trace_flags, Some(expected.trace_flags()));
     }
 
     #[tokio::test]
