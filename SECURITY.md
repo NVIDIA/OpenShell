@@ -4,11 +4,11 @@
 
 Report OpenShell vulnerabilities through [GitHub's private reporting form](https://github.com/NVIDIA/OpenShell/security/advisories/new). Submitting a report does not publish an advisory. Do not disclose vulnerabilities in public issues, discussions, or pull requests.
 
-Include:
+Every report must use the [advisory template](.agents/skills/create-security-advisory/assets/advisory-template.md). Keep its core headings and include:
 
 - Affected component and version, commit, or image digest.
 - Description, impact, and prerequisites for exploitation.
-- Reproduction steps or a minimal proof of concept.
+- Reproduction steps and observed results, or concrete code evidence of the attack path.
 - Relevant deployment and policy configuration, with secrets and personal information removed.
 - Known mitigations, existing CVE identifiers, or disclosure deadlines, if any.
 
@@ -16,9 +16,11 @@ The [OpenShell maintainers](https://github.com/NVIDIA/OpenShell/blob/main/MAINTA
 
 ### Report quality and agent skills
 
-AI tools are welcome for investigation and drafting, consistent with our [AI usage guidelines](CONTRIBUTING.md#ai-usage). You remain responsible for understanding the finding and verifying the report's accuracy. Explain the issue in your own words, distinguish reproduced behavior, code inspection, and unverified claims, and include concise evidence excerpts. Raw scanner output or agent transcripts alone are not sufficient.
+AI tools may assist investigation and drafting under our [AI usage guidelines](CONTRIBUTING.md#ai-usage). A human reporter must review the report, verify its accuracy, and be able to explain the attack scenario and supporting evidence. Distinguish reproduced behavior, code inspection, and unverified claims. Raw scanner output, agent transcripts, or speculative vulnerability lists alone are not sufficient.
 
-Use the optional [advisory template](.agents/skills/create-security-advisory/assets/advisory-template.md) to structure the report. With a source checkout, [create-security-advisory](.agents/skills/create-security-advisory/SKILL.md) helps prepare it; maintainers can use [review-security-issue](.agents/skills/review-security-issue/SKILL.md) for assessment. Submit reports through the private form above.
+Reports that do not follow the template or lack concrete reproduction or code evidence will be returned for revision before technical triage. Identify missing information explicitly; a root cause, CVSS/CWE classification, or proposed fix is not required.
+
+The agent skills are optional helpers: with a source checkout, [create-security-advisory](.agents/skills/create-security-advisory/SKILL.md) helps prepare a report; maintainers can use [review-security-issue](.agents/skills/review-security-issue/SKILL.md) for assessment. Submit reports through the private form above.
 
 ## Coordinated disclosure
 
