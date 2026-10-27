@@ -124,6 +124,10 @@ supervisor:
     seccompProfile:
       # -- Seccomp profile applied to the shared supervisor pod.
       type: RuntimeDefault
+  # -- Affinity rules for the shared supervisor pod, rendered only when
+  # gatewayConfig selects supervisor_topology = "gateway". Top-level affinity
+  # applies only to the gateway pod.
+  affinity: {}
   sandboxRuntime:
     # -- Workload boundary TLS listener port.
     boundaryPort: 5500

@@ -286,8 +286,8 @@ tests:
           path: spec.template.spec.terminationGracePeriodSeconds
           value: 60
         documentIndex: 0
-      - exists:
-          path: spec.template.spec.affinity.podAntiAffinity
+      - notExists:
+          path: spec.template.spec.affinity
         documentIndex: 0
       - contains:
           path: spec.template.spec.containers[0].env
@@ -337,20 +337,6 @@ tests:
       - equal:
           path: spec.template.spec.terminationGracePeriodSeconds
           value: 60
-        documentIndex: 0
-      - equal:
-          path: spec.template.spec.affinity
-          value:
-            podAntiAffinity:
-              preferredDuringSchedulingIgnoredDuringExecution:
-                - weight: 100
-                  podAffinityTerm:
-                    labelSelector:
-                      matchLabels:
-                        app.kubernetes.io/name: openshell-supervisor
-                        app.kubernetes.io/instance: openshell
-                        app.kubernetes.io/component: supervisor
-                    topologyKey: kubernetes.io/hostname
         documentIndex: 0
       - contains:
           path: spec.template.spec.containers[0].env

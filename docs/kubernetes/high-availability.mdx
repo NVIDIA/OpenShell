@@ -517,14 +517,32 @@ replicas so sandboxes can fail over:
 ```yaml
 gatewayConfig:
   openshell.drivers.kubernetes:
+    # Creates a supervisor Deployment alongside the gateway.
+    # Per-workspace and per-node supervisor options are planned.
     supervisor_topology: gateway
 
 supervisor:
   replicas: 2
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: openshell-supervisor
+              app.kubernetes.io/instance: openshell
+              app.kubernetes.io/component: supervisor
+          topologyKey: kubernetes.io/hostname
 ```
 
 The chart creates the supervisor Deployment and connects it to the gateway.
 Tune the pool through the top-level `supervisor` values.
+
+The chart sets no supervisor affinity by default. The example rule places each
+supervisor replica on a different node, so losing one node leaves another
+supervisor to take over. Replace `openshell` in `app.kubernetes.io/instance`
+with your Helm release name. A required rule leaves a replica Pending when there
+are not enough nodes; use `preferredDuringSchedulingIgnoredDuringExecution` to
+spread replicas when possible without blocking scheduling.
 
 ### Recover from a Supervisor Failure
 

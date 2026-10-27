@@ -114,8 +114,9 @@ chart renders the gateway's
 `[openshell.gateway.supervisor_pool]` tuning table (only
 `recovery_timeout_secs` from `supervisor.recoveryTimeoutSeconds`, default 60;
 the driver's `shared_supervisor` table stays unchanged), a
-RollingUpdate Deployment (`maxSurge: 1`, `maxUnavailable: 0`) with preferred
-hostname anti-affinity and a 60-second grace period, the pool identity env vars
+RollingUpdate Deployment (`maxSurge: 1`, `maxUnavailable: 0`) with a 60-second
+grace period, no affinity unless `supervisor.affinity` is set (top-level
+`affinity` applies only to the gateway), the pool identity env vars
 (`OPENSHELL_SUPERVISOR_POOL_MEMBER_ID` and `_ADVERTISE_IP` from the Pod name
 and IP), and a `maxUnavailable: 1` PodDisruptionBudget.
 `ci/values-supervisor-ha.yaml` selects two replicas and a 60-second recovery

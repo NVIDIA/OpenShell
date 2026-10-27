@@ -65,17 +65,10 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      # Prefer separate nodes, so losing one node leaves members to take over
-      # its instances.
+      {{- with .Values.supervisor.affinity }}
       affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels:
-                    {{- include "openshell.supervisorSelectorLabels" . | nindent 20 }}
-                topologyKey: kubernetes.io/hostname
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: supervisor
           image: {{ get $kubernetes "supervisor_image" | quote }}

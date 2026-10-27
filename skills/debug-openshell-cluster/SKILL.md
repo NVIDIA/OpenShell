@@ -1163,7 +1163,9 @@ shared supervisor as a pool, and the `<release>-supervisor` Deployment runs
 `supervisor.replicas` members (default 1, which has no failover). The chart
 renders only `[openshell.gateway.supervisor_pool] recovery_timeout_secs` (the
 driver's `shared_supervisor` table carries no pool settings), rolls one member
-at a time, prefers separate nodes, gives each member a 60-second grace period to leave,
+at a time, sets no affinity by default (set `supervisor.affinity` to control
+supervisor scheduling; top-level `affinity` applies only to the gateway), gives
+each member a 60-second grace period to leave,
 and adds a `<release>-supervisor` PodDisruptionBudget with `maxUnavailable: 1`.
 Each member takes its stable member ID from `OPENSHELL_SUPERVISOR_POOL_MEMBER_ID`
 (the Pod name) and its runtime address from
