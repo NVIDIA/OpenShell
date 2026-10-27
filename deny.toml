@@ -32,6 +32,10 @@ ignore = [
     { id = "RUSTSEC-2026-0367", reason = "zip privileged permission bits — build-only Z3 release extraction; awaiting z3-sys support for zip >=9" },
     { id = "RUSTSEC-2026-0368", reason = "zip symlink target escape — build-only Z3 release extraction; awaiting z3-sys support for zip >=9" },
     { id = "RUSTSEC-2026-0369", reason = "zip permissions follow symlinks — build-only Z3 release extraction; awaiting z3-sys support for zip >=9" },
+    { id = "RUSTSEC-2026-0391", reason = "zstd context reuse leaks prior stream data — VM driver and zip create fresh contexts; remove when the dependency chain supports zstd >=0.14.3" },
+    { id = "RUSTSEC-2026-0398", reason = "zstd-safe seekable decompression memory corruption — current consumers do not use the seekable API; remove when the dependency chain supports zstd-safe >=8.2.0" },
+    { id = "RUSTSEC-2026-0403", reason = "zstd-safe legacy frame error leaks uninitialized memory through write decoders — VM driver and zip use read decoders; remove when the dependency chain supports zstd-safe >=8.2.0" },
+    { id = "RUSTSEC-2026-0410", reason = "zstd-sys wasm32 allocator memory corruption — current consumers run on native targets; remove when the dependency chain supports zstd-sys >=2.1.2" },
 ]
 
 # -- Licenses ------------------------------------------------------------------
