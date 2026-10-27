@@ -48,6 +48,13 @@ remains in Actions. This checks
 protobuf compatibility; SDK/configuration compatibility and migration review
 remain separate qualification work.
 
+The release qualification workflow has a one-candidate, release-captain-approved
+exception for `v0.1.6-pre.7`. It still runs Buf and fails on compilation or tooling
+errors, but accepts detected protobuf breaking changes for that tag. The run
+summary and qualification JSON's `exceptions` array record the scope and reason.
+Other candidates retain the normal version policy. Remove the workflow exception
+after promotion; release notes must describe the accepted changes and migration.
+
 Fetch the target and tags to check committed branch changes locally, replacing
 `origin/main` for another target:
 

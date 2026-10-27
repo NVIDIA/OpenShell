@@ -42,6 +42,18 @@ tag, or start a second `Pre-release` run for a tag; it has no concurrency guard.
   picks the highest `-pre.N` on `main` whose whole `Pre-release` run passed,
   creates the stable tag on that commit, and publishes without requalifying.
 
+### One-candidate protobuf exception
+
+`v0.1.6-pre.7` has a release-captain-approved protobuf compatibility exception
+in `release-qualification.yml`. The check still compiles both protobuf snapshots
+and runs Buf; only detected breaking changes are allowed. Compilation and tooling
+errors still fail. Other candidates retain normal version-based enforcement.
+The run summary and qualification JSON record the exception and reason. Review
+all protobuf findings for this candidate and include migration guidance in the
+release notes; the exception does not accept other compatibility-review findings.
+Remove the workflow exception after promotion. If another candidate is needed,
+obtain explicit acceptance for that candidate before changing the tag scope.
+
 ## Setup
 
 ```shell
