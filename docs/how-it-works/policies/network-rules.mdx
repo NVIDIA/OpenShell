@@ -340,6 +340,10 @@ request, which the read-only preset denies. Run `npm install --no-audit`, or
 replace `access: read-only` with explicit rules that also allow the audit's
 `POST` requests. An endpoint cannot combine `access` and `rules`.
 
+To set the option on a live sandbox without replacing the policy, add
+`allow-encoded-slash` to the `--add-endpoint` options segment of
+`openshell policy update`, which requires a `rest` or `websocket` endpoint.
+
 Verify that a scoped package lookup succeeds:
 
 ```shell
