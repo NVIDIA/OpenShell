@@ -5036,6 +5036,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-sandbox-proxy"
+version = "0.0.0"
+dependencies = [
+ "axum",
+ "clap",
+ "openshell-core",
+ "openshell-crypto",
+ "openshell-sdk",
+ "rustls",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "openshell-sdk"
 version = "0.0.0"
 dependencies = [

@@ -344,6 +344,8 @@ still miss across worktrees.
 
 ## Container Image Base Overrides
 
+The optional application proxy image can be built with `mise run docker:build:sandbox-proxy`. Its standalone deployment chart is in `deploy/helm/openshell-sandbox-proxy`.
+
 The gateway and supervisor Dockerfiles accept `GATEWAY_BASE_IMAGE` and
 `SUPERVISOR_BASE_IMAGE` build arguments. Omitting them keeps the pinned
 distroless defaults. To build with your own bases, pass the argument through
