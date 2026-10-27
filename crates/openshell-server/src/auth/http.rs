@@ -91,6 +91,10 @@ fn sanitize_callback_host(raw: &Option<String>) -> (String, String) {
 /// Create the auth router.
 pub fn router(state: Arc<ServerState>) -> Router {
     Router::new()
+        .route(
+            "/auth/services",
+            get(service_browser_login).post(service_browser_login),
+        )
         .route("/auth/connect", get(auth_connect))
         .route("/auth/oidc-config", get(oidc_config_handler))
         .route("/.well-known/jwks.json", get(gateway_jwks_handler))
@@ -99,6 +103,16 @@ pub fn router(state: Arc<ServerState>) -> Router {
             get(gateway_discovery_handler),
         )
         .with_state(state)
+}
+
+async fn service_browser_login(
+    State(state): State<Arc<ServerState>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    match super::service_session::control(&state, req).await {
+        Ok(response) => response,
+        Err(error) => super::service_session::error(&error),
+    }
 }
 
 /// Publish OIDC-shaped discovery metadata for extension services.

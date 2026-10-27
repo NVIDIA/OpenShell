@@ -20,6 +20,10 @@ pub enum SecretOwnerKind<'a> {
     Sandbox {
         id: &'a str,
     },
+    /// Gateway-owned browser application session storage identity.
+    ApplicationSession {
+        id: &'a str,
+    },
     /// Launch material is owned by a sandbox assignment, not the host/route.
     SupervisorInstance {
         sandbox_id: &'a str,
@@ -54,9 +58,20 @@ impl<'a> SecretOwner<'a> {
         }
     }
 
+    /// `id` is the existing `service-session-<session ID>` storage identity.
+    pub fn application_session(workspace: &'a str, id: &'a str) -> Self {
+        Self {
+            workspace,
+            kind: SecretOwnerKind::ApplicationSession { id },
+        }
+    }
+
     pub(crate) fn legacy_scope(self) -> LegacyScope<'a> {
         let (provider, id) = match self.kind {
             SecretOwnerKind::Provider { id, name } => (Cow::Borrowed(name), id),
+            SecretOwnerKind::ApplicationSession { id } => {
+                (Cow::Borrowed("gateway-service-session"), id)
+            }
             SecretOwnerKind::Sandbox { id } => (Cow::Owned(format!("sandbox-ssh-{id}")), id),
             SecretOwnerKind::SupervisorInstance { sandbox_id } => (
                 Cow::Owned(format!("sandbox-instance-{sandbox_id}")),
@@ -82,6 +97,11 @@ mod tests {
                 SecretOwner::provider("workspace-a", "provider-id", "provider-name"),
                 "provider-name",
                 "provider-id",
+            ),
+            (
+                SecretOwner::application_session("workspace-a", "service-session-session-id"),
+                "gateway-service-session",
+                "service-session-session-id",
             ),
             (
                 SecretOwner::sandbox("workspace-a", "sandbox-id"),

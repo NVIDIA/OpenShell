@@ -8,7 +8,110 @@ keywords: "Generative AI, Cybersecurity, Gateway, Authentication, mTLS, OIDC, Op
 position: 1
 ---
 
-This page describes how the CLI resolves a gateway, authenticates with it, and where credentials are stored. For how to deploy or register gateways, refer to [Gateways](/how-it-works/gateways/overview).
+This page describes gateway authentication for CLI clients and sandbox service requests. For how to deploy or register gateways, refer to [Gateways](/how-it-works/gateways/overview).
+
+## Sandbox service requests
+
+Gateway-mediated HTTP requests and WebSocket upgrades authenticate with the
+configured gateway identity and require workspace user access. OIDC users need
+the configured user or admin role and, when scope enforcement is enabled,
+`sandbox:write` or `openshell:all`, matching TCP forwarding. Discovery-only access
+does not grant application access. This applies with the supervisor app listener
+enabled or disabled. Only explicitly enabled unauthenticated local development
+bypasses the gate. Existing unauthenticated service clients must supply gateway
+credentials in authenticated deployments.
+
+For a request that uses only gateway bearer authentication:
+
+```shell
+curl --header "Authorization: Bearer ${GATEWAY_ACCESS_TOKEN}" \
+  https://default--my-sandbox--web.gateway.example.com/
+```
+
+The gateway consumes that header. When an application also needs its own bearer
+token, enable the service's `bearer-passthrough` mode and separate the credentials:
+
+```shell
+curl --header "X-OpenShell-Authorization: Bearer ${GATEWAY_ACCESS_TOKEN}" \
+  --header "Authorization: Bearer ${APPLICATION_ACCESS_TOKEN}" \
+  https://default--my-sandbox--web.gateway.example.com/
+```
+
+A verified mTLS identity or browser session can also supply gateway authentication
+while `Authorization` carries the application's token. The gateway strips its
+own headers and reserved cookies before forwarding. Application cookies retain
+their normal behavior; applications cannot overwrite reserved gateway cookies.
+Missing, invalid, expired, or gateway-revoked credentials return 401 before any
+application connection. Role, scope, membership, and origin denials return 403.
+
+### Browser sessions
+
+Open the control-plane gateway's sign-in page with the gateway-mediated service
+origin as `service_origin`, for example:
+
+```text
+https://gateway.example.com/auth/services?service_origin=https%3A%2F%2Fdefault--my-sandbox--web.gateway.example.com
+```
+
+The browser first visits the service to establish login state, then returns to
+the control-plane sign-in page. Verify that page's gateway origin and target
+service, and supply an access token obtained through your configured identity
+provider. The gateway sends a single-use code to the service origin and installs
+a host-only, Secure, HttpOnly, SameSite=Strict session cookie. Application
+JavaScript never receives the gateway token. Configured mTLS browser users can
+instead access the service directly with their client certificate.
+
+Browser login requires HTTPS to the gateway itself; forwarded scheme or identity
+headers cannot enable it. The gateway stores token material through its configured
+credential driver, which must support storing session secrets. Replicas must
+share the database and credential backend/key. Direct bearer and mTLS requests
+do not require browser session storage.
+Login codes expire after two minutes. Sessions expire after ten minutes or the
+token's expiration, whichever comes first; sign in again rather than silently
+refreshing the token. Every request revalidates the token and current workspace
+membership. Each workspace admits at most 1,024 pending and active sessions;
+expired sessions are cleaned up during login.
+
+Cookie and mTLS requests require a matching Origin for unsafe HTTP methods and
+WebSocket upgrades. Cross-origin browser requests are rejected. Headless mTLS
+clients making unsafe requests must also provide the matching Origin. Explicit
+bearer headers avoid ambient browser credentials. WebSockets authenticate at
+upgrade; an established connection is not continuously reauthenticated.
+
+### Logout and credential revocation
+
+From application-origin JavaScript, log out with:
+
+```javascript
+await fetch('/.openshell/service-auth/session', { method: 'DELETE' });
+```
+
+The gateway deletes the session in the shared store and expires its cookie, so
+replaying that cookie against another replica fails. To revoke application access
+for the current gateway bearer token or verified client certificate, use
+`DELETE /.openshell/service-auth/credential` on the service origin. Include the
+matching Origin and an explicit gateway bearer header or verified mTLS identity.
+A service-scoped browser cookie can revoke only its own session. For example:
+
+```shell
+curl --request DELETE \
+  --header "Origin: https://default--my-sandbox--web.gateway.example.com" \
+  --header "Authorization: Bearer ${GATEWAY_ACCESS_TOKEN}" \
+  https://default--my-sandbox--web.gateway.example.com/.openshell/service-auth/credential
+```
+
+Revocation is durable across gateway replicas and rejects subsequent application
+requests, including browser sessions using that token. Obtain a new token or
+rotate the client certificate to regain access. Revocation targets gateway
+application access; it does not revoke the identity provider's token or alter
+control-plane RPC credentials. Offline OIDC JWT validation cannot discover an
+identity provider's individual-token revocations before token expiry or key
+changes; use this gateway revocation endpoint for immediate application cutoff.
+The gateway retains certificate revocations and removes expired token revocations;
+it admits at most 1,024 outstanding application credential revocations.
+
+Direct supervisor app-listener access delegates authentication to the ingress
+provider. Gateway browser sessions and credentials do not authorize that path.
 
 ## Gateway Resolution
 
