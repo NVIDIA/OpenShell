@@ -3375,6 +3375,48 @@ require_client_auth = true
     }
 
     #[test]
+    fn metrics_tls_without_an_enabled_metrics_listener_is_rejected() {
+        let config_home = tempfile::tempdir().unwrap();
+
+        Environment::new()
+            .set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap())
+            .remove("OPENSHELL_GATEWAY_CONFIG")
+            .remove("OPENSHELL_METRICS_PORT")
+            .remove("OPENSHELL_METRICS_TLS_CERT")
+            .remove("OPENSHELL_METRICS_TLS_KEY")
+            .remove("OPENSHELL_METRICS_TLS_CLIENT_CA")
+            .remove("OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH")
+            .run(|| {
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--disable-tls",
+                    "--compute-driver",
+                    "podman",
+                    "--metrics-tls-cert",
+                    "/metrics/tls.crt",
+                    "--metrics-tls-key",
+                    "/metrics/tls.key",
+                ]);
+                let registry = test_registry("podman", true);
+
+                let error =
+                    match super::prepare_server_config_with_drivers(&mut args, &matches, &registry)
+                    {
+                        Err(error) => error,
+                        Ok(_) => panic!("metrics TLS without a listener must be rejected"),
+                    };
+                assert!(
+                    error
+                        .to_string()
+                        .contains("metrics TLS requires an enabled metrics listener"),
+                    "error: {error}"
+                );
+            });
+    }
+
+    #[test]
     fn explicit_metrics_client_auth_value_overrides_file_value() {
         Environment::new()
             .remove("OPENSHELL_METRICS_TLS_CERT")
