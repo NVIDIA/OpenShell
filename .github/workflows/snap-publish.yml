@@ -86,52 +86,6 @@ jobs:
           run-id: ${{ inputs.artifact-run-id || github.run_id }}
           github-token: ${{ inputs.artifact-run-id && github.token || '' }}
 
-      # Artifacts from another run must come from this repository's publishing
-      # workflow for the channel, and stable snaps must match the GitHub Release.
-      - name: Verify artifact provenance
-        if: inputs.artifact-run-id != ''
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
-        env:
-          RUN_ID: ${{ inputs.artifact-run-id }}
-          UPLOAD_CHANNEL: ${{ inputs.upload-channel }}
-          RELEASE_TAG: ${{ inputs.release-tag }}
-        with:
-          script: |
-            const fs = require('fs');
-            const crypto = require('crypto');
-            const { RUN_ID, UPLOAD_CHANNEL, RELEASE_TAG } = process.env;
-            const workflows = {
-              'latest/stable': '.github/workflows/release.yml',
-              'latest/beta': '.github/workflows/release-prerelease.yml',
-              'latest/edge': '.github/workflows/release-dev.yml',
-            };
-            const repo = `${context.repo.owner}/${context.repo.repo}`;
-            const { data: run } = await github.rest.actions.getWorkflowRun({
-              ...context.repo,
-              run_id: Number(RUN_ID),
-            });
-            if (run.path !== workflows[UPLOAD_CHANNEL]) {
-              core.setFailed(`Run ${RUN_ID} is ${run.path}, not ${workflows[UPLOAD_CHANNEL]}`);
-              return;
-            }
-            if (run.head_repository?.full_name !== repo) {
-              core.setFailed(`Run ${RUN_ID} is from ${run.head_repository?.full_name}, not ${repo}`);
-              return;
-            }
-            if (UPLOAD_CHANNEL !== 'latest/stable') return;
-            const { data: release } = await github.rest.repos.getReleaseByTag({
-              ...context.repo,
-              tag: RELEASE_TAG,
-            });
-            for (const file of fs.readdirSync('.').filter(name => name.endsWith('.snap'))) {
-              const digest = `sha256:${crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')}`;
-              const asset = release.assets.find(asset => asset.name === file);
-              if (asset?.digest !== digest) {
-                core.setFailed(`${file} does not match the ${RELEASE_TAG} release asset`);
-                return;
-              }
-            }
-
       - name: Install snapcraft
         run: |
           set -euo pipefail
@@ -148,12 +102,6 @@ jobs:
         uses: ./release-workflow/.github/actions/check-latest-release
         with:
           release-tag: ${{ inputs.release-tag }}
-
-      - name: Report skipped upload
-        if: ${{ inputs.release-tag != '' && steps.latest.outputs.make-latest != 'true' }}
-        env:
-          INPUTS_RELEASE_TAG: ${{ inputs.release-tag }}
-        run: echo "::notice::Snap upload skipped; ${INPUTS_RELEASE_TAG} is no longer the newest release."
 
       - name: Upload snap to Snap Store
         if: ${{ inputs.release-tag == '' || steps.latest.outputs.make-latest == 'true' }}

@@ -97,7 +97,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${WHEEL_FILENAMES}" ]; then
-            echo "No wheel filenames provided" >&2
+            echo "No wheel filenames provided by build job" >&2
             exit 1
           fi
 
