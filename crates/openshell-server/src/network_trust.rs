@@ -92,6 +92,10 @@ fn normalize_source_path(source_path: &Path) -> Result<NormalizedNetworkSupervis
     let source = read_source_bounded(source_path)?;
     let (normalized_pem, certificate_count) = normalize_source(source_path, &source)?;
     Ok(NormalizedNetworkSupervisorTrust {
+        // Deterministic destination-trust generation label, not an
+        // authenticity proof: trust comes from the gateway's normalization,
+        // the immutable staged artifact, and TLS verification. Classified as
+        // a non-security identity hash in openshell-crypto/README.md.
         digest: format!("sha256:{:x}", Sha256::digest(&normalized_pem)),
         normalized_pem,
         certificate_count,

@@ -701,6 +701,11 @@ fn initialize_additional_ca_snapshot(config: &mut VmDriverConfig) -> Result<(), 
             }
             let expected_digest = normalized_additional_ca_digest(expected_digest)?;
             let pem = read_gateway_additional_ca_artifact(path)?;
+            // Deterministic destination-trust generation label, not an
+            // authenticity proof: the equality check below only detects
+            // staged-artifact drift; trust comes from the gateway's
+            // normalization and TLS verification. Classified as a non-security
+            // identity hash in openshell-crypto/README.md.
             let actual_digest = format!("sha256:{:x}", Sha256::digest(&pem));
             if actual_digest != expected_digest {
                 return Err(format!(

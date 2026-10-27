@@ -551,12 +551,13 @@ immutable, content-addressed ConfigMap in the target sandbox namespace. Its
 name binds the effective gateway identity and normalized trust digest. The
 managed ConfigMap must have `openshell.ai/managed-by=openshell`, the matching
 `openshell.ai/gateway-id` label, and an
-`openshell.ai/network-supervisor-trust-generation` annotation. Different trust
+`openshell.ai/additional-ca-generation` annotation. Different trust
 generations intentionally coexist so running sandboxes retain their startup
-trust. The pod receives that expected digest as a protected supervisor argument.
-Both the sidecar `network-init` boundary and the long-running network supervisor
-canonicalize the read-only mounted PEM and fail before network setup if its
-digest differs, closing deletion/recreation races after the driver's API check.
+trust. The supervisor Pod mounts the ConfigMap read-only at
+`/etc/openshell/tls/additional/ca-bundle.pem` and receives
+`--additional-ca-bundle` for that path; the immutable flag plus the driver's
+per-creation digest and exact-byte validation close deletion/recreation races
+after the API check.
 
 Kubernetes RBAC cannot restrict `create` by `resourceNames` or restrict `get`
 by a name prefix. When this feature is enabled, the chart grants the gateway
