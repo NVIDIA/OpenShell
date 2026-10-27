@@ -11,7 +11,7 @@
 
 use std::fmt;
 use std::path::Path;
-use std::process::{ExitStatus, Output};
+use std::process::{ExitCode, ExitStatus, Output};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -21,6 +21,8 @@ use tmachine::config::Config;
 use crate::bundle::{Bundle, PROFILE, READY_BINARY};
 
 const GUEST_DIR: &str = "/var/tmp/openshell-tests";
+/// The nextest log's name, in the guest directory and in the results.
+const NEXTEST_LOG: &str = "nextest.log";
 /// How long the gateway has to become healthy after the environment is up.
 // Matches the installers' own wait: an HA k3s gateway booted from a cached
 // disk can take minutes to report healthy.
@@ -40,6 +42,12 @@ const NEXTEST_NO_TESTS_RUN: i32 = 4;
 /// ends its output with a summary that names the failed tests.
 const LOG_TAIL_LINES: usize = 40;
 
+/// The runner's exit code when a test failed.
+const TEST_FAILED_EXIT: u8 = 1;
+/// The runner's exit code when the run could not complete. clap also exits
+/// with 2 on a usage error.
+pub const ERROR_EXIT: u8 = 2;
+
 /// How a run ended.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Status {
@@ -53,6 +61,16 @@ pub enum Status {
 impl Status {
     pub const fn is_failure(&self) -> bool {
         !matches!(self, Self::Passed)
+    }
+
+    /// The runner's exit code: 1 when a test failed and 2 when the run could
+    /// not complete, so CI can tell a test failure from a broken environment.
+    pub fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::Passed => ExitCode::SUCCESS,
+            Self::Failed => ExitCode::from(TEST_FAILED_EXIT),
+            Self::Error(_) => ExitCode::from(ERROR_EXIT),
+        }
     }
 
     /// The status of a nextest run that exited with `status`. nextest fails
@@ -117,10 +135,14 @@ pub async fn run(config: &Config, run: &Run<'_>) -> Status {
         Ok(status) => status,
         Err(error) => Status::Error(format!("{error:#}")),
     };
-    if status.is_failure()
-        && let Err(error) = collect_diagnostics(&session, &run.results.join("diagnostics")).await
-    {
-        eprintln!("==> {label}: collecting diagnostics failed: {error:#}");
+    if let Err(error) = collect_results(&session, run.results).await {
+        eprintln!("==> {label}: collecting test results failed: {error:#}");
+    }
+    if status.is_failure() {
+        print_log_tail(&run.results.join(NEXTEST_LOG));
+        if let Err(error) = collect_diagnostics(&session, &run.results.join("diagnostics")).await {
+            eprintln!("==> {label}: collecting diagnostics failed: {error:#}");
+        }
     }
 
     if run.keep {
@@ -175,7 +197,7 @@ async fn provision(config: &Config, environment: &str, installer: &str) -> Resul
 /// can't pass for this one's.
 fn prepare_results(results: &Path) -> Result<()> {
     std::fs::create_dir_all(results).with_context(|| format!("create {}", results.display()))?;
-    for stale in ["junit.xml", "nextest.log"] {
+    for stale in ["junit.xml", NEXTEST_LOG] {
         let path = results.join(stale);
         if path.exists() {
             std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
@@ -190,8 +212,6 @@ fn prepare_results(results: &Path) -> Result<()> {
 }
 
 async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
-    let results = run.results;
-
     let openshell_bin = checked(
         "find the installed openshell CLI",
         session.exec(&["sh", "-c", "command -v openshell"]).await?,
@@ -268,33 +288,62 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
     if let Some(filter) = run.filter {
         nextest.extend(["-E", filter]);
     }
-    let output = session.exec_timeout(&nextest, RUN_TIMEOUT).await?;
-    let mut log = output.stdout.clone();
-    log.extend_from_slice(&output.stderr);
-    let log_path = results.join("nextest.log");
-    std::fs::write(&log_path, &log)?;
+    // nextest writes its output to a file in the guest, so a run that times
+    // out or loses SSH still leaves a log for `collect_results`.
+    let log = format!("{guest}/{NEXTEST_LOG}");
+    let mut command = vec!["sh", "-c", r#"exec "$@" >"$0" 2>&1"#, &log];
+    command.extend(nextest);
+    let output = session.exec_timeout(&command, RUN_TIMEOUT).await?;
+    Ok(Status::of_nextest(
+        output.status,
+        &run.results.join(NEXTEST_LOG),
+    ))
+}
 
-    // The JUnit report is uploaded with the results; the status comes from
-    // nextest's exit code.
-    let found = checked(
-        "find JUnit report",
-        session.exec(&["find", guest, "-name", "junit.xml"]).await?,
-    )?;
-    match found.lines().next() {
-        Some(path) => session.copy_out(path, &results.join("junit.xml")).await?,
-        None => eprintln!("==> nextest wrote no JUnit report"),
-    }
-
-    let status = Status::of_nextest(output.status, &log_path);
-    if status.is_failure() {
-        let log = String::from_utf8_lossy(&log);
-        let lines: Vec<_> = log.lines().collect();
-        eprintln!("==> the end of {}:", log_path.display());
-        for line in &lines[lines.len().saturating_sub(LOG_TAIL_LINES)..] {
-            eprintln!("{line}");
+/// Copy the nextest log and the JUnit report out of the guest, whether or not
+/// the run finished. Either may be missing, for example when the gateway never
+/// became ready.
+async fn collect_results(session: &Session, results: &Path) -> Result<()> {
+    let found = session
+        .exec(&[
+            "find",
+            GUEST_DIR,
+            "-type",
+            "f",
+            "(",
+            "-name",
+            NEXTEST_LOG,
+            "-o",
+            "-name",
+            "junit.xml",
+            ")",
+        ])
+        .await?;
+    let mut copied = Vec::new();
+    for path in String::from_utf8_lossy(&found.stdout).lines() {
+        let Some(name) = Path::new(path).file_name() else {
+            continue;
+        };
+        if !copied.contains(&name) {
+            session.copy_out(path, &results.join(name)).await?;
+            copied.push(name);
         }
     }
-    Ok(status)
+    Ok(())
+}
+
+/// Print the end of the nextest log, which names the failed tests, or the
+/// test that was running when the run stopped.
+fn print_log_tail(log: &Path) {
+    let Ok(contents) = std::fs::read(log) else {
+        return;
+    };
+    let contents = String::from_utf8_lossy(&contents);
+    let lines: Vec<_> = contents.lines().collect();
+    eprintln!("==> the end of {}:", log.display());
+    for line in &lines[lines.len().saturating_sub(LOG_TAIL_LINES)..] {
+        eprintln!("{line}");
+    }
 }
 
 /// Write the OpenShell gateway's journal to `dir/gateway.log`.
@@ -345,5 +394,15 @@ mod tests {
             Status::Error("no test ran; see log".to_string())
         );
         assert!(matches!(status(1), Status::Error(_)));
+    }
+
+    #[test]
+    fn exit_code_separates_test_failures_from_errors() {
+        assert_eq!(Status::Passed.exit_code(), ExitCode::SUCCESS);
+        assert_eq!(Status::Failed.exit_code(), ExitCode::from(1));
+        assert_eq!(
+            Status::Error("broken".to_string()).exit_code(),
+            ExitCode::from(2)
+        );
     }
 }

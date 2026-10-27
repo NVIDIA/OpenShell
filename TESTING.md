@@ -210,9 +210,11 @@ nix run .#openshell-test-runner -- \
 It needs KVM, and tmachine only boots guests of the host's architecture. The
 runner points the tests at the installed CLI and the gateway the installer
 registered (`--gateway`, default `openshell`). A run passes if nextest
-succeeds; nextest fails a run with no tests. The runner writes `junit.xml`,
-`nextest.log` and, after a failure, the guest's diagnostics to
-`artifacts/test-results/` (`--results`).
+succeeds; nextest fails a run with no tests. The runner exits with 1 when a
+test failed and 2 when the run could not complete, for example because the
+environment didn't come up. It writes `junit.xml`, `nextest.log` and, after a
+failure, the guest's diagnostics to `artifacts/test-results/` (`--results`),
+even when the run timed out.
 
 `--filter <filterset>` narrows the tests with a nextest filterset, and
 `--keep` leaves the VM running until you press Enter. Two runs on one host
@@ -225,8 +227,8 @@ out of every environment until it's fixed.
 
 **CI.** `.github/workflows/e2e-suites.yml` lists the environments and suites as
 an explicit matrix and runs the runner once per row. Branch E2E calls it when
-the `test:e2e` label is set. It is advisory, so a failure doesn't block
-merging. To run a suite in another environment on CI, add a row.
+the `test:e2e` label is set, and a failure fails the Core E2E result. To run
+a suite in another environment on CI, add a row.
 
 ### Python E2E (`e2e/python/`)
 

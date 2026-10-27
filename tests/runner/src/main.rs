@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 
-use crate::execute::Run;
+use crate::execute::{Run, Status};
 
 mod bundle;
 mod execute;
@@ -63,7 +63,8 @@ async fn main() -> ExitCode {
         Ok(Ok(code)) => code,
         Ok(Err(error)) => {
             eprintln!("error: {error:#}");
-            ExitCode::FAILURE
+            annotate("E2E suites: runner error", &format!("{error:#}"));
+            ExitCode::from(execute::ERROR_EXIT)
         }
     }
 }
@@ -114,16 +115,27 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     )
     .await;
 
-    eprintln!(
-        "\n{} / {} / {}: {status}",
-        cli.environment, cli.installer, cli.family
-    );
+    let label = format!("{} / {} / {}", cli.environment, cli.installer, cli.family);
+    eprintln!("\n{label}: {status}");
     eprintln!("Results: {}", results.display());
-    Ok(if status.is_failure() {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
+    match &status {
+        Status::Passed => {}
+        Status::Failed => annotate("E2E suites: test failure", &format!("{label}: {status}")),
+        Status::Error(_) => annotate("E2E suites: runner error", &format!("{label}: {status}")),
+    }
+    Ok(status.exit_code())
+}
+
+/// On GitHub Actions, show `message` as an error on the run's summary page.
+fn annotate(title: &str, message: &str) {
+    if std::env::var_os("GITHUB_ACTIONS").is_none() {
+        return;
+    }
+    let message = message
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A");
+    println!("::error title={title}::{message}");
 }
 
 /// Load the tmachine configuration and enter `tests/tmachine/`, which its
