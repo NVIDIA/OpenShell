@@ -25,10 +25,9 @@ pub const COMPUTE_ISOLATION_BACKEND: &str = "openshell.compute.isolation-backend
 /// Driver implements `SuspendSandbox` and resuming through `StartSandbox`.
 pub const COMPUTE_SUSPEND_RESUME: &str = "openshell.compute.suspend-resume";
 
-/// Optional stopped-state image updates retaining the resource and its storage.
+/// Optional stopped-state workload configuration updates retaining the resource and storage.
 pub const COMPUTE_UPDATE_SANDBOX_CONFIGURATION: &str =
     "openshell.compute.update-sandbox-configuration";
-pub const COMPUTE_UPDATE_SANDBOX_IMAGE: &str = "openshell.compute.update-sandbox-image";
 
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
@@ -133,7 +132,6 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
     if family == ExtensionFamily::Compute {
         supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
         supported_capabilities.push(COMPUTE_ISOLATION_BACKEND.to_string());
-        supported_capabilities.push(COMPUTE_UPDATE_SANDBOX_IMAGE.to_string());
         supported_capabilities.push(COMPUTE_UPDATE_SANDBOX_CONFIGURATION.to_string());
     }
     PeerMetadata {
@@ -419,7 +417,7 @@ mod tests {
             gateway
                 .supported_capabilities
                 .iter()
-                .any(|c| c == COMPUTE_UPDATE_SANDBOX_IMAGE)
+                .any(|c| c == COMPUTE_UPDATE_SANDBOX_CONFIGURATION)
         );
     }
 

@@ -180,7 +180,7 @@ mod tests {
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
         "be99bb3fcc7894eb85d774f54b642173e70dd37bc8e5fcaf3fdff2454ae689e1";
     const DURABLE_SCHEMA_SHA256: &str =
-        "a20f41356b6cee4b543091c3533b0d4fd409d040fcfb2e17ecf1b6c4a3460794";
+        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -652,7 +652,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            109 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            108 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()

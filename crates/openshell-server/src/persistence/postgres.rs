@@ -20,22 +20,13 @@ use openshell_core::SetResourceVersion;
 use openshell_core::proto::Sandbox;
 use prost::Message;
 use sqlx::pool::PoolConnection;
-use sqlx::postgres::{PgConnection, PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, PgPool, Postgres, QueryBuilder, Row};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
-
-/// A protocol capability, not an exact build version or an authorization
-/// credential. Identify every pool connection, including after reconnect.
-async fn identify_image_update_writer(connection: &mut PgConnection) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT set_config('application_name', 'openshell-image-update-v2', false)")
-        .execute(connection)
-        .await?;
-    Ok(())
-}
 
 #[cfg(test)]
 pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
@@ -313,7 +304,6 @@ impl PostgresStore {
         );
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
-            .after_connect(|connection, _| Box::pin(identify_image_update_writer(connection)))
             .connect(url)
             .await
             .map_err(|e| map_db_error(&e))?;
@@ -330,7 +320,6 @@ impl PostgresStore {
                         .bind(MUTATION_LOCK_TIMEOUT_SETTING)
                         .execute(&mut *connection)
                         .await?;
-                    identify_image_update_writer(connection).await?;
                     Ok(())
                 })
             })

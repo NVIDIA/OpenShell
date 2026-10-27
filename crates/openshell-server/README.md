@@ -129,22 +129,32 @@ member identity is asserted by its hello rather than bound to its Pod.
 `ComputeDriverInstance` retains its existing variants. Existing compiled drivers
 and factories need no new trait implementation or registration method.
 
-A supporting factory overrides `ComputeDriverFactory::build_with_image_updates`
-to return its ordinary instance plus a separately registered image updater. The
-default calls the existing `build` method and returns no updater. The gateway
-requires both this opt-in and the negotiated capability before recording image
-intent. Remote drivers register the separate `ComputeDriverImageUpdates` service
-on their existing endpoint instead.
+A supporting factory overrides `ComputeDriverFactory::build_with_configuration_updates`
+to return its ordinary instance plus a separately registered updater. The default
+calls `build` and returns no updater. External drivers serve
+`ComputeDriverConfigurationUpdates` on their existing endpoint. Workload updates
+require `openshell.compute.update-sandbox-configuration` for image, command, or
+environment changes. Metadata-only replacements use one database CAS and update
+the label index without invoking a driver.
 
-Command, environment, label, and annotation selections use the same stopped-only
-transaction and durable interlock. Extended requests require the separate
-configuration-update driver capability and RPC; unsupported combinations fail
-before admission. User metadata replacement preserves system domains, and labels
-are indexed in the same SQL transaction as the payload. The existing activation
-flag now requires deployment protocol 2. Old private image-only intents remain
-readable, and completion verifies the selected workload targets and labels before
-clearing the fence. Annotation replacement commits at acceptance; completion
-preserves later annotation writes accepted through `UpdateConfig`.
+New updates require operator activation and compatible gateway membership.
+Accepted updates recover from private durable intent at startup and in periodic
+reconciliation, including when activation is subsequently disabled. An authorized
+`UpdateSandbox` with no selected fields and the current resource version resumes
+the stored intent without reconstructing its selections. Completion retains the
+exact operation receipt for idempotent completion across replicas; a newer update
+invalidates it. Ambiguous results retain the baseline provisioning interlock.
+Explicit deletion can supersede a pending update: the driver only patches the
+original immutable resource and never creates a replacement. The Deleting CAS
+prevents delayed completion, and successful deletion reclaims private intent.
+
+Metadata replacement preserves gateway-owned keys, including retention, while
+other user keys under OpenShell domains remain editable. Completion preserves
+later annotation merges accepted through `UpdateConfig`.
+
+A provisioning timeout can be repaired by Stop after its original driver work
+settles and cleanup completes. Stop exposes Stopped without discarding the timeout
+diagnosis or storage. This lifecycle behavior also applies when updates are disabled.
 
 ## Operator credential export
 

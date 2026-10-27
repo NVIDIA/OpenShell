@@ -74,20 +74,9 @@ service ComputeDriver {
   rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
 }
 
-// Optional image-update extension, served on the same endpoint as ComputeDriver.
-// Keeping this separate preserves the baseline generated server trait for
-// independently versioned external drivers. Drivers advertise
-// openshell.compute.update-sandbox-image only when they serve this service;
-// gateways must negotiate that capability before calling it.
-service ComputeDriverImageUpdates {
-  // Idempotently replace only the workload image of a stopped sandbox, retaining
-  // its stable resource and storage. Unsupported drivers omit this service and
-  // return UNIMPLEMENTED without changing any resource.
-  rpc UpdateSandboxImage(UpdateSandboxImageRequest)
-      returns (UpdateSandboxImageResponse);
-}
-
-// Optional extension; never send configuration changes through the image-only RPC.
+// Optional stopped-sandbox configuration update extension on the same endpoint.
+// Baseline generated driver traits remain unchanged. Negotiate
+// openshell.compute.update-sandbox-configuration before calling this service.
 service ComputeDriverConfigurationUpdates {
   rpc UpdateSandboxConfiguration(UpdateSandboxConfigurationRequest)
       returns (UpdateSandboxConfigurationResponse);
@@ -95,7 +84,7 @@ service ComputeDriverConfigurationUpdates {
 
 message UpdateSandboxConfigurationRequest {
   // Shared lifecycle, image, revision and runtime identity preconditions.
-  UpdateSandboxImageRequest image_update = 1;
+  SandboxUpdatePreconditions preconditions = 1;
   // Absent leaves the command unchanged; empty restores the default shell.
   SandboxMainProcessUpdate main_process = 2;
   // Effective user environment after template inheritance. Presence replaces it.
@@ -481,7 +470,7 @@ message CreateSandboxResponse {
   string runtime_identity = 1;
 }
 
-message UpdateSandboxImageRequest {
+message SandboxUpdatePreconditions {
   string sandbox_id = 1;
   string name = 2;
   string image = 3;
@@ -500,7 +489,6 @@ message UpdateSandboxImageRequest {
   uint64 revision = 8;
 }
 
-message UpdateSandboxImageResponse {}
 
 message StopSandboxRequest {
   // Stable sandbox ID stored by the gateway.

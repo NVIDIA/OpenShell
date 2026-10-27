@@ -13,7 +13,7 @@ use crate::test_support::FakeComputeDriver;
 use crate::{
     ComputeDriverBuildContext, ComputeDriverFactory, ComputeDriverInstance,
     ComputeDriverRegistration, ComputeDriverRegistry, DriverWatchStream, SharedComputeDriver,
-    SharedComputeDriverImageUpdates,
+    SharedComputeDriverConfigurationUpdates,
 };
 
 // Written using only the baseline generated trait, not the new optional trait.
@@ -53,12 +53,12 @@ impl ComputeDriverFactory for OptInFactory {
         Ok(ComputeDriverInstance::InProcess(self.driver.clone()))
     }
 
-    async fn build_with_image_updates(
+    async fn build_with_configuration_updates(
         &self,
         _context: ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<(
         ComputeDriverInstance,
-        Option<SharedComputeDriverImageUpdates>,
+        Option<SharedComputeDriverConfigurationUpdates>,
     )> {
         self.opt_in_calls.fetch_add(1, Ordering::SeqCst);
         Ok((
@@ -79,11 +79,33 @@ async fn registered_runtime(factory: impl ComputeDriverFactory + 'static) -> cra
     let startup = crate::compute::driver_config::DriverStartupContext {
         file: None,
         guest_tls: None,
+        network_trust: None,
+        network_trust_configured: false,
         gateway_port: 8080,
         gateway_tls_enabled: false,
         endpoint_overrides: &overrides,
     };
     let store = Arc::new(crate::persistence::test_store().await);
+    crate::ensure_default_workspace(&store).await.unwrap();
+    let mut sandbox = openshell_core::proto::Sandbox {
+        metadata: Some(openshell_core::proto::ObjectMeta {
+            id: "fixture-sandbox".into(),
+            name: "fixture-sandbox".into(),
+            workspace: "default".into(),
+            ..Default::default()
+        }),
+        spec: Some(openshell_core::proto::SandboxSpec {
+            template: Some(openshell_core::proto::SandboxTemplate {
+                image: "example/workload:v1".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    sandbox.set_phase(openshell_core::proto::SandboxPhase::Stopped as i32);
+    store.put_message(&sandbox).await.unwrap();
+
     crate::build_compute_runtime(
         &registry,
         &selection,
@@ -120,7 +142,7 @@ async fn baseline_factory_and_trait_object_still_build_without_opt_in() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         runtime
-            .update_sandbox_image("not-created", "example/workload:v2".into(), 1)
+            .update_sandbox_image("fixture-sandbox", "example/workload:v2".into(), 1)
             .await
             .unwrap_err()
             .code(),
@@ -139,7 +161,7 @@ async fn capability_alone_does_not_register_an_in_process_image_updater() {
     driver.clear_calls();
     assert_eq!(
         runtime
-            .update_sandbox_image("not-created", "example/workload:v2".into(), 1)
+            .update_sandbox_image("fixture-sandbox", "example/workload:v2".into(), 1)
             .await
             .unwrap_err()
             .code(),
@@ -160,13 +182,12 @@ async fn registered_opt_in_hook_supplies_the_optional_updater() {
     .await;
     assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
     assert_eq!(opt_in_calls.load(Ordering::SeqCst), 1);
-    // Passing capability/registration admission reaches the sandbox lookup.
+    let updated = runtime
+        .update_sandbox_image("fixture-sandbox", "example/workload:v2".into(), 1)
+        .await
+        .unwrap();
     assert_eq!(
-        runtime
-            .update_sandbox_image("not-created", "example/workload:v2".into(), 1)
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::NotFound
+        updated.spec.unwrap().template.unwrap().image,
+        "example/workload:v2"
     );
 }

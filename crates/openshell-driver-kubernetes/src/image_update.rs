@@ -13,7 +13,7 @@ use super::{
 use k8s_openapi::api::core::v1::Pod;
 use kube::Api;
 use kube::api::{DynamicObject, ListParams, Patch, PatchParams};
-use openshell_core::proto::compute::v1::UpdateSandboxImageRequest;
+use openshell_core::proto::compute::v1::SandboxUpdatePreconditions;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -28,8 +28,6 @@ struct ImageUpdateRecord {
     expected_image: String,
     image: String,
     revision: u64,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    configuration: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     command_updated: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -50,19 +48,26 @@ impl KubernetesComputeDriver {
             sandbox.id = %request.sandbox_id,
         )
     )]
+    #[cfg(test)]
     pub async fn update_sandbox_image(
         &self,
-        request: &UpdateSandboxImageRequest,
+        request: &SandboxUpdatePreconditions,
     ) -> Result<(), KubernetesDriverError> {
-        self.update_workload(request, None).await
+        self.update_sandbox_configuration(
+            &openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest {
+                preconditions: Some(request.clone()),
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     pub async fn update_sandbox_configuration(
         &self,
         request: &openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest,
     ) -> Result<(), KubernetesDriverError> {
-        let image = request.image_update.as_ref().ok_or_else(|| {
-            KubernetesDriverError::InvalidArgument("image_update is required".into())
+        let image = request.preconditions.as_ref().ok_or_else(|| {
+            KubernetesDriverError::InvalidArgument("preconditions are required".into())
         })?;
         validate_configuration(request)?;
         self.update_workload(image, Some(request)).await
@@ -70,7 +75,7 @@ impl KubernetesComputeDriver {
 
     async fn update_workload(
         &self,
-        request: &UpdateSandboxImageRequest,
+        request: &SandboxUpdatePreconditions,
         configuration: Option<
             &openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest,
         >,
@@ -98,7 +103,7 @@ impl KubernetesComputeDriver {
 
     async fn update_sandbox_image_inner(
         &self,
-        request: &UpdateSandboxImageRequest,
+        request: &SandboxUpdatePreconditions,
         configuration: Option<
             &openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest,
         >,
@@ -262,7 +267,7 @@ impl KubernetesComputeDriver {
 }
 
 fn validate_image_update_request(
-    request: &UpdateSandboxImageRequest,
+    request: &SandboxUpdatePreconditions,
 ) -> Result<(), KubernetesDriverError> {
     for (field, value) in [
         ("sandbox_id", request.sandbox_id.as_str()),
@@ -370,7 +375,7 @@ fn require_stopped_for_image_update(
 /// Apply the image-only mutation in memory; return true for an exact retry.
 fn prepare_update(
     object: &mut DynamicObject,
-    request: &UpdateSandboxImageRequest,
+    request: &SandboxUpdatePreconditions,
     configuration: Option<&openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
 ) -> Result<bool, KubernetesDriverError> {
     let evidence = object
@@ -388,7 +393,6 @@ fn prepare_update(
         expected_image: request.expected_image.clone(),
         image: request.image.clone(),
         revision: request.revision,
-        configuration: configuration.is_some(),
         command_updated: configuration.is_some_and(|value| value.main_process.is_some()),
         environment_updated: configuration.is_some_and(|value| value.environment.is_some()),
     };

@@ -1389,7 +1389,7 @@ async fn terminate_signal() {
 
 pub use compute::{
     AcquiredRemoteDriverEndpoint, DriverWatchStream, ManagedDriverProcess, SharedComputeDriver,
-    SharedComputeDriverImageUpdates,
+    SharedComputeDriverConfigurationUpdates,
 };
 
 /// Driver instance returned by a compiled compute-driver factory.
@@ -1469,16 +1469,16 @@ pub trait ComputeDriverFactory: Send + Sync {
     /// Build with a separately registered, optional in-process image updater.
     ///
     /// Existing factories only implement `build`; their baseline driver object
-    /// remains sufficient and this hook defaults to no image-update support.
+    /// remains sufficient and this hook defaults to no configuration-update support.
     /// Supporting factories return the same driver instance in both slots and
-    /// advertise the negotiated image-update capability. Remote drivers expose
+    /// advertise the negotiated configuration-update capability. Remote drivers expose
     /// their extension over the existing endpoint instead of using this hook.
-    async fn build_with_image_updates(
+    async fn build_with_configuration_updates(
         &self,
         context: ComputeDriverBuildContext<'_>,
     ) -> Result<(
         ComputeDriverInstance,
-        Option<SharedComputeDriverImageUpdates>,
+        Option<SharedComputeDriverConfigurationUpdates>,
     )> {
         self.build(context).await.map(|instance| (instance, None))
     }
@@ -1934,7 +1934,7 @@ async fn build_compute_runtime(
             };
             let (instance, image_updates) = registration
                 .factory
-                .build_with_image_updates(build_context)
+                .build_with_configuration_updates(build_context)
                 .await?;
             let supervisor_host = shared_supervision
                 .into_inner()

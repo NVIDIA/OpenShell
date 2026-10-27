@@ -156,6 +156,7 @@ fn project_begin(
         revision: 0,
         pending: None,
         previous_provisioning: None,
+        completed: None,
     });
     if state.revision != expected_revision || state.pending.is_some() {
         return Err(conflict(Some(current_version)));
@@ -194,6 +195,7 @@ fn project_begin(
     );
     state.revision = next_revision;
     state.pending = Some(intent.clone());
+    state.completed = None;
     state.previous_provisioning = previous_provisioning;
     let status = sandbox
         .status
@@ -222,9 +224,17 @@ fn project_complete(
     intent: &StoredSandboxImageUpdate,
 ) -> PersistenceResult<(Sandbox, StoredSandboxImageState)> {
     let current_version = resource_version(&sandbox);
-    require_stopped(&sandbox)?;
     validate_intent(intent)?;
     let mut state = state.ok_or_else(|| conflict(Some(current_version)))?;
+    // The exact receipt proves completion even if a subsequent Start changed
+    // the phase. A newer update clears this receipt, preventing ABA matches.
+    if state.pending.is_none()
+        && state.revision == intent.revision
+        && state.completed.as_ref() == Some(intent)
+    {
+        return Ok((sandbox, state));
+    }
+    require_stopped(&sandbox)?;
     if state.revision != intent.revision || state.pending.as_ref() != Some(intent) {
         return Err(conflict(Some(current_version)));
     }
@@ -287,6 +297,7 @@ fn project_complete(
     }
     state.previous_provisioning = None;
     state.pending = None;
+    state.completed = Some(intent.clone());
     // Completing an intent invalidates any Start CAS based on pending state.
     bump_resource_version(&mut sandbox)?;
     Ok((sandbox, state))
@@ -370,6 +381,10 @@ impl Store {
         let state = tx.lock_state(sandbox_id).await?;
         let previous_version = resource_version(&sandbox);
         let (sandbox, state) = project_complete(sandbox, state, intent)?;
+        if resource_version(&sandbox) == previous_version {
+            tx.commit().await?;
+            return Ok(sandbox);
+        }
         tx.write_projection(sandbox_id, previous_version, &sandbox, &state)
             .await?;
         tx.commit().await?;
@@ -603,6 +618,27 @@ mod tests {
             .as_ref()
             .unwrap()
             .image
+    }
+
+    #[test]
+    fn exact_completion_is_idempotent_but_another_operation_is_not() {
+        let (accepted, state) = project_begin(sandbox(), None, 5, 0, &intent()).unwrap();
+        let (completed, receipt) = project_complete(accepted, Some(state), &intent()).unwrap();
+        assert_eq!(
+            project_complete(completed.clone(), Some(receipt.clone()), &intent()).unwrap(),
+            (completed.clone(), receipt.clone())
+        );
+        let mut other = intent();
+        other.operation_id = "another-operation".into();
+        assert!(project_complete(completed.clone(), Some(receipt.clone()), &other).is_err());
+        let mut started = completed;
+        started.set_phase(SandboxPhase::Starting as i32);
+        assert_eq!(
+            project_complete(started.clone(), Some(receipt), &intent())
+                .unwrap()
+                .0,
+            started
+        );
     }
 
     #[test]
@@ -1068,12 +1104,14 @@ mod tests {
                 .await,
             Err(PersistenceError::Conflict { .. })
         ));
-        // Neither a completed operation nor an older generation can be replayed.
-        assert!(
+        // Concurrent completion of the same intent returns the current object
+        // without a second version bump. A newer generation invalidates it.
+        assert_eq!(
             store
                 .complete_sandbox_image_update("sandbox-id", &intent())
                 .await
-                .is_err()
+                .unwrap(),
+            completed
         );
         let next = StoredSandboxImageUpdate {
             operation_id: "next-operation".into(),
@@ -1418,6 +1456,15 @@ updated_at_ms = $3 WHERE object_type = 'sandbox' AND id = $1 AND resource_versio
             resource_version(&rewritten) + 1
         );
         assert!(completed.status.as_ref().unwrap().provisioning.is_none());
+        // A second replica finishing the same reconciliation gets the current
+        // object without a conflict or a second resource-version increment.
+        assert_eq!(
+            second
+                .complete_sandbox_image_update("sandbox-id", &winning_intent)
+                .await
+                .unwrap(),
+            completed
+        );
         let retained = second
             .get_sandbox_image_state("sandbox-id")
             .await

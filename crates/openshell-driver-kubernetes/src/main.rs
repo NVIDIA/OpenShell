@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use tracing::info;
 
 use openshell_core::VERSION;
-use openshell_core::proto::compute::v1::compute_driver_image_updates_server::ComputeDriverImageUpdatesServer;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
     ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
@@ -343,7 +342,6 @@ async fn main() -> Result<()> {
 
     let driver_service = ComputeDriverService::new(driver);
     let configuration_updates_service = openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdatesServer::new(driver_service.clone());
-    let image_updates_service = ComputeDriverImageUpdatesServer::new(driver_service.clone());
     let service = ComputeDriverServer::new(driver_service);
     let shutdown = async move {
         shutdown_signal().await;
@@ -358,7 +356,6 @@ async fn main() -> Result<()> {
         tonic::transport::Server::builder()
             .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
-            .add_service(image_updates_service)
             .add_service(configuration_updates_service)
             .serve_with_incoming_shutdown(
                 openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
@@ -371,7 +368,6 @@ async fn main() -> Result<()> {
         tonic::transport::Server::builder()
             .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
-            .add_service(image_updates_service)
             .add_service(configuration_updates_service)
             .serve_with_shutdown(args.bind_address, shutdown)
             .await

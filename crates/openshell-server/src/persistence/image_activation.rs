@@ -10,15 +10,9 @@
 //! old-understood pending-operation interlock, not these observations, protects
 //! an accepted image mutation from a subsequent legacy Start.
 
-use super::{ObjectRecord, PersistenceError, PersistenceResult, Store, map_db_error};
-use crate::gateway_members::MEMBER_TTL;
+use super::{ObjectRecord, PersistenceError, PersistenceResult, Store};
+use crate::gateway_members::{MEMBER_TTL, SANDBOX_UPDATE_PROTOCOL};
 use openshell_core::time::now_ms;
-
-/// Compatibility marker advertised by both gateway `PostgreSQL` connection pools.
-///
-/// This marker describes a protocol, not an exact build version. It is neither
-/// authentication nor a security boundary: database clients can set it too.
-pub(super) const IMAGE_UPDATE_APPLICATION_NAME: &str = "openshell-image-update-v2";
 
 const MEMBER_OBJECT_TYPE: &str = "gateway_member";
 const MEMBER_LIMIT: u32 = 1024;
@@ -29,36 +23,14 @@ impl Store {
     /// The caller separately enforces the default-off operator activation flag.
     /// `SQLite` returns success under its supported single-gateway deployment
     /// contract; this does not enforce process exclusion for a shared file.
-    /// `PostgreSQL` checks every client backend in this database, not merely
-    /// registered peers, and then strictly checks all fresh membership records.
-    /// Administrative clients without the marker also prevent activation. Any
-    /// database read failure propagates rather than granting compatibility.
+    /// `PostgreSQL` checks fresh gateway membership records. Administrative,
+    /// monitoring, and backup sessions are not gateway participants. Operator
+    /// activation attests that unregistered legacy processes have been retired.
+    /// Recovery of accepted operations does not use this admission check.
     pub async fn ensure_image_update_deployment_compatible(&self) -> PersistenceResult<()> {
-        let Self::Postgres(store) = self else {
+        let Self::Postgres(_) = self else {
             return Ok(());
         };
-
-        let incompatible_backend: bool = sqlx::query_scalar(
-            r"
-SELECT EXISTS (
-    SELECT 1 FROM pg_stat_activity
-    WHERE datname = current_database()
-      AND (backend_type = 'client backend' OR backend_type IS NULL)
-      AND application_name IS DISTINCT FROM $1
-)
-",
-        )
-        .bind(IMAGE_UPDATE_APPLICATION_NAME)
-        .fetch_one(&store.pool)
-        .await
-        .map_err(|error| map_db_error(&error))?;
-        if incompatible_backend {
-            return Err(PersistenceError::Config(
-                "sandbox image updates require a uniformly compatible gateway deployment; \
-                 a PostgreSQL client backend has an unknown or legacy image-update protocol"
-                    .into(),
-            ));
-        }
 
         // One extra row distinguishes a complete bounded snapshot from a
         // truncated listing. Never silently treat uninspected rows as compatible.
@@ -93,13 +65,14 @@ fn ensure_live_members_compatible(records: &[ObjectRecord], now: i64) -> Persist
             })?;
         let replica_id = member.get("replica_id").and_then(serde_json::Value::as_str);
         let protocol = member
-            .get("image_update_protocol")
+            .get("sandbox_update_protocol")
             .and_then(serde_json::Value::as_u64);
-        if replica_id.is_none_or(|id| id.trim().is_empty()) || protocol != Some(2) {
-            return Err(PersistenceError::Config(
-                "sandbox image updates require every live gateway membership record to advertise image-update protocol 2 and a nonempty replica id"
-                    .into(),
-            ));
+        if replica_id.is_none_or(|id| id.trim().is_empty())
+            || protocol != Some(u64::from(SANDBOX_UPDATE_PROTOCOL))
+        {
+            return Err(PersistenceError::Config(format!(
+                "sandbox updates require every live gateway membership record to advertise sandbox-update protocol {SANDBOX_UPDATE_PROTOCOL} and a nonempty replica id"
+            )));
         }
     }
     Ok(())
@@ -133,83 +106,40 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a disposable PostgreSQL database and CREATEDB privileges in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
-    async fn postgres_image_activation_checks_client_backends_and_live_members() {
-        use super::super::test_postgres::TEST_POSTGRES_URL_ENV;
-        use super::super::{MutationLockSet, WriteCondition};
-        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-        use std::time::Duration;
-
-        // This check intentionally includes every backend in a database. A
-        // disposable schema would share unmarked test-control/other-test
-        // sessions and make its positive assertions dependent on test order.
-        // Keep the unmarked control pool in the original database instead.
-        let base = std::env::var(TEST_POSTGRES_URL_ENV)
-            .expect("OPENSHELL_TEST_POSTGRES_URL must name a disposable PostgreSQL database");
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&base)
-            .await
-            .expect("connect to the test-control database");
-        let database = format!("image_activation_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-            .execute(&admin)
-            .await
-            .expect("create a dedicated activation-test database (requires CREATEDB)");
-        let mut url = url::Url::parse(&base).expect("parse the test PostgreSQL URL");
-        url.set_path(&format!("/{database}"));
-        let first = Store::connect(url.as_str()).await.unwrap();
-        let second = Store::connect(url.as_str()).await.unwrap();
-
-        // Exercise both data pools and a lazily opened mutation-lock pool.
-        let guard = second
-            .acquire_distributed_mutation_guard(
-                &MutationLockSet::sandbox_lifecycle("activation-test-sandbox"),
-                tokio::time::Instant::now() + Duration::from_secs(10),
-            )
+    #[ignore = "requires OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_activation_ignores_administrative_sessions_and_preserves_application_name() {
+        use super::super::test_postgres::TestSchema;
+        let schema = TestSchema::create("sandbox_update_activation").await;
+        let mut url = url::Url::parse(schema.url()).unwrap();
+        url.query_pairs_mut()
+            .append_pair("application_name", "operator-custom-name");
+        let store = Store::connect(url.as_str()).await.unwrap();
+        let Store::Postgres(pg) = &store else {
+            unreachable!()
+        };
+        let name: String = sqlx::query_scalar("SHOW application_name")
+            .fetch_one(&pg.pool)
             .await
             .unwrap();
-        first
+        assert_eq!(name, "operator-custom-name");
+        // TestSchema's unmarked admin connection remains open in this database.
+        store
             .ensure_image_update_deployment_compatible()
             .await
-            .expect("compatible data and lock pools must pass despite the other database's control pool");
-        drop(guard);
-
-        // No membership record is needed to detect an old or administrative
-        // client. Do not weaken the production filter to exempt this session.
-        let legacy_options = url
-            .as_str()
-            .parse::<PgConnectOptions>()
-            .unwrap()
-            .application_name("legacy-image-activation-test");
-        let legacy = PgPoolOptions::new()
-            .max_connections(1)
-            .connect_with(legacy_options)
+            .unwrap();
+        let index = crate::gateway_members::GatewayMemberIndex::new(
+            std::sync::Arc::new(store.clone()),
+            MEMBER_TTL,
+        );
+        index
+            .register("compatible", "https://gateway:8443")
             .await
             .unwrap();
-        assert!(matches!(
-            first.ensure_image_update_deployment_compatible().await,
-            Err(PersistenceError::Config(_))
-        ));
-        legacy.close().await;
-
-        // SQLx closing its socket can precede the server removing the backend.
-        // Bound this wait instead of depending on a fixed scheduling delay.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match first.ensure_image_update_deployment_compatible().await {
-                    Ok(()) => break,
-                    Err(PersistenceError::Config(_)) => {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                    Err(error) => panic!("compatibility read failed: {error}"),
-                }
-            }
-        })
-        .await
-        .expect("closed legacy backend must disappear from pg_stat_activity");
-
-        let member = first
+        store
+            .ensure_image_update_deployment_compatible()
+            .await
+            .unwrap();
+        store
             .put_if(
                 MEMBER_OBJECT_TYPE,
                 "gateway-member:legacy",
@@ -217,51 +147,23 @@ mod tests {
                 "",
                 br#"{"replica_id":"legacy"}"#,
                 None,
-                WriteCondition::MustCreate,
+                super::super::WriteCondition::MustCreate,
             )
             .await
             .unwrap();
         assert!(matches!(
-            first.ensure_image_update_deployment_compatible().await,
+            store.ensure_image_update_deployment_compatible().await,
             Err(PersistenceError::Config(_))
         ));
-        first
-            .put_if(
-                MEMBER_OBJECT_TYPE,
-                "gateway-member:legacy",
-                "legacy",
-                "",
-                br#"{"replica_id":"legacy","image_update_protocol":2}"#,
-                None,
-                WriteCondition::MatchResourceVersion(member.resource_version),
-            )
-            .await
-            .unwrap();
-        first
-            .ensure_image_update_deployment_compatible()
-            .await
-            .unwrap();
-
-        first.close().await;
-        assert!(matches!(
-            first.ensure_image_update_deployment_compatible().await,
-            Err(PersistenceError::Database(_))
-        ));
-        second.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE {database} WITH (FORCE)"
-        )))
-        .execute(&admin)
-        .await
-        .expect("drop the isolated activation-test database");
-        admin.close().await;
+        store.close().await;
+        schema.drop_schema().await;
     }
 
     #[test]
     fn compatible_live_members_and_empty_snapshot_pass() {
         assert!(ensure_live_members_compatible(&[], 100).is_ok());
         let member = record(
-            br#"{"replica_id":"gw-0","peer_endpoint":"https://gw-0:8443","image_update_protocol":2}"#,
+            br#"{"replica_id":"gw-0","peer_endpoint":"https://gw-0:8443","sandbox_update_protocol":1}"#,
             100,
         );
         assert!(ensure_live_members_compatible(&[member], 100).is_ok());
@@ -275,14 +177,14 @@ mod tests {
             br#"["gw-0",1]"#,
             br"null",
             br#"{"replica_id":"gw-0"}"#,
-            br#"{"replica_id":"gw-0","image_update_protocol":0}"#,
-            br#"{"replica_id":"gw-0","image_update_protocol":1}"#,
-            br#"{"replica_id":"gw-0","image_update_protocol":"1"}"#,
-            br#"{"replica_id":"gw-0","image_update_protocol":true}"#,
-            br#"{"replica_id":"gw-0","image_update_protocol":2.0}"#,
-            br#"{"image_update_protocol":1}"#,
-            br#"{"replica_id":"","image_update_protocol":1}"#,
-            br#"{"replica_id":"  ","image_update_protocol":1}"#,
+            br#"{"replica_id":"gw-0","sandbox_update_protocol":0}"#,
+            br#"{"replica_id":"gw-0","sandbox_update_protocol":2}"#,
+            br#"{"replica_id":"gw-0","sandbox_update_protocol":"1"}"#,
+            br#"{"replica_id":"gw-0","sandbox_update_protocol":true}"#,
+            br#"{"replica_id":"gw-0","sandbox_update_protocol":1.0}"#,
+            br#"{"sandbox_update_protocol":1}"#,
+            br#"{"replica_id":"","sandbox_update_protocol":1}"#,
+            br#"{"replica_id":"  ","sandbox_update_protocol":1}"#,
         ];
         for payload in invalid {
             assert!(ensure_live_members_compatible(&[record(payload, 100)], 100).is_err());
@@ -301,7 +203,7 @@ mod tests {
 
     #[test]
     fn any_incompatible_live_member_rejects_the_snapshot() {
-        let compatible = record(br#"{"replica_id":"gw-0","image_update_protocol":2}"#, 100);
+        let compatible = record(br#"{"replica_id":"gw-0","sandbox_update_protocol":1}"#, 100);
         let legacy = record(br#"{"replica_id":"gw-1"}"#, 100);
         assert!(ensure_live_members_compatible(&[compatible, legacy], 100).is_err());
     }

@@ -223,8 +223,8 @@ fn fixture(
     (driver, state)
 }
 
-fn request() -> UpdateSandboxImageRequest {
-    UpdateSandboxImageRequest {
+fn request() -> SandboxUpdatePreconditions {
+    SandboxUpdatePreconditions {
         sandbox_id: "sandbox-1".into(),
         name: "sandbox-name".into(),
         image: "registry.example/agent:v2".into(),
@@ -273,7 +273,7 @@ async fn image_update_preflight_validates_without_writes_and_apply_rechecks() {
 async fn image_update_capability_is_optional() {
     let (driver, _) = fixture(SANDBOX_VERSION_V1BETA1, false);
     let metadata = driver.capabilities().unwrap().extension.unwrap();
-    let capability = openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_IMAGE;
+    let capability = openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION;
     assert!(
         metadata
             .supported_capabilities
@@ -310,7 +310,6 @@ async fn image_update_preserves_resource_storage_and_operator_bootstrap_annotati
             expected["metadata"]["generation"] = serde_json::json!(8);
             expected["metadata"]["annotations"][IMAGE_UPDATE_ANNOTATION] = serde_json::json!(
                 serde_json::to_string(&ImageUpdateRecord {
-                    configuration: false,
                     command_updated: false,
                     environment_updated: false,
                     operation_id: request().operation_id,
@@ -565,13 +564,18 @@ async fn image_update_conflict_does_not_blindly_retry_or_recreate() {
 
 #[tokio::test]
 async fn image_update_grpc_maps_validation_and_precondition_errors() {
-    use openshell_core::proto::compute::v1::compute_driver_image_updates_server::ComputeDriverImageUpdates;
+    use openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdates;
     let (driver, state) = fixture(SANDBOX_VERSION_V1BETA1, false);
     let service = crate::ComputeDriverService::new(driver);
     let mut invalid = request();
     invalid.image = "https://registry.example/image:v2".into();
     let error = service
-        .update_sandbox_image(tonic::Request::new(invalid))
+        .update_sandbox_configuration(tonic::Request::new(
+            openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest {
+                preconditions: Some(invalid),
+                ..Default::default()
+            },
+        ))
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
@@ -579,7 +583,12 @@ async fn image_update_grpc_maps_validation_and_precondition_errors() {
     let mut conflict = request();
     conflict.expected_image = "other:v1".into();
     let error = service
-        .update_sandbox_image(tonic::Request::new(conflict))
+        .update_sandbox_configuration(tonic::Request::new(
+            openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest {
+                preconditions: Some(conflict),
+                ..Default::default()
+            },
+        ))
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
@@ -681,7 +690,7 @@ async fn configuration_update_atomically_changes_restart_inputs_and_retries_with
         }
         let before = state.lock().unwrap().sandbox.clone();
         let mut update = UpdateSandboxConfigurationRequest {
-            image_update: Some(request()),
+            preconditions: Some(request()),
             main_process: Some(SandboxMainProcessUpdate {
                 command: vec!["/usr/local/bin/start-agent".into(), "--new".into()],
                 ..Default::default()
@@ -693,10 +702,10 @@ async fn configuration_update_atomically_changes_restart_inputs_and_retries_with
                 )]),
             }),
         };
-        update.image_update.as_mut().unwrap().validate_only = true;
+        update.preconditions.as_mut().unwrap().validate_only = true;
         driver.update_sandbox_configuration(&update).await.unwrap();
         assert_eq!(state.lock().unwrap().sandbox, before);
-        update.image_update.as_mut().unwrap().validate_only = false;
+        update.preconditions.as_mut().unwrap().validate_only = false;
         driver.update_sandbox_configuration(&update).await.unwrap();
         {
             let state = state.lock().unwrap();
@@ -710,7 +719,7 @@ async fn configuration_update_atomically_changes_restart_inputs_and_retries_with
                 agent["command"],
                 before["spec"]["podTemplate"]["spec"]["containers"][0]["command"]
             );
-            assert_eq!(agent["image"], update.image_update.as_ref().unwrap().image);
+            assert_eq!(agent["image"], update.preconditions.as_ref().unwrap().image);
             let env = agent["env"].as_array().unwrap();
             assert!(env.iter().any(|entry| entry["name"] == "AGENT_MODE"
                 && entry["value"] == "sensitive-environment-value"));
@@ -756,10 +765,10 @@ async fn configuration_update_atomically_changes_restart_inputs_and_retries_with
             .command
             .push("--different".into());
         assert!(driver.update_sandbox_configuration(&changed).await.is_err());
-        update.image_update.as_mut().unwrap().expected_image =
-            update.image_update.as_ref().unwrap().image.clone();
-        update.image_update.as_mut().unwrap().revision += 1;
-        update.image_update.as_mut().unwrap().operation_id = "clear-configuration".into();
+        update.preconditions.as_mut().unwrap().expected_image =
+            update.preconditions.as_ref().unwrap().image.clone();
+        update.preconditions.as_mut().unwrap().revision += 1;
+        update.preconditions.as_mut().unwrap().operation_id = "clear-configuration".into();
         update.main_process.as_mut().unwrap().command.clear();
         update.environment.as_mut().unwrap().values.clear();
         driver.update_sandbox_configuration(&update).await.unwrap();
@@ -787,7 +796,7 @@ async fn configuration_update_rejects_reserved_environment_without_writes() {
     };
     let (driver, state) = fixture(SANDBOX_VERSION_V1BETA1, false);
     let update = UpdateSandboxConfigurationRequest {
-        image_update: Some(request()),
+        preconditions: Some(request()),
         main_process: None,
         environment: Some(SandboxEnvironmentUpdate {
             values: std::collections::HashMap::from([(

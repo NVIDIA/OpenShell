@@ -13,7 +13,7 @@ message StoredSandboxImageUpdate {
   string previous_image = 2;
   string image = 3;
   uint64 revision = 4;
-  // Absent for legacy image-only operations. Presence retains selection semantics.
+  // Presence retains selection semantics.
   openshell.v1.SandboxCommandUpdate command = 5;
   openshell.v1.SandboxMapUpdate environment = 6;
   openshell.v1.SandboxMapUpdate labels = 7;
@@ -27,4 +27,6 @@ message StoredSandboxImageState {
   // Original presence and attempt identity while the interlock is held.
   // Completion preserves newer diagnostics and clock edits on the live record.
   openshell.v1.SandboxProvisioning previous_provisioning = 4;
+  // Exact last successful intent, for idempotent completion across replicas.
+  StoredSandboxImageUpdate completed = 5;
 }

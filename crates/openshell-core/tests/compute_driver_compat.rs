@@ -13,12 +13,13 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, SuspendSandboxRequest, SuspendSandboxResponse,
-    UpdateSandboxImageRequest, UpdateSandboxImageResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
+    UpdateSandboxConfigurationRequest, UpdateSandboxConfigurationResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
+    WatchSandboxesRequest,
     compute_driver_client::ComputeDriverClient,
-    compute_driver_image_updates_client::ComputeDriverImageUpdatesClient,
-    compute_driver_image_updates_server::{
-        ComputeDriverImageUpdates, ComputeDriverImageUpdatesServer,
+    compute_driver_configuration_updates_client::ComputeDriverConfigurationUpdatesClient,
+    compute_driver_configuration_updates_server::{
+        ComputeDriverConfigurationUpdates, ComputeDriverConfigurationUpdatesServer,
     },
     compute_driver_server::{ComputeDriver, ComputeDriverServer},
 };
@@ -134,17 +135,17 @@ impl ComputeDriver for BaselineDriver {
 
 #[derive(Debug, Clone, Default)]
 struct ImageUpdates {
-    calls: Arc<Mutex<Vec<UpdateSandboxImageRequest>>>,
+    calls: Arc<Mutex<Vec<UpdateSandboxConfigurationRequest>>>,
 }
 
 #[tonic::async_trait]
-impl ComputeDriverImageUpdates for ImageUpdates {
-    async fn update_sandbox_image(
+impl ComputeDriverConfigurationUpdates for ImageUpdates {
+    async fn update_sandbox_configuration(
         &self,
-        request: Request<UpdateSandboxImageRequest>,
-    ) -> Result<Response<UpdateSandboxImageResponse>, Status> {
+        request: Request<UpdateSandboxConfigurationRequest>,
+    ) -> Result<Response<UpdateSandboxConfigurationResponse>, Status> {
         self.calls.lock().unwrap().push(request.into_inner());
-        Ok(Response::new(UpdateSandboxImageResponse {}))
+        Ok(Response::new(UpdateSandboxConfigurationResponse {}))
     }
 }
 
@@ -167,8 +168,8 @@ async fn roundtrip(serve_image_updates: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let extension = ImageUpdates::default();
-    let optional_service =
-        serve_image_updates.then(|| ComputeDriverImageUpdatesServer::new(extension.clone()));
+    let optional_service = serve_image_updates
+        .then(|| ComputeDriverConfigurationUpdatesServer::new(extension.clone()));
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -216,13 +217,18 @@ async fn roundtrip(serve_image_updates: bool) {
             .is_none()
     );
 
-    let request = UpdateSandboxImageRequest {
-        sandbox_id: "sandbox-id".into(),
-        image: "example/workload:v2".into(),
+    let request = UpdateSandboxConfigurationRequest {
+        preconditions: Some(
+            openshell_core::proto::compute::v1::SandboxUpdatePreconditions {
+                sandbox_id: "sandbox-id".into(),
+                image: "example/workload:v2".into(),
+                ..Default::default()
+            },
+        ),
         ..Default::default()
     };
-    let result = ComputeDriverImageUpdatesClient::new(channel)
-        .update_sandbox_image(request.clone())
+    let result = ComputeDriverConfigurationUpdatesClient::new(channel)
+        .update_sandbox_configuration(request.clone())
         .await;
     if serve_image_updates {
         result.unwrap();
@@ -290,11 +296,11 @@ fn baseline_compute_service_methods_are_frozen() {
     let image_updates = compute
         .service
         .iter()
-        .find(|service| service.name.as_deref() == Some("ComputeDriverImageUpdates"))
+        .find(|service| service.name.as_deref() == Some("ComputeDriverConfigurationUpdates"))
         .unwrap();
     assert_eq!(image_updates.method.len(), 1);
     assert_eq!(
         image_updates.method[0].name.as_deref(),
-        Some("UpdateSandboxImage")
+        Some("UpdateSandboxConfiguration")
     );
 }

@@ -634,3 +634,13 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass and BackendTrafficPolicy for Envoy Gateway (`mise run helm:gateway:apply`) |
 | `tasks/scripts/helm-k3s-local.sh` | k3d cluster create/delete/start/stop/status |
 | `tasks/scripts/keycloak-k8s-setup.sh` | Keycloak deploy, realm import, and development TLS trust anchor |
+
+## Sandbox update regression lane
+
+Run `mise run e2e:kubernetes:updates` for the testkit update suite against both
+supported Agent Sandbox APIs with `workspaceResources.enabled=false` and the
+separate workspace chart. It verifies stopped-only updates, retained CR/PVC
+identity and contents, command/environment changes, and request replay.
+`OPENSHELL_E2E_UPDATE_ORIGINAL_IMAGE` and `OPENSHELL_E2E_UPDATE_TARGET_IMAGE` can
+select mirrored Alpine 3.21 and 3.22 manifests. Defaults use the public registry
+cache; keep immutable digests when overriding them.

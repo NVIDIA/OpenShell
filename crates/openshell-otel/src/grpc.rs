@@ -63,8 +63,6 @@ where
 }
 
 pub const COMPUTE_DRIVER_RPC_SERVICE: &str = "openshell.compute.v1.ComputeDriver";
-pub const COMPUTE_DRIVER_IMAGE_UPDATES_RPC_SERVICE: &str =
-    "openshell.compute.v1.ComputeDriverImageUpdates";
 
 /// Low-cardinality semantic-convention identity for a compute-driver RPC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,11 +106,6 @@ pub mod rpc {
         service: "openshell.compute.v1.ComputeDriverConfigurationUpdates",
         method: "UpdateSandboxConfiguration",
         operation: "openshell.compute.v1.ComputeDriverConfigurationUpdates/UpdateSandboxConfiguration",
-    };
-    pub const UPDATE_SANDBOX_IMAGE: ComputeDriverRpc = ComputeDriverRpc {
-        service: super::COMPUTE_DRIVER_IMAGE_UPDATES_RPC_SERVICE,
-        method: "UpdateSandboxImage",
-        operation: "openshell.compute.v1.ComputeDriverImageUpdates/UpdateSandboxImage",
     };
     pub const GET_SANDBOX: ComputeDriverRpc = ComputeDriverRpc::new(
         "GetSandbox",
@@ -207,7 +200,6 @@ pub fn compute_driver_rpc_operation(path: &str) -> Option<ComputeDriverRpc> {
         Some("ValidateSandboxCreate") => Some(rpc::VALIDATE_SANDBOX_CREATE),
         Some("CreateSandbox") => Some(rpc::CREATE_SANDBOX),
         Some("UpdateSandboxConfiguration") => Some(rpc::UPDATE_SANDBOX_CONFIGURATION),
-        Some("UpdateSandboxImage") => Some(rpc::UPDATE_SANDBOX_IMAGE),
         Some("GetSandbox") => Some(rpc::GET_SANDBOX),
         Some("ListSandboxes") => Some(rpc::LIST_SANDBOXES),
         Some("StopSandbox") => Some(rpc::STOP_SANDBOX),
@@ -331,7 +323,7 @@ mod tests {
             rpc::GET_CAPABILITIES,
             rpc::VALIDATE_SANDBOX_CREATE,
             rpc::CREATE_SANDBOX,
-            rpc::UPDATE_SANDBOX_IMAGE,
+            rpc::UPDATE_SANDBOX_CONFIGURATION,
             rpc::GET_SANDBOX,
             rpc::LIST_SANDBOXES,
             rpc::STOP_SANDBOX,

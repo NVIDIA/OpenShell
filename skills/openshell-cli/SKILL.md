@@ -527,6 +527,10 @@ stopped or completed. Starting a retained `Completed` or
 invalidates SSH sessions from the previous runtime generation. Delete remains
 the operation that removes retained state.
 
+Before updating a retained `Completed` or `Error/MainProcessFailed` sandbox,
+run `sandbox stop`. It cleans up compute and transitions to `Stopped`, retaining
+the exit code until the next start.
+
 The sandbox's SSH host identity survives stop/start and runtime restarts.
 API clients can read its public fingerprint from the sandbox resource or
 SSH-session response and pin it to the sandbox ID. Recreating a deleted
@@ -578,21 +582,21 @@ unchanged; supplied lists and maps replace their user-owned values, including
 explicitly empty values. Template environment defaults still apply. System metadata
 is protected; top-level labels and annotations do not update pod metadata.
 Combined configuration changes require the configuration-update driver capability
-and a uniformly upgraded protocol-2 gateway deployment.
+and a uniformly upgraded gateway deployment. Metadata-only updates need no
+driver capability and preserve the retention annotation.
 
 For an image that fails to start and reaches a provisioning timeout, wait for
 cleanup completion and settlement of the original driver operation, then run
 `sandbox stop` to obtain `Stopped` before correcting the image. This retains the
 timeout diagnostic and storage and does not bypass pending cleanup.
 
-An operation-pending error after a failure blocks start, stop, provisioning
-retry, and delete. Image intent and revision are private; the public `SandboxStatus`
-shape is unchanged. Read a fresh version and retry the same selected fields and target values originally
-requested, even if the spec already names it. An optional
-`request_id` with an unresolved admission does not execute again; inspect and
-reconcile state before submitting a new conditional request with a fresh
-version and new ID, or no ID. Never change the payload under the original ID or
-blindly switch IDs after a timeout. See the published
+An operation-pending error blocks start, stop, and provisioning retry. The gateway
+retries automatically even when new updates are disabled. To resume immediately,
+read a fresh resource version and call `UpdateSandbox` with no selected fields;
+the gateway loads the stored targets. Use a new request ID or no ID for this
+explicit resume. An unresolved original ID returns uncertainty, and its payload
+must not change. Explicit delete can reclaim a sandbox whose update cannot
+complete, including its storage. See the published
 [image update workflow](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview#update-the-image-of-a-stopped-sandbox)
 and [API errors](https://docs.nvidia.com/openshell/latest/sdk/api-errors).
 

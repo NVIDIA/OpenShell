@@ -507,8 +507,8 @@ until callers request a fresh URL.
 `[openshell.gateway] enable_sandbox_updates` defaults to `false`. It gates
 the separate `openshell.v1.SandboxUpdates/UpdateSandbox` RPC on the existing
 gateway listener. It gates image, command, environment, label, and annotation
-updates for stopped sandboxes. Protocol 2 requires upgrading all
-gateways, including gateways that previously supported image-only updates.
+updates for stopped sandboxes. Upgrade every gateway before activation.
+Disabling the flag stops new updates; accepted updates still recover automatically.
 The equivalent gateway process flag and environment variable
 are `--enable-sandbox-updates true` and
 `OPENSHELL_ENABLE_SANDBOX_UPDATES=true`.
@@ -518,7 +518,9 @@ Enable it only after completing the
 Setting it to `true` attests that every gateway that can write the database is
 compatible and incompatible gateways cannot return. Keep it false throughout a
 rolling upgrade, including while outstanding operations from retired gateways
-settle. Database and membership checks fail closed but do not prove retirement.
+settle. Gateway membership checks fail closed but do not prove retirement. PostgreSQL
+administrative and monitoring sessions do not block updates; connection
+`application_name` settings are preserved.
 
 For a schema-v2 file, set:
 
@@ -1689,7 +1691,7 @@ compute_driver = "kyma"
 socket_path = "/run/openshell/kyma-compute-driver.sock"
 ```
 
-<h2 id="gateway-config-preflight">Preflight package configuration</h2>
+## Preflight package configuration {#gateway-config-preflight}
 
 Before starting a package-managed gateway, validate the selected file without
 changing it:

@@ -254,6 +254,14 @@ run = [
   "AGENT_SANDBOX_VERSION=v0.4.6 e2e/rust/e2e-kubernetes.sh",
 ]
 
+["e2e:kubernetes:updates"]
+description = "Validate sandbox updates with split workspace RBAC on both Agent Sandbox APIs"
+env = { OPENSHELL_E2E_KUBE_TEST = "kubernetes_image_update", OPENSHELL_E2E_KUBE_SPLIT_WORKSPACE = "1" }
+run = [
+  "e2e/rust/e2e-kubernetes.sh",
+  "AGENT_SANDBOX_VERSION=v0.4.6 e2e/rust/e2e-kubernetes.sh",
+]
+
 ["e2e:kubernetes:isolation"]
 description = "Run Kubernetes e2e with the workload network fence and separate supervisor"
 run = "e2e/rust/e2e-kubernetes.sh"

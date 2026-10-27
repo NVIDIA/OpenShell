@@ -1006,6 +1006,10 @@ command. Starting a fresh instance invalidates SSH sessions issued for the
 previous runtime generation. Delete an inactive sandbox normally when you no
 longer need its retained state.
 
+To change the configuration of a retained `Completed` or `Error/MainProcessFailed`
+sandbox, run `sandbox stop` first. Stop cleans up compute and moves the sandbox
+to `Stopped`, preserving its exit code until the next start.
+
 If an infrastructure failure leaves a sandbox in `Error`, fix the reported cause, then run `sandbox stop` followed by `sandbox start`. Wait for stop to succeed before starting. This retains the sandbox and its persistent workspace on backends that support restarting stopped sandboxes; it cannot recover deleted resources or storage.
 
 For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
@@ -1016,7 +1020,7 @@ Use `openshell.v1.SandboxUpdates/UpdateSandbox` to change a stopped sandbox's
 workload image, command, environment overrides, labels, and annotations together. This separate service uses the same gateway listener
 and authentication as `OpenShell`; it requires `sandbox:write` and workspace
 user access. This operation initially supports the Kubernetes compute driver
-only; other drivers return `UNIMPLEMENTED` after activation. There is no
+for workload changes; metadata-only updates work with every compute driver. There is no
 `sandbox update` CLI command or curated SDK update method.
 
 Image updates default to disabled. Ask the operator to complete the
@@ -1033,16 +1037,15 @@ login shell resolved from the workload image. A supplied environment map replace
 sandbox-level overrides; clearing it restores any template-provided defaults.
 Labels and annotations replace user metadata on the gateway resource, preserve
 system-owned keys, and do not set Kubernetes pod metadata. Attempts to supply
-system-owned keys are rejected. At least one update field is required.
+system-owned keys are rejected. Metadata-only changes commit directly without
+contacting the compute driver. The retention annotation is preserved when omitted.
 Annotation changes accepted through `UpdateConfig` after the sandbox update is
 accepted remain in place when the update completes, including after a retry.
 
 Without a pending update, a request whose target values already match is a no-op.
 Use a different image tag or an immutable digest to select new image content.
-Configuration updates require the driver's
-`openshell.compute.update-sandbox-configuration` capability; image-only clients
-can continue using `openshell.compute.update-sandbox-image`. Upgrade every gateway
-before enabling updates: older gateways can ignore new request fields.
+Workload changes require `openshell.compute.update-sandbox-configuration`.
+Upgrade every gateway before enabling updates.
 
 Follow this sequence through the CLI and a generated/raw RPC client.
 
@@ -1086,27 +1089,29 @@ If the new image fails to start and provisioning times out, wait until
 `provisioning.driver_operation_pending` is false. Run `sandbox stop` to move the
 reclaimed sandbox from `Error` to `Stopped`, then repeat the update sequence with
 a working image. Stop retains the timeout record and storage; it does not stop
-compute again. Cleanup that is still pending cannot be bypassed.
+compute again. This Stop behavior also applies when updates are disabled.
+Cleanup that is still pending cannot be bypassed.
 
 An `ABORTED` version conflict requires another read before you construct a new
 conditional request. An update failure or disconnected response can leave a
 pending operation, even when `sandbox.spec.template.image` already names the
-target image. Start, stop, provisioning retry, and delete reject the pending
-operation.
-The public `SandboxStatus` shape is unchanged; image intent and revision remain
-private. Use the operation-pending error to guide recovery, not a status image
-field. Read the current version and retry `UpdateSandbox` with the same selected fields and target values
-you originally requested. Do not select another configuration or delete the sandbox to
-bypass reconciliation. Only a successful retry clears the pending operation.
+target image. Start, stop, and provisioning retry remain blocked until reconciliation
+succeeds. The gateway retries accepted updates at startup and periodically, even
+if new updates are disabled. If the driver is unavailable or no longer supports
+updates, restore a compatible driver. Explicit deletion can reclaim a sandbox
+whose update cannot complete; deletion also removes its stored workspace.
+
+To resume immediately, read the current resource version and call `UpdateSandbox`
+with the same scope and name, that version, and no selected fields. The gateway
+uses the stored operation and target values. With no pending update, this returns
+`FAILED_PRECONDITION`. The operation ID is visible in
+`status.provisioning.driver_operation_id` while pending; the full intent stays private.
 
 The optional `request_id` uses [durable request admission](/sdk/api-errors#durable-request-admission).
-A retry with the same ID must keep the original payload, including its expected
-version. An unresolved admission returns `REQUEST_OUTCOME_UNCERTAIN` rather than
-executing again. Reconcile against the sandbox state and your original requested
-configuration, then submit a new conditional request for the same target with a fresh version
-and a new ID, or no ID.
-Do not change the expected version under the original ID or blindly switch IDs
-after a timeout.
+Reusing an unresolved ID returns `REQUEST_OUTCOME_UNCERTAIN`. For explicit resume,
+use a new ID or omit it, and use the fresh resource version. Do not change the
+original payload under its original ID. A confirmed successful request still
+replays without applying another update.
 
 ## Delete Sandboxes
 

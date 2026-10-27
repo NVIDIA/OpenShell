@@ -302,30 +302,25 @@ storage. The driver confirms the stop from both the published `Suspended`
 condition and deletion of the backing pod. Legacy `v1alpha1` controllers omit
 a usable stopped condition, so pod deletion alone confirms their stop.
 
-The optional `openshell.compute.update-sandbox-image` capability supports
-image-only updates while the sandbox is stopped. External drivers serve it as
-the separate `ComputeDriverImageUpdates` service on the baseline `ComputeDriver`
-endpoint, preserving the baseline generated server trait. The linked gateway
-factory opts in through `ComputeDriverFactory::build_with_image_updates` without
-changing the baseline driver object. `UpdateSandboxImage` requires
-the persisted Kubernetes runtime identity, current image, sandbox name, and a
-stable operation ID with a monotonic image revision. The driver verifies that
-the same Sandbox resource is suspended, runtime bootstrap has completed, and
-no workload or supervisor Pods
-remain, then revalidates stored external-resource admission. It patches only
-the agent image, the workspace seed image, and dedicated operation evidence,
-using the resource UID and `resourceVersion` as concurrency guards. A repeat of
-the same completed operation succeeds without a second patch; a different
-current image, stale revision, or reused operation ID with different parameters
-fails closed. A stale operation cannot reapply an image after a later update
-returns to an earlier tag. Image updates do not delete or recreate the Sandbox resource, PVCs, mounts,
-trusted runtime images, or bootstrap annotations. They leave the sandbox
-stopped. Existing workspace contents and the seed sentinel remain unchanged,
-so an image update does not replace files already stored under `/sandbox`.
+The optional `openshell.compute.update-sandbox-configuration` capability supports
+image, command, and environment updates while stopped. External drivers serve
+`ComputeDriverConfigurationUpdates` separately from the baseline driver service;
+linked factories opt in through `build_with_configuration_updates`.
+The request identifies the sandbox, original resource UID, expected image,
+operation ID, and monotonic revision. The driver checks the suspended state,
+completed bootstrap, current resource UID, and absence of workload and supervisor
+Pods, including Pods found only by owner UID or recorded name. It revalidates
+external-resource admission before patching the existing resource with a
+`resourceVersion` condition. The patch includes the verified UID; Kubernetes
+immutable-UID validation also rejects a same-name replacement. No resource or
+PVC is recreated. Existing workspace contents are not reseeded.
 
-The additional `openshell.compute.update-sandbox-configuration` capability and
-`ComputeDriverConfigurationUpdates` service reconcile workload argv and effective
-user environment with the image in one UID/resource-version-fenced patch. The
+A retry verifies durable operation evidence and the live selected targets before
+returning success without another patch. Different parameters or older revisions
+fail closed, including when later operations return to an earlier image.
+
+The service reconciles workload argv and effective user environment with the image
+in the same conditional patch. The
 main-process annotation and agent environment supply the next runtime generation;
 the trusted container launcher and runtime environment remain intact. Retry
 records identify selected fields and verify their live target values without

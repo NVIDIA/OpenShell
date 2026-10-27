@@ -346,45 +346,19 @@ impl openshell_core::compute::ComputeDriver for ComputeDriverService {
         Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>,
         Status,
     > {
-        self.driver
-            .update_sandbox_configuration(&request.into_inner())
-            .await
-            .map_err(|error| Status::from(openshell_core::ComputeDriverError::from(error)))?;
-        Ok(Response::new(
-            openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse {},
-        ))
-    }
-
-    async fn update_sandbox_image(
-        &self,
-        request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>, Status>
-    {
         self.rpc_tracer
-            .trace(openshell_otel::rpc::UPDATE_SANDBOX_IMAGE, async {
+            .trace(openshell_otel::rpc::UPDATE_SANDBOX_CONFIGURATION, async {
                 self.driver
-                    .update_sandbox_image(&request.into_inner())
+                    .update_sandbox_configuration(&request.into_inner())
                     .await
                     .map_err(|error| {
                         Status::from(openshell_core::ComputeDriverError::from(error))
                     })?;
                 Ok(Response::new(
-                    openshell_core::proto::compute::v1::UpdateSandboxImageResponse {},
+                    openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse {},
                 ))
             })
             .await
-    }
-}
-
-#[tonic::async_trait]
-impl openshell_core::proto::compute::v1::compute_driver_image_updates_server::ComputeDriverImageUpdates
-    for ComputeDriverService
-{
-    async fn update_sandbox_image(
-        &self,
-        request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>, Status> {
-        openshell_core::compute::ComputeDriver::update_sandbox_image(self, request).await
     }
 }
 

@@ -68,23 +68,16 @@ dependency from the policy crate to the supervisor implementation.
 ## Optional Compute Updates
 
 The generated `proto::compute::v1::compute_driver_server::ComputeDriver` trait
-retains its baseline methods and streaming associated type. External drivers
-that support image updates additionally serve `ComputeDriverImageUpdates` on
-the same endpoint and advertise `openshell.compute.update-sandbox-image`.
-Drivers without that capability need no new generated-trait method.
+retains its baseline methods and streaming associated type. Supporting external
+drivers additionally serve `ComputeDriverConfigurationUpdates` on the same
+endpoint and advertise `openshell.compute.update-sandbox-configuration`.
+The request carries image and lifecycle preconditions plus optional command and
+environment replacements. Drivers without the capability need no new method.
 
-Drivers supporting command and environment replacement additionally serve
-`ComputeDriverConfigurationUpdates` and advertise
-`openshell.compute.update-sandbox-configuration`. Its separate typed request
-retains image-update lifecycle preconditions. Both optional in-process methods
-have `UNIMPLEMENTED` defaults, so image-only implementations remain valid.
-
-Existing linked in-process drivers and factories need no new trait or hook.
-Only drivers opting into image updates implement
-`openshell_core::compute::ComputeDriver` and register that implementation through
-`ComputeDriverFactory::build_with_image_updates`. The default factory hook calls
-the existing `build` method without an updater. The gateway requires both this
-separate registration and the negotiated capability before invoking updates.
+Linked drivers opt in through `openshell_core::compute::ComputeDriver` and
+`ComputeDriverFactory::build_with_configuration_updates`. The default factory
+hook calls `build` without an updater. Registration and capability negotiation
+are both required. Metadata-only updates are handled by the gateway.
 
 ## Protobuf Struct Conversion
 

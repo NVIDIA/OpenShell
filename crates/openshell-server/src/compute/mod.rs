@@ -43,7 +43,6 @@ use openshell_core::proto::compute::v1::{
     ResourceRequirements as DriverSandboxResourceRequirements, StartSandboxRequest,
     StopSandboxRequest, SuspendSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent,
     WatchSandboxesRequest, WorkloadIdentityRequest, compute_driver_client::ComputeDriverClient,
-    compute_driver_image_updates_client::ComputeDriverImageUpdatesClient,
     compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto::{
@@ -88,8 +87,8 @@ pub type DriverWatchStream =
 pub type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
 
-/// Optional image-update registration, independent of the baseline driver object.
-pub type SharedComputeDriverImageUpdates = Arc<
+/// Optional configuration-update registration, independent of the baseline driver object.
+pub type SharedComputeDriverConfigurationUpdates = Arc<
     dyn openshell_core::compute::ComputeDriver<WatchSandboxesStream = DriverWatchStream>
         + Send
         + Sync,
@@ -438,9 +437,7 @@ impl QuiesceOperation {
         let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
         match self {
             Self::Stop => {
-                if matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
-                    || is_failed_main_process_result(sandbox)
-                {
+                if phase == SandboxPhase::Stopped {
                     return Ok(QuiesceAdmission::Settled);
                 }
                 // Timeout cleanup owns reclamation until it completes. Once
@@ -458,7 +455,8 @@ impl QuiesceOperation {
                         "sandbox provisioning timed out; wait for timeout cleanup before stop or start",
                     ));
                 }
-                // Error does not prove compute has stopped. Use the normal
+                // Neither a main-process exit nor an infrastructure Error
+                // proves compute has stopped. Use the normal
                 // driver stop and session cleanup before a subsequent start
                 // renews authentication and repeats configuration admission
                 // for the retained sandbox. Stopping a suspended sandbox
@@ -467,6 +465,7 @@ impl QuiesceOperation {
                 if !matches!(
                     phase,
                     SandboxPhase::Ready
+                        | SandboxPhase::Completed
                         | SandboxPhase::Stopping
                         | SandboxPhase::Error
                         | SandboxPhase::Suspending
@@ -474,7 +473,7 @@ impl QuiesceOperation {
                 ) && !is_automatic_restart_transition(sandbox)
                 {
                     return Err(Status::failed_precondition(format!(
-                        "sandbox must be Ready, Suspended, Error, or in an automatic restart to stop (current phase: {phase:?})"
+                        "sandbox must be Ready, Completed, Suspended, Error, or in an automatic restart to stop (current phase: {phase:?})"
                     )));
                 }
                 Ok(if phase == SandboxPhase::Stopping {
@@ -686,9 +685,6 @@ impl AcquiredRemoteDriverEndpoint {
 struct RemoteComputeDriver {
     client: RemoteComputeDriverClient,
     configuration_updates_client: openshell_core::proto::compute::v1::compute_driver_configuration_updates_client::ComputeDriverConfigurationUpdatesClient<tonic::service::interceptor::InterceptedService<Channel, TraceContextInterceptor>>,
-    image_updates_client: ComputeDriverImageUpdatesClient<
-        tonic::service::interceptor::InterceptedService<Channel, TraceContextInterceptor>,
-    >,
     admission_acknowledgement: Arc<StdMutex<Option<String>>>,
 }
 
@@ -700,11 +696,7 @@ impl RemoteComputeDriver {
     fn new(channel: Channel) -> Self {
         Self {
             client: ComputeDriverClient::with_interceptor(channel.clone(), TraceContextInterceptor),
-            configuration_updates_client: openshell_core::proto::compute::v1::compute_driver_configuration_updates_client::ComputeDriverConfigurationUpdatesClient::with_interceptor(channel.clone(), TraceContextInterceptor),
-            image_updates_client: ComputeDriverImageUpdatesClient::with_interceptor(
-                channel,
-                TraceContextInterceptor,
-            ),
+            configuration_updates_client: openshell_core::proto::compute::v1::compute_driver_configuration_updates_client::ComputeDriverConfigurationUpdatesClient::with_interceptor(channel, TraceContextInterceptor),
             admission_acknowledgement: Arc::new(StdMutex::new(None)),
         }
     }
@@ -758,21 +750,6 @@ impl openshell_core::compute::ComputeDriver for RemoteComputeDriver {
         self.configuration_updates_client
             .clone()
             .update_sandbox_configuration(request)
-            .await
-    }
-
-    async fn update_sandbox_image(
-        &self,
-        request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
-    ) -> Result<
-        tonic::Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>,
-        Status,
-    > {
-        // An image-only update does not install an external isolation route.
-        self.verify_admission_policy(false).await?;
-        self.image_updates_client
-            .clone()
-            .update_sandbox_image(request)
             .await
     }
 }
@@ -933,13 +910,14 @@ pub struct ComputeRuntime {
     admission: openshell_core::resource_admission::DriverAdmissionConfig,
     admission_acknowledgement: String,
     driver: TracedDriver,
-    image_update_driver: Option<SharedComputeDriverImageUpdates>,
+    image_update_driver: Option<SharedComputeDriverConfigurationUpdates>,
     driver_info: ComputeDriverInfoSnapshot,
     telemetry_compute_driver: TelemetryComputeDriver,
     driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
     image_preparation_timeout_seconds: u32,
     sandbox_updates_enabled: bool,
+    update_recovery_sweep: Arc<tokio::sync::Semaphore>,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
@@ -1058,6 +1036,7 @@ impl ComputeRuntime {
             default_image,
             image_preparation_timeout_seconds: 1800,
             sandbox_updates_enabled: false,
+            update_recovery_sweep: Arc::new(tokio::sync::Semaphore::new(1)),
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -1206,7 +1185,7 @@ impl ComputeRuntime {
 
     pub(crate) fn with_image_update_driver(
         mut self,
-        driver: Option<SharedComputeDriverImageUpdates>,
+        driver: Option<SharedComputeDriverConfigurationUpdates>,
     ) -> Self {
         self.image_update_driver = driver;
         self
@@ -3496,7 +3475,23 @@ impl ComputeRuntime {
                     .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
                     .ok_or_else(|| Status::not_found("sandbox not found"))?,
             };
-            provisioning_operation::ensure_operation_settled(&sandbox)?;
+            // Explicit deletion can supersede a configuration update: the
+            // driver only patches an existing immutable resource and cannot
+            // recreate it after deletion. Keep the interlock until removal so
+            // a failed delete can safely restore the pending update.
+            let pending_update = self
+                .store
+                .get_sandbox_image_state(sandbox_id)
+                .await
+                .map_err(|_| Status::unavailable("cannot read pending sandbox update"))?
+                .and_then(|state| state.pending);
+            if failed_create.is_none()
+                && let Some(intent) = pending_update
+            {
+                image_update::ensure_image_update_interlock(&sandbox, &intent)?;
+            } else {
+                provisioning_operation::ensure_operation_settled(&sandbox)?;
+            }
 
             // Failed-create compensation owns only its original attempt.
             // Preserve its timeout diagnosis and any replacement attempt on
@@ -3652,7 +3647,9 @@ impl ComputeRuntime {
 
         let mut delete_resource_version = record.resource_version;
         let mut sandbox = decode_sandbox_record(&record)?;
-        if provisioning_deadline::driver_operation_pending(&sandbox) {
+        if provisioning_deadline::driver_operation_pending(&sandbox)
+            && sandbox.phase() != SandboxPhase::Deleting as i32
+        {
             return Ok(false);
         }
         if sandbox.phase() != SandboxPhase::Deleting as i32 {
@@ -4167,7 +4164,7 @@ impl ComputeRuntime {
     {
         Box::pin(self.recover_persisted_lifecycle_transitions()).await?;
         if !self.driver_info.gateway_manages_lifecycle {
-            return Ok(());
+            return self.recover_pending_sandbox_updates().await;
         }
 
         let sandbox_ids = self.list_persisted_sandbox_ids("gateway startup").await?;
@@ -4427,7 +4424,7 @@ impl ComputeRuntime {
                 "Sandbox start sweep complete"
             );
         }
-        Ok(())
+        self.recover_pending_sandbox_updates().await
     }
 
     async fn recover_persisted_lifecycle_transitions(&self) -> Result<(), String> {
@@ -4448,7 +4445,9 @@ impl ComputeRuntime {
                     continue;
                 }
             };
-            if provisioning_deadline::driver_operation_pending(&sandbox) {
+            if provisioning_deadline::driver_operation_pending(&sandbox)
+                && sandbox.phase() != SandboxPhase::Deleting as i32
+            {
                 warn!(
                     sandbox_id,
                     "Retaining pending driver operation during gateway recovery"
@@ -4857,6 +4856,9 @@ impl ComputeRuntime {
 
     async fn reconcile_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
+            if let Err(error) = self.recover_pending_sandbox_updates().await {
+                warn!(%error, "Sandbox update recovery sweep failed");
+            }
             if let Err(err) = self.reconcile_store_with_backend(ORPHAN_GRACE_PERIOD).await {
                 warn!(error = %err, "Store reconciliation sweep failed");
             }
@@ -6176,7 +6178,8 @@ impl ComputeRuntime {
             // Timeout cleanup can emit Deleted before an explicit stop exposes
             // Stopped for repair. A delayed (or repeated) event must retain that
             // recovery record too; explicit deletion still transitions to Deleting.
-            if provisioning_deadline::driver_operation_pending(sandbox)
+            if (provisioning_deadline::driver_operation_pending(sandbox)
+                && sandbox.phase() != SandboxPhase::Deleting as i32)
                 || (provisioning_deadline::timed_out(sandbox)
                     && matches!(
                         SandboxPhase::try_from(sandbox.phase()),
@@ -6217,7 +6220,9 @@ impl ComputeRuntime {
         sandbox: &Sandbox,
         expected_resource_version: u64,
     ) -> Result<(), String> {
-        if provisioning_deadline::driver_operation_pending(sandbox) {
+        if provisioning_deadline::driver_operation_pending(sandbox)
+            && sandbox.phase() != SandboxPhase::Deleting as i32
+        {
             return Ok(());
         }
         let sandbox_id = sandbox.object_id();
@@ -6546,7 +6551,9 @@ impl ComputeRuntime {
             }
 
             let sandbox = decode_sandbox_record(&current_record)?;
-            if provisioning_deadline::driver_operation_pending(&sandbox) {
+            if provisioning_deadline::driver_operation_pending(&sandbox)
+                && sandbox.phase() != SandboxPhase::Deleting as i32
+            {
                 return Ok(());
             }
             let age_ms = openshell_core::time::now_ms()
@@ -8051,6 +8058,9 @@ fn apply_lifecycle_phase(
     message: &str,
     image_preparation_timeout_seconds: u32,
 ) {
+    let preserve_exit_code = phase == SandboxPhase::Stopping
+        && (sandbox.phase() == SandboxPhase::Completed as i32
+            || is_failed_main_process_result(sandbox));
     sandbox.set_phase(phase as i32);
     // Every explicit lifecycle write ends the previous transition's resume
     // intent. A resuming start records a new one after this write.
@@ -8066,7 +8076,11 @@ fn apply_lifecycle_phase(
         let status = sandbox.status.get_or_insert_with(Default::default);
         // Retain the previous instance id as a tombstone until the restarted
         // supervisor registers its new id.
-        status.exit_code = None;
+        // Explicit stop preserves an already-recorded terminal result for
+        // diagnosis while the sandbox is repaired. A fresh start clears it.
+        if !preserve_exit_code {
+            status.exit_code = None;
+        }
         status.restart_count = 0;
         set_next_restart_at_ms(status, 0);
         set_main_process_started_at_ms(status, 0);
@@ -8505,6 +8519,7 @@ pub fn new_test_runtime_with_driver(
         default_image: "openshell/sandbox:test".to_string(),
         image_preparation_timeout_seconds: 1800,
         sandbox_updates_enabled: false,
+        update_recovery_sweep: Arc::new(tokio::sync::Semaphore::new(1)),
         store,
         sandbox_index: SandboxIndex::new(),
         sandbox_watch_bus: SandboxWatchBus::new(),
@@ -9706,6 +9721,7 @@ mod tests {
             default_image: "openshell/sandbox:test".to_string(),
             image_preparation_timeout_seconds: 1800,
             sandbox_updates_enabled: false,
+            update_recovery_sweep: Arc::new(Semaphore::new(1)),
             store,
             sandbox_index: SandboxIndex::new(),
             sandbox_watch_bus: SandboxWatchBus::new(),
@@ -17707,10 +17723,15 @@ mod tests {
                 .await
                 .unwrap();
             remote
-                .update_sandbox_image(Request::new(
-                    openshell_core::proto::compute::v1::UpdateSandboxImageRequest {
-                        sandbox_id: sandbox.id.clone(),
-                        image: "example/workload:v2".into(),
+                .update_sandbox_configuration(Request::new(
+                    openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest {
+                        preconditions: Some(
+                            openshell_core::proto::compute::v1::SandboxUpdatePreconditions {
+                                sandbox_id: sandbox.id.clone(),
+                                image: "example/workload:v2".into(),
+                                ..Default::default()
+                            },
+                        ),
                         ..Default::default()
                     },
                 ))
@@ -18344,9 +18365,11 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
                 .await
                 .is_err()
         );
-        let status = openshell_core::compute::ComputeDriver::update_sandbox_image(
+        let status = openshell_core::compute::ComputeDriver::update_sandbox_configuration(
             &remote,
-            Request::new(openshell_core::proto::compute::v1::UpdateSandboxImageRequest::default()),
+            Request::new(
+                openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest::default(),
+            ),
         )
         .await
         .unwrap_err();
@@ -18362,7 +18385,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
     async fn remote_compute_driver_negotiates_optional_image_service() {
         use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
         use openshell_core::GetResourceVersion as _;
-        use openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_IMAGE;
+        use openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION;
 
         for supported in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -18406,7 +18429,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
                     .negotiated_extension
                     .supported_capabilities
                     .iter()
-                    .any(|capability| capability == COMPUTE_UPDATE_SANDBOX_IMAGE),
+                    .any(|capability| capability == COMPUTE_UPDATE_SANDBOX_CONFIGURATION),
                 supported,
             );
             let mut sandbox = sandbox_record("sb-image", "image-sandbox", SandboxPhase::Stopped);
@@ -18489,9 +18512,22 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             .driver_info
             .negotiated_extension
             .supported_capabilities
-            .push(openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_IMAGE.into());
+            .push(openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION.into());
+        let mut sandbox = sandbox_record(
+            "unsupported-update",
+            "unsupported-update",
+            SandboxPhase::Stopped,
+        );
+        sandbox.spec = Some(SandboxSpec {
+            template: Some(SandboxTemplate {
+                image: "example/workload:v1".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
         let error = runtime
-            .update_sandbox_image("not-created", "example/workload:v2".into(), 1)
+            .update_sandbox_image("unsupported-update", "example/workload:v2".into(), 1)
             .await
             .unwrap_err();
         assert_eq!(error.code(), Code::Unimplemented);

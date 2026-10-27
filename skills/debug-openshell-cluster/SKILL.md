@@ -1455,25 +1455,25 @@ retired, their outstanding driver operations have settled, and old binaries
 cannot return through rollout or rollback configurations. Keep it false during
 a rolling upgrade. SQLite supports one gateway process, not shared-file HA.
 
-On PostgreSQL, an unmarked client backend in the same database blocks updates,
-including an administrative session. The new binary sets every pool
-connection's `application_name` to `openshell-image-update-v2`; close unmarked
-sessions or use a dedicated database, rather than relabeling old clients. Live
-gateway membership must advertise image-update protocol 2; malformed or
-truncated membership reads fail closed. Neither these observations nor an
-expired membership TTL proves old gateways and their work have stopped. Follow
-the published
-[activation checklist](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#activate-sandbox-updates),
-and do not downgrade while updates are pending or retained sandboxes require
-the private revision protocol.
+On PostgreSQL, fresh gateway membership must advertise sandbox-update protocol 1;
+malformed or truncated membership reads fail closed. Administrative, monitoring,
+and backup connections do not block updates, and custom `application_name` values
+are preserved. Membership expiry does not prove a gateway has stopped. Follow the
+[activation checklist](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#activate-sandbox-updates).
 
-For an operation-pending error, use the original selected fields and target values and a fresh
-sandbox resource version to reconcile through `SandboxUpdates`. Intent and
-revision are private, not new public status fields. Start, stop, provisioning
-retry, and delete do not bypass the barrier. Preserve request-admission semantics:
-never change the payload under an existing ID or blindly switch IDs after a
-timeout. See the published
+The gateway retries accepted updates automatically, even with new updates disabled.
+To resume immediately, read the sandbox resource version and call `UpdateSandbox`
+with that version and no selected fields. Restore a compatible driver if recovery
+reports missing support. Start, stop, and provisioning retry retain the barrier;
+explicit deletion can reclaim an unrecoverable sandbox and its storage. Preserve
+request admission semantics: use a new ID or no ID for the explicit resume request,
+and never change the original payload under its original ID. See the
 [recovery contract](https://docs.nvidia.com/openshell/latest/sdk/api-errors#sandbox-image-update-recovery).
+
+Split Helm deployments need the current `openshell-workspace` Role, including
+`get` and `list` on Pods. The update preflight must find remaining Pods by owner
+UID and controller-recorded name as well as labels. Upgrade the workspace chart
+alongside the gateway chart; a label selector does not remove the `list` permission.
 
 ### Step 7: Check VM-Backed Gateways
 

@@ -3696,7 +3696,8 @@ func (x *CreateSandboxRequest) GetServiceExposures() []*SandboxServiceExposure {
 }
 
 // Update selected configuration of a stopped sandbox. Omitted fields are unchanged.
-// Start explicitly after a successful update. At least one field must be selected.
+// Start explicitly after a successful update. With no fields selected, resume
+// the pending operation stored by the gateway using the current resource version.
 type UpdateSandboxRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Workspace scope. Only a named workspace selection is accepted.

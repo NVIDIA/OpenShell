@@ -135,10 +135,7 @@ async fn state() -> (Arc<ServerState>, Arc<FakeComputeDriver>, Sandbox) {
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/image-test",
                 "test",
-                [
-                    openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_IMAGE.into(),
-                    openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION.into(),
-                ],
+                [openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION.into()],
             )),
             ..Default::default()
         }),
@@ -287,7 +284,7 @@ async fn public_image_update_replays_without_reapplying_or_touching_same_name_re
     let replay = client.update_sandbox(req.clone()).await.unwrap();
     assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
     assert_eq!(replay.get_ref().sandbox.as_ref().unwrap(), &updated);
-    assert_eq!(driver.calls().iter().filter(|call| matches!(call, FakeComputeDriverCall::UpdateSandboxConfiguration { request } if !request.image_update.as_ref().unwrap().validate_only)).count(), 1);
+    assert_eq!(driver.calls().iter().filter(|call| matches!(call, FakeComputeDriverCall::UpdateSandboxConfiguration { request } if !request.preconditions.as_ref().unwrap().validate_only)).count(), 1);
     let changed = UpdateSandboxRequest {
         image: Some("example/workload:other".into()),
         ..req.clone()
@@ -317,20 +314,29 @@ async fn public_image_update_replays_without_reapplying_or_touching_same_name_re
         .unwrap()
         .unwrap();
     assert_eq!(replacement.spec, sandbox.spec);
-    assert_eq!(driver.calls().iter().filter(|call| matches!(call, FakeComputeDriverCall::UpdateSandboxConfiguration { request } if !request.image_update.as_ref().unwrap().validate_only)).count(), 1);
+    assert_eq!(driver.calls().iter().filter(|call| matches!(call, FakeComputeDriverCall::UpdateSandboxConfiguration { request } if !request.preconditions.as_ref().unwrap().validate_only)).count(), 1);
 }
 
 #[test]
 fn configuration_update_presence_and_reserved_metadata() {
     let mut update = request();
     update.image = None;
-    assert!(validate_image_update_request(&update).is_err());
+    assert!(validate_image_update_request(&update).is_ok());
     update.command = Some(SandboxCommandUpdate::default());
     validate_image_update_request(&update).unwrap();
+    // User metadata under these domains was accepted at creation and remains
+    // editable; only explicit gateway identity and lifecycle keys are reserved.
+    for key in ["openshell.ai/user-note", "agents.x-k8s.io/user-note"] {
+        update.annotations = Some(openshell_core::proto::SandboxMapUpdate {
+            values: HashMap::from([(key.into(), "new".into())]),
+        });
+        validate_image_update_request(&update).unwrap();
+    }
+    update.annotations = None;
     for key in [
         "internal.openshell.ai/auth-epoch",
-        "openshell.ai/identity",
-        "agents.x-k8s.io/name",
+        "openshell.ai/sandbox-id",
+        "openshell.nvidia.com/retention",
     ] {
         update.annotations = Some(openshell_core::proto::SandboxMapUpdate {
             values: HashMap::from([(key.into(), "forged".into())]),
@@ -399,7 +405,13 @@ async fn pending_update_retry_preserves_later_update_config_annotations() {
         .await
         .unwrap()
         .unwrap();
-    update.expected_resource_version = current.get_resource_version();
+    // Resume from stored intent, without knowing the original selection mask.
+    update = UpdateSandboxRequest {
+        workspace_scope: update.workspace_scope,
+        name: update.name,
+        expected_resource_version: current.get_resource_version(),
+        ..Default::default()
+    };
     driver.set_image_update_error(None);
     let completed = handle_update_sandbox(&state, authed_request(update))
         .await

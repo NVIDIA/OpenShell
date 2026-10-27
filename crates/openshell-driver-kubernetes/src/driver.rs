@@ -1345,7 +1345,6 @@ impl KubernetesComputeDriver {
                 "openshell/kubernetes",
                 openshell_core::VERSION,
                 [
-                    openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_IMAGE.to_string(),
                     openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION
                         .to_string(),
                 ],

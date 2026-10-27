@@ -289,17 +289,17 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        self.build_with_image_updates(context)
+        self.build_with_configuration_updates(context)
             .await
             .map(|(instance, _)| instance)
     }
 
-    async fn build_with_image_updates(
+    async fn build_with_configuration_updates(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<(
         openshell_server::ComputeDriverInstance,
-        Option<openshell_server::SharedComputeDriverImageUpdates>,
+        Option<openshell_server::SharedComputeDriverConfigurationUpdates>,
     )> {
         let mut config = kubernetes_config(context.config_context())?;
         config.supervisor_otlp_endpoint = context

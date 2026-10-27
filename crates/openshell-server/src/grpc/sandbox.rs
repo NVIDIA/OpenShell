@@ -379,16 +379,6 @@ fn validate_image_update_request(
             "expected_resource_version must be nonzero",
         ));
     }
-    if request.image.is_none()
-        && request.command.is_none()
-        && request.environment.is_none()
-        && request.labels.is_none()
-        && request.annotations.is_none()
-    {
-        return Err(Status::invalid_argument(
-            "at least one update field is required",
-        ));
-    }
     if let Some(image) = &request.image
         && (image.is_empty()
             || image.len() > super::MAX_TEMPLATE_STRING_LEN
@@ -402,7 +392,6 @@ fn validate_image_update_request(
         .into_iter()
         .flatten()
     {
-        super::validation::validate_annotations(&map.values, "metadata")?;
         if map
             .values
             .keys()
@@ -414,9 +403,10 @@ fn validate_image_update_request(
         }
     }
     if let Some(labels) = &request.labels {
-        for value in labels.values.values() {
-            super::validation::validate_label_value(value)?;
-        }
+        super::validation::validate_labels(&labels.values)?;
+    }
+    if let Some(annotations) = &request.annotations {
+        super::validation::validate_annotations(&annotations.values, "annotations")?;
     }
     Ok(())
 }
@@ -892,10 +882,7 @@ fn validate_create_sandbox_request_pre_io(
     workload_template_name: &str,
 ) -> Result<(), Status> {
     // Validate labels (keys and values must meet Kubernetes requirements).
-    for (key, value) in &request.labels {
-        crate::grpc::validation::validate_label_key(key)?;
-        crate::grpc::validation::validate_label_value(value)?;
-    }
+    crate::grpc::validation::validate_labels(&request.labels)?;
     crate::grpc::validation::validate_caller_annotations(&request.annotations, "annotations")?;
 
     if request.service_exposures.len() > MAX_CREATE_SERVICE_EXPOSURES {
