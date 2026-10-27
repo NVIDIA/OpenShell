@@ -541,6 +541,9 @@ pub struct MtlsAuthConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayAuthConfig {
+    /// Operator-managed JSON discovery certificate grant file, reloaded on requests/watches.
+    #[serde(default)]
+    pub discovery_grants_file: Option<PathBuf>,
     /// When true, unauthenticated user/CLI calls are accepted as a local
     /// developer principal. This is an unsafe local-development escape hatch
     /// for trusted, non-shared gateways. Sandbox supervisor calls still use

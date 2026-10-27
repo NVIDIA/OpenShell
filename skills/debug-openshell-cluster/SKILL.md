@@ -1703,3 +1703,13 @@ application Authorization header. Gateway headers and reserved cookies are
 stripped; application cookies and explicit bearer passthrough remain available.
 Only explicit local-development unauthenticated access bypasses gateway auth.
 Direct listener authentication belongs to the ingress provider.
+
+For discovery-only readers, verify the TLS client CA and an `OU=discovery`
+certificate whose lowercase DER SHA-256 fingerprint appears in the
+administrator-managed `openshell.gateway.auth.discovery_grants_file` JSON.
+Missing mappings, duplicate fingerprints, invalid scope combinations, and expired
+certificates fail closed. Verify the projected grant file on every replica;
+propagation precedes the gateway's one-second refresh and bounded collection
+rechecks. Do not replace a discovery identity with an operator certificate.
+Single, finite-set, and all-workspaces discovery require explicit selectors;
+workspace users retain membership checks and cannot request platform scope.

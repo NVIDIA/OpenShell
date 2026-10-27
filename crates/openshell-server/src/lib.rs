@@ -1315,11 +1315,14 @@ fn spawn_gateway_connection(
                                         return;
                                     }
                                 };
+                            let certificate_expiry =
+                                multiplex::extract_peer_certificate_expiry(&tls_stream);
                             if let Err(e) = service
-                                .serve_with_verified_certificate(
+                                .serve_with_certificate_expiry(
                                     tls_stream,
                                     peer_identity,
                                     certificate_sha256,
+                                    certificate_expiry,
                                     ConnectionSource::Peer(addr),
                                 )
                                 .await
@@ -3034,6 +3037,123 @@ mod tests {
             }
             stop_listener(shutdown, handle).await;
         }
+    }
+
+    #[tokio::test]
+    async fn discovery_certificate_authenticates_only_route_rpcs_over_verified_tls() {
+        use rustls::pki_types::CertificateDer;
+        let dir = tempdir().unwrap();
+        let (ca, ca_key) = generate_test_certs_with_ca(dir.path());
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "discovery-proxy");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationalUnitName, "discovery");
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let client_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let client = openshell_crypto::pki::signed_by(params, &client_key, &ca, &ca_key).unwrap();
+        let client_cert = CertificateDer::from(client.der().to_vec());
+        let key_pem = client_key.serialize_pem().unwrap();
+        let client_pem_key = key_pem.clone();
+        let fingerprint = hex::encode(openshell_crypto::sha256(client_cert.as_ref()).unwrap());
+        std::fs::write(dir.path().join("grants.json"),serde_json::to_vec(&serde_json::json!({"readers":[{"certificate_sha256":fingerprint,"all_workspaces":true}]})).unwrap()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut state = test_state(addr, false).await;
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.config.auth.allow_unauthenticated_users = false;
+        inner.config.mtls_auth.enabled = false;
+        inner.config.auth.discovery_grants_file = Some(dir.path().join("grants.json"));
+        inner.config.supervisor_app_listener.enabled = false;
+        inner.config.tls = Some(openshell_core::TlsConfig {
+            cert_path: dir.path().join("server-cert.pem"),
+            key_path: dir.path().join("server-key.pem"),
+            client_ca_path: Some(dir.path().join("ca.pem")),
+            require_client_auth: false,
+            external_cert_path: None,
+            external_key_path: None,
+            external_server_names: vec![],
+        });
+        let acceptor = TlsAcceptor::from_files(
+            &dir.path().join("server-cert.pem"),
+            &dir.path().join("server-key.pem"),
+            Some(&dir.path().join("ca.pem")),
+            false,
+            None,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let (shutdown, rx) = watch::channel(false);
+        let handle = tokio::spawn(serve_gateway_listener(
+            BoundGatewayListener {
+                listener,
+                address: addr,
+            },
+            MultiplexService::new(state),
+            Some(acceptor),
+            false,
+            rx,
+        ));
+
+        let tls = tonic::transport::ClientTlsConfig::new()
+            .domain_name("localhost")
+            .ca_certificate(tonic::transport::Certificate::from_pem(ca.pem()))
+            .identity(tonic::transport::Identity::from_pem(
+                client.pem(),
+                client_pem_key,
+            ));
+        let channel =
+            tonic::transport::Endpoint::from_shared(format!("https://localhost:{}", addr.port()))
+                .unwrap()
+                .tls_config(tls)
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+        let mut client = OpenShellClient::new(channel);
+        let request = || openshell_core::proto::GetServiceRouteSnapshotRequest {
+            workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+            ..Default::default()
+        };
+        assert!(client.get_service_route_snapshot(request()).await.is_ok());
+        assert_eq!(
+            client
+                .get_current_user(openshell_core::proto::GetCurrentUserRequest {})
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut watch = client
+            .watch_service_routes(openshell_core::proto::WatchServiceRoutesRequest {
+                workspace_scope: request().workspace_scope,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(watch.message().await.unwrap().is_some());
+        std::fs::write(dir.path().join("grants.json"), r#"{"readers":[]}"#).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), watch.message())
+                .await
+                .unwrap()
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            client
+                .get_service_route_snapshot(request())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        stop_listener(shutdown, handle).await;
     }
 
     #[tokio::test]

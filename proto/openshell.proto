@@ -4273,10 +4273,12 @@ message SupervisorServiceAdvertisement {
   string service_domain = 5;
 }
 
-// One explicit active workspace is required. Omitted and all-workspaces
-// selectors are rejected; discovery-only machine grants are separate work.
+// Select one workspace, or all active workspaces with an explicit platform grant.
+// Alternatively provide a finite set in workspaces; never combine selectors.
 message GetServiceRouteSnapshotRequest {
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  // Up to 64 distinct canonical workspace references; exclusive with workspace_scope.
+  repeated string workspaces = 2;
 }
 message GetServiceRouteSnapshotResponse {
   ServiceRouteSnapshot snapshot = 1;
@@ -4287,6 +4289,8 @@ message GetServiceRouteSnapshotResponse {
 // routes during discovery errors; errors are not empty replacements.
 message WatchServiceRoutesRequest {
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  // Up to 64 distinct canonical workspace references; exclusive with workspace_scope.
+  repeated string workspaces = 2;
 }
 message WatchServiceRoutesResponse {
   ServiceRouteSnapshot snapshot = 1;

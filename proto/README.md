@@ -54,7 +54,9 @@ identifies the service being exposed.
 - Accept `WorkspaceSelector.all_workspaces` only on collection-list RPCs that
   explicitly document and authorize cross-workspace access. The supported
   public collections are sandboxes, sandbox templates, providers, and
-  services.
+  services. Service-route snapshot/watch discovery also accepts this selector
+  with explicit platform discovery authorization, or a request-specific finite
+  `workspaces` set mutually exclusive with `workspace_scope`.
 - Requests whose primary resource is a workspace use `name`, not
   `workspace_scope`.
 - Document every request that permits an omitted selector. Current exceptions
