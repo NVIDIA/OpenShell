@@ -175,6 +175,33 @@ The local Rust listener tests use a real TLS client and backend RPC connector.
 They supplement this live cluster check; they do not establish HA pool recovery
 or real Kubernetes reachability.
 
+## Discovery-driven proxy path
+
+Build the gateway, CLI, and optional proxy from the same stack. Deploy dedicated
+supervisors with the listener enabled and set `public_url` to an HTTPS origin
+whose port differs from both the gateway port-forward and listener port. Deploy
+`deploy/helm/openshell-sandbox-proxy` with two replicas, the gateway CA, and one
+explicit workspace. Provide a workspace-authorized discovery identity when the
+gateway requires authentication. Permit the proxy Pods to reach supervisor app
+ports through NetworkPolicy; the proxy needs no Kubernetes API access.
+
+Create a sandbox with an unnamed service and expose a second named service.
+Verify `service expose`, API get/list, create-time response maps, and SDK results
+retain the public origin. The gateway alternative must remain independently
+available. From a permitted client Pod, use the returned hostname as SNI and
+HTTP authority while connecting to each proxy Pod and then its Service. Verify
+the supervisor certificate using only the public application CA. No application
+private key is mounted in the proxy.
+
+Hold named and unnamed WebSockets through the proxy beyond the thirty-second
+listener freshness interval. Delete the named declaration and require that
+stream to close while the unnamed stream survives. Verify both proxy replicas
+observe the same accepted installation. Repeat reconnect/expiry checks during
+discovery interruption: unexpired cached routes may be used, authorization loss
+clears them, and expired routes never open or retain a connection. Test malformed
+or missing SNI without backend fallback. Inspect `/readyz`, `/healthz`, and
+`/metrics` separately from application health.
+
 ## Shared-supervisor HA and discovery
 
 Use the shared-supervisor HA overlay with the app-listener values and two gateway

@@ -64,3 +64,12 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20
     steps: *build_steps
+
+  sandbox-proxy:
+    env:
+      COMPONENT: sandbox-proxy
+      BINARY: openshell-sandbox-proxy
+      TARGET_SUFFIX: unknown-linux-gnu
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 20
+    steps: *build_steps

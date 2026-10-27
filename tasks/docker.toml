@@ -69,3 +69,7 @@ run = "scripts/docker-cleanup.sh --force"
 ["docker:cleanup:dry-run"]
 description = "Preview what docker:cleanup would remove without deleting anything"
 run = "scripts/docker-cleanup.sh --dry-run"
+
+["docker:build:sandbox-proxy"]
+description = "Build the optional sandbox TLS proxy image"
+run = "tasks/scripts/docker-build-image.sh sandbox-proxy"

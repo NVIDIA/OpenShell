@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+suite: discovery proxy deployment
+templates:
+  - templates/proxy.yaml
+set:
+  gatewayEndpoint: https://gateway.example.com
+  clientIdentitySecret: discovery-reader
+tests:
+  - it: renders a Kubernetes Deployment for one workspace
+    set:
+      workspace: default
+    asserts:
+      - equal:
+          path: apiVersion
+          value: apps/v1
+        documentIndex: 0
+      - isKind:
+          of: Deployment
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: default
+        documentIndex: 0
+  - it: renders a Deployment for a finite workspace set
+    set:
+      workspaces: [team-a, team-b]
+    asserts:
+      - equal:
+          path: apiVersion
+          value: apps/v1
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: team-b
+        documentIndex: 0
+  - it: renders a Deployment for all workspaces
+    set:
+      allWorkspaces: true
+    asserts:
+      - equal:
+          path: apiVersion
+          value: apps/v1
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --all-workspaces
+        documentIndex: 0
+  - it: rejects ambiguous scope
+    set:
+      workspace: default
+      allWorkspaces: true
+    asserts:
+      - failedTemplate:
+          errorMessage: select exactly one of workspace, workspaces, or allWorkspaces
+  - it: rejects missing scope
+    asserts:
+      - failedTemplate:
+          errorMessage: select exactly one of workspace, workspaces, or allWorkspaces
+  - it: rejects duplicate workspaces
+    set:
+      workspaces: [team-a, team-a]
+    asserts:
+      - failedTemplate:
+          errorMessage: duplicate workspaces are not allowed

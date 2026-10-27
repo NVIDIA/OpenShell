@@ -54,13 +54,16 @@ _publish_multiarch_docker() {
   echo "Building multi-arch supervisor image..."
   tasks/scripts/docker-build-image.sh supervisor
 
+  echo "Building multi-arch sandbox proxy image..."
+  tasks/scripts/docker-build-image.sh sandbox-proxy
+
   TAGS_TO_APPLY=("${EXTRA_TAGS[@]}")
   if [[ "${TAG_LATEST}" == "true" ]]; then
     TAGS_TO_APPLY+=("latest")
   fi
 
   if [[ ${#TAGS_TO_APPLY[@]} -gt 0 ]]; then
-    for component in gateway sandbox supervisor; do
+    for component in gateway sandbox supervisor sandbox-proxy; do
       full_image="${REGISTRY}/${component}"
       for tag in "${TAGS_TO_APPLY[@]}"; do
         [[ "${tag}" == "${IMAGE_TAG}" ]] && continue
@@ -83,7 +86,7 @@ _publish_multiarch_podman() {
   # Split comma-separated platforms into an array.
   IFS=',' read -ra PLATFORM_LIST <<< "${PLATFORMS}"
 
-  for component in gateway sandbox supervisor; do
+  for component in gateway sandbox supervisor sandbox-proxy; do
     local full_image="${REGISTRY}/${component}"
     local manifest_name="${full_image}:${IMAGE_TAG}"
 
@@ -151,6 +154,7 @@ echo "Done! Multi-arch images pushed to ${REGISTRY}:"
 echo "  ${REGISTRY}/gateway:${IMAGE_TAG}"
 echo "  ${REGISTRY}/sandbox:${IMAGE_TAG}"
 echo "  ${REGISTRY}/supervisor:${IMAGE_TAG}"
+echo "  ${REGISTRY}/sandbox-proxy:${IMAGE_TAG}"
 if [[ "${TAG_LATEST}" == "true" ]]; then
   echo "  (all also tagged :latest)"
 fi

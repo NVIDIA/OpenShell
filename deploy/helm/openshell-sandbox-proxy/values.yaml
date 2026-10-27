@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+replicaCount: 2
+image:
+  repository: ghcr.io/nvidia/openshell/sandbox-proxy
+  tag: dev
+  pullPolicy: IfNotPresent
+gatewayEndpoint: ""
+# Exactly one of workspace, workspaces, or allWorkspaces must be configured.
+workspace: ""
+workspaces: []
+allWorkspaces: false
+# Secrets are mounted as directories so projected credential rotation is visible.
+gatewayCASecret: ""
+clientIdentitySecret: ""
+tokenSecret: ""
+service:
+  type: ClusterIP
+  port: 443
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
