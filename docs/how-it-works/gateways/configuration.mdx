@@ -1237,11 +1237,8 @@ runtime-selected profile.
 
 ### MXC
 
-Native Windows implementation and releases remain on the
-[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
-Use a build from that branch for this section, including when reading it in
-documentation published from `main`. See the
-[Windows guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md)
+Use a build from the [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+See the [Windows guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md)
 for build prerequisites and runtime limitations.
 
 The MXC driver is Windows-only and opt-in. It links into the gateway and invokes Microsoft MXC through `wxc-exec.exe`. The driver starts `openshell-supervisor --role=isolation-backend` on the host and `openshell-windows-sandbox.exe` inside each ProcessContainer. The standard authenticated Sandbox Protocol and supervisor session provide lifecycle, exec, forwarding, provider refresh, and network policy.

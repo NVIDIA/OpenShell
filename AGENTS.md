@@ -10,13 +10,6 @@ OpenShell is built agent-first. We design systems and use agents to implement th
 
 ## Skills
 
-Native Windows implementation and releases belong to the
-[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
-See [WINDOWS.md](WINDOWS.md) before Windows work. Base native Windows code
-changes on that branch. Shared documentation may merge into `main`; keep links
-to Windows-only implementation, tasks, and runtime guidance explicitly pinned
-to `windows`, and do not imply that documentation on `main` ships Windows support.
-
 OpenShell has two skill collections:
 
 - `skills/` contains public, installable skills for using and operating OpenShell. These skills must work outside a source checkout and use installed CLI help plus published documentation as their sources of truth.

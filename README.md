@@ -27,14 +27,9 @@ OpenShell governs what agents can do in two ways: it instruments the kernel to e
 
 See [Architecture](https://docs.nvidia.com/openshell/latest/about/architecture) for how the gateway, supervisor, and sandbox fit together.
 
-Native Windows has a separate MXC implementation on the
-[`windows` development and release branch](https://github.com/NVIDIA/OpenShell/tree/windows).
-See [Native Windows support](WINDOWS.md) for its runtime architecture and current
-enforcement limitations; the guarantees above do not establish Windows parity.
-
 ## Quickstart
 
-The quickstart below supports Linux and macOS on Apple Silicon, with experimental Linux use inside WSL 2. It requires Docker, Podman, or host virtualization. For native Windows x64 or ARM64, follow [Native Windows support](WINDOWS.md) and build from the [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows). Native Windows uses MXC and does not use the installer below. See the [Support Matrix](https://docs.nvidia.com/openshell/latest/about/support-matrix) for details.
+You need Linux, macOS on Apple Silicon, or Windows with WSL 2 (experimental), plus Docker, Podman, or host virtualization. See the [Support Matrix](https://docs.nvidia.com/openshell/latest/about/support-matrix) for details.
 
 ```shell
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
@@ -42,6 +37,8 @@ openshell sandbox create --name demo
 ```
 
 The installer sets up the CLI and a local gateway. The default sandbox image is minimal Ubuntu with no agent installed. To run a real agent, follow [Run Your First Agent](https://docs.nvidia.com/openshell/latest/about/run-your-first-agent): it runs OpenCode against a free OpenRouter model and shows how to approve new access as the agent needs it.
+
+For native Windows support through Microsoft MXC, see the [Windows build and runtime guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md) for setup and current limitations.
 
 ## Explore Further
 
@@ -53,7 +50,6 @@ The installer sets up the CLI and a local gateway. The default sandbox image is 
 - [Extensibility](https://docs.nvidia.com/openshell/latest/extensibility/overview): middleware, interceptors, and compute drivers.
 - [Tutorials](https://docs.nvidia.com/openshell/latest/tutorials/first-network-policy): step-by-step policy and agent walkthroughs.
 - [Prerelease and development builds](https://docs.nvidia.com/openshell/latest/about/installation#prerelease-and-development-builds): try an upcoming release or the latest commit on `main`.
-- [Native Windows support](WINDOWS.md): build, run, and validate the MXC implementation maintained and released from `windows`, even when this documentation is read on `main`.
 
 ### Test the gRPC API with grpcurl
 

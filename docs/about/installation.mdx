@@ -10,17 +10,9 @@ position: 3
 
 Install OpenShell on a local workstation or Kubernetes.
 
-For native Windows x64 or ARM64, use the
-[`windows` development and release branch](https://github.com/NVIDIA/OpenShell/tree/windows)
-and its [Windows build and runtime guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md).
-That implementation uses Microsoft MXC and remains on `windows` even when this
-documentation is published from `main`. The installer and release channels
-below cover Linux/macOS, including experimental Linux use inside WSL 2;
-they do not install native Windows binaries.
-
 ## Install OpenShell
 
-Install the CLI, policy prover, and a local gateway with one command:
+On Linux or macOS, install the CLI, policy prover, and a local gateway with one command:
 
 ```shell
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
@@ -80,6 +72,21 @@ The local gateway auto-detects an available runtime. To pin one, set `compute_dr
 | Docker | Docker Desktop or Docker Engine 28.0 or later. |
 | Podman | Linux with Podman 5.x, cgroups v2, and an active Podman user socket. |
 | MicroVM | Host virtualization: Hypervisor.framework on macOS or KVM on Linux. |
+| [Windows MXC](#windows) | Native Windows x64 or ARM64 with MXC 1.0.0 and a host that passes the ProcessContainer capability probe. Development; not production-qualified. |
+
+## Windows
+
+Build native Windows x64 or ARM64 binaries from the
+[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Follow the [Windows build and runtime guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md)
+for MSVC prerequisites, MXC host probing, and gateway setup. Select
+`compute_driver = "mxc"` in the gateway TOML file.
+
+Native Windows uses Microsoft MXC ProcessContainer isolation. It is under
+development and is not production-qualified; see the
+[current runtime limitations](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md#runtime-and-current-limits).
+The installer and release channels above do not supply native Windows binaries.
+Running Linux OpenShell inside WSL 2 is a separate, experimental option.
 
 ## macOS
 
