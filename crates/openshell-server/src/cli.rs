@@ -1573,6 +1573,8 @@ mod tests {
                         assert!(error.contains(expected), "missing {expected:?} in {error}");
                     }
                 });
+        }
+    }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

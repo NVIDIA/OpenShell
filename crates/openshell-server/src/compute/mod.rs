@@ -18128,7 +18128,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
     }
 
     #[test]
-    fn start_sandbox_request_uses_optional_wire_field_seven_for_durable_snapshot() {
+    fn start_sandbox_request_uses_optional_wire_field_nine_for_durable_snapshot() {
         let legacy = StartSandboxRequest {
             sandbox_id: "sandbox-id".into(),
             name: "sandbox-name".into(),
@@ -18136,6 +18136,8 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             generation_id: "generation-id".into(),
             expected_runtime_identity: String::new(),
             isolation_backend: None,
+            resume: false,
+            restart_if_restore_fails: false,
             sandbox: None,
         };
         let with_snapshot = StartSandboxRequest {
@@ -18148,11 +18150,11 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         };
         let legacy_wire = legacy.encode_to_vec();
         let snapshot_wire = with_snapshot.encode_to_vec();
-        // Field 7 is length-delimited, hence its protobuf key is 0x3a. The
-        // legacy form does not emit it, preserving existing fields 1–6
-        // (field 6 is the upstream isolation backend registration).
-        assert!(!legacy_wire.contains(&0x3a));
-        assert!(snapshot_wire.contains(&0x3a));
+        // Field 9 is length-delimited, hence its protobuf key is 0x4a. The
+        // legacy form does not emit it, preserving existing fields 1–8
+        // (fields 7 and 8 are the upstream suspend/resume controls).
+        assert!(!legacy_wire.contains(&0x4a));
+        assert!(snapshot_wire.contains(&0x4a));
         assert_eq!(
             StartSandboxRequest::decode(snapshot_wire.as_slice())
                 .unwrap()

@@ -2426,6 +2426,8 @@ mod tests {
                         guest_tls: None,
                         gateway_port: 8080,
                         gateway_tls_enabled: true,
+                        network_trust: None,
+                        network_trust_configured: false,
                         endpoint_overrides: &endpoint_overrides,
                     },
                 },
