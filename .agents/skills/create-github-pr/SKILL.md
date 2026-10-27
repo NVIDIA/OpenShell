@@ -24,14 +24,16 @@ to the target repository, not their fork. For the authenticated `gh` user:
 
 ```bash
 gh repo view OWNER/REPO --json nameWithOwner,viewerPermission
-gh issue view ISSUE_NUMBER --repo OWNER/REPO --json number,url,labels
+gh issue view ISSUE_NUMBER --repo OWNER/REPO --json number,url,labels,author
 ```
 
 Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may proceed without
 `state:accepted`; keep the issue link and note the missing label. Everyone else
-must link at least one target-repository issue and have `state:accepted` on each.
-Otherwise, preserve local work and report which issue needs acceptance. A direct
-request, roadmap placement, other labels, or vouch status does not bypass this gate.
+must reference at least one target-repository issue they submitted themselves
+that has `state:accepted`. Related description references and closing links both
+qualify; other references need not qualify. Otherwise, preserve local work and
+report the missing qualification. A direct request, roadmap placement, other
+labels, or vouch status does not bypass this gate.
 
 When acting for another author, verify their permissions. Resolve failed lookups
 before proceeding; retry sandbox network failures outside the sandbox before
