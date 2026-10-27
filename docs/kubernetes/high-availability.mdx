@@ -507,32 +507,12 @@ rollout finishes.
 ## (Experimental) Multi-tenant supervisor
 
 By default, the Kubernetes driver runs a supervisor Pod for each sandbox. With
-the multi-tenant topology, one shared supervisor Deployment in the release
-namespace hosts many sandbox instances, and each supervisor Pod supervises
-every sandbox assigned to it. Each sandbox instance keeps its own policy and
-identity context.
+the multi-tenant topology, a shared supervisor Deployment hosts many sandboxes,
+and each sandbox keeps its own policy and identity. Supervisor replicas are
+independent of the gateway replica count.
 
-<Warning>
-The multi-tenant supervisor is experimental. It has been validated on a
-single-node Kubernetes cluster for supervisor process and Pod failure and for
-scaling from one to two supervisors and back. Node failure and network
-partitions between gateway replicas have not been validated.
-</Warning>
-
-The topology has these requirements and restrictions:
-
-- Gateway TLS must be enabled.
-- Upstream proxy settings and provider SPIFFE identity are not supported.
-- It applies only to sandboxes created after you enable it.
-
-Supervisor replicas are independent of the gateway replica count. The topology
-works with a single gateway replica, and the PostgreSQL requirements earlier on
-this page apply only when you also run multiple gateway replicas.
-
-### Enable the Multi-tenant Supervisor
-
-Opt in by setting the Kubernetes driver's `supervisor_topology` to `gateway`.
-Add these values to your release:
+Enable the topology in your release values. Run at least two supervisor
+replicas so sandboxes can fail over:
 
 ```yaml
 gatewayConfig:
@@ -543,101 +523,40 @@ supervisor:
   replicas: 2
 ```
 
-The chart creates the supervisor Deployment in the release namespace and
-renders the gateway's shared supervisor Service, port, and token Secret wiring
-and its `[openshell.gateway.supervisor_pool]` table. Select the topology in
-`gatewayConfig`, and tune the pool through the top-level `supervisor` values.
-Do not hand-write the chart-owned `shared_supervisor` entry or `supervisor_pool`
-table in `gatewayConfig`; the chart rejects them. Other `gatewayConfig`
-settings remain valid.
-
-Check the supervisor Pods and their disruption budget:
-
-```shell
-kubectl -n openshell get deployment,poddisruptionbudget openshell-supervisor
-kubectl -n openshell get pods -l app.kubernetes.io/name=openshell-supervisor -o wide
-```
-
-If you changed the chart's generated names with `nameOverride` or
-`fullnameOverride`, use the rendered `<fullname>-supervisor` name instead.
-
-### Plan Failover Capacity
-
-The gateway always coordinates the shared supervisors as a pool, even with one
-replica. There is no separate high-availability setting. The default of one
-replica has no failover. Run two or more replicas, with enough spare capacity
-for the remaining members to accept a failed member's sandboxes. The gateway
-refuses a new sandbox launch when no live supervisor can take it.
-
-The chart prefers to schedule supervisor Pods on different nodes, replaces them
-one at a time during rollouts, and gives each Pod a 60-second termination grace
-period. Its PodDisruptionBudget lets voluntary disruptions, such as node
-drains, evict one supervisor Pod at a time.
+The chart creates the supervisor Deployment and connects it to the gateway.
+Tune the pool through the top-level `supervisor` values.
 
 ### Recover from a Supervisor Failure
 
-Each sandbox runs on one supervisor, and a healthy supervisor keeps its
-sandboxes. When a supervisor process exits, its Pod or node fails, or it shuts
-down, the gateway moves each of its sandboxes to a live supervisor after
-revoking the credentials the previous one held for that sandbox. The sandbox
-runtime freezes the workload briefly and resumes it after the replacement
-confirms the takeover.
+When a supervisor fails, the gateway moves its sandboxes to a live supervisor.
+The sandboxes keep their running processes and in-memory state. They pause
+briefly during the move, and open proxied connections and interactive sessions
+must reconnect. Recovery does not restore a sandbox whose own Pod or node is
+lost.
 
-A takeover does not restart the sandbox. The sandbox keeps its Pod, its running
-processes and their PIDs, and its in-memory state. The replacement keeps the
-sandbox CA, SSH host key, and
-[binary identity](/security/best-practices#binary-identity-binding) pins.
-Proxied connections and interactive exec and SSH sessions that are open during
-the takeover break, and clients must reconnect.
-
-Takeover recovers only the supervisor. It does not recover a sandbox whose own
-Pod or node is unavailable.
-
-Recovery is bounded. If no replacement confirms the takeover within the
-recovery timeout, for example because no live supervisor has capacity, the
-sandbox runtime terminates the workload instead of letting it run
-unsupervised. With one replica, a supervisor failure terminates its workloads
-once the timeout passes.
-
-`supervisor.recoveryTimeoutSeconds` sets the timeout. It defaults to `60` and
-accepts values from `10` to `300`. The chart renders it into the gateway
-configuration as the optional `recovery_timeout_secs` field, which has the same
-default and range:
-
-```toml
-[openshell.gateway.supervisor_pool]
-recovery_timeout_secs = 60
-```
-
-Setting `supervisor.recoveryTimeoutSeconds` to `null` omits the table, and the
-gateway uses the defaults. The gateway refuses to start with the table when no
-in-process compute driver uses the shared supervisor. The gateway takes up to
-22 seconds to detect a failed node, or 30 seconds right after a gateway replica
-starts, and the replacement then needs time to take over, so keep the timeout
-well above that.
+If no supervisor takes over within `supervisor.recoveryTimeoutSeconds`, the
+sandbox terminates its workload. The timeout defaults to `60` seconds and
+accepts values from `10` to `300`.
 
 ### Scale Supervisors Manually
 
-Change `supervisor.replicas` to scale the pool. The gateway configuration and
-supervisor Pod template do not depend on the replica count, so a change neither
-restarts the gateway nor replaces running supervisors:
+Change `supervisor.replicas` to scale the pool:
 
 ```shell
 helm upgrade openshell <chart> -n openshell --reuse-values --set supervisor.replicas=2
 helm upgrade openshell <chart> -n openshell --reuse-values --set supervisor.replicas=1
 ```
 
-Scaling up moves no running sandbox, and new sandboxes can land on the new
-supervisor. Scaling down hands the removed supervisor's sandboxes to the
-remaining supervisors within its grace period. Those sandboxes keep running,
-and their open proxied connections and interactive sessions must reconnect.
+Scaling up adds capacity for new sandboxes without moving existing ones.
+Scaling down hands the removed supervisor's sandboxes to the
+remaining supervisors, where they keep running and their open connections must
+reconnect.
 
 ### Autoscale shared supervisors by memory
 
-Set `supervisor.autoscaling.enabled` to let a separate HPA manage the
-supervisor Deployment. Autoscaling is off by default. Your cluster must provide
-the Kubernetes resource metrics API, usually through Metrics Server. Gateway
-autoscaling remains controlled by the top-level `autoscaling` settings.
+Set `supervisor.autoscaling.enabled` to let a HorizontalPodAutoscaler manage
+the supervisor replica count. Your cluster must provide the Kubernetes resource
+metrics API, usually through Metrics Server.
 
 ```yaml
 gatewayConfig:
@@ -652,30 +571,18 @@ supervisor:
     targetMemoryAverageValue: 512Mi
 ```
 
-The replica limits and memory target shown are the defaults. The target is an absolute average memory
-usage per supervisor Pod, not a percentage of its memory request. When
-enabled, the HPA owns the replica count and the chart ignores
-`supervisor.replicas`. The default scale-down behavior waits through a
-five-minute stabilization window and removes at most one supervisor every two
-minutes. Override it with `supervisor.autoscaling.behavior`.
+Autoscaling is off by default. The replica limits and memory target shown are
+the defaults. The target is an absolute average memory usage per supervisor
+Pod. When enabled, the HPA owns the replica count and the chart ignores
+`supervisor.replicas`. Scaling up adds room for new sandboxes but does
+not rebalance existing ones.
 
-Scaling up adds room for new sandboxes but does not rebalance existing ones, so
-it does not reduce a busy supervisor's memory usage. A memory target does not
-guarantee spare capacity for failover, so size `minReplicas` for it.
-
-Enable the HPA when you install the chart, or during a maintenance window.
-Removing `spec.replicas` from an existing Deployment can reset it to one Pod
-until the HPA restores the minimum. On an existing release, upgrade with
-`--reset-then-reuse-values`, or the older-Helm equivalent described in
-[Autoscale with a HorizontalPodAutoscaler](#autoscale-with-a-horizontalpodautoscaler),
-to pick up the autoscaling defaults. When you disable the HPA, set
-`supervisor.replicas` to the fixed count you want in the same upgrade.
-
-```shell
-kubectl -n openshell get hpa openshell-supervisor
-kubectl -n openshell describe hpa openshell-supervisor
-kubectl -n openshell top pods -l app.kubernetes.io/component=supervisor
-```
+Enabling the HPA on an existing release can briefly reset the supervisor
+Deployment to one Pod, so enable it at install time or during a maintenance
+window. If your release uses older values, upgrade with
+`--reset-then-reuse-values` as described in
+[Autoscale with a HorizontalPodAutoscaler](#autoscale-with-a-horizontalpodautoscaler).
+When you disable the HPA, set `supervisor.replicas` in the same upgrade.
 
 ## Next Steps
 
