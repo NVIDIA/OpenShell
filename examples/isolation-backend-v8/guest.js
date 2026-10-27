@@ -9,3 +9,18 @@ try {
   if (error.message !== "Network access is disabled") throw error;
   console.log(error.message);
 }
+
+// Counts once per second of running time. The guest has no timers, so it
+// busy-waits. Suspend partway through; after resume the count continues from
+// the value held in the isolate's memory.
+const started = Date.now();
+let count = 0;
+let next = Date.now() + 1000;
+while (count < 12) {
+  if (Date.now() >= next) {
+    count += 1;
+    next = Date.now() + 1000;
+    console.log(`count ${count} (${Math.round((Date.now() - started) / 1000)}s since start)`);
+  }
+}
+console.log("done");

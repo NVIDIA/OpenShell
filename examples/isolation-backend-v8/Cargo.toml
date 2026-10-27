@@ -21,6 +21,7 @@ rustix = { version = "1", features = ["process"] }
 tokio-rustls = "0.26"
 rustls = "0.23"
 rustls-pemfile = "2"
+hmac = "0.12"
 clap = { version = "4.5", features = ["derive", "env"] }
 prost = "0.14"
 prost-types = "0.14"
@@ -34,6 +35,10 @@ tonic-prost = "0.14"
 uuid = { version = "1", features = ["v4"] }
 
 v8 = "152.2.0"
+
+[dev-dependencies]
+tempfile = "3"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3"
