@@ -1050,6 +1050,8 @@ async fn suspend_signal_exits_without_terminating_boundary() {
             provider_workload_api_socket: None,
             // The binary loads the proxy trust directory from its environment.
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
+            takeover: None,
+            supervisor_recovery_timeout_secs: None,
         };
         let bindings = crate::SandboxInstanceBindings::dedicated(
             &config,

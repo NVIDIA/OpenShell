@@ -1078,7 +1078,9 @@ mod tests {
         for key in ["alpha", "beta"] {
             assert!(host.status(key).unwrap().ready);
         }
-        host.remove_all(Duration::from_secs(1)).await;
+        for key in ["alpha", "beta"] {
+            host.remove(key, Duration::from_secs(1)).await;
+        }
         assert!(!host.request_suspend("alpha"));
     }
 
