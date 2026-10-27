@@ -498,6 +498,10 @@ fn operator_network_trust(
     )
     .map_err(PodmanApiError::InvalidInput)?;
     let certificate_count = pem.matches("-----BEGIN CERTIFICATE-----").count();
+    // Deterministic destination-trust generation label, not an authenticity
+    // proof: trust comes from the bounded validation above, the immutable
+    // staged artifact, and TLS verification. Classified as a non-security
+    // identity hash in openshell-crypto/README.md.
     let digest = format!("sha256:{:x}", sha2::Sha256::digest(pem.as_bytes()));
 
     let staging = tempfile::tempdir().map_err(|error| {
@@ -1903,17 +1907,10 @@ impl PodmanComputeDriver {
             Err(error) => return Err(error.into()),
         };
 
-        let supervisor_rollback_name =
-            format!("openshell-supervisor-rollback-{}", uuid::Uuid::new_v4());
-        if previous_supervisor.is_some()
-            && let Err(error) = self
-                .client
-                .rename_container(&canonical_supervisor, &supervisor_rollback_name)
-                .await
-        {
-            return Err(error.into());
-        }
-
+        // Complete every remaining fallible preparation before the rename so
+        // a transient failure cannot return with the previous supervisor
+        // already moved to its rollback name, where a normal delete would
+        // never find it.
         let existing_token_name = container::token_secret_name(&durable_sandbox.id);
         let existing_token = self
             .client
@@ -1927,6 +1924,18 @@ impl PodmanComputeDriver {
             .as_mut()
             .expect("validated durable snapshot has a spec")
             .launch_authentication = encoded_authentication.to_vec();
+
+        let supervisor_rollback_name =
+            format!("openshell-supervisor-rollback-{}", uuid::Uuid::new_v4());
+        if previous_supervisor.is_some()
+            && let Err(error) = self
+                .client
+                .rename_container(&canonical_supervisor, &supervisor_rollback_name)
+                .await
+        {
+            return Err(error.into());
+        }
+
         let provisioned = self
             .create_sandbox_with_existing_token(
                 &replacement,
@@ -1939,20 +1948,53 @@ impl PodmanComputeDriver {
             // The stopped workload and all of its resources were retained.
             // Restore the canonical supervisor name so a failed replacement
             // has no externally observable provisioning change.
-            if previous_supervisor.is_some() {
-                let _ = self
+            if previous_supervisor.is_some()
+                && let Err(restore_error) = self
                     .client
                     .rename_container(&supervisor_rollback_name, &canonical_supervisor)
-                    .await;
+                    .await
+            {
+                // The previous supervisor keeps the rollback name and must
+                // stay identifiable for operator cleanup. A later retry
+                // still succeeds: the canonical name is absent, so the
+                // replacement path recreates a fresh supervisor.
+                warn!(
+                    rollback_container = %supervisor_rollback_name,
+                    sandbox_id = %durable_sandbox.id,
+                    restore_error = %restore_error,
+                    "failed to restore the previous Podman supervisor after a failed trust refresh"
+                );
+                return Err(ComputeDriverError::Message(format!(
+                    "trust refresh failed and the previous supervisor could not be \
+                     restored; the retained supervisor is named '{supervisor_rollback_name}' \
+                     and can be removed manually: {restore_error}"
+                )));
             }
             return Err(error);
         }
 
-        if previous_supervisor.is_some() {
-            self.client
+        if previous_supervisor.is_some()
+            && let Err(error) = self
+                .client
                 .remove_container_preserving_volumes(&supervisor_rollback_name)
                 .await
-                .map_err(ComputeDriverError::from)?;
+            && !matches!(error, PodmanApiError::NotFound(_))
+        {
+            // The replacement supervisor is running; the stopped rollback
+            // container is an identifiable orphan. Surface the failure so
+            // the orphan is not silently lost; a retry observes the fresh
+            // canonical supervisor and resumes the normal start path.
+            warn!(
+                rollback_container = %supervisor_rollback_name,
+                sandbox_id = %durable_sandbox.id,
+                remove_error = %error,
+                "failed to remove the previous Podman supervisor after a trust refresh"
+            );
+            return Err(ComputeDriverError::Message(format!(
+                "trust refresh succeeded but the previous supervisor could not be \
+                 removed; the orphaned supervisor is named '{supervisor_rollback_name}' \
+                 and can be removed manually: {error}"
+            )));
         }
         Ok(())
     }
@@ -2754,6 +2796,158 @@ mod tests {
         assert!(
             !requests.iter().any(|request| request.contains("/pull")),
             "supervisor-only refresh must never pull the workload tag: {requests:?}"
+        );
+    }
+
+    fn refresh_fixture(
+        sandbox_id: &str,
+    ) -> (
+        ContainerListEntry,
+        DriverSandbox,
+        openshell_core::sandbox_generation::SandboxGenerationId,
+    ) {
+        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+        let old_workload = ContainerListEntry {
+            id: format!("workload-{sandbox_id}"),
+            names: vec![format!("openshell-default--{sandbox_id}")],
+            state: "exited".to_string(),
+            labels: HashMap::from([(LABEL_SANDBOX_ID.to_string(), sandbox_id.to_string())]),
+            ports: None,
+            networks: None,
+            exit_code: 0,
+        };
+        let durable = DriverSandbox {
+            id: sandbox_id.to_string(),
+            name: format!("sandbox-{sandbox_id}"),
+            namespace: String::new(),
+            spec: Some(DriverSandboxSpec::default()),
+            status: None,
+            workspace: String::new(),
+        };
+        let generation =
+            openshell_core::sandbox_generation::SandboxGenerationId::parse("generation-1")
+                .expect("valid generation");
+        (old_workload, durable, generation)
+    }
+
+    const REFRESH_STOPPED_SUPERVISOR: &str = r#"{"Id":"sup-1","Name":"supervisor","State":{"Status":"exited","Running":false},"Config":{"Image":"sha256:supervisor-image"}}"#;
+
+    #[tokio::test]
+    async fn supervisor_refresh_completes_fallible_prep_before_renaming() {
+        // A transient secret-lookup failure must return before the previous
+        // supervisor is renamed, so the canonical supervisor is never left
+        // under its rollback name where a normal delete cannot find it.
+        let (socket, requests, handle) = spawn_podman_stub(
+            "refresh-prep-before-rename",
+            vec![
+                StubResponse::new(StatusCode::OK, REFRESH_STOPPED_SUPERVISOR),
+                StubResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"message":"transient secret lookup failure"}"#,
+                ),
+            ],
+        );
+        let driver = test_driver(socket);
+        let (old_workload, durable, generation) = refresh_fixture("prep-1");
+        let result = driver
+            .replace_supervisor_for_network_trust(&old_workload, &durable, &generation, b"auth")
+            .await;
+        assert!(
+            result.is_err(),
+            "secret lookup failure must fail the refresh"
+        );
+        handle.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert!(
+            !requests.iter().any(|request| request.contains("/rename")),
+            "fallible preparation must complete before any rename: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_refresh_restores_canonical_name_when_replacement_fails() {
+        // The replacement create fails at its first image pull; the previous
+        // supervisor must be restored to the canonical name and must not be
+        // deleted, so a later retry observes the original stopped pair.
+        let (socket, requests, handle) = spawn_podman_stub(
+            "refresh-restore-on-failure",
+            vec![
+                StubResponse::new(StatusCode::OK, REFRESH_STOPPED_SUPERVISOR),
+                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"no secret"}"#),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"message":"image pull failed"}"#,
+                ),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+            ],
+        );
+        let driver = test_driver(socket);
+        let (old_workload, durable, generation) = refresh_fixture("restore-1");
+        let result = driver
+            .replace_supervisor_for_network_trust(&old_workload, &durable, &generation, b"auth")
+            .await;
+        assert!(result.is_err(), "failed replacement must fail the refresh");
+        handle.await.unwrap();
+        let requests = requests.lock().unwrap();
+        let renames = requests
+            .iter()
+            .filter(|request| request.contains("/rename"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            renames.len(),
+            2,
+            "expected rename to rollback and rename back: {requests:?}"
+        );
+        assert!(
+            renames[0].contains("openshell-supervisor-restore-1")
+                && renames[0].contains("openshell-supervisor-rollback-"),
+            "first rename moves the canonical supervisor to the rollback name: {renames:?}"
+        );
+        assert!(
+            renames[1].contains("openshell-supervisor-rollback-")
+                && renames[1].contains("name=openshell-supervisor-restore-1"),
+            "second rename restores the canonical name: {renames:?}"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.starts_with("DELETE") && request.contains("rollback")),
+            "the restored supervisor must not be deleted: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_refresh_names_orphaned_rollback_when_restore_fails() {
+        // If the restore rename itself fails, the error must name the
+        // rollback container so the orphan is identifiable for cleanup.
+        let (socket, _requests, handle) = spawn_podman_stub(
+            "refresh-restore-failure-orphan",
+            vec![
+                StubResponse::new(StatusCode::OK, REFRESH_STOPPED_SUPERVISOR),
+                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"no secret"}"#),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"message":"image pull failed"}"#,
+                ),
+                StubResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"message":"rename raced with cleanup"}"#,
+                ),
+            ],
+        );
+        let driver = test_driver(socket);
+        let (old_workload, durable, generation) = refresh_fixture("orphan-1");
+        let error = driver
+            .replace_supervisor_for_network_trust(&old_workload, &durable, &generation, b"auth")
+            .await
+            .expect_err("restore failure must fail the refresh");
+        handle.await.unwrap();
+        let message = error.to_string();
+        assert!(
+            message.contains("openshell-supervisor-rollback-"),
+            "error must name the orphaned rollback container: {message}"
         );
     }
 
