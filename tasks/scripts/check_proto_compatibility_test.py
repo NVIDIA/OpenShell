@@ -23,7 +23,11 @@ REASON = "Release captain accepted the protobuf changes."
     ("ref", "exception_tag", "reason", "expected"),
     [
         (f"refs/tags/{TAG}", TAG, REASON, True),
+        ("refs/tags/v0.1.6-pre.8", "v0.1.6-pre.8", REASON, True),
+        ("refs/tags/v0.1.6-pre.12", "v0.1.6-pre.12", REASON, True),
         ("refs/tags/v0.1.6-pre.8", "", "", False),
+        ("refs/tags/v0.1.7-pre.1", "", "", False),
+        ("refs/tags/v0.2.0-pre.1", "", "", False),
         (f"refs/tags/{TAG}", "", "", False),
         ("refs/tags/v0.1.6-pre.8", TAG, REASON, ValueError),
         ("refs/tags/v0.1.6", "v0.1.6", REASON, ValueError),
@@ -113,13 +117,14 @@ def test_real_buf_field_rename(monkeypatch, allows_breaks):
 
 @pytest.mark.parametrize("exception", [False, True])
 @pytest.mark.parametrize("proto_result", ["success", "failure", "skipped"])
+@pytest.mark.parametrize("tag", [TAG, "v0.1.6-pre.8"])
 def test_qualification_records_exception_without_bypassing_results(
-    tmp_path, exception, proto_result
+    tmp_path, exception, proto_result, tag
 ):
     output = tmp_path / "qualification.json"
     env = {
         **os.environ,
-        "RELEASE_TAG": TAG,
+        "RELEASE_TAG": tag,
         "SOURCE_SHA": "candidate-sha",
         "IS_PRERELEASE": "true",
         "GITHUB_RUN_ID": "123",
@@ -127,7 +132,7 @@ def test_qualification_records_exception_without_bypassing_results(
         "GITHUB_SERVER_URL": "https://github.com",
         "GITHUB_REPOSITORY": "NVIDIA/OpenShell",
         "PROTO_COMPATIBILITY_RESULT": proto_result,
-        "PROTO_COMPATIBILITY_EXCEPTION_TAG": TAG if exception else "",
+        "PROTO_COMPATIBILITY_EXCEPTION_TAG": tag if exception else "",
         "PROTO_COMPATIBILITY_EXCEPTION_REASON": REASON,
     }
     for suite in (
@@ -152,7 +157,7 @@ def test_qualification_records_exception_without_bypassing_results(
     summary = json.loads(output.read_text())
     assert summary["current_profile_passed"] is (proto_result == "success")
     assert summary["exceptions"] == (
-        [{"suite": "protobuf_compatibility", "tag": TAG, "reason": REASON}]
+        [{"suite": "protobuf_compatibility", "tag": tag, "reason": REASON}]
         if exception
         else []
     )

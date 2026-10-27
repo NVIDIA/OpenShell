@@ -30,9 +30,9 @@ permissions:
 
 env:
   RELEASE_TAG: ${{ inputs.release-tag }}
-  # One-candidate exception accepted by the release captain. Remove after promotion.
-  PROTO_COMPATIBILITY_EXCEPTION_TAG: ${{ inputs.is-prerelease && inputs.release-tag == 'v0.1.6-pre.7' && inputs.release-tag || '' }}
-  PROTO_COMPATIBILITY_EXCEPTION_REASON: Release captain accepted protobuf breaking changes for v0.1.6-pre.7; migration guidance must accompany the release.
+  # Patch-train exception accepted by the release captain. Remove after promotion.
+  PROTO_COMPATIBILITY_EXCEPTION_TAG: ${{ inputs.is-prerelease && startsWith(inputs.release-tag, 'v0.1.6-pre.') && inputs.release-tag || '' }}
+  PROTO_COMPATIBILITY_EXCEPTION_REASON: Release captain accepted protobuf breaking changes for the v0.1.6 prerelease train; migration guidance must accompany the release.
 
 defaults:
   run:
