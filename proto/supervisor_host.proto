@@ -65,14 +65,17 @@ message HostHello {
   PoolMember member = 3;
 }
 
-// One member of a supervisor pool, as its deployment identifies it.
+// One member of a supervisor pool.
 message PoolMember {
-  // Stable member name (the Pod name). One process serves a member at a time.
+  reserved 2;
+  reserved "member_uid";
+
+  // Opaque, stable logical member ID. One process serves a member at a time;
+  // HostHello.instance_id identifies that process.
   string member_id = 1;
-  // Identity of the member's current incarnation (the Pod UID).
-  string member_uid = 2;
-  // Address (IP:port) of the member's routed runtime listener. Other members
-  // redirect sandbox runtimes here for the instances this member owns.
+  // Address (IP:port) of the member's routed runtime listener, reachable from
+  // sandbox runtimes. Other members redirect sandbox runtimes here for the
+  // instances this member owns.
   string runtime_address = 3;
 }
 

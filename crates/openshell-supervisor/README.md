@@ -215,12 +215,14 @@ control listener: it dials the gateway and receives its assignments from it.
   reports only that the process runs. On SIGTERM or SIGINT the member
   announces that it is leaving, waits for the gateway to move its instances,
   and relinquishes whatever it still hosts; their workloads keep running.
-- **Pool members.** `--pool-member-id`, `--pool-member-uid`, and
-  `--pool-advertise-ip` (or `OPENSHELL_SUPERVISOR_POOL_MEMBER_ID`,
-  `_MEMBER_UID`, `_ADVERTISE_IP`, which the chart fills from the Pod's name,
-  UID, and IP) are required with `--mode=shared`: every shared supervisor is a
-  member of the gateway's high-availability pool, and its hello names the
-  member and its runtime address. Missing values fail startup with the flag
+- **Pool members.** `--pool-member-id` and `--pool-advertise-ip` (or
+  `OPENSHELL_SUPERVISOR_POOL_MEMBER_ID` and `_ADVERTISE_IP`) are required with
+  `--mode=shared`: every shared supervisor is a member of the gateway's
+  high-availability pool, and its hello names the member and its runtime
+  address. The member ID is an opaque, stable logical ID served by one
+  process at a time; the hello's `instance_id` and `connection_epoch` identify
+  and order that process's streams. The advertised IP must be reachable from
+  sandbox runtimes. The Helm chart fills them from the Pod's name and IP. Missing values fail startup with the flag
   and variable to set. A pool snapshot lists only
   the instances this process owns. An instance it omits moved to another
   member and is **relinquished**: the instance is cancelled without its stop

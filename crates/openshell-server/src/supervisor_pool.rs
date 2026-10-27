@@ -164,7 +164,6 @@ fn report_object_name(route: &str, auth_epoch: u64) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MemberPayload {
     member_id: String,
-    member_uid: String,
     process_id: String,
     runtime_address: String,
     #[serde(default)]
@@ -920,7 +919,6 @@ impl SupervisorPool {
         }
         let payload = MemberPayload {
             member_id: member.member_id.clone(),
-            member_uid: member.member_uid.clone(),
             process_id: member.process_id.clone(),
             runtime_address: member.runtime_address.clone(),
             leaving: member.leaving,
@@ -3050,7 +3048,6 @@ mod tests {
             let pool = self.replica("membership-writer");
             pool.write_member(&ConnectedMember {
                 member_id: member_id.to_string(),
-                member_uid: format!("uid-{member_id}"),
                 process_id: process_id.to_string(),
                 runtime_address: "10.0.0.1:5500".to_string(),
                 leaving,
@@ -4836,7 +4833,6 @@ mod tests {
     fn stream(member_id: &str, process_id: &str, connected_at_ms: i64) -> ConnectedMember {
         ConnectedMember {
             member_id: member_id.to_string(),
-            member_uid: format!("uid-{member_id}"),
             process_id: process_id.to_string(),
             runtime_address: "10.0.0.1:5500".to_string(),
             leaving: false,

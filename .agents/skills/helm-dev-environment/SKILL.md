@@ -116,8 +116,8 @@ chart renders the gateway's
 the driver's `shared_supervisor` table stays unchanged), a
 RollingUpdate Deployment (`maxSurge: 1`, `maxUnavailable: 0`) with preferred
 hostname anti-affinity and a 60-second grace period, the pool identity env vars
-(`OPENSHELL_SUPERVISOR_POOL_MEMBER_ID`, `_MEMBER_UID`, `_ADVERTISE_IP` from the
-Pod name, UID, and IP), and a `maxUnavailable: 1` PodDisruptionBudget.
+(`OPENSHELL_SUPERVISOR_POOL_MEMBER_ID` and `_ADVERTISE_IP` from the Pod name
+and IP), and a `maxUnavailable: 1` PodDisruptionBudget.
 `ci/values-supervisor-ha.yaml` selects two replicas and a 60-second recovery
 timeout. The topology needs gateway TLS: the e2e harness keeps it on with
 `ci/values-tls-port-forward.yaml` and `OPENSHELL_E2E_KUBE_TLS=1`, which reaches

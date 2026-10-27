@@ -218,7 +218,6 @@ pub struct MemberReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectedMember {
     pub member_id: String,
-    pub member_uid: String,
     pub process_id: String,
     pub runtime_address: String,
     /// The member reported that it is leaving.
@@ -720,7 +719,6 @@ impl SupervisorHostController {
             .values()
             .map(|session| ConnectedMember {
                 member_id: session.member.member_id.clone(),
-                member_uid: session.member.member_uid.clone(),
                 process_id: session.instance_id.clone(),
                 runtime_address: session.member.runtime_address.clone(),
                 leaving: session.status.as_ref().is_some_and(|status| status.leaving),
@@ -1253,9 +1251,8 @@ impl SupervisorHostController {
 
 /// Why a hello without a pool member is refused.
 const MISSING_MEMBER: &str = "the shared supervisor did not name its pool member; set \
-OPENSHELL_SUPERVISOR_POOL_MEMBER_ID, OPENSHELL_SUPERVISOR_POOL_MEMBER_UID, and \
-OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP (the OpenShell Helm chart sets them from the Pod name, \
-UID, and IP)";
+OPENSHELL_SUPERVISOR_POOL_MEMBER_ID to a stable member ID and \
+OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP to an IP reachable from sandbox runtimes";
 
 /// Check a pool member's identity, naming the setting that is wrong.
 fn validate_member(member: &PoolMember) -> Result<(), &'static str> {
@@ -1265,13 +1262,7 @@ fn validate_member(member: &PoolMember) -> Result<(), &'static str> {
     if !valid(&member.member_id) {
         return Err(
             "the shared supervisor's pool member id is empty or invalid; set \
-OPENSHELL_SUPERVISOR_POOL_MEMBER_ID to its Pod name",
-        );
-    }
-    if !valid(&member.member_uid) {
-        return Err(
-            "the shared supervisor's pool member UID is empty or invalid; set \
-OPENSHELL_SUPERVISOR_POOL_MEMBER_UID to its Pod UID",
+OPENSHELL_SUPERVISOR_POOL_MEMBER_ID to a stable member ID",
         );
     }
     if member
@@ -1281,7 +1272,7 @@ OPENSHELL_SUPERVISOR_POOL_MEMBER_UID to its Pod UID",
     {
         return Err(
             "the shared supervisor's pool member runtime address is invalid; set \
-OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP to its Pod IP",
+OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP to an IP reachable from sandbox runtimes",
         );
     }
     Ok(())
@@ -1430,7 +1421,6 @@ mod tests {
             connection_epoch,
             member: Some(PoolMember {
                 member_id: member.to_string(),
-                member_uid: format!("uid-{member}"),
                 runtime_address: format!("10.0.0.{}:5500", member.len()),
             }),
         }
@@ -1925,10 +1915,10 @@ mod tests {
             ),
             (
                 PoolMember {
-                    member_uid: "uid with space".to_string(),
+                    member_id: "id with space".to_string(),
                     ..member.clone()
                 },
-                "OPENSHELL_SUPERVISOR_POOL_MEMBER_UID",
+                "OPENSHELL_SUPERVISOR_POOL_MEMBER_ID",
             ),
             (
                 PoolMember {
@@ -1955,7 +1945,6 @@ mod tests {
             .unwrap_err();
         for setting in [
             "OPENSHELL_SUPERVISOR_POOL_MEMBER_ID",
-            "OPENSHELL_SUPERVISOR_POOL_MEMBER_UID",
             "OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP",
         ] {
             assert!(error.message().contains(setting), "{}", error.message());

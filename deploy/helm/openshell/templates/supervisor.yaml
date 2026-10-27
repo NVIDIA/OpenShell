@@ -105,17 +105,13 @@ spec:
             - name: OPENSHELL_GATEWAY_TLS_SERVER_NAME
               value: {{ get $endpointUrl "hostname" | quote }}
             {{- end }}
-            # Pool membership: the Pod name and UID identify this member, and
+            # Pool membership: the Pod name is this member's stable ID, and
             # other members redirect the runtimes of its instances to its Pod
             # IP.
             - name: OPENSHELL_SUPERVISOR_POOL_MEMBER_ID
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: OPENSHELL_SUPERVISOR_POOL_MEMBER_UID
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.uid
             - name: OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP
               valueFrom:
                 fieldRef:

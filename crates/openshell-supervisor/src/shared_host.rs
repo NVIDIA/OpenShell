@@ -155,12 +155,12 @@ fn jitter_sample() -> f64 {
 /// Identity of a shared supervisor process in a supervisor pool.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolIdentity {
-    /// Stable name of the member (its Pod name).
+    /// Opaque, stable logical ID of the member. One process serves a member
+    /// at a time.
     pub member_id: String,
-    /// Identity of this incarnation of the member (its Pod UID).
-    pub member_uid: String,
-    /// Address of this member's routed runtime listener that other members
-    /// redirect its instances' runtimes to.
+    /// Address of this member's routed runtime listener, reachable from
+    /// sandbox runtimes, that other members redirect its instances'
+    /// runtimes to.
     pub runtime_address: SocketAddr,
 }
 
@@ -1072,7 +1072,6 @@ async fn attach_with(
             connection_epoch,
             member: Some(PoolMember {
                 member_id: host.pool.member_id.clone(),
-                member_uid: host.pool.member_uid.clone(),
                 runtime_address: host.pool.runtime_address.to_string(),
             }),
         };
@@ -1578,7 +1577,6 @@ mod tests {
             removal_grace: Duration::from_secs(10),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
-                member_uid: "uid-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
         })
@@ -1615,7 +1613,6 @@ mod tests {
             removal_grace: Duration::from_secs(10),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
-                member_uid: "uid-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
         })
@@ -1737,7 +1734,6 @@ mod tests {
             removal_grace: Duration::from_secs(10),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
-                member_uid: "uid-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
         })
@@ -1834,7 +1830,6 @@ mod tests {
             removal_grace: Duration::from_secs(10),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
-                member_uid: "uid-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
         })
@@ -2045,7 +2040,6 @@ mod tests {
             removal_grace: Duration::from_secs(10),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
-                member_uid: "uid-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
         })
@@ -2355,7 +2349,6 @@ mod tests {
             removal_grace: Duration::from_secs(10),
             pool: PoolIdentity {
                 member_id: "member-1".to_string(),
-                member_uid: "uid-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
             },
         })

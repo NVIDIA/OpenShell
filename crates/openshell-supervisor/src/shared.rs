@@ -44,25 +44,18 @@ fn run_platform(args: crate::Args) -> Result<()> {
     let missing = [
         (
             args.pool_member_id.is_none(),
-            "--pool-member-id (OPENSHELL_SUPERVISOR_POOL_MEMBER_ID, the Pod name)",
-        ),
-        (
-            args.pool_member_uid.is_none(),
-            "--pool-member-uid (OPENSHELL_SUPERVISOR_POOL_MEMBER_UID, the Pod UID)",
+            "--pool-member-id (OPENSHELL_SUPERVISOR_POOL_MEMBER_ID, a stable member ID)",
         ),
         (
             args.pool_advertise_ip.is_none(),
-            "--pool-advertise-ip (OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP, the Pod IP)",
+            "--pool-advertise-ip (OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP, an IP reachable \
+from sandbox runtimes)",
         ),
     ]
     .into_iter()
     .filter_map(|(missing, setting)| missing.then_some(setting))
     .collect::<Vec<_>>();
-    let (Some(name), Some(incarnation), Some(advertise_ip)) = (
-        args.pool_member_id,
-        args.pool_member_uid,
-        args.pool_advertise_ip,
-    ) else {
+    let (Some(name), Some(advertise_ip)) = (args.pool_member_id, args.pool_advertise_ip) else {
         return Err(miette::miette!(
             "--mode=shared runs a supervisor pool member and needs {}",
             missing.join(", ")
@@ -70,7 +63,6 @@ fn run_platform(args: crate::Args) -> Result<()> {
     };
     let pool = openshell_supervisor::shared_host::PoolIdentity {
         member_id: name,
-        member_uid: incarnation,
         runtime_address: std::net::SocketAddr::new(advertise_ip, runtime_listen.port()),
     };
     // The supervisor token travels only over TLS; the host verifies the

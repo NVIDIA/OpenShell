@@ -300,14 +300,6 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
-            name: OPENSHELL_SUPERVISOR_POOL_MEMBER_UID
-            valueFrom:
-              fieldRef:
-                fieldPath: metadata.uid
-        documentIndex: 0
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
             name: OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP
             valueFrom:
               fieldRef:
@@ -367,14 +359,6 @@ tests:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.name
-        documentIndex: 0
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_SUPERVISOR_POOL_MEMBER_UID
-            valueFrom:
-              fieldRef:
-                fieldPath: metadata.uid
         documentIndex: 0
       - contains:
           path: spec.template.spec.containers[0].env

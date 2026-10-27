@@ -83,21 +83,16 @@ struct Args {
     #[arg(long, required_if_eq("mode", "shared"))]
     session_root: Option<PathBuf>,
 
-    /// Stable name of this shared supervisor as a member of the gateway's
-    /// supervisor pool (its Pod name), so the gateway can place, keep, and
-    /// fail over sandbox instances among members. Required for
-    /// `--mode=shared`.
+    /// Opaque, stable logical ID of this shared supervisor as a member of
+    /// the gateway's supervisor pool, so the gateway can place, keep, and
+    /// fail over sandbox instances among members. One process serves a
+    /// member at a time. Required for `--mode=shared`.
     #[arg(long, env = "OPENSHELL_SUPERVISOR_POOL_MEMBER_ID")]
     pool_member_id: Option<String>,
 
-    /// Identity of this incarnation of the pool member (its Pod UID).
-    /// Required for `--mode=shared`.
-    #[arg(long, env = "OPENSHELL_SUPERVISOR_POOL_MEMBER_UID")]
-    pool_member_uid: Option<String>,
-
-    /// Address other pool members redirect this member's sandbox runtimes
-    /// to (its Pod IP); the runtime listener's port is appended. Required for
-    /// `--mode=shared`.
+    /// IP address, reachable from sandbox runtimes, that other pool members
+    /// redirect this member's sandbox runtimes to; the runtime listener's
+    /// port is appended. Required for `--mode=shared`.
     #[arg(long, env = "OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP")]
     pool_advertise_ip: Option<std::net::IpAddr>,
 
