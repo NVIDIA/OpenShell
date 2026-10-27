@@ -35,7 +35,8 @@ policy inputs, auth bundle, backend descriptor, and file locations.
 `SandboxInstanceBindings` is the live state its owner prepares once: the
 `GatewayCredentials` issued from the auth bundle, the OCSF context and JSON
 settings, the log sink, and the denial history served by `policy.local`.
-`SandboxInstanceControls` carries the owner's stop signal and readiness.
+`SandboxInstanceControls` carries the owner's stop signal, suspension requests,
+and readiness.
 Everything else, including credential renewal, policy, provider credentials and
 token grants, middleware credentials, the backend connection, and the access
 plane, is created by the instance. Gateway clients receive a `GatewayEndpoint`,
@@ -81,6 +82,32 @@ when a dedicated supervisor exits. A hosted instance without an explicit proxy
 trust directory uses its private directory. Hosted processes must install
 `LogPushLayer::thread_bound` and an `OcsfShorthandLayer` writing to
 `SandboxInstanceDenialWriter`.
+
+## Suspend and resume
+
+The dedicated process wrapper installs a `SIGUSR1` handler at startup and
+maps it to that instance's suspension request stream. Hosted instances never
+subscribe to process-wide suspension signals; `SandboxInstanceHost::request_suspend`
+queues a request for one instance by key. Pending requests coalesce, and a
+failed suspension can be retried with another request. After the workload
+starts, requests suspend it when the backend advertises
+`openshell.sandbox.suspend-resume`; otherwise the instance ignores them.
+
+While suspending, the supervisor stops waiting on the workload so a fenced
+generation's stream failure cannot race the request. The backend retains the
+state and hands its handle to the compute driver through their native
+integration. On success the instance ends with status 0 without writing a
+reference file, calling `TerminateBoundary`, or reporting a main-process exit.
+The dedicated wrapper exits; a shared host keeps its other instances running.
+On failure it resumes waiting on the workload. Both outcomes emit OCSF events
+without reference bytes.
+
+Resume is provisioned by the driver and backend. The supervisor's ordinary
+`OpenBoundary` call can prepare a restored boundary. The opening response selects
+its launch path; actual restoration may wait until `StartAgent`, after policy
+admission. A late restore failure fails startup. A successful resumed launch is
+reported only after `StartAgent` succeeds. No retention state or policy is carried
+in the shared supervisor bootstrap metadata.
 
 ## Console logging
 

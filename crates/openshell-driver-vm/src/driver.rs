@@ -63,10 +63,10 @@ use openshell_core::proto::compute::v1::{
     GpuResourceCapabilities, ListSandboxesRequest, ListSandboxesResponse,
     MemoryResourceCapabilities, ResolvedWorkloadIdentity, ResourceCapabilities,
     StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
-    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
-    WatchSandboxesSandboxEvent, WorkloadIdentityRequest, compute_driver_server::ComputeDriver,
-    watch_sandboxes_event,
+    SuspendSandboxRequest, SuspendSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
+    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
+    WorkloadIdentityRequest, compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -4950,6 +4950,15 @@ impl ComputeDriver for VmDriver {
         Ok(Response::new(ListSandboxesResponse {
             sandboxes: self.current_snapshots().await,
         }))
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        _request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SuspendSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "the VM compute driver does not support sandbox suspend",
+        ))
     }
 
     async fn stop_sandbox(

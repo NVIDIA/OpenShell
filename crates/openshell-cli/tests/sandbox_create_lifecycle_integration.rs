@@ -241,6 +241,20 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn suspend_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::SuspendSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ResumeSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn get_sandbox(
         &self,
         request: tonic::Request<GetSandboxRequest>,
@@ -4158,4 +4172,46 @@ async fn service_forward_falls_back_to_session_tokens_once_for_a_legacy_gateway(
             .all(|init| matches!(init.target, Some(tcp_forward_init::Target::Tcp(_))))
     );
     forward.abort();
+}
+
+#[tokio::test]
+async fn rejected_suspend_preserves_active_forwards() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let mut forward = tokio::process::Command::new("sleep")
+                .arg("60")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let directory = xdg_dir.path().join("openshell/forwards/default");
+            fs::create_dir_all(&directory).unwrap();
+            let pid_file = directory.join("suspend-rejected-8080.pid");
+            fs::write(
+                &pid_file,
+                format!("{}\tsb-forward\t127.0.0.1", forward.id().unwrap()),
+            )
+            .unwrap();
+            let error = run::sandbox_suspend(
+                &server.endpoint,
+                "suspend-rejected",
+                "default",
+                &test_tls(&server),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("unused"), "{error:?}");
+            assert!(
+                pid_file.exists(),
+                "rejected suspension must preserve forward registration"
+            );
+            assert!(
+                forward.try_wait().unwrap().is_none(),
+                "rejected suspension must keep the forward process alive"
+            );
+            forward.kill().await.unwrap();
+        })
+        .await;
 }

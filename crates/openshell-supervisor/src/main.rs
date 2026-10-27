@@ -248,6 +248,26 @@ fn backend_descriptor(args: &Args, admitted_backend: &str) -> Result<BackendDesc
     })
 }
 
+// Bound the protected identity and TLS metadata before allocating it.
+const MAX_BOUNDARY_LAUNCH_BYTES: usize = 1024 * 1024;
+
+fn read_boundary_launch(
+    path: &Path,
+) -> Result<openshell_sandbox_backend::delegated::DelegatedLaunch> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)
+        .map_err(|error| miette::miette!("read boundary launch metadata: {error}"))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_BOUNDARY_LAUNCH_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| miette::miette!("read boundary launch metadata: {error}"))?;
+    if bytes.len() > MAX_BOUNDARY_LAUNCH_BYTES {
+        return Err(miette::miette!("boundary launch metadata exceeds 1 MiB"));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| miette::miette!("decode boundary launch metadata: {error}"))
+}
+
 fn backend_setup(
     args: &Args,
     admitted_backend: &str,
@@ -287,10 +307,7 @@ fn backend_setup(
     let path = args.boundary_launch_file.as_ref().ok_or_else(|| {
         miette::miette!("--boundary-launch-file is required for a registered external backend")
     })?;
-    let bytes = std::fs::read(path)
-        .map_err(|error| miette::miette!("read boundary launch metadata: {error}"))?;
-    let launch = serde_json::from_slice(&bytes)
-        .map_err(|error| miette::miette!("decode boundary launch metadata: {error}"))?;
+    let launch = read_boundary_launch(path)?;
     Ok(Box::new(registrations.resolve(admitted_backend, launch)?))
 }
 
@@ -1046,6 +1063,18 @@ mod tests {
         ])
         .expect("network-proxy arguments");
         assert!(validate_role_arguments(&args).is_err());
+    }
+
+    #[test]
+    fn boundary_launch_input_is_bounded_before_decoding() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("boundary.json");
+        assert!(read_boundary_launch(&path).is_err());
+        std::fs::write(&path, vec![b' '; MAX_BOUNDARY_LAUNCH_BYTES + 1]).unwrap();
+        let error = read_boundary_launch(&path).unwrap_err();
+        assert!(error.to_string().contains("exceeds 1 MiB"));
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(read_boundary_launch(&path).is_err());
     }
 
     #[test]

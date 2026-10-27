@@ -121,8 +121,13 @@ message Attach {
 // unmediated egress path; supervisor-dependent operations fail closed.
 // A backend may terminate, pause, or keep a disconnected workload contained.
 message Confirm {}
-// Start with the policy retained by Attach. Unsupported provider files must be
-// rejected before workload execution.
+// Begin workload execution with the policy admitted by Attach and Confirm.
+// For a prepared restore, complete restoration here and return the restored
+// main process rather than starting a duplicate. Restoration may immediately
+// execute workload instructions, so all launch-time controls must be installed
+// before invoking it. A deferred restore failure fails this call, without
+// silently changing the launch path selected when the boundary was opened.
+// Unsupported provider files must be rejected before workload execution.
 message StartAgent {
   string sandbox_id = 1;
   AgentSpec spec = 2;

@@ -213,6 +213,8 @@ mod tests {
         for path in [
             "/openshell.v1.OpenShell/StopSandbox",
             "/openshell.v1.OpenShell/StartSandbox",
+            "/openshell.v1.OpenShell/SuspendSandbox",
+            "/openshell.v1.OpenShell/ResumeSandbox",
         ] {
             let entry = lookup(path).expect("lifecycle RPC must have auth metadata");
             assert_eq!(entry.auth_mode, AuthMode::Bearer);

@@ -34,11 +34,11 @@ use openshell_core::proto::{
     ExecSandboxStdout, GetSandboxRequest, GetSandboxTemplateRequest, ListSandboxProvidersRequest,
     ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
     ListSandboxesRequest, ListSandboxesResponse, Provider, ProviderMutationKind,
-    ResourceRequirements, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResources,
-    SandboxResponse, SandboxSpec, SandboxStreamEvent, SandboxTemplateResponse,
+    ResourceRequirements, ResumeSandboxRequest, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    SandboxResources, SandboxResponse, SandboxSpec, SandboxStreamEvent, SandboxTemplateResponse,
     SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance, SshRelayTarget,
-    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    WatchSandboxRequest, relay_open, tcp_forward_init,
+    StartSandboxRequest, StopSandboxRequest, SuspendSandboxRequest, TcpForwardFrame,
+    TcpForwardInit, TcpRelayTarget, WatchSandboxRequest, relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{
     BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
@@ -1840,6 +1840,103 @@ async fn handle_start_sandbox_inner(
     }))
 }
 
+pub(super) async fn handle_suspend_sandbox(
+    state: &Arc<ServerState>,
+    request: Request<SuspendSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let result = handle_suspend_sandbox_inner(state, request).await;
+    openshell_core::telemetry::emit_lifecycle(
+        LifecycleResource::Sandbox,
+        LifecycleOperation::Suspend,
+        if result.is_ok() {
+            TelemetryOutcome::Success
+        } else {
+            TelemetryOutcome::Failure
+        },
+    );
+    result
+}
+
+async fn handle_suspend_sandbox_inner(
+    state: &Arc<ServerState>,
+    request: Request<SuspendSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    let resolved = resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &req.name,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = resolved.object_workspace();
+    let name = resolved.object_name();
+    let sandbox = state.compute.suspend_sandbox(workspace, name).await?;
+    info!(sandbox_name = %name, "SuspendSandbox request completed successfully");
+    Ok(Response::new(SandboxResponse {
+        sandbox: Some(sandbox),
+        service_urls: HashMap::new(),
+    }))
+}
+
+pub(super) async fn handle_resume_sandbox(
+    state: &Arc<ServerState>,
+    request: Request<ResumeSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let result = handle_resume_sandbox_inner(state, request).await;
+    openshell_core::telemetry::emit_lifecycle(
+        LifecycleResource::Sandbox,
+        LifecycleOperation::Resume,
+        if result.is_ok() {
+            TelemetryOutcome::Success
+        } else {
+            TelemetryOutcome::Failure
+        },
+    );
+    result
+}
+
+async fn handle_resume_sandbox_inner(
+    state: &Arc<ServerState>,
+    request: Request<ResumeSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    let resolved = resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &req.name,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = resolved.object_workspace().to_string();
+    let name = resolved.object_name().to_string();
+    let mut sandbox = state
+        .compute
+        .resume_sandbox_authenticated(
+            &workspace,
+            &name,
+            req.restart_if_restore_fails,
+            state.sandbox_session_jwt_authority.as_deref(),
+        )
+        .await?;
+    let remote_authority =
+        crate::supervisor_session::remote_supervisor_owner(state, sandbox.object_id())
+            .await?
+            .is_some();
+    state
+        .supervisor_sessions
+        .project_endpoint_status(&mut sandbox, remote_authority);
+    info!(sandbox_name = %name, "ResumeSandbox request completed successfully");
+    Ok(Response::new(SandboxResponse {
+        sandbox: Some(sandbox),
+        service_urls: HashMap::new(),
+    }))
+}
+
 pub async fn mint_persisted_authentication(
     state: &ServerState,
     sandbox: &Sandbox,
@@ -2499,7 +2596,11 @@ pub(super) async fn handle_watch_sandbox(
 fn is_watch_terminal(phase: SandboxPhase) -> bool {
     matches!(
         phase,
-        SandboxPhase::Ready | SandboxPhase::Completed | SandboxPhase::Stopped | SandboxPhase::Error
+        SandboxPhase::Ready
+            | SandboxPhase::Completed
+            | SandboxPhase::Stopped
+            | SandboxPhase::Suspended
+            | SandboxPhase::Error
     )
 }
 
@@ -4231,6 +4332,7 @@ mod tests {
             SandboxPhase::Ready,
             SandboxPhase::Completed,
             SandboxPhase::Stopped,
+            SandboxPhase::Suspended,
             SandboxPhase::Error,
         ] {
             assert!(is_watch_terminal(phase), "{phase:?} should stop the watch");
@@ -4239,6 +4341,7 @@ mod tests {
             SandboxPhase::Provisioning,
             SandboxPhase::Starting,
             SandboxPhase::Stopping,
+            SandboxPhase::Suspending,
             SandboxPhase::Deleting,
             SandboxPhase::Unknown,
         ] {

@@ -142,6 +142,7 @@ struct HostedSandboxInstance {
     fingerprint: [u8; 32],
     sandbox_id: String,
     stop: watch::Sender<bool>,
+    suspend: tokio::sync::mpsc::Sender<()>,
     abort: watch::Sender<bool>,
     phase: watch::Receiver<SandboxInstancePhaseReport>,
     ready: watch::Receiver<bool>,
@@ -302,6 +303,7 @@ impl SandboxInstanceHost {
                 fingerprint,
                 sandbox_id,
                 stop: running.stop,
+                suspend: running.suspend,
                 abort: running.abort,
                 phase: running.phase,
                 ready: running.ready,
@@ -311,6 +313,24 @@ impl SandboxInstanceHost {
         );
         self.changes.notify();
         Ok(SandboxInstanceAdmitted::Created)
+    }
+
+    /// Request suspension of one hosted instance. This only queues the request;
+    /// the backend still decides whether suspension succeeds. Repeated pending
+    /// requests coalesce. Returns false for missing, removing, or exited instances.
+    #[must_use]
+    pub fn request_suspend(&self, key: &str) -> bool {
+        let instances = lock(&self.instances);
+        let Some(instance) = instances
+            .get(key)
+            .filter(|instance| instance.removal.is_none())
+        else {
+            return false;
+        };
+        matches!(
+            instance.suspend.try_send(()),
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(()))
+        )
     }
 
     /// Status of a hosted sandbox instance, including one that ended but has
@@ -469,6 +489,7 @@ impl Removal {
 /// Signals and thread of one started instance runtime.
 struct RunningInstance {
     stop: watch::Sender<bool>,
+    suspend: tokio::sync::mpsc::Sender<()>,
     abort: watch::Sender<bool>,
     phase: watch::Receiver<SandboxInstancePhaseReport>,
     ready: watch::Receiver<bool>,
@@ -481,6 +502,7 @@ fn spawn_instance(
     changes: ChangeNotifier,
 ) -> std::result::Result<RunningInstance, SandboxInstanceHostError> {
     let (stop, stop_requested) = watch::channel(false);
+    let (suspend, suspend_requested) = tokio::sync::mpsc::channel(1);
     let (abort, abort_requested) = watch::channel(false);
     let (phase_tx, phase) = watch::channel(SandboxInstancePhaseReport::Starting);
     let (ready_tx, ready) = watch::channel(false);
@@ -493,6 +515,7 @@ fn spawn_instance(
                 body,
                 SandboxInstanceSignals {
                     stop_requested,
+                    suspend_requested,
                     abort_requested,
                     phase: phase_tx,
                     ready: ready_tx,
@@ -506,6 +529,7 @@ fn spawn_instance(
         })?;
     Ok(RunningInstance {
         stop,
+        suspend,
         abort,
         phase,
         ready,
@@ -515,6 +539,7 @@ fn spawn_instance(
 
 struct SandboxInstanceSignals {
     stop_requested: watch::Receiver<bool>,
+    suspend_requested: tokio::sync::mpsc::Receiver<()>,
     abort_requested: watch::Receiver<bool>,
     phase: watch::Sender<SandboxInstancePhaseReport>,
     ready: watch::Sender<bool>,
@@ -554,6 +579,7 @@ fn run_hosted_sandbox_instance(
 ) {
     let SandboxInstanceSignals {
         stop_requested,
+        suspend_requested,
         mut abort_requested,
         phase,
         ready,
@@ -617,6 +643,7 @@ fn run_hosted_sandbox_instance(
                     });
                     let instance = body(SandboxInstanceControls {
                         shutdown,
+                        suspend: Box::pin(tokio_stream::wrappers::ReceiverStream::new(suspend_requested)),
                         readiness,
                     });
                     let outcome = tokio::select! {
@@ -852,6 +879,7 @@ mod tests {
                 let SandboxInstanceControls {
                     shutdown,
                     readiness,
+                    ..
                 } = controls;
                 // Nested tasks and the blocking pool inherit the instance identity.
                 let observed = tokio::spawn(async {
@@ -961,6 +989,51 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let host = SandboxInstanceHost::new(root.path().join("instances")).unwrap();
         (root, Arc::new(host))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn suspend_requests_are_isolated_and_retryable_between_hosted_instances() {
+        let (_root, host) = private_host();
+        let (observed, mut requests) = mpsc::channel(8);
+        for key in ["alpha", "beta"] {
+            let observed = observed.clone();
+            let body: SandboxInstanceBody = Box::new(move |mut controls| {
+                Box::pin(async move {
+                    controls.readiness.send_replace(true);
+                    loop {
+                        tokio::select! {
+                            Some(()) = futures::StreamExt::next(&mut controls.suspend) => {
+                                // Leave this instance running, as after a failed
+                                // suspension, so a later request can retry it.
+                                observed.send(key).await.unwrap();
+                            }
+                            () = &mut controls.shutdown => return Ok(0),
+                        }
+                    }
+                })
+            });
+            admit(&host, key, key, 1, unbound(), body).unwrap();
+            wait_supervising(&host, key).await;
+        }
+        assert!(!host.request_suspend("missing"));
+        for key in ["alpha", "alpha", "beta"] {
+            assert!(host.request_suspend(key));
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), requests.recv())
+                    .await
+                    .unwrap(),
+                Some(key)
+            );
+        }
+        assert!(
+            requests.try_recv().is_err(),
+            "requests must never reach another instance"
+        );
+        for key in ["alpha", "beta"] {
+            assert!(host.status(key).unwrap().ready);
+        }
+        host.remove_all(Duration::from_secs(1)).await;
+        assert!(!host.request_suspend("alpha"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
