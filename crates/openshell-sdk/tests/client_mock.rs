@@ -2535,6 +2535,7 @@ async fn raw_discovery_shares_transport_and_refreshes_the_live_auth_slot() {
     let client = OpenShellClient::connect(config).await.unwrap();
     let mut discovery = client.raw_service_discovery();
     let request = proto::GetServiceRouteSnapshotRequest {
+        workspaces: Vec::new(),
         workspace_scope: Some(proto::workspace_selector("team")),
     };
     assert_eq!(
