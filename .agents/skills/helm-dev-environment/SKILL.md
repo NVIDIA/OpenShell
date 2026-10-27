@@ -118,7 +118,12 @@ RollingUpdate Deployment (`maxSurge: 1`, `maxUnavailable: 0`) with a 60-second
 grace period, no affinity unless `supervisor.affinity` is set (top-level
 `affinity` applies only to the gateway), the pool identity env vars
 (`OPENSHELL_SUPERVISOR_POOL_MEMBER_ID` and `_ADVERTISE_IP` from the Pod name
-and IP), and a `maxUnavailable: 1` PodDisruptionBudget.
+and IP), and a `maxUnavailable: 1` PodDisruptionBudget unless
+`supervisor.podDisruptionBudget.enabled=false` (default `true`; toggling it
+changes only the PodDisruptionBudget). Each supervisor resource has its own
+template: `supervisor.yaml` (Deployment), `supervisor-service.yaml`,
+`supervisor-networkpolicy.yaml`, `supervisor-token-secret.yaml`,
+`supervisor-pdb.yaml`, and `supervisor-hpa.yaml`.
 `ci/values-supervisor-ha.yaml` selects two replicas and a 60-second recovery
 timeout. The topology needs gateway TLS: the e2e harness keeps it on with
 `ci/values-tls-port-forward.yaml` and `OPENSHELL_E2E_KUBE_TLS=1`, which reaches

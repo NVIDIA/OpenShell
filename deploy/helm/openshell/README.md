@@ -625,6 +625,7 @@ discovery endpoint or its TLS CA.
 | supervisor.image.registry | string | `""` | Supervisor image registry. Empty uses global.image.registry. |
 | supervisor.image.repository | string | `"openshell/supervisor"` | Supervisor image repository. |
 | supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
+| supervisor.podDisruptionBudget.enabled | bool | `true` | Render a PodDisruptionBudget with maxUnavailable 1 for the shared supervisor, used only when gatewayConfig selects supervisor_topology = "gateway". Disable it only when maintenance must evict more than one supervisor Pod at a time, or evict a member while another is unavailable. |
 | supervisor.podSecurityContext.fsGroup | int | `65534` | fsGroup assigned to the shared supervisor pod. |
 | supervisor.podSecurityContext.runAsGroup | int | `65534` | Primary GID assigned to the shared supervisor pod. |
 | supervisor.podSecurityContext.runAsNonRoot | bool | `true` | Require the shared supervisor to run as a non-root user. |

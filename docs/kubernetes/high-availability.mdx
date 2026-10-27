@@ -544,6 +544,15 @@ with your Helm release name. A required rule leaves a replica Pending when there
 are not enough nodes; use `preferredDuringSchedulingIgnoredDuringExecution` to
 spread replicas when possible without blocking scheduling.
 
+The chart also creates a PodDisruptionBudget that lets voluntary disruptions,
+such as node drains, evict one supervisor at a time. If maintenance must evict
+more supervisors at once, set `supervisor.podDisruptionBudget.enabled` to
+`false` for the maintenance window and set it back to `true` afterward:
+
+```shell
+helm upgrade openshell <chart> -n openshell --reuse-values --set supervisor.podDisruptionBudget.enabled=false
+```
+
 ### Recover from a Supervisor Failure
 
 When a supervisor fails, the gateway moves its sandboxes to a live supervisor.

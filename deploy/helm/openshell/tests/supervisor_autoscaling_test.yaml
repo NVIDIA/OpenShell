@@ -4,6 +4,7 @@ suite: shared supervisor memory autoscaling
 templates:
   - templates/supervisor-hpa.yaml
   - templates/supervisor.yaml
+  - templates/supervisor-pdb.yaml
   - templates/hpa.yaml
 release:
   name: openshell
@@ -74,6 +75,30 @@ tests:
       - equal:
           path: spec.replicas
           value: 3
+  - it: keeps the PodDisruptionBudget alongside the HPA by default
+    template: templates/supervisor-pdb.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+  - it: drops only the PodDisruptionBudget when disabled under the HPA
+    set:
+      supervisor.podDisruptionBudget.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+        template: templates/supervisor-pdb.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-hpa.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor.yaml
+      - notExists:
+          path: spec.replicas
+        template: templates/supervisor.yaml
   - it: adds no supervisor HPA when disabled
     template: templates/supervisor-hpa.yaml
     set:

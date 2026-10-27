@@ -363,6 +363,16 @@ raw gateway configuration so openshell.effectiveKubernetesConfig can use it.
 {{- end }}
 
 {{/*
+Whether the shared supervisor PodDisruptionBudget renders. A missing
+podDisruptionBudget map or enabled value means enabled on older releases.
+*/}}
+{{- define "openshell.supervisorPodDisruptionBudgetEnabled" -}}
+{{- $pdb := get (.Values.supervisor | default dict) "podDisruptionBudget" | default dict -}}
+{{- $enabled := ternary (get $pdb "enabled") true (kindIs "map" $pdb) -}}
+{{- if not (and (kindIs "bool" $enabled) (not $enabled)) -}}true{{- end -}}
+{{- end }}
+
+{{/*
 Name of the shared supervisor Deployment and Service (and, with `-token`, its token Secret):
 the fullname with a fixed suffix, within the 63-character Service name limit.
 A fullname without room for the suffix keeps a prefix and a hash of the whole
@@ -728,6 +738,13 @@ Validate chart values that Helm would otherwise accept silently.
 {{- fail "shared_supervisor is rendered by the chart; set only supervisor_topology" -}}
 {{- end -}}
 {{- include "openshell.validateSupervisorAutoscaling" . -}}
+{{- $pdb := get (.Values.supervisor | default dict) "podDisruptionBudget" | default dict -}}
+{{- if not (kindIs "map" $pdb) -}}
+{{- fail "supervisor.podDisruptionBudget must be a map" -}}
+{{- end -}}
+{{- if and (hasKey $pdb "enabled") (not (kindIs "invalid" (get $pdb "enabled"))) (not (kindIs "bool" (get $pdb "enabled"))) -}}
+{{- fail "supervisor.podDisruptionBudget.enabled must be a boolean" -}}
+{{- end -}}
 {{- $_ := include "openshell.supervisorPoolConfig" . -}}
 {{- $workloadKind := include "openshell.workloadKind" . -}}
 {{- $workload := .Values.workload | default dict -}}

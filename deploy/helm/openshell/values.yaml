@@ -102,6 +102,12 @@ supervisor:
           - type: Pods
             value: 1
             periodSeconds: 120
+  podDisruptionBudget:
+    # -- Render a PodDisruptionBudget with maxUnavailable 1 for the shared
+    # supervisor, used only when gatewayConfig selects supervisor_topology =
+    # "gateway". Disable it only when maintenance must evict more than one
+    # supervisor Pod at a time, or evict a member while another is unavailable.
+    enabled: true
   # -- Seconds a sandbox workload stays frozen after losing its pool member's
   # supervision before the sandbox runtime terminates it, rendered as
   # [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an

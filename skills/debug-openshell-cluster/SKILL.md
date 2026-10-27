@@ -1166,7 +1166,10 @@ driver's `shared_supervisor` table carries no pool settings), rolls one member
 at a time, sets no affinity by default (set `supervisor.affinity` to control
 supervisor scheduling; top-level `affinity` applies only to the gateway), gives
 each member a 60-second grace period to leave,
-and adds a `<release>-supervisor` PodDisruptionBudget with `maxUnavailable: 1`.
+and adds a `<release>-supervisor` PodDisruptionBudget with `maxUnavailable: 1`
+unless `supervisor.podDisruptionBudget.enabled` is `false` (default `true`).
+If a node drain stalls on supervisor evictions, check the budget's allowed
+disruptions; disable it only for the maintenance window.
 Each member takes its stable member ID from `OPENSHELL_SUPERVISOR_POOL_MEMBER_ID`
 (the Pod name) and its runtime address from
 `OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP` (the Pod IP, which sandbox runtimes
