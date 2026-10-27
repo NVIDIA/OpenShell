@@ -3320,6 +3320,61 @@ require_client_auth = true
     }
 
     #[test]
+    fn partial_metrics_tls_flags_are_rejected_with_actionable_errors() {
+        Environment::new()
+            .remove("OPENSHELL_METRICS_TLS_CERT")
+            .remove("OPENSHELL_METRICS_TLS_KEY")
+            .remove("OPENSHELL_METRICS_TLS_CLIENT_CA")
+            .remove("OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH")
+            .run(|| {
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-tls-key",
+                    "/metrics/tls.key",
+                ]);
+                let error = resolve_metrics_tls(&args).expect_err("cert is required");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("metrics TLS requires --metrics-tls-cert"),
+                    "error: {error}"
+                );
+
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-tls-cert",
+                    "/metrics/tls.crt",
+                ]);
+                let error = resolve_metrics_tls(&args).expect_err("key is required");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("metrics TLS requires --metrics-tls-key"),
+                    "error: {error}"
+                );
+
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-tls-client-ca",
+                    "/metrics/ca.crt",
+                ]);
+                let error = resolve_metrics_tls(&args).expect_err("cert and key are required");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("metrics TLS requires --metrics-tls-cert"),
+                    "error: {error}"
+                );
+            });
+    }
+
+    #[test]
     fn explicit_metrics_client_auth_value_overrides_file_value() {
         Environment::new()
             .remove("OPENSHELL_METRICS_TLS_CERT")
