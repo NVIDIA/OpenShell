@@ -169,6 +169,8 @@ the shared `check-protobuf-compatibility` action with `nix run .#check-protobuf-
 During `0.x`, a minor train permits compatibility findings
 as warnings; a patch train or no active train rejects them. Compare the current
 train's version with the latest stable release; commit messages are irrelevant.
+For the patch-train `v0.1.6-pre.N` exception, inspect the run summary and the
+qualification JSON's `exceptions` array; see `release-captain` for disposition.
 Compilation, baseline, and tool errors remain fatal. The `protobuf_compatibility` suite participates in
 the `release-tag-v1` qualification profile. Pre-release calls the reusable
 `release-qualification.yml` workflow after building, in parallel with publication. Release

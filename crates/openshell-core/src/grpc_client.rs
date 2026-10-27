@@ -370,6 +370,24 @@ impl tonic::service::Interceptor for AuthInterceptor {
     }
 }
 
+/// Configure server-authenticated TLS for the gateway control-plane endpoint.
+///
+/// Trust only the configured gateway CA. Destination, system, and proxy
+/// trust are intentionally not parameters to this control-plane boundary.
+fn configure_gateway_tls(
+    ep: Endpoint,
+    ca_pem: Vec<u8>,
+    server_name: Option<&str>,
+) -> Result<Endpoint> {
+    let mut tls_config = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem));
+    if let Some(server_name) = server_name.filter(|name| !name.is_empty()) {
+        tls_config = tls_config.domain_name(server_name);
+    }
+    ep.tls_config(tls_config)
+        .into_diagnostic()
+        .wrap_err("failed to configure TLS")
+}
+
 /// Build the plain (un-intercepted) gRPC channel.
 ///
 /// When the endpoint uses `https://`, server-authenticated TLS is configured
@@ -405,27 +423,12 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to read CA cert from {ca_path}"))?;
 
-        // Trust only the configured CA — this is the chart's internal CA
-        // that signs the gateway's internal server certificate. The gateway uses SNI-based
-        // certificate selection to present this internal cert to supervisor
-        // connections, so no public root trust is needed here.
-        //
-        // Do NOT add `.with_native_roots()` or `.with_webpki_roots()` here:
-        // the supervisor runs inside the user-selected sandbox image
-        // (Docker/Podman drivers), and broadening the trust store would let
-        // an attacker who controls the image + DNS present a publicly valid
-        // certificate and intercept the supervisor→gateway TLS connection.
-        let mut tls_config = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem));
-        if let Ok(server_name) = std::env::var(sandbox_env::GATEWAY_TLS_SERVER_NAME)
-            && !server_name.is_empty()
-        {
-            tls_config = tls_config.domain_name(server_name);
-        }
-
-        ep = ep
-            .tls_config(tls_config)
-            .into_diagnostic()
-            .wrap_err("failed to configure TLS")?;
+        // The gateway uses SNI-based certificate selection to present its
+        // internal cert to supervisor connections. Do not add native,
+        // webpki, destination, or child-process roots here: an image that can
+        // influence DNS must not broaden supervisor→gateway authentication.
+        let server_name = std::env::var(sandbox_env::GATEWAY_TLS_SERVER_NAME).ok();
+        ep = configure_gateway_tls(ep, ca_pem, server_name.as_deref())?;
     }
 
     ep.connect()
@@ -459,6 +462,125 @@ impl Drop for ClientSpanStatus {
         if !self.finished {
             self.span.record("otel.status_code", "ERROR");
         }
+    }
+}
+
+#[cfg(test)]
+mod gateway_tls_isolation_tests {
+    use super::*;
+    use rcgen::{CertificateParams, IsCa};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::io::Cursor;
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    #[allow(clippy::struct_field_names)]
+    struct TestPki {
+        ca_pem: Vec<u8>,
+        server_cert_pem: Vec<u8>,
+        server_key_pem: Vec<u8>,
+    }
+
+    fn test_pki(server_name: &str) -> TestPki {
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let ca = openshell_crypto::pki::self_signed(ca_params, &ca_key).unwrap();
+
+        let server_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let server_params = CertificateParams::new(vec![server_name.to_string()]).unwrap();
+        let server =
+            openshell_crypto::pki::signed_by(server_params, &server_key, &ca, &ca_key).unwrap();
+        TestPki {
+            ca_pem: ca.pem().into_bytes(),
+            server_cert_pem: server.pem().into_bytes(),
+            server_key_pem: server_key.serialize_pem().unwrap().into_bytes(),
+        }
+    }
+
+    async fn start_h2_tls_server(pki: &TestPki) -> std::net::SocketAddr {
+        let certificates = rustls_pemfile::certs(&mut Cursor::new(&pki.server_cert_pem))
+            .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
+            .unwrap();
+        let key: PrivateKeyDer<'static> =
+            rustls_pemfile::private_key(&mut Cursor::new(&pki.server_key_pem))
+                .unwrap()
+                .unwrap();
+        let mut config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certificates, key)
+            .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            if let Ok(mut connection) = h2::server::handshake(stream).await {
+                while let Some(request) = connection.accept().await {
+                    if request.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        address
+    }
+
+    async fn connect_with_gateway_ca(
+        address: std::net::SocketAddr,
+        pki: &TestPki,
+        server_name: &str,
+    ) -> Result<Channel> {
+        let endpoint = Endpoint::from_shared(format!("https://{address}")).into_diagnostic()?;
+        configure_gateway_tls(endpoint, pki.ca_pem.clone(), Some(server_name))?
+            .connect()
+            .await
+            .into_diagnostic()
+    }
+
+    #[tokio::test]
+    async fn destination_ca_cannot_authenticate_gateway() {
+        const GATEWAY_NAME: &str = "gateway.internal.test";
+        let gateway = test_pki(GATEWAY_NAME);
+        let destination = test_pki(GATEWAY_NAME);
+
+        let real_address = start_h2_tls_server(&gateway).await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_with_gateway_ca(real_address, &gateway, GATEWAY_NAME),
+        )
+        .await
+        .expect("real gateway connection timed out")
+        .expect("configured gateway CA should authenticate the gateway");
+
+        let fake_address = start_h2_tls_server(&destination).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_with_gateway_ca(fake_address, &gateway, GATEWAY_NAME),
+        )
+        .await
+        .expect("fake gateway rejection timed out")
+        .expect_err("destination-signed fake gateway must be rejected");
+        assert!(format!("{error:?}").contains("certificate"), "{error:?}");
+
+        let mismatch_address = start_h2_tls_server(&gateway).await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_with_gateway_ca(mismatch_address, &gateway, "wrong.internal.test"),
+        )
+        .await
+        .expect("hostname mismatch rejection timed out")
+        .expect_err("normal server-name verification must remain enabled");
     }
 }
 

@@ -3,6 +3,42 @@
 
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsEnvironmentMode {
+    /// `OpenShell`'s generated trust files are authoritative for mediated traffic.
+    Override,
+    /// Preserve caller-provided TLS variables and fill only missing values.
+    FillMissing,
+}
+
+const TLS_ENVIRONMENT_VARIABLES: [&str; 6] = [
+    "NODE_EXTRA_CA_CERTS",
+    "DENO_CERT",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+];
+
+#[must_use]
+pub fn is_tls_environment_variable(key: &str) -> bool {
+    TLS_ENVIRONMENT_VARIABLES.contains(&key)
+}
+
+pub fn tls_env_vars_for_mode<S: std::hash::BuildHasher>(
+    ca_cert_path: &Path,
+    combined_bundle_path: &Path,
+    mode: TlsEnvironmentMode,
+    user_environment: &std::collections::HashMap<String, String, S>,
+) -> Vec<(&'static str, String)> {
+    tls_env_vars(ca_cert_path, combined_bundle_path)
+        .into_iter()
+        .filter(|(key, _)| {
+            matches!(mode, TlsEnvironmentMode::Override) || !user_environment.contains_key(*key)
+        })
+        .collect()
+}
+
 pub fn tls_env_vars(
     ca_cert_path: &Path,
     combined_bundle_path: &Path,
@@ -49,5 +85,15 @@ mod tests {
         assert!(stdout.contains("REQUESTS_CA_BUNDLE=/etc/openshell-tls/ca-bundle.pem"));
         assert!(stdout.contains("CURL_CA_BUNDLE=/etc/openshell-tls/ca-bundle.pem"));
         assert!(stdout.contains("GIT_SSL_CAINFO=/etc/openshell-tls/ca-bundle.pem"));
+
+        let keys = tls_env_vars(ca_cert_path, combined_bundle_path).map(|(key, _)| key);
+        assert!(
+            !keys.contains(&openshell_core::sandbox_env::TLS_CA),
+            "destination/child trust must not overwrite gateway mTLS trust"
+        );
+        assert_ne!(
+            ca_cert_path,
+            Path::new(openshell_core::container_paths::TLS_CA_MOUNT_PATH)
+        );
     }
 }

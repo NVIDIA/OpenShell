@@ -42,6 +42,21 @@ tag, or start a second `Pre-release` run for a tag; it has no concurrency guard.
   picks the highest `-pre.N` on `main` whose whole `Pre-release` run passed,
   creates the stable tag on that commit, and publishes without requalifying.
 
+### Patch-train protobuf exception
+
+All `v0.1.6-pre.N` candidates have a release-captain-approved protobuf compatibility exception
+in `release-qualification.yml`. The check still compiles both protobuf snapshots
+and runs Buf; only detected breaking changes are allowed. Compilation and tooling
+errors still fail. Other versions retain normal version-based enforcement.
+The run summary and qualification JSON record the exception and reason. Review
+all protobuf findings for each candidate and include migration guidance in the
+release notes; the exception does not accept other compatibility-review findings.
+Squash-merge PR #4976 and, after verifying v0.1.6 publication, prepare a cleanup PR
+reverting its entire squash-merge commit. Follow "Remove the v0.1.6 exception" in
+`CI.md`; remove the checker support and metadata along with the workflow exception.
+A new prerelease number
+within this patch train retains the exception; other patch or minor trains do not.
+
 ## Setup
 
 ```shell

@@ -29,6 +29,50 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?m)^enable_websocket_tunnel\s*=\s*true$'
 
+  - it: omits service_hostname_format unless a format is configured
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'service_hostname_format\s*='
+
+  - it: renders service_hostname_format from server.serviceHostnameFormat
+    template: templates/gateway-config.yaml
+    set:
+      server.serviceHostnameFormat: hashed
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_hostname_format\s*=\s*"hashed"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^name\s*=\s*"openshell"$'
+
+  - it: renders service_hostname_format with the configured installation name
+    template: templates/gateway-config.yaml
+    set:
+      server.serviceHostnameFormat: hashed
+      server.name: gateway-west
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_hostname_format\s*=\s*"hashed"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^name\s*=\s*"gateway-west"$'
+
+  - it: preserves an explicit gatewayConfig service_hostname_format over the value
+    template: templates/gateway-config.yaml
+    set:
+      server.serviceHostnameFormat: hashed
+      gatewayConfig:
+        openshell.gateway:
+          service_hostname_format: readable
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_hostname_format\s*=\s*"readable"$'
+
   - it: defaults to label admission with caller driver config disabled
     template: templates/gateway-config.yaml
     asserts:
@@ -1250,6 +1294,25 @@ tests:
       - failedTemplate:
           errorPattern: "replicaCount > 1 requires server.externalDbSecret"
 
+  - it: renders writable ephemeral XDG state for gateway trust artifacts
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: XDG_STATE_HOME
+            value: /var/lib/openshell-state
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: gateway-state
+            mountPath: /var/lib/openshell-state
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: gateway-state
+            emptyDir: {}
+
   - it: renders a Deployment for external database-backed gateway workloads
     template: templates/deployment.yaml
     set:
@@ -1287,6 +1350,16 @@ tests:
               secretKeyRef:
                 name: my-pg-secret
                 key: uri
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: gateway-state
+            mountPath: /var/lib/openshell-state
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: gateway-state
+            emptyDir: {}
 
   - it: fails when a Deployment uses the default SQLite database
     template: templates/statefulset.yaml

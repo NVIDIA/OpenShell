@@ -206,20 +206,71 @@ openshell gateway add https://127.0.0.1:8080 --local --name local
 
 ## Using Podman
 
-Replace `docker` with `podman` in the commands above. Mount the Podman socket instead of the Docker socket and set the driver to `podman`:
+The Podman driver runs sandboxes as rootless containers through the user Podman socket, and [Sandbox Runtimes](/how-it-works/sandboxes/runtimes#podman-driver) lists its requirements. The commands in this section assume rootless Podman. Enable the socket for your user:
+
+```shell
+systemctl --user enable --now podman.socket
+```
+
+Running the gateway as a rootless Podman container needs five settings beyond the Docker commands above:
+
+1. **Writable state directory.** The image runs as user `1000` and cannot write to its default home directory. Mount a host directory, set `HOME` and `XDG_DATA_HOME` to it, and add `--userns=keep-id:uid=1000,gid=1000`.
+
+2. **Same-path data directory.** The driver bind-mounts files from the data directory into each sandbox, and the host Podman resolves the path on the host. Mount the directory at the same absolute path inside the container. A named volume does not work.
+
+3. **Signing keys and TLS certificates.** Generate them with `generate-certs` and set `OPENSHELL_LOCAL_TLS_DIR` to the output directory. The gateway then serves HTTPS and requires client certificates.
+
+4. **SELinux type.** On SELinux hosts, add `--security-opt label=type:container_runtime_t`. Without it, the container cannot connect to the Podman socket. Podman ignores the option on other hosts. The gateway can start containers as your user through that socket, so run only the published gateway image.
+
+5. **Matching ports.** Supervisor containers call back to `127.0.0.1` on the gateway's in-container port. Publish the same port number on the host, or set `grpc_endpoint` as described below.
+
+Generate the keys and certificates:
+
+```shell
+data_dir="$HOME/.local/share/openshell-gateway"
+mkdir -p "$data_dir"
+
+podman run --rm \
+  --userns=keep-id:uid=1000,gid=1000 \
+  --security-opt label=type:container_runtime_t \
+  -v "$data_dir:$data_dir" \
+  -e HOME="$data_dir" \
+  ghcr.io/nvidia/openshell/gateway:latest \
+  generate-certs --output-dir "$data_dir/tls"
+```
+
+Start the gateway:
 
 ```shell
 podman run -d \
   --name openshell-gateway \
+  --userns=keep-id:uid=1000,gid=1000 \
+  --security-opt label=type:container_runtime_t \
   -p 127.0.0.1:8080:8080 \
-  -v openshell-state:/var/openshell \
+  -v "$data_dir:$data_dir" \
   -v "$XDG_RUNTIME_DIR/podman/podman.sock:/var/run/podman.sock" \
+  -e HOME="$data_dir" \
+  -e XDG_DATA_HOME="$data_dir" \
+  -e OPENSHELL_LOCAL_TLS_DIR="$data_dir/tls" \
   -e OPENSHELL_COMPUTE_DRIVER=podman \
   -e OPENSHELL_PODMAN_SOCKET=/var/run/podman.sock \
-  -e OPENSHELL_DB_URL=sqlite:/var/openshell/openshell.db \
-  -e OPENSHELL_DISABLE_TLS=true \
+  -e "OPENSHELL_DB_URL=sqlite:$data_dir/gateway.db" \
   ghcr.io/nvidia/openshell/gateway:latest
 ```
+
+If the gateway container exits at startup with `--tls-cert is required when TLS is enabled`, `OPENSHELL_LOCAL_TLS_DIR` is unset or points at a directory without the generated certificates. Set it, and run `generate-certs` first.
+
+The gateway takes a few seconds to start listening. Register it with the CLI and confirm the connection:
+
+```shell
+OPENSHELL_LOCAL_TLS_DIR="$data_dir/tls" \
+  openshell gateway add https://127.0.0.1:8080 --local --name local
+openshell status
+```
+
+The CLI imports its client certificates from `OPENSHELL_LOCAL_TLS_DIR`. Without it, the CLI reads `~/.local/state/openshell/tls`, which can hold another gateway's certificates and fails with `BadSignature`. If a gateway named `local` is already registered, run `openshell gateway remove local` first.
+
+To publish a different host port, set `grpc_endpoint` to the host address under `[openshell.drivers.podman]` in a gateway TOML file. For example, with `-p 127.0.0.1:9090:8080`, the file needs only `version = 2` under `[openshell]` and `grpc_endpoint = "https://127.0.0.1:9090"`. Save it as `$data_dir/gateway.toml`, add `-e OPENSHELL_GATEWAY_CONFIG="$data_dir/gateway.toml"` to the gateway command, and register the gateway at `https://127.0.0.1:9090`. The [gateway configuration reference](/how-it-works/gateways/configuration#podman) lists the other Podman options.
 
 ## Next Steps
 

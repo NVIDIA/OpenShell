@@ -101,9 +101,10 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Contributing    | `create-rfc`              | Create RFC proposals from the repository template                                                   |
 | Contributing    | `build-from-issue`        | Plan and implement work from a GitHub issue (maintainer workflow)                                   |
 | Contributing    | `create-github-issue`     | Create well-structured GitHub issues                                                                |
+| Contributing    | `create-security-advisory` | Prepare structured vulnerability reports and authorized private GitHub advisory drafts             |
 | Contributing    | `create-github-pr`        | Create pull requests with proper conventions                                                        |
 | Reviewing       | `review-github-pr`        | Summarize PR diffs and key design decisions                                                         |
-| Reviewing       | `review-security-issue`   | Assess security issues for severity and remediation                                                 |
+| Reviewing       | `review-security-issue`   | Assess security issues and private advisories for severity and remediation                           |
 | Reviewing       | `fix-security-issue`      | Implement an approved security remediation plan                                                     |
 | Reviewing       | `watch-github-actions`    | Monitor CI pipeline status and logs                                                                 |
 | Reviewing       | `launch-openshell-gator`  | Launch and supervise OpenShell gator agents for issue and PR monitoring                             |
@@ -432,7 +433,7 @@ See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authorin
 
 ## Stale Issues and Pull Requests
 
-Issues and pull requests receive `state:stale` after 14 days without activity. Only `lifecycle:frozen` or `state:frozen` exempts an issue from stale handling. Both labels are supported while the naming convention is being decided. Issues close after another 14 days without activity; pull requests are not automatically closed. Comment on an item to reset the inactivity timer and remove its stale label.
+Issues receive `state:stale` after 28 days without activity; pull requests receive it after 14 days. Issues labeled `roadmap`, `lifecycle:frozen`, or `state:frozen` are exempt from stale handling. Both frozen labels are supported while the naming convention is being decided. Issues close after another 14 days without activity; pull requests are not automatically closed. Comment on an item to reset the inactivity timer and remove its stale label.
 
 ## Pull Requests
 

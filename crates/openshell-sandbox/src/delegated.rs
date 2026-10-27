@@ -86,6 +86,9 @@ pub async fn spawn_workload(
             launcher.clone(),
         ));
 
+    // The delegated workload runs behind OpenShell's mediated network path,
+    // so the generated trust files remain authoritative for its TLS settings.
+    let tls_environment_mode = crate::child_env::TlsEnvironmentMode::Override;
     #[cfg(target_os = "linux")]
     let mut handle = ProcessHandle::spawn(
         launcher,
@@ -95,6 +98,7 @@ pub async fn spawn_workload(
         interactive,
         policy,
         ca_file_paths.as_ref(),
+        tls_environment_mode,
         &provider_env,
     )
     .wrap_err("spawn delegated workload process")?;
@@ -106,6 +110,7 @@ pub async fn spawn_workload(
         interactive,
         policy,
         ca_file_paths.as_ref(),
+        tls_environment_mode,
         &provider_env,
     )?;
 

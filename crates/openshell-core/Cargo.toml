@@ -46,6 +46,7 @@ openshell-otel = { path = "../openshell-otel", optional = true }
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 rustix = { workspace = true }
+libc = "0.2"
 
 [features]
 default = ["telemetry"]
@@ -66,9 +67,10 @@ tonic-prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
+h2 = "0.4"
+rcgen = { workspace = true }
 tempfile = "3"
 tracing-subscriber = { workspace = true }
-rcgen = { workspace = true }
 tokio-rustls = { workspace = true }
 
 [lints]

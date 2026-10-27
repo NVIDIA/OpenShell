@@ -345,6 +345,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         proxy_ca_bundle: None,
         provider_spiffe_workload_api_socket: None,
         app_armor_profile: Some(AppArmorProfile::Unconfined),
+        network_trust: None,
     }
 }
 
@@ -428,7 +429,7 @@ async fn docker_constructor_rejects_proxy_ca_bundle_without_proxy() {
     config.upstream_proxy.https_proxy = None;
 
     let Err(error) =
-        DockerComputeDriver::new("127.0.0.1:17670".parse().unwrap(), "info", &config).await
+        DockerComputeDriver::new("127.0.0.1:17670".parse().unwrap(), "info", &config, None).await
     else {
         panic!("constructor must reject incoherent proxy CA configuration before Docker I/O");
     };
@@ -1037,6 +1038,7 @@ async fn start_sandbox_span_does_not_capture_launch_authentication() {
             "sandbox",
             "invalid-generation",
             b"secret-launch-authentication",
+            None,
         )
         .with_subscriber(subscriber)
         .await
@@ -1126,7 +1128,8 @@ async fn tracing_direct_start_exports_a_docker_start_span() {
     let driver = test_driver_with_config(runtime_config());
 
     Box::pin(
-        DockerComputeDriver::start_sandbox(&driver, "", "", "", &[]).with_subscriber(subscriber),
+        DockerComputeDriver::start_sandbox(&driver, "", "", "", &[], None)
+            .with_subscriber(subscriber),
     )
     .await
     .expect_err("missing identifier should fail");
@@ -2579,6 +2582,15 @@ fn build_container_create_body_replaces_inherited_cmd_with_sandbox_bootstrap() {
             BOUNDARY_CONFIG_MOUNT_PATH.to_string(),
         ])
     );
+    assert!(
+        create_body
+            .host_config
+            .as_ref()
+            .and_then(|config| config.binds.as_ref())
+            .is_some_and(|binds| binds
+                .iter()
+                .all(|bind| !bind.contains(ADDITIONAL_CA_MOUNT_PATH)))
+    );
     assert_eq!(
         create_body
             .labels
@@ -2601,6 +2613,128 @@ fn build_container_create_body_replaces_inherited_cmd_with_sandbox_bootstrap() {
     assert_eq!(host_config.network_mode.as_deref(), Some("none"));
     assert_eq!(host_config.extra_hosts, None);
     assert!(create_body.networking_config.is_none());
+}
+
+#[test]
+fn additional_destination_trust_is_supervisor_only_and_digest_paired() {
+    let dir = TempDir::new().unwrap();
+    let artifact = dir.path().join("normalized-additional-ca.crt");
+    let pem = b"normalized certificate fixture";
+    fs::write(&artifact, pem).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(
+        &artifact,
+        std::os::unix::fs::PermissionsExt::from_mode(0o444),
+    )
+    .unwrap();
+    let bundle = NetworkSupervisorTrustBundle::new(
+        pem.to_vec(),
+        1,
+        "sha256:paired-digest",
+        artifact.clone(),
+    );
+    let mut config = runtime_config();
+    config.network_trust = Some(bundle.clone());
+
+    let workload = build_container_create_body(&test_sandbox(), &config).unwrap();
+    assert!(
+        workload
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
+            .is_some()
+    );
+    assert!(
+        workload
+            .cmd
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|argument| argument != "--additional-ca-bundle")
+    );
+    assert!(
+        workload
+            .host_config
+            .as_ref()
+            .and_then(|host| host.mounts.as_ref())
+            .unwrap()
+            .iter()
+            .all(|mount| mount.target.as_deref() != Some(ADDITIONAL_CA_MOUNT_PATH))
+    );
+
+    let args = docker_network_trust_supervisor_args(Some(&bundle));
+    assert!(
+        args.windows(2)
+            .any(|arguments| { arguments == ["--additional-ca-bundle", ADDITIONAL_CA_MOUNT_PATH] })
+    );
+    let mount = docker_network_trust_supervisor_mount(&bundle).unwrap();
+    assert_eq!(mount.target.as_deref(), Some(ADDITIONAL_CA_MOUNT_PATH));
+    assert_eq!(mount.source.as_deref(), artifact.to_str());
+    assert_eq!(mount.read_only, Some(true));
+}
+
+#[test]
+fn tampered_additional_destination_trust_fails_closed_without_pem_contents() {
+    let dir = TempDir::new().unwrap();
+    let artifact = dir.path().join("normalized-additional-ca.crt");
+    fs::write(&artifact, b"expected").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(
+        &artifact,
+        std::os::unix::fs::PermissionsExt::from_mode(0o444),
+    )
+    .unwrap();
+    let bundle = NetworkSupervisorTrustBundle::new(
+        b"expected".to_vec(),
+        1,
+        "sha256:expected",
+        artifact.clone(),
+    );
+    fs::remove_file(&artifact).unwrap();
+    fs::write(&artifact, b"BEGIN CERTIFICATE modified secret data").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(
+        &artifact,
+        std::os::unix::fs::PermissionsExt::from_mode(0o444),
+    )
+    .unwrap();
+
+    let error = docker_network_trust_supervisor_mount(&bundle)
+        .expect_err("a changed gateway artifact must fail closed");
+    assert!(error.message().contains("network additional CA artifact"));
+    assert!(!error.message().contains("modified secret data"));
+}
+
+#[test]
+fn user_mount_cannot_replace_network_trust_destination() {
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().join("user-ca.crt");
+    fs::write(&source, b"user-controlled fixture").unwrap();
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": source,
+            "target": ADDITIONAL_CA_MOUNT_PATH
+        }]
+    })));
+
+    let error = build_container_create_body(&sandbox, &config)
+        .expect_err("user mount must not mask network trust material");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().contains("reserved OpenShell path"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

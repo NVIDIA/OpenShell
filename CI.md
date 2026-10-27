@@ -48,6 +48,14 @@ remains in Actions. This checks
 protobuf compatibility; SDK/configuration compatibility and migration review
 remain separate qualification work.
 
+The release qualification workflow has a release-captain-approved exception
+for all `v0.1.6-pre.N` candidates, including replacement candidates after a failed
+run. It still runs Buf and fails on compilation or tooling
+errors, but accepts detected protobuf breaking changes for that tag. The run
+summary and qualification JSON's `exceptions` array record the scope and reason.
+Other versions retain the normal version policy. Remove the workflow exception
+after promotion; release notes must describe the accepted changes and migration.
+
 Fetch the target and tags to check committed branch changes locally, replacing
 `origin/main` for another target:
 
@@ -66,6 +74,23 @@ nix run .#check-protobuf-compatibility -- refs/tags/v0.2.0-pre.1
 For an intentional minor-train incompatibility, record the Buf finding,
 linked issue, consumer impact, and migration plan in the PR. Keep the finding
 visible; do not disable the job or add a broad Buf ignore rule.
+
+### Remove the v0.1.6 exception
+
+Squash-merge [PR #4976](https://github.com/NVIDIA/OpenShell/pull/4976) so the
+exception, checker support, qualification metadata, tests, and temporary guidance
+can be removed together with one revert. After verifying stable v0.1.6 publication,
+open a cleanup PR from current `main` and revert that PR's squash-merge commit:
+
+```shell
+git revert --no-commit <PR-4976-squash-merge-sha>
+git commit --signoff -m "revert(ci): remove temporary v0.1.6 protobuf exception"
+```
+
+Use the final squash-merge SHA shown on the merged PR, not a branch commit SHA.
+Validate the reverted workflow with Actionlint and run the normal protobuf check
+before merging the cleanup. Reverting the whole PR restores normal enforcement
+and removes the exception mechanism; do not leave the bypass support behind.
 
 ### Windows validation
 

@@ -902,6 +902,7 @@ pub struct ComputeRuntime {
     /// Desired assignments of the shared supervisor host, when the gateway
     /// coordinates one for the in-process driver.
     supervisor_host: Option<openshell_supervisor_control::SupervisorHostController>,
+    service_route_index: Arc<OnceLock<Arc<crate::service_routing::ServiceRouteIndex>>>,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -1011,6 +1012,7 @@ impl ComputeRuntime {
             ssh_identities: Arc::new(OnceLock::new()),
             supervisor_ocsf_headers: Arc::new(OnceLock::new()),
             supervisor_host: None,
+            service_route_index: Arc::new(OnceLock::new()),
         })
     }
 
@@ -1046,6 +1048,13 @@ impl ComputeRuntime {
 
     /// Collector headers that launch bundles carry to supervisors for OCSF
     /// export.
+    pub(crate) fn configure_service_route_index(
+        &self,
+        index: Arc<crate::service_routing::ServiceRouteIndex>,
+    ) {
+        let _ = self.service_route_index.set(index);
+    }
+
     pub(crate) fn configure_supervisor_ocsf_headers(
         &self,
         headers: Option<openshell_core::jwt::SecretOtlpHeaders>,
@@ -1207,6 +1216,11 @@ impl ComputeRuntime {
         // Every start path derives resume from the durable transition, so a
         // retried or recovered start repeats the request that was committed.
         let resume = in_flight_resume_intent(sandbox);
+        // Starts may need to replace a stopped local workload/supervisor
+        // pair. Always reconstruct that input from the gateway's durable
+        // record; never let a driver derive provisioning input from mutable
+        // runtime inspection output.
+        let driver_sandbox = self.driver_sandbox_for_launch(sandbox)?;
         Ok(StartSandboxRequest {
             sandbox_id: sandbox.object_id().to_string(),
             name: sandbox.object_name().to_string(),
@@ -1218,6 +1232,7 @@ impl ComputeRuntime {
             isolation_backend: self.isolation_backend.clone(),
             resume: resume.is_some(),
             restart_if_restore_fails: resume.unwrap_or(false),
+            sandbox: Some(driver_sandbox),
         })
     }
 
@@ -2486,6 +2501,10 @@ impl ComputeRuntime {
         } else {
             None
         };
+        // Starts may need to replace a stopped local workload/supervisor pair.
+        // The request (including its durable provisioning snapshot) is always
+        // reconstructed from the gateway's record; never let a driver derive
+        // provisioning input from mutable runtime inspection output.
         let request =
             self.driver_start_request(&starting, launch_authentication, expected_runtime_identity)?;
         let driver = self.driver.clone();
@@ -4025,11 +4044,13 @@ impl ComputeRuntime {
     /// Should be called once at gateway startup, before watchers spawn,
     /// so the watch loop sees the post-start state on its first poll.
     pub async fn start_persisted_sandboxes(&self) -> Result<(), String> {
-        self.start_persisted_sandboxes_with_authentication(
+        // The reconciliation futures carry full persisted sandbox records;
+        // keep them off the caller's stack (clippy::large_futures).
+        Box::pin(self.start_persisted_sandboxes_with_authentication(
             |_| async { Ok(Vec::new()) },
             |_| async { Ok(()) },
             |_| {},
-        )
+        ))
         .await
     }
 
@@ -4048,13 +4069,13 @@ impl ComputeRuntime {
         authentication_failed: Failed,
     ) -> Result<(), String>
     where
-        Authentication: Fn(&Sandbox) -> AuthenticationFuture,
-        AuthenticationFuture: Future<Output = Result<Vec<u8>, String>>,
-        Committed: Fn(&str) -> CommittedFuture,
-        CommittedFuture: Future<Output = Result<(), String>>,
-        Failed: Fn(&str),
+        Authentication: Fn(&Sandbox) -> AuthenticationFuture + Send + Sync,
+        AuthenticationFuture: Future<Output = Result<Vec<u8>, String>> + Send,
+        Committed: Fn(&str) -> CommittedFuture + Send + Sync,
+        CommittedFuture: Future<Output = Result<(), String>> + Send,
+        Failed: Fn(&str) + Send + Sync,
     {
-        self.recover_persisted_lifecycle_transitions().await?;
+        Box::pin(self.recover_persisted_lifecycle_transitions()).await?;
         if !self.driver_info.gateway_manages_lifecycle {
             return Ok(());
         }
@@ -4151,6 +4172,9 @@ impl ComputeRuntime {
                     continue;
                 }
             };
+            // Recovery is allowed to reconstruct provisioning inputs only
+            // from the persisted gateway record (the request snapshot is
+            // rebuilt by `driver_start_request`).
             let request = match self.driver_start_request(
                 &sandbox,
                 launch_authentication,
@@ -4411,8 +4435,8 @@ impl ComputeRuntime {
                     // Recovery retains the original attempt and deadline. A
                     // stalled driver must release this lifecycle gate after
                     // expiry so the deadline worker can reclaim its compute.
-                    match self
-                        .await_provisioning_operation(
+                    match Box::pin(
+                        self.await_provisioning_operation(
                             &sandbox,
                             self.driver.call_owned(
                                 openshell_otel::rpc::START_SANDBOX,
@@ -4421,8 +4445,9 @@ impl ComputeRuntime {
                                     driver.start_sandbox(Request::new(request)).await
                                 },
                             ),
-                        )
-                        .await
+                        ),
+                    )
+                    .await
                     {
                         Ok((_, settled)) => {
                             let updated = self.clear_resume_intent(*settled).await;
@@ -4483,6 +4508,11 @@ impl ComputeRuntime {
             .map_err(|err| format!("failed to list sandboxes for {operation}: {err}"))
     }
 
+    /// Fail closed when a start/recovery cannot reconstruct a driver's durable
+    /// provisioning snapshot.  This is intentionally distinct from an
+    /// ambiguous transport failure: no start RPC has been issued, so keeping
+    /// `Starting` for a blind retry would allow a local reconciliation path to
+    /// fall back to mutable platform state.
     async fn mark_sandbox_error(&self, sandbox: &Sandbox, reason: &str, message: &str) {
         let _guard = self.lock_sandbox_local(sandbox.object_id()).await;
         let sandbox_id = sandbox.object_id().to_string();
@@ -6300,12 +6330,16 @@ impl ComputeRuntime {
             if let Ok(endpoint) = ServiceEndpoint::decode(record.payload.as_slice())
                 && endpoint.sandbox_id == sandbox_id
             {
-                self.store
+                let deleted = self
+                    .store
                     .delete(ServiceEndpoint::object_type(), endpoint.object_id())
                     .await
                     .map_err(|e| {
                         format!("delete service endpoint {}: {e}", endpoint.object_id())
                     })?;
+                if deleted && let Some(index) = self.service_route_index.get() {
+                    index.remove(workspace, &endpoint.sandbox, &endpoint.name);
+                }
             }
         }
 
@@ -8383,6 +8417,7 @@ pub fn new_test_runtime_with_driver(
         ssh_identities: Arc::new(OnceLock::new()),
         supervisor_ocsf_headers: Arc::new(OnceLock::new()),
         supervisor_host: None,
+        service_route_index: Arc::new(OnceLock::new()),
     }
 }
 
@@ -9578,6 +9613,7 @@ mod tests {
             ssh_identities: Arc::new(OnceLock::new()),
             supervisor_ocsf_headers: Arc::new(OnceLock::new()),
             supervisor_host: None,
+            service_route_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -18058,11 +18094,31 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         ));
 
         driver.clear_calls();
-        runtime.start_persisted_sandboxes().await.unwrap();
+        runtime
+            .start_persisted_sandboxes_with_authentication(
+                |_| async { Ok(b"test-launch-authentication".to_vec()) },
+                |_| async { Ok(()) },
+                |_| {},
+            )
+            .await
+            .unwrap();
         assert!(matches!(
             driver.calls().as_slice(),
-            [FakeComputeDriverCall::GetCapabilities, FakeComputeDriverCall::StartSandbox { sandbox_id, sandbox_name, .. }]
-                if sandbox_id == "sb-uds" && sandbox_name == "uds-sandbox"
+            [
+                FakeComputeDriverCall::GetCapabilities,
+                FakeComputeDriverCall::StartSandbox {
+                    sandbox_id,
+                    sandbox_name,
+                    launch_authentication,
+                    sandbox: Some(durable),
+                    ..
+                },
+            ]
+                if sandbox_id == "sb-uds"
+                    && sandbox_name == "uds-sandbox"
+                    && !launch_authentication.is_empty()
+                    && durable.id == "sb-uds"
+                    && durable.name == "uds-sandbox"
         ));
         driver.clear_calls();
         assert!(
@@ -18085,6 +18141,44 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             }
             other => panic!("expected DeleteSandbox call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn start_sandbox_request_uses_optional_wire_field_nine_for_durable_snapshot() {
+        let legacy = StartSandboxRequest {
+            sandbox_id: "sandbox-id".into(),
+            name: "sandbox-name".into(),
+            launch_authentication: b"opaque-auth".to_vec(),
+            generation_id: "generation-id".into(),
+            expected_runtime_identity: String::new(),
+            isolation_backend: None,
+            resume: false,
+            restart_if_restore_fails: false,
+            sandbox: None,
+        };
+        let with_snapshot = StartSandboxRequest {
+            sandbox: Some(DriverSandbox {
+                id: "sandbox-id".into(),
+                name: "sandbox-name".into(),
+                ..Default::default()
+            }),
+            ..legacy.clone()
+        };
+        let legacy_wire = legacy.encode_to_vec();
+        let snapshot_wire = with_snapshot.encode_to_vec();
+        // Field 9 is length-delimited, hence its protobuf key is 0x4a. The
+        // legacy form does not emit it, preserving existing fields 1–8
+        // (fields 7 and 8 are the upstream suspend/resume controls).
+        assert!(!legacy_wire.contains(&0x4a));
+        assert!(snapshot_wire.contains(&0x4a));
+        assert_eq!(
+            StartSandboxRequest::decode(snapshot_wire.as_slice())
+                .unwrap()
+                .sandbox
+                .as_ref()
+                .map(|sandbox| sandbox.id.as_str()),
+            Some("sandbox-id")
+        );
     }
 
     #[tokio::test]
@@ -19977,9 +20071,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         runtime.store.put_message(&sandbox).await.unwrap();
         let recovered_runtime = runtime.clone();
         let mut recovery = tokio::spawn(async move {
-            recovered_runtime
-                .recover_persisted_lifecycle_transitions()
-                .await
+            Box::pin(recovered_runtime.recover_persisted_lifecycle_transitions()).await
         });
         tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
             .await

@@ -161,6 +161,11 @@ pub struct GatewayFileSection {
     /// Enable plaintext HTTP routing for loopback sandbox service URLs.
     #[serde(default)]
     pub enable_loopback_service_http: Option<bool>,
+    /// Hostname format for exposed sandbox services: `readable` (default) or
+    /// `hashed` (opaque one-label hostnames discriminated by the gateway
+    /// installation name).
+    #[serde(default)]
+    pub service_hostname_format: Option<openshell_core::config::ServiceHostnameFormat>,
     /// Enable the WebSocket tunnel for an authenticated edge proxy.
     #[serde(default)]
     pub enable_websocket_tunnel: Option<bool>,
@@ -464,6 +469,22 @@ pub struct SupervisorFileSection {
     /// operator-owned and changes require a gateway restart.
     #[serde(default)]
     pub middleware: Vec<MiddlewareServiceFileConfig>,
+    /// Shared network-supervisor configuration. This is intentionally outside
+    /// the compute-driver tables so every supported driver consumes the same
+    /// startup contract.
+    #[serde(default)]
+    pub network: SupervisorNetworkFileSection,
+}
+
+/// `[openshell.supervisor.network]` configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorNetworkFileSection {
+    /// Gateway-local pre-assembled PEM bundle whose certificates augment the
+    /// supervisor's destination trust roots. The gateway validates and stages
+    /// this single file during startup before any compute driver is constructed.
+    #[serde(default)]
+    pub additional_ca_bundle: Option<PathBuf>,
 }
 
 impl ConfigFile {
@@ -861,6 +882,19 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
     {
         return Err(ConfigFileError::InvalidDriverTable { name: name.clone() });
     }
+    if file
+        .openshell
+        .supervisor
+        .network
+        .additional_ca_bundle
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(ConfigFileError::InvalidValue {
+            field: "openshell.supervisor.network.additional_ca_bundle",
+            message: "path must not be empty",
+        });
+    }
 
     openshell_core::isolation_registration::validate_registrations(
         &file.openshell.supervisor.isolation_backends,
@@ -1198,6 +1232,32 @@ audience = "aud"
 "#;
         let tmp = write_tmp(toml);
         assert!(load(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn service_hostname_format_parses_and_serializes() {
+        let file = toml::from_str::<ConfigFile>(
+            r#"
+[openshell]
+version = 2
+
+[openshell.gateway]
+service_hostname_format = "hashed"
+"#,
+        )
+        .expect("service hostname format parses");
+
+        assert_eq!(
+            file.openshell.gateway.service_hostname_format,
+            Some(openshell_core::config::ServiceHostnameFormat::Hashed)
+        );
+
+        let serialized = toml::to_string(&file).expect("config serializes");
+        assert!(serialized.contains("service_hostname_format = \"hashed\""));
+
+        let unset = toml::from_str::<ConfigFile>("[openshell]\nversion = 2\n")
+            .expect("file without the field parses");
+        assert!(unset.openshell.gateway.service_hostname_format.is_none());
     }
 
     #[test]
@@ -1540,6 +1600,65 @@ allow_unauthenticated_users = true
         let file = load(tmp.path()).expect("valid auth config parses");
         let auth = file.openshell.gateway.auth.expect("auth config");
         assert!(auth.allow_unauthenticated_users);
+    }
+
+    #[test]
+    fn parses_supervisor_network_additional_ca_bundle() {
+        let tmp = write_tmp(
+            r#"
+[openshell.supervisor.network]
+additional_ca_bundle = "/etc/openshell/ca-bundle.crt"
+"#,
+        );
+
+        let file = load(tmp.path()).expect("network supervisor config parses");
+        assert_eq!(
+            file.openshell.supervisor.network.additional_ca_bundle,
+            Some(PathBuf::from("/etc/openshell/ca-bundle.crt"))
+        );
+    }
+
+    #[test]
+    fn supervisor_network_additional_ca_bundle_defaults_to_unset() {
+        let file: ConfigFile = toml::from_str("[openshell.supervisor]\n").expect("valid config");
+        assert!(
+            file.openshell
+                .supervisor
+                .network
+                .additional_ca_bundle
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn supervisor_network_rejects_unknown_fields() {
+        let tmp = write_tmp(
+            r"
+[openshell.supervisor.network]
+unknown = true
+",
+        );
+        assert!(matches!(
+            load(tmp.path()),
+            Err(ConfigFileError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn supervisor_network_rejects_empty_ca_bundle_path() {
+        let tmp = write_tmp(
+            r#"
+[openshell.supervisor.network]
+additional_ca_bundle = ""
+"#,
+        );
+        let error = load(tmp.path()).expect_err("empty source paths must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("openshell.supervisor.network.additional_ca_bundle")
+        );
+        assert!(error.to_string().contains("must not be empty"));
     }
 
     #[test]

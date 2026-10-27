@@ -140,6 +140,7 @@ not a whole-application crypto coverage claim:
 | Provider-refresh advisory-lock keys | Deterministic database lock selection for coordinating refreshes, not authentication or encryption. These remain outside the selected-backend contract. |
 | Endpoint IDs and pagination fingerprints | Deterministic identification/request matching, not authentication. These remain outside the selected-backend contract. |
 | Debug token fingerprints | Diagnostic display only; direct hashing remains outside the contract even though the input is a credential. |
+| Destination-trust generation labels (`openshell-server` network trust, Podman operator staging, Kubernetes ConfigMap naming, VM staged-snapshot checks) | Deterministic identity derivation for naming and generation equality, not encryption or proof of authorization. Trust decisions use the gateway's normalization, immutable staging, exact-byte validation, and TLS verification rather than these digests. These retain `sha2` directly. |
 | Schema compatibility tests, content-cache identities, retry jitter, test fixtures | Non-authentication uses remain unchanged. |
 
 Cargo feature selection does not prevent a crate from adding another crypto

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [build-system]
-requires = ["setuptools>=83", "setuptools-scm[simple]>=8"]
+requires = ["setuptools>=84.1.0", "setuptools-scm[simple]>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]

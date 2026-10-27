@@ -684,6 +684,12 @@ certificate—still applies. The application is responsible for authentication
 enabled on its endpoint, and an upstream edge proxy may still apply its own
 access policy. For gateway service-domain configuration, refer to
 [Manage Gateways](/how-it-works/gateways/overview#configure-service-forwarding).
+
+Consume the URL the CLI or SDK prints rather than constructing hostnames from
+workspace, sandbox, and service names. The hostname format is a gateway
+configuration detail: gateways configured with a service routing name return
+opaque hashed hostnames (`https://<hash>.<base-domain>/`) instead of the
+readable composite.
 </Note>
 
 ## Monitor and Debug
