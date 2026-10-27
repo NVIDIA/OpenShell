@@ -343,6 +343,7 @@ async fn main() -> Result<()> {
 
     let driver_service = ComputeDriverService::new(driver);
     let configuration_updates_service = openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdatesServer::new(driver_service.clone());
+    let app_endpoints_service = openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpointsServer::new(driver_service.clone());
     let service = ComputeDriverServer::new(driver_service);
     let shutdown = async move {
         shutdown_signal().await;
@@ -358,6 +359,7 @@ async fn main() -> Result<()> {
             .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
             .add_service(configuration_updates_service)
+            .add_service(app_endpoints_service)
             .serve_with_incoming_shutdown(
                 openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
                 shutdown,
@@ -370,6 +372,7 @@ async fn main() -> Result<()> {
             .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
             .add_service(configuration_updates_service)
+            .add_service(app_endpoints_service)
             .serve_with_shutdown(args.bind_address, shutdown)
             .await
             .into_diagnostic()

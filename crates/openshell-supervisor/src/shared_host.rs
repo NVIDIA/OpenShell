@@ -785,7 +785,7 @@ impl SharedHost {
             app_router: self
                 .app_listener
                 .as_ref()
-                .map(crate::app_listener::HostHandle::router),
+                .map(crate::app_listener::HostHandle::leased_router),
             command: main_process.command,
             workdir: registration.workdir,
             timeout_secs: 0,
