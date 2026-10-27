@@ -1795,3 +1795,23 @@ unnamed service on sandbox `demo` in workspace `default` uses SNI and Host
 the owning supervisor while preserving that hostname. Automatic discovery and
 application URL publication are separate work; current CLI URLs still identify
 the existing gateway path.
+
+Enabled supervisors report installed service routes through their authenticated
+gateway sessions. The gateway accepts only current configuration and ownership,
+resolves the supervisor endpoint through the compute driver, and expires
+installation evidence unless renewed. Reports do not establish application
+health or confirm that external ingress is ready. No additional reporting port
+or application credentials are required. Shared Kubernetes discovery selects the
+acknowledged pool owner's Pod IP and app port. The gateway revalidates the
+ownership term and live membership against shared storage. During takeover,
+old installations are withdrawn and the new endpoint appears only after the
+replacement installs the configuration. Application connections may need to
+reconnect; the sandbox workload and public URL remain unchanged.
+
+Shared listeners require both current configuration and a gateway-issued serving
+lease of at most fifteen seconds. Lease deadlines include queueing time; keep
+supervisor and gateway clocks synchronized. Loss of serving authority closes
+application streams even if configuration continues renewing. Under a partition,
+allow for pool membership failure detection before the last serving lease expires.
+Storage errors prevent lease renewal. Discovery expiry and serving expiry are
+separate from external ingress readiness.

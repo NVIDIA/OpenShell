@@ -1042,6 +1042,7 @@ mod tests {
             tx,
             supports_session_redirect: false,
             pushes_config: true,
+            advertises_services: false,
         }
     }
 

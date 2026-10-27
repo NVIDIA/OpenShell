@@ -342,6 +342,7 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         let driver = std::sync::Arc::new(
             openshell_driver_kubernetes::ComputeDriverService::new_in_process(driver),
         );
+        context.register_app_endpoints(driver.clone())?;
         Ok((
             openshell_server::ComputeDriverInstance::InProcess(driver.clone()),
             Some(driver),
