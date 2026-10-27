@@ -4,34 +4,43 @@
 {{- range .Values.imagePullSecrets -}}
 {{- $imagePullSecrets = append $imagePullSecrets .name -}}
 {{- end -}}
-{{- if eq (get $kubernetes "supervisor_topology" | default "") "gateway" }}
+{{- if include "openshell.supervisorEnabled" . }}
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+{{- $shared := get $kubernetes "shared_supervisor" }}
+{{- $name := include "openshell.supervisorName" . }}
+{{- $endpoint := get $kubernetes "grpc_endpoint" }}
+{{- $endpointUrl := urlParse $endpoint }}
+{{- $gatewayTls := and (not .Values.server.disableTls) .Values.server.tls.clientTlsSecretName }}
+# One supervisor process hosting a sandbox instance per sandbox generation.
+# The process dials the gateway over TLS with the supervisor token the gateway
+# mints for it and receives its assignments from it; nothing but sandbox
+# runtimes and kubelet probes connect to it. The Pod holds no Kubernetes
+# identity of its own: each instance acts only with the credentials the
+# gateway issued for its generation.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "openshell.fullname" . }}-supervisor
+  name: {{ $name }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
     app.kubernetes.io/component: supervisor
 spec:
+  # Instances live in this process; a second replica could not serve them.
   replicas: 1
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app.kubernetes.io/name: openshell-supervisor
-      app.kubernetes.io/instance: {{ .Release.Name }}
-      app.kubernetes.io/component: supervisor
+      {{- include "openshell.supervisorSelectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: openshell-supervisor
-        app.kubernetes.io/instance: {{ .Release.Name }}
-        app.kubernetes.io/component: supervisor
+        {{- include "openshell.supervisorSelectorLabels" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
+      enableServiceLinks: false
       terminationGracePeriodSeconds: 30
       {{- with ($imagePullSecrets | uniq) }}
       imagePullSecrets:
@@ -50,11 +59,33 @@ spec:
           args:
             - --mode=shared
             - --gateway-endpoint
-            - {{ include "openshell.grpcEndpoint" . | quote }}
+            - {{ $endpoint | quote }}
             - --address
             - 0.0.0.0:5501
+            - --token-file
+            - /etc/openshell/supervisor-token/token
+            - --runtime-listen
+            - 0.0.0.0:{{ get $shared "runtime_port" }}
+            - --session-root
+            - /run/openshell/sessions
+          env:
+            - name: OPENSHELL_ENDPOINT
+              value: {{ $endpoint | quote }}
+            - name: OPENSHELL_LOG_LEVEL
+              value: info
+            {{- if $gatewayTls }}
+            - name: OPENSHELL_TLS_CA
+              value: /var/run/secrets/openshell-tls/ca.crt
+            {{- end }}
+            {{- if eq (get $endpointUrl "scheme") "https" }}
+            - name: OPENSHELL_GATEWAY_TLS_SERVER_NAME
+              value: {{ get $endpointUrl "hostname" | quote }}
+            {{- end }}
           ports:
-            - name: supervisor
+            - name: runtime
+              containerPort: {{ get $shared "runtime_port" }}
+              protocol: TCP
+            - name: health
               containerPort: 5501
               protocol: TCP
           securityContext:
@@ -64,14 +95,114 @@ spec:
               drop: [ALL]
           resources:
             requests:
-              cpu: 10m
-              memory: 32Mi
+              cpu: 50m
+              memory: 64Mi
             limits:
-              memory: 128Mi
+              memory: 1Gi
+          # Process health only: the health listener accepts and closes probe
+          # connections. Each instance's readiness is reported to the gateway
+          # over the supervisor's own connection to it.
           readinessProbe:
             tcpSocket:
-              port: supervisor
+              port: health
           livenessProbe:
             tcpSocket:
-              port: supervisor
+              port: health
+          volumeMounts:
+            - name: run
+              mountPath: /run/openshell
+            - name: logs
+              mountPath: /var/log
+            - name: supervisor-token
+              mountPath: /etc/openshell/supervisor-token
+              readOnly: true
+            {{- if $gatewayTls }}
+            - name: gateway-ca
+              mountPath: /var/run/secrets/openshell-tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+        - name: supervisor-token
+          secret:
+            secretName: {{ $name }}-token
+        {{- if $gatewayTls }}
+        - name: gateway-ca
+          secret:
+            secretName: {{ .Values.server.tls.clientTlsSecretName }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: supervisor
+spec:
+  selector:
+    {{- include "openshell.supervisorSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: runtime
+      port: {{ get $shared "runtime_port" }}
+      targetPort: runtime
+      protocol: TCP
+{{- if .Values.networkPolicy.enabled }}
+---
+# Only sandbox workloads in this gateway's sandbox namespaces reach the routed
+# runtime listener. Each sandbox's own egress allowance limits its workload to
+# that port, and the routing preface plus the generation's pinned TLS identity
+# decide which instance it reaches. The supervisor dials the gateway itself,
+# so no ingress from the gateway is needed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: supervisor
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "openshell.supervisorSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- include "openshell.supervisorSandboxNamespaces" (dict "kubernetes" $kubernetes) | nindent 12 }}
+          podSelector:
+            matchLabels:
+              openshell.ai/boundary-role: workload
+      ports:
+        - protocol: TCP
+          port: {{ get $shared "runtime_port" }}
+  # Instances carry policy-approved sandbox egress, as dedicated supervisors
+  # do, and the host reaches the gateway.
+  egress:
+    - {}
+{{- end }}
+---
+# Delivery of the gateway-minted supervisor token. The chart creates the
+# Secret empty; the gateway replaces its `token` on every renewal, and the
+# supervisor re-reads the mounted file on each connection attempt. Helm
+# upgrades leave the live token in place.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}-token
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: supervisor
+type: Opaque
 {{- end }}

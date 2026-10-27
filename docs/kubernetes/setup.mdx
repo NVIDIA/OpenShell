@@ -118,6 +118,18 @@ helm upgrade --install openshell \
 
 The chart automatically generates PKI secrets on first install using pre-install Helm hooks. No manual secret creation is required.
 
+To add labels or annotations to both certificate hook Pod templates, use
+`pkiInitJob.podLabels` and `pkiInitJob.podAnnotations`. Chart-owned Pod labels
+take precedence when custom keys conflict.
+For example, disable sidecar injection for hook Pods in an Istio-injected
+namespace:
+
+```yaml
+pkiInitJob:
+  podAnnotations:
+    sidecar.istio.io/inject: "false"
+```
+
 The default Kubernetes driver puts all workspaces in one sandbox namespace. To
 have the gateway create a namespace for each workspace, follow
 [Workspace on Kubernetes](/kubernetes/workspaces).

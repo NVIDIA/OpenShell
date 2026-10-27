@@ -242,6 +242,61 @@ impl BackendSetup for OpenShellBackendSetup {
     }
 }
 
+/// The built-in Sandbox Protocol for one sandbox instance of a shared
+/// supervisor.
+///
+/// The descriptor must use the routed transport for exactly `route`;
+/// decoding claims that route on the shared listener for as long as the
+/// instance's backend exists.
+pub struct RoutedBackendSetup {
+    router: Arc<openshell_sandbox_backend::runtime_routed::RuntimeRouter>,
+    route: String,
+}
+
+impl RoutedBackendSetup {
+    #[must_use]
+    pub fn new(
+        router: Arc<openshell_sandbox_backend::runtime_routed::RuntimeRouter>,
+        route: String,
+    ) -> Self {
+        Self { router, route }
+    }
+}
+
+impl BackendSetup for RoutedBackendSetup {
+    fn backend_name(&self) -> &str {
+        openshell_sandbox_backend::BACKEND_NAME
+    }
+
+    fn decode(
+        &self,
+        payload: &[u8],
+    ) -> std::result::Result<(LaunchIdentity, Box<dyn PreparedBackend>), BackendError> {
+        let descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor =
+            serde_json::from_slice(payload).map_err(|error| {
+                BackendError::Descriptor(format!("decode sandbox runtime descriptor: {error}"))
+            })?;
+        openshell_sandbox_backend::validate_runtime_coordinates(&descriptor)?;
+        let registration = self.router.register(&self.route, &descriptor.tls)?;
+        let transport =
+            openshell_sandbox_backend::BoundaryTransport::routed(&descriptor, registration)?;
+        let identity = LaunchIdentity {
+            sandbox_id: descriptor.boundary_id.clone(),
+            generation: descriptor.generation.clone(),
+            session_id: descriptor.session_id,
+            workload_identity: descriptor.workload_identity.clone(),
+            vm_policy_identity: None,
+        };
+        Ok((
+            identity,
+            Box::new(OpenShellLaunch {
+                descriptor,
+                transport,
+            }),
+        ))
+    }
+}
+
 /// Launch data plus the transport chosen for it. Discovery and the attached
 /// backend use clones of one transport, so a runtime-initiated descriptor binds
 /// its control listener once for the supervisor's lifetime.

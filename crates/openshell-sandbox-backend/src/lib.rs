@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! Concrete supervisor-side client for the Isolation Backend and Sandbox Protocol RPCs.
 //!
@@ -18,6 +18,7 @@ pub mod mediation;
 pub mod protobuf;
 mod runtime;
 mod runtime_initiated;
+pub mod runtime_routed;
 pub mod sandbox_auth;
 pub mod stream_adapter;
 
@@ -27,7 +28,7 @@ pub use runtime::{
     ConfirmedBoundary, ExecSession, NetworkMediationSource, OpenShellRuntimeBackend,
     ProcessAttachment, ReadyBoundary, RunningBoundary,
 };
-pub use runtime::{BoundaryTransport, BoundaryTransportConnector};
+pub use runtime::{BoundaryTransport, BoundaryTransportConnector, validate_runtime_coordinates};
 
 /// Stable isolation backend name implemented by `openshell-sandbox`.
 pub const BACKEND_NAME: &str = openshell_core::isolation_registration::BUILTIN_BACKEND_NAME;

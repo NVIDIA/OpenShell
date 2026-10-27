@@ -202,12 +202,80 @@ pub enum SupervisorTopology {
     Workspace,
 }
 
+/// The supervisor Helm deploys for the gateway topology.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedSupervisorConfig {
+    /// Service selecting the shared supervisor Pod.
+    pub service_name: String,
+    pub service_namespace: String,
+    /// Service port for runtime-initiated Sandbox Protocol connections.
+    pub runtime_port: u16,
+    /// Secret in `service_namespace` the driver keeps current with the
+    /// gateway-minted supervisor token (key `token`); the supervisor Pod
+    /// mounts it and presents the token on its assignment stream.
+    pub token_secret_name: String,
+}
+
+impl SharedSupervisorConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !is_dns_label(&self.service_name) || !is_dns_label(&self.service_namespace) {
+            return Err(
+                "shared_supervisor service_name and service_namespace must be DNS labels".into(),
+            );
+        }
+        if self.runtime_port == 0 {
+            return Err("shared_supervisor runtime_port must be nonzero".into());
+        }
+        if !is_dns_subdomain(&self.token_secret_name) {
+            return Err("shared_supervisor token_secret_name must be a DNS subdomain name".into());
+        }
+        Ok(())
+    }
+
+    /// DNS name of the shared supervisor Service, which sandbox runtimes dial.
+    #[must_use]
+    pub fn service_host(&self) -> String {
+        format!("{}.{}.svc", self.service_name, self.service_namespace)
+    }
+}
+
+/// RFC 1123 subdomain, as Kubernetes object names require.
+fn is_dns_subdomain(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
+
+fn is_dns_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesComputeConfig {
-    /// Deploy an idle shared supervisor through Helm. Does not route sessions.
+    /// Supervise new sandbox generations with one supervisor shared by the
+    /// gateway instead of a supervisor Pod per sandbox. Existing generations
+    /// keep the topology recorded when they started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supervisor_topology: Option<SupervisorTopology>,
+    /// Shared supervisor connection rendered by Helm with the gateway topology.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_supervisor: Option<SharedSupervisorConfig>,
     /// Permit caller-supplied driver JSON. Does not waive resource admission.
     pub allow_driver_config: bool,
     /// Operator-owned external attachment approval policy.
@@ -401,6 +469,7 @@ impl Default for KubernetesComputeConfig {
     fn default() -> Self {
         Self {
             supervisor_topology: None,
+            shared_supervisor: None,
             workspace_mode: WorkspaceMode::default(),
             allow_driver_config: false,
             resource_admission:
@@ -454,9 +523,7 @@ impl Default for KubernetesComputeConfig {
 impl KubernetesComputeConfig {
     /// Validate startup configuration without connecting to Kubernetes.
     pub fn validate_configuration(&self) -> Result<(), String> {
-        if self.supervisor_topology == Some(SupervisorTopology::Workspace) {
-            return Err("supervisor_topology=workspace is not implemented".into());
-        }
+        self.validate_supervisor_topology()?;
         self.validate_workspace_mode()?;
         self.validate_provider_spiffe_workload_api_socket_path()?;
         self.validate_sandbox_identity_config()?;
@@ -464,6 +531,42 @@ impl KubernetesComputeConfig {
         self.validate_upstream_proxy_config()?;
         self.validate_allowed_pod_annotations()?;
         self.validate_allowed_pod_labels()
+    }
+
+    /// The shared supervisor serves only sandbox instances it can isolate: it
+    /// holds no per-sandbox workload identity, upstream proxy credential, or
+    /// proxy CA.
+    pub fn validate_supervisor_topology(&self) -> Result<(), String> {
+        match self.supervisor_topology {
+            None => {
+                if self.shared_supervisor.is_some() {
+                    return Err("shared_supervisor requires supervisor_topology=gateway".into());
+                }
+                Ok(())
+            }
+            Some(SupervisorTopology::Workspace) => {
+                Err("supervisor_topology=workspace is not implemented".into())
+            }
+            Some(SupervisorTopology::Gateway) => {
+                let shared = self.shared_supervisor.as_ref().ok_or_else(|| {
+                    "supervisor_topology=gateway requires shared_supervisor".to_string()
+                })?;
+                shared.validate()?;
+                if self.provider_spiffe_enabled() {
+                    return Err("supervisor_topology=gateway does not support provider_spiffe_workload_api_socket_path; a shared supervisor has no per-sandbox workload identity".into());
+                }
+                if self.https_proxy.is_some()
+                    || self.proxy_auth_secret_name.is_some()
+                    || self.proxy_ca_bundle.is_some()
+                {
+                    return Err(
+                        "supervisor_topology=gateway does not support upstream proxy settings"
+                            .into(),
+                    );
+                }
+                Ok(())
+            }
+        }
     }
 
     pub fn validate_allowed_pod_annotations(&self) -> Result<(), String> {
@@ -1009,6 +1112,69 @@ fn validate_provider_spiffe_workload_api_socket_path_value(
 mod tests {
     use super::*;
     use std::collections::BTreeMap as HashMap;
+
+    #[test]
+    fn gateway_supervisor_topology_requires_its_connection_and_refuses_unsupported_inputs() {
+        let shared = || SharedSupervisorConfig {
+            service_name: "openshell-supervisor".to_string(),
+            service_namespace: "openshell".to_string(),
+            runtime_port: 8443,
+            token_secret_name: "openshell-supervisor-token".to_string(),
+        };
+        let gateway = |shared: Option<SharedSupervisorConfig>| KubernetesComputeConfig {
+            supervisor_topology: Some(SupervisorTopology::Gateway),
+            shared_supervisor: shared,
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(
+            gateway(Some(shared()))
+                .validate_supervisor_topology()
+                .is_ok()
+        );
+        assert!(gateway(None).validate_supervisor_topology().is_err());
+        // The connection alone does not opt a gateway in.
+        let unset = KubernetesComputeConfig {
+            shared_supervisor: Some(shared()),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(unset.validate_supervisor_topology().is_err());
+        for invalid in [
+            SharedSupervisorConfig {
+                runtime_port: 0,
+                ..shared()
+            },
+            SharedSupervisorConfig {
+                service_namespace: "Not_A_Label".to_string(),
+                ..shared()
+            },
+            SharedSupervisorConfig {
+                token_secret_name: "Not_A_Secret_Name".to_string(),
+                ..shared()
+            },
+        ] {
+            assert!(
+                gateway(Some(invalid))
+                    .validate_supervisor_topology()
+                    .is_err()
+            );
+        }
+        // A shared supervisor holds no per-sandbox workload identity or proxy credential.
+        let with_proxy = KubernetesComputeConfig {
+            https_proxy: Some("http://proxy.example:3128".to_string()),
+            ..gateway(Some(shared()))
+        };
+        assert!(with_proxy.validate_supervisor_topology().is_err());
+        let with_proxy_ca = KubernetesComputeConfig {
+            proxy_ca_bundle: Some("/etc/proxy/ca.pem".to_string()),
+            ..gateway(Some(shared()))
+        };
+        assert!(with_proxy_ca.validate_supervisor_topology().is_err());
+        let workspace = KubernetesComputeConfig {
+            supervisor_topology: Some(SupervisorTopology::Workspace),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(workspace.validate_supervisor_topology().is_err());
+    }
 
     #[test]
     fn image_pull_policy_accepts_config_and_kubernetes_spellings() {

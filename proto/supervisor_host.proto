@@ -1,0 +1,129 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.supervisor.host.v1;
+
+import "google/protobuf/duration.proto";
+import "options.proto";
+
+// Private contract between a gateway and the supervisor process it shares
+// among its sandboxes. It is a version-locked deployment protocol, not a
+// public API: the gateway, the Kubernetes compute driver, and the shared
+// supervisor are released together, and no SDK generates bindings for it.
+//
+// The supervisor host opens one Attach stream, identifies itself, and keeps
+// the stream for its lifetime. The gateway owns the desired set of sandbox
+// instances and sends it as complete snapshots; the host reconciles its
+// registry to each snapshot and reports what it observes. Disconnecting
+// never stops hosted instances; only a later snapshot that omits them does.
+service SupervisorHost {
+  // Supervisor-initiated assignment stream. Only the gateway-minted
+  // supervisor token may call it.
+  rpc Attach(stream HostMessage) returns (stream HostGatewayMessage) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "supervisor"
+    };
+  }
+}
+
+// Envelope for host-to-gateway messages.
+message HostMessage {
+  oneof payload {
+    HostHello hello = 1;
+    HostStatus status = 2;
+    HostHeartbeat heartbeat = 3;
+  }
+}
+
+// Envelope for gateway-to-host messages.
+message HostGatewayMessage {
+  oneof payload {
+    HostAccepted accepted = 1;
+    HostRejected rejected = 2;
+    AssignmentSnapshot assignments = 3;
+    HostGatewayHeartbeat heartbeat = 4;
+  }
+}
+
+// First message of every stream.
+message HostHello {
+  // Identifies one host process (for example a boot id). A reconnect from the
+  // same process keeps it; a restarted process has a new one.
+  string instance_id = 1;
+  // Counter the host increments for every connection of one instance_id, so
+  // the gateway can order reconnects.
+  uint64 connection_epoch = 2;
+}
+
+// The gateway accepted the host and will send assignment snapshots.
+message HostAccepted {
+  // Scopes every snapshot revision and status report of this stream.
+  string session_id = 1;
+  google.protobuf.Duration heartbeat_interval = 2;
+}
+
+// The gateway refuses the host; the stream ends after this message.
+message HostRejected {
+  string reason = 1;
+}
+
+// Complete desired set of sandbox instances. Each snapshot replaces the
+// previous one; an instance absent from a snapshot must stop.
+message AssignmentSnapshot {
+  // Monotonic within the session, starting at 1.
+  uint64 revision = 1;
+  repeated SandboxInstanceAssignment instances = 2;
+}
+
+// One running generation of a stable Sandbox resource, assigned to the host.
+message SandboxInstanceAssignment {
+  // Route handle the sandbox runtime names; the instance's key on the host.
+  string route = 1;
+  string sandbox_id = 2;
+  // Runtime generation this assignment launches. Never reused.
+  string generation = 3;
+  // Trusted launch material for the generation: the JSON-encoded sandbox
+  // instance registration (runtime descriptor, gateway-issued credentials,
+  // proxy CA, main process). Never logged or forwarded.
+  bytes launch_material = 4 [(openshell.options.v1.secret) = true];
+}
+
+// Everything the host observes, sent after reconciling each snapshot and
+// whenever an instance changes.
+message HostStatus {
+  // Highest snapshot revision of this session the host has reconciled to;
+  // 0 before the first one.
+  uint64 applied_revision = 1;
+  // Every hosted instance, including ones that ended but are still being
+  // removed.
+  repeated SandboxInstanceStatus instances = 2;
+}
+
+// Lifecycle phase of a hosted sandbox instance.
+enum SandboxInstancePhase {
+  SANDBOX_INSTANCE_PHASE_UNSPECIFIED = 0;
+  SANDBOX_INSTANCE_PHASE_STARTING = 1;
+  SANDBOX_INSTANCE_PHASE_SUPERVISING = 2;
+  SANDBOX_INSTANCE_PHASE_STOPPING = 3;
+  SANDBOX_INSTANCE_PHASE_EXITED = 4;
+  SANDBOX_INSTANCE_PHASE_FAILED = 5;
+}
+
+// Observed state of one hosted sandbox instance.
+message SandboxInstanceStatus {
+  string route = 1;
+  string sandbox_id = 2;
+  SandboxInstancePhase phase = 3;
+  // The gateway currently accepts this instance's supervision session.
+  bool ready = 4;
+  // Workload exit code; meaningful only for EXITED.
+  int32 exit_code = 5;
+  // Sanitized failure; meaningful only for FAILED.
+  string error = 6;
+}
+
+message HostHeartbeat {}
+
+message HostGatewayHeartbeat {}

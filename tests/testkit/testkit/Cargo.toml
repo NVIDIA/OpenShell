@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-testkit"
+description = "Shared support for OpenShell end-to-end test suites"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/NVIDIA/OpenShell"
+publish = false
+
+[lib]
+name = "testkit"
+
+[dependencies]
+openshell-bootstrap = { path = "../../../crates/openshell-bootstrap" }
+openshell-core = { path = "../../../crates/openshell-core", default-features = false }
+openshell-sdk = { path = "../../../crates/openshell-sdk" }
+openshell-testkit-macros = { path = "../testkit-macros" }
+futures = "0.3"
+rand = "0.9"
+serde = "1"
+serde_json = "1"
+tokio = { version = "1.43", features = ["macros", "process", "rt", "time"] }

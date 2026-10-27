@@ -1,0 +1,853 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Gateway side of the private supervisor host protocol
+//! (`openshell.supervisor.host.v1`).
+//!
+//! The gateway owns the desired set of sandbox instances a shared supervisor
+//! runs. The [`SharedSupervision`](crate::SharedSupervision) coordinator
+//! publishes that set here on behalf of a compute driver; the gateway's gRPC
+//! server hands each host stream authenticated by a supervisor token to
+//! [`SupervisorHostController::attach`], which sends complete snapshots and
+//! records what the host reports. The gateway also mints that token and
+//! publishes each renewal here for the driver to deliver to the host.
+//!
+//! Desired state is uninitialized until the complete set has been derived
+//! from durable records once. Nothing is sent before that, so a restarted
+//! gateway can never present an empty map as authoritative and stop running
+//! instances. An explicit empty snapshot, after initialization, does stop
+//! them. Full resyncs are compare-and-replace against the revision read
+//! before the records were listed, so a list that raced a lifecycle edit
+//! never resurrects a withdrawn instance or discards a new one.
+//!
+//! Exactly one host serves a gateway: a new attach from a newer connection of
+//! the same host process, or from a new host process, supersedes the current
+//! session; reports and acks from a superseded stream are dropped, and a
+//! delayed hello from an older connection of the current process is refused.
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use tokio::sync::{mpsc, watch};
+use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Status, Streaming};
+
+use crate::proto::{
+    AssignmentSnapshot, HostAccepted, HostGatewayHeartbeat, HostGatewayMessage, HostHello,
+    HostMessage, HostStatus, SandboxInstanceAssignment, SandboxInstanceStatus,
+    host_gateway_message, host_message,
+};
+
+/// Interval at which both ends send heartbeats on an idle stream.
+pub const HOST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// Silence after which the gateway closes a host stream.
+const HOST_SILENCE_TIMEOUT: Duration = Duration::from_mins(1);
+/// Bound on the host sending its hello.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on queueing one gateway-to-host message; a host that cannot drain
+/// its stream this long is disconnected rather than stalling the session.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Gateway-to-host messages queued before the stream applies backpressure.
+const OUTBOUND_QUEUE: usize = 16;
+/// Most sandbox instances one shared supervisor host runs. The gateway
+/// refuses to assign beyond it, and the host refuses snapshots beyond it, so
+/// a sandbox is never created that its host could not accept.
+pub const MAX_ASSIGNED_INSTANCES: usize = 256;
+/// Most instances one host status report may describe: every assignment plus
+/// instances still being removed.
+pub const MAX_REPORTED_INSTANCES: usize = 4 * MAX_ASSIGNED_INSTANCES;
+
+/// Verified identity of a connected supervisor host: the claims of the
+/// supervisor token that authenticated its stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostIdentity {
+    /// Subject of the supervisor token (`openshell-supervisor:<gateway_id>`).
+    pub subject: String,
+    /// `jti` of the supervisor token.
+    pub token_id: String,
+    /// `exp` of the supervisor token (Unix seconds). The gateway ends the
+    /// stream when it passes; the host reconnects with a renewed token.
+    pub expires_at: i64,
+}
+
+/// The current supervisor token, as the gateway mints and renews it.
+///
+/// A compute driver delivers it to the supervisor process by whatever means
+/// its deployment packaging provides; the Kubernetes driver writes a Secret.
+#[derive(Clone, Debug)]
+pub struct SupervisorCredential {
+    pub token: openshell_core::jwt::SecretJwt,
+    /// Unix seconds.
+    pub expires_at: i64,
+}
+
+/// What the gateway knows about one assigned route on the host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObservedInstance {
+    /// No host session is connected.
+    NoHost,
+    /// A host is connected but has not reconciled to the snapshot that
+    /// assigned this route.
+    Pending,
+    /// The host reconciled to that snapshot (or the route is not assigned)
+    /// and does not host the route.
+    Absent,
+    /// The host's latest report of the instance.
+    Reported(SandboxInstanceStatus),
+}
+
+struct Assigned {
+    assignment: SandboxInstanceAssignment,
+    /// Snapshot revision that first carried this exact assignment.
+    revision: u64,
+}
+
+#[derive(Default)]
+struct Desired {
+    initialized: bool,
+    revision: u64,
+    assignments: BTreeMap<String, Assigned>,
+    /// Edits made before initialization, applied over the first full list.
+    pending: BTreeMap<String, Option<SandboxInstanceAssignment>>,
+}
+
+impl Desired {
+    fn snapshot(&self) -> Option<AssignmentSnapshot> {
+        self.initialized.then(|| AssignmentSnapshot {
+            revision: self.revision,
+            instances: self
+                .assignments
+                .values()
+                .map(|assigned| assigned.assignment.clone())
+                .collect(),
+        })
+    }
+
+    /// Insert or replace one assignment; returns whether anything changed.
+    fn put(&mut self, assignment: SandboxInstanceAssignment, revision: u64) -> bool {
+        match self.assignments.get(&assignment.route) {
+            Some(existing) if existing.assignment == assignment => false,
+            _ => {
+                self.assignments.insert(
+                    assignment.route.clone(),
+                    Assigned {
+                        assignment,
+                        revision,
+                    },
+                );
+                true
+            }
+        }
+    }
+}
+
+struct HostSession {
+    id: u64,
+    identity: HostIdentity,
+    instance_id: String,
+    connection_epoch: u64,
+    superseded: watch::Sender<bool>,
+    /// Highest snapshot revision sent on this stream; acks beyond it are
+    /// impossible and rejected.
+    sent_revision: u64,
+}
+
+#[derive(Default)]
+struct Observed {
+    session: Option<HostSession>,
+    /// Latest report of the current session.
+    status: Option<HostStatus>,
+    next_session: u64,
+}
+
+struct Inner {
+    desired: Mutex<Desired>,
+    /// Latest supervisor token the gateway minted; `None` until the first.
+    credential: watch::Sender<Option<SupervisorCredential>>,
+    /// Current desired revision; 0 while uninitialized.
+    revision: watch::Sender<u64>,
+    observed: Mutex<Observed>,
+}
+
+/// Gateway-owned desired assignments and observed status of one shared
+/// supervisor host.
+#[derive(Clone)]
+pub struct SupervisorHostController {
+    inner: Arc<Inner>,
+}
+
+impl Default for SupervisorHostController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for SupervisorHostController {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SupervisorHostController")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a change to the desired set was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AssignmentError {
+    /// A full resync was derived from a desired set that has since changed:
+    /// `baseline` is the revision the caller read before deriving its list and
+    /// `current` the one now in force; derive the list again from it.
+    #[error("desired assignments changed from revision {baseline} to {current} during the resync")]
+    Conflict { baseline: u64, current: u64 },
+    /// The change would assign more instances than one host runs.
+    #[error("the shared supervisor hosts at most {MAX_ASSIGNED_INSTANCES} sandbox instances")]
+    Capacity,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl SupervisorHostController {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                desired: Mutex::new(Desired::default()),
+                credential: watch::Sender::new(None),
+                revision: watch::Sender::new(0),
+                observed: Mutex::new(Observed::default()),
+            }),
+        }
+    }
+
+    /// Publish a freshly minted supervisor token for delivery to the host.
+    pub fn publish_credential(&self, credential: SupervisorCredential) {
+        self.inner.credential.send_replace(Some(credential));
+    }
+
+    /// The current supervisor token and every renewal after it.
+    #[must_use]
+    pub fn credential(&self) -> watch::Receiver<Option<SupervisorCredential>> {
+        self.inner.credential.subscribe()
+    }
+
+    /// The complete desired set has been derived from durable records at
+    /// least once.
+    #[must_use]
+    pub fn is_initialized(&self) -> bool {
+        lock(&self.inner.desired).initialized
+    }
+
+    /// Current desired revision: 0 while uninitialized. Read it before
+    /// deriving a full list for [`Self::replace_assignments`]; the
+    /// coordinator does so through
+    /// [`SharedSupervision::begin_recovery`](crate::SharedSupervision::begin_recovery).
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        lock(&self.inner.desired).revision
+    }
+
+    /// The current assignment of `route`, if any.
+    #[must_use]
+    pub fn assignment(&self, route: &str) -> Option<SandboxInstanceAssignment> {
+        lock(&self.inner.desired)
+            .assignments
+            .get(route)
+            .map(|assigned| assigned.assignment.clone())
+    }
+
+    /// Replace the whole desired set with `assignments`, derived from
+    /// durable records while the revision was `baseline`.
+    ///
+    /// Initializes the controller; edits made before initialization are
+    /// applied on top of the list. After initialization the replacement is
+    /// compare-and-replace: when the revision moved past `baseline` while
+    /// the list was being derived, nothing changes and the conflict is
+    /// returned so the caller derives the list again.
+    pub fn replace_assignments(
+        &self,
+        baseline: u64,
+        assignments: impl IntoIterator<Item = SandboxInstanceAssignment>,
+    ) -> Result<u64, AssignmentError> {
+        let mut desired = lock(&self.inner.desired);
+        if desired.initialized && desired.revision != baseline {
+            return Err(AssignmentError::Conflict {
+                baseline,
+                current: desired.revision,
+            });
+        }
+        // Resolve the list and the pending overlay first, so a refused
+        // replacement leaves the current set untouched.
+        let mut resolved = BTreeMap::new();
+        for assignment in assignments {
+            resolved.insert(assignment.route.clone(), assignment);
+        }
+        for (route, edit) in &desired.pending {
+            match edit {
+                Some(assignment) => {
+                    resolved.insert(route.clone(), assignment.clone());
+                }
+                None => {
+                    resolved.remove(route);
+                }
+            }
+        }
+        if resolved.len() > MAX_ASSIGNED_INSTANCES {
+            return Err(AssignmentError::Capacity);
+        }
+        desired.pending.clear();
+        let next = desired.revision + 1;
+        let mut changed = !desired.initialized;
+        for assignment in resolved.values() {
+            changed |= desired.put(assignment.clone(), next);
+        }
+        let before = desired.assignments.len();
+        desired
+            .assignments
+            .retain(|route, _| resolved.contains_key(route));
+        changed |= desired.assignments.len() != before;
+        desired.initialized = true;
+        if changed {
+            desired.revision = next;
+            self.inner.revision.send_replace(next);
+        }
+        Ok(desired.revision)
+    }
+
+    /// Assign one instance. Before initialization the edit is kept until the
+    /// first full list arrives. Refused when it would exceed the host's
+    /// capacity, so the caller fails its create before anything runs.
+    pub fn assign(&self, assignment: SandboxInstanceAssignment) -> Result<(), AssignmentError> {
+        let mut desired = lock(&self.inner.desired);
+        if !desired.initialized {
+            let pending_additions = desired
+                .pending
+                .values()
+                .filter(|edit| edit.is_some())
+                .count();
+            if !desired.pending.contains_key(&assignment.route)
+                && pending_additions >= MAX_ASSIGNED_INSTANCES
+            {
+                return Err(AssignmentError::Capacity);
+            }
+            desired
+                .pending
+                .insert(assignment.route.clone(), Some(assignment));
+            return Ok(());
+        }
+        if !desired.assignments.contains_key(&assignment.route)
+            && desired.assignments.len() >= MAX_ASSIGNED_INSTANCES
+        {
+            return Err(AssignmentError::Capacity);
+        }
+        let next = desired.revision + 1;
+        if desired.put(assignment, next) {
+            desired.revision = next;
+            self.inner.revision.send_replace(next);
+        }
+        Ok(())
+    }
+
+    /// Withdraw one instance so the host stops it.
+    pub fn unassign(&self, route: &str) {
+        let mut desired = lock(&self.inner.desired);
+        if !desired.initialized {
+            desired.pending.insert(route.to_string(), None);
+            return;
+        }
+        if desired.assignments.remove(route).is_some() {
+            desired.revision += 1;
+            let revision = desired.revision;
+            self.inner.revision.send_replace(revision);
+        }
+    }
+
+    /// Whether a host session is currently connected.
+    #[must_use]
+    pub fn host_connected(&self) -> bool {
+        lock(&self.inner.observed).session.is_some()
+    }
+
+    /// What the connected host reports for `route`.
+    #[must_use]
+    pub fn observed(&self, route: &str) -> ObservedInstance {
+        let desired = lock(&self.inner.desired);
+        let observed = lock(&self.inner.observed);
+        if observed.session.is_none() {
+            return ObservedInstance::NoHost;
+        }
+        let Some(status) = &observed.status else {
+            return ObservedInstance::Pending;
+        };
+        if let Some(instance) = status
+            .instances
+            .iter()
+            .find(|instance| instance.route == route)
+        {
+            return ObservedInstance::Reported(instance.clone());
+        }
+        match desired.assignments.get(route) {
+            Some(assigned) if assigned.revision > status.applied_revision => {
+                ObservedInstance::Pending
+            }
+            _ => ObservedInstance::Absent,
+        }
+    }
+
+    /// Serve one authenticated host stream. Reads the hello, supersedes any
+    /// current session, and returns the gateway-to-host stream.
+    pub async fn attach(
+        &self,
+        identity: HostIdentity,
+        mut inbound: Streaming<HostMessage>,
+    ) -> Result<ReceiverStream<Result<HostGatewayMessage, Status>>, Status> {
+        let hello = match tokio::time::timeout(HELLO_TIMEOUT, inbound.next()).await {
+            Ok(Some(Ok(HostMessage {
+                payload: Some(host_message::Payload::Hello(hello)),
+            }))) => hello,
+            Ok(Some(Ok(_))) => {
+                return Err(Status::invalid_argument(
+                    "supervisor host stream must start with a hello",
+                ));
+            }
+            Ok(Some(Err(status))) => return Err(status),
+            Ok(None) => {
+                return Err(Status::invalid_argument(
+                    "supervisor host stream ended before its hello",
+                ));
+            }
+            Err(_) => {
+                return Err(Status::deadline_exceeded(
+                    "supervisor host did not send its hello in time",
+                ));
+            }
+        };
+        if hello.instance_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "supervisor host hello names no instance",
+            ));
+        }
+        let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let expires_at = identity.expires_at;
+        let (session_id, superseded) = self.begin_session(identity, &hello)?;
+        tx.send(Ok(HostGatewayMessage {
+            payload: Some(host_gateway_message::Payload::Accepted(HostAccepted {
+                session_id: session_id.to_string(),
+                heartbeat_interval: Some(prost_types::Duration {
+                    seconds: i64::try_from(HOST_HEARTBEAT_INTERVAL.as_secs()).unwrap_or(15),
+                    nanos: 0,
+                }),
+            })),
+        }))
+        .await
+        .map_err(|_| Status::unavailable("supervisor host stream closed"))?;
+        let controller = self.clone();
+        tokio::spawn(async move {
+            controller
+                .run_session(session_id, expires_at, inbound, tx, superseded)
+                .await;
+            controller.end_session(session_id);
+        });
+        Ok(ReceiverStream::new(rx))
+    }
+
+    /// Start a session for `hello`, superseding the current one. A hello from
+    /// the current host process with a connection epoch that is not newer is
+    /// a delayed or replayed connection and is refused.
+    fn begin_session(
+        &self,
+        identity: HostIdentity,
+        hello: &HostHello,
+    ) -> Result<(u64, watch::Receiver<bool>), Status> {
+        let mut observed = lock(&self.inner.observed);
+        if let Some(current) = &observed.session
+            && current.instance_id == hello.instance_id
+            && hello.connection_epoch <= current.connection_epoch
+        {
+            return Err(Status::failed_precondition(
+                "supervisor host connection epoch is not newer than the current session",
+            ));
+        }
+        observed.next_session += 1;
+        let id = observed.next_session;
+        if let Some(previous) = observed.session.take() {
+            tracing::info!(
+                subject = %previous.identity.subject,
+                instance_id = %previous.instance_id,
+                connection_epoch = previous.connection_epoch,
+                "superseding supervisor host session"
+            );
+            previous.superseded.send_replace(true);
+        }
+        tracing::info!(
+            subject = %identity.subject,
+            instance_id = %hello.instance_id,
+            connection_epoch = hello.connection_epoch,
+            session = id,
+            "supervisor host attached"
+        );
+        let (superseded, watch) = watch::channel(false);
+        observed.session = Some(HostSession {
+            id,
+            identity,
+            instance_id: hello.instance_id.clone(),
+            connection_epoch: hello.connection_epoch,
+            superseded,
+            sent_revision: 0,
+        });
+        observed.status = None;
+        Ok((id, watch))
+    }
+
+    fn end_session(&self, id: u64) {
+        let mut observed = lock(&self.inner.observed);
+        if observed
+            .session
+            .as_ref()
+            .is_some_and(|session| session.id == id)
+        {
+            let session = observed.session.take();
+            observed.status = None;
+            if let Some(session) = session {
+                tracing::info!(
+                    subject = %session.identity.subject,
+                    instance_id = %session.instance_id,
+                    session = id,
+                    "supervisor host detached; hosted instances keep running"
+                );
+            }
+        }
+    }
+
+    /// Note that `revision` was sent on session `id`.
+    fn record_sent(&self, id: u64, revision: u64) {
+        let mut observed = lock(&self.inner.observed);
+        if let Some(session) = observed.session.as_mut().filter(|session| session.id == id) {
+            session.sent_revision = session.sent_revision.max(revision);
+        }
+    }
+
+    /// Record a report from session `id`. Reports from other sessions, acks
+    /// of revisions never sent on this session, regressing acks, and
+    /// oversized reports are dropped.
+    fn record_status(&self, id: u64, status: HostStatus) -> Result<(), &'static str> {
+        let mut observed = lock(&self.inner.observed);
+        let Some(session) = observed.session.as_ref().filter(|session| session.id == id) else {
+            return Err("report from a superseded supervisor host session");
+        };
+        if status.applied_revision > session.sent_revision {
+            return Err("supervisor host acknowledged a revision it was never sent");
+        }
+        if status.instances.len() > MAX_REPORTED_INSTANCES {
+            return Err("supervisor host status reports too many instances");
+        }
+        if observed
+            .status
+            .as_ref()
+            .is_some_and(|previous| status.applied_revision < previous.applied_revision)
+        {
+            return Err("supervisor host acknowledged an older revision than before");
+        }
+        observed.status = Some(status);
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Option<AssignmentSnapshot> {
+        lock(&self.inner.desired).snapshot()
+    }
+
+    async fn run_session(
+        &self,
+        session_id: u64,
+        expires_at: i64,
+        mut inbound: Streaming<HostMessage>,
+        tx: mpsc::Sender<Result<HostGatewayMessage, Status>>,
+        mut superseded: watch::Receiver<bool>,
+    ) {
+        // A bearer is verified once per stream, so the stream lives no longer
+        // than the token did. Hosted instances are unaffected; the host
+        // reconnects with the renewed token it has been delivered.
+        let credential_expiry = tokio::time::sleep(credential_remaining(expires_at));
+        tokio::pin!(credential_expiry);
+        let mut revision = self.inner.revision.subscribe();
+        let mut sent_revision = 0;
+        let mut last_heard = tokio::time::Instant::now();
+        let mut heartbeat = tokio::time::interval(HOST_HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // A send that cannot complete within the bound ends the session, so a
+        // stalled host can neither block supersession nor delay heartbeats.
+        let send = |message: host_gateway_message::Payload| {
+            let tx = tx.clone();
+            async move {
+                tx.send_timeout(
+                    Ok(HostGatewayMessage {
+                        payload: Some(message),
+                    }),
+                    SEND_TIMEOUT,
+                )
+                .await
+                .is_ok()
+            }
+        };
+        loop {
+            let current = *revision.borrow_and_update();
+            if current > sent_revision {
+                let Some(snapshot) = self.snapshot() else {
+                    continue;
+                };
+                tracing::debug!(
+                    session = session_id,
+                    revision = snapshot.revision,
+                    instances = snapshot.instances.len(),
+                    "sending supervisor host assignment snapshot"
+                );
+                let revision_sent = snapshot.revision;
+                if !send(host_gateway_message::Payload::Assignments(snapshot)).await {
+                    return;
+                }
+                self.record_sent(session_id, revision_sent);
+                sent_revision = current;
+            }
+            tokio::select! {
+                changed = revision.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                message = inbound.next() => match message {
+                    Some(Ok(HostMessage { payload: Some(host_message::Payload::Status(status)) })) => {
+                        last_heard = tokio::time::Instant::now();
+                        if let Err(reason) = self.record_status(session_id, status) {
+                            tracing::warn!(session = session_id, reason, "dropped supervisor host status report");
+                        }
+                    }
+                    Some(Ok(HostMessage { payload: Some(host_message::Payload::Heartbeat(_)) })) => {
+                        last_heard = tokio::time::Instant::now();
+                    }
+                    Some(Ok(_)) => {
+                        let _ = tx
+                            .send_timeout(
+                                Err(Status::invalid_argument(
+                                    "unexpected message on supervisor host stream",
+                                )),
+                                SEND_TIMEOUT,
+                            )
+                            .await;
+                        return;
+                    }
+                    Some(Err(status)) => {
+                        tracing::debug!(session = session_id, %status, "supervisor host stream failed");
+                        return;
+                    }
+                    None => return,
+                },
+                _ = heartbeat.tick() => {
+                    if last_heard.elapsed() > HOST_SILENCE_TIMEOUT {
+                        tracing::warn!(session = session_id, "supervisor host stream went silent; closing it");
+                        return;
+                    }
+                    if !send(host_gateway_message::Payload::Heartbeat(HostGatewayHeartbeat {})).await {
+                        return;
+                    }
+                }
+                _ = superseded.changed() => return,
+                () = &mut credential_expiry => {
+                    tracing::info!(session = session_id, "supervisor token expired; closing the stream for reconnection");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Time until `expires_at` (Unix seconds); zero once it has passed.
+fn credential_remaining(expires_at: i64) -> Duration {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        });
+    Duration::from_secs(u64::try_from(expires_at.saturating_sub(now)).unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assignment(route: &str, material: &[u8]) -> SandboxInstanceAssignment {
+        SandboxInstanceAssignment {
+            route: route.to_string(),
+            sandbox_id: format!("sandbox-{route}"),
+            generation: "gen".to_string(),
+            launch_material: material.to_vec(),
+        }
+    }
+
+    fn status(applied_revision: u64, routes: &[&str]) -> HostStatus {
+        HostStatus {
+            applied_revision,
+            instances: routes
+                .iter()
+                .map(|route| SandboxInstanceStatus {
+                    route: (*route).to_string(),
+                    sandbox_id: format!("sandbox-{route}"),
+                    phase: 2,
+                    ready: true,
+                    exit_code: 0,
+                    error: String::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn full_resyncs_initialize_once_and_then_compare_and_replace() {
+        let controller = SupervisorHostController::new();
+        let revision = controller.inner.revision.subscribe();
+        // Edits before the first full list wait for it.
+        controller
+            .assign(assignment("rt-created-before-list", b"a"))
+            .unwrap();
+        controller.unassign("rt-stopped-before-list");
+        assert!(!controller.is_initialized());
+        assert!(controller.snapshot().is_none());
+        assert!(!revision.has_changed().unwrap());
+
+        let baseline = controller.revision();
+        assert_eq!(
+            controller.replace_assignments(
+                baseline,
+                [
+                    assignment("rt-stopped-before-list", b"old"),
+                    assignment("rt-listed", b"b"),
+                ],
+            ),
+            Ok(1)
+        );
+        let snapshot = controller.snapshot().unwrap();
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(
+            snapshot
+                .instances
+                .iter()
+                .map(|instance| instance.route.as_str())
+                .collect::<Vec<_>>(),
+            ["rt-created-before-list", "rt-listed"]
+        );
+        assert!(revision.has_changed().unwrap());
+
+        // An identical list changes nothing.
+        assert_eq!(
+            controller.replace_assignments(
+                1,
+                [
+                    assignment("rt-created-before-list", b"a"),
+                    assignment("rt-listed", b"b"),
+                ],
+            ),
+            Ok(1)
+        );
+        controller.assign(assignment("rt-listed", b"b")).unwrap();
+        assert_eq!(controller.revision(), 1);
+
+        // A list derived at revision 1 that races a stop cannot resurrect the
+        // stopped instance; the caller derives it again.
+        controller.unassign("rt-listed");
+        assert_eq!(controller.revision(), 2);
+        assert_eq!(
+            controller.replace_assignments(
+                1,
+                [
+                    assignment("rt-created-before-list", b"a"),
+                    assignment("rt-listed", b"b"),
+                ],
+            ),
+            Err(AssignmentError::Conflict {
+                baseline: 1,
+                current: 2
+            })
+        );
+        assert!(controller.assignment("rt-listed").is_none());
+        assert_eq!(controller.replace_assignments(2, []), Ok(3));
+        assert!(controller.snapshot().unwrap().instances.is_empty());
+
+        // The gateway refuses the assignment its host could not accept.
+        let full =
+            (0..MAX_ASSIGNED_INSTANCES).map(|index| assignment(&format!("rt-{index}"), b"x"));
+        assert_eq!(controller.replace_assignments(3, full), Ok(4));
+        assert_eq!(
+            controller.assign(assignment("rt-one-too-many", b"x")),
+            Err(AssignmentError::Capacity)
+        );
+        assert_eq!(controller.assign(assignment("rt-0", b"x")), Ok(()));
+    }
+
+    #[test]
+    fn sessions_fence_stale_streams_epochs_and_acks() {
+        let controller = SupervisorHostController::new();
+        controller
+            .replace_assignments(0, [assignment("rt-a", b"a")])
+            .unwrap();
+        assert_eq!(controller.observed("rt-a"), ObservedInstance::NoHost);
+
+        let identity = HostIdentity {
+            subject: "openshell-supervisor:test".to_string(),
+            token_id: "token".to_string(),
+            expires_at: i64::MAX,
+        };
+        let hello = |instance_id: &str, connection_epoch| HostHello {
+            instance_id: instance_id.to_string(),
+            connection_epoch,
+        };
+        let (first, superseded) = controller
+            .begin_session(identity.clone(), &hello("boot-1", 1))
+            .unwrap();
+        assert_eq!(controller.observed("rt-a"), ObservedInstance::Pending);
+
+        // A delayed hello from an older connection of the same process is
+        // refused; a newer one supersedes the stream.
+        assert!(
+            controller
+                .begin_session(identity.clone(), &hello("boot-1", 1))
+                .is_err()
+        );
+        let (current, _) = controller
+            .begin_session(identity.clone(), &hello("boot-1", 2))
+            .unwrap();
+        assert!(*superseded.borrow());
+        assert!(controller.record_status(first, status(0, &[])).is_err());
+
+        // Acks are bounded by what this stream was sent and never regress.
+        assert!(controller.record_status(current, status(1, &[])).is_err());
+        controller.record_sent(current, 1);
+        controller
+            .record_status(current, status(1, &["rt-a"]))
+            .unwrap();
+        assert!(controller.record_status(current, status(0, &[])).is_err());
+        assert!(matches!(
+            controller.observed("rt-a"),
+            ObservedInstance::Reported(status) if status.ready
+        ));
+
+        // A newer assignment is pending until the host reconciles past it.
+        controller.assign(assignment("rt-b", b"b")).unwrap();
+        assert_eq!(controller.observed("rt-b"), ObservedInstance::Pending);
+        assert_eq!(controller.observed("rt-unknown"), ObservedInstance::Absent);
+        controller.record_sent(current, 2);
+        controller.record_status(current, status(2, &[])).unwrap();
+        assert_eq!(controller.observed("rt-b"), ObservedInstance::Absent);
+
+        // A new host process always takes over; ending a stale session is a no-op.
+        let (replacement, _) = controller
+            .begin_session(identity, &hello("boot-2", 1))
+            .unwrap();
+        controller.end_session(current);
+        assert!(controller.host_connected());
+        controller.end_session(replacement);
+        assert_eq!(controller.observed("rt-a"), ObservedInstance::NoHost);
+    }
+}

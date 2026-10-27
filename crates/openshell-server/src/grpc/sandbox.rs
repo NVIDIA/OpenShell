@@ -9378,7 +9378,8 @@ mod tests {
                 update_sandbox_cas(&state, &sandbox_id, 0, |sandbox| {
                     if first_attempt {
                         first_attempt = false;
-                        barrier.wait();
+                        // Hand off queued work so SQLx can return the connection to other writers.
+                        tokio::task::block_in_place(|| barrier.wait());
                     }
                     let annotations = &mut sandbox.metadata.as_mut().unwrap().annotations;
                     let count = annotations

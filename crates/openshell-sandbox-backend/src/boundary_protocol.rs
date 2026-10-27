@@ -269,13 +269,21 @@ pub enum SandboxTransport {
         guest_cid: u32,
         port: u32,
     },
+    /// The runtime dials a supervisor shared by several sandbox instances and
+    /// names this instance's opaque route handle before the pinned TLS
+    /// handshake.
+    /// Only a host that owns the shared listener can serve this transport.
+    RuntimeInitiatedRouted {
+        authority: String,
+        route: String,
+    },
 }
 
 impl SandboxTransport {
     pub fn validate(&self) -> Result<(), &'static str> {
         let valid = match self {
             Self::Unix { socket_path } | Self::RuntimeInitiatedUnix { socket_path } => {
-                socket_path.is_absolute()
+                openshell_core::paths::is_posix_absolute(socket_path)
             }
             Self::Tcp {
                 authority,
@@ -293,6 +301,9 @@ impl SandboxTransport {
             } => !authority.is_empty() && listen_address.port() != 0,
             Self::Vsock { guest_cid, port } | Self::RuntimeInitiatedVsock { guest_cid, port } => {
                 *guest_cid >= 3 && *guest_cid != u32::MAX && *port != 0 && *port != u32::MAX
+            }
+            Self::RuntimeInitiatedRouted { authority, route } => {
+                !authority.is_empty() && crate::runtime_routed::validate_route_handle(route).is_ok()
             }
         };
         if valid {
@@ -444,6 +455,10 @@ pub enum BoundaryListener {
         /// Driver-resolved supervisor endpoints, tried in order.
         addresses: Vec<std::net::SocketAddr>,
         tls: SandboxTlsServerConfig,
+        /// Route handle sent before TLS to a supervisor shared by several
+        /// sandbox instances. Absent for a dedicated supervisor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<String>,
     },
     /// Dial the supervisor over the driver's protected shared Unix socket.
     RuntimeInitiatedUnix {

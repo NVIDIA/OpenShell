@@ -53,6 +53,10 @@ struct KubernetesControlPolicyEvidence<'a> {
     network_policy_uid: &'a str,
     network_policy_resource_version: &'a str,
     port: u16,
+    /// Namespace of a supervisor shared by sandboxes. Omitted for a
+    /// dedicated supervisor so its evidence encoding is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supervisor_namespace: Option<&'a str>,
 }
 
 impl KubernetesControlPolicyEvidence<'_> {
@@ -281,6 +285,68 @@ pub fn runtime_control_policy(namespace: &str, name: &str, pair: &str, port: u16
     }
 }
 
+/// Per-sandbox allowance for runtime-initiated control to a shared supervisor.
+///
+/// It selects only this pair's workload Pod and admits one egress flow, to the
+/// shared supervisor Pods in their namespace on the runtime port. The
+/// namespace fence keeps denying every other workload connection. Which
+/// sandbox instance a connection reaches is decided by its routing preface
+/// and pinned TLS identity, not by this policy.
+#[must_use]
+pub fn shared_runtime_control_policy(
+    namespace: &str,
+    name: &str,
+    pair: &str,
+    supervisor_namespace: &str,
+    supervisor_selector: BTreeMap<String, String>,
+    port: u16,
+) -> NetworkPolicy {
+    NetworkPolicy {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            ..Default::default()
+        },
+        spec: Some(NetworkPolicySpec {
+            pod_selector: LabelSelector {
+                match_labels: Some(pair_role_labels(pair, WORKLOAD_ROLE)),
+                ..Default::default()
+            },
+            policy_types: Some(vec!["Egress".to_string()]),
+            egress: Some(vec![NetworkPolicyEgressRule {
+                to: Some(vec![NetworkPolicyPeer {
+                    namespace_selector: Some(LabelSelector {
+                        match_labels: Some(BTreeMap::from([(
+                            "kubernetes.io/metadata.name".to_string(),
+                            supervisor_namespace.to_string(),
+                        )])),
+                        ..Default::default()
+                    }),
+                    pod_selector: Some(LabelSelector {
+                        match_labels: Some(supervisor_selector),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ports: Some(vec![NetworkPolicyPort {
+                    port: Some(IntOrString::Int(i32::from(port))),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                }]),
+            }]),
+            ..Default::default()
+        }),
+    }
+}
+
+/// The supervisor bound into a generation's resource claims.
+pub enum KubernetesSupervisorClaim {
+    /// UID of the generation's dedicated supervisor Pod.
+    Pod(String),
+    /// Route of the generation's sandbox instance on the shared supervisor.
+    SandboxInstance(String),
+}
+
 /// Which side opens the Sandbox Protocol connection, with the verified
 /// Kubernetes coordinates that mode needs.
 pub enum KubernetesControlPath {
@@ -298,6 +364,18 @@ pub enum KubernetesControlPath {
         /// Supervisor bind address.
         supervisor_listen: SocketAddr,
         /// Verified per-sandbox control policy coordinates.
+        control_policy_uid: String,
+        control_policy_resource_version: String,
+    },
+    /// The workload runtime dials the gateway's shared supervisor and names
+    /// this generation's route before TLS.
+    RuntimeInitiatedShared {
+        control_authority: String,
+        /// Shared Service address the runtime dials.
+        supervisor_address: SocketAddr,
+        supervisor_namespace: String,
+        route: String,
+        /// Verified per-sandbox shared control policy coordinates.
         control_policy_uid: String,
         control_policy_resource_version: String,
     },
@@ -321,7 +399,7 @@ pub struct KubernetesSandboxRuntimeBoundarySpec {
     pub sandbox_resource_uid: String,
     pub workload_pod_uid: String,
     pub workload_pod_uid_path: PathBuf,
-    pub supervisor_pod_uid: String,
+    pub supervisor: KubernetesSupervisorClaim,
     pub egress_policy_uid: String,
     pub egress_policy_resource_version: String,
     pub control_path: KubernetesControlPath,
@@ -352,10 +430,15 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 "kubernetes.workload_pod_uid".to_string(),
                 self.workload_pod_uid,
             ),
-            (
-                "kubernetes.supervisor_pod_uid".to_string(),
-                self.supervisor_pod_uid,
-            ),
+            match self.supervisor {
+                KubernetesSupervisorClaim::Pod(uid) => {
+                    ("kubernetes.supervisor_pod_uid".to_string(), uid)
+                }
+                // The claim key keeps its established `supervisor_session` name.
+                KubernetesSupervisorClaim::SandboxInstance(route) => {
+                    ("kubernetes.supervisor_session".to_string(), route)
+                }
+            },
             (
                 "kubernetes.egress_policy_uid".to_string(),
                 self.egress_policy_uid,
@@ -365,6 +448,8 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 self.egress_policy_resource_version,
             ),
         ]);
+        let mut supervisor_namespace = None;
+        let mut shared_port = None;
         let (listener, transport) = match self.control_path {
             KubernetesControlPath::SupervisorInitiated {
                 boundary_listener,
@@ -400,10 +485,42 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                         authority: control_authority.clone(),
                         addresses: vec![supervisor_address],
                         tls: self.sandbox_tls,
+                        route: None,
                     },
                     SandboxTransport::RuntimeInitiatedTcp {
                         authority: control_authority,
                         listen_address: supervisor_listen,
+                    },
+                )
+            }
+            KubernetesControlPath::RuntimeInitiatedShared {
+                control_authority,
+                supervisor_address,
+                supervisor_namespace: shared_namespace,
+                route,
+                control_policy_uid,
+                control_policy_resource_version,
+            } => {
+                resource_claims.insert(
+                    "kubernetes.control_policy_uid".to_string(),
+                    control_policy_uid,
+                );
+                resource_claims.insert(
+                    "kubernetes.control_policy_resource_version".to_string(),
+                    control_policy_resource_version,
+                );
+                supervisor_namespace = Some(shared_namespace);
+                shared_port = Some(supervisor_address.port());
+                (
+                    BoundaryListener::RuntimeInitiatedTlsTcp {
+                        authority: control_authority.clone(),
+                        addresses: vec![supervisor_address],
+                        tls: self.sandbox_tls,
+                        route: Some(route.clone()),
+                    },
+                    SandboxTransport::RuntimeInitiatedRouted {
+                        authority: control_authority,
+                        route,
                     },
                 )
             }
@@ -412,6 +529,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
             SandboxTransport::RuntimeInitiatedTcp { listen_address, .. } => {
                 Some(listen_address.port())
             }
+            SandboxTransport::RuntimeInitiatedRouted { .. } => shared_port,
             _ => None,
         };
         let provisioning_evidence = KubernetesOuterFenceEvidence {
@@ -426,6 +544,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 network_policy_resource_version: &resource_claims
                     ["kubernetes.control_policy_resource_version"],
                 port,
+                supervisor_namespace: supervisor_namespace.as_deref(),
             }),
         }
         .project(&self.generation)?;
@@ -531,7 +650,7 @@ mod tests {
             sandbox_resource_uid: "sandbox-resource-uid".to_string(),
             workload_pod_uid: "pod-uid".to_string(),
             workload_pod_uid_path: PathBuf::from("/.openshell/pod-identity/uid"),
-            supervisor_pod_uid: "supervisor-pod-uid".to_string(),
+            supervisor: KubernetesSupervisorClaim::Pod("supervisor-pod-uid".to_string()),
             egress_policy_uid: "network-policy-uid".to_string(),
             egress_policy_resource_version: "1945".to_string(),
             control_path: KubernetesControlPath::SupervisorInitiated {

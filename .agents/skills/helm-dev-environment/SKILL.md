@@ -68,15 +68,33 @@ gatewayConfig:
     supervisor_topology: gateway
 ```
 
-The gateway chart creates a separate, single-replica shared-host placeholder Deployment
-in the release namespace, regardless of shared/managed/operator workspace mode.
-Use a supervisor image built from this branch: `--mode=shared` is new.
-The chart sets `--gateway-endpoint` from the gateway's gRPC endpoint and
-`--address` to `0.0.0.0:5501`. Check its rollout and TCP health probes on this
-listener (container port `supervisor`, 5501). The outbound gateway connection and
-session RPCs are not implemented yet; sandboxes
-still use dedicated supervisors. `workspace` is reserved and rejected. Omit the
-field to disable it.
+The gateway chart creates a single-replica shared supervisor Deployment,
+Service, NetworkPolicy, and an empty `<release>-supervisor-token` Secret in
+the release namespace, regardless of shared/managed/operator workspace mode.
+The gateway mints a supervisor token from its sandbox-JWT signing key, writes
+it into that Secret (the gateway Role may `get`/`patch` only that Secret), and
+renews it at half its lifetime; the supervisor mounts the Secret and presents
+the token on the private `openshell.supervisor.host.v1` assignment stream,
+which accepts nothing else. The topology requires gateway TLS and the signing
+key (`server.disableTls` is rejected; the gateway refuses to start without
+`gateway_jwt`). New sandbox generations run as sandbox instances in that
+process. The chart starts `--mode=shared`, sets `--gateway-endpoint` to the
+gateway gRPC URL, mounts the token at `--token-file`, and binds `--address`
+(5501) to a plain TCP health listener for the `tcpSocket` probes; nothing
+dials the supervisor but sandbox runtimes (5500) and the kubelet. Build the gateway, supervisor, and sandbox
+images from the same branch: all three must support the routed runtime
+connection and the assignment stream. `workspace` is reserved and rejected.
+Omit the field to disable it. `mise run
+e2e:kubernetes:shared-supervisor` runs the focused e2e
+(`ci/values-supervisor.yaml`). The task prepends that overlay to any
+colon-separated `OPENSHELL_E2E_KUBE_EXTRA_VALUES` list, so layer a
+workspace-mode overlay to cover managed namespaces:
+
+```bash
+OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-workspace-managed.yaml \
+OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
+  mise run e2e:kubernetes:shared-supervisor
+```
 
 ### 2. Deploy OpenShell
 

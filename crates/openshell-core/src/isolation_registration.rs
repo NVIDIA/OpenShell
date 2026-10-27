@@ -34,7 +34,8 @@ pub enum SandboxTransport {
 impl SandboxTransport {
     pub fn validate(&self) -> Result<(), &'static str> {
         let valid = match self {
-            Self::Unix { socket_path } => socket_path.is_absolute(),
+            // Unix transport only runs on Unix hosts, but validation may not.
+            Self::Unix { socket_path } => crate::paths::is_posix_absolute(socket_path),
             Self::Tcp {
                 authority,
                 addresses,

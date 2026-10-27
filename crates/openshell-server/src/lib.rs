@@ -73,7 +73,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::LazyLock;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -236,6 +236,53 @@ fn spawn_gateway_extension_token_refresh(
                         error = %status,
                         "failed to mint gateway extension credential"
                     ),
+                }
+            }
+        }
+    });
+}
+
+/// Mint the shared supervisor's token and renew it at half its lifetime so
+/// the delivered copy is never close to expiry when the supervisor restarts
+/// or reconnects. Minting failures are logged and retried shortly.
+fn spawn_supervisor_token_refresh(
+    authority: Arc<auth::sandbox_jwt::SandboxSessionJwtAuthority>,
+    ttl: Duration,
+    controller: openshell_supervisor_control::SupervisorHostController,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let delay = match authority.mint_supervisor_token(ttl) {
+                Ok(minted) => {
+                    let remaining = minted.expires_at.saturating_sub(
+                        i64::try_from(
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map_or(0, |elapsed| elapsed.as_secs()),
+                        )
+                        .unwrap_or(i64::MAX),
+                    );
+                    controller.publish_credential(
+                        openshell_supervisor_control::SupervisorCredential {
+                            token: minted.token,
+                            expires_at: minted.expires_at,
+                        },
+                    );
+                    Duration::from_secs(u64::try_from(remaining).unwrap_or(0) / 2)
+                        .max(Duration::from_secs(1))
+                }
+                Err(error) => {
+                    warn!(%error, "failed to mint the supervisor token; retrying");
+                    Duration::from_secs(10)
+                }
+            };
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return;
+                    }
                 }
             }
         }
@@ -743,6 +790,37 @@ pub(crate) async fn run_server(
     state.sandbox_session_jwt_authority = sandbox_session_jwt_authority;
     if let Some(issuer) = extension_jwt_issuer {
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
+    }
+    // The shared supervisor authenticates with a token this gateway mints
+    // from its launch-signing key and carries only over TLS, so the topology
+    // needs both.
+    if let Some(controller) = state.compute.supervisor_host() {
+        let (authority, jwt) = state
+            .sandbox_session_jwt_authority
+            .clone()
+            .zip(config.gateway_jwt.as_ref())
+            .ok_or_else(|| {
+                Error::config(
+                    "the shared supervisor requires gateway_jwt signing material to mint \
+                     supervisor tokens; configure [openshell.gateway.gateway_jwt] or disable \
+                     supervisor_topology",
+                )
+            })?;
+        if config.tls.is_none() {
+            return Err(Error::config(
+                "the shared supervisor requires gateway TLS; its token travels only over TLS. \
+                 Enable TLS or disable supervisor_topology",
+            ));
+        }
+        let ttl = jwt.token_ttl().clamp(
+            openshell_core::jwt::MIN_SESSION_TOKEN_TTL,
+            openshell_core::jwt::MAX_SESSION_TOKEN_TTL,
+        );
+        info!(
+            ttl_secs = ttl.as_secs(),
+            "shared supervisor assignment stream enabled; minting supervisor tokens"
+        );
+        spawn_supervisor_token_refresh(authority, ttl, controller.clone(), shutdown_rx.clone());
     }
 
     if state.sandbox_session_jwt_authority.is_some()
@@ -1617,9 +1695,22 @@ impl ComputeDriverConfigContext<'_> {
 pub struct ComputeDriverBuildContext<'a> {
     config: ComputeDriverConfigContext<'a>,
     shutdown_rx: watch::Receiver<bool>,
+    shared_supervision: &'a OnceLock<openshell_supervisor_control::SharedSupervision>,
 }
 
 impl ComputeDriverBuildContext<'_> {
+    /// The gateway's coordination of a shared supervisor host, for an
+    /// in-process driver whose configuration places new generations on it.
+    /// The gateway owns the desired set, serves it to the host over the
+    /// private assignment stream, mints the supervisor token, and publishes
+    /// each renewal for the driver to deliver. Created on first request; every
+    /// call returns the same coordination.
+    pub fn shared_supervision(&self) -> openshell_supervisor_control::SharedSupervision {
+        self.shared_supervision
+            .get_or_init(openshell_supervisor_control::SharedSupervision::new)
+            .clone()
+    }
+
     #[must_use]
     pub fn config_context(&self) -> ComputeDriverConfigContext<'_> {
         self.config
@@ -1737,6 +1828,7 @@ async fn build_compute_runtime(
     info!(driver = %driver.name(), "Using compute driver");
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
+            let shared_supervision = OnceLock::new();
             let build_context = ComputeDriverBuildContext {
                 config: ComputeDriverConfigContext {
                     driver_name: &registration.name,
@@ -1746,8 +1838,12 @@ async fn build_compute_runtime(
                     driver_startup,
                 },
                 shutdown_rx,
+                shared_supervision: &shared_supervision,
             };
             let instance = registration.factory.build(build_context).await?;
+            let supervisor_host = shared_supervision
+                .into_inner()
+                .map(|supervision| supervision.controller().clone());
             match instance {
                 ComputeDriverInstance::InProcess(driver) => ComputeRuntime::from_driver(
                     registration.name,
@@ -1762,7 +1858,13 @@ async fn build_compute_runtime(
                 .await
                 .map_err(|error| {
                     Error::execution(format!("failed to create compute runtime: {error}"))
-                })?,
+                })?
+                .with_supervisor_host(supervisor_host),
+                ComputeDriverInstance::ManagedRemote(_) if supervisor_host.is_some() => {
+                    return Err(Error::config(
+                        "only an in-process compute driver can use the gateway's shared supervision",
+                    ));
+                }
                 ComputeDriverInstance::ManagedRemote(mut endpoint) => {
                     endpoint.name = registration.name;
                     ComputeRuntime::new_remote_driver(

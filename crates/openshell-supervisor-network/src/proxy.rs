@@ -1227,11 +1227,11 @@ async fn handle_transparent_tcp_connection(
         &decision,
         None,
         None,
-        agent_proposals,
         // The transparent TCP path carries no PolicyLocalContext, so no
         // workspace is available here; matches the CONNECT path default when
         // policy-local context is absent.
-        String::new(),
+        None,
+        agent_proposals,
         relay::RelaySignals {
             activity: activity_tx.clone(),
             endpoint_observation: None,
@@ -3019,16 +3019,12 @@ async fn handle_mediated_connection(
     // gate needs it) and drives the raw-tunnel branch below.
 
     // Build request-processing context shared by CONNECT and forward HTTP.
-    let workspace = policy_local_ctx
-        .as_ref()
-        .map(|ctx| ctx.workspace())
-        .unwrap_or_default();
     let mut ctx = relay::http_context(
         &decision,
         provider_credentials,
         secret_resolver.clone(),
+        policy_local_ctx.as_deref(),
         agent_proposals,
-        workspace,
         relay::RelaySignals {
             activity: activity_tx.clone(),
             endpoint_observation: endpoint_observation_tx,
@@ -5673,16 +5669,12 @@ async fn handle_forward_proxy(
         .map_or_else(std::collections::HashMap::new, |query| {
             crate::l7::rest::parse_query_params(query).unwrap_or_default()
         });
-    let workspace = policy_local_ctx
-        .as_ref()
-        .map(|ctx| ctx.workspace())
-        .unwrap_or_default();
     let mut l7_ctx = relay::http_context(
         &decision,
         provider_credentials,
         secret_resolver.clone(),
+        policy_local_ctx.as_deref(),
         agent_proposals,
-        workspace,
         relay::RelaySignals {
             activity: activity_tx.cloned(),
             endpoint_observation: endpoint_observation_tx,

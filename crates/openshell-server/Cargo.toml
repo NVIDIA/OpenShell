@@ -25,6 +25,7 @@ openshell-policy = { path = "../openshell-policy" }
 openshell-prover = { path = "../openshell-prover" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
+openshell-supervisor-control = { path = "../openshell-supervisor-control" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 
 # Kubernetes client used by ServiceAccount bootstrap authentication and the

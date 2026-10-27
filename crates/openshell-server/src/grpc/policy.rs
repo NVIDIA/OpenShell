@@ -2788,8 +2788,8 @@ async fn resolve_sandbox_by_name_for_principal(
         Principal::User(_) | Principal::Operator(_) => {
             sandbox.ok_or_else(|| Status::not_found("sandbox not found"))
         }
-        Principal::Peer(_) => Err(Status::permission_denied(
-            "gateway peer principals may not resolve sandbox configuration",
+        Principal::Peer(_) | Principal::Supervisor(_) => Err(Status::permission_denied(
+            "gateway peer and supervisor principals may not resolve sandbox configuration",
         )),
         Principal::Anonymous => Err(Status::unauthenticated(
             "sandbox-scoped methods require an authenticated caller",
@@ -23151,19 +23151,34 @@ mod tests {
 
     #[test]
     fn config_revision_changes_when_supervisor_middleware_services_change() {
+        use openshell_core::proto::{
+            SupervisorMiddlewareBinding, SupervisorMiddlewareBindingPolicy,
+        };
+
         let policy = ProtoSandboxPolicy::default();
         let settings = HashMap::new();
-        let service = openshell_core::proto::SupervisorMiddlewareService {
+        let mut service = openshell_core::proto::SupervisorMiddlewareService {
             name: "local-guard".into(),
             grpc_endpoint: "http://127.0.0.1:50051".into(),
             max_payload_bytes: 1024,
             ..Default::default()
         };
 
-        let without = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
-        let with =
-            compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[service]);
-        assert_ne!(without, with);
+        let revision = |services: &[openshell_core::proto::SupervisorMiddlewareService]| {
+            compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, services)
+        };
+        let without = revision(&[]);
+        let dynamic = revision(std::slice::from_ref(&service));
+        assert_ne!(without, dynamic);
+
+        service.binding_policy = SupervisorMiddlewareBindingPolicy::Allowlist.into();
+        service.bindings = vec![SupervisorMiddlewareBinding::HttpRequestPreCredentials.into()];
+        let request = revision(std::slice::from_ref(&service));
+        assert_ne!(dynamic, request);
+        service
+            .bindings
+            .push(SupervisorMiddlewareBinding::HttpResponsePreReturn.into());
+        assert_ne!(request, revision(&[service]));
     }
 
     #[test]

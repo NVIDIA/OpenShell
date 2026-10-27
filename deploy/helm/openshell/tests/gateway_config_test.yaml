@@ -508,6 +508,47 @@ tests:
             mountPath: /var/log/openshell
             subPathExpr: $(OPENSHELL_POD_NAME)
 
+  - it: adds extra gateway environment variables in a StatefulSet
+    template: templates/statefulset.yaml
+    set:
+      server.extraEnv:
+        - name: OTEL_TRACES_SAMPLER
+          value: parentbased_traceidratio
+        - name: OTEL_EXPORTER_OTLP_HEADERS
+          valueFrom:
+            secretKeyRef:
+              name: otel-collector-auth
+              key: headers
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OTEL_TRACES_SAMPLER
+            value: parentbased_traceidratio
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OTEL_EXPORTER_OTLP_HEADERS
+            valueFrom:
+              secretKeyRef:
+                name: otel-collector-auth
+                key: headers
+
+  - it: adds extra gateway environment variables in a Deployment
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      server.extraEnv:
+        - name: OTEL_TRACES_SAMPLER
+          value: parentbased_traceidratio
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OTEL_TRACES_SAMPLER
+            value: parentbased_traceidratio
+
   - it: mounts the OIDC CA bundle when TLS is disabled
     template: templates/statefulset.yaml
     set:

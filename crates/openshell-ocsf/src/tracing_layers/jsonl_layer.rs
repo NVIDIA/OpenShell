@@ -16,6 +16,28 @@ use tracing_subscriber::layer::Context;
 use crate::format::downgrade::downgrade_event;
 use crate::tracing_layers::event_bridge::{OCSF_TARGET, clone_current_event};
 
+/// OCSF JSON output settings owned by one hosted sandbox instance.
+///
+/// Instances apply their own `ocsf_json_enabled` and schema-version settings
+/// to these values. Binding them to the instance's runtime threads makes every
+/// [`OcsfJsonlLayer`] use them for events those threads emit.
+#[derive(Clone, Debug, Default)]
+pub struct OcsfJsonSettings {
+    pub enabled: Arc<AtomicBool>,
+    pub target_version: Arc<Mutex<String>>,
+}
+
+std::thread_local! {
+    static THREAD_JSON_SETTINGS: std::cell::RefCell<Option<OcsfJsonSettings>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Apply one hosted sandbox instance's JSON settings to events emitted on this
+/// thread.
+pub fn bind_thread_json_settings(settings: Option<OcsfJsonSettings>) {
+    THREAD_JSON_SETTINGS.with(|current| *current.borrow_mut() = settings);
+}
+
 /// A tracing `Layer` that intercepts OCSF events and writes JSONL output.
 ///
 /// Only events with `target: "ocsf"` are processed; non-OCSF events are ignored.
@@ -90,8 +112,15 @@ where
             return;
         }
 
+        // A hosted sandbox instance's settings replace the process-wide ones.
+        let instance = THREAD_JSON_SETTINGS.with(|current| current.borrow().clone());
+        let (enabled, target_version) = instance.as_ref().map_or(
+            (self.enabled.as_ref(), self.target_version.as_ref()),
+            |settings| (Some(&settings.enabled), Some(&settings.target_version)),
+        );
+
         // If an enabled flag is set and it reads `false`, skip writing.
-        if let Some(ref flag) = self.enabled
+        if let Some(flag) = enabled
             && !flag.load(Ordering::Relaxed)
         {
             return;
@@ -100,7 +129,7 @@ where
         if let Some(ocsf_event) = clone_current_event()
             && let Ok(mut w) = self.writer.lock()
         {
-            let line = if let Some(ref target) = self.target_version
+            let line = if let Some(target) = target_version
                 && let Ok(version) = target.lock()
                 && !version.is_empty()
             {

@@ -68,12 +68,13 @@ pub use format::downgrade::OcsfSchemaVersion;
 // --- Builders ---
 pub use builders::{
     ApiActivityBuilder, AppLifecycleBuilder, AuthenticationBuilder, BaseEventBuilder,
-    ConfigStateChangeBuilder, DetectionFindingBuilder, EventContext, EventOrigin,
+    ConfigStateChangeBuilder, ContextRef, DetectionFindingBuilder, EventContext, EventOrigin,
     HttpActivityBuilder, NetworkActivityBuilder, ProcessActivityBuilder, SshActivityBuilder,
 };
 
 // --- Tracing layers ---
 pub use tracing_layers::{
-    OCSF_TARGET, OcsfJsonlLayer, OcsfShorthandLayer, clear_current_event, clone_current_event,
-    emit_ocsf_event, emit_ocsf_event_routed, set_current_event,
+    OCSF_TARGET, OcsfJsonSettings, OcsfJsonlLayer, OcsfShorthandLayer, bind_thread_json_settings,
+    clear_current_event, clone_current_event, emit_ocsf_event, emit_ocsf_event_routed,
+    set_current_event,
 };

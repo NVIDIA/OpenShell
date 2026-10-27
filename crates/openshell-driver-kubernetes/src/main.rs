@@ -261,6 +261,7 @@ async fn main() -> Result<()> {
     let driver = KubernetesComputeDriver::new(
         KubernetesComputeConfig {
             supervisor_topology: None,
+            shared_supervisor: None,
             allow_driver_config: args.admission_config_json.allow_driver_config,
             resource_admission: args.admission_config_json.resource_admission.clone(),
             workspace_mode: args.workspace_mode,

@@ -43,6 +43,8 @@ pub const PROXY_CA_PRIVATE_KEY: &str = "proxy-ca.key";
 /// bundle (`proxy_ca_bundle`). Distinct from [`PROXY_CA_CERTIFICATE_KEY`],
 /// which is the sandbox's own generated TLS-interception CA.
 pub const UPSTREAM_PROXY_CA_BUNDLE_KEY: &str = "upstream-proxy-ca.pem";
+/// JSON sandbox instance registration of a generation on the shared supervisor.
+pub const SHARED_INSTANCE_KEY: &str = "instance.json";
 pub const CLIENT_TLS_CA_KEY: &str = "client-ca.crt";
 pub const SANDBOX_BOOTSTRAP_INPUT_PATH: &str = "/.openshell/bootstrap-input";
 pub const BOUNDARY_CONFIG_PATH: &str = "/.openshell/state/bootstrap/boundary.json";
@@ -118,6 +120,8 @@ pub struct SandboxRuntimeNames {
     pub supervisor_service: String,
     /// Per-sandbox egress allowance used only by runtime-initiated control.
     pub control_policy: String,
+    /// Per-sandbox egress allowance to the gateway's shared supervisor.
+    pub shared_control_policy: String,
     pub supervisor_pod: String,
     pub workload_policy: String,
     pub supervisor_policy: String,
@@ -134,6 +138,7 @@ impl SandboxRuntimeNames {
             boundary_service: format!("os-boundary-{suffix}"),
             supervisor_service: format!("os-supervisor-{suffix}"),
             control_policy: format!("os-control-{suffix}"),
+            shared_control_policy: format!("os-shared-control-{suffix}"),
             supervisor_pod: format!("os-supervisor-{suffix}"),
             workload_policy: NAMESPACE_WORKLOAD_POLICY_NAME.to_string(),
             supervisor_policy: NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME.to_string(),
@@ -280,6 +285,30 @@ pub fn control_policy(
     );
     policy.metadata.owner_references = Some(vec![owner]);
     policy.metadata.labels = Some(common_labels(sandbox_id, "sandbox-control-egress"));
+    policy
+}
+
+/// Egress allowance from this sandbox's workload Pod to the shared supervisor.
+#[must_use]
+pub fn shared_control_policy(
+    namespace: &str,
+    names: &SandboxRuntimeNames,
+    sandbox_id: &str,
+    supervisor_namespace: &str,
+    supervisor_selector: BTreeMap<String, String>,
+    runtime_port: u16,
+    owner: OwnerReference,
+) -> NetworkPolicy {
+    let mut policy = crate::isolation::shared_runtime_control_policy(
+        namespace,
+        &names.shared_control_policy,
+        &pair_label_value(sandbox_id),
+        supervisor_namespace,
+        supervisor_selector,
+        runtime_port,
+    );
+    policy.metadata.owner_references = Some(vec![owner]);
+    policy.metadata.labels = Some(common_labels(sandbox_id, "sandbox-shared-control-egress"));
     policy
 }
 
@@ -655,6 +684,35 @@ pub fn supervisor_bootstrap_secret(
             ..Default::default()
         },
         data: Some(data),
+        immutable: Some(true),
+        type_: Some("Opaque".to_string()),
+        ..Default::default()
+    }
+}
+
+/// Durable launch material of one shared-supervisor sandbox instance, under
+/// the generation's supervisor Secret name so the existing generation cleanup
+/// deletes it. The gateway reads it back to rebuild the host's assignments.
+#[must_use]
+pub fn shared_instance_secret(
+    namespace: &str,
+    names: &SandboxRuntimeNames,
+    sandbox_id: &str,
+    registration: Vec<u8>,
+    owner: OwnerReference,
+) -> Secret {
+    Secret {
+        metadata: ObjectMeta {
+            name: Some(names.supervisor_secret.clone()),
+            namespace: Some(namespace.to_string()),
+            owner_references: Some(vec![owner]),
+            labels: Some(common_labels(sandbox_id, SUPERVISOR_SECRET_COMPONENT)),
+            ..Default::default()
+        },
+        data: Some(BTreeMap::from([(
+            SHARED_INSTANCE_KEY.to_string(),
+            ByteString(registration),
+        )])),
         immutable: Some(true),
         type_: Some("Opaque".to_string()),
         ..Default::default()

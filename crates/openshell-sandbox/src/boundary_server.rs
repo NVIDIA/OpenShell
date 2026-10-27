@@ -382,7 +382,14 @@ mod linux {
                 authority,
                 addresses,
                 tls,
-            } => validate_runtime_initiated_targets(authority, addresses, tls)?,
+                route,
+            } => {
+                validate_runtime_initiated_targets(authority, addresses, tls)?;
+                if let Some(route) = route {
+                    openshell_sandbox_backend::runtime_routed::validate_route_handle(route)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
             BoundaryListenerConfig::Unix { .. }
             | BoundaryListenerConfig::RuntimeInitiatedUnix { .. }
             | BoundaryListenerConfig::RuntimeInitiatedVsock { .. }
@@ -742,16 +749,30 @@ mod linux {
     }
 
     /// Dial only driver-provided supervisor addresses from the bootstrap.
+    ///
+    /// A shared supervisor first receives this generation's route handle so
+    /// it can expect the right pinned identity; this runtime then serves TLS
+    /// exactly as it does for a dedicated supervisor.
     async fn dial_supervisor(config: &BoundaryListenerConfig) -> io::Result<PlainControlStream> {
         match config {
-            BoundaryListenerConfig::RuntimeInitiatedTlsTcp { addresses, .. } => {
-                let stream =
+            BoundaryListenerConfig::RuntimeInitiatedTlsTcp {
+                addresses, route, ..
+            } => {
+                let mut stream =
                     openshell_core::net::connect_tcp_nodelay_best_effort(addresses).await?;
                 let keepalive = socket2::TcpKeepalive::new()
                     .with_time(Duration::from_secs(10))
                     .with_interval(Duration::from_secs(5))
                     .with_retries(3);
                 let _ = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive);
+                if let Some(route) = route {
+                    let preface =
+                        openshell_sandbox_backend::runtime_routed::encode_route_preface(route)
+                            .map_err(|error| {
+                                io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+                            })?;
+                    stream.write_all(&preface).await?;
+                }
                 Ok(PlainControlStream::Tcp(stream.into_std()?))
             }
             BoundaryListenerConfig::RuntimeInitiatedUnix { socket_path, .. } => {

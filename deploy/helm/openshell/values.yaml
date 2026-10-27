@@ -369,6 +369,9 @@ server:
   extraVolumes: []
   # -- Additional volume mounts for the gateway container.
   extraVolumeMounts: []
+  # -- Additional environment variables for the gateway container, such as
+  # OTEL_* exporter settings. Entries can read from a Secret with valueFrom.
+  extraEnv: []
   # -- Enable anonymous OpenShell telemetry from the gateway and the sandbox
   # supervisors it launches.
   telemetryEnabled: true
@@ -658,6 +661,10 @@ pkiInitJob:
   # Secrets. When certManager.enabled=true, cert-manager owns TLS and this same
   # hook runs in JWT-only mode even if pkiInitJob.enabled remains true.
   enabled: true
+  # -- Additional labels on both certificate hook Pods. Chart-owned labels take precedence.
+  podLabels: {}
+  # -- Additional annotations on both certificate hook Pods.
+  podAnnotations: {}
   # -- Extra DNS SANs to append to the server certificate.
   serverDnsNames: []
   # -- Extra IP SANs to append to the server certificate.

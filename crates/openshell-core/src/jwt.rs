@@ -47,6 +47,9 @@ mod session {
 
     pub const GATEWAY_SESSION_JWT_TYPE: &str = "openshell-gateway-session+jwt";
     pub const SANDBOX_SESSION_JWT_TYPE: &str = "openshell-sandbox-session+jwt";
+    /// JOSE `typ` of the supervisor token: the credential of the gateway's
+    /// shared supervisor process for the assignment stream, and nothing else.
+    pub const SUPERVISOR_JWT_TYPE: &str = "openshell-supervisor+jwt";
     pub const SANDBOX_SESSION_AUDIENCE: &str = "openshell-sandbox";
     pub const DEFAULT_SESSION_TOKEN_TTL: Duration = Duration::from_hours(1);
     pub const MIN_SESSION_TOKEN_TTL: Duration = Duration::from_mins(1);
@@ -55,6 +58,7 @@ mod session {
 
     const GATEWAY_ISSUER_PREFIX: &str = "openshell-gateway:";
     const SANDBOX_SUBJECT_PREFIX: &str = "spiffe://openshell/sandbox/";
+    const SUPERVISOR_SUBJECT_PREFIX: &str = "openshell-supervisor:";
 
     /// Canonical sandbox identity carried by both session-token profiles.
     #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -172,6 +176,21 @@ mod session {
         sandbox_id: SandboxId,
         runtime_generation: SandboxGenerationId,
         auth_epoch: CredentialEpoch,
+        component: SessionComponent,
+    }
+
+    /// Claims of the supervisor token. It names no sandbox, generation, or
+    /// credential epoch: the shared supervisor acts for sandboxes only with the
+    /// per-instance credentials each assignment carries.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SupervisorClaims {
+        iss: String,
+        sub: String,
+        aud: String,
+        iat: i64,
+        exp: i64,
+        jti: String,
         component: SessionComponent,
     }
 
@@ -668,6 +687,40 @@ mod session {
             })
         }
 
+        /// Mint the shared supervisor's token for the gateway's assignment
+        /// stream with its own bounded lifetime, independent of the session
+        /// token lifetime (which may be non-expiring).
+        pub fn mint_supervisor_token(
+            &self,
+            ttl: Duration,
+        ) -> Result<MintedSessionToken, SessionJwtError> {
+            validate_ttl(ttl)?;
+            let issued_at = self.clock.now_unix_seconds();
+            let expires_at =
+                issued_at.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX));
+            let token_id = Uuid::new_v4();
+            let gateway_id = &self.issuer[GATEWAY_ISSUER_PREFIX.len()..];
+            let claims = SupervisorClaims {
+                iss: self.issuer.clone(),
+                sub: format!("{SUPERVISOR_SUBJECT_PREFIX}{gateway_id}"),
+                aud: self.issuer.clone(),
+                iat: issued_at,
+                exp: expires_at,
+                jti: token_id.to_string(),
+                component: SessionComponent::OpenShellSupervisor,
+            };
+            let mut header = Header::new(Algorithm::EdDSA);
+            header.kid = Some(self.key_id.clone());
+            header.typ = Some(SUPERVISOR_JWT_TYPE.to_string());
+            let token = encode(&header, &claims, &self.encoding_key)
+                .map_err(|_| SessionJwtError::SigningFailed)?;
+            Ok(MintedSessionToken {
+                token: SecretJwt::parse(token)?,
+                expires_at,
+                token_id,
+            })
+        }
+
         fn mint(
             &self,
             profile: SessionTokenProfile,
@@ -749,20 +802,8 @@ mod session {
         ) -> Result<Self, SessionJwtError> {
             install_crypto_provider();
             let gateway_id = validate_gateway_id(gateway_id)?;
-            let mut parsed = BTreeMap::new();
-            for key in keys {
-                let key_id = validate_key_id(key.key_id)?;
-                let decoding_key = DecodingKey::from_ed_pem(&key.public_key_pem)
-                    .map_err(|_| SessionJwtError::InvalidVerificationKey)?;
-                if parsed.insert(key_id, decoding_key).is_some() {
-                    return Err(SessionJwtError::DuplicateKeyId);
-                }
-            }
-            if parsed.is_empty() {
-                return Err(SessionJwtError::NoVerificationKeys);
-            }
             Ok(Self {
-                keys: parsed,
+                keys: parse_verification_keys(keys)?,
                 issuer: format!("{GATEWAY_ISSUER_PREFIX}{gateway_id}"),
                 profile,
                 clock,
@@ -770,27 +811,12 @@ mod session {
         }
 
         pub fn verify(&self, token: &str) -> Result<AuthenticatedSandboxSession, SessionJwtError> {
-            install_crypto_provider();
-            let header = decode_header(token).map_err(|_| SessionJwtError::InvalidToken)?;
-            if header.alg != Algorithm::EdDSA {
-                return Err(SessionJwtError::WrongAlgorithm);
-            }
-            if header.typ.as_deref() != Some(self.profile.token_type()) {
-                return Err(SessionJwtError::WrongTokenType);
-            }
-            let key_id = header.kid.ok_or(SessionJwtError::MissingKeyId)?;
-            let key = self
-                .keys
-                .get(&key_id)
-                .ok_or(SessionJwtError::UnknownKeyId)?;
-            let mut validation = Validation::new(Algorithm::EdDSA);
-            validation.algorithms = vec![Algorithm::EdDSA];
-            validation.validate_exp = false;
-            validation.validate_aud = false;
-            validation.set_required_spec_claims(&["iss", "aud", "iat", "exp", "sub", "jti"]);
-            let claims = decode::<SessionClaims>(token, key, &validation)
-                .map_err(|_| SessionJwtError::InvalidToken)?
-                .claims;
+            let claims = decode_signed::<SessionClaims>(
+                &self.keys,
+                token,
+                self.profile.token_type(),
+                &["iss", "aud", "iat", "exp", "sub", "jti"],
+            )?;
             self.validate_claims(claims)
         }
 
@@ -810,23 +836,7 @@ mod session {
             SandboxGenerationId::parse(claims.runtime_generation.to_string())
                 .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?;
             let token_id = Uuid::parse_str(&claims.jti).map_err(|_| SessionJwtError::InvalidJti)?;
-            let now = self.clock.now_unix_seconds();
-            let leeway = i64::try_from(MAX_SESSION_CLOCK_LEEWAY.as_secs()).unwrap_or(30);
-            if claims.iat > now.saturating_add(leeway) {
-                return Err(SessionJwtError::IssuedInFuture);
-            }
-            if claims.exp != 0 {
-                if claims.exp <= claims.iat {
-                    return Err(SessionJwtError::InvalidLifetime);
-                }
-                let lifetime = claims.exp.saturating_sub(claims.iat);
-                if lifetime > i64::try_from(MAX_SESSION_TOKEN_TTL.as_secs()).unwrap_or(i64::MAX) {
-                    return Err(SessionJwtError::InvalidLifetime);
-                }
-                if claims.exp < now.saturating_sub(leeway) {
-                    return Err(SessionJwtError::Expired);
-                }
-            }
+            validate_lifetime(claims.iat, claims.exp, self.clock.now_unix_seconds())?;
             Ok(AuthenticatedSandboxSession {
                 sandbox_id: claims.sandbox_id,
                 runtime_generation: claims.runtime_generation,
@@ -836,6 +846,151 @@ mod session {
                 expires_at: claims.exp,
             })
         }
+    }
+
+    /// A verified supervisor token.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct AuthenticatedSupervisor {
+        /// `openshell-supervisor:<gateway_id>`.
+        pub subject: String,
+        pub token_id: Uuid,
+        pub issued_at: i64,
+        pub expires_at: i64,
+    }
+
+    /// Strict gateway-side verifier of supervisor tokens. Accepts only the
+    /// supervisor profile signed by this gateway for this gateway.
+    pub struct SupervisorJwtVerifier {
+        keys: BTreeMap<String, DecodingKey>,
+        issuer: String,
+        subject: String,
+        clock: Arc<dyn JwtClock>,
+    }
+
+    impl fmt::Debug for SupervisorJwtVerifier {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("SupervisorJwtVerifier")
+                .field("key_ids", &self.keys.keys().collect::<Vec<_>>())
+                .field("issuer", &self.issuer)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl SupervisorJwtVerifier {
+        pub fn new(
+            gateway_id: &str,
+            keys: impl IntoIterator<Item = SessionVerificationKey>,
+            clock: Arc<dyn JwtClock>,
+        ) -> Result<Self, SessionJwtError> {
+            install_crypto_provider();
+            let gateway_id = validate_gateway_id(gateway_id)?;
+            Ok(Self {
+                keys: parse_verification_keys(keys)?,
+                issuer: format!("{GATEWAY_ISSUER_PREFIX}{gateway_id}"),
+                subject: format!("{SUPERVISOR_SUBJECT_PREFIX}{gateway_id}"),
+                clock,
+            })
+        }
+
+        pub fn verify(&self, token: &str) -> Result<AuthenticatedSupervisor, SessionJwtError> {
+            let claims = decode_signed::<SupervisorClaims>(
+                &self.keys,
+                token,
+                SUPERVISOR_JWT_TYPE,
+                &["iss", "aud", "iat", "exp", "sub", "jti"],
+            )?;
+            if claims.iss != self.issuer {
+                return Err(SessionJwtError::WrongIssuer);
+            }
+            if claims.aud != self.issuer {
+                return Err(SessionJwtError::WrongAudience);
+            }
+            if claims.sub != self.subject {
+                return Err(SessionJwtError::SubjectMismatch);
+            }
+            let token_id = Uuid::parse_str(&claims.jti).map_err(|_| SessionJwtError::InvalidJti)?;
+            // Supervisor tokens must expire; a non-expiring one is refused.
+            if claims.exp == 0 {
+                return Err(SessionJwtError::InvalidLifetime);
+            }
+            validate_lifetime(claims.iat, claims.exp, self.clock.now_unix_seconds())?;
+            Ok(AuthenticatedSupervisor {
+                subject: claims.sub,
+                token_id,
+                issued_at: claims.iat,
+                expires_at: claims.exp,
+            })
+        }
+    }
+
+    fn parse_verification_keys(
+        keys: impl IntoIterator<Item = SessionVerificationKey>,
+    ) -> Result<BTreeMap<String, DecodingKey>, SessionJwtError> {
+        let mut parsed = BTreeMap::new();
+        for key in keys {
+            let key_id = validate_key_id(key.key_id)?;
+            let decoding_key = DecodingKey::from_ed_pem(&key.public_key_pem)
+                .map_err(|_| SessionJwtError::InvalidVerificationKey)?;
+            if parsed.insert(key_id, decoding_key).is_some() {
+                return Err(SessionJwtError::DuplicateKeyId);
+            }
+        }
+        if parsed.is_empty() {
+            return Err(SessionJwtError::NoVerificationKeys);
+        }
+        Ok(parsed)
+    }
+
+    /// Check the header (`EdDSA` only, exact `typ`, known `kid`) and the
+    /// signature, then decode the claims. Time and audience are validated by
+    /// the caller against its own clock and profile.
+    fn decode_signed<T: serde::de::DeserializeOwned>(
+        keys: &BTreeMap<String, DecodingKey>,
+        token: &str,
+        token_type: &str,
+        required_claims: &[&str],
+    ) -> Result<T, SessionJwtError> {
+        install_crypto_provider();
+        let header = decode_header(token).map_err(|_| SessionJwtError::InvalidToken)?;
+        if header.alg != Algorithm::EdDSA {
+            return Err(SessionJwtError::WrongAlgorithm);
+        }
+        if header.typ.as_deref() != Some(token_type) {
+            return Err(SessionJwtError::WrongTokenType);
+        }
+        let key_id = header.kid.ok_or(SessionJwtError::MissingKeyId)?;
+        let key = keys.get(&key_id).ok_or(SessionJwtError::UnknownKeyId)?;
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.algorithms = vec![Algorithm::EdDSA];
+        validation.validate_exp = false;
+        validation.validate_aud = false;
+        validation.set_required_spec_claims(required_claims);
+        Ok(decode::<T>(token, key, &validation)
+            .map_err(|_| SessionJwtError::InvalidToken)?
+            .claims)
+    }
+
+    /// Shared lifetime rules: not issued in the future, and when expiring,
+    /// a positive lifetime within the session bound that has not passed.
+    fn validate_lifetime(issued_at: i64, expires_at: i64, now: i64) -> Result<(), SessionJwtError> {
+        let leeway = i64::try_from(MAX_SESSION_CLOCK_LEEWAY.as_secs()).unwrap_or(30);
+        if issued_at > now.saturating_add(leeway) {
+            return Err(SessionJwtError::IssuedInFuture);
+        }
+        if expires_at != 0 {
+            if expires_at <= issued_at {
+                return Err(SessionJwtError::InvalidLifetime);
+            }
+            let lifetime = expires_at.saturating_sub(issued_at);
+            if lifetime > i64::try_from(MAX_SESSION_TOKEN_TTL.as_secs()).unwrap_or(i64::MAX) {
+                return Err(SessionJwtError::InvalidLifetime);
+            }
+            if expires_at < now.saturating_sub(leeway) {
+                return Err(SessionJwtError::Expired);
+            }
+        }
+        Ok(())
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1074,6 +1229,138 @@ mod tests {
         }
 
         #[test]
+        fn supervisor_tokens_are_a_separate_profile_bound_to_the_gateway() {
+            let (issuer, gateway, sandbox, _identity) = fixture();
+            let minted = issuer
+                .mint_supervisor_token(std::time::Duration::from_mins(15))
+                .expect("supervisor token");
+            assert_eq!(minted.expires_at, 1_900_000_000 + 900);
+
+            let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519).unwrap();
+            let public_key_pem = key.public_key_pem().into_bytes();
+            let clock: Arc<dyn JwtClock> = Arc::new(FixedClock(1_900_000_000));
+            // A verifier holding a different key under the same key ID sees a
+            // signature failure, not a key lookup failure.
+            let verification_key = |pem: Vec<u8>| SessionVerificationKey {
+                key_id: "current".to_string(),
+                public_key_pem: pem,
+            };
+            let wrong_key = SupervisorJwtVerifier::new(
+                "test",
+                [verification_key(public_key_pem)],
+                clock.clone(),
+            )
+            .expect("verifier");
+            assert_eq!(
+                wrong_key.verify(minted.token.expose_secret()),
+                Err(SessionJwtError::InvalidToken)
+            );
+
+            // Session verifiers refuse the supervisor profile and the supervisor
+            // verifier refuses session tokens, whatever key signed them.
+            assert_eq!(
+                gateway.verify(minted.token.expose_secret()),
+                Err(SessionJwtError::WrongTokenType)
+            );
+            assert_eq!(
+                sandbox.verify(minted.token.expose_secret()),
+                Err(SessionJwtError::WrongTokenType)
+            );
+            let identity = SandboxRuntimeIdentity {
+                sandbox_id: SandboxId::parse("sandbox-a").unwrap(),
+                runtime_generation: SandboxGenerationId::parse("generation-1").unwrap(),
+                auth_epoch: CredentialEpoch::new(1).unwrap(),
+            };
+            let pair = issuer.mint_pair(&identity).unwrap();
+            assert_eq!(
+                wrong_key.verify(pair.gateway.token.expose_secret()),
+                Err(SessionJwtError::WrongTokenType)
+            );
+
+            // The supervisor lifetime is bounded on its own, whatever the
+            // session lifetime is.
+            drop(clock);
+            for ttl in [
+                std::time::Duration::from_secs(59),
+                std::time::Duration::from_secs(3_601),
+            ] {
+                assert_eq!(
+                    issuer.mint_supervisor_token(ttl).unwrap_err(),
+                    SessionJwtError::InvalidLifetime
+                );
+            }
+        }
+
+        #[test]
+        fn supervisor_tokens_verify_only_for_their_gateway_and_lifetime() {
+            let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519).unwrap();
+            let public_key_pem = key.public_key_pem().into_bytes();
+            let signing_pem = key.serialize_pem().unwrap();
+            let verification_key = || SessionVerificationKey {
+                key_id: "current".to_string(),
+                public_key_pem: public_key_pem.clone(),
+            };
+            let issuer = |gateway_id: &str, now: i64| {
+                SessionJwtIssuer::from_ed25519_pem(
+                    signing_pem.as_bytes(),
+                    "current",
+                    gateway_id,
+                    Some(std::time::Duration::from_mins(15)),
+                    Arc::new(FixedClock(now)),
+                )
+                .unwrap()
+            };
+            let verifier = |gateway_id: &str, now: i64| {
+                SupervisorJwtVerifier::new(
+                    gateway_id,
+                    [verification_key()],
+                    Arc::new(FixedClock(now)),
+                )
+                .unwrap()
+            };
+
+            let minted = issuer("gw-a", 1_900_000_000)
+                .mint_supervisor_token(std::time::Duration::from_mins(15))
+                .unwrap();
+            let authenticated = verifier("gw-a", 1_900_000_100)
+                .verify(minted.token.expose_secret())
+                .expect("valid supervisor token");
+            assert_eq!(authenticated.subject, "openshell-supervisor:gw-a");
+            assert_eq!(authenticated.token_id, minted.token_id);
+            assert_eq!(authenticated.expires_at, 1_900_000_900);
+
+            // Another gateway's token is refused by issuer, audience, and subject.
+            assert_eq!(
+                verifier("gw-b", 1_900_000_100).verify(minted.token.expose_secret()),
+                Err(SessionJwtError::WrongIssuer)
+            );
+            // Expired tokens are refused past the leeway.
+            assert_eq!(
+                verifier("gw-a", 1_900_001_000).verify(minted.token.expose_secret()),
+                Err(SessionJwtError::Expired)
+            );
+            assert_eq!(
+                verifier("gw-a", 1_899_999_000).verify(minted.token.expose_secret()),
+                Err(SessionJwtError::IssuedInFuture)
+            );
+            assert_eq!(
+                verifier("gw-a", 1_900_000_100).verify("not-a-token"),
+                Err(SessionJwtError::InvalidToken)
+            );
+        }
+
+        #[derive(Serialize)]
+        struct NonExpiringSupervisor<'a> {
+            iss: &'a str,
+            sub: &'a str,
+            aud: &'a str,
+            iat: i64,
+            exp: i64,
+            jti: String,
+            component: SessionComponent,
+        }
+
+        #[test]
         fn non_expiring_session_tokens_remain_usable() {
             let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519)
                 .expect("generate Ed25519 key");
@@ -1109,6 +1396,46 @@ mod tests {
             verifier
                 .verify(pair.sandbox.token.expose_secret())
                 .expect("non-expiring token remains valid");
+
+            // The default (non-expiring) session issuer still mints expiring
+            // supervisor tokens, and a supervisor token must expire.
+            let supervisor = issuer
+                .mint_supervisor_token(std::time::Duration::from_mins(15))
+                .expect("supervisor token from a non-expiring issuer");
+            assert_eq!(supervisor.expires_at, 1_900_000_000 + 900);
+            let supervisor_verifier = SupervisorJwtVerifier::new(
+                "test",
+                [SessionVerificationKey {
+                    key_id: "current".to_string(),
+                    public_key_pem: key.public_key_pem().into_bytes(),
+                }],
+                Arc::new(FixedClock(1_900_000_100)),
+            )
+            .unwrap();
+            supervisor_verifier
+                .verify(supervisor.token.expose_secret())
+                .expect("expiring supervisor token");
+            let mut header = Header::new(Algorithm::EdDSA);
+            header.kid = Some("current".to_string());
+            header.typ = Some(SUPERVISOR_JWT_TYPE.to_string());
+            let forever = encode(
+                &header,
+                &NonExpiringSupervisor {
+                    iss: "openshell-gateway:test",
+                    sub: "openshell-supervisor:test",
+                    aud: "openshell-gateway:test",
+                    iat: 1_900_000_000,
+                    exp: 0,
+                    jti: uuid::Uuid::new_v4().to_string(),
+                    component: SessionComponent::OpenShellSupervisor,
+                },
+                &EncodingKey::from_ed_pem(key.serialize_pem().unwrap().as_bytes()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                supervisor_verifier.verify(&forever),
+                Err(SessionJwtError::InvalidLifetime)
+            );
 
             let slot = SessionBearerTokenSlot::new(
                 pair.sandbox.token.clone(),

@@ -517,6 +517,18 @@ jobs:
     secrets:
       publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
+  publish-prerelease-snap:
+    name: Publish Prerelease Snap
+    needs: release
+    if: inputs.is-prerelease
+    uses: ./.github/workflows/snap-publish.yml
+    with:
+      upload-channel: latest/beta
+      release-tag: ${{ inputs.release-tag }}
+      github-environment: latest/beta
+    secrets:
+      publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+
   publish-sdk-typescript:
     name: Publish TypeScript SDK
     needs: release

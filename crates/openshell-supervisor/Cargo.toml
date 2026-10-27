@@ -20,6 +20,7 @@ openshell-core = { path = "../openshell-core", default-features = false, feature
 openshell-extension-core = { path = "../openshell-extension-core" }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
+openshell-supervisor-control = { path = "../openshell-supervisor-control" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }
@@ -29,6 +30,7 @@ openshell-supervisor-network = { path = "../openshell-supervisor-network", defau
 openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 
 clap = { workspace = true }
+futures = { workspace = true }
 miette = { workspace = true }
 nix = { workspace = true }
 opentelemetry = { workspace = true }
@@ -42,6 +44,8 @@ socket2 = { workspace = true }
 tempfile = "3"
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-stream = { workspace = true }
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
@@ -57,9 +61,13 @@ bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 tonic-prost = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-futures = { workspace = true }
 temp-env = "0.3"
 tokio-tungstenite = { workspace = true }
 

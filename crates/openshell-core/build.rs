@@ -74,6 +74,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configure tonic/prost protobuf code generation.
     tonic_prost_build::configure()
         .btree_map(".openshell.sandbox.protocol.v1")
+        .type_attribute(
+            ".openshell.sandbox.v1.SupervisorMiddlewareBinding",
+            r#"#[derive(serde::Serialize, serde::Deserialize)] #[serde(rename_all = "snake_case")]"#,
+        )
         .build_server(true)
         .build_client(true)
         .include_file("openshell.rs")

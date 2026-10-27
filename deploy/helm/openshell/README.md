@@ -17,6 +17,23 @@ namespace. The gateway and workspace releases can then be upgraded and removed
 independently. Use Kubernetes `operator` workspace mode when one gateway serves
 multiple pre-provisioned workspace namespaces.
 
+## Certificate hook metadata
+
+Use `pkiInitJob.podLabels` and `pkiInitJob.podAnnotations` to add metadata to the
+Pod templates of the `<fullname>-certgen` and `<fullname>-certgen-backend-ca`
+Jobs. These settings apply to both hooks when enabled and do not affect gateway
+or sandbox Pods. Chart-owned Pod labels take precedence when custom keys
+conflict.
+
+For example, disable Istio sidecar injection for the hook Pods in an injected
+namespace:
+
+```yaml
+pkiInitJob:
+  podAnnotations:
+    sidecar.istio.io/inject: "false"
+```
+
 ## Cluster-scoped vs namespaced objects
 
 Most objects in this chart are namespaced and land in the release namespace.
@@ -450,6 +467,8 @@ discovery endpoint or its TLS CA.
 | openshiftRoute.host | string | `""` | Hostname for the Route. Must match a SAN on the gateway's server cert. |
 | pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets. When certManager.enabled=true, cert-manager owns TLS and this same hook runs in JWT-only mode even if pkiInitJob.enabled remains true. |
 | pkiInitJob.failOnTimeout | bool | `true` | Fail the helm install/upgrade if cert-manager does not issue the certificate within the polling timeout. When true (default), the install fails immediately if the timeout is reached, providing clear feedback that BackendTLSPolicy is non-functional. When false, the hook succeeds with a warning and you can run `helm upgrade` after cert-manager issues the certificate to create the backend CA ConfigMap. If you set this to false and see "TLS error: Secret is not supplied by SDS" when connecting to the gateway, check if the TLS secret exists and run `helm upgrade` to create the ConfigMap. |
+| pkiInitJob.podAnnotations | object | `{}` | Additional annotations on both certificate hook Pods. |
+| pkiInitJob.podLabels | object | `{}` | Additional labels on both certificate hook Pods. Chart-owned labels take precedence. |
 | pkiInitJob.securityContext.allowPrivilegeEscalation | bool | `false` | Whether the certgen hook container can gain additional privileges. |
 | pkiInitJob.securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the certgen hook container. |
 | pkiInitJob.securityContext.runAsNonRoot | bool | `true` | Require the certgen hook container to run as a non-root user. |
@@ -527,6 +546,7 @@ discovery endpoint or its TLS CA.
 | server.enableUserNamespaces | bool | `false` | Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox pods. Requires Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), plus a supporting container runtime and Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host UID and capabilities become namespaced. |
 | server.enableWebsocketTunnel | bool | `false` | Enable the WebSocket tunnel used by CLI/SDK clients behind an authenticated edge proxy. Leave disabled for direct gateway installs. |
 | server.externalDbSecret | string | `""` | Name of a pre-existing Opaque Secret containing a PostgreSQL connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL from this Secret instead of using dbUrl. The Secret must contain a `uri` key, e.g. postgresql://user:pass@host:5432/dbname. |
+| server.extraEnv | list | `[]` | Additional environment variables for the gateway container, such as OTEL_* exporter settings. Entries can read from a Secret with valueFrom. |
 | server.extraVolumeMounts | list | `[]` | Additional volume mounts for the gateway container. |
 | server.extraVolumes | list | `[]` | Additional volumes for the gateway pod. |
 | server.grpcEndpoint | string | `""` | gRPC endpoint sandboxes call back into the gateway. Leave empty to derive it from the chart fullname, release namespace, service port, and disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080. Override only when sandboxes must reach the gateway via a different hostname (e.g. an external ingress or a host alias). |

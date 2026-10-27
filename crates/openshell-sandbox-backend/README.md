@@ -124,6 +124,23 @@ open, so reconnects and credential rotation never wait for a new dial.
 The new variants leave existing encodings unchanged. Binaries that predate them
 reject runtime-initiated descriptors instead of falling back to another mode.
 
+`SandboxTransport::RuntimeInitiatedRouted` serves the sandbox instances of a
+supervisor shared by many sandboxes from one listener
+(`runtime_routed::RuntimeRouter`). A sandbox instance is one running
+generation of a stable Sandbox resource. The runtime first sends a fixed
+preface: `OSRP`, version `1`, a length byte, and an opaque route handle of 16
+to 64 lowercase letters, digits, or hyphens. The handle is untrusted; it only
+selects which instance's generation-pinned TLS identity the supervisor then
+demands. Unknown, removed, and replaced handles are closed before any
+handshake. Handshakes are bounded globally and per route, and an
+authenticated connection only fills its own instance's spare queue. A routed
+instance waits up to five minutes for its first connection, since it is
+registered before its workload Pod is scheduled, and the usual connect window
+afterwards. The launch material and status of one hosted instance
+(`SandboxInstanceRegistration`, `SandboxInstanceStatusReport`) are defined by
+`openshell-supervisor-control`, which depends on this crate for the runtime
+descriptor and route validation.
+
 Runtime-initiated transport supports TCP, protected Unix sockets, and host
 vsock listeners. These share bounded TLS handshakes, the authenticated spare
 queue, and the same generation-pinned runtime identity check. The legacy

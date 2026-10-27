@@ -35,10 +35,13 @@ use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
     write_ca_files,
 };
+use crate::l7::token_grant_injection::SpiffeTokenGrantResolver;
 use crate::opa::OpaEngine;
-use crate::policy_local::PolicyLocalContext;
+use crate::policy_local::{DenialLogSource, PolicyLocalContext};
 use crate::proxy::ProxyHandle;
+use crate::token_grant::SandboxInstanceTokenGrants;
 use openshell_core::endpoint_status::EndpointObservationSender;
+use openshell_core::grpc_client::GatewayEndpoint;
 
 /// Concrete listener options supplied by trusted supervisor composition.
 /// This is not an isolation-backend capability or a serialized launch contract.
@@ -189,6 +192,52 @@ fn append_additional_ca_bundle(
     Ok(())
 }
 
+/// Identity and authority of the one sandbox a [`run_networking`] call serves.
+///
+/// A process hosting several sandboxes builds one per sandbox instance; no value
+/// is read from the process environment, so instances cannot share gateway
+/// credentials, provider token grants, denial history, or proxy CA files.
+#[derive(Debug, Default)]
+pub struct SandboxInstanceNetwork {
+    pub sandbox_id: Option<String>,
+    pub sandbox_name: Option<String>,
+    /// Gateway access with this instance's credentials.
+    pub gateway: Option<GatewayEndpoint>,
+    /// SPIFFE Workload API socket for provider token grants. Without one,
+    /// grants fail closed.
+    pub provider_workload_api_socket: Option<std::path::PathBuf>,
+    /// Source served by `policy.local` `/v1/denials`.
+    pub denial_log: DenialLogSource,
+    /// Proxy interception CA and trust-file directory.
+    pub proxy_tls: ProxyTlsFiles,
+}
+
+/// Provisioned proxy CA files and the directory that receives trust files.
+///
+/// Without a provisioned CA the proxy generates an ephemeral one. Without a
+/// directory it writes to the default container TLS root.
+#[derive(Clone, Debug, Default)]
+pub struct ProxyTlsFiles {
+    pub ca_certificate: Option<std::path::PathBuf>,
+    pub ca_private_key: Option<std::path::PathBuf>,
+    pub directory: Option<std::path::PathBuf>,
+}
+
+impl ProxyTlsFiles {
+    /// Files configured for a single-sandbox supervisor through its environment.
+    #[must_use]
+    pub fn from_environment() -> Self {
+        Self {
+            ca_certificate: std::env::var_os(openshell_core::sandbox_env::PROXY_CA_CERT)
+                .map(std::path::PathBuf::from),
+            ca_private_key: std::env::var_os(openshell_core::sandbox_env::PROXY_CA_KEY)
+                .map(std::path::PathBuf::from),
+            directory: std::env::var_os(openshell_core::sandbox_env::PROXY_TLS_DIR)
+                .map(std::path::PathBuf::from),
+        }
+    }
+}
+
 /// Handles and values produced by [`run_networking`] that the rest of
 /// `run_sandbox` consumes.
 ///
@@ -235,9 +284,7 @@ pub async fn run_networking(
     entrypoint_pid: Arc<AtomicU32>,
     process_enabled: bool,
     provider_credentials: &ProviderCredentialState,
-    sandbox_id: Option<&str>,
-    sandbox_name: Option<&str>,
-    openshell_endpoint: Option<&str>,
+    instance: SandboxInstanceNetwork,
     denial_tx: Option<UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
     endpoint_observation_tx: Option<EndpointObservationSender>,
@@ -245,7 +292,6 @@ pub async fn run_networking(
     workspace_rx: tokio::sync::watch::Receiver<String>,
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
     additional_ca_bundle: Option<&str>,
-    proxy_tls_dir: Option<&std::path::Path>,
     host_gateway_ip: Option<IpAddr>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
     network_mediation_source: Option<Arc<NetworkMediationSource>>,
@@ -254,15 +300,30 @@ pub async fn run_networking(
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
     // it can publish updated policy snapshots after a successful reload.
-    let policy_local_ctx = Arc::new(PolicyLocalContext::new(
-        retained_proto.cloned(),
-        openshell_endpoint.map(str::to_string),
-        sandbox_name
-            .map(str::to_string)
-            .or_else(|| sandbox_id.map(str::to_string)),
-        agent_proposals.clone(),
-        workspace_rx,
+    let SandboxInstanceNetwork {
+        sandbox_id,
+        sandbox_name,
+        gateway,
+        provider_workload_api_socket,
+        denial_log,
+        proxy_tls,
+    } = instance;
+    let token_grants = SpiffeTokenGrantResolver::new(SandboxInstanceTokenGrants::new(
+        gateway.clone(),
+        sandbox_id.clone(),
+        provider_workload_api_socket,
     ));
+    let policy_local_ctx = Arc::new(
+        PolicyLocalContext::new(
+            retained_proto.cloned(),
+            gateway,
+            sandbox_name.or(sandbox_id),
+            agent_proposals.clone(),
+            workspace_rx,
+        )
+        .with_denial_log(denial_log)
+        .with_token_grants(Arc::new(token_grants)),
+    );
 
     // Readiness signal for the proxy accept loop: the proxy binds the TCP
     // listener immediately (so the OS backlog queues early SYN packets) but
@@ -370,14 +431,10 @@ pub async fn run_networking(
     // process; otherwise generate an ephemeral CA.
     // The CA cert is written to disk so sandbox processes can trust it.
     let (tls_state, ca_file_paths) = if matches!(policy.network.mode, NetworkMode::Proxy) {
-        let configured_ca = match (
-            std::env::var_os(openshell_core::sandbox_env::PROXY_CA_CERT),
-            std::env::var_os(openshell_core::sandbox_env::PROXY_CA_KEY),
-        ) {
-            (Some(certificate), Some(private_key)) => Some(SandboxCa::load_from_paths(
-                std::path::Path::new(&certificate),
-                std::path::Path::new(&private_key),
-            )?),
+        let configured_ca = match (&proxy_tls.ca_certificate, &proxy_tls.ca_private_key) {
+            (Some(certificate), Some(private_key)) => {
+                Some(SandboxCa::load_from_paths(certificate, private_key)?)
+            }
             (None, None) => None,
             _ => {
                 return Err(miette::miette!(
@@ -390,14 +447,9 @@ pub async fn run_networking(
         let durable_ca = configured_ca.is_some();
         match configured_ca.map_or_else(SandboxCa::generate, Ok) {
             Ok(ca) => {
-                let configured_tls_dir =
-                    std::env::var_os(openshell_core::sandbox_env::PROXY_TLS_DIR)
-                        .map(std::path::PathBuf::from);
-                let tls_dir = proxy_tls_dir
-                    .or(configured_tls_dir.as_deref())
-                    .unwrap_or_else(|| {
-                        std::path::Path::new(openshell_core::container_paths::TLS_ROOT)
-                    });
+                let tls_dir = proxy_tls.directory.as_deref().unwrap_or_else(|| {
+                    std::path::Path::new(openshell_core::container_paths::TLS_ROOT)
+                });
                 let mut system_ca_bundle = read_system_ca_bundle();
                 // A TLS-intercepting corporate proxy (issue #1792) re-signs
                 // tunneled server certificates with the corporate CA, so the

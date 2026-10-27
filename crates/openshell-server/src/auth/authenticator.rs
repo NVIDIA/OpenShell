@@ -19,6 +19,8 @@
 //!   gateway session JWTs
 //! - [`super::compute_driver::ComputeDriverAuthenticator`] — driver-native
 //!   sandbox bootstrap credentials (path-scoped to `IssueSandboxToken`)
+//! - [`super::supervisor_token::SupervisorTokenAuthenticator`] — the shared
+//!   supervisor's gateway-minted token for the assignment stream
 //! - [`super::oidc::OidcAuthenticator`] — user OIDC Bearer tokens
 use super::principal::Principal;
 use async_trait::async_trait;
@@ -118,6 +120,8 @@ pub enum AuthMechanism {
     GatewayPeer,
     /// The `CreateSshSession` token an SSH relay presents.
     SshSessionToken,
+    /// The shared supervisor's gateway-minted supervisor token.
+    SupervisorToken,
 }
 
 impl AuthMechanism {
@@ -131,6 +135,7 @@ impl AuthMechanism {
             Self::ComputeDriver => "compute_driver",
             Self::GatewayPeer => "k8s_service_account",
             Self::SshSessionToken => "ssh_session_token",
+            Self::SupervisorToken => "supervisor_token",
         }
     }
 }

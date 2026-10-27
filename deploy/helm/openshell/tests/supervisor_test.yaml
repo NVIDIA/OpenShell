@@ -13,7 +13,7 @@ tests:
     asserts:
       - hasDocuments:
           count: 0
-  - it: deploys one isolated idle process in the gateway namespace
+  - it: deploys one instance host without Kubernetes identity in the gateway namespace
     template: templates/supervisor.yaml
     set:
       gatewayConfig:
@@ -21,18 +21,28 @@ tests:
           supervisor_topology: gateway
           supervisor_image: example.com/supervisor:shared
     asserts:
+      - hasDocuments:
+          count: 4
+      - equal:
+          path: kind
+          value: Deployment
+        documentIndex: 0
       - equal:
           path: metadata.namespace
           value: gateway
+        documentIndex: 0
       - equal:
           path: spec.replicas
           value: 1
+        documentIndex: 0
       - equal:
           path: spec.template.metadata.labels["app.kubernetes.io/name"]
           value: openshell-supervisor
+        documentIndex: 0
       - equal:
           path: spec.template.spec.containers[0].image
           value: example.com/supervisor:shared
+        documentIndex: 0
       - equal:
           path: spec.template.spec.containers[0].args
           value:
@@ -41,30 +51,204 @@ tests:
             - https://openshell.gateway.svc.cluster.local:8080
             - --address
             - 0.0.0.0:5501
-      - equal:
+            - --token-file
+            - /etc/openshell/supervisor-token/token
+            - --runtime-listen
+            - 0.0.0.0:5500
+            - --session-root
+            - /run/openshell/sessions
+        documentIndex: 0
+      - lengthEqual:
           path: spec.template.spec.containers[0].ports
-          value:
-            - name: supervisor
-              containerPort: 5501
-              protocol: TCP
+          count: 2
+        documentIndex: 0
       - equal:
           path: spec.template.spec.containers[0].readinessProbe
           value:
             tcpSocket:
-              port: supervisor
+              port: health
+        documentIndex: 0
       - equal:
           path: spec.template.spec.containers[0].livenessProbe
           value:
             tcpSocket:
-              port: supervisor
-      - notExists:
+              port: health
+        documentIndex: 0
+      - contains:
           path: spec.template.spec.containers[0].volumeMounts
-      - notExists:
-          path: spec.template.spec.volumes
+          content:
+            name: run
+            mountPath: /run/openshell
+        documentIndex: 0
+      - equal:
+          path: spec.ports
+          value:
+            - name: runtime
+              port: 5500
+              targetPort: runtime
+              protocol: TCP
+        documentIndex: 1
       - equal:
           path: spec.template.spec.automountServiceAccountToken
           value: false
-  - it: renders the same setting into gateway TOML
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_ENDPOINT
+            value: https://openshell.gateway.svc.cluster.local:8080
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_GATEWAY_TLS_SERVER_NAME
+            value: openshell.gateway.svc.cluster.local
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: supervisor-token
+            secret:
+              secretName: openshell-supervisor-token
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: supervisor-token
+            mountPath: /etc/openshell/supervisor-token
+            readOnly: true
+        documentIndex: 0
+      - equal:
+          path: kind
+          value: Secret
+        documentIndex: 3
+      - equal:
+          path: metadata.name
+          value: openshell-supervisor-token
+        documentIndex: 3
+      - equal:
+          path: type
+          value: Opaque
+        documentIndex: 3
+      - notExists:
+          path: data
+        documentIndex: 3
+      - notExists:
+          path: stringData
+        documentIndex: 3
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: gateway-ca
+            secret:
+              secretName: openshell-client-tls
+              items:
+                - key: ca.crt
+                  path: ca.crt
+        documentIndex: 0
+      - equal:
+          path: kind
+          value: Service
+        documentIndex: 1
+      - equal:
+          path: spec.selector
+          value:
+            app.kubernetes.io/name: openshell-supervisor
+            app.kubernetes.io/instance: openshell
+            app.kubernetes.io/component: supervisor
+        documentIndex: 1
+      - equal:
+          path: kind
+          value: NetworkPolicy
+        documentIndex: 2
+      - lengthEqual:
+          path: spec.ingress
+          count: 1
+        documentIndex: 2
+      - equal:
+          path: spec.ingress[0]
+          value:
+            from:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: gateway
+                podSelector:
+                  matchLabels:
+                    openshell.ai/boundary-role: workload
+            ports:
+              - protocol: TCP
+                port: 5500
+        documentIndex: 2
+  - it: admits runtimes only from this gateway's managed namespaces
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+          workspace_mode: managed
+          gateway_id: gw-a
+    asserts:
+      - equal:
+          path: spec.ingress[0].from[0].namespaceSelector
+          value:
+            matchLabels:
+              openshell.ai/managed-by: openshell
+              openshell.ai/gateway-id: gw-a
+        documentIndex: 2
+  - it: admits runtimes only from operator-labeled namespaces
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+          workspace_mode: operator
+          operator_namespace_label: example.com/openshell-workspace=true
+    asserts:
+      - equal:
+          path: spec.ingress[0].from[0].namespaceSelector
+          value:
+            matchLabels:
+              example.com/openshell-workspace: "true"
+        documentIndex: 2
+  - it: rejects operator namespace selectors it cannot scope
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+          workspace_mode: operator
+          operator_namespace_file: /etc/openshell/namespaces
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor_topology=gateway in operator workspace mode requires operator_namespace_label of the form key=value
+  - it: keeps a distinct name when the release fullname leaves no room for the suffix
+    template: templates/supervisor.yaml
+    set:
+      fullnameOverride: openshell-gateway-release-with-a-very-very-long-name-0057
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - matchRegex:
+          path: metadata.name
+          pattern: ^openshell-gateway-release-with-a-very-very-[0-9a-f]{8}-supervisor$
+        documentIndex: 1
+      - notEqual:
+          path: metadata.name
+          value: openshell-gateway-release-with-a-very-very-long-name-0057
+        documentIndex: 1
+  - it: requires gateway TLS for the supervisor token
+    template: templates/supervisor.yaml
+    set:
+      server:
+        disableTls: true
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor_topology=gateway requires gateway TLS; the supervisor token travels only over TLS
+  - it: renders the chart-owned shared supervisor connection into gateway TOML
     template: templates/gateway-config.yaml
     set:
       gatewayConfig:
@@ -74,6 +258,31 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: 'supervisor_topology = "gateway"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'shared_supervisor = \{ runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
+  - it: rejects a hand-written shared supervisor connection
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+          shared_supervisor:
+            service_name: elsewhere
+    asserts:
+      - failedTemplate:
+          errorMessage: shared_supervisor is rendered by the chart; set only supervisor_topology
+  - it: rejects settings the shared supervisor cannot isolate
+    template: templates/supervisor.yaml
+    set:
+      upstreamProxy:
+        url: http://proxy.example:3128
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor_topology=gateway does not support upstream proxy settings or provider SPIFFE identity
   - it: rejects workspace until implemented
     template: templates/supervisor.yaml
     set:

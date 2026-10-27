@@ -11,7 +11,7 @@ use openshell_core::proto::{
     UpdateConfigResponse, gateway_message, supervisor_message,
 };
 use openshell_isolation_interface::contract::{BackendError, ResolvedWorkloadIdentity};
-use std::sync::{Mutex, atomic::Ordering};
+use std::sync::atomic::Ordering;
 use tonic::codegen::tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tonic::codegen::{Body, BoxFuture, BoxStream, Bytes, Service, StdError, http};
 
@@ -277,36 +277,41 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         session_id,
         probe: probe.clone(),
     };
-    let startup = run_sandbox_with_backend(
-        &setup,
-        SandboxRunConfig {
-            command: vec!["true".into()],
-            workdir: None,
-            timeout_secs: 0,
-            interactive: false,
-            await_main_process_attachment: false,
-            sandbox_id: Some("sb-legacy-restart".into()),
-            sandbox: Some("legacy-restart".into()),
-            openshell_endpoint: Some(endpoint),
-            policy_rules: None,
-            policy_data: None,
-            ssh_socket_path: None,
-            health_socket_path: None,
-            health_port: None,
-            ocsf_enabled: Arc::new(AtomicBool::new(false)),
-            ocsf_schema_version: Arc::new(Mutex::new(String::new())),
-            upstream_proxy_args:
-                openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
-            additional_ca_bundle: None,
-            backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor {
-                backend_name: "test-held".into(),
-                payload: Vec::new(),
-            },
-            auth_bundle,
-            admitted_isolation_backend: Some("test-held".into()),
-            main_exit_marker: None,
+    let config = SandboxInstanceConfig {
+        command: vec!["true".into()],
+        workdir: None,
+        timeout_secs: 0,
+        interactive: false,
+        await_main_process_attachment: false,
+        sandbox_id: Some("sb-legacy-restart".into()),
+        sandbox: Some("legacy-restart".into()),
+        container_image: String::new(),
+        openshell_endpoint: Some(endpoint),
+        policy_rules: None,
+        policy_data: None,
+        ssh_socket_path: None,
+        shared_ssh_socket: false,
+        upstream_proxy_args:
+            openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
+        additional_ca_bundle: None,
+        backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor {
+            backend_name: "test-held".into(),
+            payload: Vec::new(),
         },
+        auth_bundle,
+        admitted_isolation_backend: Some("test-held".into()),
+        main_exit_marker: None,
+        trace_context: None,
+        provider_workload_api_socket: None,
+        proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
+    };
+    let bindings = SandboxInstanceBindings::dedicated(
+        &config,
+        openshell_core::grpc_client::GatewayCredentials::from_auth_bundle(&config.auth_bundle)
+            .unwrap(),
+        openshell_ocsf::OcsfJsonSettings::default(),
     );
+    let startup = run_sandbox_with_backend(&setup, config, bindings, None, None);
     tokio::pin!(startup);
     let result = tokio::select! {
         () = probe.ready_event.notified() => None,

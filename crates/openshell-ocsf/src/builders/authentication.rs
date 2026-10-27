@@ -3,7 +3,7 @@
 
 //! Builder for Authentication [3002] events.
 
-use crate::builders::EventContext;
+use crate::builders::ContextRef;
 use crate::enums::{ActionId, AuthProtocolId, DispositionId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{AuthenticationEvent, OcsfEvent};
@@ -11,7 +11,7 @@ use crate::objects::{Endpoint, HttpRequest, Service, User};
 
 /// Builder for Authentication [3002] Logon events.
 pub struct AuthenticationBuilder<'a> {
-    ctx: &'a EventContext,
+    ctx: ContextRef<'a>,
     user: User,
     service: Service,
     auth_protocol: Option<AuthProtocolId>,
@@ -29,9 +29,9 @@ pub struct AuthenticationBuilder<'a> {
 
 impl<'a> AuthenticationBuilder<'a> {
     #[must_use]
-    pub fn new(ctx: &'a EventContext, user: User, service: Service) -> Self {
+    pub fn new(ctx: impl Into<ContextRef<'a>>, user: User, service: Service) -> Self {
         Self {
-            ctx,
+            ctx: ctx.into(),
             user,
             service,
             auth_protocol: None,

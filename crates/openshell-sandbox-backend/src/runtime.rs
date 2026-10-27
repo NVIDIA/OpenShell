@@ -50,6 +50,10 @@ const ATTACH_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// callers retry whole calls above this; past boot, exhausting this window
 /// means the remote boundary (or its launcher) is gone rather than still starting.
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on a routed sandbox instance's first connection. The instance is
+/// registered before its workload Pod is scheduled and its image pulled; the
+/// driver reaps a bootstrap that is still incomplete after the same interval.
+const ROUTED_FIRST_CONNECT_TIMEOUT: Duration = Duration::from_mins(5);
 /// Bounds the liveness check that decides whether a stream failure lost the
 /// whole connection.
 const CONNECTION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -96,6 +100,8 @@ enum TransportSource {
     Connector(Arc<dyn BoundaryTransportConnector>),
     /// Accept streams the sandbox runtime opens to this supervisor.
     RuntimeInitiated(Arc<crate::runtime_initiated::RuntimeInitiatedListener>),
+    /// Accept streams routed to this sandbox instance by a shared listener.
+    Routed(Arc<crate::runtime_routed::RouteRegistration>),
 }
 
 impl BoundaryTransport {
@@ -109,8 +115,32 @@ impl BoundaryTransport {
             | SandboxTransport::RuntimeInitiatedVsock { .. } => TransportSource::RuntimeInitiated(
                 crate::runtime_initiated::RuntimeInitiatedListener::bind(descriptor)?,
             ),
+            SandboxTransport::RuntimeInitiatedRouted { .. } => {
+                return Err(BackendError::Descriptor(
+                    "a routed runtime-initiated transport requires a shared runtime listener"
+                        .to_string(),
+                ));
+            }
             _ => TransportSource::Dial,
         }))
+    }
+
+    /// Accept the connections a shared listener routes to one sandbox
+    /// instance. The registration's handle must be the descriptor's route.
+    pub fn routed(
+        descriptor: &SandboxRuntimeDescriptor,
+        registration: Arc<crate::runtime_routed::RouteRegistration>,
+    ) -> Result<Self, BackendError> {
+        match &descriptor.transport {
+            SandboxTransport::RuntimeInitiatedRouted { route, .. }
+                if route == registration.handle() =>
+            {
+                Ok(Self(TransportSource::Routed(registration)))
+            }
+            _ => Err(BackendError::Descriptor(
+                "runtime descriptor does not use this sandbox instance's route".to_string(),
+            )),
+        }
     }
 
     /// Establish raw streams through a backend-owned connector.
@@ -130,6 +160,20 @@ impl BoundaryTransport {
             TransportSource::Connector(connector) => Some(connector.as_ref()),
             TransportSource::RuntimeInitiated(listener) => {
                 return tokio::time::timeout(CONNECT_RETRY_TIMEOUT, listener.accept(descriptor))
+                    .await
+                    .map_err(|_| {
+                        BackendError::Unavailable(
+                            "timed out waiting for the sandbox runtime to connect".to_string(),
+                        )
+                    })?;
+            }
+            TransportSource::Routed(registration) => {
+                let window = if registration.has_connected() {
+                    CONNECT_RETRY_TIMEOUT
+                } else {
+                    ROUTED_FIRST_CONNECT_TIMEOUT
+                };
+                return tokio::time::timeout(window, registration.accept(&descriptor.tls))
                     .await
                     .map_err(|_| {
                         BackendError::Unavailable(
@@ -1964,7 +2008,8 @@ impl BoundaryClient {
         let connector_transport = transport.clone();
         let authority = match &runtime_descriptor.transport {
             SandboxTransport::Tcp { authority, .. }
-            | SandboxTransport::RuntimeInitiatedTcp { authority, .. } => authority.as_str(),
+            | SandboxTransport::RuntimeInitiatedTcp { authority, .. }
+            | SandboxTransport::RuntimeInitiatedRouted { authority, .. } => authority.as_str(),
             SandboxTransport::Unix { .. }
             | SandboxTransport::Vsock { .. }
             | SandboxTransport::RuntimeInitiatedUnix { .. }
@@ -2134,7 +2179,8 @@ async fn connect_boundary_using_connector(
             SandboxTransport::Vsock { guest_cid, port } => connect_host_vsock(*guest_cid, *port)?,
             SandboxTransport::RuntimeInitiatedTcp { .. }
             | SandboxTransport::RuntimeInitiatedUnix { .. }
-            | SandboxTransport::RuntimeInitiatedVsock { .. } => {
+            | SandboxTransport::RuntimeInitiatedVsock { .. }
+            | SandboxTransport::RuntimeInitiatedRouted { .. } => {
                 return Err(BackendError::Descriptor(
                     "a runtime-initiated transport cannot be dialed".to_string(),
                 ));
