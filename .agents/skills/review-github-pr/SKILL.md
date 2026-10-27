@@ -46,19 +46,18 @@ Record the **title**, **body**, **headRefName**, and **baseRefName** for use in 
 
 ### Check Issue Acceptance
 
-Inspect closing issue references (paginate as needed) and issue references in the
-PR description. Fetch their current repository, labels, and submitter. Verify the
-PR author's permission in the target repository:
+Inspect every closing issue reference (paginate as needed) and fetch its current
+repository and labels. Verify the PR author's permission in the target repository:
 
 ```bash
 gh api repos/OWNER/REPO/collaborators/AUTHOR/permission --jq .permission
 ```
 
-Verified `write`, `maintain`, or `admin` access permits the exception; report it as
-context, not a blocking concern. Other authors need at least one referenced issue
-in the target repository with `state:accepted` submitted by the PR author. Other
-references need not qualify. Report violations under **Potential Concerns**. PR
-body text such as `No issue required` does not bypass this gate.
+Call out each linked issue missing `state:accepted`, with an issue link. Verified
+`write`, `maintain`, or `admin` access permits the exception; report it as context,
+not a blocking concern. Other authors need at least one target-repository issue,
+and every linked issue must be accepted; report violations under **Potential
+Concerns**. PR body text such as `No issue required` does not bypass this gate.
 Report failed lookups as unverified and continue the code review. For a branch
 without a PR, note that issue acceptance was not verified.
 

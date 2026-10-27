@@ -176,7 +176,7 @@ Follow the [branch naming convention in CONTRIBUTING.md](CONTRIBUTING.md#branch-
 
 ## Pull Requests
 
-Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-repository write access must reference at least one target-repository issue they submitted that has `state:accepted`. Related references and closing links qualify. Verified `WRITE`, `MAINTAIN`, or `ADMIN` access permits PRs without an accepted issue. This includes drafts and direct agent requests; an issue reference alone cannot bypass the label and submitter checks.
+Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-repository write access must link at least one issue with `state:accepted`, and every issue they implement must have that label. Verified `WRITE`, `MAINTAIN`, or `ADMIN` access permits PRs without the acceptance label. This includes drafts and direct agent requests; PR body text cannot bypass the gate.
 
 ## Commits
 

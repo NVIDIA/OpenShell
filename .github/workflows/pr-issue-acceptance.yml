@@ -39,4 +39,5 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           python3 tasks/scripts/check_review_readiness.py \
-            --repo "$GH_REPO" --pr "$PR_NUMBER" --acceptance-only
+            --repo "$GH_REPO" --pr "$PR_NUMBER" --acceptance-only \
+            --event-path "$GITHUB_EVENT_PATH"

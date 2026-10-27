@@ -7,15 +7,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Validate accepted work and reconcile reviewers from the merged REVIEWERS.md.
-
-Preview with --repo OWNER/REPO --pr NUMBER; add --apply to update the PR.
-Use --acceptance-only to report acceptance without routing or changing the PR.
-Unaccepted work is moved to draft before any reviewer requests are changed.
-Request all matching members with write access, excluding the author. Preserve
-manual choices, unknown request provenance, and anyone who commented or reviewed.
-The parser and planning helpers are importable. No state is stored between runs.
-"""
+"""Ensure pull requests are ready for review by the appropriate people."""
 
 from __future__ import annotations
 
@@ -32,7 +24,7 @@ LABEL = re.compile(r"(?:area|topic):[a-z0-9]+(?:-[a-z0-9]+)*")
 PROFILE = re.compile(r"\[@([a-z0-9-]+)\]\(https://github\.com/([a-z0-9-]+)/?\)", re.I)
 ACCEPTANCE_ERROR = (
     "PR is not accepted work: the author needs repository write access "
-    "or a referenced state:accepted issue they submitted themselves"
+    "or a referenced state:accepted issue"
 )
 
 
@@ -251,7 +243,7 @@ def _referenced_issues(repository: str, number: int, body: str):
 
 
 def _accepted_work(repository: str, number: int, pr: dict) -> bool:
-    """Accept write access or a referenced accepted issue filed by the PR author."""
+    """Accept write access or a referenced accepted issue."""
     owner, repo = repository.split("/")
     author = pr["user"]["login"].lower()
     cursor = None
@@ -290,7 +282,6 @@ def _accepted_work(repository: str, number: int, pr: dict) -> bool:
                       repository(owner: $owner, name: $repo) {
                         issueOrPullRequest(number: $number) {
                           ... on Issue {
-                            author { login }
                             labels(first: 100, after: $cursor) {
                               nodes { name }
                               pageInfo { hasNextPage endCursor }
@@ -307,7 +298,7 @@ def _accepted_work(repository: str, number: int, pr: dict) -> bool:
                     break
                 raise
             issue = data["repository"]["issueOrPullRequest"]
-            if not issue or (issue.get("author") or {}).get("login", "").lower() != author:
+            if not issue or "labels" not in issue:
                 break
             if any(label["name"] == "state:accepted" for label in issue["labels"]["nodes"]):
                 return True
@@ -379,6 +370,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", required=True, help="target OWNER/REPO")
     parser.add_argument("--pr", required=True, type=int, help="pull request number")
     parser.add_argument(
+        "--event-path", type=Path,
+        help="PR event payload for --acceptance-only; otherwise fetch current PR metadata",
+    )
+    parser.add_argument(
         "--event", default="opened",
         choices=("opened", "ready_for_review", "labeled", "unlabeled"),
         help="PR event; acceptance is checked on opened and ready_for_review",
@@ -396,15 +391,18 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--repo must be OWNER/REPO and --pr must be positive")
     try:
         if args.acceptance_only:
-            owner, repo = args.repo.split("/")
-            pr = _graphql(
-                """query($owner: String!, $repo: String!, $number: Int!) {
-                  repository(owner: $owner, name: $repo) {
-                    pullRequest(number: $number) { user: author { login } body }
-                  }
-                }""",
-                owner=owner, repo=repo, number=args.pr,
-            )["repository"]["pullRequest"]
+            if args.event_path:
+                pr = json.loads(args.event_path.read_text(encoding="utf-8"))["pull_request"]
+            else:
+                owner, repo = args.repo.split("/")
+                pr = _graphql(
+                    """query($owner: String!, $repo: String!, $number: Int!) {
+                      repository(owner: $owner, name: $repo) {
+                        pullRequest(number: $number) { user: author { login } body }
+                      }
+                    }""",
+                    owner=owner, repo=repo, number=args.pr,
+                )["repository"]["pullRequest"]
             if not _accepted_work(args.repo, args.pr, pr):
                 raise ValueError(ACCEPTANCE_ERROR)
             result = {"accepted": True}

@@ -302,13 +302,14 @@ class AcceptanceTests(unittest.TestCase):
             self.assertTrue(routing._accepted_work(REPO, 42, pr()))
         self.assertEqual(api.call_count, 3)
 
-    def test_description_and_closing_references_require_same_submitter_and_label(self):
+    def test_description_and_closing_references_require_acceptance_not_same_submitter(self):
         for body in (
             "", "Related to #1", "Related to owner/repo#1", "Related to OWNER/REPO#1",
             "Related to https://github.com/owner/repo/issues/1",
         ):
             for author, accepted, expected in (
-                ("AUTHOR", True, True), ("someone-else", True, False), ("author", False, False),
+                ("AUTHOR", True, True), ("someone-else", True, True),
+                ("author", False, False), ("someone-else", False, False),
             ):
                 with (
                     self.subTest(body=body, author=author, accepted=accepted),
@@ -599,15 +600,16 @@ class CliTests(unittest.TestCase):
         cases = [
             ("WRITE", "", (), {}, True),
             ("READ", "Related to #1", (), {1: ("author", True)}, True),
-            ("READ", "Closes #1", (1,), {1: ("someone-else", True)}, False),
+            ("READ", "Closes #1", (1,), {1: ("someone-else", True)}, True),
             ("READ", "Closes #1 and #2", (1, 2),
              {1: ("author", True), 2: ("author", False)}, True),
             ("READ", "Related to #1", (), {1: ("author", False)}, False),
             ("READ", "", (), {}, False),
         ]
-        for acceptance_only in (False, True):
+        for mode in ("preview", "acceptance-api", "acceptance-event"):
+            acceptance_only = mode != "preview"
             for permission, body, linked, issues, expected in cases:
-                with self.subTest(acceptance_only=acceptance_only, body=body, issues=issues), tempfile.TemporaryDirectory() as directory:
+                with self.subTest(mode=mode, body=body, issues=issues), tempfile.TemporaryDirectory() as directory:
                     path = Path(directory) / "REVIEWERS.md"
                     path.write_text(DOCUMENT, encoding="utf-8")
                     value = pr("area:runtime", body=body)
@@ -619,6 +621,7 @@ class CliTests(unittest.TestCase):
                         query = kwargs["data"]["query"]
                         self.assertNotIn("mutation", query)
                         if "user: author" in query:
+                            self.assertNotEqual(mode, "acceptance-event")
                             self.assertEqual(kwargs["data"]["variables"]["number"], 42)
                             return {"data": {"repository": {"pullRequest": value}}}
                         if "collaborators" in query:
@@ -638,7 +641,13 @@ class CliTests(unittest.TestCase):
                         contextlib.redirect_stderr(errors),
                     ):
                         argv = ["--repo", REPO, "--pr", "42", "--reviewers", str(path)]
-                        status = routing.main(argv + (["--acceptance-only"] if acceptance_only else []))
+                        if acceptance_only:
+                            argv.append("--acceptance-only")
+                        if mode == "acceptance-event":
+                            event_path = Path(directory) / "event.json"
+                            event_path.write_text(json.dumps({"pull_request": value}))
+                            argv.extend(["--event-path", str(event_path)])
+                        status = routing.main(argv)
                     self.assertEqual(status, 0 if expected else 1)
                     if expected:
                         self.assertEqual(json.loads(output.getvalue()),
@@ -687,6 +696,24 @@ class CliTests(unittest.TestCase):
                 route.assert_not_called()
                 if metadata_error:
                     check.assert_not_called()
+
+    def test_invalid_event_payload_fails_without_api_calls_or_routing(self):
+        for contents in (None, "not JSON"):
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "event.json"
+                if contents is not None:
+                    path.write_text(contents)
+                with (
+                    mock.patch.object(routing, "_api") as api,
+                    mock.patch.object(routing, "check_review_readiness") as route,
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    self.assertEqual(routing.main([
+                        "--repo", REPO, "--pr", "42", "--acceptance-only",
+                        "--event-path", str(path),
+                    ]), 1)
+                api.assert_not_called()
+                route.assert_not_called()
 
     def test_acceptance_only_cannot_be_combined_with_apply(self):
         with (
@@ -858,6 +885,7 @@ class WorkflowTests(unittest.TestCase):
         command = workflow.split("        run: |\n", 1)[1]
         self.assertIn("python3 tasks/scripts/check_review_readiness.py", command)
         self.assertIn('--repo "$GH_REPO" --pr "$PR_NUMBER" --acceptance-only', command)
+        self.assertIn('--event-path "$GITHUB_EVENT_PATH"', command)
         self.assertNotIn("--apply", command)
 
 
