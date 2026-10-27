@@ -20,6 +20,10 @@ on:
         description: Immutable ID of the prepared integration inputs artifact
         required: true
         type: string
+    secrets:
+      CACHIX_AUTH_TOKEN:
+        description: Token used to push Nix builds, such as the test runner, to Cachix
+        required: false
 
 permissions:
   actions: read
@@ -66,6 +70,8 @@ jobs:
           exec 3>&-
 
       - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Cache tmachine disks
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
