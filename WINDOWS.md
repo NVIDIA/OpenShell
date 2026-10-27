@@ -76,6 +76,7 @@ The tasks produce `openshell.exe`, `openshell-gateway.exe`,
 together with the matching `libz3.dll` staged by the build task. The target
 triples are `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`.
 `CARGO_TARGET_DIR` can override the output root.
+The runtime host also needs the matching Visual C++ runtime.
 
 The build uses pinned prebuilt Z3 by default. Compile and test hosts do not
 need a working MXC runtime; running native sandboxes does. These tasks do not
