@@ -3307,7 +3307,7 @@ require_client_auth = true
 
                 // The man page documents the flag as [--metrics-require-client-auth[=BOOL]]:
                 // the value, when given, must use an equals sign.
-                super::command()
+                command()
                     .try_get_matches_from([
                         "openshell-gateway",
                         "--db-url",
