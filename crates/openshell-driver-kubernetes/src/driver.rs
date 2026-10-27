@@ -147,6 +147,10 @@ fn network_additional_ca_config_map_name(gateway_id: &str, digest: &str) -> Stri
     // Kubernetes labels have a 63-byte limit. Keep recognizable stable
     // prefixes while hashing both variable inputs. The complete digest is
     // retained in an annotation and checked before every supervisor creation.
+    // The hashes derive deterministic object names, not authenticity proofs;
+    // trust comes from the immutable flag, the digest annotation, and the
+    // exact-byte validation. Classified as a non-security identity hash in
+    // openshell-crypto/README.md.
     let gateway_hash = format!("{:x}", Sha256::digest(gateway_id.as_bytes()));
     let digest_hash = format!("{:x}", Sha256::digest(digest.as_bytes()));
     format!(
@@ -202,13 +206,32 @@ fn validate_network_additional_ca_config_map(
     expected: &ConfigMap,
 ) -> Result<(), KubernetesDriverError> {
     let name = expected.metadata.name.as_deref().unwrap_or_default();
-    let expected_labels = expected.metadata.labels.as_ref();
-    if existing.metadata.labels.as_ref() != expected_labels
-        // The immutable generation must outlive individual sandbox objects.
-        // Reject even an explicitly empty ownerReferences field so only the
-        // API representation produced by our ownerless template is accepted.
-        || existing.metadata.owner_references.is_some()
-    {
+    // Validate the gateway-owned label pairs individually. A mutating
+    // admission webhook may attach organizational labels to the created
+    // ConfigMap; an exact-map comparison would then reject the correct map on
+    // the create response and on every later create/start through this
+    // existing-object path, blocking sandbox launches despite the required
+    // ownership labels, immutable flag, digest, and certificate bytes
+    // remaining correct. Unrelated labels are therefore allowed; each
+    // gateway-owned pair must match exactly.
+    if let Some(expected_labels) = expected.metadata.labels.as_ref() {
+        let existing_labels = existing.metadata.labels.as_ref().ok_or_else(|| {
+            KubernetesDriverError::Precondition(format!(
+                "network additional CA ConfigMap {name} is not owned by this gateway"
+            ))
+        })?;
+        for (key, value) in expected_labels {
+            if existing_labels.get(key) != Some(value) {
+                return Err(KubernetesDriverError::Precondition(format!(
+                    "network additional CA ConfigMap {name} is not owned by this gateway"
+                )));
+            }
+        }
+    }
+    // The immutable generation must outlive individual sandbox objects.
+    // Reject even an explicitly empty ownerReferences field so only the
+    // API representation produced by our ownerless template is accepted.
+    if existing.metadata.owner_references.is_some() {
         return Err(KubernetesDriverError::Precondition(format!(
             "network additional CA ConfigMap {name} is not owned by this gateway"
         )));
@@ -9443,6 +9466,49 @@ mod tests {
             validate_network_additional_ca_config_map(&stale_digest, &expected),
             Err(KubernetesDriverError::Precondition(message))
                 if message.contains("unexpected trust generation")
+        ));
+    }
+
+    #[test]
+    fn destination_trust_config_map_allows_admission_added_labels() {
+        // A mutating admission webhook may attach organizational labels to
+        // the created ConfigMap. The gateway-owned pairs must still match
+        // exactly, but unrelated labels must not block every later
+        // create/start through the existing-object validation path.
+        let bundle = network_trust_bundle(
+            "gateway-a",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        let expected = network_additional_ca_config_map("workspace-a", "gateway-a", &bundle)
+            .expect("normalized PEM must be valid UTF-8");
+
+        let mut admitted = expected.clone();
+        admitted
+            .metadata
+            .labels
+            .as_mut()
+            .expect("expected ConfigMap has gateway-owned labels")
+            .insert(
+                "org.example/compliance-scan".to_string(),
+                "managed".to_string(),
+            );
+        assert!(
+            validate_network_additional_ca_config_map(&admitted, &expected).is_ok(),
+            "an admission-added organizational label must not reject a correct \
+             ConfigMap"
+        );
+
+        let mut missing_gateway_label = expected.clone();
+        missing_gateway_label
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .remove(&LABEL_GATEWAY_ID.to_string());
+        assert!(matches!(
+            validate_network_additional_ca_config_map(&missing_gateway_label, &expected),
+            Err(KubernetesDriverError::Precondition(message))
+                if message.contains("is not owned by this gateway")
         ));
     }
 
