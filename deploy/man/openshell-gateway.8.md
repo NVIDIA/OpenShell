@@ -66,10 +66,12 @@ TLS.
     certificates. Use a CA distinct from the gateway client CA.
     Environment: **OPENSHELL_METRICS_TLS_CLIENT_CA**.
 
-**--metrics-require-client-auth** *BOOL*
+**--metrics-require-client-auth**[=*BOOL*]
 :   Require metrics clients to present a certificate trusted by
     **--metrics-tls-client-ca**. Defaults to **false**. When enabled, a
-    metrics client CA is required.
+    metrics client CA is required. Pass the flag alone for **true**, or a
+    value with an equals sign, as in
+    **--metrics-require-client-auth=false**.
     Environment: **OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH**.
 
 **--log-level** *LEVEL*

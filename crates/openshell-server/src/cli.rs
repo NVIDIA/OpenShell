@@ -3277,6 +3277,49 @@ require_client_auth = true
     }
 
     #[test]
+    fn metrics_require_client_auth_matches_documented_forms() {
+        Environment::new()
+            .remove("OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH")
+            .run(|| {
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-require-client-auth",
+                ]);
+                assert_eq!(args.metrics_require_client_auth, Some(true));
+
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-require-client-auth=true",
+                ]);
+                assert_eq!(args.metrics_require_client_auth, Some(true));
+
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-require-client-auth=false",
+                ]);
+                assert_eq!(args.metrics_require_client_auth, Some(false));
+
+                // The man page documents the flag as [--metrics-require-client-auth[=BOOL]]:
+                // the value, when given, must use an equals sign.
+                super::command()
+                    .try_get_matches_from([
+                        "openshell-gateway",
+                        "--db-url",
+                        "sqlite::memory:",
+                        "--metrics-require-client-auth",
+                        "false",
+                    ])
+                    .expect_err("space-separated value must be rejected");
+            });
+    }
+
+    #[test]
     fn explicit_metrics_client_auth_value_overrides_file_value() {
         Environment::new()
             .remove("OPENSHELL_METRICS_TLS_CERT")
