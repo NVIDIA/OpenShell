@@ -4426,8 +4426,8 @@ impl ComputeRuntime {
                     // Recovery retains the original attempt and deadline. A
                     // stalled driver must release this lifecycle gate after
                     // expiry so the deadline worker can reclaim its compute.
-                    match self
-                        .await_provisioning_operation(
+                    match Box::pin(
+                        self.await_provisioning_operation(
                             &sandbox,
                             self.driver.call_owned(
                                 openshell_otel::rpc::START_SANDBOX,
@@ -4436,8 +4436,9 @@ impl ComputeRuntime {
                                     driver.start_sandbox(Request::new(request)).await
                                 },
                             ),
-                        )
-                        .await
+                        ),
+                    )
+                    .await
                     {
                         Ok((_, settled)) => {
                             let updated = self.clear_resume_intent(*settled).await;
@@ -20055,9 +20056,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         runtime.store.put_message(&sandbox).await.unwrap();
         let recovered_runtime = runtime.clone();
         let mut recovery = tokio::spawn(async move {
-            recovered_runtime
-                .recover_persisted_lifecycle_transitions()
-                .await
+            Box::pin(recovered_runtime.recover_persisted_lifecycle_transitions()).await
         });
         tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
             .await
