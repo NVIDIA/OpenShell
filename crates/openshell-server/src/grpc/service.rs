@@ -186,6 +186,9 @@ pub(super) async fn expose_service_endpoint(
         }
     };
 
+    if state.config.supervisor_app_listener.enabled {
+        crate::config_delivery::publish_sandbox(state, sandbox.object_id());
+    }
     let mut endpoint = endpoint;
     if let Some(ref mut meta) = endpoint.metadata {
         meta.resource_version = result.resource_version;
@@ -360,12 +363,65 @@ pub(super) async fn handle_delete_service(
         state
             .service_route_index
             .remove(workspace, sandbox_name, &req.name);
+        if state.config.supervisor_app_listener.enabled {
+            crate::config_delivery::publish_sandbox(state, &endpoint.sandbox_id);
+        }
         service_routing::emit_service_endpoint_delete_event(&endpoint);
     }
 
     Ok(Response::new(DeleteServiceResponse {
         outcome: super::deletion_outcome(deleted, req.allow_missing, "service endpoint")?,
     }))
+}
+
+/// Complete bounded allowlist for the supervisor configuration. Disabled
+/// ingress leaves existing gateway-only configurations and fingerprints alone.
+pub(super) async fn configured_app_routes(
+    state: &ServerState,
+    sandbox: &Sandbox,
+) -> Result<Vec<openshell_core::proto::SandboxServiceRoute>, Status> {
+    if !state.config.supervisor_app_listener.enabled {
+        return Ok(Vec::new());
+    }
+    let selector = format!("sandbox={}", sandbox.object_name());
+    let page = state
+        .store
+        .list_message_page::<ServiceEndpoint>(
+            ObjectListQuery::WorkspaceSelector {
+                workspace: sandbox.object_workspace(),
+                label_selector: &selector,
+            },
+            None,
+            1024,
+        )
+        .await
+        .map_err(|_| Status::unavailable("service declarations unavailable"))?;
+    if page.next_cursor.is_some() {
+        return Err(Status::resource_exhausted(
+            "too many application service declarations",
+        ));
+    }
+    let mut service_routes: Vec<_> = page
+        .messages
+        .into_iter()
+        .filter(|ep| {
+            ep.sandbox_id == sandbox.object_id()
+                && ep.domain
+                && ep
+                    .metadata
+                    .as_ref()
+                    .is_none_or(|m| m.deletion_time.is_none())
+        })
+        .map(|ep| openshell_core::proto::SandboxServiceRoute {
+            endpoint_id: ep.object_id().to_string(),
+            name: ep.name.clone(),
+            target_port: ep.target_port,
+            authorization_mode: ep.authorization_mode,
+            resource_version: ep.metadata.as_ref().map_or(0, |m| m.resource_version),
+        })
+        .collect();
+    service_routes.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(service_routes)
 }
 
 async fn get_service_endpoint(
@@ -483,6 +539,121 @@ mod tests {
     #[test]
     fn validates_good_endpoint_name() {
         validate_endpoint_name("service", "web-api", 28).unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_declarations_update_configuration_identity_and_stay_sandbox_scoped() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .expect("unshared test state")
+            .config
+            .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+            enabled: true,
+            port: 9443,
+            domain: "services.example.com".into(),
+        };
+        seed_sandbox(&state, "first").await;
+        seed_sandbox(&state, "second").await;
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>("sandbox-first")
+            .await
+            .unwrap()
+            .unwrap();
+        let before = super::super::policy::load_sandbox_config(&state, &sandbox)
+            .await
+            .unwrap();
+        for name in ["first", "second"] {
+            handle_expose_service(
+                &state,
+                authed_request(ExposeServiceRequest {
+                    sandbox: name.into(),
+                    name: "web".into(),
+                    target_port: 8080,
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let installed = super::super::policy::load_sandbox_config(&state, &sandbox)
+            .await
+            .unwrap();
+        assert_eq!(installed.service_routes.len(), 1);
+        assert_eq!(installed.service_routes[0].target_port, 8080);
+        assert_ne!(installed.config_revision, before.config_revision);
+
+        handle_expose_service(
+            &state,
+            authed_request(ExposeServiceRequest {
+                sandbox: "first".into(),
+                name: "web".into(),
+                target_port: 9090,
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let edited = super::super::policy::load_sandbox_config(&state, &sandbox)
+            .await
+            .unwrap();
+        assert_eq!(edited.service_routes[0].target_port, 9090);
+        assert_eq!(
+            edited.service_routes[0].endpoint_id,
+            installed.service_routes[0].endpoint_id
+        );
+        assert_ne!(edited.config_revision, installed.config_revision);
+
+        handle_delete_service(
+            &state,
+            authed_request(DeleteServiceRequest {
+                sandbox: "first".into(),
+                name: "web".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let removed = super::super::policy::load_sandbox_config(&state, &sandbox)
+            .await
+            .unwrap();
+        assert!(removed.service_routes.is_empty());
+        assert_eq!(removed.config_revision, before.config_revision);
+    }
+
+    #[tokio::test]
+    async fn gateway_only_exposure_does_not_change_supervisor_configuration() {
+        let state = test_server_state().await;
+        seed_sandbox(&state, "gateway-only").await;
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>("sandbox-gateway-only")
+            .await
+            .unwrap()
+            .unwrap();
+        let before = super::super::policy::load_sandbox_config(&state, &sandbox)
+            .await
+            .unwrap();
+        handle_expose_service(
+            &state,
+            authed_request(ExposeServiceRequest {
+                sandbox: "gateway-only".into(),
+                name: "web".into(),
+                target_port: 8080,
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let after = super::super::policy::load_sandbox_config(&state, &sandbox)
+            .await
+            .unwrap();
+        assert!(after.service_routes.is_empty());
+        assert_eq!(after.config_revision, before.config_revision);
     }
 
     #[test]

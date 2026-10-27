@@ -1754,3 +1754,44 @@ Replace the executable and configuration paths with your installation's paths, a
 The command reports each selected executable path and version. Each tool receives only `-V`, with a five-second deadline and an 8 KiB output limit per stream. Missing, non-executable, outdated, or failing tools return a nonzero exit status with corrective guidance and the selected tool's error. The checks create no gateway state or images and do not start a driver or VM. Version checks confirm the installation; they do not test image creation or filesystem recovery.
 
 Other drivers do not require these VM tools. A VM configuration table alone does not select the VM driver. When a remote driver socket is configured, preflight reports that host tool checks were not performed; run the check on that host in the driver service's environment with a local VM configuration.
+
+## Supervisor application listener
+
+Enable a separate application TLS listener for declared sandbox HTTP and
+WebSocket services. Application traffic reaches the supervisor directly and uses
+authentication supplied by your application or ingress edge. Gateway service
+ingress remains available independently.
+
+```toml
+[openshell.supervisor.app_listener]
+enabled = true
+port = 9443
+domain = "services.example.com"
+
+[openshell.drivers.kubernetes.sandbox_runtime.app_listener]
+tls_secret_name = "openshell-app-tls"
+```
+
+The listener defaults to disabled, with port `8443` and no domain. Port, domain,
+or driver options alone do not enable it. Use an unprivileged port distinct from
+the supervisor runtime and health ports. The common `port` controls both the
+listener and its Kubernetes endpoint.
+
+On Kubernetes, provide a TLS Secret with `tls.crt` and `tls.key` matching
+`*.services.example.com` in each supervisor namespace, and allow your ingress
+clients to reach the app port through NetworkPolicy. The driver mounts the Secret
+only in supervisor containers. Restart supervisors after changing certificates.
+Dedicated and shared supervisors expose the app listener directly on their Pod
+IPs. Route application traffic to the supervisor owning the sandbox, using the
+configured app port. The driver creates no Kubernetes Service for application
+traffic; ingress integrations manage any routing resources they need.
+Existing supervisor processes retain their startup listener configuration until
+restarted.
+
+Expose services with the existing commands. For direct listener testing, an
+unnamed service on sandbox `demo` in workspace `default` uses SNI and Host
+`default--demo.services.example.com`; a service named `web` uses
+`default--demo--web.services.example.com`. Configure DNS or your ingress to reach
+the owning supervisor while preserving that hostname. Automatic discovery and
+application URL publication are separate work; current CLI URLs still identify
+the existing gateway path.
