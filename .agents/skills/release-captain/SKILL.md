@@ -51,7 +51,10 @@ errors still fail. Other versions retain normal version-based enforcement.
 The run summary and qualification JSON record the exception and reason. Review
 all protobuf findings for each candidate and include migration guidance in the
 release notes; the exception does not accept other compatibility-review findings.
-Remove the workflow exception after promoting v0.1.6. A new prerelease number
+Squash-merge PR #4976 and, after verifying v0.1.6 publication, prepare a cleanup PR
+reverting its entire squash-merge commit. Follow "Remove the v0.1.6 exception" in
+`CI.md`; remove the checker support and metadata along with the workflow exception.
+A new prerelease number
 within this patch train retains the exception; other patch or minor trains do not.
 
 ## Setup
