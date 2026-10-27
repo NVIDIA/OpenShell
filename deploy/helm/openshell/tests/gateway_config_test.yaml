@@ -29,33 +29,49 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?m)^enable_websocket_tunnel\s*=\s*true$'
 
-  - it: omits service_routing_gateway_name unless a routing name is configured
+  - it: omits service_hostname_format unless a format is configured
     template: templates/gateway-config.yaml
     asserts:
       - notMatchRegex:
           path: data["gateway.toml"]
-          pattern: 'service_routing_gateway_name\s*='
+          pattern: 'service_hostname_format\s*='
 
-  - it: renders service_routing_gateway_name from server.serviceRoutingGatewayName
+  - it: renders service_hostname_format from server.serviceHostnameFormat
     template: templates/gateway-config.yaml
     set:
-      server.serviceRoutingGatewayName: gateway-west
+      server.serviceHostnameFormat: hashed
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?m)^service_routing_gateway_name\s*=\s*"gateway-west"$'
+          pattern: '(?m)^service_hostname_format\s*=\s*"hashed"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^name\s*=\s*"openshell"$'
 
-  - it: preserves an explicit gatewayConfig service_routing_gateway_name over the legacy value
+  - it: renders service_hostname_format with the configured installation name
     template: templates/gateway-config.yaml
     set:
-      server.serviceRoutingGatewayName: gateway-west
+      server.serviceHostnameFormat: hashed
+      server.name: gateway-west
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_hostname_format\s*=\s*"hashed"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^name\s*=\s*"gateway-west"$'
+
+  - it: preserves an explicit gatewayConfig service_hostname_format over the value
+    template: templates/gateway-config.yaml
+    set:
+      server.serviceHostnameFormat: hashed
       gatewayConfig:
         openshell.gateway:
-          service_routing_gateway_name: gateway-east
+          service_hostname_format: readable
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?m)^service_routing_gateway_name\s*=\s*"gateway-east"$'
+          pattern: '(?m)^service_hostname_format\s*=\s*"readable"$'
 
   - it: defaults to label admission with caller driver config disabled
     template: templates/gateway-config.yaml

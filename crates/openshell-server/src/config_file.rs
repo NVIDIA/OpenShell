@@ -159,11 +159,11 @@ pub struct GatewayFileSection {
     /// Enable plaintext HTTP routing for loopback sandbox service URLs.
     #[serde(default)]
     pub enable_loopback_service_http: Option<bool>,
-    /// Gateway name used to derive opaque hashed sandbox service route
-    /// labels. Unset keeps readable `<workspace>--<sandbox>[--<service>]`
-    /// service hostnames.
+    /// Hostname format for exposed sandbox services: `readable` (default) or
+    /// `hashed` (opaque one-label hostnames discriminated by the gateway
+    /// installation name).
     #[serde(default)]
-    pub service_routing_gateway_name: Option<String>,
+    pub service_hostname_format: Option<openshell_core::config::ServiceHostnameFormat>,
     /// Enable the WebSocket tunnel for an authenticated edge proxy.
     #[serde(default)]
     pub enable_websocket_tunnel: Option<bool>,
@@ -1100,38 +1100,29 @@ compute_driver = 42
     }
 
     #[test]
-    fn service_routing_gateway_name_parses_and_serializes() {
+    fn service_hostname_format_parses_and_serializes() {
         let file = toml::from_str::<ConfigFile>(
             r#"
 [openshell]
 version = 2
 
 [openshell.gateway]
-service_routing_gateway_name = "gateway-west"
+service_hostname_format = "hashed"
 "#,
         )
-        .expect("service routing gateway name parses");
+        .expect("service hostname format parses");
 
         assert_eq!(
-            file.openshell
-                .gateway
-                .service_routing_gateway_name
-                .as_deref(),
-            Some("gateway-west")
+            file.openshell.gateway.service_hostname_format,
+            Some(openshell_core::config::ServiceHostnameFormat::Hashed)
         );
 
         let serialized = toml::to_string(&file).expect("config serializes");
-        assert!(serialized.contains("service_routing_gateway_name = \"gateway-west\""));
+        assert!(serialized.contains("service_hostname_format = \"hashed\""));
 
         let unset = toml::from_str::<ConfigFile>("[openshell]\nversion = 2\n")
             .expect("file without the field parses");
-        assert!(
-            unset
-                .openshell
-                .gateway
-                .service_routing_gateway_name
-                .is_none()
-        );
+        assert!(unset.openshell.gateway.service_hostname_format.is_none());
     }
 
     #[test]

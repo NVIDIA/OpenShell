@@ -347,45 +347,62 @@ pub struct ServiceRoutingConfig {
     /// HTTP for sandbox service hostnames.
     pub enable_loopback_service_http: bool,
 
-    /// Optional gateway name used to derive opaque hashed service route
-    /// labels.
+    /// Format used for newly generated service hostnames.
     ///
-    /// When `None` (the default), the gateway keeps generating readable
-    /// `<workspace>--<sandbox>[--<service>]` service hostnames. When set,
-    /// newly generated service hostnames use a stable, one-label hash derived
-    /// from this name plus the workspace, sandbox, and service instead.
-    ///
-    /// This value is unrelated to [`Config::name`] and
-    /// [`GatewayJwtConfig::gateway_id`]; it is never derived from them.
-    pub service_routing_gateway_name: Option<String>,
+    /// `Readable` (the default) generates
+    /// `<workspace>--<sandbox>[--<service>]` hostnames. `Hashed` generates a
+    /// stable, one-label opaque hash derived from the gateway installation
+    /// name plus the workspace, sandbox, and service — see
+    /// [`Config::service_routing_discriminator`].
+    pub service_hostname_format: ServiceHostnameFormat,
+}
+
+/// Format of exposed-service hostnames minted by the gateway.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceHostnameFormat {
+    /// Readable `<workspace>--<sandbox>[--<service>]` hostnames.
+    #[default]
+    Readable,
+    /// Opaque one-label hashed hostnames, discriminated by the gateway
+    /// installation name.
+    Hashed,
+}
+
+impl FromStr for ServiceHostnameFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "readable" => Ok(Self::Readable),
+            "hashed" => Ok(Self::Hashed),
+            _ => Err(format!(
+                "invalid service hostname format '{value}'; expected readable or hashed"
+            )),
+        }
+    }
 }
 
 impl ServiceRoutingConfig {
-    /// Validate the service-routing configuration.
+    /// Validate the service-routing configuration against the gateway
+    /// installation name.
     ///
-    /// Currently validates [`Self::service_routing_gateway_name`]: `None` is
-    /// always valid, while `Some(name)` must be a DNS-1123 label — 1–63 ASCII
-    /// bytes of lowercase `a-z`, `0-9`, or `-`, with no leading or trailing
-    /// `-`. An empty string is rejected; the setting is represented as
-    /// disabled only by `None`.
-    pub fn validate(&self) -> crate::error::Result<()> {
-        Self::validate_gateway_name(self.service_routing_gateway_name.as_deref())
-    }
-
-    /// Validate an optional service-routing gateway name.
-    ///
-    /// `None` is always valid. `Some(name)` must be a DNS-1123 label — 1–63
-    /// ASCII bytes of lowercase `a-z`, `0-9`, or `-`, with no leading or
-    /// trailing `-`. An empty string is rejected; the setting is represented
-    /// as disabled only by `None`.
-    pub fn validate_gateway_name(name: Option<&str>) -> crate::error::Result<()> {
-        if let Some(name) = name
-            && !is_dns_label(name)
+    /// When [`ServiceHostnameFormat::Hashed`] is selected, the installation
+    /// name becomes the hash discriminator and must be a DNS-1123 label —
+    /// 1–63 ASCII bytes of lowercase `a-z`, `0-9`, or `-`, with no leading or
+    /// trailing `-`. It must also be unique among all gateways sharing the
+    /// service base domain; that uniqueness is an operational contract the
+    /// deploying platform is responsible for, since a single gateway cannot
+    /// observe its siblings.
+    pub fn validate(&self, installation_name: &str) -> crate::error::Result<()> {
+        if self.service_hostname_format == ServiceHostnameFormat::Hashed
+            && !is_dns_label(installation_name)
         {
             return Err(crate::error::Error::Config {
                 message: format!(
-                    "service_routing_gateway_name must be a DNS label (1-63 lowercase \
-                     ASCII alphanumeric or '-' bytes, no leading/trailing '-'): {name:?}"
+                    "hashed service hostnames require the gateway installation name to be \
+                     a DNS label (1-63 lowercase ASCII alphanumeric or '-' bytes, no \
+                     leading/trailing '-'): {installation_name:?}"
                 ),
             });
         }
@@ -1170,15 +1187,34 @@ impl Config {
         self
     }
 
-    /// Set the service-routing gateway name used to derive hashed service
-    /// route labels.
+    /// Select the hostname format for exposed sandbox services.
     ///
-    /// `None` preserves readable service hostnames. `Some(name)` must pass
-    /// [`ServiceRoutingConfig::validate`].
+    /// [`ServiceHostnameFormat::Hashed`] derives its discriminator from the
+    /// gateway installation name ([`Config::name`]); see
+    /// [`Self::service_routing_discriminator`].
     #[must_use]
-    pub fn with_service_routing_gateway_name(mut self, name: Option<impl Into<String>>) -> Self {
-        self.service_routing.service_routing_gateway_name = name.map(Into::into);
+    pub fn with_service_hostname_format(mut self, format: ServiceHostnameFormat) -> Self {
+        self.service_routing.service_hostname_format = format;
         self
+    }
+
+    /// The discriminator hashed into exposed-service hostnames when
+    /// [`ServiceHostnameFormat::Hashed`] is selected: the gateway
+    /// installation name.
+    ///
+    /// Returns `None` while readable hostnames are in use, in which case no
+    /// hashed service hosts exist. The name is an operator- or
+    /// platform-assigned value; it must be unique among all gateways sharing
+    /// the service base domain, an operational contract enforced by the
+    /// deploying platform rather than the gateway itself. Renaming the
+    /// installation changes every minted hostname.
+    ///
+    /// Unrelated to [`GatewayJwtConfig::gateway_id`], which carries security
+    /// and Kubernetes-ownership semantics.
+    #[must_use]
+    pub fn service_routing_discriminator(&self) -> Option<&str> {
+        (self.service_routing.service_hostname_format == ServiceHostnameFormat::Hashed)
+            .then_some(self.name.as_str())
     }
 
     /// Enable or disable plaintext HTTP routing for loopback sandbox service
@@ -1202,7 +1238,7 @@ impl Default for ServiceRoutingConfig {
         Self {
             base_domains: default_service_routing_domains(),
             enable_loopback_service_http: default_enable_loopback_service_http(),
-            service_routing_gateway_name: None,
+            service_hostname_format: ServiceHostnameFormat::default(),
         }
     }
 }
@@ -1281,8 +1317,8 @@ mod tests {
         AppArmorProfile, Config, ConfigDeliveryMode, DEFAULT_SERVICE_ROUTING_DOMAIN,
         GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
         GatewayJwtConfig, GatewayProviderProfileSourceConfig, ImagePullPolicy,
-        PolicyValidationFailureMode, UpstreamProxyConfig, default_sandbox_pids_limit,
-        normalize_compute_driver_name,
+        PolicyValidationFailureMode, ServiceHostnameFormat, UpstreamProxyConfig,
+        default_sandbox_pids_limit, normalize_compute_driver_name,
     };
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -1758,28 +1794,31 @@ mod tests {
     }
 
     #[test]
-    fn service_routing_gateway_name_defaults_to_none() {
+    fn service_hostname_format_defaults_to_readable() {
         let cfg = Config::new(None);
-        assert!(cfg.service_routing.service_routing_gateway_name.is_none());
-        cfg.service_routing.validate().expect("unset is valid");
+        assert_eq!(
+            cfg.service_routing.service_hostname_format,
+            ServiceHostnameFormat::Readable
+        );
+        assert_eq!(cfg.service_routing_discriminator(), None);
+        cfg.service_routing
+            .validate("any name")
+            .expect("readable is valid");
     }
 
     #[test]
-    fn service_routing_gateway_name_accepts_dns_label() {
-        for name in ["gateway-west", "g", &"g".repeat(63), "gateway-1-west"] {
-            let cfg = Config::new(None).with_service_routing_gateway_name(Some(name));
-            assert_eq!(
-                cfg.service_routing.service_routing_gateway_name.as_deref(),
-                Some(name)
-            );
-            cfg.service_routing
-                .validate()
-                .unwrap_or_else(|e| panic!("{name:?} must be valid: {e}"));
-        }
+    fn hashed_format_discriminates_on_the_installation_name() {
+        let cfg = Config::new(None)
+            .with_name("gateway-west")
+            .with_service_hostname_format(ServiceHostnameFormat::Hashed);
+        assert_eq!(cfg.service_routing_discriminator(), Some("gateway-west"));
+        cfg.service_routing
+            .validate("gateway-west")
+            .expect("DNS-label installation name is valid");
     }
 
     #[test]
-    fn service_routing_gateway_name_rejects_empty_uppercase_invalid_hyphen_and_overlong_values() {
+    fn hashed_format_requires_a_dns_label_installation_name() {
         for name in [
             "",
             "Gateway-West",
@@ -1789,25 +1828,30 @@ mod tests {
             "gateway west",
             &"g".repeat(64),
         ] {
-            let cfg = Config::new(None).with_service_routing_gateway_name(Some(name));
+            let cfg = Config::new(None)
+                .with_name(name)
+                .with_service_hostname_format(ServiceHostnameFormat::Hashed);
             let error = cfg
                 .service_routing
-                .validate()
+                .validate(name)
                 .expect_err(&format!("{name:?} must be rejected"));
             let message = error.to_string();
-            assert!(message.contains("service_routing_gateway_name"), "{name:?}");
+            assert!(
+                message.contains("hashed service hostnames require"),
+                "{name:?}: {message}"
+            );
         }
     }
 
     #[test]
-    fn server_sans_update_preserves_service_routing_gateway_name() {
+    fn server_sans_update_preserves_service_hostname_format() {
         let cfg = Config::new(None)
-            .with_service_routing_gateway_name(Some("gateway-west"))
+            .with_service_hostname_format(ServiceHostnameFormat::Hashed)
             .with_server_sans(["*.apps.example.com"]);
 
         assert_eq!(
-            cfg.service_routing.service_routing_gateway_name.as_deref(),
-            Some("gateway-west")
+            cfg.service_routing.service_hostname_format,
+            ServiceHostnameFormat::Hashed
         );
         assert_eq!(
             cfg.service_routing.base_domains,

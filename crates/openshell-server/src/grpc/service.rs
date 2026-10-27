@@ -458,6 +458,7 @@ fn is_dns_label(value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::grpc::test_support::{authed_request, test_server_state};
+    use openshell_core::config::ServiceHostnameFormat;
     use openshell_core::proto::{Sandbox, SandboxPhase};
 
     async fn seed_sandbox(state: &Arc<ServerState>, name: &str) {
@@ -534,7 +535,8 @@ mod tests {
         state_mut.config = state_mut
             .config
             .clone()
-            .with_service_routing_gateway_name(Some("gateway-a"));
+            .with_name("gateway-a")
+            .with_service_hostname_format(ServiceHostnameFormat::Hashed);
         state_mut.service_route_index = Arc::new(service_routing::ServiceRouteIndex::new(Some(
             "gateway-a".to_string(),
         )));

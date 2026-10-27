@@ -294,7 +294,8 @@ helm upgrade openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set server.serviceRoutingGatewayName=gateway-a
+  --set server.name=gateway-a \
+  --set server.serviceHostnameFormat=hashed
 ```
 
 With a routing name set, each gateway emits opaque, fixed-length hashed

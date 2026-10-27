@@ -162,7 +162,13 @@ pub fn endpoint_url(
     sandbox: &str,
     service: &str,
 ) -> Option<String> {
-    let host = endpoint_host(&config.service_routing, workspace, sandbox, service)?;
+    let host = endpoint_host(
+        config.service_routing_discriminator(),
+        &config.service_routing,
+        workspace,
+        sandbox,
+        service,
+    )?;
     let scheme = endpoint_scheme(config);
     let port = config.bind_address.port();
     let include_port = !matches!((scheme, port), ("https", 443) | ("http", 80));
@@ -185,13 +191,14 @@ fn endpoint_scheme(config: &openshell_core::Config) -> &'static str {
 }
 
 fn endpoint_host(
+    discriminator: Option<&str>,
     config: &ServiceRoutingConfig,
     workspace: &str,
     sandbox: &str,
     service: &str,
 ) -> Option<String> {
     let base_domain = config.base_domains.first()?;
-    Some(config.service_routing_gateway_name.as_deref().map_or_else(
+    Some(discriminator.map_or_else(
         || {
             if service.is_empty() {
                 format!("{workspace}--{sandbox}.{base_domain}")
@@ -292,11 +299,25 @@ impl std::fmt::Display for CollisionError {
 
 impl std::error::Error for CollisionError {}
 
+/// Debounce window for miss-triggered index rebuilds on the request path.
+///
+/// A miss-triggered rebuild scans every persisted service endpoint across all
+/// workspaces, and misses happen before authentication: without a debounce,
+/// a stream of unauthenticated requests carrying random well-formed hash
+/// labels would amplify into a full store scan per request. With the
+/// debounce, the worst case is one scan per window.
+pub const SERVICE_ROUTE_REBUILD_DEBOUNCE: Duration = Duration::from_secs(5);
+
 /// In-memory lookup table for opaque service-routing host labels.
 #[derive(Debug)]
 pub struct ServiceRouteIndex {
     gateway_name: Option<String>,
     entries: Arc<RwLock<HashMap<String, ServiceRouteTarget>>>,
+    /// Timestamp of the last rebuild attempt, gating miss-triggered
+    /// rebuilds. `None` means the index has never been rebuilt and the
+    /// first miss may trigger one immediately.
+    last_rebuild: RwLock<Option<Instant>>,
+    rebuild_debounce: Duration,
 }
 
 impl ServiceRouteIndex {
@@ -304,7 +325,14 @@ impl ServiceRouteIndex {
         Self {
             gateway_name,
             entries: Arc::new(RwLock::new(HashMap::new())),
+            last_rebuild: RwLock::new(None),
+            rebuild_debounce: SERVICE_ROUTE_REBUILD_DEBOUNCE,
         }
+    }
+
+    /// Override the miss-triggered rebuild debounce (tests only).
+    pub fn set_rebuild_debounce(&mut self, debounce: Duration) {
+        self.rebuild_debounce = debounce;
     }
 
     fn route_label(&self, target: &ServiceRouteTarget) -> Option<String> {
@@ -370,7 +398,30 @@ impl ServiceRouteIndex {
         self.entries.write().unwrap().insert(label, target);
     }
 
+    /// Rebuild from durable state unconditionally. Startup hydration and
+    /// explicit refresh paths use this; the request path uses
+    /// [`Self::rebuild_if_stale`].
     pub async fn rebuild(&self, store: &Store) -> Result<(), CollisionError> {
+        *self.last_rebuild.write().unwrap() = Some(Instant::now());
+        self.rebuild_inner(store).await
+    }
+
+    /// Rebuild from durable state only when the previous rebuild attempt is
+    /// older than the debounce window. Returns `Ok(false)` when the rebuild
+    /// was skipped. The timestamp is stamped on the attempt, so a failing
+    /// store cannot be retried more than once per window either.
+    pub async fn rebuild_if_stale(&self, store: &Store) -> Result<bool, CollisionError> {
+        {
+            let mut last = self.last_rebuild.write().unwrap();
+            if last.is_some_and(|at| at.elapsed() < self.rebuild_debounce) {
+                return Ok(false);
+            }
+            *last = Some(Instant::now());
+        }
+        self.rebuild_inner(store).await.map(|()| true)
+    }
+
+    async fn rebuild_inner(&self, store: &Store) -> Result<(), CollisionError> {
         let Some(gateway_name) = self.gateway_name.as_deref() else {
             return Ok(());
         };
@@ -448,11 +499,7 @@ pub async fn resolve_service_host(state: &ServerState, host: &str) -> Option<Ser
         return Some(ServiceRouteTarget::new(&workspace, &sandbox, &service));
     }
 
-    let gateway_name = state
-        .config
-        .service_routing
-        .service_routing_gateway_name
-        .as_deref()?;
+    let gateway_name = state.config.service_routing_discriminator()?;
     let label = service_host_label(host, &state.config.service_routing)?;
     if !is_hash_label(label) {
         return None;
@@ -462,9 +509,15 @@ pub async fn resolve_service_host(state: &ServerState, host: &str) -> Option<Ser
     }
 
     // A gateway can begin receiving traffic before an endpoint is exposed on
-    // this replica, so reload once from durable state before treating it as a
-    // normal, non-service request.
-    if let Err(error) = state.service_route_index.rebuild(&state.store).await {
+    // this replica, so reload from durable state before treating it as a
+    // normal, non-service request — but at most once per debounce window.
+    // Unknown labels reach this point before authentication, and without the
+    // debounce each one would trigger a full all-workspace endpoint scan.
+    if let Err(error) = state
+        .service_route_index
+        .rebuild_if_stale(&state.store)
+        .await
+    {
         warn!(error = %error, gateway_name, "failed to refresh service routing index");
         return None;
     }
@@ -1131,7 +1184,11 @@ pub fn emit_cross_origin_service_http_rejection(state: &ServerState, req: &Reque
     let Some(host) = request_host(req) else {
         return;
     };
-    let Some((_, sandbox_name, service_name)) = parse_host(host, &state.config.service_routing)
+    // `parse_host` only understands readable hosts; hashed service hosts
+    // recover their identity from the route index instead.
+    let Some((sandbox_name, service_name)) = parse_host(host, &state.config.service_routing)
+        .map(|(_, sandbox, service)| (sandbox, service))
+        .or_else(|| hashed_host_event_identity(state, host))
     else {
         return;
     };
@@ -1141,6 +1198,32 @@ pub fn emit_cross_origin_service_http_rejection(state: &ServerState, req: &Reque
         "cross-origin service request rejected",
     );
     emit_service_http_failure(state, req, &sandbox_name, &service_name, None, &err);
+}
+
+/// Recover the sandbox/service identity of a hashed service host for
+/// cross-origin rejection events.
+///
+/// Mirrors the hashed-host half of `resolve_service_host`, but consults only
+/// the in-memory route index: this emitter runs on the request path, and
+/// `resolve_service_host` rebuilds the index from durable state on a miss —
+/// a step a hostile client must not be able to trigger per rejected request.
+fn hashed_host_event_identity(state: &ServerState, host: &str) -> Option<(String, String)> {
+    // Hashed service hosts only exist when hashed hostname format is
+    // enabled; without it a hash-shaped label is an ordinary hostname.
+    state.config.service_routing_discriminator()?;
+    let label = service_host_label(host, &state.config.service_routing)?;
+    if !is_hash_label(label) {
+        return None;
+    }
+    Some(match state.service_route_index.lookup(label) {
+        Some(target) => (target.sandbox, target.service.unwrap_or_default()),
+        // Unknown label (e.g. the endpoint was removed after the request was
+        // classified as a service request). Attribute the event to the raw
+        // label so the rejection stays visible: a hashed host carries no
+        // readable sandbox/service split, and the full hostname is already
+        // recorded in the event's dst_endpoint.
+        None => (label.to_string(), String::new()),
+    })
 }
 
 fn emit_service_http_failure(
@@ -1339,6 +1422,7 @@ fn http_activity_for_method(method: &Method) -> ActivityId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::config::ServiceHostnameFormat;
 
     fn endpoint() -> ServiceEndpoint {
         ServiceEndpoint {
@@ -1465,7 +1549,8 @@ mod tests {
         let cfg = openshell_core::Config::new(Some(tls_config()))
             .with_bind_address("127.0.0.1:8080".parse().unwrap())
             .with_server_sans(["*.dev.openshell.localhost"])
-            .with_service_routing_gateway_name(Some("gateway-a"));
+            .with_name("gateway-a")
+            .with_service_hostname_format(ServiceHostnameFormat::Hashed);
 
         assert_eq!(
             endpoint_url(&cfg, "default", "my-sandbox", "web").as_deref(),
@@ -1517,6 +1602,83 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn miss_triggered_rebuilds_are_debounced() {
+        use prost::Message;
+
+        let store = crate::persistence::test_store().await;
+        let endpoint = endpoint();
+        store
+            .put_if(
+                ServiceEndpoint::object_type(),
+                endpoint.object_id(),
+                "my-sandbox--web",
+                "default",
+                &endpoint.encode_to_vec(),
+                None,
+                crate::persistence::WriteCondition::MustCreate,
+            )
+            .await
+            .unwrap();
+        let label = service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web"));
+
+        let mut index = ServiceRouteIndex::new(Some("gateway-a".to_string()));
+        // A long debounce makes the test deterministic without a clock.
+        index.set_rebuild_debounce(Duration::from_mins(10));
+
+        // The first miss-triggered rebuild runs: the index never rebuilt.
+        assert!(index.rebuild_if_stale(&store).await.unwrap());
+        assert_eq!(
+            index.lookup(&label),
+            Some(ServiceRouteTarget::new("default", "my-sandbox", "web"))
+        );
+
+        // Remove the entry in memory; a second miss within the window must
+        // not trigger another full-store rebuild.
+        index.remove("default", "my-sandbox", "web");
+        assert!(!index.rebuild_if_stale(&store).await.unwrap());
+        assert_eq!(index.lookup(&label), None);
+
+        // An explicit rebuild bypasses the debounce.
+        index.rebuild(&store).await.unwrap();
+        assert_eq!(
+            index.lookup(&label),
+            Some(ServiceRouteTarget::new("default", "my-sandbox", "web"))
+        );
+    }
+
+    #[tokio::test]
+    async fn miss_triggered_rebuild_runs_when_the_debounce_is_zero() {
+        use prost::Message;
+
+        let store = crate::persistence::test_store().await;
+        let endpoint = endpoint();
+        store
+            .put_if(
+                ServiceEndpoint::object_type(),
+                endpoint.object_id(),
+                "my-sandbox--web",
+                "default",
+                &endpoint.encode_to_vec(),
+                None,
+                crate::persistence::WriteCondition::MustCreate,
+            )
+            .await
+            .unwrap();
+        let label = service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web"));
+
+        let mut index = ServiceRouteIndex::new(Some("gateway-a".to_string()));
+        index.set_rebuild_debounce(Duration::ZERO);
+        assert!(index.rebuild_if_stale(&store).await.unwrap());
+        index.remove("default", "my-sandbox", "web");
+        // Zero debounce: every miss may rebuild from durable state.
+        assert!(index.rebuild_if_stale(&store).await.unwrap());
+        assert_eq!(
+            index.lookup(&label),
+            Some(ServiceRouteTarget::new("default", "my-sandbox", "web"))
+        );
+    }
+
     #[test]
     fn service_route_index_rejects_seeded_collision() {
         let index = ServiceRouteIndex::new(Some("gateway-a".to_string()));
@@ -1529,17 +1691,23 @@ mod tests {
         assert!(index.register("default", "my-sandbox", "web").is_err());
     }
 
-    #[tokio::test]
-    async fn hashed_hosts_resolve_and_unknown_hashes_are_not_service_requests() {
+    async fn hashed_gateway_state() -> Arc<ServerState> {
         let mut state = crate::grpc::test_support::test_server_state().await;
         let state_mut = Arc::get_mut(&mut state).unwrap();
         state_mut.config = state_mut
             .config
             .clone()
             .with_server_sans(["*.dev.openshell.localhost"])
-            .with_service_routing_gateway_name(Some("gateway-a"));
+            .with_name("gateway-a")
+            .with_service_hostname_format(ServiceHostnameFormat::Hashed);
         state_mut.service_route_index =
             Arc::new(ServiceRouteIndex::new(Some("gateway-a".to_string())));
+        state
+    }
+
+    #[tokio::test]
+    async fn hashed_hosts_resolve_and_unknown_hashes_are_not_service_requests() {
+        let state = hashed_gateway_state().await;
         state
             .service_route_index
             .register("default", "my-sandbox", "web")
@@ -1558,6 +1726,103 @@ mod tests {
             resolve_service_host(&state, "default--my-sandbox--web.dev.openshell.localhost").await,
             Some(ServiceRouteTarget::new("default", "my-sandbox", "web"))
         );
+    }
+
+    #[tokio::test]
+    async fn cross_origin_rejection_for_hashed_service_host_emits_ocsf_event() {
+        let state = hashed_gateway_state().await;
+        state
+            .service_route_index
+            .register("default", "my-sandbox", "web")
+            .unwrap();
+
+        let hash = service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web"));
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/private")
+            .header(header::HOST, format!("{hash}.dev.openshell.localhost"))
+            .body(Body::empty())
+            .unwrap();
+
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        {
+            let _guard = capture.install();
+            emit_cross_origin_service_http_rejection(&state, &request);
+        }
+
+        let seen = capture.json_events();
+        assert_eq!(seen.len(), 1, "hashed-host rejection must emit one event");
+        assert_eq!(seen[0]["class_uid"], 4002);
+        assert_eq!(seen[0]["http_response"]["code"], 403);
+        assert_eq!(
+            seen[0]["message"],
+            "Cross-origin service request rejected: my-sandbox/web"
+        );
+        assert_eq!(
+            seen[0]["dst_endpoint"]["domain"],
+            format!("{hash}.dev.openshell.localhost")
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_origin_rejection_for_unknown_hashed_label_emits_ocsf_event() {
+        let state = hashed_gateway_state().await;
+        // Nothing is registered: the label is hash-shaped but unknown.
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/private")
+            .header(header::HOST, "aaaaaaaaaaaaaaaa.dev.openshell.localhost")
+            .body(Body::empty())
+            .unwrap();
+
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        {
+            let _guard = capture.install();
+            emit_cross_origin_service_http_rejection(&state, &request);
+        }
+
+        let seen = capture.json_events();
+        assert_eq!(seen.len(), 1, "an unknown hashed label must still emit");
+        assert_eq!(
+            seen[0]["message"],
+            "Cross-origin service request rejected: aaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_origin_rejection_skips_non_service_hosts() {
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.config = state_mut
+            .config
+            .clone()
+            .with_server_sans(["*.dev.openshell.localhost"]);
+
+        for host in [
+            "api.dev.openshell.localhost",
+            // Hash-shaped, but hashed service hosts require a gateway name.
+            "aaaaaaaaaaaaaaaa.dev.openshell.localhost",
+            "127.0.0.1:8080",
+        ] {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("/")
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .unwrap();
+
+            let capture = openshell_ocsf::test_support::OcsfCapture::default();
+            {
+                let _guard = capture.install();
+                emit_cross_origin_service_http_rejection(&state, &request);
+            }
+
+            assert!(
+                capture.events().is_empty(),
+                "{host} is not a service host and must not emit"
+            );
+        }
     }
 
     #[test]

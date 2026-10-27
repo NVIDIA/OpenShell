@@ -481,7 +481,7 @@ impl ServerState {
         let replica_id = compute::lease::replica_id();
         compute.configure_ssh_identities(credentials.clone());
         let service_route_index = Arc::new(service_routing::ServiceRouteIndex::new(
-            config.service_routing.service_routing_gateway_name.clone(),
+            config.service_routing_discriminator().map(str::to_string),
         ));
         compute.configure_service_route_index(Arc::clone(&service_route_index));
         let peer_endpoint = derive_peer_endpoint(&config);

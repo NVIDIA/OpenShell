@@ -494,6 +494,17 @@ aliases. Confirm the credential driver's namespace matches its Role and
 RoleBinding. An unset workload `image_pull_policy` uses Kubernetes defaults;
 the global Helm pull policy applies to runtime and supervisor images.
 
+When multiple gateways share one service base domain, confirm each release
+sets `server.serviceHostnameFormat: hashed` and a `server.name` unique among
+those gateways — the installation name is the hash discriminator for
+exposed-service hostnames, so a duplicate name silently routes two gateways'
+services to the same hostnames and a rename invalidates every previously
+issued URL. Check the rendered pair with:
+
+```bash
+kubectl -n <gateway-namespace> get cm <release>-config -o jsonpath='{.data.gateway\.toml}' | rg -n '^name|service_hostname_format'
+```
+
 The chart mounts the `gateway.toml` ConfigMap key directly at
 `/etc/openshell/gateway.toml` as a read-only `subPath` file. This avoids the
 atomic-writer symlink exposed by a ConfigMap directory mount because the gateway

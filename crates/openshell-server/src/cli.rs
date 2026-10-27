@@ -6,7 +6,10 @@
 use clap::parser::ValueSource;
 use clap::{ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
-use openshell_core::config::{ConfigDeliveryMode, DEFAULT_GATEWAY_NAME, DEFAULT_SERVER_PORT};
+use openshell_core::config::{
+    ConfigDeliveryMode, DEFAULT_GATEWAY_NAME, DEFAULT_SERVER_PORT, ServiceHostnameFormat,
+    ServiceRoutingConfig,
+};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::net::{IpAddr, SocketAddr};
@@ -286,11 +289,12 @@ struct RunArgs {
     )]
     server_sans: Vec<String>,
 
-    /// Gateway name used to derive opaque hashed sandbox service route
-    /// labels. Unset keeps readable `<workspace>--<sandbox>[--<service>]`
-    /// service hostnames.
-    #[arg(long, env = "OPENSHELL_SERVICE_ROUTING_GATEWAY_NAME")]
-    service_routing_gateway_name: Option<String>,
+    /// Hostname format for exposed sandbox services: `readable` (default)
+    /// keeps `<workspace>--<sandbox>[--<service>]` hostnames; `hashed` mints
+    /// opaque one-label hostnames discriminated by the gateway installation
+    /// name.
+    #[arg(long, env = "OPENSHELL_SERVICE_HOSTNAME_FORMAT")]
+    service_hostname_format: Option<ServiceHostnameFormat>,
 
     /// Enable plaintext HTTP routing for loopback sandbox service URLs.
     #[arg(
@@ -574,12 +578,12 @@ fn prepare_server_config_with_drivers(
                 .unwrap_or_default(),
         )
         .with_server_sans(args.server_sans.clone())
-        .with_service_routing_gateway_name(args.service_routing_gateway_name.clone())
+        .with_service_hostname_format(args.service_hostname_format.unwrap_or_default())
         .with_loopback_service_http(args.enable_loopback_service_http)
         .with_websocket_tunnel(args.enable_websocket_tunnel);
     config
         .service_routing
-        .validate()
+        .validate(&config.name)
         .map_err(|error| miette::miette!("invalid service routing configuration: {error}"))?;
     if let Some(sources) = file
         .as_ref()
@@ -1055,10 +1059,11 @@ fn validate_preflight_semantics(
         args.grpc_rate_limit_requests,
         args.grpc_rate_limit_window_seconds,
     )?;
-    openshell_core::config::ServiceRoutingConfig::validate_gateway_name(
-        args.service_routing_gateway_name.as_deref(),
-    )
-    .map_err(|error| miette::miette!("invalid service routing configuration: {error}"))?;
+    if args.service_hostname_format == Some(ServiceHostnameFormat::Hashed) {
+        ServiceRoutingConfig::default()
+            .validate(args.name.trim())
+            .map_err(|error| miette::miette!("invalid service routing configuration: {error}"))?;
+    }
     GuestTlsPaths::validate_configuration(Some(gateway), args.disable_tls)
         .map_err(|error| miette::miette!("invalid gateway guest TLS configuration: {error}"))?;
 
@@ -1267,11 +1272,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.server_sans.clone_from(sans);
     }
-    if let Some(name) = &file.service_routing_gateway_name
-        && args.service_routing_gateway_name.is_none()
-        && arg_defaulted(matches, "service_routing_gateway_name")
+    if let Some(format) = &file.service_hostname_format
+        && args.service_hostname_format.is_none()
+        && arg_defaulted(matches, "service_hostname_format")
     {
-        args.service_routing_gateway_name = Some(name.clone());
+        args.service_hostname_format = Some(*format);
     }
     if let Some(enabled) = file.enable_loopback_service_http
         && arg_defaulted(matches, "enable_loopback_service_http")
@@ -1438,6 +1443,7 @@ mod tests {
     use super::{Cli, command};
     use crate::test_environment::Environment;
     use clap::Parser;
+    use openshell_core::config::ServiceHostnameFormat;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3683,64 +3689,63 @@ enable_loopback_service_http = false
     }
 
     #[test]
-    fn file_populates_service_routing_gateway_name() {
+    fn file_populates_service_hostname_format() {
         Environment::new()
-            .remove("OPENSHELL_SERVICE_ROUTING_GATEWAY_NAME")
+            .remove("OPENSHELL_SERVICE_HOSTNAME_FORMAT")
             .run(|| {
                 let (mut args, matches) =
                     parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
                 let file = config_file_from_toml(
-                    "[openshell.gateway]\nservice_routing_gateway_name = \"gateway-west\"\n",
+                    "[openshell.gateway]\nservice_hostname_format = \"hashed\"\n",
                 );
                 merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
 
                 assert_eq!(
-                    args.service_routing_gateway_name.as_deref(),
-                    Some("gateway-west")
+                    args.service_hostname_format,
+                    Some(ServiceHostnameFormat::Hashed)
                 );
             });
     }
 
     #[test]
-    fn service_routing_gateway_name_cli_and_env_override_file_value() {
+    fn service_hostname_format_cli_and_env_override_file_value() {
         // CLI flag wins over the file value.
         let (mut args, matches) = parse_with_args(&[
             "openshell-gateway",
             "--db-url",
             "sqlite::memory:",
-            "--service-routing-gateway-name",
-            "gateway-cli",
+            "--service-hostname-format",
+            "readable",
         ]);
-        let file = config_file_from_toml(
-            "[openshell.gateway]\nservice_routing_gateway_name = \"gateway-west\"\n",
-        );
+        let file =
+            config_file_from_toml("[openshell.gateway]\nservice_hostname_format = \"hashed\"\n");
         merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
         assert_eq!(
-            args.service_routing_gateway_name.as_deref(),
-            Some("gateway-cli"),
+            args.service_hostname_format,
+            Some(ServiceHostnameFormat::Readable),
             "CLI flag must win over file value"
         );
 
         // Env var wins over the file value.
         Environment::new()
-            .set("OPENSHELL_SERVICE_ROUTING_GATEWAY_NAME", "gateway-env")
+            .set("OPENSHELL_SERVICE_HOSTNAME_FORMAT", "readable")
             .run(|| {
                 let (mut args, matches) =
                     parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
                 let file = config_file_from_toml(
-                    "[openshell.gateway]\nservice_routing_gateway_name = \"gateway-west\"\n",
+                    "[openshell.gateway]\nservice_hostname_format = \"hashed\"\n",
                 );
                 merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
                 assert_eq!(
-                    args.service_routing_gateway_name.as_deref(),
-                    Some("gateway-env"),
+                    args.service_hostname_format,
+                    Some(ServiceHostnameFormat::Readable),
                     "env var must win over file value"
                 );
             });
     }
 
     #[test]
-    fn server_config_preparation_applies_and_validates_service_routing_gateway_name() {
+    fn server_config_preparation_applies_and_validates_hashed_hostnames() {
         let state = tempfile::tempdir().unwrap();
         let local_tls = tempfile::tempdir().unwrap();
 
@@ -3750,12 +3755,12 @@ enable_loopback_service_http = false
                 "OPENSHELL_LOCAL_TLS_DIR",
                 local_tls.path().to_str().unwrap(),
             )
-            .remove("OPENSHELL_SERVICE_ROUTING_GATEWAY_NAME")
+            .remove("OPENSHELL_SERVICE_HOSTNAME_FORMAT")
             .run(|| {
                 let config_path = state.path().join("gateway.toml");
                 std::fs::write(
                     &config_path,
-                    "[openshell]\nversion = 2\n\n[openshell.gateway]\nservice_routing_gateway_name = \"gateway-west\"\n",
+                    "[openshell]\nversion = 2\n\n[openshell.gateway]\nname = \"gateway-west\"\nservice_hostname_format = \"hashed\"\n",
                 )
                 .unwrap();
 
@@ -3773,18 +3778,14 @@ enable_loopback_service_http = false
                 let prepared = super::prepare_server_config(&mut args, &matches)
                     .expect("server config is prepared");
                 assert_eq!(
-                    prepared
-                        .config
-                        .service_routing
-                        .service_routing_gateway_name
-                        .as_deref(),
+                    prepared.config.service_routing_discriminator(),
                     Some("gateway-west")
                 );
 
                 let invalid_path = state.path().join("invalid-gateway-name.toml");
                 std::fs::write(
                     &invalid_path,
-                    "[openshell]\nversion = 2\n\n[openshell.gateway]\nservice_routing_gateway_name = \"Gateway West\"\n",
+                    "[openshell]\nversion = 2\n\n[openshell.gateway]\nname = \"Gateway West\"\nservice_hostname_format = \"hashed\"\n",
                 )
                 .unwrap();
                 let (mut args, matches) = parse_with_args(&[
@@ -3799,9 +3800,9 @@ enable_loopback_service_http = false
                 ]);
                 let error = super::prepare_server_config(&mut args, &matches)
                     .err()
-                    .expect("invalid routing gateway name must fail preparation");
+                    .expect("invalid installation name must fail preparation");
                 assert!(
-                    error.to_string().contains("service_routing_gateway_name"),
+                    error.to_string().contains("hashed service hostnames require"),
                     "unexpected error: {error}"
                 );
             });

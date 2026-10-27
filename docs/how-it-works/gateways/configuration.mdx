@@ -199,12 +199,12 @@ config_delivery_mode = "poll"
 server_sans                  = ["openshell", "*.dev.openshell.localhost"]
 # Allow plaintext HTTP routing for loopback sandbox service URLs.
 enable_loopback_service_http = true
-# Disambiguate service hostnames when multiple gateways share one service
-# base domain behind a single ingress. When set, service URLs use opaque
-# hashed labels (https://<hash>.<base-domain>/) instead of the readable
-# <workspace>--<sandbox>--<service> composite. Changing the name changes
-# every issued URL.
-service_routing_gateway_name = "gateway-west"
+# Hostname format for exposed sandbox services. "hashed" makes service URLs
+# opaque one-label hashes (https://<hash>.<base-domain>/) discriminated by
+# the installation name above, instead of the readable
+# <workspace>--<sandbox>--<service> composite. Renaming the installation
+# changes every issued URL.
+service_hostname_format = "hashed"
 # Serve the WebSocket tunnel for CLI clients behind an authenticating edge proxy.
 enable_websocket_tunnel = false
 
@@ -355,37 +355,41 @@ and `https://<workspace>--<sandbox>.<base-domain>/` for the unnamed endpoint.
 The base domain is the first wildcard DNS SAN in `server_sans`; gateways
 without SANs use the built-in `openshell.localhost`.
 
-`service_routing_gateway_name` disambiguates service hostnames when multiple
-gateways share one service base domain behind a single ingress and wildcard
-certificate. Identically named workspaces, sandboxes, and services on two such
-gateways produce identical composite hostnames, so the shared ingress cannot
-select the correct gateway. Assign each gateway a distinct routing name with
-`[openshell.gateway].service_routing_gateway_name`,
-`--service-routing-gateway-name`, or
-`OPENSHELL_SERVICE_ROUTING_GATEWAY_NAME`. The field is unset by default. Its
-precedence is `--service-routing-gateway-name` >
-`OPENSHELL_SERVICE_ROUTING_GATEWAY_NAME` > TOML > unset.
+`service_hostname_format` selects the hostname format for exposed sandbox
+services when multiple gateways share one service base domain behind a single
+ingress and wildcard certificate. Identically named workspaces, sandboxes, and
+services on two such gateways produce identical composite hostnames, so the
+shared ingress cannot select the correct gateway. Set the format to `hashed`
+with `[openshell.gateway].service_hostname_format`,
+`--service-hostname-format`, or `OPENSHELL_SERVICE_HOSTNAME_FORMAT`. The
+field defaults to `readable` (the composite hostname). Its precedence is
+`--service-hostname-format` > `OPENSHELL_SERVICE_HOSTNAME_FORMAT` > TOML >
+default.
 
-The value must match `[a-z0-9]([-a-z0-9]*[a-z0-9])?` and be at most 63 bytes.
-It is a hostname label only: it is unrelated to the gateway installation
-`name` (used for telemetry identity) and to `gateway_jwt.gateway_id` (the
-sandbox JWT issuer and Kubernetes ownership identity).
+In hashed mode the discriminator hashed into every service hostname is the
+gateway installation `name` — the operator- or platform-assigned value used
+for telemetry identity. It must match `[a-z0-9]([-a-z0-9]*[a-z0-9])?` and be
+at most 63 bytes, and it must be unique among all gateways sharing the
+service base domain; that uniqueness is an operational contract enforced by
+the deploying platform, since a single gateway cannot observe its siblings.
+`gateway_jwt.gateway_id` is unrelated: it carries the sandbox JWT issuer and
+Kubernetes ownership semantics and must not be reused here.
 
-When set, service URLs replace the readable composite label with a
-deterministic 16-character hash of the routing name, workspace, sandbox, and
-service name: `https://<hash>.<base-domain>/` (for example,
+With the format set, service URLs replace the readable composite label with a
+deterministic 16-character hash of the installation name, workspace, sandbox,
+and service name: `https://<hash>.<base-domain>/` (for example,
 `https://enh47uqyj7bpyttz.apps.example.com/`, the label a gateway named
 `gateway-a` issues for workspace `default`, sandbox `my-sandbox`, service
 `web`). The hash stays one DNS label
 deep, so the existing single wildcard certificate keeps working, and it is
 unique per gateway, so exact-host ingress rules can route it unambiguously.
-The gateway still accepts requests for legacy composite hostnames while a
-routing name is configured.
+The gateway still accepts requests for legacy composite hostnames while
+hashed format is configured.
 
 Service URLs are recomputed from the current configuration, not persisted.
-Changing or removing the routing name changes every hash URL issued before
-the change; previously issued URLs stop resolving until callers request a
-fresh URL.
+Changing the installation name, the hostname format, or both changes every
+hash URL issued before the change; previously issued URLs stop resolving
+until callers request a fresh URL.
 
 ## Database Pool
 
