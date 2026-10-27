@@ -152,13 +152,15 @@ The ingress policy schema needs definition. Existing egress rules must not impli
 
 Application TLS is configured separately from gateway TLS. Operators provide DNS and certificates; `svc.openshell.internal` is an example domain. Certificate provisioning and rotation remain open questions.
 
-SNI selects a route; it does not authenticate a user. Applications can handle authentication, or operators can apply an edge access policy. Preserve existing header handling: strip `Authorization` by default, allow explicit `bearer-passthrough`, and strip gateway/edge identity headers and edge authentication cookies. Native OpenShell user/workspace authorization is not the proposed default for application requests.
+SNI selects a route; it does not authenticate a user. Direct app-listener access delegates authentication to the ingress provider; implementing that authentication is outside this proposal. Preserve existing listener header handling: strip `Authorization` by default, allow explicit `bearer-passthrough`, and strip gateway/edge identity headers and edge authentication cookies.
+
+Gateway-mediated application HTTP requests and WebSocket upgrades use configured gateway authentication and workspace authorization independently of app-listener enablement, as tracked by #4722. Use the TCP-forwarding access policy, including `sandbox:write` when scopes are enforced. Keep gateway credentials separate from application bearer passthrough and cookies; consume and strip gateway material before forwarding. Browser sessions require a control-plane login flow, origin/CSRF protections, and revocation. Missing, invalid, expired, or revoked credentials fail before application dial; insufficient permissions return 403. WebSockets authenticate at upgrade. Explicit unauthenticated local-development configurations retain their documented behavior.
 
 A passthrough proxy cannot inspect HTTP credentials. An edge that terminates TLS must reconnect with the correct service SNI and authority. Restrict supervisor listener access to prevent bypassing required edge authentication; use authenticated backend transport where network restrictions are insufficient.
 
 ### Deployment and compatibility
 
-Enable the new path explicitly and retain existing gateway-mode behavior. CLI/SDK URLs must use the application ingress domain and public port independently of the gateway endpoint. Status should distinguish configured, advertised, and unavailable routes. Domain migrations require coordinated DNS, TLS, and client changes.
+Enable the app-listener path explicitly. Gateway-mediated service clients independently require configured gateway credentials and workspace access; TLS gateway URLs retain HTTPS on loopback to support client certificates. CLI/SDK URLs must use the application ingress domain and public port independently of the gateway endpoint. Status should distinguish configured, advertised, and unavailable routes. Domain migrations require coordinated DNS, TLS, and client changes.
 
 ## Implementation plan
 

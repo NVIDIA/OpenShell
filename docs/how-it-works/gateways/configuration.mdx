@@ -1655,3 +1655,14 @@ URL does not mean that a supervisor installed the route or ingress is ready.
 Upgrade the CLI alongside the gateway when enabling `public_url`. Older CLI
 versions can replace the public application port with the gateway connection's
 port.
+
+Gateway-mediated service URLs use configured gateway authentication and workspace
+access controls with the app listener enabled or disabled. See
+[application request authentication](/how-it-works/gateways/authentication#sandbox-service-requests)
+for browser sessions, application credential passthrough, and revocation.
+Direct app-listener authentication belongs to the ingress provider.
+
+TLS gateways advertise HTTPS for authenticated gateway service access, including
+on loopback, so clients can present an mTLS identity. The separate plaintext
+loopback service listener cannot accept a client-certificate identity or browser
+sessions; use an explicit gateway bearer credential there.

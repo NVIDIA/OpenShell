@@ -227,6 +227,39 @@ after one minute or a five-second blocked send. Each gateway process accepts at
 most 32 watches. Reconnect and relist on stream termination; revisions are opaque
 equality tokens, not resumable cursors or an ordering across gateway replicas.
 
+## Gateway application authentication
+
+Gateway-mediated application HTTP requests and WebSocket upgrades authenticate
+through the gateway chain or verified TLS client identity before endpoint lookup,
+independently of app-listener enablement. User access requires TCP-forwarding
+role/scope policy (`sandbox:write` when enforced) and current workspace membership;
+operators retain their platform grant. Internal principals are rejected. Only
+explicit local-development unauthenticated access bypasses this gate.
+
+`/auth/services` hosts browser login on the control-plane origin. The application
+origin receives a single-use bootstrap code bound to a browser login nonce, then
+a distinct host-only, Secure/HttpOnly session cookie. Shared metadata contains
+only credential-driver handles and hashes; the configured credential driver
+stores the access token. Login codes expire after two minutes, sessions after
+at most ten minutes or token expiry. Every request revalidates the token and
+workspace authorization. Session deletion, credential revocation, and redemption
+CAS use the shared database. Expired metadata cleanup and admission are bounded.
+The application path consumes standard gateway bearer headers, or authenticates
+through a separate `X-OpenShell-Authorization`, browser session, or mTLS identity
+while preserving application bearer passthrough and cookies. Gateway headers and
+reserved cookies never reach the workload, and workloads cannot set reserved
+browser auth cookies. Browser ambient credentials require origin checks for
+unsafe methods and WebSocket upgrades. Direct supervisor ingress delegates
+application authentication to its ingress provider.
+
+The optional real-Chrome login test uses an isolated profile and local test
+credentials. Run it with `OPENSHELL_BROWSER_E2E_CHROME` pointing to Chrome:
+
+```shell
+OPENSHELL_BROWSER_E2E_CHROME='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' \
+  cargo test -p openshell-server --lib gateway_service_auth_real_browser_cross_site_login -- --ignored
+```
+
 ## Application URL publication
 
 `supervisor.app_listener.public_url` is an optional HTTPS origin matching the

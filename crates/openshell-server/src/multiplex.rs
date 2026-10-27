@@ -319,18 +319,25 @@ impl MultiplexService {
                 .config
                 .mtls_auth
                 .enabled
-                .then_some(peer_identity)
+                .then_some(peer_identity.clone())
                 .flatten(),
             self.state.config.mtls_auth.enabled,
             self.state.config.auth.allow_unauthenticated_users,
         )
-        .with_peer_certificate(certificate_sha256)
+        .with_peer_certificate(certificate_sha256.clone())
         .with_operator(operator)
         .with_connection_source(source)
         .with_logons(self.state.logons.clone());
         let grpc_service =
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
-        let http_service = http_router(self.state.clone());
+        let http_service = http_router(self.state.clone()).layer(axum::Extension(
+            crate::auth::service_access::ServicePeer {
+                secure: self.state.config.tls.is_some(),
+                identity: peer_identity,
+                certificate_sha256,
+                source: Some(source),
+            },
+        ));
 
         let grpc_service = request_id_middleware!(grpc_service);
         let http_service = request_id_middleware!(http_service);
@@ -1064,7 +1071,7 @@ where
 ///
 /// When no bearer authenticators are configured, the chain is left as `None`.
 /// The router still requires an mTLS principal or the explicit development opt-in.
-fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
+pub fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
     if let Some(peer) = state.peer_authenticator.clone() {
         authenticators.push(peer);
@@ -1176,7 +1183,7 @@ impl<S> AuthGrpcRouter<S> {
     }
 }
 
-fn unauthenticated_dev_user_principal() -> Principal {
+pub fn unauthenticated_dev_user_principal() -> Principal {
     Principal::User(UserPrincipal {
         identity: Identity {
             subject: "unauthenticated-local-dev".to_string(),

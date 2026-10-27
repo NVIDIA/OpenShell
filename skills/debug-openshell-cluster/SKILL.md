@@ -1542,3 +1542,20 @@ Service responses identify the application and gateway paths separately. A
 configured application URL must retain its public port even when the CLI uses a
 gateway port-forward. Inspect discovery and ingress acceptance separately:
 URL publication alone proves neither installation nor public reachability.
+
+Gateway-mediated service HTTP requests and WebSocket upgrades require configured
+gateway authentication and workspace user access with the app listener disabled
+or enabled. OIDC scope enforcement requires `sandbox:write` (or `openshell:all`),
+as for TCP forwarding. Check HTTP 401 for missing/invalid/expired/revoked
+credentials and 403 for role/scope/membership/origin denial. Browser login starts
+at the control-plane `/auth/services?service_origin=...`; the app host receives
+only a single-use code and a Secure/HttpOnly cookie. Check shared database and
+credential-driver availability across replicas. Browser sessions expire within
+ten minutes and reauthorize on every request. DELETE the same-origin app paths
+`/.openshell/service-auth/session` to log out or
+`/.openshell/service-auth/credential` to revoke the current application-access
+credential. `X-OpenShell-Authorization` separates gateway bearer auth from an
+application Authorization header. Gateway headers and reserved cookies are
+stripped; application cookies and explicit bearer passthrough remain available.
+Only explicit local-development unauthenticated access bypasses gateway auth.
+Direct listener authentication belongs to the ingress provider.
