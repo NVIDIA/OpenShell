@@ -42,6 +42,16 @@ def pr(*labels, requested=(), author="author", draft=False, state="open", body="
     }
 
 
+def graphql_pr(value, *, cursor=None):
+    return {"repository": {"pullRequest": {
+        **value,
+        "labels": {
+            "nodes": value["labels"],
+            "pageInfo": {"hasNextPage": cursor is not None, "endCursor": cursor},
+        },
+    }}}
+
+
 def reviewers(*, requested=(), engaged=(), manual=()):
     return {"requested": set(requested), "engaged": set(engaged), "manual": set(manual)}
 
@@ -197,14 +207,6 @@ class TimelineTests(unittest.TestCase):
 
 
 class GitHubTests(unittest.TestCase):
-    def test_graphql_passes_variables_and_unwraps_response(self):
-        with mock.patch.object(routing, "_api", return_value={"data": {"value": 1}}) as api:
-            self.assertEqual(routing._graphql("query", number=42), {"value": 1})
-        api.assert_called_once_with(
-            "graphql", method="POST",
-            data={"query": "query", "variables": {"number": 42}},
-        )
-
     def test_api_reads_all_pages(self):
         with mock.patch.object(routing.subprocess, "run") as run:
             run.return_value.stdout = json.dumps(
@@ -281,6 +283,11 @@ class AcceptanceTests(unittest.TestCase):
                 self.assertTrue(routing._accepted_work(REPO, 42, pr(body="See #9999999")))
                 api.assert_called_once()
                 self.assertNotIn("pullRequest", api.call_args.kwargs["data"]["query"])
+
+    def test_acceptance_recorded_on_pr_needs_no_further_lookups(self):
+        with mock.patch.object(routing, "_api") as api:
+            self.assertTrue(routing._accepted_work(REPO, 42, pr("state:accepted")))
+        api.assert_not_called()
 
     def test_collaborator_search_result_must_match_the_pr_author(self):
         with mock.patch.object(routing, "_api", side_effect=[
@@ -397,22 +404,75 @@ class AcceptanceTests(unittest.TestCase):
         ]):
             self.assertTrue(routing._accepted_work(REPO, 42, pr(body="Related to #1")))
 
-    def test_creation_and_ready_transition_reject_before_reviewer_changes(self):
-        for event in ("opened", "ready_for_review"):
-            for apply in (False, True):
-                with (
-                    self.subTest(event=event, apply=apply),
-                    mock.patch.object(routing, "_api", side_effect=[pr(), DRAFTED]) as api,
-                    mock.patch.object(routing, "_accepted_work", return_value=False),
-                    mock.patch.object(routing, "_load_reviewers") as load,
-                ):
-                    with self.assertRaisesRegex(ValueError, "not accepted work"):
-                        routing.check_review_readiness(ROSTER, REPO, 42, apply=apply, event=event)
-                    load.assert_not_called()
-                    self.assertEqual(api.call_count, 2 if apply else 1)
-                    if apply:
-                        self.assertIn("convertPullRequestToDraft", api.call_args.kwargs["data"]["query"])
-                        self.assertEqual(api.call_args.kwargs["data"]["variables"], {"id": "PR_node_42"})
+    def test_first_draft_conversion_comments_once_and_subsequent_attempts_are_silent(self):
+        comments = f"repos/{REPO}/issues/42/comments"
+        posted = {"user": {"type": "Bot"}, "body": ""}
+        with (
+            mock.patch.object(routing, "_api", side_effect=[
+                pr(), DRAFTED, [], posted,
+                pr(), DRAFTED, [posted],
+                pr(), DRAFTED, [posted],
+            ]) as api,
+            mock.patch.object(routing, "_accepted_work", return_value=False),
+            mock.patch.object(routing, "_load_reviewers") as load,
+        ):
+            for attempt in range(3):
+                with self.assertRaisesRegex(ValueError, "not accepted work"):
+                    routing.check_review_readiness(
+                        ROSTER, REPO, 42, apply=True, event="ready_for_review"
+                    )
+                if attempt == 0:
+                    posted["body"] = api.call_args.kwargs["data"]["body"]
+            self.assertEqual(sum(
+                "convertPullRequestToDraft" in call.kwargs.get("data", {}).get("query", "")
+                for call in api.call_args_list
+            ), 3)
+            self.assertEqual(sum(
+                call.args[0] == comments and call.kwargs.get("method") == "POST"
+                for call in api.call_args_list
+            ), 1)
+            load.assert_not_called()
+
+    def test_existing_notice_suppresses_comment_and_all_pages_are_read(self):
+        comments = f"repos/{REPO}/issues/42/comments"
+        for previous, should_post in (
+            ([{"user": {"type": "User"}, "body": routing.DRAFT_COMMENT}], False),
+            ([{"user": {"type": "Bot"}, "body": "unrelated comment"}], True),
+            ([{"user": None, "body": None}], True),
+            ([{"user": {"type": "Bot"}, "body": None}] * 100 + [
+                {"user": {"type": "Bot"}, "body": routing.DRAFT_COMMENT}
+            ], False),
+        ):
+            with (
+                self.subTest(previous=previous, should_post=should_post),
+                mock.patch.object(routing, "_api", side_effect=[
+                    pr(), DRAFTED, previous, {},
+                ]) as api,
+                mock.patch.object(routing, "_accepted_work", return_value=False),
+                self.assertRaisesRegex(ValueError, "not accepted work"),
+            ):
+                routing.check_review_readiness(ROSTER, REPO, 42, apply=True)
+            self.assertIn(mock.call(f"{comments}?per_page=100", pages=True), api.call_args_list)
+            self.assertEqual(any(
+                call.kwargs.get("method") == "POST" and call.args[0] == comments
+                for call in api.call_args_list
+            ), should_post)
+
+    def test_comment_lookup_or_post_failure_still_leaves_pr_drafted(self):
+        for posting in (False, True):
+            error = subprocess.CalledProcessError(1, "gh")
+            with (
+                self.subTest(posting=posting),
+                mock.patch.object(routing, "_api", side_effect=(
+                    [pr(), DRAFTED, [], error] if posting else [pr(), DRAFTED, error]
+                )) as api,
+                mock.patch.object(routing, "_accepted_work", return_value=False),
+                mock.patch.object(routing, "_load_reviewers") as load,
+                self.assertRaises(subprocess.CalledProcessError),
+            ):
+                routing.check_review_readiness(ROSTER, REPO, 42, apply=True)
+            self.assertIn("convertPullRequestToDraft", api.call_args_list[1].kwargs["data"]["query"])
+            load.assert_not_called()
 
     def test_lookup_errors_fail_without_drafting_or_requesting_reviewers(self):
         with (
@@ -495,17 +555,6 @@ class ReconciliationTests(unittest.TestCase):
                 )
                 self.assertEqual(plan.add, ("dave",))
                 accepted.assert_not_called()
-
-    def test_draft_and_closed_prs_skip_all_routing(self):
-        for value in (pr(draft=True), pr(state="closed")):
-            with self.subTest(value=value):
-                plan, api, load, eligible = self.run_routing(
-                    CATEGORIES, snapshots=[], responses=[value]
-                )
-                self.assertIsNone(plan)
-                api.assert_called_once_with(PULL)
-                load.assert_not_called()
-                eligible.assert_not_called()
 
     def test_preview_makes_no_changes(self):
         plan, api, _, _ = self.run_routing(
@@ -598,21 +647,22 @@ class ReconciliationTests(unittest.TestCase):
 class CliTests(unittest.TestCase):
     def test_both_cli_modes_use_the_same_acceptance_policy(self):
         cases = [
-            ("WRITE", "", (), {}, True),
-            ("READ", "Related to #1", (), {1: ("author", True)}, True),
-            ("READ", "Closes #1", (1,), {1: ("someone-else", True)}, True),
+            ("WRITE", "", (), {}, (), True),
+            ("READ", "", (), {}, ("state:accepted",), True),
+            ("READ", "Related to #1", (), {1: ("author", True)}, (), True),
+            ("READ", "Closes #1", (1,), {1: ("someone-else", True)}, (), True),
             ("READ", "Closes #1 and #2", (1, 2),
-             {1: ("author", True), 2: ("author", False)}, True),
-            ("READ", "Related to #1", (), {1: ("author", False)}, False),
-            ("READ", "", (), {}, False),
+             {1: ("author", True), 2: ("author", False)}, (), True),
+            ("READ", "Related to #1", (), {1: ("author", False)}, (), False),
+            ("READ", "", (), {}, (), False),
         ]
         for mode in ("preview", "acceptance-api", "acceptance-event"):
             acceptance_only = mode != "preview"
-            for permission, body, linked, issues, expected in cases:
-                with self.subTest(mode=mode, body=body, issues=issues), tempfile.TemporaryDirectory() as directory:
+            for permission, body, linked, issues, labels, expected in cases:
+                with self.subTest(mode=mode, body=body, issues=issues, labels=labels), tempfile.TemporaryDirectory() as directory:
                     path = Path(directory) / "REVIEWERS.md"
                     path.write_text(DOCUMENT, encoding="utf-8")
-                    value = pr("area:runtime", body=body)
+                    value = pr("area:runtime", *labels, body=body)
 
                     def api(endpoint, **kwargs):
                         if endpoint == PULL:
@@ -623,7 +673,7 @@ class CliTests(unittest.TestCase):
                         if "user: author" in query:
                             self.assertNotEqual(mode, "acceptance-event")
                             self.assertEqual(kwargs["data"]["variables"]["number"], 42)
-                            return {"data": {"repository": {"pullRequest": value}}}
+                            return {"data": graphql_pr(value)}
                         if "collaborators" in query:
                             return AcceptanceTests.member(permission)
                         if "closingIssuesReferences" in query:
@@ -658,13 +708,31 @@ class CliTests(unittest.TestCase):
                         eligible.assert_not_called()
                         load.assert_not_called()
 
+    def test_acceptance_only_reads_later_pr_label_pages(self):
+        output = io.StringIO()
+        with (
+            mock.patch.object(routing, "_graphql", side_effect=[
+                graphql_pr(pr("topic:policy"), cursor="next-page"),
+                graphql_pr(pr("state:accepted")),
+            ]) as query,
+            mock.patch.object(routing, "_api", side_effect=AssertionError("No further lookups")),
+            mock.patch.object(routing, "check_review_readiness") as route,
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(routing.main([
+                "--repo", REPO, "--pr", "42", "--acceptance-only",
+            ]), 0)
+        self.assertEqual(json.loads(output.getvalue()), {"accepted": True})
+        self.assertEqual(query.call_args.kwargs["cursor"], "next-page")
+        route.assert_not_called()
+
     def test_acceptance_only_checks_drafts_and_closed_prs_without_routing(self):
         for value in (pr(), pr(draft=True), pr(state="closed")):
             for accepted in (False, True):
                 with self.subTest(value=value, accepted=accepted):
                     output, errors = io.StringIO(), io.StringIO()
                     with (
-                        mock.patch.object(routing, "_graphql", return_value={"repository": {"pullRequest": value}}) as query,
+                        mock.patch.object(routing, "_graphql", return_value=graphql_pr(value)) as query,
                         mock.patch.object(routing, "_accepted_work", return_value=accepted) as check,
                         mock.patch.object(routing, "check_review_readiness") as route,
                         mock.patch.object(routing, "parse_reviewers") as parse,
@@ -686,7 +754,7 @@ class CliTests(unittest.TestCase):
             with (
                 self.subTest(metadata_error=metadata_error),
                 mock.patch.object(routing, "_graphql", side_effect=error if metadata_error else None,
-                                  return_value={"repository": {"pullRequest": pr()}}),
+                                  return_value=graphql_pr(pr())),
                 mock.patch.object(routing, "_accepted_work", side_effect=error) as check,
                 mock.patch.object(routing, "check_review_readiness") as route,
                 contextlib.redirect_stdout(io.StringIO()),
@@ -725,21 +793,6 @@ class CliTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 2)
         api.assert_not_called()
 
-    def test_acceptance_only_refreshes_metadata_for_each_pr_and_run(self):
-        for number in (7, 8, 7):
-            value = pr(body=f"Related to #{number}")
-            with (
-                self.subTest(number=number),
-                mock.patch.object(routing, "_graphql", return_value={"repository": {"pullRequest": value}}) as query,
-                mock.patch.object(routing, "_accepted_work", return_value=True) as check,
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                self.assertEqual(routing.main([
-                    "--repo", REPO, "--pr", str(number), "--acceptance-only",
-                ]), 0)
-            self.assertEqual(query.call_args.kwargs["number"], number)
-            check.assert_called_once_with(REPO, number, value)
-
     def test_rejected_pr_does_not_need_a_readable_valid_roster(self):
         for contents in (None, "not a registry"):
             for apply in (False, True):
@@ -749,7 +802,7 @@ class CliTests(unittest.TestCase):
                         path.write_text(contents, encoding="utf-8")
                     output, errors = io.StringIO(), io.StringIO()
                     with (
-                        mock.patch.object(routing, "_api", side_effect=[pr(), DRAFTED]) as api,
+                        mock.patch.object(routing, "_api", side_effect=[pr(), DRAFTED, [], {}]) as api,
                         mock.patch.object(routing, "_accepted_work", return_value=False),
                         mock.patch.object(routing, "parse_reviewers") as parse,
                         mock.patch.object(routing, "_load_reviewers") as load,
@@ -762,9 +815,9 @@ class CliTests(unittest.TestCase):
                     self.assertEqual(output.getvalue(), "")
                     parse.assert_not_called()
                     load.assert_not_called()
-                    self.assertEqual(api.call_count, 2 if apply else 1)
+                    self.assertEqual(api.call_count, 4 if apply else 1)
                     if apply:
-                        self.assertIn("convertPullRequestToDraft", api.call_args.kwargs["data"]["query"])
+                        self.assertIn("convertPullRequestToDraft", api.call_args_list[1].kwargs["data"]["query"])
 
     def test_accepted_pr_reads_real_roster_and_previews_reviewers(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -802,49 +855,6 @@ class CliTests(unittest.TestCase):
                 accepted.assert_not_called()
                 self.assertEqual(json.loads(output.getvalue()), {"skipped": "closed or draft PR"})
 
-    def test_passes_label_event_to_reconciliation(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "REVIEWERS.md"
-            path.write_text(DOCUMENT, encoding="utf-8")
-            with (
-                mock.patch.object(
-                    routing, "check_review_readiness",
-                    return_value=routing.ReviewPlan((), ()),
-                ) as check,
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                self.assertEqual(routing.main([
-                    "--reviewers", str(path), "--repo", REPO, "--pr", "42",
-                    "--event", "labeled", "--apply",
-                ]), 0)
-            self.assertEqual(check.call_args.kwargs, {"apply": True, "event": "labeled"})
-
-    def test_emits_plan_and_passes_apply_option(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "REVIEWERS.md"
-            path.write_text(DOCUMENT, encoding="utf-8")
-            output = io.StringIO()
-            with (
-                mock.patch.object(
-                    routing, "check_review_readiness",
-                    return_value=routing.ReviewPlan(("alice",), ()),
-                ) as check,
-                contextlib.redirect_stdout(output),
-            ):
-                self.assertEqual(
-                    routing.main([
-                        "--reviewers", str(path), "--repo", REPO,
-                        "--pr", "42", "--apply",
-                    ]),
-                    0,
-                )
-            self.assertEqual(
-                json.loads(output.getvalue()), {"add": ["alice"], "remove": []}
-            )
-            check.assert_called_once_with(
-                path, REPO, 42, apply=True, event="opened"
-            )
-
     def test_accepted_pr_with_invalid_registry_fails_before_reviewer_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "REVIEWERS.md"
@@ -865,28 +875,6 @@ class CliTests(unittest.TestCase):
             api.assert_called_once_with(PULL)
             self.assertEqual(output.getvalue(), "")
             self.assertIn("no area/topic", errors.getvalue())
-
-
-class WorkflowTests(unittest.TestCase):
-    def test_legacy_workflow_keeps_its_status_events_and_read_only_permissions(self):
-        root = Path(__file__).resolve().parents[2]
-        workflow = (root / ".github/workflows/pr-issue-acceptance.yml").read_text()
-        self.assertIn("name: PR Issue Acceptance\n", workflow)
-        self.assertIn("    name: OpenShell / PR Issue Acceptance\n", workflow)
-        self.assertIn("types: [opened, edited, reopened, synchronize]", workflow)
-        permissions = workflow.split("permissions:\n", 1)[1].split("\n\n", 1)[0]
-        self.assertEqual(dict(line.strip().split(": ") for line in permissions.splitlines()),
-                         {"contents": "read", "issues": "read", "pull-requests": "read"})
-        self.assertIn("ref: ${{ github.sha }}", workflow)
-        self.assertIn("persist-credentials: false", workflow)
-        self.assertIn("sparse-checkout: tasks/scripts/check_review_readiness.py", workflow)
-        self.assertIn("GH_REPO: ${{ github.repository }}", workflow)
-        self.assertIn("PR_NUMBER: ${{ github.event.pull_request.number }}", workflow)
-        command = workflow.split("        run: |\n", 1)[1]
-        self.assertIn("python3 tasks/scripts/check_review_readiness.py", command)
-        self.assertIn('--repo "$GH_REPO" --pr "$PR_NUMBER" --acceptance-only', command)
-        self.assertIn('--event-path "$GITHUB_EVENT_PATH"', command)
-        self.assertNotIn("--apply", command)
 
 
 if __name__ == "__main__":

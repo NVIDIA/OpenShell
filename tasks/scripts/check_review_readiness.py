@@ -24,7 +24,15 @@ LABEL = re.compile(r"(?:area|topic):[a-z0-9]+(?:-[a-z0-9]+)*")
 PROFILE = re.compile(r"\[@([a-z0-9-]+)\]\(https://github\.com/([a-z0-9-]+)/?\)", re.I)
 ACCEPTANCE_ERROR = (
     "PR is not accepted work: the author needs repository write access "
-    "or a referenced state:accepted issue"
+    "or state:accepted on the PR or a referenced issue"
+)
+DRAFT_COMMENT_MARKER = "<!-- openshell-review-readiness:unaccepted-work -->"
+DRAFT_COMMENT = (
+    "This PR has been automatically moved to draft because it's not associated "
+    "with an issue that is accepted work. You're welcome to continue to work on "
+    "it while it's in draft mode; it will be allowed to move to \"Ready for Review\" "
+    "when the issue or PR have been marked accepted.\n\n"
+    + DRAFT_COMMENT_MARKER
 )
 
 
@@ -243,7 +251,9 @@ def _referenced_issues(repository: str, number: int, body: str):
 
 
 def _accepted_work(repository: str, number: int, pr: dict) -> bool:
-    """Accept write access or a referenced accepted issue."""
+    """Accept write access or acceptance recorded on the PR or a referenced issue."""
+    if any(label["name"] == "state:accepted" for label in pr["labels"]):
+        return True
     owner, repo = repository.split("/")
     author = pr["user"]["login"].lower()
     cursor = None
@@ -341,6 +351,13 @@ def check_review_readiness(
                 }""",
                 id=pr["node_id"],
             )
+            comments = f"repos/{repository}/issues/{number}/comments"
+            previous = _api(f"{comments}?per_page=100", pages=True)
+            if not any(
+                DRAFT_COMMENT_MARKER in (comment.get("body") or "")
+                for comment in previous
+            ):
+                _api(comments, method="POST", data={"body": DRAFT_COMMENT})
         raise ValueError(ACCEPTANCE_ERROR)
     categories = parse_reviewers(reviewers.read_text(encoding="utf-8"))
     selected = select_reviewers(categories, {label["name"] for label in pr["labels"]})
@@ -395,14 +412,29 @@ def main(argv: list[str] | None = None) -> int:
                 pr = json.loads(args.event_path.read_text(encoding="utf-8"))["pull_request"]
             else:
                 owner, repo = args.repo.split("/")
-                pr = _graphql(
-                    """query($owner: String!, $repo: String!, $number: Int!) {
-                      repository(owner: $owner, name: $repo) {
-                        pullRequest(number: $number) { user: author { login } body }
-                      }
-                    }""",
-                    owner=owner, repo=repo, number=args.pr,
-                )["repository"]["pullRequest"]
+                cursor, labels = None, []
+                while True:
+                    pr = _graphql(
+                        """query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                          repository(owner: $owner, name: $repo) {
+                            pullRequest(number: $number) {
+                              user: author { login }
+                              body
+                              labels(first: 100, after: $cursor) {
+                                nodes { name }
+                                pageInfo { hasNextPage endCursor }
+                              }
+                            }
+                          }
+                        }""",
+                        owner=owner, repo=repo, number=args.pr, cursor=cursor,
+                    )["repository"]["pullRequest"]
+                    page = pr["labels"]
+                    labels.extend(page["nodes"])
+                    if not page["pageInfo"]["hasNextPage"]:
+                        break
+                    cursor = page["pageInfo"]["endCursor"]
+                pr["labels"] = labels
             if not _accepted_work(args.repo, args.pr, pr):
                 raise ValueError(ACCEPTANCE_ERROR)
             result = {"accepted": True}
