@@ -2628,13 +2628,15 @@ mod tests {
                 .expect("failed to create test store"),
         );
         let compute = crate::compute::new_test_runtime(store.clone()).await;
+        let mut config = Config::new(None)
+            .with_database_url("sqlite::memory:?cache=shared")
+            .with_bind_address(bind_addr)
+            .with_server_sans(["*.dev.openshell.localhost"])
+            .with_loopback_service_http(enable_loopback_service_http)
+            .with_credential_drivers(["test-static"]);
+        config.auth.allow_unauthenticated_users = true;
         Arc::new(ServerState::new(
-            Config::new(None)
-                .with_database_url("sqlite::memory:?cache=shared")
-                .with_bind_address(bind_addr)
-                .with_server_sans(["*.dev.openshell.localhost"])
-                .with_loopback_service_http(enable_loopback_service_http)
-                .with_credential_drivers(["test-static"]),
+            config,
             store,
             compute,
             crate::sandbox_index::SandboxIndex::new(),
@@ -2936,6 +2938,102 @@ mod tests {
             "same-origin browser context should not be rejected as cross-origin, got: {response:?}"
         );
         stop_listener(shutdown, handle).await;
+    }
+
+    #[tokio::test]
+    async fn service_auth_uses_real_tls_client_identity_with_listener_disabled_or_enabled() {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject};
+        let dir = tempdir().unwrap();
+        let (ca, ca_key) = generate_test_certs_with_ca(dir.path());
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "application-user");
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let client_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let client = openshell_crypto::pki::signed_by(params, &client_key, &ca, &ca_key).unwrap();
+        let client_cert = CertificateDer::from(client.der().to_vec());
+        let key_pem = client_key.serialize_pem().unwrap();
+        let client_key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
+        for enabled in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut state = test_state(addr, false).await;
+            let inner = Arc::get_mut(&mut state).unwrap();
+            inner.config.auth.allow_unauthenticated_users = false;
+            inner.config.mtls_auth.enabled = true;
+            inner.config.supervisor_app_listener.enabled = enabled;
+            inner.config.tls = Some(openshell_core::TlsConfig {
+                cert_path: dir.path().join("server-cert.pem"),
+                key_path: dir.path().join("server-key.pem"),
+                client_ca_path: Some(dir.path().join("ca.pem")),
+                require_client_auth: false,
+                external_cert_path: None,
+                external_key_path: None,
+                external_server_names: vec![],
+            });
+            let acceptor = TlsAcceptor::from_files(
+                &dir.path().join("server-cert.pem"),
+                &dir.path().join("server-key.pem"),
+                Some(&dir.path().join("ca.pem")),
+                false,
+                None,
+                None,
+                vec![],
+            )
+            .unwrap();
+            let (shutdown, rx) = watch::channel(false);
+            let handle = tokio::spawn(serve_gateway_listener(
+                BoundGatewayListener {
+                    listener,
+                    address: addr,
+                },
+                MultiplexService::new(state),
+                Some(acceptor),
+                false,
+                rx,
+            ));
+            for authenticated in [false, true] {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.add(CertificateDer::from(ca.der().to_vec())).unwrap();
+                let builder = openshell_crypto::tls::client_builder().with_root_certificates(roots);
+                let config = if authenticated {
+                    builder
+                        .with_client_auth_cert(vec![client_cert.clone()], client_key.clone_key())
+                        .unwrap()
+                } else {
+                    builder.with_no_client_auth()
+                };
+                let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[addr])
+                    .await
+                    .unwrap();
+                let mut stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+                    .connect(ServerName::try_from("localhost").unwrap(), stream)
+                    .await
+                    .unwrap();
+                stream
+                    .write_all(
+                        service_request(addr, &[("X-Forwarded-Client-Cert", "forged")]).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let mut response = vec![];
+                tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let response = String::from_utf8_lossy(&response);
+                assert!(
+                    response.starts_with(if authenticated {
+                        "HTTP/1.1 404"
+                    } else {
+                        "HTTP/1.1 401"
+                    }),
+                    "listener={enabled}, authenticated={authenticated}: {response}"
+                );
+            }
+            stop_listener(shutdown, handle).await;
+        }
     }
 
     #[tokio::test]
