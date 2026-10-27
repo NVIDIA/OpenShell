@@ -948,7 +948,7 @@ impl Authenticator for OidcAuthenticator {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     fn transport_test_config(issuer: impl Into<String>) -> OidcConfig {
@@ -1418,7 +1418,7 @@ mod tests {
     }
 
     /// Sign `claims` with the test key, tagging the header with `kid`.
-    fn mint_rs256(claims: &serde_json::Value, kid: &str) -> String {
+    pub fn mint_rs256(claims: &serde_json::Value, kid: &str) -> String {
         crate::install_jsonwebtoken_crypto_provider();
 
         let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
@@ -1428,7 +1428,7 @@ mod tests {
         openshell_crypto::jwt::encode(&header, claims, &key).expect("sign RS256 token")
     }
 
-    fn claims_for(issuer: &str, audience: &str, exp: i64) -> serde_json::Value {
+    pub fn claims_for(issuer: &str, audience: &str, exp: i64) -> serde_json::Value {
         serde_json::json!({
             "sub": "user-42",
             "preferred_username": "ada",
@@ -1442,7 +1442,7 @@ mod tests {
 
     /// Serve an OIDC discovery document and a JWKS carrying the test key, then
     /// build a cache against them the same way production does.
-    async fn cache_with_mock_issuer(server: &wiremock::MockServer) -> JwksCache {
+    pub async fn cache_with_mock_issuer(server: &wiremock::MockServer) -> JwksCache {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 

@@ -144,6 +144,86 @@ pub struct CredentialRuntime {
 }
 
 impl CredentialRuntime {
+    /// Gateway-private browser session secrets use the configured credential
+    /// driver, rather than persisting bearer material in session metadata.
+    pub async fn store_application_token(
+        &self,
+        workspace: &str,
+        id: &str,
+        token: &str,
+    ) -> Result<CredentialHandle, Status> {
+        let driver_name = self.registry.storage_owner_name();
+        let mut handle = self
+            .connected_driver(&driver_name)?
+            .store_credential(StoreCredentialRequest {
+                provider: "gateway-service-session".into(),
+                credential_key: "gateway-access-token".into(),
+                value: token.into(),
+                existing_handle: None,
+                workspace: workspace.into(),
+                provider_id: format!("service-session-{id}"),
+                object_id: format!("service-session-{id}"),
+            })
+            .await?;
+        if handle.handle.is_empty() {
+            return Err(Status::internal("empty application credential handle"));
+        }
+        handle.driver = driver_name;
+        Ok(handle)
+    }
+
+    pub async fn resolve_application_token(
+        &self,
+        workspace: &str,
+        id: &str,
+        handle: CredentialHandle,
+    ) -> Result<String, Status> {
+        let values = self
+            .connected_driver(&handle.driver)?
+            .resolve_credentials(vec![ResolveCredentialRequest {
+                request_id: "application-token".into(),
+                provider: "gateway-service-session".into(),
+                credential_key: "gateway-access-token".into(),
+                handle: Some(handle),
+                workspace: workspace.into(),
+                provider_id: format!("service-session-{id}"),
+            }])
+            .await?;
+        if values.len() != 1
+            || values[0].request_id != "application-token"
+            || values[0].value.is_empty()
+        {
+            return Err(Status::unauthenticated(
+                "application credential unavailable",
+            ));
+        }
+        if let Some(expires) = &values[0].expiration_time
+            && openshell_core::time::timestamp_to_millis(expires)
+                .map_err(|_| Status::unavailable("invalid application credential expiration"))?
+                <= openshell_core::time::now_ms()
+        {
+            return Err(Status::unauthenticated("expired application credential"));
+        }
+        Ok(values.into_iter().next().unwrap().value)
+    }
+
+    pub async fn delete_application_token(
+        &self,
+        workspace: &str,
+        id: &str,
+        handle: CredentialHandle,
+    ) -> Result<(), Status> {
+        self.connected_driver(&handle.driver)?
+            .delete_credential(DeleteCredentialRequest {
+                provider: "gateway-service-session".into(),
+                credential_key: "gateway-access-token".into(),
+                handle: Some(handle),
+                workspace: workspace.into(),
+                provider_id: format!("service-session-{id}"),
+            })
+            .await
+    }
+
     pub fn from_config(config: &Config) -> CoreResult<Self> {
         Self::from_config_with_optional_store(config, None)
     }
