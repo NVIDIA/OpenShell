@@ -347,6 +347,13 @@ boundary from the gateway listener so its client CA can stay independent. */}}
 {{- if and (get $metricsTls "clientCaSecretName") (eq (get $metricsTls "clientCaSecretName") $gatewayClientCaSecretName) -}}
 {{- fail "metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret" -}}
 {{- end -}}
+{{/* The sandbox client TLS Secret carries the gateway CA (certgen writes
+ca.crt into it), so trusting it as the metrics client CA would grant sandbox
+workloads scraping access even when its name differs from the client CA
+Secret. */}}
+{{- if and (get $metricsTls "clientCaSecretName") (eq (get $metricsTls "clientCaSecretName") .Values.server.tls.clientTlsSecretName) -}}
+{{- fail "metrics.tls.clientCaSecretName must not reuse the gateway client TLS Secret (server.tls.clientTlsSecretName)" -}}
+{{- end -}}
 {{- $metricsTlsConfig := get $config "openshell.gateway.metrics_tls" | default dict -}}
 {{- $_ := set $metricsTlsConfig "cert_path" "/etc/openshell-metrics/server/tls.crt" -}}
 {{- $_ := set $metricsTlsConfig "key_path" "/etc/openshell-metrics/server/tls.key" -}}

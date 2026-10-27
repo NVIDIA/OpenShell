@@ -487,9 +487,13 @@ metrics:
 The server Secret must provide `tls.crt` and `tls.key`; the scraper CA Secret
 must provide `ca.crt`. When `requireClientCert` is true, the chart rejects a
 render without `clientCaSecretName`. The metrics client CA must be separate
-from `server.tls.clientCaSecretName`: sandbox workloads receive gateway client
-credentials, and trusting that CA on the metrics listener would grant those
-workloads scraping access.
+from the gateway client credentials: sandbox workloads receive them for the
+control plane, and trusting that CA on the metrics listener would grant those
+workloads scraping access. The chart fails the render when
+`metrics.tls.clientCaSecretName` reuses `server.tls.clientCaSecretName` or
+`server.tls.clientTlsSecretName` (the sandbox client Secret, which certgen
+seeds with the gateway CA). The comparison is by Secret name only; the chart
+cannot detect a different Secret holding the same CA.
 
 The metrics server certificate may reuse the gateway server TLS Secret when its
 SANs cover the Service DNS name used by the scraper. The gateway reloads valid
@@ -585,7 +589,7 @@ discovery endpoint or its TLS CA.
 | grpcRoute.replicaRouting.enabled | bool | `false` | Route requests carrying an `x-openshell-replica` header straight to that gateway replica. The CLI sets the header on long-lived sandbox connections (SSH, port forwards, exec) using the owner the gateway reports, so they skip the relay through a peer replica. Renders one Service per replica. Requires workload.kind=statefulset, workload.allowMultiReplicaStatefulSet=true, and at most 15 replicas. |
 | imagePullSecrets | list | `[]` | Image pull secrets attached to gateway and helper pods. |
 | metrics.tls.certSecretName | string | `""` | Kubernetes TLS Secret with tls.crt and tls.key. Empty reuses server.tls.certSecretName. |
-| metrics.tls.clientCaSecretName | string | `""` | Secret with ca.crt for verifying metrics scraper client certificates. It must not contain the gateway client CA. Required when requireClientCert is true. |
+| metrics.tls.clientCaSecretName | string | `""` | Secret with ca.crt for verifying metrics scraper client certificates. It must not contain the gateway client CA. The chart rejects reusing the gateway client CA and client TLS Secret names; the check is by name only and cannot detect a different Secret holding the same CA. Required when requireClientCert is true. |
 | metrics.tls.enabled | bool | `false` | Enable TLS for the dedicated metrics listener. |
 | metrics.tls.requireClientCert | bool | `false` | Require a client certificate signed by clientCaSecretName to scrape metrics. |
 | nameOverride | string | `"openshell"` | Override the chart name used in generated resource names. |

@@ -941,7 +941,10 @@ kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec
 When `metrics.tls.enabled=true`, the dedicated metrics listener uses its own
 TLS configuration and, when requested, an independent scraper client CA. Do
 not use the gateway client CA: sandbox workloads receive gateway client
-credentials, so trusting that CA here would grant them metrics access. Inspect
+credentials, so trusting that CA here would grant them metrics access. The
+chart fails rendering when `metrics.tls.clientCaSecretName` matches
+`server.tls.clientCaSecretName` or `server.tls.clientTlsSecretName`; that
+check is by name only. Inspect
 the rendered configuration and the read-only Secret mounts before debugging the
 scraper:
 

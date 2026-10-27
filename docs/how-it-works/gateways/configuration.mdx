@@ -496,7 +496,10 @@ Secret and restart the gateway to restore metrics scraping.
 For a Helm installation, set `metrics.tls.enabled=true` and provide the
 operator-managed Secret names through `metrics.tls.certSecretName` and, for
 mTLS, `metrics.tls.clientCaSecretName`. The chart does not create
-metrics-specific PKI or monitoring resources.
+metrics-specific PKI or monitoring resources. It rejects a
+`metrics.tls.clientCaSecretName` that reuses the gateway client CA or client
+TLS Secret names; that comparison is by name only and cannot detect a
+different Secret holding the same CA.
 
 `[openshell.gateway] policy_validation_failure_mode` controls what sandbox supervisors do when a complete candidate policy fails runtime validation. The default, `fail_closed`, deactivates the previous network policy, closes relays pinned to it, and denies new egress until a valid generation loads. `retain_last_valid` leaves the previous valid generation active. Both modes reject the candidate atomically; startup keeps the workload unstarted until the effective policy and matching provider configuration pass admission. A rejected startup exposes `ConfigurationInvalid` and remains available for policy/provider repair in either mode. Gateway mutation paths that can preflight a known effective scope reject invalid candidates before persistence and leave the active policy unchanged regardless of this setting. Changing the value requires restarting the gateway so it can reload `gateway.toml` and distribute the new posture to sandbox supervisors.
 
