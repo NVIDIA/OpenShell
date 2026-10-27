@@ -100,7 +100,7 @@ func (s *sshClient) Tunnel(ctx context.Context, workspace, sandboxName string, p
 	}
 
 	streamCtx, cancel := context.WithCancel(ctx)
-	stream, err := openForward(streamCtx, s.client, owner, initFrame)
+	stream, err := openBidiRouted(streamCtx, owner, initFrame, s.client.ForwardTcp) //nolint:revive // proto-generated method name
 	if err != nil {
 		cancel()
 		return nil, converter.FromGRPCError(err)

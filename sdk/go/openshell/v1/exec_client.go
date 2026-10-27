@@ -104,17 +104,8 @@ func (e *execClient) Interactive(ctx context.Context, workspace, sandboxName str
 	startReq.WorkspaceScope = namedWorkspaceScope(workspace)
 
 	streamCtx, cancel := context.WithCancel(ctx)
-	stream, err := openRouted(streamCtx, owner, func(ctx context.Context) (grpc.BidiStreamingClient[pb.ExecSandboxInput, pb.ExecSandboxEvent], error) {
-		s, err := e.client.ExecSandboxInteractive(ctx)
-		if err != nil {
-			return nil, err
-		}
-		// io.EOF means the stream already ended; its status comes from Recv.
-		if err := s.Send(&pb.ExecSandboxInput{Payload: &pb.ExecSandboxInput_Start{Start: startReq}}); err != nil && err != io.EOF {
-			return s, err
-		}
-		return s, nil
-	})
+	start := &pb.ExecSandboxInput{Payload: &pb.ExecSandboxInput_Start{Start: startReq}}
+	stream, err := openBidiRouted(streamCtx, owner, start, e.client.ExecSandboxInteractive)
 	if err != nil {
 		cancel()
 		return nil, converter.FromGRPCError(err)

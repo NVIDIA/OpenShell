@@ -117,32 +117,32 @@ func validateTemplateCreateSpec(spec *SandboxSpec) error {
 }
 
 func (s *sandboxClient) Get(ctx context.Context, workspace, name string) (*Sandbox, error) {
-	resp, err := s.client.GetSandbox(ctx, &pb.GetSandboxRequest{
-		Name:           name,
-		WorkspaceScope: namedWorkspaceScope(workspace),
-	})
-	if err != nil {
-		return nil, converter.FromGRPCError(err)
-	}
-	return converter.SandboxFromProto(resp.GetSandbox()), nil
+	return s.get(ctx, workspace, name)
 }
 
 // getWithOwner is Get that also asks the gateway for the owner replica.
 func (s *sandboxClient) getWithOwner(ctx context.Context, workspace, name string) (*Sandbox, string, error) {
 	var md metadata.MD
-	resp, err := s.client.GetSandbox(
-		metadata.AppendToOutgoingContext(ctx, ownerRequestHeader, "1"),
-		&pb.GetSandboxRequest{Name: name, WorkspaceScope: namedWorkspaceScope(workspace)},
-		grpc.Header(&md),
-	)
+	sb, err := s.get(metadata.AppendToOutgoingContext(ctx, ownerRequestHeader, "1"), workspace, name, grpc.Header(&md))
 	if err != nil {
-		return nil, "", converter.FromGRPCError(err)
+		return nil, "", err
 	}
 	var owner string
 	if v := md.Get(ownerReplicaHeader); len(v) > 0 {
 		owner = v[0]
 	}
-	return converter.SandboxFromProto(resp.GetSandbox()), owner, nil
+	return sb, owner, nil
+}
+
+func (s *sandboxClient) get(ctx context.Context, workspace, name string, opts ...grpc.CallOption) (*Sandbox, error) {
+	resp, err := s.client.GetSandbox(ctx, &pb.GetSandboxRequest{
+		Name:           name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
+	}, opts...)
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	return converter.SandboxFromProto(resp.GetSandbox()), nil
 }
 
 func (s *sandboxClient) List(workspace string, opts ...ListOptions) (*Pager[*Sandbox], error) {

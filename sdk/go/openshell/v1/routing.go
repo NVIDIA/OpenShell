@@ -8,7 +8,6 @@ import (
 	"io"
 	"strings"
 
-	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -16,7 +15,8 @@ import (
 )
 
 // Metadata that lets an edge proxy send a sandbox's long-lived calls straight
-// to the gateway replica holding its supervisor session.
+// to the gateway replica holding its supervisor session. The headers and the
+// retry rule are documented in docs/kubernetes/ingress.mdx.
 const (
 	ownerReplicaHeader = "x-openshell-owner"
 	ownerRequestHeader = "x-openshell-want-owner"
@@ -42,34 +42,41 @@ func sandboxOwner(ctx context.Context, sandboxes SandboxInterface, workspace, na
 // openRouted opens a stream tagged with the owner replica. It opens once more
 // untagged when the proxy reports that the owner's route has no ready endpoints.
 // A stale owner is safe: any replica relays the call to the real owner.
+// With an owner, it returns only after the gateway answers, as the CLI does.
 func openRouted[S grpc.ClientStream](ctx context.Context, owner string, open func(context.Context) (S, error)) (S, error) {
 	if owner == "" {
 		return open(ctx)
 	}
-	stream, err := open(metadata.AppendToOutgoingContext(ctx, routeReplicaHeader, owner))
+	stream, err := answered(open(metadata.AppendToOutgoingContext(ctx, routeReplicaHeader, owner)))
+	if retryUnrouted(err) {
+		return answered(open(ctx))
+	}
+	return stream, err
+}
+
+// answered waits for the response headers. Nil metadata means the stream ended
+// without headers, and RecvMsg then returns its status.
+func answered[S grpc.ClientStream](stream S, err error) (S, error) {
 	if err == nil {
-		// Header blocks until the proxy answers; nil metadata means the stream
-		// ended without headers, and RecvMsg then returns its status.
 		var md metadata.MD
 		if md, err = stream.Header(); err == nil && md == nil {
 			err = stream.RecvMsg(nil)
 		}
 	}
-	if retryUnrouted(err) {
-		return open(ctx)
-	}
 	return stream, err
 }
 
-// openForward opens a ForwardTcp stream routed to owner and sends its init frame.
-func openForward(ctx context.Context, client pb.OpenShellClient, owner string, init *pb.TcpForwardFrame) (grpc.BidiStreamingClient[pb.TcpForwardFrame, pb.TcpForwardFrame], error) {
-	return openRouted(ctx, owner, func(ctx context.Context) (grpc.BidiStreamingClient[pb.TcpForwardFrame, pb.TcpForwardFrame], error) {
-		s, err := client.ForwardTcp(ctx)
+// openBidiRouted is openRouted for a bidi stream whose first frame is sent on open.
+func openBidiRouted[I, O any](ctx context.Context, owner string, first *I, open func(context.Context, ...grpc.CallOption) (grpc.BidiStreamingClient[I, O], error)) (grpc.BidiStreamingClient[I, O], error) {
+	return openRouted(ctx, owner, func(ctx context.Context) (grpc.BidiStreamingClient[I, O], error) {
+		s, err := open(ctx)
 		if err != nil {
 			return nil, err
 		}
-		// io.EOF means the stream already ended; its status comes from Recv.
-		if err := s.Send(init); err != nil && err != io.EOF {
+		// io.EOF means the stream already ended; answered reports its status.
+		if err := s.Send(first); err == io.EOF {
+			return answered(s, nil)
+		} else if err != nil {
 			return s, err
 		}
 		return s, nil

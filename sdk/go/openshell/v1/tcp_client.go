@@ -62,7 +62,7 @@ func (t *tcpClient) Forward(ctx context.Context, workspace, sandboxName string, 
 	}
 
 	streamCtx, cancel := context.WithCancel(ctx)
-	stream, err := openForward(streamCtx, t.client, owner, initFrame)
+	stream, err := openBidiRouted(streamCtx, owner, initFrame, t.client.ForwardTcp) //nolint:revive // proto-generated method name
 	if err != nil {
 		cancel()
 		return nil, converter.FromGRPCError(err)
