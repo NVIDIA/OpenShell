@@ -57,6 +57,15 @@ async fn authorize_with_chain(
     workspace: &str,
     chain: Option<AuthenticatorChain>,
 ) -> Result<Principal, Status> {
+    if peer
+        .identity
+        .as_ref()
+        .is_some_and(super::discovery::is_certificate)
+    {
+        return Err(Status::permission_denied(
+            "discovery certificates cannot access applications",
+        ));
+    }
     let origin = RequestOrigin::new(peer.source, headers);
     let principal = authenticate(state, headers, peer, chain).await.map_err(
         |(status, mechanism, reason)| {

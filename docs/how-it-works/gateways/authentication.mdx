@@ -478,3 +478,12 @@ Installers can also seed read-only defaults under `/etc/openshell/` (or a non-em
 Only `active_gateway` and `metadata.json` fall back to the system layout. mTLS bundles, OIDC tokens, edge tokens, and `last_sandbox` remain per-user state.
 
 For OIDC gateways, `metadata.json` also stores the issuer, CLI client ID, optional audience, and requested scopes. Treat `oidc_token.json` as a credential. OpenShell writes it with owner-only file permissions.
+
+### Discovery-only certificates
+
+An administrator can grant an `OU=discovery` client certificate access to route
+snapshots and watches for selected workspaces or the whole platform. These
+certificates cannot act as users or operators, even when ordinary mTLS user
+authentication or local development access is enabled. See
+[discovery reader configuration](./configuration#discovery-reader-grants) for
+fingerprint mappings, rotation, and revocation.

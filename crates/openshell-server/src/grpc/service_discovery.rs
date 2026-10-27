@@ -20,7 +20,7 @@ use super::service_advertisement::{Installation, OBJECT_TYPE, is_current};
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{
-    MinWorkspaceRole, authorize_workspace, selected_workspace_name,
+    MinWorkspaceRole, authorize_workspace, require_platform_admin, selected_workspace_name,
 };
 use crate::persistence::{ObjectCursor, ObjectRecord, current_time_ms};
 
@@ -57,15 +57,202 @@ async fn authorize(
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+enum Selection {
+    Named(Vec<String>),
+    All,
+}
+
+fn selection(
+    scope: Option<&openshell_core::proto::WorkspaceSelector>,
+    names: &[String],
+) -> Result<Selection, Status> {
+    if !names.is_empty() {
+        if scope.is_some() || names.len() > crate::auth::discovery::MAX_WORKSPACES {
+            return Err(Status::invalid_argument(
+                "choose a workspace selector or up to 64 workspaces",
+            ));
+        }
+        let mut names = names.to_vec();
+        for name in &names {
+            super::workspace::validate_workspace_name(name)?;
+        }
+        names.sort();
+        if names.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Status::invalid_argument("duplicate workspace selection"));
+        }
+        return Ok(Selection::Named(names));
+    }
+    if scope.is_some_and(|scope| {
+        matches!(
+            scope.selection,
+            Some(openshell_core::proto::workspace_selector::Selection::AllWorkspaces(_))
+        )
+    }) {
+        return Ok(Selection::All);
+    }
+    Ok(Selection::Named(vec![
+        selected_workspace_name(scope)?.to_string(),
+    ]))
+}
+
+async fn authorize_selection(
+    state: &ServerState,
+    principal: &Principal,
+    selection: &Selection,
+) -> Result<(), Status> {
+    if let Principal::Discovery(reader) = principal {
+        let grant = crate::auth::discovery::grant(
+            state.config.auth.discovery_grants_file.as_deref(),
+            reader,
+        )
+        .await?;
+        match selection {
+            Selection::All if !grant.all_workspaces => {
+                return Err(Status::permission_denied(
+                    "all-workspaces discovery grant required",
+                ));
+            }
+            Selection::Named(names)
+                if !grant.all_workspaces
+                    && names.iter().any(|name| !grant.workspaces.contains(name)) =>
+            {
+                return Err(Status::permission_denied(
+                    "workspace not granted for discovery",
+                ));
+            }
+            _ => return Ok(()),
+        }
+    }
+    match selection {
+        Selection::All => {
+            if let Principal::User(user) = principal {
+                let explicit_dev = state.config.auth.allow_unauthenticated_users
+                    && user.identity.provider == crate::auth::identity::IdentityProvider::LocalDev;
+                if !explicit_dev && state.admin_role.is_empty() {
+                    return Err(Status::permission_denied(
+                        "explicit platform discovery authority required",
+                    ));
+                }
+            }
+            require_platform_admin(&state.admin_role, principal)
+        }
+        Selection::Named(names) => {
+            for name in names {
+                authorize(state, principal, name).await?;
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn active_workspaces(state: &ServerState) -> Result<Vec<String>, Status> {
+    let mut cursor: Option<ObjectCursor> = None;
+    let mut names = Vec::new();
+    let mut count = 0;
+    let mut bytes = 0usize;
+    loop {
+        let page = state
+            .store
+            .list_by_type_after("workspace", cursor.as_ref(), 65)
+            .await
+            .map_err(|_| Status::unavailable("workspace discovery storage unavailable"))?;
+        count += page.len();
+        for record in &page {
+            bytes = bytes.saturating_add(record.payload.len());
+            if count > crate::auth::discovery::MAX_WORKSPACES || bytes > MAX_BYTES {
+                return Err(Status::resource_exhausted(
+                    "workspace discovery limit exceeded",
+                ));
+            }
+            let workspace = openshell_core::proto::Workspace::decode(record.payload.as_slice())
+                .map_err(|_| Status::internal("invalid workspace record"))?;
+            let metadata = workspace
+                .metadata
+                .ok_or_else(|| Status::internal("workspace metadata missing"))?;
+            if metadata.deletion_time.is_none() {
+                names.push(metadata.name);
+            }
+        }
+        cursor = page.last().map(ObjectCursor::from);
+        if page.len() < 65 {
+            break;
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+async fn selection_workspaces(
+    state: &ServerState,
+    selection: &Selection,
+) -> Result<Vec<String>, Status> {
+    match selection {
+        Selection::All => active_workspaces(state).await,
+        Selection::Named(names) => {
+            let mut active = Vec::new();
+            for name in names {
+                match super::workspace::resolve_workspace(state.store.as_ref(), name).await {
+                    Ok(workspace) if !workspace.terminating => active.push(name.clone()),
+                    Ok(_) => {}
+                    Err(error) if error.code() == tonic::Code::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(active)
+        }
+    }
+}
+
+async fn selected_snapshot(
+    state: &ServerState,
+    principal: &Principal,
+    selection: &Selection,
+) -> Result<ServiceRouteSnapshot, Status> {
+    tokio::time::timeout(SNAPSHOT_TIMEOUT, async {
+        authorize_selection(state, principal, selection).await?;
+        let before = selection_workspaces(state, selection).await?;
+        let names = before.clone();
+        let mut result = ServiceRouteSnapshot::default();
+        let mut bytes = 0usize;
+        for name in names {
+            let part = snapshot(state, &name).await?;
+            bytes = bytes.saturating_add(part.encoded_len());
+            if bytes > MAX_BYTES - 128 || result.routes.len() + part.routes.len() > MAX_ROUTES {
+                return Err(Status::resource_exhausted(
+                    "combined discovery limit exceeded",
+                ));
+            }
+            result.routes.extend(part.routes);
+        }
+        if before != selection_workspaces(state, selection).await? {
+            return Err(Status::unavailable(
+                "workspace set changed during discovery; retry",
+            ));
+        }
+        // Recheck grants/membership after collection, before publishing a view.
+        authorize_selection(state, principal, selection).await?;
+        result.revision = hex::encode(
+            openshell_crypto::sha256(&result.encode_to_vec())
+                .map_err(|_| Status::internal("snapshot fingerprint failed"))?,
+        );
+        Ok(result)
+    })
+    .await
+    .map_err(|_| Status::unavailable("service discovery collection timed out"))?
+}
+
 pub async fn get_snapshot(
     state: &Arc<ServerState>,
     request: Request<GetServiceRouteSnapshotRequest>,
 ) -> Result<Response<GetServiceRouteSnapshotResponse>, Status> {
     let principal = super::extract_principal(&request)?;
-    let workspace = selected_workspace_name(request.get_ref().workspace_scope.as_ref())?;
-    authorize(state, &principal, workspace).await?;
+    let selection = selection(
+        request.get_ref().workspace_scope.as_ref(),
+        &request.get_ref().workspaces,
+    )?;
     Ok(Response::new(GetServiceRouteSnapshotResponse {
-        snapshot: Some(snapshot(state, workspace).await?),
+        snapshot: Some(selected_snapshot(state, &principal, &selection).await?),
     }))
 }
 
@@ -74,15 +261,22 @@ pub async fn watch(
     request: Request<WatchServiceRoutesRequest>,
 ) -> Result<Response<RouteWatchStream>, Status> {
     let principal = super::extract_principal(&request)?;
-    let workspace =
-        selected_workspace_name(request.get_ref().workspace_scope.as_ref())?.to_string();
-    authorize(state, &principal, &workspace).await?;
+    let selection = selection(
+        request.get_ref().workspace_scope.as_ref(),
+        &request.get_ref().workspaces,
+    )?;
+    tokio::time::timeout(
+        SNAPSHOT_TIMEOUT,
+        authorize_selection(state, &principal, &selection),
+    )
+    .await
+    .map_err(|_| Status::unavailable("discovery authorization timed out"))??;
     let permit = state
         .discovery_watches
         .clone()
         .try_acquire_owned()
         .map_err(|_| Status::resource_exhausted("too many service discovery watches"))?;
-    let initial = snapshot(state, &workspace).await?;
+    let initial = selected_snapshot(state, &principal, &selection).await?;
     let mut revision = initial.revision.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     tx.try_send(Ok(WatchServiceRoutesResponse {
@@ -102,10 +296,7 @@ pub async fn watch(
                 () = tokio::time::sleep_until(deadline) => return,
                 _ = interval.tick() => {}
             }
-            let refresh = async {
-                authorize(&state, &principal, &workspace).await?;
-                snapshot(&state, &workspace).await
-            };
+            let refresh = async { selected_snapshot(&state, &principal, &selection).await };
             let result = tokio::select! {
                 () = tx.closed() => return,
                 () = tokio::time::sleep_until(deadline) => return,
@@ -305,6 +496,7 @@ mod tests {
     fn request() -> GetServiceRouteSnapshotRequest {
         GetServiceRouteSnapshotRequest {
             workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            ..Default::default()
         }
     }
 
@@ -456,6 +648,7 @@ mod tests {
             &state,
             authed_request(WatchServiceRoutesRequest {
                 workspace_scope: request().workspace_scope,
+                ..Default::default()
             }),
         )
         .await
@@ -520,11 +713,12 @@ mod tests {
             get_snapshot(
                 &state,
                 authed_request(GetServiceRouteSnapshotRequest {
-                    workspace_scope: Some(openshell_core::proto::all_workspaces_selector())
+                    workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+                    ..Default::default()
                 })
             )
             .await
-            .is_err()
+            .is_ok()
         );
         let mut outsider = authed_request(request());
         if let Some(Principal::User(user)) = outsider.extensions_mut().get_mut::<Principal>() {
@@ -551,6 +745,7 @@ mod tests {
             &state,
             authed_request(WatchServiceRoutesRequest {
                 workspace_scope: request().workspace_scope,
+                ..Default::default()
             }),
         )
         .await
@@ -575,6 +770,7 @@ mod tests {
         state.store.put_message(&member).await.unwrap();
         let mut request = authed_request(WatchServiceRoutesRequest {
             workspace_scope: request().workspace_scope,
+            ..Default::default()
         });
         if let Some(Principal::User(user)) = request.extensions_mut().get_mut::<Principal>() {
             user.identity.roles = vec!["openshell-user".into()];
@@ -604,6 +800,7 @@ mod tests {
             &state,
             authed_request(WatchServiceRoutesRequest {
                 workspace_scope: request().workspace_scope,
+                ..Default::default()
             }),
         )
         .await
@@ -666,6 +863,275 @@ mod tests {
         assert_eq!(
             snapshot(&state, "default").await.unwrap_err().code(),
             tonic::Code::Unavailable
+        );
+    }
+    async fn reader_fixture(all: bool) -> (Arc<ServerState>, Principal, tempfile::TempDir) {
+        let (mut state, owner, report) = installed_fixture().await;
+        accept(&state, &owner, &report, current_time_ms() + 10_000)
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grants.json");
+        let fingerprint = "a".repeat(64);
+        let grant = if all {
+            serde_json::json!({"certificate_sha256":fingerprint,"all_workspaces":true})
+        } else {
+            serde_json::json!({"certificate_sha256":fingerprint,"workspaces":["default","team-b"]})
+        };
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"readers":[grant]})).unwrap(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .auth
+            .discovery_grants_file = Some(path);
+        let principal = Principal::Discovery(crate::auth::principal::DiscoveryPrincipal {
+            certificate_sha256: fingerprint,
+            expires_at_ms: current_time_ms() + 60_000,
+        });
+        (state, principal, dir)
+    }
+
+    fn reader_request<T>(body: T, principal: &Principal) -> Request<T> {
+        let mut request = Request::new(body);
+        request.extensions_mut().insert(principal.clone());
+        request
+    }
+
+    #[tokio::test]
+    async fn machine_selection_does_not_grant_workspace_or_application_permissions() {
+        let (state, principal, _dir) = reader_fixture(false).await;
+        assert!(
+            get_snapshot(&state, reader_request(request(), &principal))
+                .await
+                .is_ok()
+        );
+        assert!(
+            authorize_workspace(
+                &state.store,
+                &state.admin_role,
+                &principal,
+                "default",
+                MinWorkspaceRole::User
+            )
+            .await
+            .is_err()
+        );
+        for scope in [Selection::All, Selection::Named(vec!["not-granted".into()])] {
+            assert_eq!(
+                authorize_selection(&state, &principal, &scope)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+        assert!(selection(request().workspace_scope.as_ref(), &["default".into()]).is_err());
+        assert!(selection(None, &["default".into(), "default".into()]).is_err());
+        let selected = GetServiceRouteSnapshotRequest {
+            workspaces: vec!["default".into(), "team-b".into()],
+            ..Default::default()
+        };
+        assert!(
+            get_snapshot(&state, reader_request(selected, &principal))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn machine_watch_rechecks_grants_and_certificate_expiry() {
+        let (state, principal, dir) = reader_fixture(true).await;
+        let body = WatchServiceRoutesRequest {
+            workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+            ..Default::default()
+        };
+        let mut stream = watch(&state, reader_request(body, &principal))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stream.next().await.unwrap().is_ok());
+        std::fs::write(dir.path().join("grants.json"), r#"{"readers":[]}"#).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert!(stream.next().await.is_none());
+        let expired = Principal::Discovery(crate::auth::principal::DiscoveryPrincipal {
+            certificate_sha256: "a".repeat(64),
+            expires_at_ms: 0,
+        });
+        assert_eq!(
+            get_snapshot(&state, reader_request(request(), &expired))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    #[tokio::test]
+    async fn all_workspace_views_follow_creation_and_deletion_with_bounded_output() {
+        use openshell_core::proto::{ObjectMeta, Workspace};
+        let (state, principal, _dir) = reader_fixture(true).await;
+        assert_eq!(
+            selection_workspaces(&state, &Selection::All).await.unwrap(),
+            vec!["default"]
+        );
+        let mut workspace = Workspace {
+            metadata: Some(ObjectMeta {
+                id: "team-b".into(),
+                name: "team-b".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        state.store.put_message(&workspace).await.unwrap();
+        assert_eq!(
+            selection_workspaces(&state, &Selection::All).await.unwrap(),
+            vec!["default", "team-b"]
+        );
+        workspace.metadata.as_mut().unwrap().deletion_time =
+            Some(openshell_core::time::timestamp_from_millis(current_time_ms()).unwrap());
+        state.store.put_message(&workspace).await.unwrap();
+        assert_eq!(
+            selection_workspaces(&state, &Selection::All).await.unwrap(),
+            vec!["default"]
+        );
+        for n in 0..crate::auth::discovery::MAX_WORKSPACES {
+            let name = format!("w-{n}");
+            state
+                .store
+                .put_message(&Workspace {
+                    metadata: Some(ObjectMeta {
+                        id: name.clone(),
+                        name,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            selected_snapshot(&state, &principal, &Selection::All)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert!(
+            selected_snapshot(
+                &state,
+                &principal,
+                &Selection::Named(vec!["default".into()])
+            )
+            .await
+            .is_ok()
+        );
+    }
+    #[tokio::test]
+    async fn finite_and_platform_snapshots_combine_actual_routes_and_withdraw_deleted_workspaces() {
+        use openshell_core::proto::{ObjectMeta, ServiceEndpoint, Workspace};
+        let (state, principal, _dir) = reader_fixture(true).await;
+        state
+            .store
+            .put_message(&Workspace {
+                metadata: Some(ObjectMeta {
+                    id: "workspace-b".into(),
+                    name: "team-b".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut sandbox = state
+            .store
+            .get_message::<Sandbox>("sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        let meta = sandbox.metadata.as_mut().unwrap();
+        meta.id = "sandbox-b".into();
+        meta.workspace = "team-b".into();
+        state.store.put_message(&sandbox).await.unwrap();
+        let mut endpoint = state
+            .store
+            .get_message::<ServiceEndpoint>("endpoint")
+            .await
+            .unwrap()
+            .unwrap();
+        endpoint.sandbox_id = "sandbox-b".into();
+        let meta = endpoint.metadata.as_mut().unwrap();
+        meta.id = "endpoint-b".into();
+        meta.workspace = "team-b".into();
+        state.store.put_message(&endpoint).await.unwrap();
+        let owner = crate::supervisor_owner::SupervisorOwnerIndex::new(
+            state.store.clone(),
+            crate::supervisor_owner::OWNER_TTL,
+        )
+        .publish(
+            "sandbox-b",
+            "session-b",
+            "instance-b",
+            1,
+            "replica",
+            "local://replica",
+        )
+        .await
+        .unwrap();
+        let config = super::super::policy::build_sandbox_config_snapshot(&state, &sandbox)
+            .await
+            .unwrap();
+        accept(
+            &state,
+            &owner,
+            &openshell_core::proto::SupervisorServiceAdvertisement {
+                service_domain: "services.example.com".into(),
+                lease_sequence: 1,
+                configuration_instance_id: config.configuration_instance_id,
+                config_revision: config.config_revision,
+                routes: config.service_routes,
+            },
+            current_time_ms() + 10_000,
+        )
+        .await
+        .unwrap();
+        let selected = Selection::Named(vec!["default".into(), "team-b".into()]);
+        let both = selected_snapshot(&state, &principal, &selected)
+            .await
+            .unwrap();
+        assert_eq!(
+            both.routes
+                .iter()
+                .map(|route| route.workspace.as_str())
+                .collect::<Vec<_>>(),
+            vec!["default", "team-b"]
+        );
+        assert_eq!(
+            both,
+            selected_snapshot(&state, &principal, &Selection::All)
+                .await
+                .unwrap()
+        );
+        state
+            .store
+            .delete("workspace", "workspace-b")
+            .await
+            .unwrap();
+        assert_eq!(
+            selected_snapshot(&state, &principal, &Selection::All)
+                .await
+                .unwrap()
+                .routes
+                .len(),
+            1
         );
     }
 }

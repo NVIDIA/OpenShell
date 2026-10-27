@@ -737,7 +737,20 @@ fn prepare_server_config_with_drivers(
 
 /// Reject an implicit development gateway before starting any listeners or services.
 fn validate_user_auth(config: &openshell_core::Config) -> Result<()> {
+    if config.auth.discovery_grants_file.is_some()
+        && config
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.client_ca_path.as_ref())
+            .is_none()
+    {
+        return Err(miette::miette!(
+            "discovery grants require TLS and a client CA"
+        ));
+    }
+
     if !config.auth.allow_unauthenticated_users
+        && config.auth.discovery_grants_file.is_none()
         && !config.mtls_auth.enabled
         && !config.mtls_auth.operator_enabled
         && config.oidc.is_none()

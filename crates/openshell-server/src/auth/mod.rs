@@ -13,6 +13,7 @@ pub mod authenticator;
 pub mod authz;
 pub mod compute_driver;
 pub mod descriptor_authz;
+pub mod discovery;
 pub mod extension_mint_limit;
 pub mod guard;
 mod http;
