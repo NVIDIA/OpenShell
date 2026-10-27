@@ -58,6 +58,7 @@ type Client struct {
 	templates      SandboxTemplateInterface
 	providers      ProviderInterface
 	services       ServiceInterface
+	serviceRoutes  ServiceDiscoveryInterface
 	exec           ExecInterface
 	files          FileInterface
 	health         HealthInterface
@@ -105,6 +106,7 @@ func NewClient(cfg Config) (*Client, error) {
 	c.templates = newSandboxTemplateClient(conn)
 	c.providers = newProviderClient(conn)
 	c.services = newServiceClient(conn)
+	c.serviceRoutes = newServiceDiscoveryClient(conn)
 	c.exec = newExecClient(conn, c.sandboxes)
 	c.files = newFileClient(conn, c.sandboxes)
 	c.health = newHealthClient(conn)
@@ -137,6 +139,10 @@ func (c *Client) Providers() ProviderInterface { return c.providers }
 
 // Services returns the service sub-client.
 func (c *Client) Services() ServiceInterface { return c.services }
+
+// ServiceRoutes returns the read-only workspace discovery client. This additive
+// accessor has its own narrow consumer interface to preserve ClientInterface mocks.
+func (c *Client) ServiceRoutes() ServiceDiscoveryInterface { return c.serviceRoutes }
 
 // Exec returns the exec sub-client.
 func (c *Client) Exec() ExecInterface { return c.exec }
