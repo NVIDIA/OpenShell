@@ -30,7 +30,7 @@ use tonic::Status;
 pub fn ensure_sandbox_scope(principal: &Principal, claimed_sandbox_id: &str) -> Result<(), Status> {
     match principal {
         Principal::User(_) | Principal::Operator(_) => Ok(()),
-        Principal::Peer(_) | Principal::Supervisor(_) => Err(deny(
+        Principal::Discovery(_) | Principal::Peer(_) | Principal::Supervisor(_) => Err(deny(
             principal,
             AuthzDenial::MethodNotPermitted,
             "gateway peer and supervisor principals may not call sandbox-scoped methods",
@@ -88,7 +88,8 @@ pub fn ensure_sandbox_principal_scope(
             ensure_sandbox_scope(principal, claimed_sandbox_id)?;
             Ok(p.clone())
         }
-        Principal::User(_)
+        Principal::Discovery(_)
+        | Principal::User(_)
         | Principal::Operator(_)
         | Principal::Peer(_)
         | Principal::Supervisor(_) => Err(deny(
