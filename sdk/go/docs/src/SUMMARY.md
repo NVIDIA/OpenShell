@@ -21,6 +21,7 @@
 - [Profiles](api/profiles.md)
 - [Refresh](api/refresh.md)
 - [Services](api/services.md)
+- [Service discovery](api/service-discovery.md)
 - [Files](api/files.md)
 - [Health](api/health.md)
 - [SSH](api/ssh.md)
