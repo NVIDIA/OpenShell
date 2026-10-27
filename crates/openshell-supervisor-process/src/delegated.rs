@@ -94,6 +94,7 @@ pub async fn start_boundary_access(
     config_push_updates: tokio::sync::watch::Sender<bool>,
     host_key: Option<russh::keys::PrivateKey>,
     gateway_home: Option<tokio::sync::watch::Receiver<Option<String>>>,
+    app_installations: Option<openshell_core::app_listener::InstallationSource>,
 ) -> Result<BoundaryAccess> {
     let instance_id = uuid::Uuid::new_v4().to_string();
     let terminating = Arc::new(AtomicBool::new(false));
@@ -128,6 +129,7 @@ pub async fn start_boundary_access(
                 terminating.clone(),
                 crate::supervisor_session::SessionRuntimeContext {
                     instance_id: instance_id.clone(),
+                    app_installations,
                     session_id_updates: supervisor_session_updates,
                     config_apply_tx,
                     config_push_updates,

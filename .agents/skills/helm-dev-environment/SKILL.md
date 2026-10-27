@@ -195,6 +195,17 @@ every member one at a time. The PID must survive each case, while an open
 replacement confirmed within the recovery timeout, so the runtime terminated
 the workload.
 
+For RFC 0017 app-listener validation, enable the listener and supply the app TLS
+Secret on the shared Deployment, plus a separate NetworkPolicy allowing the test
+client/proxy to reach its app port. Runtime-port access does not grant app access.
+Discovery returns the acknowledged owner's Pod IP and app port; no headless app
+Service is needed. Exercise HTTP/WebSocket reconnection through graceful downscale
+and abrupt loss, preserving workload generation/PID/in-memory state and the public
+hostname. Verify stale-owner rejection independently of the replacement's success.
+Shared serving leases expire within fifteen seconds of issuance and do not renew
+from configuration alone. Do not claim seamless socket migration or infer external
+ingress readiness from an advertisement.
+
 ### 2. Deploy OpenShell
 
 **Iterative dev** (rebuilds on file changes, recommended during active development):
