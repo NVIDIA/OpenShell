@@ -103,6 +103,13 @@ jobs:
           path: release/
           merge-multiple: true
 
+      - name: Download sandbox proxy binary artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: sandbox-proxy-binary-*
+          path: release/
+          merge-multiple: true
+
       - name: Download sandbox binary artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -198,6 +205,10 @@ jobs:
             openshell-supervisor-x86_64-unknown-linux-gnu.tar.gz \
             openshell-supervisor-aarch64-unknown-linux-gnu.tar.gz > openshell-supervisor-checksums-sha256.txt
           cat openshell-supervisor-checksums-sha256.txt
+          sha256sum -- \
+            openshell-sandbox-proxy-x86_64-unknown-linux-gnu.tar.gz \
+            openshell-sandbox-proxy-aarch64-unknown-linux-gnu.tar.gz > openshell-sandbox-proxy-checksums-sha256.txt
+          cat openshell-sandbox-proxy-checksums-sha256.txt
 
       - name: Generate Homebrew formula
         run: |
@@ -262,7 +273,7 @@ jobs:
           VERSION: ${{ inputs.semver }}
         run: |
           set -euo pipefail
-          for component in gateway sandbox supervisor; do
+          for component in gateway sandbox supervisor sandbox-proxy; do
             image="ghcr.io/nvidia/openshell/${component}:${VERSION}"
             # Archives are build artifacts from this run, not externally signed images.
             nix shell --inputs-from . nixpkgs#skopeo -c \
@@ -296,7 +307,7 @@ jobs:
         run: |
           set -euo pipefail
           REGISTRY="ghcr.io/nvidia/openshell"
-          for component in gateway sandbox supervisor; do
+          for component in gateway sandbox supervisor sandbox-proxy; do
             if [[ "${IS_PRERELEASE}" == "true" ]]; then
               echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION}..."
               docker buildx imagetools create \
@@ -429,7 +440,9 @@ jobs:
             release/openshell-sandbox-x86_64-unknown-linux-musl.tar.gz
             release/openshell-sandbox-aarch64-unknown-linux-musl.tar.gz
             release/openshell-supervisor-x86_64-unknown-linux-gnu.tar.gz
+            release/openshell-sandbox-proxy-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-supervisor-aarch64-unknown-linux-gnu.tar.gz
+            release/openshell-sandbox-proxy-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
@@ -442,6 +455,7 @@ jobs:
             release/openshell-gateway-checksums-sha256.txt
             release/openshell-sandbox-checksums-sha256.txt
             release/openshell-supervisor-checksums-sha256.txt
+            release/openshell-sandbox-proxy-checksums-sha256.txt
             release/openshell-prover-checksums-sha256.txt
 
       - name: Upload amd64 Debian prerelease package

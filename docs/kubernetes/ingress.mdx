@@ -314,3 +314,28 @@ for the routing-name field, its validation, and the effects of changing it.
 ## Next Steps
 
 Return to [Setup](/kubernetes/setup) to complete the installation.
+
+## Independent application proxy
+
+With supervisor application listeners and service discovery enabled, the optional
+`openshell-sandbox-proxy` forwards TLS directly to the discovered supervisor.
+Application payloads bypass the gateway. Configure the application public origin
+with `supervisor.app_listener.public_url`; the gateway API endpoint and internal
+supervisor listener port can differ from that origin.
+
+Deploy the standalone chart in `deploy/helm/openshell-sandbox-proxy` with a gateway
+HTTPS endpoint, a workspace selection, and discovery trust/identity Secrets.
+Select `workspace`, a `workspaces` list, or `allWorkspaces: true`. Use a
+discovery-only certificate whose administrator-managed grant covers the selection;
+see [gateway configuration](../how-it-works/gateways/configuration#discovery-reader-grants).
+The proxy does not need Kubernetes API
+permissions or application private keys; application TLS terminates at supervisors.
+
+Attach TLSRoute passthrough to the proxy Service's port 443 and configure DNS
+for the application domain. HTTPRoute requires an explicit edge-termination and
+backend-TLS design. Allow proxy egress to the gateway API and supervisor app
+ports, and restrict direct supervisor ingress when edge authentication is required.
+Discovery failures retain routes only through their expiry; withdrawals,
+replacement, and expiry close affected streams. Multiple proxy replicas maintain
+independent caches. A separate ingress controller can consume the same API and
+route directly to supervisors without deploying this proxy.

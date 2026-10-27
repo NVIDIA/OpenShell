@@ -1,0 +1,145 @@
+{{- $modes := 0 -}}
+{{- if .Values.workspace }}{{ $modes = add $modes 1 }}{{ end -}}
+{{- if .Values.workspaces }}{{ $modes = add $modes 1 }}{{ end -}}
+{{- if .Values.allWorkspaces }}{{ $modes = add $modes 1 }}{{ end -}}
+{{- if ne (int $modes) 1 }}{{ fail "select exactly one of workspace, workspaces, or allWorkspaces" }}{{ end -}}
+{{- if gt (len .Values.workspaces) 64 }}{{ fail "select at most 64 workspaces" }}{{ end -}}
+{{- if ne (len .Values.workspaces) (len (uniq .Values.workspaces)) }}{{ fail "duplicate workspaces are not allowed" }}{{ end -}}
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: openshell-sandbox-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/name: openshell-sandbox-proxy
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: proxy
+          image: {{ printf "%s:%s" .Values.image.repository .Values.image.tag | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --gateway-endpoint
+            - {{ required "gatewayEndpoint is required" .Values.gatewayEndpoint | quote }}
+            {{- if .Values.allWorkspaces }}
+            - --all-workspaces
+            {{- else if .Values.workspace }}
+            - --workspace
+            - {{ .Values.workspace | quote }}
+            {{- else }}
+            {{- range .Values.workspaces }}
+            - --workspace
+            - {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.gatewayCASecret }}
+            - --gateway-ca
+            - /run/discovery/ca/ca.crt
+            {{- end }}
+            {{- if .Values.clientIdentitySecret }}
+            - --discovery-client-cert
+            - /run/discovery/client/tls.crt
+            - --discovery-client-key
+            - /run/discovery/client/tls.key
+            {{- end }}
+            {{- if .Values.tokenSecret }}
+            - --discovery-token-file
+            - /run/discovery/token/token
+            {{- end }}
+          ports:
+            - name: app
+              containerPort: 8443
+            - name: health
+              containerPort: 9091
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            {{- if .Values.gatewayCASecret }}
+            - name: ca
+              mountPath: /run/discovery/ca
+              readOnly: true
+            {{- end }}
+            {{- if .Values.clientIdentitySecret }}
+            - name: client
+              mountPath: /run/discovery/client
+              readOnly: true
+            {{- end }}
+            {{- if .Values.tokenSecret }}
+            - name: token
+              mountPath: /run/discovery/token
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if .Values.gatewayCASecret }}
+        - name: ca
+          secret:
+            secretName: {{ .Values.gatewayCASecret }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+            defaultMode: 0440
+        {{- end }}
+        {{- if .Values.clientIdentitySecret }}
+        - name: client
+          secret:
+            secretName: {{ .Values.clientIdentitySecret }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+            defaultMode: 0440
+        {{- end }}
+        {{- if .Values.tokenSecret }}
+        - name: token
+          secret:
+            secretName: {{ .Values.tokenSecret }}
+            items:
+              - key: token
+                path: token
+            defaultMode: 0440
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: openshell-sandbox-proxy
+  ports:
+    - name: app
+      port: {{ .Values.service.port }}
+      targetPort: app
