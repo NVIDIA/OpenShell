@@ -310,6 +310,9 @@ spec:
     {{- with .Values.server.extraVolumes }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
+  {{- with .Values.priorityClassName }}
+  priorityClassName: {{ . }}
+  {{- end }}
   {{- with .Values.nodeSelector }}
   nodeSelector:
     {{- toYaml . | nindent 4 }}
@@ -320,6 +323,10 @@ spec:
   {{- end }}
   {{- with .Values.tolerations }}
   tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.topologySpreadConstraints }}
+  topologySpreadConstraints:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 {{- end }}
