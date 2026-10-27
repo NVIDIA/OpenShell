@@ -49,6 +49,8 @@ pub(crate) struct PolicyDnsRuntimeConfig {
     pub(crate) ipv4_cidr: ipnet::Ipv4Net,
     pub(crate) ipv6_cidr: ipnet::Ipv6Net,
     pools: SyntheticPools,
+    ipv6_egress: bool,
+    trusted_resolver: Option<SocketAddr>,
 }
 
 impl PolicyDnsRuntimeConfig {
@@ -82,7 +84,29 @@ impl PolicyDnsRuntimeConfig {
             ipv4_cidr,
             ipv6_cidr,
             pools,
+            ipv6_egress: false,
+            trusted_resolver: None,
         })
+    }
+
+    /// Answer AAAA queries from the synthetic IPv6 pool instead of returning
+    /// NOERROR/NODATA.
+    #[must_use]
+    pub(crate) fn with_ipv6_egress(mut self, enabled: bool) -> Self {
+        self.ipv6_egress = enabled;
+        self
+    }
+
+    /// Use `server` instead of the first `/etc/resolv.conf` nameserver.
+    #[cfg(test)]
+    pub(crate) fn with_trusted_resolver(mut self, server: SocketAddr) -> Self {
+        self.trusted_resolver = Some(server);
+        self
+    }
+
+    fn upstream(&self) -> Result<SocketAddr> {
+        self.trusted_resolver
+            .map_or_else(trusted_resolver_from_resolv_conf, Ok)
     }
 }
 
@@ -101,7 +125,8 @@ impl PolicyDnsRuntime {
         config: PolicyDnsRuntimeConfig,
         mut engine_ready: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self> {
-        let upstream = trusted_resolver_from_resolv_conf()?;
+        let upstream = config.upstream()?;
+        let ipv6_egress = config.ipv6_egress;
         let store = Arc::new(ResolvedEndpointStore::new(
             StoreConfig::new(config.pools, MAX_MAPPINGS)
                 .map_err(|error| miette::miette!(error.to_string()))?,
@@ -132,10 +157,12 @@ impl PolicyDnsRuntime {
                     let timing = query.timing.clone();
                     let response = match query.transport {
                         DnsTransport::Udp => {
-                            wire::handle_udp_query_with_ipv6(&service, &query.message, false).await
+                            wire::handle_udp_query_with_ipv6(&service, &query.message, ipv6_egress)
+                                .await
                         }
                         DnsTransport::Tcp => {
-                            wire::handle_tcp_query_with_ipv6(&service, &query.message, false).await
+                            wire::handle_tcp_query_with_ipv6(&service, &query.message, ipv6_egress)
+                                .await
                         }
                     }
                     .map_err(|error| {
@@ -174,7 +201,11 @@ impl PolicyDnsRuntime {
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
                 .state(StateId::Enabled, "ready")
-                .message("Policy DNS connected to isolation boundary")
+                .unmapped("ipv6_egress", ipv6_egress)
+                .message(format!(
+                    "Policy DNS connected to isolation boundary (IPv6 egress {})",
+                    if ipv6_egress { "enabled" } else { "disabled" }
+                ))
                 .build()
         );
         Ok(Self {
@@ -191,7 +222,8 @@ impl PolicyDnsRuntime {
         config: PolicyDnsRuntimeConfig,
         engine_ready: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self> {
-        let upstream = trusted_resolver_from_resolv_conf()?;
+        let upstream = config.upstream()?;
+        let ipv6_egress = config.ipv6_egress;
         let store = Arc::new(ResolvedEndpointStore::new(
             StoreConfig::new(config.pools, MAX_MAPPINGS)
                 .map_err(|error| miette::miette!(error.to_string()))?,
@@ -225,11 +257,10 @@ impl PolicyDnsRuntime {
                 let udp = udp.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    // Docker and Podman do not currently prove usable IPv6
-                    // egress. Return NOERROR/NODATA for AAAA so dual-stack
-                    // clients can fall back to the usable IPv4 path.
+                    // Without IPv6 egress, AAAA receives NOERROR/NODATA so
+                    // dual-stack clients fall back to the usable IPv4 path.
                     if let Ok(response) =
-                        wire::handle_udp_query_with_ipv6(&service, &request, false).await
+                        wire::handle_udp_query_with_ipv6(&service, &request, ipv6_egress).await
                     {
                         let _ = udp.send_to(&response, peer).await;
                     }
@@ -264,7 +295,7 @@ impl PolicyDnsRuntime {
                             return;
                         }
                         let Ok(response) =
-                            wire::handle_tcp_query_with_ipv6(&service, &frame, false).await
+                            wire::handle_tcp_query_with_ipv6(&service, &frame, ipv6_egress).await
                         else {
                             return;
                         };
@@ -289,6 +320,7 @@ impl PolicyDnsRuntime {
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
                 .state(StateId::Enabled, "ready")
+                .unmapped("ipv6_egress", ipv6_egress)
                 .message(format!("Policy DNS listening on {address}"))
                 .build()
         );
@@ -307,7 +339,7 @@ impl Drop for PolicyDnsRuntime {
     }
 }
 
-fn trusted_resolver_from_resolv_conf() -> Result<SocketAddr> {
+pub(crate) fn trusted_resolver_from_resolv_conf() -> Result<SocketAddr> {
     let contents = std::fs::read_to_string("/etc/resolv.conf")
         .into_diagnostic()
         .wrap_err("failed to read trusted supervisor resolver configuration")?;
@@ -411,6 +443,13 @@ mod tests {
         for address in [first.ipv4_cidr.network(), second.ipv4_cidr.broadcast()] {
             assert!(parent.contains(&address));
         }
+    }
+
+    #[test]
+    fn runtime_config_keeps_ipv6_egress_disabled_by_default() {
+        let config = PolicyDnsRuntimeConfig::for_epoch(3).unwrap();
+        assert!(!config.ipv6_egress);
+        assert!(config.with_ipv6_egress(true).ipv6_egress);
     }
 
     #[test]

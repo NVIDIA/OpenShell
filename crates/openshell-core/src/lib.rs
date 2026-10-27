@@ -72,7 +72,8 @@ pub use config::{
     GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
     GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig, GatewayJwtConfig,
     GatewayProviderProfileSourceConfig, ImagePullPolicy, MtlsAuthConfig, OidcConfig,
-    PolicyValidationFailureMode, TlsConfig, UpstreamProxyConfig,
+    PolicyDnsIpv6Egress, PolicyValidationFailureMode, SupervisorIpv6EgressConfig, TlsConfig,
+    UpstreamProxyConfig,
 };
 pub use dynamic_string_allowlist::DynamicStringAllowlist;
 pub use error::{ComputeDriverError, Error, Result};

@@ -666,6 +666,7 @@ pub async fn run_network_proxy(
     tls_dir: Option<std::path::PathBuf>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
     additional_ca_bundle: Option<String>,
+    nat64_prefixes: Vec<openshell_supervisor_network::run::Nat64Prefix>,
 ) -> Result<i32> {
     if !listen.ip().is_loopback() {
         return Err(miette::miette!(
@@ -738,6 +739,9 @@ pub async fn run_network_proxy(
         workspace_rx,
         &upstream_proxy_args,
         additional_ca_bundle.as_deref(),
+        // No isolation boundary is attached, so mediated policy DNS is off.
+        openshell_supervisor_network::run::PolicyDnsIpv6Egress::Disabled,
+        nat64_prefixes,
         None,
         #[cfg(target_os = "linux")]
         None,
@@ -901,6 +905,8 @@ pub struct SandboxInstanceConfig {
     pub shared_ssh_socket: bool,
     pub upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
     pub additional_ca_bundle: Option<String>,
+    pub policy_dns_ipv6_egress: openshell_supervisor_network::run::PolicyDnsIpv6Egress,
+    pub nat64_prefixes: Vec<openshell_supervisor_network::run::Nat64Prefix>,
     pub backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
     pub auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     pub admitted_isolation_backend: Option<String>,
@@ -1061,6 +1067,8 @@ pub async fn run_sandbox_instance(
         shared_ssh_socket,
         upstream_proxy_args,
         additional_ca_bundle,
+        policy_dns_ipv6_egress,
+        nat64_prefixes,
         backend_descriptor,
         auth_bundle,
         admitted_isolation_backend,
@@ -1424,6 +1432,8 @@ pub async fn run_sandbox_instance(
             workspace_rx.clone(),
             &upstream_proxy_args,
             additional_ca_bundle.as_deref(),
+            policy_dns_ipv6_egress,
+            nat64_prefixes,
             remote_host_gateway_ip,
             #[cfg(target_os = "linux")]
             None,
@@ -4597,6 +4607,9 @@ mod tests {
             upstream_proxy_args:
                 openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
             additional_ca_bundle: None,
+            policy_dns_ipv6_egress:
+                openshell_supervisor_network::run::PolicyDnsIpv6Egress::Disabled,
+            nat64_prefixes: Vec::new(),
             backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor {
                 backend_name: "in-process-test".to_string(),
                 payload: b"in-process-only-launch-data".to_vec(),

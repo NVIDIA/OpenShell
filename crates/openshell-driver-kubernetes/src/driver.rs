@@ -3150,6 +3150,7 @@ impl KubernetesComputeDriver {
                 self.config.proxy_auth_allow_insecure == Some(true),
                 self.config.proxy_connect_by_hostname == Some(true),
                 upstream_proxy_ca_bundle_staged,
+                &self.config.ipv6_egress_config().supervisor_args(),
                 self.config.provider_spiffe_enabled().then_some(
                     self.config
                         .provider_spiffe_workload_api_socket_path
