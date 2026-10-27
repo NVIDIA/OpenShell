@@ -27,7 +27,14 @@ LABEL = re.compile(r"(?:area|topic):[a-z0-9]+(?:[-:][a-z0-9]+)*")
 PROFILE = re.compile(r"\[@([a-z0-9-]+)\]\(https://github\.com/([a-z0-9-]+)/?\)", re.I)
 ACCEPTANCE_ERROR = (
     "PR is not accepted work: the author needs repository write access "
-    "or a referenced state:accepted issue"
+    "or state:accepted on the PR or a referenced issue"
+)
+DRAFT_COMMENT_MARKER = "<!-- openshell-review-readiness:unaccepted-work -->"
+DRAFT_COMMENT = (
+    "This PR has been automatically moved to draft because it's not associated "
+    "with an issue that is accepted work. You're welcome to continue to work on "
+    'it while it\'s in draft mode; it will be allowed to move to "Ready for Review" '
+    "when the issue or PR have been marked accepted.\n\n" + DRAFT_COMMENT_MARKER
 )
 
 
@@ -203,15 +210,6 @@ def _load_reviewers(repository: str, number: int, pr: dict) -> dict[str, set[str
     }
 
 
-def _eligible_reviewers(repository: str, logins: set[str]) -> set[str]:
-    eligible = set()
-    for login in sorted(logins):
-        value = _api(f"repos/{repository}/collaborators/{login}/permission")
-        if value.get("permission") in {"write", "maintain", "admin"}:
-            eligible.add(login)
-    return eligible
-
-
 def _referenced_issues(repository: str, number: int, body: str):
     """Yield description references first, then closing links, without duplicates."""
     escaped = re.escape(repository)
@@ -238,7 +236,10 @@ def _referenced_issues(repository: str, number: int, body: str):
                 }
               }
             }""",
-            owner=owner, repo=repo, number=number, cursor=cursor,
+            owner=owner,
+            repo=repo,
+            number=number,
+            cursor=cursor,
         )
         linked = data["repository"]["pullRequest"]["closingIssuesReferences"]
         for issue in linked["nodes"]:
@@ -254,7 +255,11 @@ def _referenced_issues(repository: str, number: int, body: str):
 
 
 def _accepted_work(repository: str, number: int, pr: dict) -> bool:
-    """Accept write access or a referenced accepted issue."""
+    """Accept write access or acceptance recorded on the PR or a referenced issue."""
+    if pr["user"]["login"].lower() == "dependabot[bot]":
+        return True
+    if any(label["name"] == "state:accepted" for label in pr["labels"]):
+        return True
     owner, repo = repository.split("/")
     author = pr["user"]["login"].lower()
     cursor = None
@@ -268,12 +273,18 @@ def _accepted_work(repository: str, number: int, pr: dict) -> bool:
                 }
               }
             }""",
-            owner=owner, repo=repo, author=author, cursor=cursor,
+            owner=owner,
+            repo=repo,
+            author=author,
+            cursor=cursor,
         )
         members = data["repository"]["collaborators"]
         member = next(
-            (edge for edge in members["edges"]
-             if edge["node"]["login"].lower() == author),
+            (
+                edge
+                for edge in members["edges"]
+                if edge["node"]["login"].lower() == author
+            ),
             None,
         )
         if member:
@@ -301,7 +312,10 @@ def _accepted_work(repository: str, number: int, pr: dict) -> bool:
                         }
                       }
                     }""",
-                    owner=owner, repo=repo, number=issue_number, cursor=cursor,
+                    owner=owner,
+                    repo=repo,
+                    number=issue_number,
+                    cursor=cursor,
                 )
             except subprocess.CalledProcessError as exc:
                 errors = json.loads(exc.stdout or "{}").get("errors", [])
@@ -311,7 +325,9 @@ def _accepted_work(repository: str, number: int, pr: dict) -> bool:
             issue = data["repository"]["issueOrPullRequest"]
             if not issue or "labels" not in issue:
                 break
-            if any(label["name"] == "state:accepted" for label in issue["labels"]["nodes"]):
+            if any(
+                label["name"] == "state:accepted" for label in issue["labels"]["nodes"]
+            ):
                 return True
             if not issue["labels"]["pageInfo"]["hasNextPage"]:
                 break
@@ -332,20 +348,45 @@ def _routing_key(pr: dict):
 
 
 def check_review_readiness(
-    reviewers: Path,
+    reviewers: Path | dict[str, set[str]],
     repository: str,
     number: int,
     *,
     apply=False,
     event="opened",
+    label_accepted_work=False,
+    maintainers: set[str] | None = None,
 ) -> ReviewPlan | None:
-    """Validate acceptance, then route. Callers must serialize runs for the same PR."""
+    """Plan labeling and routing; callers serialize runs for the same PR.
+
+    Enable label_accepted_work for newly opened PRs, including drafts. Acceptance
+    is independent of readiness and classification; only reviewer routing needs
+    a ready PR with an area label. Labeling never removes an existing label.
+    """
     pull = f"repos/{repository}/pulls/{number}"
     pr = _api(pull)
     if pr["state"] != "open":
         return None
-    if event in {"opened", "ready_for_review"} and not _accepted_work(
-        repository, number, pr
+    accepted = None
+    add_labels = ()
+    labels = {label["name"] for label in pr["labels"]}
+    if label_accepted_work:
+        accepted = check_pr_accepted_work(
+            repository, pr, maintainers or set(), api=_api
+        )
+        if accepted and ACCEPTED_LABEL not in labels:
+            add_labels = (ACCEPTED_LABEL,)
+            if apply:
+                _api(
+                    f"repos/{repository}/issues/{number}/labels",
+                    method="POST",
+                    data={"labels": list(add_labels)},
+                )
+    if (
+        not pr["draft"]
+        and event in {"opened", "ready_for_review"}
+        and accepted is not True
+        and not _accepted_work(repository, number, pr)
     ):
         if apply:
             _graphql(
@@ -356,11 +397,30 @@ def check_review_readiness(
                 }""",
                 id=pr["node_id"],
             )
+            comments = f"repos/{repository}/issues/{number}/comments"
+            previous = _api(f"{comments}?per_page=100", pages=True)
+            if not any(
+                DRAFT_COMMENT_MARKER in (comment.get("body") or "")
+                for comment in previous
+            ):
+                _api(comments, method="POST", data={"body": DRAFT_COMMENT})
         raise ValueError(ACCEPTANCE_ERROR)
-    categories = parse_reviewers(reviewers.read_text(encoding="utf-8"))
-    selected = select_reviewers(categories, {label["name"] for label in pr["labels"]})
-    selected = _eligible_reviewers(repository, selected - {pr["user"]["login"].lower()})
-    plan = plan_review_requests(selected, **_load_reviewers(repository, number, pr))
+    if pr["draft"] or not any(label.startswith("area:") for label in labels):
+        if pr["draft"] and not label_accepted_work:
+            return None
+        return ReviewPlan((), (), accepted, add_labels)
+    categories = (
+        reviewers
+        if isinstance(reviewers, dict)
+        else parse_reviewers(reviewers.read_text(encoding="utf-8"))
+    )
+    selected = select_reviewers(categories, labels)
+    selected -= {pr["user"]["login"].lower()}
+    plan = replace(
+        plan_review_requests(selected, **_load_reviewers(repository, number, pr)),
+        accepted_work=accepted,
+        add_labels=add_labels,
+    )
     if apply:
         endpoint = f"{pull}/requested_reviewers"
         if plan.add:
@@ -391,17 +451,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", required=True, help="target OWNER/REPO")
     parser.add_argument("--pr", required=True, type=int, help="pull request number")
     parser.add_argument(
-        "--event-path", type=Path,
+        "--event-path",
+        type=Path,
         help="PR event payload for --acceptance-only; otherwise fetch current PR metadata",
     )
     parser.add_argument(
-        "--event", default="opened",
+        "--event",
+        default="opened",
         choices=("opened", "ready_for_review", "labeled", "unlabeled"),
         help="PR event; acceptance is checked on opened and ready_for_review",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
-        "--acceptance-only", action="store_true",
+        "--acceptance-only",
+        action="store_true",
         help="report acceptance without reading the roster or changing the PR",
     )
     mode.add_argument(
@@ -413,26 +476,66 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.acceptance_only:
             if args.event_path:
-                pr = json.loads(args.event_path.read_text(encoding="utf-8"))["pull_request"]
+                pr = json.loads(args.event_path.read_text(encoding="utf-8"))[
+                    "pull_request"
+                ]
             else:
                 owner, repo = args.repo.split("/")
-                pr = _graphql(
-                    """query($owner: String!, $repo: String!, $number: Int!) {
-                      repository(owner: $owner, name: $repo) {
-                        pullRequest(number: $number) { user: author { login } body }
-                      }
-                    }""",
-                    owner=owner, repo=repo, number=args.pr,
-                )["repository"]["pullRequest"]
+                cursor, labels = None, []
+                while True:
+                    pr = _graphql(
+                        """query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                          repository(owner: $owner, name: $repo) {
+                            pullRequest(number: $number) {
+                              user: author { login }
+                              body
+                              labels(first: 100, after: $cursor) {
+                                nodes { name }
+                                pageInfo { hasNextPage endCursor }
+                              }
+                            }
+                          }
+                        }""",
+                        owner=owner,
+                        repo=repo,
+                        number=args.pr,
+                        cursor=cursor,
+                    )["repository"]["pullRequest"]
+                    page = pr["labels"]
+                    labels.extend(page["nodes"])
+                    if not page["pageInfo"]["hasNextPage"]:
+                        break
+                    cursor = page["pageInfo"]["endCursor"]
+                pr["labels"] = labels
             if not _accepted_work(args.repo, args.pr, pr):
                 raise ValueError(ACCEPTANCE_ERROR)
             result = {"accepted": True}
         else:
-            plan = check_review_readiness(
-                args.reviewers, args.repo, args.pr, apply=args.apply, event=args.event
+            maintainers = (
+                parse_maintainers(args.maintainers.read_text(encoding="utf-8"))
+                if args.label_accepted_work
+                else None
             )
-            result = asdict(plan) if plan is not None else {"skipped": "closed or draft PR"}
-    except (OSError, UnicodeError, ValueError, subprocess.CalledProcessError) as exc:
+            plan = check_review_readiness(
+                args.reviewers,
+                args.repo,
+                args.pr,
+                apply=args.apply,
+                event=args.event,
+                label_accepted_work=args.label_accepted_work,
+                maintainers=maintainers,
+            )
+            result = (
+                asdict(plan) if plan is not None else {"skipped": "closed or draft PR"}
+            )
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        KeyError,
+        TypeError,
+        subprocess.CalledProcessError,
+    ) as exc:
         print(f"Review readiness: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(result))
