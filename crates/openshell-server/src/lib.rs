@@ -481,6 +481,24 @@ impl MetricsTlsHandshakeLogLimiter {
     }
 }
 
+/// Separate limiters for handshake rejections and timeouts so a burst of one
+/// kind cannot absorb the other's warnings, and each periodic WARN reports
+/// counts for a single event type.
+#[derive(Clone)]
+struct MetricsTlsHandshakeLogLimiters {
+    rejections: Arc<MetricsTlsHandshakeLogLimiter>,
+    timeouts: Arc<MetricsTlsHandshakeLogLimiter>,
+}
+
+impl MetricsTlsHandshakeLogLimiters {
+    fn new(interval: Duration) -> Self {
+        Self {
+            rejections: Arc::new(MetricsTlsHandshakeLogLimiter::new(interval)),
+            timeouts: Arc::new(MetricsTlsHandshakeLogLimiter::new(interval)),
+        }
+    }
+}
+
 fn log_metrics_tls_handshake_rejection(
     limiter: &MetricsTlsHandshakeLogLimiter,
     error: &std::io::Error,
@@ -1318,9 +1336,8 @@ async fn serve_tls_metrics_listener(
     tls_acceptor: TlsAcceptor,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let handshake_log_limiter = Arc::new(MetricsTlsHandshakeLogLimiter::new(
-        METRICS_TLS_HANDSHAKE_WARNING_INTERVAL,
-    ));
+    let handshake_log_limiters =
+        MetricsTlsHandshakeLogLimiters::new(METRICS_TLS_HANDSHAKE_WARNING_INTERVAL);
     loop {
         let accepted = tokio::select! {
             changed = shutdown.changed() => {
@@ -1343,7 +1360,7 @@ async fn serve_tls_metrics_listener(
 
         let acceptor = tls_acceptor.clone();
         let service = TowerToHyperService::new(router.clone());
-        let handshake_log_limiter = handshake_log_limiter.clone();
+        let handshake_log_limiters = handshake_log_limiters.clone();
         tokio::spawn(async move {
             match tokio::time::timeout(Duration::from_secs(10), acceptor.acceptor().accept(stream))
                 .await
@@ -1364,10 +1381,14 @@ async fn serve_tls_metrics_listener(
                     debug!(error = %error, client = %addr, "Metrics TLS handshake closed early");
                 }
                 Ok(Err(error)) => {
-                    log_metrics_tls_handshake_rejection(&handshake_log_limiter, &error, addr);
+                    log_metrics_tls_handshake_rejection(
+                        &handshake_log_limiters.rejections,
+                        &error,
+                        addr,
+                    );
                 }
                 Err(_) => {
-                    log_metrics_tls_handshake_timeout(&handshake_log_limiter, addr);
+                    log_metrics_tls_handshake_timeout(&handshake_log_limiters.timeouts, addr);
                 }
             }
         });
@@ -2451,10 +2472,11 @@ mod compute_factory_compatibility;
 mod tests {
     use super::{
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
-        MetricsTlsHandshakeLogLimiter, MultiplexService, ServerState, TlsAcceptor,
-        allow_plaintext_service_http, bind_gateway_listener, classify_initial_bytes,
-        configured_compute_driver, extension_token_ttl, is_benign_tls_handshake_failure,
-        log_metrics_tls_handshake_rejection, metrics_tls_acceptor_or_disable,
+        MetricsTlsHandshakeLogLimiter, MetricsTlsHandshakeLogLimiters, MultiplexService,
+        ServerState, TlsAcceptor, allow_plaintext_service_http, bind_gateway_listener,
+        classify_initial_bytes, configured_compute_driver, extension_token_ttl,
+        is_benign_tls_handshake_failure, log_metrics_tls_handshake_rejection,
+        log_metrics_tls_handshake_timeout, metrics_tls_acceptor_or_disable,
         mint_gateway_extension_credential, serve_gateway_listener, serve_tls_metrics_listener,
         validate_peer_endpoint_scheme,
     };
@@ -3134,6 +3156,49 @@ mod tests {
             limiter.record(start + Duration::from_secs(60)),
             Some(2),
             "the next warning reports the rejected handshakes suppressed during the interval"
+        );
+    }
+
+    #[test]
+    fn metrics_tls_handshake_timeout_warns_independently_of_rejections() {
+        use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuffer(buffer.clone());
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+        );
+        let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+        let limiters = MetricsTlsHandshakeLogLimiters::new(Duration::from_secs(60));
+        let client = "192.0.2.10:443".parse().expect("valid test client address");
+
+        // A rejected handshake warns once and suppresses further rejections
+        // for the interval; a timeout during that window must still warn with
+        // its own message and counts instead of being absorbed by the
+        // rejection limiter.
+        log_metrics_tls_handshake_rejection(
+            &limiters.rejections,
+            &Error::new(ErrorKind::InvalidData, "untrusted client certificate"),
+            client,
+        );
+        log_metrics_tls_handshake_timeout(&limiters.timeouts, client);
+
+        let output = String::from_utf8(buffer.lock().expect("trace buffer lock").clone())
+            .expect("tracing output is UTF-8");
+        assert!(
+            output.contains("metrics_tls_handshake_rejected"),
+            "log output: {output}"
+        );
+        assert!(
+            output.contains("Metrics TLS handshakes timed out"),
+            "the timeout still warns after a rejected handshake: {output}"
+        );
+        assert!(
+            output.matches("WARN").count() >= 2,
+            "both the rejection and the timeout warn: {output}"
         );
     }
 
