@@ -26,6 +26,12 @@ pub const SSH_SOCKET_PATH: &str = "OPENSHELL_SSH_SOCKET_PATH";
 /// Log level for the sandbox supervisor (e.g. `"debug"`, `"info"`, `"warn"`).
 pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 
+/// Directory where the supervisor writes its rotated log files.
+pub const LOG_DIR: &str = "OPENSHELL_LOG_DIR";
+
+/// Supervisor log directory when [`LOG_DIR`] is not set.
+pub const DEFAULT_LOG_DIR: &str = "/var/log";
+
 /// OTLP/gRPC collector endpoint for supervisor trace export.
 pub const OTLP_ENDPOINT: &str = "OPENSHELL_OTLP_ENDPOINT";
 

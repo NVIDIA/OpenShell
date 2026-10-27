@@ -134,6 +134,14 @@ struct Args {
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
     log_level: String,
 
+    /// Directory for rotated supervisor log files.
+    #[arg(
+        long,
+        default_value = openshell_core::sandbox_env::DEFAULT_LOG_DIR,
+        env = openshell_core::sandbox_env::LOG_DIR
+    )]
+    log_dir: PathBuf,
+
     /// OTLP/gRPC collector endpoint for supervisor trace export.
     #[arg(long, env = openshell_core::sandbox_env::OTLP_ENDPOINT)]
     otlp_endpoint: Option<String>,
@@ -526,7 +534,7 @@ fn main() -> Result<()> {
 
         let (logging_layers, _logging_guards, file_available) = logging::layers(
             std::io::stderr(),
-            Path::new("/var/log"),
+            &args.log_dir,
             console_filter,
             ocsf_enabled.clone(),
             ocsf_schema_version.clone(),
@@ -543,7 +551,10 @@ fn main() -> Result<()> {
             )
             .init();
         if !file_available {
-            warn!("Could not open /var/log for log rotation; using stderr-only logging");
+            warn!(
+                log_dir = %args.log_dir.display(),
+                "Could not open log directory for rotation; using stderr-only logging"
+            );
         }
         if let Some(error) = otlp_setup_error {
             warn!(%error, "OTLP exporting could not be started; continuing without it");
@@ -638,6 +649,7 @@ fn main() -> Result<()> {
                         enabled: ocsf_enabled,
                         target_version: ocsf_schema_version,
                     },
+                    args.log_dir.clone(),
                 );
                 let result = Box::pin(openshell_supervisor::run_sandbox_with_backend(
                     backend_setup.as_ref(),
@@ -985,6 +997,18 @@ mod tests {
                 .payload,
             vec![0]
         );
+    }
+
+    #[test]
+    fn log_dir_defaults_to_var_log_and_accepts_an_override() {
+        let args = Args::try_parse_from(["openshell-supervisor"]).unwrap();
+        assert_eq!(
+            args.log_dir,
+            Path::new(openshell_core::sandbox_env::DEFAULT_LOG_DIR)
+        );
+        let args =
+            Args::try_parse_from(["openshell-supervisor", "--log-dir", "/tmp/logs"]).unwrap();
+        assert_eq!(args.log_dir, Path::new("/tmp/logs"));
     }
 
     #[test]

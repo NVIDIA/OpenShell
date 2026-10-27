@@ -312,6 +312,7 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         openshell_core::grpc_client::GatewayCredentials::from_auth_bundle(&config.auth_bundle)
             .unwrap(),
         openshell_ocsf::OcsfJsonSettings::default(),
+        std::path::PathBuf::from(openshell_core::sandbox_env::DEFAULT_LOG_DIR),
     );
     let startup = run_sandbox_with_backend(&setup, config, bindings, None, None);
     tokio::pin!(startup);

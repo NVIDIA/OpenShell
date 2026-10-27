@@ -214,6 +214,8 @@ const GUEST_BOUNDARY_CONFIG_DIR: &str = "/.openshell/state";
 const GUEST_BOUNDARY_CONFIG_ENV: &str = "OPENSHELL_VM_SANDBOX_BOOTSTRAP";
 const HOST_AUTH_BUNDLE_FILE: &str = "supervisor-auth.json";
 const HOST_RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
+/// Private directory in the sandbox state directory for supervisor log files.
+const HOST_SUPERVISOR_LOG_DIR: &str = "logs";
 const HOST_BOUNDARY_GENERATION_FILE: &str = "boundary-generation";
 /// Per-sandbox host-only copy of the gateway-normalized destination trust.
 ///
@@ -1428,6 +1430,12 @@ impl VmDriver {
         .map_err(|error| Status::internal(format!("encode main process spec: {error}")))?;
         let upstream_proxy_args = upstream_proxy_cli_args(&self.config)
             .map_err(|error| Status::invalid_argument(format!("render upstream proxy: {error}")))?;
+        // The host supervisor cannot count on a writable `/var/log`, and
+        // sandboxes must not share log files there.
+        let log_dir = state_dir.join(HOST_SUPERVISOR_LOG_DIR);
+        create_private_dir_all(&log_dir)
+            .await
+            .map_err(|error| Status::internal(format!("create supervisor log dir: {error}")))?;
         let mut command = Command::new(&supervisor_binary);
         isolate_host_control_environment(&mut command);
         command
@@ -1482,6 +1490,7 @@ impl VmDriver {
                 openshell_core::sandbox_env::LOG_LEVEL,
                 openshell_core::driver_utils::sandbox_log_level(sandbox, &self.config.log_level),
             )
+            .env(openshell_core::sandbox_env::LOG_DIR, &log_dir)
             .env(
                 openshell_core::sandbox_env::TELEMETRY_ENABLED,
                 openshell_core::telemetry::enabled_env_value(),
