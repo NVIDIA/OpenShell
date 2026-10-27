@@ -17,6 +17,11 @@ on:
         required: false
         type: string
         default: ""
+      artifact-run-id:
+        description: Run whose snap-linux-* artifacts are uploaded; defaults to the current run
+        required: false
+        type: string
+        default: ""
     secrets:
       SNAPCRAFT_STORE_CREDENTIALS:
         required: true
@@ -119,6 +124,11 @@ jobs:
           snap_file="${snaps[0]}"
           snap_name="${snap_file%.snap}"
           snap_name="${snap_name%%_*}"
+          # Artifacts can come from another run, so confirm they were built for this tag.
+          if [[ -n "${INPUTS_RELEASE_TAG}" && "${snap_file}" != "${snap_name}_${INPUTS_RELEASE_TAG#v}_"* ]]; then
+            echo "${snap_file} was not built for ${INPUTS_RELEASE_TAG}" >&2
+            exit 1
+          fi
           component_args=()
           for comp in "${snap_name}"+*.comp; do
             component_file="${comp##*/}"

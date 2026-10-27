@@ -42,11 +42,46 @@ on:
         required: true
         type: string
 
-permissions: {}
+permissions:
+  contents: read
 
 jobs:
+  # Dispatch inputs are free-form, so confirm they describe a published release.
+  verify:
+    name: Verify Release Inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check tag, commit and wheels
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ inputs.source-sha }}
+          RELEASE_VERSION: ${{ inputs.python-version }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+          WHEEL_FILENAMES: ${{ inputs.wheel-filenames }}
+        run: |
+          set -euo pipefail
+          tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_TAG}" --jq .sha)
+          if [[ "${tag_sha}" != "${COMMIT_SHA}" ]]; then
+            echo "${RELEASE_TAG} points to ${tag_sha}, not ${COMMIT_SHA}" >&2
+            exit 1
+          fi
+          assets=$(gh release view "${RELEASE_TAG}" -R "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')
+          for wheel in ${WHEEL_FILENAMES//,/ }; do
+            if ! grep -qxF "${wheel}" <<<"${assets}"; then
+              echo "${wheel} is not attached to the ${RELEASE_TAG} release" >&2
+              exit 1
+            fi
+            if [[ "${wheel}" != *"-${RELEASE_VERSION}-"* ]]; then
+              echo "${wheel} is not version ${RELEASE_VERSION}" >&2
+              exit 1
+            fi
+          done
+
   trigger:
     name: Trigger Wheel Publish
+    needs: verify
     runs-on: [self-hosted, nv]
     timeout-minutes: 10
     steps:
