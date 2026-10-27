@@ -1238,6 +1238,10 @@ runtime-selected profile.
 
 ### MXC
 
+Use a build from the [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+See the [Windows guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md)
+for build prerequisites and runtime limitations.
+
 The MXC driver is Windows-only and opt-in. It links into the gateway and invokes Microsoft MXC through `wxc-exec.exe`. The driver starts `openshell-supervisor --role=isolation-backend` on the host and `openshell-windows-sandbox.exe` inside each ProcessContainer. The standard authenticated Sandbox Protocol and supervisor session provide lifecycle, exec, forwarding, provider refresh, and network policy.
 
 MXC does not support foreground attachment to the main process. Use `--detach`
@@ -1247,18 +1251,12 @@ The dedicated `openshell-windows-sandbox.exe` uses a Windows boundary library fo
 
 The Windows sandbox initiates its authenticated control connection to a generation-scoped loopback listener in the host isolation backend. This follows the Windows relay's connection direction without changing host firewall rules. TLS identity verification and supervisor bearer authentication remain required.
 
-This development branch temporarily asserts MXC outer-fence guarantees for Windows-branch compatibility testing. These assertions do not establish supervisor-only egress or verified live revocation. Workloads can bypass the proxy to reach other host-local services. Do not use this compatibility path as a production-qualified security boundary; passing E2E does not close these known gaps.
+The `windows` branch implementation temporarily asserts MXC outer-fence guarantees for compatibility testing. These assertions do not establish supervisor-only egress or verified live revocation. Workloads can bypass the proxy to reach other host-local services. Do not use this compatibility path as a production-qualified security boundary; passing E2E does not close these known gaps.
 
 #### Prepare the Windows host
 
-Build the native binaries from the `windows` branch on a Windows
-MSVC host. Use `mise run --skip-tools windows:build:x64` for x64 or
-`mise run --skip-tools windows:build:arm64` for ARM64. These tasks build
-`openshell-gateway.exe`, `openshell.exe`, `openshell-supervisor.exe`, and
-`openshell-windows-sandbox.exe`, and stage the target-matching `libz3.dll` beside
-them under `target/<target-triple>/release`. Keep these files together when
-copying to a runtime host, and install the matching Visual C++ runtime there.
-The Windows MSVC workflow does not publish Windows release downloads.
+For the Windows source, build prerequisites, and matching runtime binaries,
+see the [Windows build guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md#build).
 
 Copy `wxc-exec.exe` to a regular directory outside an MSIX or `WindowsApps`
 package directory. Package ACLs can prevent the gateway from starting it.

@@ -7,10 +7,17 @@ metadata:
 
 # Build OpenShell-MXC for Windows
 
-This skill maintains the existing native Windows MSVC and MXC runtime lane in
-the OpenShell repository's `windows` branch. Use that branch for
-MXC runtime work; do not treat this skill as a first-time porting recipe unless
-the user explicitly asks for a new fork or a from-scratch bring-up.
+This skill maintains the existing native Windows MSVC build lane in the
+OpenShell repository's [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+That branch owns native Windows implementation and releases. Shared docs may
+also appear on `main`; always direct Windows work to `windows` and use explicit
+Windows branch links for implementation details. See
+[Native Windows support](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md).
+
+Before running the tasks below, use a `windows`-based checkout and read the
+[skill from that branch](https://github.com/NVIDIA/OpenShell/blob/windows/.agents/skills/build-openshell-mxc-windows/SKILL.md).
+The task and runtime descriptions refer to that checkout, not to any older
+Windows source snapshot retained on `main`.
 
 The lane validates that OpenShell can compile and test on Windows MSVC for the
 supported deliverables:
@@ -238,21 +245,36 @@ $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
 switch ($arch.ToString()) {
     "X64" {
         mise run --skip-tools windows:ci
+        if ($LASTEXITCODE -ne 0) { throw "windows:ci failed." }
         mise run --skip-tools windows:test:mxc-real:x64
+        if ($LASTEXITCODE -ne 0) { throw "windows:test:mxc-real:x64 failed." }
+        mise run --skip-tools windows:e2e:mxc
+        if ($LASTEXITCODE -ne 0) { throw "MXC E2E validation failed or was incomplete." }
     }
     "Arm64" {
         mise run --skip-tools windows:check:arm64
+        if ($LASTEXITCODE -ne 0) { throw "windows:check:arm64 failed." }
         mise run --skip-tools windows:build:arm64
+        if ($LASTEXITCODE -ne 0) { throw "windows:build:arm64 failed." }
         mise run --skip-tools windows:test:arm64
+        if ($LASTEXITCODE -ne 0) { throw "windows:test:arm64 failed." }
         mise run --skip-tools windows:test:unsupported:arm64
+        if ($LASTEXITCODE -ne 0) { throw "windows:test:unsupported:arm64 failed." }
         mise run --skip-tools windows:test:mxc-real:arm64
+        if ($LASTEXITCODE -ne 0) { throw "windows:test:mxc-real:arm64 failed." }
         mise run --skip-tools windows:artifacts
+        if ($LASTEXITCODE -ne 0) { throw "windows:artifacts failed." }
+        mise run --skip-tools windows:e2e:mxc
+        if ($LASTEXITCODE -ne 0) { throw "MXC E2E validation failed or was incomplete." }
     }
     default {
         throw "Unsupported Windows host architecture for OpenShell MSVC validation: $arch"
     }
 }
 ```
+
+Full validation requires an MXC-capable host. E2E exits nonzero when any
+required runtime scenario fails or skips.
 
 On x64 hosts, `windows:ci` is the full current CI contract and runs in this
 order:

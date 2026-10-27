@@ -21,7 +21,7 @@ the sandbox record and driver-supported persistent storage.
 | [Podman](#podman-driver) | `podman` | Rootless Linux workstations without a Docker daemon. |
 | [MicroVM](#microvm-driver) | `vm` | Workloads need a VM boundary instead of a container boundary. |
 | [Kubernetes](#kubernetes-driver) | `kubernetes` | Shared clusters, remote compute, and GPU scheduling. |
-| [Windows MXC](/how-it-works/gateways/configuration#mxc) | `mxc` | Experimental native Windows commands in ProcessContainers on the `windows` branch. |
+| [Windows MXC](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md) | `mxc` | Native Windows workloads on x64 or ARM64. |
 
 ## Select a Compute Driver
 
@@ -37,7 +37,7 @@ compute_driver = "docker"
 
 Every gateway TOML file must start with the `[openshell]` table and `version = 2`, or `openshell-gateway config preflight` rejects it with `missing_version`. The remaining examples on this page show only the tables they change.
 
-When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The VM and MXC drivers are never auto-detected. Native Windows gateways must explicitly select `mxc`; the other built-in compute drivers are unsupported on native Windows.
+When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The VM and MXC drivers are never auto-detected.
 
 Configure driver-specific values, such as images, endpoints, and sizing, under `[openshell.drivers.<name>]`. See the [Gateway Configuration File](/how-it-works/gateways/configuration) reference for every option.
 

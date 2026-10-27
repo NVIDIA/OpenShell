@@ -54,24 +54,15 @@ OpenShell publishes multi-architecture gateway images for `linux/amd64` and `lin
 | Linux (Debian/Ubuntu)            | aarch64 (arm64)       | Supported |
 | macOS (Docker Desktop)           | Apple Silicon (arm64) | Supported |
 | Windows (WSL 2 + Docker Desktop) | x86_64                | Experimental  |
+| [Native Windows (MXC)](#windows) | x86_64 and ARM64 | `windows` branch |
 
 On Linux, the `openshell` CLI is a static musl binary and does not require glibc at runtime.
 
-### Native Windows development builds
+### Windows
 
-The `windows` branch also builds native x64 and ARM64 binaries for
-the experimental MXC runtime. Its Windows MSVC workflow validates and builds
-the binaries but does not upload or publish Windows release artifacts. Build
-from source on a Windows MSVC host and deploy `openshell-gateway.exe`,
-`openshell.exe`, `openshell-supervisor.exe`, `openshell-windows-sandbox.exe`,
-and the matching `libz3.dll` together. The runtime host also needs the native
-Visual C++ runtime and MXC 1.0.0 with ProcessContainer host-loopback support.
-
-Native Windows gateways use MXC. Docker, Podman, Kubernetes, and MicroVM compute
-drivers return unsupported errors on native Windows. See [MXC
-configuration](/how-it-works/gateways/configuration#mxc) for host preparation
-and the current enforcement and qualification limits. This development path
-is not production-qualified.
+Native Windows uses MXC and is separate from WSL 2. Use the
+[Windows guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md)
+for builds from `windows`, host requirements, and enforcement limitations.
 
 ## Standalone Gateway Binary
 
@@ -143,7 +134,6 @@ The gateway can manage sandboxes through several runtimes.
 | Podman | Supported for rootless local and workstation workflows. | Requires a Podman-compatible socket and rootless networking setup. |
 | Kubernetes | Supported through the [OpenShell Helm chart](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md). | Requires a Kubernetes cluster supplied by the operator. |
 | MicroVM | Supported for VM-backed sandboxes. | Uses the VM compute driver and libkrun-based runtime. |
-| Windows MXC | Experimental on the `windows` branch. | Native Windows commands in ProcessContainers; source build only. See [MXC configuration](/how-it-works/gateways/configuration#mxc). |
 
 ## Software Prerequisites
 
@@ -165,9 +155,8 @@ Docker, Podman, Kubernetes, and MicroVM accept standard Linux OCI images. The bu
 minimal Ubuntu Noble userspace and does not bundle agent CLIs. Operators can
 change the default, and users can select an explicit image with `--from`.
 
-Native Windows MXC launches a Windows command with an absolute working
-directory supplied through `--driver-config-json`; it does not start workloads
-from OCI images. See [MXC configuration](/how-it-works/gateways/configuration#mxc).
+Native Windows MXC runs host commands rather than OCI images. See the
+[Windows guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md).
 
 ## Container Images
 

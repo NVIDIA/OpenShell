@@ -1,5 +1,11 @@
 # openshell-driver-mxc
 
+Native Windows implementation and releases stay on the
+[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Start with the [Windows guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md)
+for checkout and build instructions, including when this README is linked
+from documentation on `main`.
+
 The Windows-only MXC compute driver runs each workload in a Microsoft MXC
 ProcessContainer while preserving OpenShell's standard RFC 0012 runtime split:
 

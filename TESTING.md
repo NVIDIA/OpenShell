@@ -2,6 +2,12 @@
 
 ## Running Tests
 
+The general E2E commands below use Linux sandbox runtimes. For native Windows,
+use a [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows)
+checkout and the [native Windows validation](#native-windows-validation) lane.
+Windows implementation and releases remain on that branch when this testing
+guide is also published on `main`.
+
 ```bash
 mise run test          # Rust + Python unit tests
 mise run e2e           # End-to-end tests (starts a Docker-backed gateway)
@@ -71,6 +77,44 @@ task skips them. Run them on an idle machine with
 `mise run test:rust:postgres:bench`.
 
 ### Native Windows validation
+
+Start with the [Windows build prerequisites](WINDOWS.md#build) in a checkout
+based on `windows`. Run the lane matching the native host:
+
+```powershell
+# Native x64 host
+mise run --skip-tools windows:lint:x64
+mise run --skip-tools windows:build:x64
+mise run --skip-tools windows:test:x64
+mise run --skip-tools windows:test:unsupported:x64
+
+# Native ARM64 host
+mise run --skip-tools windows:lint:arm64
+mise run --skip-tools windows:build:arm64
+mise run --skip-tools windows:test:arm64
+mise run --skip-tools windows:test:unsupported:arm64
+```
+
+The test tasks use the CI nextest profile and server test support. They reject
+a target that does not match the host architecture. `windows:ci` is the x64-host
+aggregate, including ARM64 cross-check/build unless explicitly skipped; it
+does not establish native ARM64 test coverage.
+
+For runtime validation, provision a capable MXC host and build its native
+release binaries first. On x64, run:
+
+```powershell
+mise run --skip-tools windows:test:mxc-real:x64
+mise run --skip-tools windows:e2e:mxc
+```
+
+Use `windows:test:mxc-real:arm64` on ARM64. The real-runtime unit tests can
+report `SKIP` when the executor or backend is absent; E2E returns nonzero
+when required runtime coverage is missing. Report passed, failed, and
+skipped/ignored executions separately, including why any probe gated coverage.
+Passing E2E does not qualify the [known Windows enforcement gaps](WINDOWS.md#runtime-and-current-limits).
+See the [Windows test task definitions](https://github.com/NVIDIA/OpenShell/blob/windows/tasks/windows.toml)
+for boundary, loopback, network, and audit suites.
 
 Use `mise run --skip-tools pre-commit` with the existing Rust/MSVC toolchain.
 Windows now checks tracked Cargo lockfiles through PowerShell rather than
