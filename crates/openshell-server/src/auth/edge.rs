@@ -12,7 +12,7 @@
 //! [`JwksCache`], the same verifier OIDC uses.
 
 use super::authenticator::{AuthRejection, Authentication, Authenticator};
-use super::http::extract_cookie;
+use super::http::cookie_value;
 use super::oidc::JwksCache;
 use async_trait::async_trait;
 use std::borrow::Cow;
@@ -33,10 +33,7 @@ pub fn edge_credential(headers: &http::HeaderMap) -> Option<Cow<'_, str>> {
         .filter(|value| !value.is_empty())
         .map(Cow::Borrowed);
     from_header.or_else(|| {
-        headers
-            .get(http::header::COOKIE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|cookies| extract_cookie(cookies, EDGE_TOKEN_COOKIE))
+        cookie_value(headers, EDGE_TOKEN_COOKIE)
             .filter(|value| !value.is_empty())
             .map(Cow::Owned)
     })
@@ -153,6 +150,15 @@ mod tests {
     #[test]
     fn credential_falls_back_to_cookie() {
         let map = headers(&[("cookie", "theme=dark; CF_Authorization=from-cookie; a=b")]);
+        assert_eq!(edge_credential(&map).as_deref(), Some("from-cookie"));
+    }
+
+    #[test]
+    fn credential_reads_cookies_split_across_headers() {
+        let map = headers(&[
+            ("cookie", "theme=dark"),
+            ("cookie", "CF_Authorization=from-cookie"),
+        ]);
         assert_eq!(edge_credential(&map).as_deref(), Some("from-cookie"));
     }
 

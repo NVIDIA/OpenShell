@@ -1063,7 +1063,7 @@ where
 ///
 /// When no bearer authenticators are configured, the chain is left as `None`.
 /// The router still requires an mTLS principal or the explicit development opt-in.
-fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
+pub fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
     if let Some(peer) = state.peer_authenticator.clone() {
         authenticators.push(peer);
@@ -1132,7 +1132,7 @@ impl<S> AuthGrpcRouter<S> {
         Self::with_peer_identity(inner, authenticator_chain, authz_policy, None, false, false)
     }
 
-    fn with_peer_identity(
+    pub(crate) fn with_peer_identity(
         inner: S,
         authenticator_chain: Option<AuthenticatorChain>,
         authz_policy: Option<AuthzPolicy>,

@@ -100,6 +100,12 @@ impl TokenKind {
         self == Self::CloudflareAccess
     }
 
+    /// Cloudflare service tokens carry an empty `sub`, which would merge
+    /// every such caller into one identity. OIDC has always accepted it.
+    fn rejects_empty_subject(self) -> bool {
+        self == Self::CloudflareAccess
+    }
+
     /// The human-readable name for the caller: `preferred_username` for
     /// OIDC, `email` for edge tokens.
     fn display_name(self, claims: &mut OidcClaims) -> Option<String> {
@@ -1001,9 +1007,7 @@ impl JwksCache {
         })?;
 
         let mut claims = token_data.claims;
-        // A token without a subject would collapse every caller into one
-        // identity. Cloudflare service tokens carry an empty `sub`.
-        if claims.sub.is_empty() {
+        if self.kind.rejects_empty_subject() && claims.sub.is_empty() {
             return Err(self.reject(
                 AuthFailureReason::InvalidCredential,
                 Status::unauthenticated("invalid token: empty subject"),
@@ -1643,6 +1647,21 @@ mod tests {
         assert_eq!(identity.roles, vec!["openshell-user".to_owned()]);
         assert_eq!(identity.scopes, vec!["sandbox:write".to_owned()]);
         assert_eq!(identity.provider, IdentityProvider::Oidc);
+    }
+
+    #[tokio::test]
+    async fn oidc_token_with_empty_subject_is_still_accepted() {
+        let server = wiremock::MockServer::start().await;
+        let cache = cache_with_mock_issuer(&server).await;
+
+        let mut claims = claims_for(&server.uri(), TEST_AUDIENCE, now_secs() + 3600);
+        claims["sub"] = serde_json::json!("");
+        let identity = cache
+            .validate_token(&mint_rs256(&claims, TEST_KID))
+            .await
+            .expect("only edge tokens reject an empty subject");
+
+        assert_eq!(identity.subject, "");
     }
 
     #[tokio::test]
@@ -2684,6 +2703,93 @@ mod tests {
                 assert_eq!(rejection.reason, reason);
                 assert_eq!(rejection.status.code(), tonic::Code::Unauthenticated);
             }
+        }
+
+        /// Through the real chain construction, a request without a valid
+        /// edge token is rejected rather than treated as local development.
+        #[tokio::test]
+        async fn router_requires_an_edge_token_on_every_request() {
+            use crate::compute::new_test_runtime;
+            use crate::multiplex::{AuthGrpcRouter, build_authenticator_chain};
+            use crate::persistence::Store;
+            use crate::sandbox_index::SandboxIndex;
+            use crate::sandbox_watch::SandboxWatchBus;
+            use crate::supervisor_session::SupervisorSessionRegistry;
+            use crate::tracing_bus::TracingLogBus;
+            use std::sync::Mutex;
+            use tower::Service;
+
+            let server = MockServer::start().await;
+            let config = openshell_core::Config::new(None).with_edge_auth(edge_config());
+            crate::auth::edge::validate_config(&config).expect("edge-only config is valid");
+            let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+            let compute = new_test_runtime(store.clone()).await;
+            let mut state = crate::ServerState::new(
+                config,
+                store,
+                compute,
+                SandboxIndex::new(),
+                SandboxWatchBus::new(),
+                TracingLogBus::new(),
+                Arc::new(SupervisorSessionRegistry::new()),
+                None,
+            );
+            state.edge_auth_cache = Some(Arc::new(edge_cache(&server).await));
+
+            let reached = Arc::new(Mutex::new(Vec::new()));
+            let recorded = reached.clone();
+            let inner = tower::service_fn(move |req: http::Request<()>| {
+                let principal = req.extensions().get::<Principal>().cloned();
+                recorded.lock().unwrap().push(principal);
+                async {
+                    Ok::<_, std::convert::Infallible>(http::Response::new(
+                        tonic::body::Body::empty(),
+                    ))
+                }
+            });
+            let mut router = AuthGrpcRouter::with_peer_identity(
+                inner,
+                build_authenticator_chain(&state),
+                crate::auth::authz::AuthzPolicy::from_config(&state.config),
+                None,
+                state.config.mtls_auth.enabled,
+                state.config.auth.allow_unauthenticated_users,
+            );
+            let call = |header: Option<&str>| {
+                let mut request =
+                    http::Request::builder().uri("/openshell.v1.OpenShell/ListSandboxes");
+                if let Some(token) = header {
+                    request = request.header(crate::auth::edge::EDGE_TOKEN_HEADER, token);
+                }
+                request.body(()).unwrap()
+            };
+            let status = |response: &http::Response<tonic::body::Body>| {
+                response
+                    .headers()
+                    .get("grpc-status")
+                    .map(|value| value.to_str().unwrap().to_owned())
+            };
+
+            let unauthenticated = tonic::Code::Unauthenticated as i32;
+            for header in [None, Some("garbage")] {
+                let response = router.call(call(header)).await.unwrap();
+                assert_eq!(
+                    status(&response).as_deref(),
+                    Some(unauthenticated.to_string().as_str()),
+                    "token {header:?}"
+                );
+            }
+            assert!(reached.lock().unwrap().is_empty(), "handler was reached");
+
+            let token = mint_rs256(&access_claims(now_secs() + 3600), TEST_KID);
+            let response = router.call(call(Some(&token))).await.unwrap();
+            assert_eq!(status(&response), None);
+            let reached = reached.lock().unwrap();
+            let Some(Some(Principal::User(user))) = reached.first() else {
+                panic!("expected a user principal, got {reached:?}");
+            };
+            assert_eq!(user.identity.subject, "user-1");
+            assert_eq!(user.identity.provider, IdentityProvider::CloudflareAccess);
         }
 
         #[tokio::test]
