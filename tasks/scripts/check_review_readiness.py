@@ -10,6 +10,7 @@
 """Validate accepted work and reconcile reviewers from the merged REVIEWERS.md.
 
 Preview with --repo OWNER/REPO --pr NUMBER; add --apply to update the PR.
+Use --acceptance-only to report acceptance without routing or changing the PR.
 Unaccepted work is moved to draft before any reviewer requests are changed.
 Request all matching members with write access, excluding the author. Preserve
 manual choices, unknown request provenance, and anyone who commented or reviewed.
@@ -29,6 +30,10 @@ from pathlib import Path
 HEADER = ["Name", "GitHub ID", "Company/Organization"]
 LABEL = re.compile(r"(?:area|topic):[a-z0-9]+(?:-[a-z0-9]+)*")
 PROFILE = re.compile(r"\[@([a-z0-9-]+)\]\(https://github\.com/([a-z0-9-]+)/?\)", re.I)
+ACCEPTANCE_ERROR = (
+    "PR is not accepted work: the author needs repository write access "
+    "or a referenced state:accepted issue they submitted themselves"
+)
 
 
 @dataclass(frozen=True)
@@ -345,10 +350,7 @@ def check_review_readiness(
                 }""",
                 id=pr["node_id"],
             )
-        raise ValueError(
-            "PR is not accepted work: the author needs repository write access "
-            "or a referenced state:accepted issue they submitted themselves"
-        )
+        raise ValueError(ACCEPTANCE_ERROR)
     categories = parse_reviewers(reviewers.read_text(encoding="utf-8"))
     selected = select_reviewers(categories, {label["name"] for label in pr["labels"]})
     selected = _eligible_reviewers(repository, selected - {pr["user"]["login"].lower()})
@@ -381,20 +383,40 @@ def main(argv: list[str] | None = None) -> int:
         choices=("opened", "ready_for_review", "labeled", "unlabeled"),
         help="PR event; acceptance is checked on opened and ready_for_review",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--acceptance-only", action="store_true",
+        help="report acceptance without reading the roster or changing the PR",
+    )
+    mode.add_argument(
         "--apply", action="store_true", help="update requests or draft unaccepted work"
     )
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo) or args.pr <= 0:
         parser.error("--repo must be OWNER/REPO and --pr must be positive")
     try:
-        plan = check_review_readiness(
-            args.reviewers, args.repo, args.pr, apply=args.apply, event=args.event
-        )
+        if args.acceptance_only:
+            owner, repo = args.repo.split("/")
+            pr = _graphql(
+                """query($owner: String!, $repo: String!, $number: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $number) { user: author { login } body }
+                  }
+                }""",
+                owner=owner, repo=repo, number=args.pr,
+            )["repository"]["pullRequest"]
+            if not _accepted_work(args.repo, args.pr, pr):
+                raise ValueError(ACCEPTANCE_ERROR)
+            result = {"accepted": True}
+        else:
+            plan = check_review_readiness(
+                args.reviewers, args.repo, args.pr, apply=args.apply, event=args.event
+            )
+            result = asdict(plan) if plan is not None else {"skipped": "closed or draft PR"}
     except (OSError, UnicodeError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"Review readiness: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps(asdict(plan) if plan is not None else {"skipped": "closed or draft PR"}))
+    print(json.dumps(result))
     return 0
 
 

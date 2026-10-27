@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Offline tests for roster parsing and PR reviewer reconciliation."""
+"""Offline tests for PR acceptance, roster parsing, and reviewer reconciliation."""
 
 from __future__ import annotations
 
@@ -595,6 +595,124 @@ class ReconciliationTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_both_cli_modes_use_the_same_acceptance_policy(self):
+        cases = [
+            ("WRITE", "", (), {}, True),
+            ("READ", "Related to #1", (), {1: ("author", True)}, True),
+            ("READ", "Closes #1", (1,), {1: ("someone-else", True)}, False),
+            ("READ", "Closes #1 and #2", (1, 2),
+             {1: ("author", True), 2: ("author", False)}, True),
+            ("READ", "Related to #1", (), {1: ("author", False)}, False),
+            ("READ", "", (), {}, False),
+        ]
+        for acceptance_only in (False, True):
+            for permission, body, linked, issues, expected in cases:
+                with self.subTest(acceptance_only=acceptance_only, body=body, issues=issues), tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "REVIEWERS.md"
+                    path.write_text(DOCUMENT, encoding="utf-8")
+                    value = pr("area:runtime", body=body)
+
+                    def api(endpoint, **kwargs):
+                        if endpoint == PULL:
+                            return value
+                        self.assertEqual(endpoint, "graphql")
+                        query = kwargs["data"]["query"]
+                        self.assertNotIn("mutation", query)
+                        if "user: author" in query:
+                            self.assertEqual(kwargs["data"]["variables"]["number"], 42)
+                            return {"data": {"repository": {"pullRequest": value}}}
+                        if "collaborators" in query:
+                            return AcceptanceTests.member(permission)
+                        if "closingIssuesReferences" in query:
+                            return AcceptanceTests.linked(*linked)
+                        self.assertIn("issueOrPullRequest", query)
+                        author, accepted = issues[kwargs["data"]["variables"]["number"]]
+                        return AcceptanceTests.issue(author, accepted)
+
+                    output, errors = io.StringIO(), io.StringIO()
+                    with (
+                        mock.patch.object(routing, "_api", side_effect=api),
+                        mock.patch.object(routing, "_eligible_reviewers", return_value={"alice"}) as eligible,
+                        mock.patch.object(routing, "_load_reviewers", return_value=reviewers()) as load,
+                        contextlib.redirect_stdout(output),
+                        contextlib.redirect_stderr(errors),
+                    ):
+                        argv = ["--repo", REPO, "--pr", "42", "--reviewers", str(path)]
+                        status = routing.main(argv + (["--acceptance-only"] if acceptance_only else []))
+                    self.assertEqual(status, 0 if expected else 1)
+                    if expected:
+                        self.assertEqual(json.loads(output.getvalue()),
+                                         {"accepted": True} if acceptance_only else {"add": ["alice"], "remove": []})
+                    else:
+                        self.assertIn(routing.ACCEPTANCE_ERROR, errors.getvalue())
+                    if acceptance_only:
+                        eligible.assert_not_called()
+                        load.assert_not_called()
+
+    def test_acceptance_only_checks_drafts_and_closed_prs_without_routing(self):
+        for value in (pr(), pr(draft=True), pr(state="closed")):
+            for accepted in (False, True):
+                with self.subTest(value=value, accepted=accepted):
+                    output, errors = io.StringIO(), io.StringIO()
+                    with (
+                        mock.patch.object(routing, "_graphql", return_value={"repository": {"pullRequest": value}}) as query,
+                        mock.patch.object(routing, "_accepted_work", return_value=accepted) as check,
+                        mock.patch.object(routing, "check_review_readiness") as route,
+                        mock.patch.object(routing, "parse_reviewers") as parse,
+                        mock.patch.object(routing.Path, "read_text", side_effect=AssertionError("Acceptance-only must not read the roster")),
+                        contextlib.redirect_stdout(output),
+                        contextlib.redirect_stderr(errors),
+                    ):
+                        status = routing.main(["--repo", REPO, "--pr", "42", "--acceptance-only"])
+                    self.assertEqual(status, 0 if accepted else 1)
+                    check.assert_called_once_with(REPO, 42, value)
+                    query.assert_called_once()
+                    self.assertNotIn("mutation", query.call_args.args[0])
+                    route.assert_not_called()
+                    parse.assert_not_called()
+
+    def test_acceptance_only_lookup_errors_fail_without_routing(self):
+        for metadata_error in (False, True):
+            error = subprocess.CalledProcessError(1, "gh")
+            with (
+                self.subTest(metadata_error=metadata_error),
+                mock.patch.object(routing, "_graphql", side_effect=error if metadata_error else None,
+                                  return_value={"repository": {"pullRequest": pr()}}),
+                mock.patch.object(routing, "_accepted_work", side_effect=error) as check,
+                mock.patch.object(routing, "check_review_readiness") as route,
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(routing.main(["--repo", REPO, "--pr", "42", "--acceptance-only"]), 1)
+                route.assert_not_called()
+                if metadata_error:
+                    check.assert_not_called()
+
+    def test_acceptance_only_cannot_be_combined_with_apply(self):
+        with (
+            mock.patch.object(routing, "_api") as api,
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit) as error,
+        ):
+            routing.main(["--repo", REPO, "--pr", "42", "--acceptance-only", "--apply"])
+        self.assertEqual(error.exception.code, 2)
+        api.assert_not_called()
+
+    def test_acceptance_only_refreshes_metadata_for_each_pr_and_run(self):
+        for number in (7, 8, 7):
+            value = pr(body=f"Related to #{number}")
+            with (
+                self.subTest(number=number),
+                mock.patch.object(routing, "_graphql", return_value={"repository": {"pullRequest": value}}) as query,
+                mock.patch.object(routing, "_accepted_work", return_value=True) as check,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(routing.main([
+                    "--repo", REPO, "--pr", str(number), "--acceptance-only",
+                ]), 0)
+            self.assertEqual(query.call_args.kwargs["number"], number)
+            check.assert_called_once_with(REPO, number, value)
+
     def test_rejected_pr_does_not_need_a_readable_valid_roster(self):
         for contents in (None, "not a registry"):
             for apply in (False, True):
@@ -720,6 +838,27 @@ class CliTests(unittest.TestCase):
             api.assert_called_once_with(PULL)
             self.assertEqual(output.getvalue(), "")
             self.assertIn("no area/topic", errors.getvalue())
+
+
+class WorkflowTests(unittest.TestCase):
+    def test_legacy_workflow_keeps_its_status_events_and_read_only_permissions(self):
+        root = Path(__file__).resolve().parents[2]
+        workflow = (root / ".github/workflows/pr-issue-acceptance.yml").read_text()
+        self.assertIn("name: PR Issue Acceptance\n", workflow)
+        self.assertIn("    name: OpenShell / PR Issue Acceptance\n", workflow)
+        self.assertIn("types: [opened, edited, reopened, synchronize]", workflow)
+        permissions = workflow.split("permissions:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertEqual(dict(line.strip().split(": ") for line in permissions.splitlines()),
+                         {"contents": "read", "issues": "read", "pull-requests": "read"})
+        self.assertIn("ref: ${{ github.sha }}", workflow)
+        self.assertIn("persist-credentials: false", workflow)
+        self.assertIn("sparse-checkout: tasks/scripts/check_review_readiness.py", workflow)
+        self.assertIn("GH_REPO: ${{ github.repository }}", workflow)
+        self.assertIn("PR_NUMBER: ${{ github.event.pull_request.number }}", workflow)
+        command = workflow.split("        run: |\n", 1)[1]
+        self.assertIn("python3 tasks/scripts/check_review_readiness.py", command)
+        self.assertIn('--repo "$GH_REPO" --pr "$PR_NUMBER" --acceptance-only', command)
+        self.assertNotIn("--apply", command)
 
 
 if __name__ == "__main__":

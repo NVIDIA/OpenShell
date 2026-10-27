@@ -2,7 +2,7 @@
 <!-- 1-3 sentences: what this PR does and why -->
 
 ## Related Issue
-<!-- Every PR must close an existing issue covering its scope, except automated dependency updates. Use Closes #NNN; see CONTRIBUTING.md for the exception. Authors without repository write access must link at least one issue with state:accepted. PR body text cannot bypass this acceptance check. -->
+<!-- Every PR must close an existing issue covering its scope, except automated dependency updates. Use Closes #NNN; see CONTRIBUTING.md for the exception. Authors without repository write access must reference at least one target-repository issue with state:accepted that they submitted themselves. Related references qualify for acceptance when both the label and submitter match. -->
 
 ## Changes
 <!-- Bullet list of key changes -->
