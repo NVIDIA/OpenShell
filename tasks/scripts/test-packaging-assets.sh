@@ -117,6 +117,9 @@ assert_not_contains "$development_gateway" 'supervisor_image = "{{ openshell_sup
 snap_wrapper="${ROOT}/tasks/scripts/snap-gateway-wrapper.sh"
 snapcraft="${ROOT}/snapcraft.yaml"
 snap_workflow="${ROOT}/.github/workflows/snap-package.yml"
+snap_publish_workflow="${ROOT}/.github/workflows/snap-publish.yml"
+release_publish_workflow="${ROOT}/.github/workflows/release-publish.yml"
+release_prerelease_workflow="${ROOT}/.github/workflows/release-prerelease.yml"
 snap_install_docs="${ROOT}/docs/about/installation.mdx"
 snap_canary="${ROOT}/.github/workflows/release-canary.yml"
 snap_configure_hook="${ROOT}/snap/hooks/configure"
@@ -126,6 +129,9 @@ package_deb="${ROOT}/tasks/scripts/package-deb.sh"
 assert_file_exists "$snap_wrapper"
 assert_file_exists "$snapcraft"
 assert_file_exists "$snap_workflow"
+assert_file_exists "$snap_publish_workflow"
+assert_file_exists "$release_publish_workflow"
+assert_file_exists "$release_prerelease_workflow"
 assert_file_exists "$snap_install_docs"
 assert_file_exists "$snap_canary"
 assert_file_exists "$snap_configure_hook"
@@ -208,6 +214,15 @@ bash "$ROOT/tasks/scripts/test-snap-post-refresh-hook.sh" "$snap_post_refresh_ho
 assert_contains "$snap_workflow" 'name: openshell-prover-${{ matrix.rust_arch }}-unknown-linux-musl'
 assert_contains "$snap_workflow" 'chmod +x prebuilt/prover/openshell-prover'
 assert_contains "$snap_workflow" 'cp prebuilt/prover/openshell-prover snap/prebuilt/openshell-prover'
+assert_contains "$release_publish_workflow" 'uses: ./.github/workflows/snap-publish.yml'
+assert_contains "$release_publish_workflow" 'upload-channel: latest/beta'
+assert_contains "$release_publish_workflow" 'github-environment: latest/beta'
+assert_contains "$release_prerelease_workflow" 'SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}'
+assert_contains "$snap_publish_workflow" 'snapcraft upload --release "${INPUTS_UPLOAD_CHANNEL}"'
+assert_contains "$snap_publish_workflow" 'component_args+=(--component "${component_name}=${comp}")'
+assert_contains "$snap_publish_workflow" 'group: snap-publish-${{ inputs.upload-channel }}-${{ matrix.arch }}'
+assert_contains "$snap_publish_workflow" 'cancel-in-progress: false'
+assert_contains "$snap_publish_workflow" 'queue: max'
 assert_contains "$snapcraft" 'for bin in openshell openshell-prover openshell-gateway openshell-sandbox openshell-gateway-wrapper; do'
 assert_contains "$snapcraft" '"$CRAFT_PART_INSTALL/bin/openshell-prover"'
 if ! awk '

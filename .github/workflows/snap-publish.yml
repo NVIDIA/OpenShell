@@ -41,6 +41,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     environment: ${{ inputs.github-environment }}
+    concurrency:
+      group: snap-publish-${{ inputs.upload-channel }}-${{ matrix.arch }}
+      cancel-in-progress: false
+      queue: max
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: inputs.release-tag != ''
@@ -90,6 +94,9 @@ jobs:
           snap_name="${snap_name%%_*}"
           component_args=()
           for comp in "${snap_name}"+*.comp; do
-            component_args+=(--component "$comp")
+            component_file="${comp##*/}"
+            component_name="${component_file#${snap_name}+}"
+            component_name="${component_name%%_*}"
+            component_args+=(--component "${component_name}=${comp}")
           done
           snapcraft upload --release "${INPUTS_UPLOAD_CHANNEL}" "$snap_file" "${component_args[@]}"

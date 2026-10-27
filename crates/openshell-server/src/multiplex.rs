@@ -1061,9 +1061,8 @@ where
 /// local developer user when `auth.allow_unauthenticated_users` is explicitly
 /// enabled.
 ///
-/// When neither OIDC nor sandbox credentials are configured (a barebones
-/// dev gateway), the chain is left as `None` so the router short-circuits
-/// to pass-through unless mTLS or local unauthenticated users are enabled.
+/// When no bearer authenticators are configured, the chain is left as `None`.
+/// The router still requires an mTLS principal or the explicit development opt-in.
 fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
     if let Some(peer) = state.peer_authenticator.clone() {
@@ -1102,8 +1101,8 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
 /// - Strip any external `x-openshell-auth-source` marker first (so callers
 ///   cannot spoof a sandbox identity).
 /// - Health probes / reflection bypass the chain entirely.
-/// - When no chain is configured (OIDC not configured), forward without
-///   authentication — preserves today's pass-through behavior.
+/// - When no chain is configured, require an mTLS principal or the explicit
+///   development opt-in.
 /// - Otherwise, run the chain. The first match produces a `Principal`.
 ///   `Principal::User` is gated by the RBAC `AuthzPolicy`.
 ///   `Principal::Sandbox` is gated by a supervisor-method allowlist, then
@@ -1299,10 +1298,15 @@ where
             } else if allow_unauthenticated_users {
                 unauthenticated_dev_user_principal()
             } else {
-                // No auth configured — dev / fronting-proxy deployments.
-                // Inject a local-dev principal so downstream handlers that
-                // call extract_principal() always find one.
-                unauthenticated_dev_user_principal()
+                audit::emit_authentication_failure(
+                    &path,
+                    &origin(req.headers()),
+                    None,
+                    AuthFailureReason::MissingCredential,
+                );
+                return Ok(status_response(tonic::Status::unauthenticated(
+                    "authentication required",
+                )));
             };
             let origin = origin(req.headers());
             audit::emit_logon(
@@ -3523,6 +3527,51 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn operator_only_requires_operator_certificate() {
+            for (peer_identity, operator) in [
+                (None, None),
+                (Some(mtls_identity("ordinary-user")), None),
+                (
+                    Some(operator_principal().identity),
+                    Some(operator_principal()),
+                ),
+            ] {
+                let capture = OcsfCapture::default();
+                let _guard = capture.install();
+                let authenticated = operator.is_some();
+                let (recorder, seen) = PrincipalRecorder::new();
+                // Operator-only authentication has no bearer chain and disables
+                // both user mTLS authentication and the development opt-in.
+                let mut router = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    None,
+                    None,
+                    peer_identity,
+                    false,
+                    false,
+                )
+                .with_operator(operator);
+                let path = "/openshell.v1.OpenShell/ListSandboxes";
+
+                let response = router.call(empty_request(path)).await.unwrap();
+
+                if authenticated {
+                    assert!(grpc_status(&response).is_none());
+                    assert!(matches!(
+                        *seen.lock().unwrap(),
+                        Some(Principal::Operator(_))
+                    ));
+                } else {
+                    assert_eq!(grpc_status(&response).as_deref(), Some("16"));
+                    assert!(seen.lock().unwrap().is_none());
+                    let events = capture.json_events();
+                    assert_eq!(events.len(), 1, "{events:?}");
+                    assert_router_authentication_failure(&events[0], path, "missing_credential", 2);
+                }
+            }
+        }
+
+        #[tokio::test]
         async fn operator_is_admin_but_not_supervisor_peer_or_unknown() {
             for (method, permitted) in [
                 ("GetProviderCredentials", true),
@@ -3661,12 +3710,25 @@ mod tests {
                     .unwrap();
                 assert_eq!(grpc_status(&response).as_deref(), Some("7"));
             }
-            let (recorder, _) = PrincipalRecorder::new();
-            let response = AuthGrpcRouter::new(recorder, None, None)
+            // Without a bearer chain, the development opt-in still grants no
+            // access to the assignment stream. Otherwise authentication fails
+            // before method authorization.
+            for (allow_unauthenticated_users, expected_status) in [(true, "7"), (false, "16")] {
+                let (recorder, seen) = PrincipalRecorder::new();
+                let response = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    None,
+                    None,
+                    None,
+                    false,
+                    allow_unauthenticated_users,
+                )
                 .call(empty_request(attach))
                 .await
                 .unwrap();
-            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+                assert_eq!(grpc_status(&response).as_deref(), Some(expected_status));
+                assert!(seen.lock().unwrap().is_none());
+            }
         }
 
         #[tokio::test]
@@ -3697,7 +3759,8 @@ mod tests {
                 assert_eq!(grpc_status(&response).as_deref(), Some("7"));
             }
             let (recorder, _) = PrincipalRecorder::new();
-            let mut router = AuthGrpcRouter::new(recorder, None, None);
+            let mut router =
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, false, true);
             let response = router
                 .call(empty_request(
                     "/openshell.v1.OpenShell/GetProviderCredentials",
@@ -4856,6 +4919,7 @@ mod tests {
                         sandbox_id: "sandbox-a".to_string(),
                         source: SandboxIdentitySource::BootstrapJwt {
                             issuer: "openshell-gateway:test".to_string(),
+                            auth_epoch: None,
                         },
                         trust_domain: None,
                     }),

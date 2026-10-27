@@ -50,6 +50,17 @@ mod session {
     /// JOSE `typ` of the supervisor token: the credential of the gateway's
     /// shared supervisor process for the assignment stream, and nothing else.
     pub const SUPERVISOR_JWT_TYPE: &str = "openshell-supervisor+jwt";
+    /// JOSE `typ` of a supervisor takeover grant.
+    ///
+    /// The grant is the gateway's authorization for one supervisor process to
+    /// replace the owner of one runtime generation at a strictly higher
+    /// credential epoch. Only the sandbox runtime verifies it, and only while
+    /// staging a replacement attach.
+    pub const SUPERVISOR_TAKEOVER_JWT_TYPE: &str = "openshell-supervisor-takeover+jwt";
+    /// Longest lifetime of a takeover grant. Replay safety comes from the
+    /// strictly increasing epoch it names; the bound only limits how long an
+    /// unused grant stays usable.
+    pub const MAX_SUPERVISOR_TAKEOVER_TTL: Duration = Duration::from_mins(10);
     pub const SANDBOX_SESSION_AUDIENCE: &str = "openshell-sandbox";
     pub const DEFAULT_SESSION_TOKEN_TTL: Duration = Duration::from_hours(1);
     pub const MIN_SESSION_TOKEN_TTL: Duration = Duration::from_mins(1);
@@ -192,6 +203,54 @@ mod session {
         exp: i64,
         jti: String,
         component: SessionComponent,
+    }
+
+    /// Claims of a supervisor takeover grant. The subject and audience are the
+    /// sandbox's, like its Sandbox Protocol session token, but the JOSE `typ`
+    /// keeps the two from ever being accepted for each other.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SupervisorTakeoverClaims {
+        iss: String,
+        sub: String,
+        aud: String,
+        iat: i64,
+        exp: i64,
+        jti: String,
+        sandbox_id: SandboxId,
+        runtime_generation: SandboxGenerationId,
+        auth_epoch: CredentialEpoch,
+        supervisor_instance: String,
+        owner: String,
+        component: SessionComponent,
+    }
+
+    /// The replacement of the supervisor that owns one runtime generation.
+    ///
+    /// The gateway grants it only after durably advancing the sandbox's
+    /// credential epoch to `auth_epoch`; ordinary credential refresh keeps the
+    /// epoch and never produces a grant.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SupervisorTakeover {
+        pub sandbox_id: SandboxId,
+        pub runtime_generation: SandboxGenerationId,
+        /// Ownership term the grant starts; it must exceed the term the
+        /// runtime currently accepts.
+        pub auth_epoch: CredentialEpoch,
+        /// Supervisor process identity the runtime pins once the replacement
+        /// is confirmed (a canonical UUID chosen by the gateway).
+        pub supervisor_instance: String,
+        /// Supervisor pool member that owns the new term, for audit.
+        pub owner: String,
+    }
+
+    /// A takeover grant whose signature, issuer, audience, and lifetime were
+    /// verified.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct VerifiedSupervisorTakeover {
+        pub takeover: SupervisorTakeover,
+        pub token_id: Uuid,
+        pub expires_at: i64,
     }
 
     /// Durable identity shared by every short-lived token for one sandbox runtime.
@@ -721,6 +780,49 @@ mod session {
             })
         }
 
+        /// Mint a takeover grant for `takeover`, valid for `ttl` (at most
+        /// [`MAX_SUPERVISOR_TAKEOVER_TTL`]). The caller must already have
+        /// advanced the sandbox's persisted credential epoch to
+        /// `takeover.auth_epoch`.
+        pub fn mint_supervisor_takeover(
+            &self,
+            takeover: &SupervisorTakeover,
+            ttl: Duration,
+        ) -> Result<MintedSessionToken, SessionJwtError> {
+            if ttl.is_zero() || ttl > MAX_SUPERVISOR_TAKEOVER_TTL {
+                return Err(SessionJwtError::InvalidLifetime);
+            }
+            validate_takeover_identity(&takeover.supervisor_instance, &takeover.owner)?;
+            let issued_at = self.clock.now_unix_seconds();
+            let expires_at =
+                issued_at.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX));
+            let token_id = Uuid::new_v4();
+            let claims = SupervisorTakeoverClaims {
+                iss: self.issuer.clone(),
+                sub: format!("{SANDBOX_SUBJECT_PREFIX}{}", takeover.sandbox_id),
+                aud: SANDBOX_SESSION_AUDIENCE.to_string(),
+                iat: issued_at,
+                exp: expires_at,
+                jti: token_id.to_string(),
+                sandbox_id: takeover.sandbox_id.clone(),
+                runtime_generation: takeover.runtime_generation.clone(),
+                auth_epoch: takeover.auth_epoch,
+                supervisor_instance: takeover.supervisor_instance.clone(),
+                owner: takeover.owner.clone(),
+                component: SessionComponent::OpenShellSupervisor,
+            };
+            let mut header = Header::new(Algorithm::EdDSA);
+            header.kid = Some(self.key_id.clone());
+            header.typ = Some(SUPERVISOR_TAKEOVER_JWT_TYPE.to_string());
+            let token = encode(&header, &claims, &self.encoding_key)
+                .map_err(|_| SessionJwtError::SigningFailed)?;
+            Ok(MintedSessionToken {
+                token: SecretJwt::parse(token)?,
+                expires_at,
+                token_id,
+            })
+        }
+
         fn mint(
             &self,
             profile: SessionTokenProfile,
@@ -818,6 +920,57 @@ mod session {
                 &["iss", "aud", "iat", "exp", "sub", "jti"],
             )?;
             self.validate_claims(claims)
+        }
+
+        /// Verify a supervisor takeover grant. Only the Sandbox profile, which
+        /// the runtime uses, verifies grants; the gateway profile refuses them.
+        pub fn verify_supervisor_takeover(
+            &self,
+            token: &str,
+        ) -> Result<VerifiedSupervisorTakeover, SessionJwtError> {
+            if self.profile != SessionTokenProfile::Sandbox {
+                return Err(SessionJwtError::WrongTokenType);
+            }
+            let claims = decode_signed::<SupervisorTakeoverClaims>(
+                &self.keys,
+                token,
+                SUPERVISOR_TAKEOVER_JWT_TYPE,
+                &["iss", "aud", "iat", "exp", "sub", "jti"],
+            )?;
+            if claims.iss != self.issuer {
+                return Err(SessionJwtError::WrongIssuer);
+            }
+            if claims.aud != SANDBOX_SESSION_AUDIENCE {
+                return Err(SessionJwtError::WrongAudience);
+            }
+            if claims.sub != format!("{SANDBOX_SUBJECT_PREFIX}{}", claims.sandbox_id) {
+                return Err(SessionJwtError::SubjectMismatch);
+            }
+            SandboxGenerationId::parse(claims.runtime_generation.to_string())
+                .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?;
+            validate_takeover_identity(&claims.supervisor_instance, &claims.owner)?;
+            let token_id = Uuid::parse_str(&claims.jti).map_err(|_| SessionJwtError::InvalidJti)?;
+            // A grant must expire, within its own bound.
+            let max_lifetime =
+                i64::try_from(MAX_SUPERVISOR_TAKEOVER_TTL.as_secs()).unwrap_or(i64::MAX);
+            if claims.exp == 0
+                || claims.exp <= claims.iat
+                || claims.exp.saturating_sub(claims.iat) > max_lifetime
+            {
+                return Err(SessionJwtError::InvalidLifetime);
+            }
+            validate_lifetime(claims.iat, claims.exp, self.clock.now_unix_seconds())?;
+            Ok(VerifiedSupervisorTakeover {
+                takeover: SupervisorTakeover {
+                    sandbox_id: claims.sandbox_id,
+                    runtime_generation: claims.runtime_generation,
+                    auth_epoch: claims.auth_epoch,
+                    supervisor_instance: claims.supervisor_instance,
+                    owner: claims.owner,
+                },
+                token_id,
+                expires_at: claims.exp,
+            })
         }
 
         fn validate_claims(
@@ -1074,6 +1227,22 @@ mod session {
             return Err(SessionJwtError::InvalidGatewayId);
         }
         Ok(gateway_id)
+    }
+
+    /// A takeover names a non-blank supervisor instance and owner without
+    /// whitespace; the runtime compares the instance with its attach request.
+    fn validate_takeover_identity(
+        supervisor_instance: &str,
+        owner: &str,
+    ) -> Result<(), SessionJwtError> {
+        let valid = |value: &str| {
+            !value.is_empty() && value.len() <= 253 && !value.chars().any(char::is_whitespace)
+        };
+        if valid(supervisor_instance) && valid(owner) {
+            Ok(())
+        } else {
+            Err(SessionJwtError::InvalidRuntimeIdentity)
+        }
     }
 
     fn validate_key_id(key_id: String) -> Result<String, SessionJwtError> {
@@ -1459,6 +1628,115 @@ mod tests {
                 ocsf_otlp_headers: None,
             };
             bundle.validate().expect("non-expiring auth bundle");
+        }
+
+        fn takeover(epoch: u64) -> SupervisorTakeover {
+            SupervisorTakeover {
+                sandbox_id: SandboxId::parse("sandbox-a").expect("sandbox ID"),
+                runtime_generation: SandboxGenerationId::parse("generation-1")
+                    .expect("runtime generation"),
+                auth_epoch: CredentialEpoch::new(epoch).expect("auth epoch"),
+                supervisor_instance: "6a8f1f4e-8c0e-4d55-9d8c-1d6e2f3a4b5c".to_string(),
+                owner: "supervisor-1".to_string(),
+            }
+        }
+
+        #[test]
+        fn takeover_grants_are_their_own_profile_verified_only_by_the_runtime() {
+            let (issuer, gateway, sandbox, identity) = fixture();
+            let expected = takeover(2);
+            let minted = issuer
+                .mint_supervisor_takeover(&expected, std::time::Duration::from_mins(5))
+                .expect("mint takeover grant");
+            let verified = sandbox
+                .verify_supervisor_takeover(minted.token.expose_secret())
+                .expect("runtime verifies the grant");
+            assert_eq!(verified.takeover, expected);
+            assert_eq!(verified.token_id, minted.token_id);
+            assert_eq!(verified.expires_at, 1_900_000_000 + 300);
+
+            // A grant is never a session credential, and no other credential is
+            // a grant: neither session profile nor the shared supervisor token.
+            assert_eq!(
+                sandbox.verify(minted.token.expose_secret()),
+                Err(SessionJwtError::WrongTokenType)
+            );
+            assert_eq!(
+                gateway.verify_supervisor_takeover(minted.token.expose_secret()),
+                Err(SessionJwtError::WrongTokenType)
+            );
+            let pair = issuer.mint_pair(&identity).expect("token pair");
+            for token in [&pair.sandbox.token, &pair.gateway.token] {
+                assert_eq!(
+                    sandbox.verify_supervisor_takeover(token.expose_secret()),
+                    Err(SessionJwtError::WrongTokenType)
+                );
+            }
+            let host = issuer
+                .mint_supervisor_token(std::time::Duration::from_mins(15))
+                .expect("supervisor token");
+            assert_eq!(
+                sandbox.verify_supervisor_takeover(host.token.expose_secret()),
+                Err(SessionJwtError::WrongTokenType)
+            );
+        }
+
+        #[test]
+        fn takeover_grants_are_bounded_named_and_expire() {
+            let (issuer, _gateway, _sandbox, _identity) = fixture();
+            for ttl in [
+                std::time::Duration::ZERO,
+                MAX_SUPERVISOR_TAKEOVER_TTL + std::time::Duration::from_secs(1),
+            ] {
+                assert_eq!(
+                    issuer.mint_supervisor_takeover(&takeover(2), ttl).err(),
+                    Some(SessionJwtError::InvalidLifetime)
+                );
+            }
+            for (instance, owner) in [("", "member"), ("instance", ""), ("in stance", "m")] {
+                let mut unnamed = takeover(2);
+                unnamed.supervisor_instance = instance.to_string();
+                unnamed.owner = owner.to_string();
+                assert_eq!(
+                    issuer
+                        .mint_supervisor_takeover(&unnamed, std::time::Duration::from_mins(5))
+                        .err(),
+                    Some(SessionJwtError::InvalidRuntimeIdentity)
+                );
+            }
+
+            let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519).unwrap();
+            let issuer = SessionJwtIssuer::from_ed25519_pem(
+                key.serialize_pem().unwrap().as_bytes(),
+                "current",
+                "test",
+                None,
+                Arc::new(FixedClock(1_900_000_000)),
+            )
+            .unwrap();
+            let verifier_at = |now| {
+                SessionJwtVerifier::new(
+                    "test",
+                    SessionTokenProfile::Sandbox,
+                    [SessionVerificationKey {
+                        key_id: "current".to_string(),
+                        public_key_pem: key.public_key_pem().into_bytes(),
+                    }],
+                    Arc::new(FixedClock(now)),
+                )
+                .unwrap()
+            };
+            // A non-expiring session issuer still mints expiring grants.
+            let minted = issuer
+                .mint_supervisor_takeover(&takeover(3), std::time::Duration::from_mins(1))
+                .unwrap();
+            verifier_at(1_900_000_030)
+                .verify_supervisor_takeover(minted.token.expose_secret())
+                .expect("grant within its lifetime");
+            assert_eq!(
+                verifier_at(1_900_000_200).verify_supervisor_takeover(minted.token.expose_secret()),
+                Err(SessionJwtError::Expired)
+            );
         }
 
         #[test]

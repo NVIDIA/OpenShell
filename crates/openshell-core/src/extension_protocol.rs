@@ -22,6 +22,9 @@ pub const COMPUTE_LAUNCH_AUTHENTICATION: &str = "openshell.compute.launch-authen
 /// Driver stages operator-selected external isolation routes for the supervisor.
 pub const COMPUTE_ISOLATION_BACKEND: &str = "openshell.compute.isolation-backend";
 
+/// Driver implements `SuspendSandbox` and resuming through `StartSandbox`.
+pub const COMPUTE_SUSPEND_RESUME: &str = "openshell.compute.suspend-resume";
+
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;

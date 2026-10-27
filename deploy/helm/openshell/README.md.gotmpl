@@ -17,6 +17,23 @@ namespace. The gateway and workspace releases can then be upgraded and removed
 independently. Use Kubernetes `operator` workspace mode when one gateway serves
 multiple pre-provisioned workspace namespaces.
 
+## Certificate hook metadata
+
+Use `pkiInitJob.podLabels` and `pkiInitJob.podAnnotations` to add metadata to the
+Pod templates of the `<fullname>-certgen` and `<fullname>-certgen-backend-ca`
+Jobs. These settings apply to both hooks when enabled and do not affect gateway
+or sandbox Pods. Chart-owned Pod labels take precedence when custom keys
+conflict.
+
+For example, disable Istio sidecar injection for the hook Pods in an injected
+namespace:
+
+```yaml
+pkiInitJob:
+  podAnnotations:
+    sidecar.istio.io/inject: "false"
+```
+
 ## Cluster-scoped vs namespaced objects
 
 Most objects in this chart are namespaced and land in the release namespace.
@@ -191,6 +208,7 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
 - [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - CI overlay for multi-replica external PostgreSQL testing
 - [`ci/values-autoscaling.yaml`](ci/values-autoscaling.yaml) - CI overlay for rendering the optional gateway HorizontalPodAutoscaler
+- [`ci/values-supervisor-autoscaling.yaml`](ci/values-supervisor-autoscaling.yaml) - CI overlay for rendering the optional shared supervisor memory HorizontalPodAutoscaler
 - [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE provider token grants
 - [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
 
@@ -360,6 +378,19 @@ including the scale-down `behavior`, when that release predates them. For backgr
 Disabling autoscaling renders `spec.replicas` from `replicaCount` again,
 which defaults to 1, so set `replicaCount` to the replica count you want in
 that upgrade.
+
+Set `supervisor.autoscaling.enabled=true` with the shared supervisor topology
+to autoscale its Deployment independently of the gateway. It uses average
+memory per Pod (`supervisor.autoscaling.targetMemoryAverageValue`, default
+`512Mi`) through the resource metrics API, usually provided by Metrics Server.
+Defaults keep two to four members and remove at most one member every two
+minutes after a five-minute stabilization window. The HPA owns replicas, so
+`supervisor.replicas` is ignored. Enabling it on an existing Deployment has
+the same temporary reset-to-one risk described above; pick up new defaults
+with `--reset-then-reuse-values`. When disabling it, set `supervisor.replicas`
+explicitly. Existing sandboxes stay on their owners when scaling up, and
+memory-based scaling does not guarantee spare capacity for handoff. See the
+[shared supervisor autoscaling guide](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#autoscale-shared-supervisors-by-memory).
 
 ## Secret bootstrap
 

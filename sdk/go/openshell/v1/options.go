@@ -30,6 +30,9 @@ type WatchOptions = types.WatchOptions
 // WaitOptions configures wait behavior. Use context for timeout control.
 type WaitOptions = types.WaitOptions
 
+// ResumeOptions configures how a suspended sandbox resumes.
+type ResumeOptions = types.ResumeOptions
+
 // ExecOptions configures command execution.
 type ExecOptions = types.ExecOptions
 

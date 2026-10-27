@@ -51,6 +51,15 @@ service ComputeDriver {
   // Idempotently start platform resources for a stopped sandbox.
   rpc StartSandbox(StartSandboxRequest) returns (StartSandboxResponse);
 
+  // Idempotently suspend a running sandbox, retaining its memory state.
+  // Drivers advertise openshell.compute.suspend-resume when implemented;
+  // otherwise this returns UNIMPLEMENTED. Before returning, the driver has the
+  // supervisor call IsolationBackend.SuspendBoundary, obtains the retained
+  // state handle through its native backend integration, and ensures the old
+  // generation is fenced. The gateway
+  // never receives the restore reference.
+  rpc SuspendSandbox(SuspendSandboxRequest) returns (SuspendSandboxResponse);
+
   // Tear down platform resources for a sandbox.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
 
@@ -462,7 +471,24 @@ message StartSandboxRequest {
   // under a different selection. Operator endpoints may change without
   // changing that identity; the driver still validates the retained resource.
   IsolationBackendRegistration isolation_backend = 6;
+  // Restore the state retained by the last SuspendSandbox through
+  // IsolationBackend.ResumeBoundary. When false, the driver discards any
+  // retained state and starts fresh. A resume without retained state fails
+  // with FAILED_PRECONDITION. When the driver can observe a failed restore
+  // before returning, it should keep the retained state and return an error,
+  // so the gateway returns the sandbox to SUSPENDED for another attempt.
+  bool resume = 7;
+  // Forwarded to ResumeBoundaryRequest.restart_if_restore_fails.
+  bool restart_if_restore_fails = 8;
 }
+
+message SuspendSandboxRequest {
+  // Immutable sandbox ID stored by the gateway. The driver resolves its own
+  // compute-runtime name from this identity.
+  string sandbox = 1;
+}
+
+message SuspendSandboxResponse {}
 
 message StartSandboxResponse {
   // Updated opaque runtime identity after a successful start. Required when

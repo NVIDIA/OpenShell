@@ -304,6 +304,12 @@ owner: server.*. Override any gatewayConfig copies before serializing TOML. */}}
 {{- end -}}
 {{- $_ := set $config "openshell.gateway.tls" $gatewayTls -}}
 {{- end -}}
+{{/* The chart owns the shared supervisor pool; see
+openshell.supervisorPoolConfig. */}}
+{{- $supervisorPool := include "openshell.supervisorPoolConfig" . | fromYaml -}}
+{{- if $supervisorPool -}}
+{{- $_ := set $config "openshell.gateway.supervisor_pool" $supervisorPool -}}
+{{- end -}}
 {{/* A nested YAML map and its dotted top-level table would serialize to
 conflicting TOML definitions. Fail before rendering an invalid ConfigMap. */}}
 {{- range $tableName := keys $config | sortAlpha -}}

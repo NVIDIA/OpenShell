@@ -176,6 +176,13 @@ selects the latest passing prerelease for the requested version and branch,
 verifies its qualification evidence, creates the stable tag at its exact commit,
 then rebuilds and publishes without rerunning qualification. The promotion job
 summary and `stable-promotion-*` artifact record the candidate and evidence.
+Both workflows accept optional tags. Tagless Pre-release creates the next
+candidate in the selected branch's seeded series; inspect Resolve Prerelease Tag
+for the actual tag and commit. Tagless Release infers the highest reachable
+prerelease version and stops if it is already stable. Explicit tags select an
+existing candidate or stable version for retries. Release Auto-Tag and manual
+candidate creation share a concurrency group; pending tag-resolution jobs can
+be waiting for that lock.
 Failed, cancelled, or skipped required suites fail
 qualification; stable publication is blocked, while published pre-release
 artifacts remain available. The Pre-release failure notification includes the

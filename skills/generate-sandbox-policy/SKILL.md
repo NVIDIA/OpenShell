@@ -224,7 +224,8 @@ Add `network_middlewares` only when the user asks to inspect, transform, redact,
 
 - Use `openshell/regex` without gateway registration for fixed-pattern redaction of UTF-8 HTTP request bodies or complete client-to-upstream WebSocket text messages.
 - Use an operator-owned middleware name only when it is already registered under `[[openshell.supervisor.middleware]]` and reachable from both the gateway and sandbox supervisors.
-- Confirm that the implementation advertises the requested binding: `HTTP_REQUEST/PRE_CREDENTIALS`, `HTTP_RESPONSE/PRE_RETURN`, or `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. A host match alone does not enable inspection.
+- Confirm that the service advertises the needed binding in `Describe` and that the operator's `binding_policy` authorizes it. For example, if a service advertises both HTTP hooks but the registration allows only `http_response_pre_return`, matching requests skip this middleware even with `on_error: fail_closed`.
+- To require request inspection, ask the operator to include `http_request_pre_credentials` in `bindings` with `binding_policy = "allowlist"` or `"exact"`. The default `dynamic` policy follows what the service advertises; sandbox policy alone cannot require a missing binding. Confirm the gateway and all supervisors support binding policies before relying on them.
 - WebSocket middleware inspects client text messages only, over both `ws://` and `wss://`. Binary and upstream-to-client messages pass without inspection, even with `fail_closed`.
 - `on_error` controls selected-stage failures. Explicit denials always block traffic. A failed WebSocket stage with `fail_open` can remain bypassed for the rest of the connection.
 - Default `on_error` to `fail_closed`. Use `fail_open` only when bypassing the stage preserves the user's stated security requirement.
@@ -403,8 +404,8 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 - [ ] Every middleware config has a non-empty `middleware` name and non-empty `endpoints.include`
 - [ ] Middleware `order` values are unique and no selected chain exceeds 10 stages
 - [ ] No fail-closed middleware selector can cover a `tls: skip` endpoint
-- [ ] Any required WebSocket control advertises `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, and the user understands that V1 does not inspect binary messages
-- [ ] Any required response control advertises `HTTP_RESPONSE/PRE_RETURN`
+- [ ] If inspection by an operator-run service is mandatory, the registration requires the binding (`http_request_pre_credentials`, `http_response_pre_return`, or `websocket_message_pre_credentials`), the service advertises it, and the attachment uses `on_error: fail_closed`
+- [ ] The user understands that V1 WebSocket middleware inspects client text messages only
 - [ ] Endpoints contributed by a credentialed provider are not L4-only or `tls: skip` unless `allow_uninspected_credentials: true` explicitly records the exception
 
 ### Schema Warnings (log-only, but should be fixed)
@@ -439,7 +440,7 @@ Evaluate the generated policy for overly broad access and **include warnings in 
 | **Hostless `allowed_ips`** (no `host` field and no `protocol: tcp`) | "This endpoint has no `host` — any domain resolving to the allowed IP range on this port will be permitted through the legacy proxy. Consider adding a `host` field to restrict which domains can use this allowlist." |
 | **Broad CIDR** in `allowed_ips` (e.g., `10.0.0.0/8`) | "This `allowed_ips` entry covers a very broad range. Consider narrowing to a specific subnet (e.g., `10.0.5.0/24`) to minimize exposure." |
 | **`on_error: fail_open`** | "This middleware can be bypassed when it is unavailable, rejects configuration, returns an invalid result, or exceeds its body limit. Use `fail_closed` unless availability is more important than this control." |
-| **Broad middleware host selector** | "This middleware attaches independently of the admitting network rule to every matching destination, then runs only for operation bindings its implementation advertises. Narrow `endpoints.include` or add exclusions if the attachment is not required for every matching host." |
+| **Broad middleware host selector** | "This middleware attaches independently of the admitting network rule to every matching destination. For operator-run middleware, only bindings the service advertises and the registration allows can run. Narrow `endpoints.include` or add exclusions if the attachment is not required for every matching host." |
 | **`allow_uninspected_credentials: true`** | "This endpoint may carry provider credentials on traffic OpenShell cannot inspect or rewrite. Prefer an inspected protocol and credential rewrite; keep this exception only when raw traffic is required." |
 
 Format breadth warnings clearly in the output, e.g.:

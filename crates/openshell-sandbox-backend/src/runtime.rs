@@ -11,8 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::backend_proto::{
-    DescribeIsolationBackendRequest, OpenBoundaryRequest,
-    isolation_backend_client::IsolationBackendClient, open_boundary_response::LaunchOutcome,
+    DescribeIsolationBackendRequest, OpenBoundaryRequest, ResumeBoundaryRequest,
+    SuspendBoundaryRequest, isolation_backend_client::IsolationBackendClient,
+    open_boundary_response::LaunchOutcome,
 };
 #[cfg(test)]
 use crate::isolation_protocol::{chunk_data, data_chunk};
@@ -64,6 +65,9 @@ const _: () = assert!(
     MAX_NETWORK_STREAMS < crate::boundary_protocol::BOUNDARY_MAX_CONCURRENT_STREAMS as usize
 );
 const NETWORK_STREAM_WAIT_WARNING: Duration = Duration::from_secs(5);
+/// Bound on waiting for a replaced owner's process attachment to be released
+/// after a takeover retires its connection.
+const ADOPTED_ATTACHMENT_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn begin_recovery_window(
     deadline: &mut Option<tokio::time::Instant>,
@@ -193,7 +197,129 @@ impl BoundaryTransport {
     }
 }
 
-/// Host-side `OpenShell` Sandbox Protocol implementation registered with the supervisor.
+/// Largest restore reference the supervisor accepts from a backend or driver.
+pub const MAX_RESTORE_REFERENCE_BYTES: usize = 64 * 1024;
+
+/// Restore a suspended boundary instead of opening a fresh one.
+///
+/// Every boundary opening for this launch, including policy discovery and
+/// transport recovery, replays the same `ResumeBoundary` request.
+#[derive(Clone)]
+pub struct ResumeLaunch {
+    restore_reference: Vec<u8>,
+    restart_if_restore_fails: bool,
+}
+
+impl ResumeLaunch {
+    /// Reject empty or oversized references before any backend call.
+    pub fn new(
+        restore_reference: Vec<u8>,
+        restart_if_restore_fails: bool,
+    ) -> Result<Self, BackendError> {
+        if restore_reference.is_empty() {
+            return Err(BackendError::Descriptor(
+                "restore reference is empty".to_string(),
+            ));
+        }
+        if restore_reference.len() > MAX_RESTORE_REFERENCE_BYTES {
+            return Err(BackendError::Descriptor(format!(
+                "restore reference exceeds {MAX_RESTORE_REFERENCE_BYTES} bytes"
+            )));
+        }
+        Ok(Self {
+            restore_reference,
+            restart_if_restore_fails,
+        })
+    }
+
+    pub fn restart_if_restore_fails(&self) -> bool {
+        self.restart_if_restore_fails
+    }
+}
+
+impl std::fmt::Debug for ResumeLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResumeLaunch")
+            .field("restore_reference", &"[REDACTED]")
+            .field("restart_if_restore_fails", &self.restart_if_restore_fails)
+            .finish()
+    }
+}
+
+/// Authority for this supervisor process to replace the owner of a running
+/// generation: the identity the gateway granted it and the signed grant.
+///
+/// The runtime stages the replacement at attach and promotes it at confirm;
+/// a runtime that does not advertise
+/// [`crate::isolation_protocol::SUPERVISOR_TAKEOVER_CAPABILITY`] is refused
+/// before the grant is sent.
+#[derive(Clone)]
+pub struct BoundaryTakeover {
+    pub supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId,
+    pub grant: openshell_core::jwt::SecretJwt,
+}
+
+impl std::fmt::Debug for BoundaryTakeover {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundaryTakeover")
+            .field("supervisor_instance_id", &self.supervisor_instance_id)
+            .field("grant", &self.grant)
+            .finish()
+    }
+}
+
+/// The selected launch path; restoration may still await `StartAgent`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryLaunchOutcome {
+    Fresh,
+    Restored,
+    ColdStartFallback,
+}
+
+impl BoundaryLaunchOutcome {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Restored => "restored",
+            Self::ColdStartFallback => "cold_start_fallback",
+        }
+    }
+}
+
+/// Accept only the outcomes the requested launch mode permits.
+fn validate_launch_outcome(
+    outcome: i32,
+    resume: Option<&ResumeLaunch>,
+    driver_managed_restore: bool,
+) -> Result<BoundaryLaunchOutcome, BackendError> {
+    let outcome = LaunchOutcome::try_from(outcome).unwrap_or(LaunchOutcome::Unspecified);
+    match (resume, outcome) {
+        (None, LaunchOutcome::Fresh) => Ok(BoundaryLaunchOutcome::Fresh),
+        (None, LaunchOutcome::Restored) if driver_managed_restore => {
+            Ok(BoundaryLaunchOutcome::Restored)
+        }
+        (None, LaunchOutcome::ColdStartFallback) if driver_managed_restore => {
+            Ok(BoundaryLaunchOutcome::ColdStartFallback)
+        }
+        (None, _) => Err(BackendError::Descriptor(
+            "invalid fresh boundary opening response".to_string(),
+        )),
+        (Some(_), LaunchOutcome::Restored) => Ok(BoundaryLaunchOutcome::Restored),
+        (Some(resume), LaunchOutcome::ColdStartFallback) if resume.restart_if_restore_fails => {
+            Ok(BoundaryLaunchOutcome::ColdStartFallback)
+        }
+        (Some(_), LaunchOutcome::ColdStartFallback) => Err(BackendError::Descriptor(
+            "backend reported a cold-start fallback that was not permitted".to_string(),
+        )),
+        (Some(_), _) => Err(BackendError::Descriptor(
+            "invalid boundary resume response outcome".to_string(),
+        )),
+    }
+}
+
+/// Concrete RPC client used for both in-tree and endpoint-registered backends.
 #[derive(Debug)]
 pub struct OpenShellRuntimeBackend {
     transport: BoundaryTransport,
@@ -201,6 +327,9 @@ pub struct OpenShellRuntimeBackend {
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     delegated: Option<DelegatedRuntime>,
+    resume: Option<ResumeLaunch>,
+    takeover: Option<BoundaryTakeover>,
+    recovery_timeout_secs: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -242,7 +371,17 @@ impl OpenShellRuntimeBackend {
             provider_credentials,
             sandbox_bearer,
             delegated: None,
+            resume: None,
+            takeover: None,
+            recovery_timeout_secs: None,
         }
+    }
+
+    /// Restore a suspended boundary rather than opening a fresh one.
+    #[must_use]
+    pub fn with_resume(mut self, resume: Option<ResumeLaunch>) -> Self {
+        self.resume = resume;
+        self
     }
 
     /// Construct the same RPC client for an operator-registered backend.
@@ -272,10 +411,29 @@ impl OpenShellRuntimeBackend {
         driver_descriptor: Vec<u8>,
         bearer: openshell_core::jwt::SessionBearerTokenSlot,
     ) -> Result<(Option<String>, bool), BackendError> {
+        Self::discover_registered_policy_with_resume(
+            backend_name,
+            descriptor,
+            driver_descriptor,
+            bearer,
+            None,
+        )
+        .await
+    }
+
+    /// Discover policy for a launch that may restore a suspended boundary.
+    pub async fn discover_registered_policy_with_resume(
+        backend_name: String,
+        descriptor: SandboxRuntimeDescriptor,
+        driver_descriptor: Vec<u8>,
+        bearer: openshell_core::jwt::SessionBearerTokenSlot,
+        resume: Option<ResumeLaunch>,
+    ) -> Result<(Option<String>, bool), BackendError> {
         crate::delegated::validate_backend_name(&backend_name)?;
         validate_runtime_coordinates(&descriptor)?;
-        let client =
+        let mut client =
             BoundaryClient::with_backend(descriptor, bearer, backend_name, driver_descriptor);
+        client.resume = resume;
         client.discover_policy().await
     }
 
@@ -283,6 +441,25 @@ impl OpenShellRuntimeBackend {
     #[must_use]
     pub fn with_transport(mut self, transport: BoundaryTransport) -> Self {
         self.transport = transport;
+        self
+    }
+
+    /// Attach as the gateway-granted replacement of the generation's current
+    /// owner. The runtime's process snapshot then decides whether the agent
+    /// is adopted or, for a runtime that never started it, launched.
+    #[must_use]
+    pub fn with_takeover(mut self, takeover: BoundaryTakeover) -> Self {
+        self.takeover = Some(takeover);
+        self
+    }
+
+    /// Offer the runtime a recovery deadline on every attach: how long it
+    /// keeps the workload frozen after losing this supervisor's connection
+    /// (see [`crate::boundary_protocol::SUPERVISOR_RECOVERY_TIMEOUT_RANGE`]).
+    /// `None` leaves the runtime's default.
+    #[must_use]
+    pub fn with_recovery_timeout_secs(mut self, seconds: Option<u32>) -> Self {
+        self.recovery_timeout_secs = seconds;
         self
     }
 
@@ -327,11 +504,23 @@ impl OpenShellRuntimeBackend {
             descriptor.payload.clone(),
         );
         client.transport = self.transport.clone();
+        client.resume.clone_from(&self.resume);
+        if let Some(takeover) = &self.takeover {
+            client.supervisor_instance_id = takeover.supervisor_instance_id;
+            client.requires_takeover = true;
+        }
+        client.recovery_timeout_secs = self.recovery_timeout_secs;
         let client = Arc::new(client);
+        let policy = Box::new(SandboxPolicyWire::from(sandbox.policy.clone()));
         let response = client
             .call_idempotent(Request::Attach {
                 supervisor_instance_id: client.supervisor_instance_id,
-                policy: Box::new(SandboxPolicyWire::from(sandbox.policy.clone())),
+                policy: policy.clone(),
+                supervisor_takeover: self
+                    .takeover
+                    .as_ref()
+                    .map(|takeover| takeover.grant.expose_secret().to_string()),
+                supervisor_recovery_timeout_secs: client.recovery_timeout_secs,
             })
             .await?;
         let Response::Attached { snapshot } = response else {
@@ -342,6 +531,12 @@ impl OpenShellRuntimeBackend {
                 "sandbox session snapshot generation does not match runtime descriptor".to_string(),
             ));
         }
+        let takeover = self.takeover.is_some().then(|| RecoveredSession {
+            // Later reconnects reattach without the grant, with the launch
+            // controls the runtime already enforces.
+            reattach_policy: snapshot.bound_policy.clone().unwrap_or(policy),
+            processes: RecoveredProcesses::from_snapshot(&snapshot),
+        });
         Ok(Box::new(BoundBoundary {
             client: client.clone(),
             agent: sandbox.agent,
@@ -355,8 +550,43 @@ impl OpenShellRuntimeBackend {
             session_id,
             resource_claims,
             provisioning_evidence,
+            takeover,
         }))
     }
+}
+
+/// Processes a replacement supervisor found running in the runtime's
+/// snapshot. They belong to the generation, not to the supervisor that
+/// started them, so the replacement adopts them instead of launching again.
+#[derive(Clone, Debug, Default)]
+struct RecoveredProcesses {
+    /// The canonical process, when the previous owner started it.
+    main: Option<String>,
+    /// Exec processes that have not exited.
+    execs: Vec<String>,
+}
+
+impl RecoveredProcesses {
+    fn from_snapshot(snapshot: &crate::boundary_protocol::SessionSnapshotWire) -> Self {
+        use crate::boundary_protocol::ProcessKindWire;
+        let mut recovered = Self::default();
+        for process in &snapshot.processes {
+            match process.kind {
+                ProcessKindWire::Main => recovered.main = Some(process.process_id.clone()),
+                ProcessKindWire::Exec if process.status.is_none() => {
+                    recovered.execs.push(process.process_id.clone());
+                }
+                ProcessKindWire::Exec => {}
+            }
+        }
+        recovered
+    }
+}
+
+/// What a takeover attach learned from the runtime.
+struct RecoveredSession {
+    reattach_policy: Box<SandboxPolicyWire>,
+    processes: RecoveredProcesses,
 }
 
 fn validate_runtime_descriptor(
@@ -465,15 +695,45 @@ pub struct BoundBoundary {
     session_id: openshell_core::SandboxSessionId,
     resource_claims: std::collections::BTreeMap<String, String>,
     provisioning_evidence: openshell_isolation_interface::contract::ProvisioningEvidence,
+    takeover: Option<RecoveredSession>,
 }
 
 impl BoundBoundary {
+    /// The runtime's network opens. A source taken before [`Self::confirm`]
+    /// waits for confirmation before accepting any, so a replacement can
+    /// load its enforcement before the frozen workload resumes.
     pub fn network_mediation_source(&self) -> Arc<NetworkMediationSource> {
         self.mediation.clone()
     }
 
+    /// Whether this boundary was attached as a gateway-granted replacement.
+    #[must_use]
+    pub fn is_takeover(&self) -> bool {
+        self.takeover.is_some()
+    }
+
+    /// Whether the runtime already runs the canonical process, which a
+    /// replacement adopts instead of starting.
+    #[must_use]
+    pub fn adopts_running_agent(&self) -> bool {
+        self.takeover
+            .as_ref()
+            .is_some_and(|takeover| takeover.processes.main.is_some())
+    }
+
     pub fn host_gateway_ip(&self) -> Option<std::net::IpAddr> {
         self.host_gateway_ip
+    }
+
+    /// The selected launch path. Restoration may still be deferred until
+    /// `StartAgent`; this value alone does not prove the workload was restored.
+    pub fn launch_outcome(&self) -> Option<BoundaryLaunchOutcome> {
+        self.client.launch_outcome.get().copied()
+    }
+
+    /// Whether the negotiated backend advertised suspend/resume support.
+    pub fn supports_suspend(&self) -> bool {
+        self.client.backend_supports_suspend.load(Ordering::Acquire)
     }
 
     pub async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
@@ -481,6 +741,16 @@ impl BoundBoundary {
         let Response::Confirmed { confirmation } = response else {
             return Err(unexpected_response("confirmed", &response));
         };
+        // A confirmed takeover pins this process at the granted epoch. From
+        // now on a reconnect reattaches without the grant, so its expiry
+        // cannot break transport recovery while confirmation is validated.
+        let reattach_policy = self
+            .takeover
+            .as_ref()
+            .map(|takeover| takeover.reattach_policy.clone());
+        if let Some(policy) = &reattach_policy {
+            self.client.forget_takeover_grant(policy.clone())?;
+        }
         if confirmation.generation != self.generation
             || confirmation.session_id != self.session_id
             || confirmation.resource_claims != self.resource_claims
@@ -496,6 +766,13 @@ impl BoundBoundary {
             crate::audit::validate_native_linux_audit(&confirmation.backend_audit)?;
         }
         let client = self.client.clone();
+        // Adopt from a snapshot taken after the promotion: the replaced owner
+        // may have started processes after the takeover attach, and it can
+        // start none once this process is promoted.
+        let recovered = match reattach_policy {
+            Some(policy) => Some(client.refresh_recovered_processes(policy).await?),
+            None => None,
+        };
         let confirmed = ConfirmedBoundary::try_new(
             Box::new(ReadyBoundary {
                 client: self.client,
@@ -503,6 +780,7 @@ impl BoundBoundary {
                 sandbox_id: self.sandbox_id,
                 ca_file_paths: self.ca_file_paths,
                 provider_credentials: self.provider_credentials,
+                recovered,
             }),
             *confirmation,
             &self.identity,
@@ -518,10 +796,48 @@ pub struct ReadyBoundary {
     sandbox_id: String,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
+    /// Processes found running by a takeover attach.
+    recovered: Option<RecoveredProcesses>,
 }
 
 impl ReadyBoundary {
+    /// Start the canonical process, or, for a replacement supervisor whose
+    /// runtime already runs it, adopt it and the running exec processes
+    /// without launching anything.
     pub async fn start_agent(self: Box<Self>) -> Result<Box<RunningBoundary>, BackendError> {
+        if let Some(RecoveredProcesses {
+            main: Some(process_id),
+            execs,
+        }) = &self.recovered
+        {
+            let adopted = |process_id: &String| {
+                Arc::new(BoundaryProcess {
+                    exec: true,
+                    adopted: true,
+                    client: self.client.clone(),
+                    process_id: process_id.clone(),
+                })
+            };
+            return Ok(Box::new(RunningBoundary {
+                process: Arc::new(BoundaryProcess {
+                    exec: false,
+                    adopted: true,
+                    client: self.client.clone(),
+                    process_id: process_id.clone(),
+                }),
+                adopted_execs: execs.iter().map(adopted).collect(),
+                exec: Arc::new(BoundaryExec {
+                    client: self.client.clone(),
+                    provider_credentials: self.provider_credentials,
+                    // Publication restarts from the runtime's installed
+                    // generation, which the first reconciliation learns.
+                    publication_generation: tokio::sync::Mutex::new(0),
+                }),
+                loopback_connector: Arc::new(BoundaryLoopbackConnector {
+                    client: self.client,
+                }),
+            }));
+        }
         let ca_paths = self
             .ca_file_paths
             .lock()
@@ -571,11 +887,13 @@ impl ReadyBoundary {
         };
         let process = Arc::new(BoundaryProcess {
             exec: false,
+            adopted: false,
             client: self.client.clone(),
             process_id,
         });
         Ok(Box::new(RunningBoundary {
             process,
+            adopted_execs: Vec::new(),
             exec: Arc::new(BoundaryExec {
                 client: self.client.clone(),
                 provider_credentials: self.provider_credentials,
@@ -590,13 +908,34 @@ impl ReadyBoundary {
 
 pub struct RunningBoundary {
     process: Arc<BoundaryProcess>,
+    /// Exec processes a replacement supervisor adopted from the runtime.
+    adopted_execs: Vec<Arc<BoundaryProcess>>,
     exec: Arc<BoundaryExec>,
     loopback_connector: Arc<BoundaryLoopbackConnector>,
 }
 
 impl RunningBoundary {
+    /// The launch path completed by the successful `StartAgent` call.
+    pub fn launch_outcome(&self) -> Option<BoundaryLaunchOutcome> {
+        self.process.client.launch_outcome.get().copied()
+    }
+
     pub fn agent(&self) -> Arc<BoundaryProcess> {
         self.process.clone()
+    }
+
+    /// Whether the canonical process was adopted from a previous owner
+    /// rather than started by this supervisor.
+    #[must_use]
+    pub fn agent_adopted(&self) -> bool {
+        self.process.adopted
+    }
+
+    /// Running exec processes adopted from a previous owner. Their original
+    /// clients are gone; the replacement observes their exit.
+    #[must_use]
+    pub fn adopted_exec_processes(&self) -> &[Arc<BoundaryProcess>] {
+        &self.adopted_execs
     }
 
     pub fn exec(&self) -> Arc<BoundaryExec> {
@@ -615,17 +954,56 @@ impl RunningBoundary {
             .await?;
         expect_response(response, "boundary_terminated")
     }
+
+    /// Whether the negotiated backend advertised suspend/resume support.
+    pub fn supports_suspend(&self) -> bool {
+        self.process
+            .client
+            .backend_supports_suspend
+            .load(Ordering::Acquire)
+    }
+
+    /// Freeze and fence this generation, returning the backend's opaque
+    /// restore reference. The caller must not terminate the boundary after a
+    /// successful suspension.
+    pub async fn suspend(&self) -> Result<Vec<u8>, BackendError> {
+        self.process.client.suspend_boundary().await
+    }
 }
 
 pub struct BoundaryProcess {
     exec: bool,
+    /// Started by a previous owner of the generation.
+    adopted: bool,
     client: Arc<BoundaryClient>,
     process_id: String,
 }
 
 impl BoundaryProcess {
+    /// Generation-scoped process ID.
+    #[must_use]
+    pub fn process_id(&self) -> &str {
+        &self.process_id
+    }
+
     pub async fn attach(&self) -> Result<ProcessAttachment, BackendError> {
-        open_process_attachment(self.client.clone(), self.process_id.clone()).await
+        if !self.adopted {
+            return open_process_attachment(self.client.clone(), self.process_id.clone()).await;
+        }
+        // The replaced owner's attachment ends with its retired connection;
+        // wait a bounded time for the runtime to release it.
+        let deadline = tokio::time::Instant::now() + ADOPTED_ATTACHMENT_RELEASE_TIMEOUT;
+        loop {
+            match open_process_attachment(self.client.clone(), self.process_id.clone()).await {
+                Err(BackendError::Denied(message))
+                    if message.contains("already has a control attachment")
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                result => return result,
+            }
+        }
     }
 
     pub async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
@@ -903,6 +1281,7 @@ async fn open_exec_session(
 
     let process: Arc<BoundaryProcess> = Arc::new(BoundaryProcess {
         exec: true,
+        adopted: false,
         client: client.clone(),
         process_id: process_id.clone(),
     });
@@ -959,7 +1338,18 @@ pub struct NetworkMediationSource {
 }
 
 impl NetworkMediationSource {
+    /// Accepts reach the runtime only from a confirmed connection.
+    async fn wait_confirmed(&self) {
+        let _ = self
+            .client
+            .confirmed
+            .subscribe()
+            .wait_for(|confirmed| *confirmed)
+            .await;
+    }
+
     pub async fn accept_tcp(&self) -> Result<PendingTcpOpen, BackendError> {
+        self.wait_confirmed().await;
         // An idle accept has no deadline. Recover transport loss before exposing
         // a source error, which permanently stops the proxy. The boundary drops
         // the interrupted pending open; a retry never replays its decision.
@@ -1000,6 +1390,7 @@ impl NetworkMediationSource {
     }
 
     pub async fn accept_dns(&self) -> Result<PendingDnsQuery, BackendError> {
+        self.wait_confirmed().await;
         loop {
             let session = self.client.mediation_session().await?;
             match session.accept_dns().await {
@@ -1185,6 +1576,9 @@ struct BoundaryClient {
     backend_name: String,
     driver_descriptor: Vec<u8>,
     boundary_handle: std::sync::OnceLock<String>,
+    resume: Option<ResumeLaunch>,
+    launch_outcome: std::sync::OnceLock<BoundaryLaunchOutcome>,
+    backend_supports_suspend: AtomicBool,
     supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     grpc_channel: tokio::sync::Mutex<Option<CachedGrpcChannel>>,
@@ -1197,6 +1591,13 @@ struct BoundaryClient {
     credential_monitor_started: AtomicBool,
     network_streams: Arc<tokio::sync::Semaphore>,
     network_streams_exhausted: AtomicBool,
+    /// This client attaches with a takeover grant; the runtime must
+    /// advertise takeover support before any request is sent.
+    requires_takeover: bool,
+    /// Recovery deadline offered on every attach.
+    recovery_timeout_secs: Option<u32>,
+    /// True once a connection of this client was confirmed.
+    confirmed: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Clone)]
@@ -1378,6 +1779,9 @@ impl BoundaryClient {
             backend_name,
             driver_descriptor,
             boundary_handle: std::sync::OnceLock::new(),
+            resume: None,
+            launch_outcome: std::sync::OnceLock::new(),
+            backend_supports_suspend: AtomicBool::new(false),
             supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId::new(),
             sandbox_bearer,
             grpc_channel: tokio::sync::Mutex::new(None),
@@ -1390,7 +1794,52 @@ impl BoundaryClient {
             credential_monitor_started: AtomicBool::new(false),
             network_streams: Arc::new(tokio::sync::Semaphore::new(MAX_NETWORK_STREAMS)),
             network_streams_exhausted: AtomicBool::new(false),
+            requires_takeover: false,
+            recovery_timeout_secs: None,
+            confirmed: tokio::sync::watch::Sender::new(false),
         }
+    }
+
+    /// Reattach on the confirmed connection as the promoted owner and read the
+    /// processes to adopt from that snapshot.
+    async fn refresh_recovered_processes(
+        &self,
+        policy: Box<SandboxPolicyWire>,
+    ) -> Result<RecoveredProcesses, BackendError> {
+        let response = self
+            .call_idempotent(Request::Attach {
+                supervisor_instance_id: self.supervisor_instance_id,
+                policy,
+                supervisor_takeover: None,
+                supervisor_recovery_timeout_secs: self.recovery_timeout_secs,
+            })
+            .await?;
+        let Response::Attached { snapshot } = response else {
+            return Err(unexpected_response("attached", &response));
+        };
+        if snapshot.generation != self.runtime_descriptor.generation {
+            return Err(BackendError::Confirm(
+                "sandbox session snapshot generation does not match runtime descriptor".to_string(),
+            ));
+        }
+        Ok(RecoveredProcesses::from_snapshot(&snapshot))
+    }
+
+    /// Replace the remembered takeover attach with an ordinary attach of the
+    /// now-pinned process, so transport recovery never depends on the
+    /// grant's lifetime.
+    fn forget_takeover_grant(&self, policy: Box<SandboxPolicyWire>) -> Result<(), BackendError> {
+        let envelope = Self::prepare_request(Request::Attach {
+            supervisor_instance_id: self.supervisor_instance_id,
+            policy,
+            supervisor_takeover: None,
+            supervisor_recovery_timeout_secs: self.recovery_timeout_secs,
+        })?;
+        *self
+            .attach_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(envelope);
+        Ok(())
     }
 
     async fn acquire_network_stream(&self) -> tokio::sync::OwnedSemaphorePermit {
@@ -1442,6 +1891,7 @@ impl BoundaryClient {
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                                 Some(envelope.clone());
+                            self.confirmed.send_replace(true);
                         }
                         return Ok(response);
                     }
@@ -2081,9 +2531,9 @@ impl BoundaryClient {
         credential: &BoundaryCredential,
     ) -> Result<(), BackendError> {
         let mut client = IsolationBackendClient::new(channel)
-            .max_decoding_message_size(64 * 1024)
-            .max_encoding_message_size(64 * 1024);
-        let supervisor = crate::isolation_protocol::metadata("openshell/supervisor");
+            .max_decoding_message_size(64 * 1024 + MAX_RESTORE_REFERENCE_BYTES)
+            .max_encoding_message_size(64 * 1024 + MAX_RESTORE_REFERENCE_BYTES);
+        let supervisor = crate::isolation_protocol::supervisor_metadata("openshell/supervisor");
         let response = client
             .describe(DescribeIsolationBackendRequest {
                 supervisor: Some(supervisor.clone()),
@@ -2091,27 +2541,60 @@ impl BoundaryClient {
             .await
             .map_err(control_rpc_error)?
             .into_inner();
-        crate::isolation_protocol::negotiate(&supervisor, response.backend)
+        let backend = crate::isolation_protocol::negotiate_peer(&supervisor, response.backend)
             .map_err(control_rpc_error)?;
-        let mut request = tonic::Request::new(OpenBoundaryRequest {
+        if self.requires_takeover
+            && !backend.supported_capabilities.iter().any(|capability| {
+                capability == crate::isolation_protocol::SUPERVISOR_TAKEOVER_CAPABILITY
+            })
+        {
+            return Err(BackendError::Unsupported(
+                "the sandbox runtime does not support supervisor takeover; refusing to resume it"
+                    .to_string(),
+            ));
+        }
+        let supports_suspend = crate::isolation_protocol::supports_suspend_resume(&backend);
+        let launch = OpenBoundaryRequest {
             session_id: self.runtime_descriptor.session_id.to_string(),
             backend_name: self.backend_name.clone(),
             driver_descriptor: self.driver_descriptor.clone(),
-        });
-        request
-            .metadata_mut()
-            .insert("authorization", credential.authorization.clone());
-        let response = client
-            .open_boundary(request)
-            .await
-            .map_err(control_rpc_error)?
-            .into_inner();
-        if response.outcome != LaunchOutcome::Fresh as i32
-            || response.boundary_id.is_empty()
-            || response.boundary_id.len() > 128
-        {
+        };
+        let response = if let Some(resume) = &self.resume {
+            if !supports_suspend {
+                return Err(BackendError::Unsupported(format!(
+                    "isolation backend does not advertise {}; cannot resume a suspended boundary",
+                    crate::isolation_protocol::SUSPEND_RESUME_CAPABILITY
+                )));
+            }
+            let mut request = tonic::Request::new(ResumeBoundaryRequest {
+                launch: Some(launch),
+                restore_reference: resume.restore_reference.clone(),
+                restart_if_restore_fails: resume.restart_if_restore_fails,
+            });
+            request
+                .metadata_mut()
+                .insert("authorization", credential.authorization.clone());
+            client
+                .resume_boundary(request)
+                .await
+                .map_err(control_rpc_error)?
+                .into_inner()
+        } else {
+            let mut request = tonic::Request::new(launch);
+            request
+                .metadata_mut()
+                .insert("authorization", credential.authorization.clone());
+            client
+                .open_boundary(request)
+                .await
+                .map_err(control_rpc_error)?
+                .into_inner()
+        };
+        let outcome =
+            validate_launch_outcome(response.outcome, self.resume.as_ref(), supports_suspend)?;
+        if response.boundary_id.is_empty() || response.boundary_id.len() > 128 {
             return Err(BackendError::Descriptor(
-                "invalid fresh boundary opening response".to_string(),
+                "invalid boundary opening response handle".to_string(),
             ));
         }
         let handle = self
@@ -2122,7 +2605,54 @@ impl BoundaryClient {
                 "boundary handle changed during launch recovery".to_string(),
             ));
         }
+        // Replays of the same launch must report the same outcome.
+        if *self.launch_outcome.get_or_init(|| outcome) != outcome {
+            return Err(BackendError::Denied(
+                "boundary launch outcome changed during launch recovery".to_string(),
+            ));
+        }
+        self.backend_supports_suspend
+            .store(supports_suspend, Ordering::Release);
         Ok(())
+    }
+
+    /// Ask the backend to freeze and fence this generation. A single attempt:
+    /// the compute driver retries by signalling the supervisor again.
+    async fn suspend_boundary(&self) -> Result<Vec<u8>, BackendError> {
+        if !self.backend_supports_suspend.load(Ordering::Acquire) {
+            return Err(BackendError::Unsupported(format!(
+                "isolation backend does not advertise {}",
+                crate::isolation_protocol::SUSPEND_RESUME_CAPABILITY
+            )));
+        }
+        let boundary_id = self.boundary_handle()?.to_string();
+        self.ensure_current_credential_connection().await?;
+        let credential = BoundaryCredential::capture(&self.sandbox_bearer)?;
+        let channel = self.grpc_channel().await?;
+        let mut client = IsolationBackendClient::new(channel)
+            .max_decoding_message_size(64 * 1024 + MAX_RESTORE_REFERENCE_BYTES)
+            .max_encoding_message_size(64 * 1024);
+        let mut request = tonic::Request::new(SuspendBoundaryRequest {
+            boundary_id,
+            session_id: self.runtime_descriptor.session_id.to_string(),
+            generation_id: self.runtime_descriptor.generation.clone(),
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", credential.authorization);
+        let response = tokio::time::timeout(REQUEST_TIMEOUT, client.suspend_boundary(request))
+            .await
+            .map_err(|_| BackendError::Unavailable("boundary suspension timed out".to_string()))?
+            .map_err(control_rpc_error)?
+            .into_inner();
+        if response.restore_reference.is_empty()
+            || response.restore_reference.len() > MAX_RESTORE_REFERENCE_BYTES
+        {
+            return Err(BackendError::Descriptor(format!(
+                "backend restore reference must be 1 to {MAX_RESTORE_REFERENCE_BYTES} bytes"
+            )));
+        }
+        Ok(response.restore_reference)
     }
 
     #[cfg(test)]
@@ -2539,6 +3069,9 @@ mod tests {
         opens: Arc<std::sync::atomic::AtomicUsize>,
         backend_name: String,
         driver_descriptor: Option<Vec<u8>>,
+        resumes: Arc<std::sync::Mutex<Vec<ResumeBoundaryRequest>>>,
+        suspends: Arc<std::sync::Mutex<Vec<SuspendBoundaryRequest>>>,
+        suspend_reference: Result<Vec<u8>, tonic::Code>,
     }
 
     impl Default for TestIsolationBackend {
@@ -2549,6 +3082,25 @@ mod tests {
                 opens: Arc::default(),
                 backend_name: crate::BACKEND_NAME.to_string(),
                 driver_descriptor: None,
+                resumes: Arc::default(),
+                suspends: Arc::default(),
+                suspend_reference: Err(tonic::Code::Unimplemented),
+            }
+        }
+    }
+
+    impl TestIsolationBackend {
+        /// A backend that advertises optional suspend/resume support.
+        fn suspendable(outcome: LaunchOutcome) -> Self {
+            let mut metadata = crate::isolation_protocol::metadata("test/backend");
+            metadata
+                .supported_capabilities
+                .push(crate::isolation_protocol::SUSPEND_RESUME_CAPABILITY.to_string());
+            Self {
+                metadata: Some(metadata),
+                outcome: outcome as i32,
+                suspend_reference: Ok(b"opaque-restore-reference".to_vec()),
+                ..Self::default()
             }
         }
     }
@@ -2593,16 +3145,295 @@ mod tests {
 
         async fn suspend_boundary(
             &self,
-            _request: tonic::Request<SuspendBoundaryRequest>,
+            request: tonic::Request<SuspendBoundaryRequest>,
         ) -> Result<tonic::Response<SuspendBoundaryResponse>, tonic::Status> {
-            Err(tonic::Status::unimplemented("test backend"))
+            assert!(request.metadata().get("authorization").is_some());
+            self.suspends.lock().unwrap().push(request.into_inner());
+            match &self.suspend_reference {
+                Ok(reference) => Ok(tonic::Response::new(SuspendBoundaryResponse {
+                    restore_reference: reference.clone(),
+                })),
+                Err(code) => Err(tonic::Status::new(*code, "test backend")),
+            }
         }
 
         async fn resume_boundary(
             &self,
-            _request: tonic::Request<ResumeBoundaryRequest>,
+            request: tonic::Request<ResumeBoundaryRequest>,
         ) -> Result<tonic::Response<OpenBoundaryResponse>, tonic::Status> {
-            Err(tonic::Status::unimplemented("test backend"))
+            assert!(request.metadata().get("authorization").is_some());
+            let request = request.into_inner();
+            let launch = request.launch.as_ref().expect("resume carries a launch");
+            assert_eq!(launch.backend_name, self.backend_name);
+            assert!(!launch.session_id.is_empty());
+            self.resumes.lock().unwrap().push(request);
+            Ok(tonic::Response::new(OpenBoundaryResponse {
+                boundary_id: TEST_BOUNDARY_HANDLE.to_string(),
+                outcome: self.outcome,
+            }))
+        }
+    }
+
+    /// Serve one TLS connection with `service` and return a client for it.
+    async fn isolation_control_client(
+        service: TestIsolationBackend,
+        resume: Option<ResumeLaunch>,
+    ) -> (BoundaryClient, tokio::task::JoinHandle<()>) {
+        let certificate = test_certificate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client_tls = certificate.client_tls.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let stream = tokio_rustls::TlsAcceptor::from(certificate.server_config)
+                .accept(stream)
+                .await
+                .unwrap();
+            tonic::transport::Server::builder()
+                .add_service(IsolationBackendServer::new(service))
+                .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
+                    Box::new(stream),
+                ))]))
+                .await
+                .unwrap();
+        });
+        let mut client = BoundaryClient::new(
+            tls_runtime_descriptor(address, client_tls),
+            test_bearer(&"a".repeat(32)),
+        );
+        client.resume = resume;
+        (client, server)
+    }
+
+    fn resume_launch(restart_if_restore_fails: bool) -> ResumeLaunch {
+        ResumeLaunch::new(
+            b"opaque-restore-reference".to_vec(),
+            restart_if_restore_fails,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn launch_outcome_validation_matches_launch_mode() {
+        let strict = resume_launch(false);
+        let fallback = resume_launch(true);
+        let cases = [
+            (
+                LaunchOutcome::Fresh,
+                None,
+                Some(BoundaryLaunchOutcome::Fresh),
+            ),
+            (LaunchOutcome::Restored, None, None),
+            (LaunchOutcome::ColdStartFallback, None, None),
+            (LaunchOutcome::Unspecified, None, None),
+            (
+                LaunchOutcome::Restored,
+                Some(&strict),
+                Some(BoundaryLaunchOutcome::Restored),
+            ),
+            (LaunchOutcome::ColdStartFallback, Some(&strict), None),
+            (
+                LaunchOutcome::ColdStartFallback,
+                Some(&fallback),
+                Some(BoundaryLaunchOutcome::ColdStartFallback),
+            ),
+            (LaunchOutcome::Fresh, Some(&fallback), None),
+            (LaunchOutcome::Unspecified, Some(&fallback), None),
+        ];
+        for (outcome, resume, expected) in cases {
+            let result = validate_launch_outcome(outcome as i32, resume, false);
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap(), expected, "{outcome:?}"),
+                None => assert!(
+                    matches!(result, Err(BackendError::Descriptor(_))),
+                    "{outcome:?} {resume:?}: {result:?}"
+                ),
+            }
+        }
+        assert!(validate_launch_outcome(99, Some(&fallback), true).is_err());
+        assert_eq!(
+            validate_launch_outcome(LaunchOutcome::Restored as i32, None, true).unwrap(),
+            BoundaryLaunchOutcome::Restored
+        );
+        assert_eq!(
+            validate_launch_outcome(LaunchOutcome::ColdStartFallback as i32, None, true).unwrap(),
+            BoundaryLaunchOutcome::ColdStartFallback
+        );
+    }
+
+    #[test]
+    fn resume_launch_rejects_empty_and_oversized_references() {
+        assert!(ResumeLaunch::new(Vec::new(), false).is_err());
+        assert!(ResumeLaunch::new(vec![0; MAX_RESTORE_REFERENCE_BYTES + 1], false).is_err());
+        assert!(ResumeLaunch::new(vec![0; MAX_RESTORE_REFERENCE_BYTES], false).is_ok());
+        let debug = format!("{:?}", resume_launch(true));
+        assert!(!debug.contains("opaque-restore-reference"), "{debug}");
+    }
+
+    #[tokio::test]
+    async fn driver_provisioned_restore_uses_normal_boundary_opening() {
+        let service = TestIsolationBackend::suspendable(LaunchOutcome::Restored);
+        let resumes = service.resumes.clone();
+        let opens = service.opens.clone();
+        let (client, server) = isolation_control_client(service, None).await;
+        client.grpc_channel().await.unwrap();
+        assert_eq!(
+            client.launch_outcome.get().copied(),
+            Some(BoundaryLaunchOutcome::Restored)
+        );
+        assert_eq!(opens.load(Ordering::Acquire), 1);
+        assert!(resumes.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn resume_sends_resume_boundary_and_records_restored_outcome() {
+        let service = TestIsolationBackend::suspendable(LaunchOutcome::Restored);
+        let resumes = service.resumes.clone();
+        let opens = service.opens.clone();
+        let (client, server) = isolation_control_client(service, Some(resume_launch(false))).await;
+        client.grpc_channel().await.unwrap();
+        assert_eq!(
+            client.launch_outcome.get().copied(),
+            Some(BoundaryLaunchOutcome::Restored)
+        );
+        assert!(client.backend_supports_suspend.load(Ordering::Acquire));
+        assert_eq!(
+            opens.load(Ordering::Acquire),
+            0,
+            "resume must not open fresh"
+        );
+        let resumes = resumes.lock().unwrap().clone();
+        assert_eq!(resumes.len(), 1);
+        assert_eq!(resumes[0].restore_reference, b"opaque-restore-reference");
+        assert!(!resumes[0].restart_if_restore_fails);
+        assert_eq!(
+            resumes[0].launch.as_ref().unwrap().session_id,
+            test_session_id().to_string()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn resume_accepts_cold_start_fallback_only_when_allowed() {
+        let service = TestIsolationBackend::suspendable(LaunchOutcome::ColdStartFallback);
+        let resumes = service.resumes.clone();
+        let (client, server) = isolation_control_client(service, Some(resume_launch(true))).await;
+        client.grpc_channel().await.unwrap();
+        assert_eq!(
+            client.launch_outcome.get().copied(),
+            Some(BoundaryLaunchOutcome::ColdStartFallback)
+        );
+        assert!(resumes.lock().unwrap()[0].restart_if_restore_fails);
+        server.abort();
+
+        let service = TestIsolationBackend::suspendable(LaunchOutcome::ColdStartFallback);
+        let (client, server) = isolation_control_client(service, Some(resume_launch(false))).await;
+        let result = client.grpc_channel().await;
+        assert!(
+            matches!(result, Err(BackendError::Descriptor(_))),
+            "{result:?}"
+        );
+        assert!(client.boundary_handle.get().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_fresh_and_unspecified_outcomes() {
+        for outcome in [LaunchOutcome::Fresh, LaunchOutcome::Unspecified] {
+            let service = TestIsolationBackend::suspendable(outcome);
+            let (client, server) =
+                isolation_control_client(service, Some(resume_launch(true))).await;
+            let result = client.grpc_channel().await;
+            assert!(
+                matches!(result, Err(BackendError::Descriptor(_))),
+                "{outcome:?}: {result:?}"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_requires_backend_suspend_resume_capability() {
+        let service = TestIsolationBackend {
+            outcome: LaunchOutcome::Restored as i32,
+            ..TestIsolationBackend::default()
+        };
+        let resumes = service.resumes.clone();
+        let opens = service.opens.clone();
+        let (client, server) = isolation_control_client(service, Some(resume_launch(true))).await;
+        let result = client.grpc_channel().await;
+        assert!(
+            matches!(result, Err(BackendError::Unsupported(_))),
+            "{result:?}"
+        );
+        assert!(resumes.lock().unwrap().is_empty());
+        assert_eq!(opens.load(Ordering::Acquire), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn supervisor_advertises_suspend_resume_as_optional() {
+        let metadata = crate::isolation_protocol::supervisor_metadata("openshell/supervisor");
+        assert!(crate::isolation_protocol::supports_suspend_resume(
+            &metadata
+        ));
+        assert!(
+            !metadata.required_capabilities.iter().any(
+                |capability| capability == crate::isolation_protocol::SUSPEND_RESUME_CAPABILITY
+            )
+        );
+        // Backends that do not advertise the capability still negotiate.
+        let (client, server) =
+            isolation_control_client(TestIsolationBackend::default(), None).await;
+        client.grpc_channel().await.unwrap();
+        assert_eq!(
+            client.launch_outcome.get().copied(),
+            Some(BoundaryLaunchOutcome::Fresh)
+        );
+        assert!(!client.backend_supports_suspend.load(Ordering::Acquire));
+        let result = client.suspend_boundary().await;
+        assert!(
+            matches!(result, Err(BackendError::Unsupported(_))),
+            "{result:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn suspend_sends_boundary_coordinates_and_returns_reference() {
+        let service = TestIsolationBackend::suspendable(LaunchOutcome::Fresh);
+        let suspends = service.suspends.clone();
+        let (client, server) = isolation_control_client(service, None).await;
+        client.grpc_channel().await.unwrap();
+        assert!(client.backend_supports_suspend.load(Ordering::Acquire));
+        let reference = client.suspend_boundary().await.unwrap();
+        assert_eq!(reference, b"opaque-restore-reference");
+        let suspends = suspends.lock().unwrap().clone();
+        assert_eq!(suspends.len(), 1);
+        assert_eq!(suspends[0].boundary_id, TEST_BOUNDARY_HANDLE);
+        assert_eq!(suspends[0].session_id, test_session_id().to_string());
+        assert_eq!(suspends[0].generation_id, "test-generation");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn suspend_rejects_backend_failures_and_invalid_references() {
+        for reference in [
+            Err(tonic::Code::FailedPrecondition),
+            Err(tonic::Code::Unavailable),
+            Ok(Vec::new()),
+            Ok(vec![0; MAX_RESTORE_REFERENCE_BYTES + 1]),
+        ] {
+            let service = TestIsolationBackend {
+                suspend_reference: reference.clone(),
+                ..TestIsolationBackend::suspendable(LaunchOutcome::Fresh)
+            };
+            let (client, server) = isolation_control_client(service, None).await;
+            client.grpc_channel().await.unwrap();
+            let result = client.suspend_boundary().await;
+            assert!(result.is_err(), "{:?}", reference.map(|bytes| bytes.len()));
+            server.abort();
         }
     }
 
@@ -2742,6 +3573,14 @@ mod tests {
         mediation_ready: bool,
         provider_environment_generation: u64,
         confirmation: BoundaryConfirmation,
+        /// Processes reported by successive attaches; empty once drained.
+        attach_snapshots: Arc<
+            std::sync::Mutex<
+                std::collections::VecDeque<Vec<crate::boundary_protocol::ProcessSnapshotWire>>,
+            >,
+        >,
+        /// Every request kind received, in order.
+        received: Arc<std::sync::Mutex<Vec<&'static str>>>,
     }
 
     type TestGrpcStream<F = ExchangeFrame> =
@@ -2768,6 +3607,8 @@ mod tests {
             let mediation_ready = self.mediation_ready;
             let provider_environment_generation = self.provider_environment_generation;
             let confirmation = self.confirmation.clone();
+            let attach_snapshots = self.attach_snapshots.clone();
+            let received = self.received.clone();
             let (outbound, outbound_rx) = tokio::sync::mpsc::channel(1);
             tokio::spawn(async move {
                 let mut frame = Vec::new();
@@ -2801,6 +3642,25 @@ mod tests {
                             return;
                         }
                     };
+                    received.lock().unwrap().push(match &envelope.request {
+                        Request::Attach {
+                            supervisor_takeover: Some(_),
+                            supervisor_recovery_timeout_secs: Some(_),
+                            ..
+                        } => "takeover-attach offering recovery",
+                        Request::Attach {
+                            supervisor_takeover: Some(_),
+                            ..
+                        } => "takeover-attach",
+                        Request::Attach {
+                            supervisor_recovery_timeout_secs: Some(_),
+                            ..
+                        } => "attach offering recovery",
+                        Request::Attach { .. } => "attach",
+                        Request::Confirm => "confirm",
+                        Request::StartAgent { .. } => "start-agent",
+                        _ => "other",
+                    });
                     match encode_frame(&ResponseEnvelope {
                         request_id: envelope.request_id,
                         response: match envelope.request {
@@ -2808,12 +3668,20 @@ mod tests {
                                 yaml: None,
                                 invalid: false,
                             },
-                            Request::Attach { .. } => Response::Attached {
-                                snapshot: crate::boundary_protocol::SessionSnapshotWire {
-                                    generation: "test-generation".to_string(),
-                                    processes: Vec::new(),
-                                },
-                            },
+                            Request::Attach { .. } => {
+                                let processes = attach_snapshots
+                                    .lock()
+                                    .unwrap()
+                                    .pop_front()
+                                    .unwrap_or_default();
+                                Response::Attached {
+                                    snapshot: crate::boundary_protocol::SessionSnapshotWire {
+                                        generation: "test-generation".to_string(),
+                                        processes,
+                                        bound_policy: None,
+                                    },
+                                }
+                            }
                             Request::Confirm => Response::Confirmed {
                                 confirmation: Box::new(confirmation),
                             },
@@ -2944,6 +3812,8 @@ mod tests {
             mediation_ready: false,
             provider_environment_generation: 0,
             confirmation: test_confirmation(),
+            attach_snapshots: Arc::default(),
+            received: Arc::default(),
         };
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -3018,6 +3888,8 @@ mod tests {
                     mediation_ready: false,
                     provider_environment_generation: 0,
                     confirmation: test_confirmation(),
+                    attach_snapshots: Arc::default(),
+                    received: Arc::default(),
                 };
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
@@ -3038,6 +3910,8 @@ mod tests {
         let attach = Request::Attach {
             supervisor_instance_id: client.supervisor_instance_id,
             policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
+            supervisor_takeover: None,
+            supervisor_recovery_timeout_secs: None,
         };
         assert!(matches!(
             client.call_idempotent(attach).await.unwrap(),
@@ -3129,6 +4003,8 @@ mod tests {
                     mediation_ready: true,
                     provider_environment_generation: 0,
                     confirmation: test_confirmation(),
+                    attach_snapshots: Arc::default(),
+                    received: Arc::default(),
                 };
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
@@ -3149,6 +4025,8 @@ mod tests {
         let attach = Request::Attach {
             supervisor_instance_id: client.supervisor_instance_id,
             policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
+            supervisor_takeover: None,
+            supervisor_recovery_timeout_secs: None,
         };
         assert!(matches!(
             client.call_idempotent(attach).await.unwrap(),
@@ -3184,6 +4062,8 @@ mod tests {
             mediation_ready: false,
             provider_environment_generation: 0,
             confirmation: test_confirmation(),
+            attach_snapshots: Arc::default(),
+            received: Arc::default(),
         };
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -3383,6 +4263,8 @@ mod tests {
             mediation_ready: false,
             provider_environment_generation: 0,
             confirmation,
+            attach_snapshots: Arc::default(),
+            received: Arc::default(),
         };
         tonic::transport::Server::builder()
             .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
@@ -3511,6 +4393,7 @@ mod tests {
             session_id: test_session_id(),
             resource_claims: std::collections::BTreeMap::new(),
             provisioning_evidence,
+            takeover: None,
         };
 
         assert!(matches!(
@@ -3901,6 +4784,8 @@ mod tests {
             mediation_ready: false,
             provider_environment_generation: 0,
             confirmation: test_confirmation(),
+            attach_snapshots: Arc::default(),
+            received: Arc::default(),
         };
         let server = tokio::spawn(async move {
             loop {
@@ -3974,6 +4859,8 @@ mod tests {
             mediation_ready: false,
             provider_environment_generation: 50,
             confirmation: test_confirmation(),
+            attach_snapshots: Arc::default(),
+            received: Arc::default(),
         };
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -4005,6 +4892,7 @@ mod tests {
             sandbox_id: context.sandbox_id,
             ca_file_paths: Arc::new(std::sync::Mutex::new(None)),
             provider_credentials: credentials.clone(),
+            recovered: None,
         });
         let running = ready.start_agent().await.unwrap();
         assert_eq!(requests.load(Ordering::Acquire), 1);
@@ -4025,6 +4913,316 @@ mod tests {
         assert_eq!(installed.session_id, test_session_id());
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn adopted_boundary_never_restarts_the_agent_and_catches_up_publication() {
+        let certificate = test_certificate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = TestGrpcBoundary {
+            wait_for_half_close: false,
+            expected_token: "a".repeat(32),
+            requests: requests.clone(),
+            mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mediation_ready: false,
+            provider_environment_generation: 50,
+            confirmation: test_confirmation(),
+            attach_snapshots: Arc::default(),
+            received: Arc::default(),
+        };
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let stream = tokio_rustls::TlsAcceptor::from(certificate.server_config)
+                .accept(stream)
+                .await
+                .unwrap();
+            tonic::transport::Server::builder()
+                .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
+                .add_service(SandboxProtocolServer::new(service))
+                .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
+                    Box::new(stream),
+                ))]))
+                .await
+                .unwrap();
+        });
+        let snapshot = crate::boundary_protocol::SessionSnapshotWire {
+            generation: "test-generation".to_string(),
+            bound_policy: None,
+            processes: vec![
+                crate::boundary_protocol::ProcessSnapshotWire {
+                    process_id: "test-generation:main:0".to_string(),
+                    kind: crate::boundary_protocol::ProcessKindWire::Main,
+                    terminal: false,
+                    status: None,
+                    retained_output: crate::boundary_protocol::OutputWindowWire {
+                        first_sequence: 0,
+                        next_sequence: 9,
+                        truncated: false,
+                    },
+                },
+                crate::boundary_protocol::ProcessSnapshotWire {
+                    process_id: "test-generation:exec:3".to_string(),
+                    kind: crate::boundary_protocol::ProcessKindWire::Exec,
+                    terminal: false,
+                    status: None,
+                    retained_output: crate::boundary_protocol::OutputWindowWire {
+                        first_sequence: 0,
+                        next_sequence: 0,
+                        truncated: false,
+                    },
+                },
+                crate::boundary_protocol::ProcessSnapshotWire {
+                    process_id: "test-generation:exec:1".to_string(),
+                    kind: crate::boundary_protocol::ProcessKindWire::Exec,
+                    terminal: false,
+                    status: Some(ExitStatusWire::Exited(0)),
+                    retained_output: crate::boundary_protocol::OutputWindowWire {
+                        first_sequence: 0,
+                        next_sequence: 4,
+                        truncated: false,
+                    },
+                },
+            ],
+        };
+        let context = sandbox();
+        let ready = Box::new(ReadyBoundary {
+            client: Arc::new(BoundaryClient::new(
+                tls_runtime_descriptor(address, certificate.client_tls),
+                test_bearer(&"a".repeat(32)),
+            )),
+            agent: context.agent,
+            sandbox_id: context.sandbox_id,
+            ca_file_paths: Arc::new(std::sync::Mutex::new(None)),
+            provider_credentials:
+                openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(
+                    6,
+                    HashMap::new(),
+                ),
+            recovered: Some(RecoveredProcesses::from_snapshot(&snapshot)),
+        });
+        let running = ready.start_agent().await.unwrap();
+        // The running canonical process is adopted: nothing is started.
+        assert_eq!(requests.load(Ordering::Acquire), 0);
+        assert!(running.agent_adopted());
+        assert_eq!(running.agent().process_id(), "test-generation:main:0");
+        // Only the exec process that has not exited is adopted.
+        assert_eq!(
+            running
+                .adopted_exec_processes()
+                .iter()
+                .map(|process| process.process_id())
+                .collect::<Vec<_>>(),
+            ["test-generation:exec:3"]
+        );
+        // Publication resumes above the runtime's installed generation.
+        running
+            .exec()
+            .synchronize_provider_environment()
+            .await
+            .unwrap();
+        assert_eq!(requests.load(Ordering::Acquire), 2);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn takeover_confirm_adopts_from_a_snapshot_taken_after_promotion() {
+        let certificate = test_certificate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let process = |process_id: &str, kind| crate::boundary_protocol::ProcessSnapshotWire {
+            process_id: process_id.to_string(),
+            kind,
+            terminal: false,
+            status: None,
+            retained_output: crate::boundary_protocol::OutputWindowWire {
+                first_sequence: 0,
+                next_sequence: 0,
+                truncated: false,
+            },
+        };
+        // The staged snapshot predates an exec the previous owner started
+        // before the promotion; only the refreshed snapshot shows it.
+        let attach_snapshots = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            vec![process(
+                "test-generation:main:0",
+                crate::boundary_protocol::ProcessKindWire::Main,
+            )],
+            vec![
+                process(
+                    "test-generation:main:0",
+                    crate::boundary_protocol::ProcessKindWire::Main,
+                ),
+                process(
+                    "test-generation:exec:4",
+                    crate::boundary_protocol::ProcessKindWire::Exec,
+                ),
+            ],
+        ])));
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let service = TestGrpcBoundary {
+            wait_for_half_close: false,
+            expected_token: "a".repeat(32),
+            requests: Arc::default(),
+            mediation_failures: Arc::default(),
+            mediation_ready: false,
+            provider_environment_generation: 0,
+            confirmation: test_confirmation(),
+            attach_snapshots,
+            received: received.clone(),
+        };
+        let server_config = certificate.server_config.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let stream = tokio_rustls::TlsAcceptor::from(server_config)
+                .accept(stream)
+                .await
+                .unwrap();
+            tonic::transport::Server::builder()
+                .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
+                .add_service(SandboxProtocolServer::new(service))
+                .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
+                    Box::new(stream),
+                ))]))
+                .await
+                .unwrap();
+        });
+        let descriptor = tls_runtime_descriptor(address, certificate.client_tls);
+        let instance = crate::boundary_protocol::SupervisorInstanceId::new();
+        let backend = OpenShellRuntimeBackend::new(
+            Arc::new(std::sync::Mutex::new(None)),
+            openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(
+                0,
+                HashMap::new(),
+            ),
+            test_bearer(&"a".repeat(32)),
+        )
+        .with_takeover(BoundaryTakeover {
+            supervisor_instance_id: instance,
+            grant: SecretJwt::parse("test-grant").unwrap(),
+        })
+        .with_recovery_timeout_secs(Some(60));
+        let bound = backend
+            .attach(descriptor.backend_descriptor().unwrap(), sandbox())
+            .await
+            .unwrap();
+        assert!(bound.is_takeover());
+        assert!(bound.adopts_running_agent());
+        let running = bound
+            .confirm()
+            .await
+            .unwrap()
+            .into_boundary()
+            .start_agent()
+            .await
+            .unwrap();
+        assert!(running.agent_adopted());
+        assert_eq!(running.agent().process_id(), "test-generation:main:0");
+        assert_eq!(
+            running
+                .adopted_exec_processes()
+                .iter()
+                .map(|process| process.process_id())
+                .collect::<Vec<_>>(),
+            ["test-generation:exec:4"]
+        );
+        // The grant goes out once; the refresh reattaches as the pinned
+        // owner, and the agent is never started again. Every attach offers
+        // the recovery deadline.
+        assert_eq!(
+            *received.lock().unwrap(),
+            [
+                "takeover-attach offering recovery",
+                "confirm",
+                "attach offering recovery"
+            ]
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn takeover_grants_reach_only_runtimes_that_support_takeover() {
+        async fn open(
+            metadata: openshell_core::proto::extension::v1::PeerMetadata,
+        ) -> (Result<(), BackendError>, usize, BoundaryClient) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let backend = TestIsolationBackend {
+                metadata: Some(metadata),
+                opens: opens.clone(),
+                ..TestIsolationBackend::default()
+            };
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                tonic::transport::Server::builder()
+                    .add_service(IsolationBackendServer::new(backend))
+                    .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(stream)]))
+                    .await
+                    .unwrap();
+            });
+            let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let mut client = BoundaryClient::new(
+                tls_runtime_descriptor(address, test_certificate().client_tls),
+                test_bearer(&"a".repeat(32)),
+            );
+            client.requires_takeover = true;
+            let credential = BoundaryCredential::capture(&client.sandbox_bearer).unwrap();
+            let opened = client.open_boundary(channel, &credential).await;
+            server.abort();
+            (opened, opens.load(Ordering::Acquire), client)
+        }
+
+        // A runtime from before takeover support never sees the boundary
+        // opened, let alone the grant.
+        let mut legacy = crate::isolation_protocol::metadata("legacy/runtime");
+        legacy.supported_capabilities.retain(|capability| {
+            capability != crate::isolation_protocol::SUPERVISOR_TAKEOVER_CAPABILITY
+        });
+        let (opened, opens, _) = open(legacy).await;
+        assert!(
+            matches!(opened, Err(BackendError::Unsupported(_))),
+            "{opened:?}"
+        );
+        assert_eq!(opens, 0);
+
+        let (opened, opens, mut client) =
+            open(crate::isolation_protocol::metadata("openshell/sandbox")).await;
+        opened.expect("a takeover-capable runtime opens");
+        assert_eq!(opens, 1);
+        client.recovery_timeout_secs = Some(60);
+
+        // Once confirmed, reconnects reattach as the pinned process without
+        // the grant, so its expiry cannot break transport recovery.
+        let policy = Box::new(SandboxPolicyWire::from(sandbox().policy));
+        *client.attach_request.lock().unwrap() = Some(
+            BoundaryClient::prepare_request(Request::Attach {
+                supervisor_instance_id: client.supervisor_instance_id,
+                policy: policy.clone(),
+                supervisor_takeover: Some("grant".to_string()),
+                supervisor_recovery_timeout_secs: Some(60),
+            })
+            .unwrap(),
+        );
+        client.forget_takeover_grant(policy).unwrap();
+        let remembered = client.attach_request.lock().unwrap().clone().unwrap();
+        // The pinned process keeps offering its recovery deadline.
+        assert!(matches!(
+            remembered.request,
+            Request::Attach {
+                supervisor_takeover: None,
+                supervisor_instance_id,
+                supervisor_recovery_timeout_secs: Some(60),
+                ..
+            } if supervisor_instance_id == client.supervisor_instance_id
+        ));
     }
 
     #[tokio::test]

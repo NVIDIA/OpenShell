@@ -26,10 +26,12 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
-use openshell_core::proto::SupervisorMiddlewareService;
+use openshell_core::proto::{
+    SupervisorMiddlewareBinding, SupervisorMiddlewareBindingPolicy, SupervisorMiddlewareService,
+};
 use openshell_core::{
-    EdgeAuthConfig, GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
-    GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig,
+    EdgeAuthConfig, ExtensionBindingPolicy, GatewayAuthConfig, GatewayInterceptorConfig,
+    GatewayJwtConfig, GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -194,6 +196,9 @@ pub struct GatewayFileSection {
     pub otlp: Option<OtlpConfig>,
     #[serde(default)]
     pub ocsf_log: Option<OcsfLogConfig>,
+    /// Tuning of the shared supervisor pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_pool: Option<SupervisorPoolConfig>,
 
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
@@ -202,6 +207,25 @@ pub struct GatewayFileSection {
     // rejected in [`load`].
     #[serde(default)]
     pub database_url: Option<String>,
+}
+
+/// `[openshell.gateway.supervisor_pool]`: optional tuning of the shared
+/// supervisor pool.
+///
+/// The shared supervisor always runs as a pool that the gateway coordinates
+/// for high availability: it places each sandbox instance on a live member by
+/// consistent hash, records its owner durably, and moves the instances of a
+/// failed or leaving member to another member, which adopts their running
+/// workloads. Without this table the defaults apply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorPoolConfig {
+    /// Seconds a sandbox runtime keeps its workload frozen after losing its
+    /// supervisor before terminating it, from 10 to 300. The pool's
+    /// supervisors offer it to each runtime; unset offers
+    /// [`openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_timeout_secs: Option<u32>,
 }
 
 /// Gateway listener TLS fields accepted in `gateway.toml`.
@@ -504,6 +528,12 @@ pub struct MiddlewareServiceFileConfig {
     /// Default RPC timeout using an integer with an `ms` or `s` suffix.
     #[serde(default)]
     pub timeout: Option<String>,
+    /// Which advertised operation/phase pairs the operator authorizes.
+    #[serde(default)]
+    pub binding_policy: ExtensionBindingPolicy,
+    /// Required operation/phase pairs for an allowlist or exact policy.
+    #[serde(default)]
+    pub bindings: Vec<SupervisorMiddlewareBinding>,
 }
 
 impl TryFrom<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
@@ -523,9 +553,25 @@ impl TryFrom<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
             None => Vec::new(),
         };
 
+        let binding_policy = match config.binding_policy {
+            // Preserve the wire config and revision of registrations using the default.
+            ExtensionBindingPolicy::Dynamic => SupervisorMiddlewareBindingPolicy::Unspecified,
+            ExtensionBindingPolicy::Allowlist => SupervisorMiddlewareBindingPolicy::Allowlist,
+            ExtensionBindingPolicy::Exact => SupervisorMiddlewareBindingPolicy::Exact,
+        };
+        // Binding order has no meaning and must not change the configuration revision.
+        // Keep duplicates so registration validation can report them.
+        let mut bindings: Vec<_> = config
+            .bindings
+            .iter()
+            .map(|binding| *binding as i32)
+            .collect();
+        bindings.sort_unstable();
         Ok(Self {
             name: config.name.clone(),
             grpc_endpoint: config.grpc_endpoint.clone(),
+            binding_policy: binding_policy.into(),
+            bindings,
             max_payload_bytes: config.max_payload_bytes,
             request_timeout: config
                 .timeout
@@ -791,6 +837,20 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
         return Err(ConfigFileError::InvalidValue {
             field: "openshell.gateway.credential_drivers",
             message: "omit the field to use default encrypted gateway credential storage, or specify exactly one external credential driver",
+        });
+    }
+    if file
+        .openshell
+        .gateway
+        .supervisor_pool
+        .and_then(|pool| pool.recovery_timeout_secs)
+        .is_some_and(|timeout| {
+            !openshell_supervisor_control::SUPERVISOR_RECOVERY_TIMEOUT_RANGE.contains(&timeout)
+        })
+    {
+        return Err(ConfigFileError::InvalidValue {
+            field: "openshell.gateway.supervisor_pool.recovery_timeout_secs",
+            message: "must be between 10 and 300 seconds",
         });
     }
     if let Some((name, _)) = file
@@ -1515,6 +1575,8 @@ timeout = "2s"
                 allow_insecure_transport: false,
                 max_payload_bytes: 262_144,
                 timeout: Some("2s".into()),
+                binding_policy: ExtensionBindingPolicy::Dynamic,
+                bindings: vec![],
             }]
         );
         let registration =
@@ -1533,6 +1595,40 @@ timeout = "2s"
     }
 
     #[test]
+    fn supervisor_middleware_binding_policy_reaches_wire_configuration() {
+        use SupervisorMiddlewareBinding::{HttpRequestPreCredentials, HttpResponsePreReturn};
+        use SupervisorMiddlewareBindingPolicy::{Allowlist, Unspecified};
+
+        let toml = r#"
+name = "guard"
+grpc_endpoint = "https://guard.example:50051"
+max_payload_bytes = 1024
+"#;
+        let parse = |text: &str| {
+            let config: MiddlewareServiceFileConfig = ::toml::from_str(text).unwrap();
+            SupervisorMiddlewareService::try_from(&config).unwrap()
+        };
+        let default = parse(toml);
+        assert_eq!(default.binding_policy, Unspecified as i32);
+        assert!(default.bindings.is_empty());
+
+        let registration = parse(&format!(
+            r#"{toml}
+binding_policy = "allowlist"
+bindings = ["http_response_pre_return", "http_request_pre_credentials"]
+"#
+        ));
+        assert_eq!(registration.binding_policy, Allowlist as i32);
+        assert_eq!(
+            registration.bindings,
+            [
+                HttpRequestPreCredentials as i32,
+                HttpResponsePreReturn as i32
+            ]
+        );
+    }
+
+    #[test]
     fn middleware_registration_defaults_audience_to_name() {
         let mut config = MiddlewareServiceFileConfig {
             name: "local-guard".into(),
@@ -1542,6 +1638,8 @@ timeout = "2s"
             allow_insecure_transport: false,
             max_payload_bytes: 262_144,
             timeout: None,
+            binding_policy: ExtensionBindingPolicy::Dynamic,
+            bindings: vec![],
         };
 
         let registration = SupervisorMiddlewareService::try_from(&config).unwrap();
@@ -1574,6 +1672,8 @@ timeout = "2s"
             allow_insecure_transport: false,
             max_payload_bytes: 262_144,
             timeout: None,
+            binding_policy: ExtensionBindingPolicy::Dynamic,
+            bindings: vec![],
         };
 
         let error = SupervisorMiddlewareService::try_from(&config)
@@ -1607,6 +1707,8 @@ timeout = "2s"
             allow_insecure_transport: false,
             max_payload_bytes: 262_144,
             timeout: None,
+            binding_policy: ExtensionBindingPolicy::Dynamic,
+            bindings: vec![],
         };
 
         let error = SupervisorMiddlewareService::try_from(&config)
@@ -1773,6 +1875,43 @@ database_lock_max_connections = 0
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_the_supervisor_pool_tuning() {
+        let pool = |table: &str| {
+            let tmp = write_tmp(&format!("[openshell.gateway.supervisor_pool]\n{table}"));
+            load(tmp.path()).map(|file| file.openshell.gateway.supervisor_pool)
+        };
+        let configured = pool("recovery_timeout_secs = 90\n").unwrap().unwrap();
+        assert_eq!(configured.recovery_timeout_secs, Some(90));
+        assert_eq!(pool("").unwrap().unwrap().recovery_timeout_secs, None);
+        let tmp = write_tmp("[openshell.gateway]\n");
+        assert!(
+            load(tmp.path())
+                .unwrap()
+                .openshell
+                .gateway
+                .supervisor_pool
+                .is_none()
+        );
+        // Recovery stays bounded, and unknown keys, including the removed
+        // `enabled` switch, are refused.
+        for out_of_range in ["9", "301"] {
+            assert!(matches!(
+                pool(&format!("recovery_timeout_secs = {out_of_range}\n")),
+                Err(ConfigFileError::InvalidValue {
+                    field: "openshell.gateway.supervisor_pool.recovery_timeout_secs",
+                    ..
+                })
+            ));
+        }
+        for unknown in ["enabled = true\n", "high_availability = true\n"] {
+            assert!(
+                matches!(pool(unknown), Err(ConfigFileError::Parse { .. })),
+                "{unknown}"
+            );
+        }
     }
 
     #[test]

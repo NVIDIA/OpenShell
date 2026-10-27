@@ -80,8 +80,11 @@ socket2 = { workspace = true, features = ["all"] }
 tempfile = "3"
 
 [dev-dependencies]
+hyper-util = { workspace = true }
+openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 rcgen = { workspace = true }
 tempfile = "3"
+tower = { workspace = true }
 
 [lints]
 workspace = true

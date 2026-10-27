@@ -114,7 +114,7 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Triage          | `apply-triage-action`     | Apply, reject, or defer one explicitly selected triage recommendation                               |
 | Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
-| Platform        | `build-openshell-mxc-windows` | Maintain and validate the build-only x64 and ARM64 Windows MSVC lane                             |
+| Platform        | `build-openshell-mxc-windows` | Maintain and validate native x64 and ARM64 MSVC builds and MXC runtime on the `windows` branch |
 | Documentation   | `update-docs-from-commits` | Scan recent commits and draft doc updates for user-facing changes                                  |
 | Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
 | Maintenance     | `release-captain`         | Run the weekly Monday pre-flight and Tuesday stable release checklist                               |
@@ -142,6 +142,12 @@ When recording a triage outcome, replace the previous assessment state rather th
 
 ## Prerequisites
 
+Native Windows development uses the [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Follow [Native Windows support](WINDOWS.md) for checkout, MSVC prerequisites,
+runtime requirements, and limitations. Target Windows implementation PRs at
+`windows`. Shared documentation can merge into `main`, but Windows-specific
+source and task links must continue to point to `windows`.
+
 Install [mise](https://mise.jdx.dev/). This is used to set up the development environment.
 
 ```bash
@@ -164,11 +170,34 @@ echo '~/.local/bin/mise activate fish | source' >> ~/.config/fish/config.fish
 echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshrc
 ```
 
-Project requirements:
+Linux/macOS development requirements:
 
 - Rust 1.94+
 - Python 3.11+
 - Docker (running)
+
+### Nix setup
+
+The `nix develop` shell and `nix run .#…` apps, such as tmachine and the test
+guests, need Nix with flakes. We recommend
+[Determinate Nix](https://docs.determinate.systems/), which CI also uses and
+which enables flakes by default. With another installer,
+[enable flakes](https://wiki.nixos.org/wiki/Flakes#Enabling_flakes_permanently)
+yourself.
+
+To download prebuilt dependencies instead of building them from source, add
+the OpenShell binary cache to your Nix configuration. With Determinate Nix, add
+these lines to
+[`/etc/nix/nix.custom.conf`](https://docs.determinate.systems/determinate-nix#configuration)
+and restart the Nix daemon:
+
+```text
+extra-substituters = https://openshell.cachix.org
+extra-trusted-public-keys = openshell.cachix.org-1:OAr5MunsfH5PZvUsfD08OtGx5RtcwdNZGJdU5FqLm5w=
+```
+
+With other installers, follow the setup instructions for the
+[`openshell` Cachix cache](https://app.cachix.org/cache/openshell).
 
 ### Z3 installation
 
@@ -203,7 +232,7 @@ cargo build -p openshell-prover-cli --features vendored-z3
 Local gateway image and E2E builds enable `vendored-z3` so their
 copied gateway binaries do not need a shared Z3 library in the runtime image.
 
-For x86-64 and ARM64 Windows MSVC builds, use one of these Z3 paths:
+For x86-64 and ARM64 Windows MSVC builds from the `windows` branch, use one of these Z3 paths:
 
 - Prebuilt Z3 (the default for `windows:*` tasks): `z3-sys` downloads the
   pinned Z3 5.1.0 GitHub release for the target architecture on the first
@@ -226,8 +255,10 @@ cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features prebu
 
 ### Windows full build
 
-To build the full set of Windows binaries, including `openshell-gateway.exe`
-and `openshell.exe`, use the `windows:build:x64` mise task instead of a
+Run these commands in a `windows`-based checkout. To build the full set of
+Windows binaries, including `openshell-gateway.exe`, `openshell.exe`,
+`openshell-supervisor.exe`, and `openshell-windows-sandbox.exe`,
+use the `windows:build:x64` mise task instead of a
 single-crate `cargo build`. It downloads the pinned prebuilt Z3 release by default. A
 full build also compiles crates that use `bindgen` (e.g. the MXC driver on
 Windows), so it requires `libclang.dll`; if LLVM is not on the default search
@@ -237,6 +268,12 @@ path, set `LIBCLANG_PATH` to the directory containing `libclang.dll`:
 $env:LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Tools\Llvm\x64\bin'
 mise run --skip-tools windows:build:x64
 ```
+
+For ARM64, use `windows:build:arm64` with ARM64 MSVC components and host-native
+LLVM. Keep the matching `libz3.dll` staged by the build beside the executables.
+See [Windows validation](https://github.com/NVIDIA/OpenShell/blob/windows/TESTING.md#native-windows-validation)
+for native tests and MXC E2E requirements. Docker is not required for the native
+Windows build or MXC runtime.
 
 To use a local x64 Z3 release instead of the prebuilt download, set
 `Z3_LIBRARY_PATH_OVERRIDE` and `Z3_SYS_Z3_HEADER` before running the task:
@@ -256,6 +293,9 @@ xcode-select --install
 ```
 
 ## Getting Started
+
+The gateway and shell shortcuts below describe Linux/macOS development.
+For native Windows, use the [Windows build and runtime instructions](WINDOWS.md).
 
 ```bash
 # One-time trust
@@ -403,7 +443,7 @@ Issues and pull requests receive `state:stale` after 14 days without activity. O
 
 For release notes, describe the user-facing change in a few short, easy-to-read sentences in the optional **Release Notes** section of the PR description. Keep the section concise. Stable releases use it when non-empty; otherwise they summarize the PR title and description.
 
-Every PR except an automated dependency update must close an existing issue. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
+Every PR must close an existing issue, except automated dependency updates and the build and flaky-test fixes described below. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
 
 Authors without write access to the target repository must link at least one issue with `state:accepted`, and every linked issue must be accepted. This applies to drafts and direct requests to agents. Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may create a PR without the acceptance label; they must still follow the issue-linking requirement above. PR body text, roadmap placement, other labels, and vouch status do not bypass acceptance.
 
@@ -411,11 +451,13 @@ The `PR Issue Acceptance` workflow reports the native `OpenShell / PR Issue Acce
 
 Automated dependency update PRs, including Dependabot PRs, are exempt from the separate issue and closing-reference requirement. Human-authored dependency updates follow the normal issue requirement. The exception does not bypass `PR Issue Acceptance` for authors without repository write access or change applicable verification, review, or private vulnerability disclosure requirements.
 
+Authors with `WRITE`, `MAINTAIN`, or `ADMIN` access may open a PR that only fixes a broken build or flaky tests without a separate issue. Describe the failure in the PR instead. Authors without write access follow the normal issue and acceptance requirements.
+
 ### Branch Names
 
 Use `<type>/<issue-id>-<short-description>/<github-username>` for contributor branches. Choose the Conventional Commit type that describes the work, such as `feat`, `fix`, `refactor`, `chore`, `perf`, `docs`, `test`, or `ci`. The description is a short lowercase slug separated by hyphens; the final component is your GitHub login, not initials.
 
-For example, issue 1234 with contributor `octocat` uses `feat/1234-add-pagination/octocat`. Dependent PRs follow the same naming rule and branch from their parent PR's branch.
+For example, issue 1234 with contributor `octocat` uses `feat/1234-add-pagination/octocat`. A PR without an issue omits the issue ID, such as `fix/flaky-sandbox-tests/octocat`. Dependent PRs follow the same naming rule and branch from their parent PR's branch.
 
 Branches created by automation, such as Dependabot and CI mirror branches, keep their generated names. For private security work, follow the authorized disclosure workflow and use a neutral description that does not expose vulnerability details.
 

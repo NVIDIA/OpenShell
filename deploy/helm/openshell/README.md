@@ -17,6 +17,23 @@ namespace. The gateway and workspace releases can then be upgraded and removed
 independently. Use Kubernetes `operator` workspace mode when one gateway serves
 multiple pre-provisioned workspace namespaces.
 
+## Certificate hook metadata
+
+Use `pkiInitJob.podLabels` and `pkiInitJob.podAnnotations` to add metadata to the
+Pod templates of the `<fullname>-certgen` and `<fullname>-certgen-backend-ca`
+Jobs. These settings apply to both hooks when enabled and do not affect gateway
+or sandbox Pods. Chart-owned Pod labels take precedence when custom keys
+conflict.
+
+For example, disable Istio sidecar injection for the hook Pods in an injected
+namespace:
+
+```yaml
+pkiInitJob:
+  podAnnotations:
+    sidecar.istio.io/inject: "false"
+```
+
 ## Cluster-scoped vs namespaced objects
 
 Most objects in this chart are namespaced and land in the release namespace.
@@ -190,6 +207,7 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
 - [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - CI overlay for multi-replica external PostgreSQL testing
 - [`ci/values-autoscaling.yaml`](ci/values-autoscaling.yaml) - CI overlay for rendering the optional gateway HorizontalPodAutoscaler
+- [`ci/values-supervisor-autoscaling.yaml`](ci/values-supervisor-autoscaling.yaml) - CI overlay for rendering the optional shared supervisor memory HorizontalPodAutoscaler
 - [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE provider token grants
 - [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
 
@@ -360,6 +378,19 @@ Disabling autoscaling renders `spec.replicas` from `replicaCount` again,
 which defaults to 1, so set `replicaCount` to the replica count you want in
 that upgrade.
 
+Set `supervisor.autoscaling.enabled=true` with the shared supervisor topology
+to autoscale its Deployment independently of the gateway. It uses average
+memory per Pod (`supervisor.autoscaling.targetMemoryAverageValue`, default
+`512Mi`) through the resource metrics API, usually provided by Metrics Server.
+Defaults keep two to four members and remove at most one member every two
+minutes after a five-minute stabilization window. The HPA owns replicas, so
+`supervisor.replicas` is ignored. Enabling it on an existing Deployment has
+the same temporary reset-to-one risk described above; pick up new defaults
+with `--reset-then-reuse-values`. When disabling it, set `supervisor.replicas`
+explicitly. Existing sandboxes stay on their owners when scaling up, and
+memory-based scaling does not guarantee spare capacity for handoff. See the
+[shared supervisor autoscaling guide](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#autoscale-shared-supervisors-by-memory).
+
 ## Secret bootstrap
 
 By default, a pre-install/pre-upgrade hook Job runs `openshell-gateway generate-certs`
@@ -450,6 +481,8 @@ discovery endpoint or its TLS CA.
 | openshiftRoute.host | string | `""` | Hostname for the Route. Must match a SAN on the gateway's server cert. |
 | pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets. When certManager.enabled=true, cert-manager owns TLS and this same hook runs in JWT-only mode even if pkiInitJob.enabled remains true. |
 | pkiInitJob.failOnTimeout | bool | `true` | Fail the helm install/upgrade if cert-manager does not issue the certificate within the polling timeout. When true (default), the install fails immediately if the timeout is reached, providing clear feedback that BackendTLSPolicy is non-functional. When false, the hook succeeds with a warning and you can run `helm upgrade` after cert-manager issues the certificate to create the backend CA ConfigMap. If you set this to false and see "TLS error: Secret is not supplied by SDS" when connecting to the gateway, check if the TLS secret exists and run `helm upgrade` to create the ConfigMap. |
+| pkiInitJob.podAnnotations | object | `{}` | Additional annotations on both certificate hook Pods. |
+| pkiInitJob.podLabels | object | `{}` | Additional labels on both certificate hook Pods. Chart-owned labels take precedence. |
 | pkiInitJob.securityContext.allowPrivilegeEscalation | bool | `false` | Whether the certgen hook container can gain additional privileges. |
 | pkiInitJob.securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the certgen hook container. |
 | pkiInitJob.securityContext.runAsNonRoot | bool | `true` | Require the certgen hook container to run as a non-root user. |
@@ -527,6 +560,7 @@ discovery endpoint or its TLS CA.
 | server.enableUserNamespaces | bool | `false` | Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox pods. Requires Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), plus a supporting container runtime and Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host UID and capabilities become namespaced. |
 | server.enableWebsocketTunnel | bool | `false` | Enable the WebSocket tunnel used by CLI/SDK clients behind an authenticated edge proxy. Leave disabled for direct gateway installs. |
 | server.externalDbSecret | string | `""` | Name of a pre-existing Opaque Secret containing a PostgreSQL connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL from this Secret instead of using dbUrl. The Secret must contain a `uri` key, e.g. postgresql://user:pass@host:5432/dbname. |
+| server.extraEnv | list | `[]` | Additional environment variables for the gateway container, such as OTEL_* exporter settings. Entries can read from a Secret with valueFrom. |
 | server.extraVolumeMounts | list | `[]` | Additional volume mounts for the gateway container. |
 | server.extraVolumes | list | `[]` | Additional volumes for the gateway pod. |
 | server.grpcEndpoint | string | `""` | gRPC endpoint sandboxes call back into the gateway. Leave empty to derive it from the chart fullname, release namespace, service port, and disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080. Override only when sandboxes must reach the gateway via a different hostname (e.g. an external ingress or a host alias). |
@@ -580,16 +614,25 @@ discovery endpoint or its TLS CA.
 | serviceAccount.annotations | object | `{}` | Annotations to add to the generated service account. |
 | serviceAccount.create | bool | `true` | Create a service account for the gateway. |
 | serviceAccount.name | string | `""` | Existing service account name to use when serviceAccount.create is false. |
+| supervisor.affinity | object | `{}` | Affinity rules for the shared supervisor pod, rendered only when gatewayConfig selects supervisor_topology = "gateway". Top-level affinity applies only to the gateway pod. |
+| supervisor.autoscaling.behavior | object | `{"scaleDown":{"policies":[{"periodSeconds":120,"type":"Pods","value":1}],"stabilizationWindowSeconds":300}}` | HPA scaling behavior. Remove at most one member every two minutes, after a five-minute stabilization window, to allow ownership handoff. |
+| supervisor.autoscaling.enabled | bool | `false` | Enable memory-based autoscaling of the shared supervisor Deployment. Requires supervisor_topology = "gateway" and the Kubernetes resource metrics API (usually Metrics Server). When enabled, the HPA owns the replica count and supervisor.replicas is ignored. |
+| supervisor.autoscaling.maxReplicas | int | `4` | Maximum supervisor replicas. |
+| supervisor.autoscaling.minReplicas | int | `2` | Minimum supervisor replicas. Keep at least 2 for failover capacity. |
+| supervisor.autoscaling.targetMemoryAverageValue | string | `"512Mi"` | Target average memory working set per supervisor Pod, as a positive Kubernetes quantity. This is an absolute value, not a percentage of requests. Scaling up adds capacity for new sandboxes; it does not move existing sandboxes away from a busy member. |
 | supervisor.image.digest | string | `""` | Supervisor image digest. When set, this takes precedence over tag. |
 | supervisor.image.pullPolicy | string | `nil` | Supervisor image pull policy. Empty uses global.image.pullPolicy. Prefer always, if_not_present, or never; the chart also accepts legacy Kubernetes spellings Always, IfNotPresent, and Never. |
 | supervisor.image.registry | string | `""` | Supervisor image registry. Empty uses global.image.registry. |
 | supervisor.image.repository | string | `"openshell/supervisor"` | Supervisor image repository. |
 | supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
+| supervisor.podDisruptionBudget.enabled | bool | `true` | Render a PodDisruptionBudget with maxUnavailable 1 for the shared supervisor, used only when gatewayConfig selects supervisor_topology = "gateway". Disable it only when maintenance must evict more than one supervisor Pod at a time, or evict a member while another is unavailable. |
 | supervisor.podSecurityContext.fsGroup | int | `65534` | fsGroup assigned to the shared supervisor pod. |
 | supervisor.podSecurityContext.runAsGroup | int | `65534` | Primary GID assigned to the shared supervisor pod. |
 | supervisor.podSecurityContext.runAsNonRoot | bool | `true` | Require the shared supervisor to run as a non-root user. |
 | supervisor.podSecurityContext.runAsUser | int | `65534` | UID assigned to the shared supervisor pod. |
 | supervisor.podSecurityContext.seccompProfile.type | string | `"RuntimeDefault"` | Seccomp profile applied to the shared supervisor pod. |
+| supervisor.recoveryTimeoutSeconds | int | `60` | Seconds a sandbox workload stays frozen after losing its pool member's supervision before the sandbox runtime terminates it, rendered as [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an integer from 10 to 300. Null leaves the gateway's pool default of 60 seconds. |
+| supervisor.replicas | int | `1` | Shared supervisor pool members, used only when gatewayConfig selects supervisor_topology = "gateway". The gateway always coordinates the shared supervisor as a high-availability pool: when a member fails or leaves, another member takes over its sandboxes without restarting their workloads. 1 has no failover; use 2 or more to survive losing a member. Only the supervisor Deployment's replica count depends on this value, so changing it neither restarts the gateway nor replaces running members. Ignored when supervisor.autoscaling.enabled is true. |
 | supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
 | upstreamProxy | object | `{"authAllowInsecure":false,"authSecret":{"key":"","name":""},"caBundle":{"configMapName":"","key":"ca.crt"},"connectByHostname":false,"noProxy":"","url":""}` | Operator-owned corporate forward proxy for policy-approved TLS egress from Kubernetes sandboxes. The workload cannot select or override it. |

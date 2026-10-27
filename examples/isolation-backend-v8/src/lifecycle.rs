@@ -87,6 +87,7 @@ impl Runtime {
         let registry = Arc::new(SandboxConnectionRegistry::new(
             launch.boundary.session_id,
             launch.rotation,
+            launch.epoch,
         ));
         Ok(Arc::new(Self {
             launch,
@@ -234,8 +235,10 @@ impl Runtime {
                 supervisor_instance_id,
                 ..
             } => {
+                // This backend does not offer supervisor takeover, so a
+                // replacement supervisor is refused rather than staged.
                 self.registry
-                    .attach(principal, *supervisor_instance_id)
+                    .attach(principal, *supervisor_instance_id, None)
                     .map_err(|e| Status::failed_precondition(e.to_string()))?;
             }
             Q::Confirm => self
@@ -298,6 +301,7 @@ impl Runtime {
                     snapshot: wire::SessionSnapshotWire {
                         generation: self.launch.boundary.generation.clone(),
                         processes: vec![],
+                        bound_policy: state.policy.clone().map(Box::new),
                     },
                 }
             }
