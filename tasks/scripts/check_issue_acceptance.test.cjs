@@ -8,7 +8,7 @@ const checkIssueAcceptance = require('./check_issue_acceptance.cjs');
 async function check({
   permission = 'read', issues = [], body = '', permissionError,
   number = 7, headSha = 'pr-head', pullError, issueError, labelError,
-  author = 'contributor', actor = 'maintainer',
+  author = 'contributor', actor = 'maintainer', draft = false,
 } = {}) {
   const failures = [];
   const github = {
@@ -18,7 +18,7 @@ async function check({
           assert.equal(pull_number, number);
           if (pullError) throw new Error('PR lookup failed');
           return { data: {
-            number, user: { login: author }, head: { sha: headSha }, body,
+            number, user: { login: author }, head: { sha: headSha }, body, draft,
           } };
         },
       },
@@ -65,6 +65,22 @@ test('Dependabot PRs pass without permission or issue lookups', async () => {
   assert.deepEqual(await check({
     author: 'dependabot[bot]', permissionError: 403, issueError: true,
   }), []);
+});
+
+test('draft PRs pass without permission or issue lookups', async () => {
+  assert.deepEqual(await check({
+    draft: true, permissionError: 403, issueError: true,
+  }), []);
+});
+
+test('community draft without accepted issues passes acceptance check', async () => {
+  assert.deepEqual(await check({ draft: true, issues: [{ number: 1 }] }), []);
+});
+
+test('ready-for-review community PR without accepted issues fails acceptance check', async () => {
+  const failures = await check({ draft: false, issues: [{ number: 1 }] });
+  assert.equal(failures.length, 1);
+  assert.match(failures[0], /Community PRs require state:accepted/);
 });
 
 test('other bots still require an accepted issue', async () => {

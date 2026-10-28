@@ -13,6 +13,11 @@ module.exports = async function checkIssueAcceptance({ github, context, core }) 
     return;
   }
 
+  if (pr.draft) {
+    core.info('Draft pull requests are exempt from issue acceptance while in draft.');
+    return;
+  }
+
   async function evaluate() {
     try {
       const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
