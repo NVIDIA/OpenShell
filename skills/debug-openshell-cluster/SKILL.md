@@ -1462,6 +1462,9 @@ are preserved. Membership expiry does not prove a gateway has stopped. Follow th
 [activation checklist](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#activate-sandbox-updates).
 
 The gateway retries accepted updates automatically, even with new updates disabled.
+Repeated automatic failures back off up to 15 minutes per gateway. Replicas retry
+independently, and restarting a gateway resets its delay. Recovery warnings include
+the attempt count and retry delay.
 To resume immediately, read the sandbox resource version and call `UpdateSandbox`
 with that version and no selected fields. Restore a compatible driver if recovery
 reports missing support. Start, stop, and provisioning retry retain the barrier;

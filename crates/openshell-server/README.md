@@ -143,8 +143,13 @@ reconciliation, including when activation is subsequently disabled. Recovery
 pages through a partial database index of pending private update records instead
 of scanning sandboxes or completed receipts. Acceptance and completion maintain
 the indexed status in the same transaction as the intent and lifecycle interlock.
+Each gateway keeps automatic recovery backoff in memory. Failed attempts wait
+1, 2, 4, 8, then 15 minutes; each failure log includes the attempt and retry delay.
+Replicas retry independently, and a gateway restart resets its backoff. A new
+operation starts without delay. Completed or deleted updates are removed from
+the backoff map as recovery observes them.
 An authorized `UpdateSandbox` with no selected fields and the current resource
-version resumes the stored intent without reconstructing its selections. Completion retains the
+version resumes immediately, bypassing backoff without reconstructing its selections. Completion retains the
 exact operation receipt for idempotent completion across replicas; a newer update
 invalidates it. Ambiguous results retain the baseline provisioning interlock.
 Explicit deletion can supersede a pending update: the driver only patches the

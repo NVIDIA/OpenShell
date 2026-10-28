@@ -591,7 +591,9 @@ cleanup completion and settlement of the original driver operation, then run
 timeout diagnostic and storage and does not bypass pending cleanup.
 
 An operation-pending error blocks start, stop, and provisioning retry. The gateway
-retries automatically even when new updates are disabled. To resume immediately,
+retries automatically even when new updates are disabled. Repeated automatic
+failures back off up to 15 minutes per gateway; restarting a gateway resets the delay.
+To resume immediately,
 read a fresh resource version and call `UpdateSandbox` with no selected fields;
 the gateway loads the stored targets. Use a new request ID or no ID for this
 explicit resume. An unresolved original ID returns uncertainty, and its payload

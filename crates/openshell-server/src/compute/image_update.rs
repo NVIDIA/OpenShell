@@ -14,6 +14,14 @@ use tonic::{Request, Status};
 use tracing::info;
 
 const UPDATE_RECOVERY_PAGE_SIZE: u32 = 128;
+const UPDATE_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
+
+#[derive(Clone)]
+pub(super) struct UpdateRecoveryBackoff {
+    operation_id: String,
+    attempts: u32,
+    next_retry: tokio::time::Instant,
+}
 
 impl ComputeRuntime {
     pub(crate) fn with_sandbox_updates(mut self, enabled: bool) -> Self {
@@ -252,6 +260,10 @@ impl ComputeRuntime {
             .map_err(|error| {
                 crate::grpc::persistence_error_to_status(error, "complete sandbox image update")
             })?;
+        self.update_recovery_backoff
+            .lock()
+            .await
+            .remove(pending.object_id());
         self.sandbox_index.update_from_sandbox(&updated);
         self.sandbox_watch_bus.notify(updated.object_id());
         info!(sandbox_id = %updated.object_id(), operation_id = %intent.operation_id,
@@ -331,25 +343,6 @@ impl ComputeRuntime {
         Ok(())
     }
 
-    /// Recover from private durable intent, independent of new-update activation.
-    pub(super) async fn recover_sandbox_update(&self, sandbox: &Sandbox) -> Result<bool, Status> {
-        let state = self
-            .store
-            .get_sandbox_image_state(sandbox.object_id())
-            .await
-            .map_err(|_| Status::unavailable("cannot read pending sandbox update"))?;
-        let Some(intent) = state.and_then(|state| state.pending) else {
-            return Ok(false);
-        };
-        if sandbox.phase() == SandboxPhase::Deleting as i32 {
-            return Ok(false);
-        }
-        ensure_image_update_stopped(sandbox)?;
-        self.ensure_configuration_update_supported()?;
-        self.complete_image_update(sandbox.clone(), intent).await?;
-        Ok(true)
-    }
-
     pub(super) async fn recover_pending_sandbox_updates(&self) -> Result<(), String> {
         let Ok(permit) = self.update_recovery_sweep.clone().try_acquire_owned() else {
             return Ok(());
@@ -360,6 +353,7 @@ impl ComputeRuntime {
             .await
             .map_err(|error| format!("list pending sandbox updates: {error}"))?;
         if ids.is_empty() {
+            self.update_recovery_backoff.lock().await.clear();
             return Ok(());
         }
         let runtime = self.clone();
@@ -380,7 +374,9 @@ impl ComputeRuntime {
         mut ids: Vec<String>,
     ) -> Result<(), String> {
         use futures::StreamExt as _;
+        let mut pending_ids = std::collections::HashSet::new();
         while let Some(after) = ids.last().cloned() {
+            pending_ids.extend(ids.iter().cloned());
             futures::stream::iter(ids)
                 .for_each_concurrent(8, |id| {
                     // Each sandbox owns independent locks even though these
@@ -388,7 +384,7 @@ impl ComputeRuntime {
                     crate::persistence::lock_order::branch(async move {
                         if let Err(error) = self.recover_one_sandbox_update(&id).await {
                             tracing::warn!(sandbox_id = %id, %error,
-                                "Sandbox update remains pending; recovery will retry");
+                                "Cannot read pending sandbox update for recovery");
                         }
                     })
                 })
@@ -399,27 +395,97 @@ impl ComputeRuntime {
                 .await
                 .map_err(|error| format!("list pending sandbox updates: {error}"))?;
         }
+        // Forget sandboxes completed or deleted by another replica. Only prune
+        // after a successful full scan, so a failed page does not reset backoff.
+        self.update_recovery_backoff
+            .lock()
+            .await
+            .retain(|id, _| pending_ids.contains(id));
         Ok(())
     }
 
     async fn recover_one_sandbox_update(&self, id: &str) -> Result<(), Status> {
+        self.recover_one_sandbox_update_at(id, tokio::time::Instant::now())
+            .await
+    }
+
+    async fn recover_one_sandbox_update_at(
+        &self,
+        id: &str,
+        now: tokio::time::Instant,
+    ) -> Result<(), Status> {
         let Some(_gate) = self.lifecycle_gates.try_lock_for(id) else {
             return Ok(());
         };
-        let recover = async {
+        let deadline = tokio::time::Instant::now() + UPDATE_RECOVERY_TIMEOUT;
+        let read = async {
             let sandbox = self
                 .store
                 .get_message::<Sandbox>(id)
                 .await
                 .map_err(|_| Status::unavailable("cannot read sandbox for update recovery"))?;
-            if let Some(sandbox) = sandbox {
-                self.recover_sandbox_update(&sandbox).await?;
-            }
+            let state = self
+                .store
+                .get_sandbox_image_state(id)
+                .await
+                .map_err(|_| Status::unavailable("cannot read pending sandbox update"))?;
+            Ok::<_, Status>((sandbox, state.and_then(|state| state.pending)))
+        };
+        let (Some(sandbox), Some(intent)) = tokio::time::timeout_at(deadline, read)
+            .await
+            .map_err(|_| Status::deadline_exceeded("reading pending sandbox update timed out"))??
+        else {
+            self.update_recovery_backoff.lock().await.remove(id);
+            return Ok(());
+        };
+        if sandbox.phase() == SandboxPhase::Deleting as i32 {
+            self.update_recovery_backoff.lock().await.remove(id);
+            return Ok(());
+        }
+        let previous = self
+            .update_recovery_backoff
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .filter(|backoff| backoff.operation_id == intent.operation_id);
+        if previous
+            .as_ref()
+            .is_some_and(|backoff| backoff.next_retry > now)
+        {
+            return Ok(());
+        }
+        let recover = async {
+            ensure_image_update_stopped(&sandbox)?;
+            self.ensure_configuration_update_supported()?;
+            self.complete_image_update(sandbox, intent.clone()).await?;
             Ok(())
         };
-        tokio::time::timeout(std::time::Duration::from_mins(1), recover)
+        let result = tokio::time::timeout_at(deadline, recover)
             .await
-            .map_err(|_| Status::deadline_exceeded("sandbox update recovery timed out"))?
+            .unwrap_or_else(|_| {
+                Err(Status::deadline_exceeded(
+                    "sandbox update recovery timed out",
+                ))
+            });
+        if let Err(error) = result {
+            let attempts = previous.map_or(1, |backoff| backoff.attempts.saturating_add(1));
+            let delay = std::time::Duration::from_secs(
+                60 * (1_u64 << attempts.saturating_sub(1).min(4)).min(15),
+            );
+            self.update_recovery_backoff.lock().await.insert(
+                id.to_owned(),
+                UpdateRecoveryBackoff {
+                    operation_id: intent.operation_id.clone(),
+                    attempts,
+                    next_retry: tokio::time::Instant::now() + delay,
+                },
+            );
+            tracing::warn!(sandbox_id = %id, operation_id = %intent.operation_id,
+                attempt = attempts, retry_after_secs = delay.as_secs(), %error,
+                "Sandbox update remains pending; recovery deferred");
+        }
+        Ok(())
     }
 
     /// Only explicit deletion of the matching update may bypass the driver
@@ -752,6 +818,11 @@ mod tests {
             );
             runtime.image_update_driver = updater;
             driver.set_image_update_error(None);
+            // Repeated scans respect this gateway's delay even after the
+            // driver has been repaired.
+            runtime.recover_pending_sandbox_updates().await.unwrap();
+            drop(runtime.update_recovery_sweep.acquire().await.unwrap());
+            assert_eq!(image_calls(&driver).len(), 1);
             let pending = runtime
                 .store
                 .get_message::<Sandbox>(original.object_id())
@@ -759,8 +830,12 @@ mod tests {
                 .unwrap()
                 .unwrap();
             if automatic {
-                runtime.recover_pending_sandbox_updates().await.unwrap();
-                drop(runtime.update_recovery_sweep.acquire().await.unwrap());
+                let next =
+                    runtime.update_recovery_backoff.lock().await[original.object_id()].next_retry;
+                runtime
+                    .recover_one_sandbox_update_at(original.object_id(), next)
+                    .await
+                    .unwrap();
             } else {
                 runtime
                     .update_sandbox_configuration(
@@ -785,6 +860,209 @@ mod tests {
             assert_eq!(calls.len(), 2);
             assert_eq!(calls[0], calls[1]);
         }
+    }
+
+    #[tokio::test]
+    async fn failed_automatic_updates_back_off_but_explicit_resume_is_immediate() {
+        let (runtime, driver, original) = fixture(true).await;
+        driver.set_image_update_error(Some(Code::Unavailable));
+        runtime
+            .update_sandbox_image(
+                original.object_id(),
+                "new-image".into(),
+                original.get_resource_version(),
+            )
+            .await
+            .unwrap_err();
+        let pending = runtime
+            .store
+            .get_message::<Sandbox>(original.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        for (attempt, delay) in [
+            (1, 60_000),
+            (2, 120_000),
+            (3, 240_000),
+            (4, 480_000),
+            (5, 900_000),
+            (6, 900_000),
+        ] {
+            let due = runtime
+                .update_recovery_backoff
+                .lock()
+                .await
+                .get(original.object_id())
+                .map_or_else(tokio::time::Instant::now, |backoff| backoff.next_retry);
+            let before = tokio::time::Instant::now();
+            runtime
+                .recover_one_sandbox_update_at(original.object_id(), due)
+                .await
+                .unwrap();
+            let after = tokio::time::Instant::now();
+            let backoff =
+                runtime.update_recovery_backoff.lock().await[original.object_id()].clone();
+            assert_eq!(backoff.attempts, attempt);
+            let delay = std::time::Duration::from_millis(delay);
+            assert!((before + delay..=after + delay).contains(&backoff.next_retry));
+            runtime
+                .recover_one_sandbox_update_at(
+                    original.object_id(),
+                    backoff.next_retry - std::time::Duration::from_millis(1),
+                )
+                .await
+                .unwrap();
+            assert_eq!(image_calls(&driver).len(), attempt as usize + 1);
+        }
+        driver.set_image_update_error(None);
+        // Scheduling never changes the public version; a fresh version is not
+        // required merely because another automatic attempt failed.
+        runtime
+            .update_sandbox_configuration(
+                original.object_id(),
+                &openshell_core::proto::UpdateSandboxRequest {
+                    expected_resource_version: pending.get_resource_version(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let state = runtime
+            .store
+            .get_sandbox_image_state(original.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.pending.is_none());
+        assert!(runtime.update_recovery_backoff.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovery_backoff_is_local_and_does_not_delay_a_new_operation() {
+        let (runtime, driver, original) = fixture(true).await;
+        driver.set_image_update_error(Some(Code::Unavailable));
+        runtime
+            .update_sandbox_image(
+                original.object_id(),
+                "new-image".into(),
+                original.get_resource_version(),
+            )
+            .await
+            .unwrap_err();
+        let state = runtime
+            .store
+            .get_sandbox_image_state(original.object_id())
+            .await
+            .unwrap();
+        runtime
+            .recover_one_sandbox_update(original.object_id())
+            .await
+            .unwrap();
+        runtime
+            .clone()
+            .recover_one_sandbox_update(original.object_id())
+            .await
+            .unwrap();
+        assert_eq!(image_calls(&driver).len(), 2);
+        assert_eq!(
+            runtime
+                .store
+                .get_sandbox_image_state(original.object_id())
+                .await
+                .unwrap(),
+            state
+        );
+
+        // A fresh runtime (restart or another replica) has no backoff, even
+        // though it reads the same durable pending intent.
+        let mut restarted = runtime.clone();
+        restarted.update_recovery_backoff = Arc::default();
+        driver.set_image_update_error(None);
+        restarted
+            .recover_one_sandbox_update(original.object_id())
+            .await
+            .unwrap();
+        assert_eq!(image_calls(&driver).len(), 3);
+        assert!(!runtime.update_recovery_backoff.lock().await.is_empty());
+
+        let completed = runtime
+            .store
+            .get_message::<Sandbox>(original.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        driver.set_image_update_error(Some(Code::Unavailable));
+        restarted
+            .update_sandbox_image(
+                original.object_id(),
+                "third-image".into(),
+                completed.get_resource_version(),
+            )
+            .await
+            .unwrap_err();
+        // The original runtime still remembers the previous operation's delay,
+        // but the new operation must be eligible immediately.
+        runtime
+            .recover_one_sandbox_update(original.object_id())
+            .await
+            .unwrap();
+        assert_eq!(image_calls(&driver).len(), 5);
+        assert_eq!(
+            runtime.update_recovery_backoff.lock().await[original.object_id()].attempts,
+            1
+        );
+
+        driver.set_image_update_error(None);
+        restarted
+            .recover_one_sandbox_update(original.object_id())
+            .await
+            .unwrap();
+        runtime.recover_pending_sandbox_updates().await.unwrap();
+        assert!(runtime.update_recovery_backoff.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timed_out_automatic_update_retains_intent_and_defers_recovery() {
+        let (runtime, driver, original) = fixture(true).await;
+        driver.set_image_update_error(Some(Code::Unavailable));
+        runtime
+            .update_sandbox_image(
+                original.object_id(),
+                "new-image".into(),
+                original.get_resource_version(),
+            )
+            .await
+            .unwrap_err();
+        driver.set_image_update_error(None);
+        let (entered, release) = driver.pause_image_updates();
+        runtime.recover_pending_sandbox_updates().await.unwrap();
+        entered.notified().await;
+        tokio::time::pause();
+        tokio::time::advance(UPDATE_RECOVERY_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        tokio::time::resume();
+        drop(runtime.update_recovery_sweep.acquire().await.unwrap());
+        let state = runtime
+            .store
+            .get_sandbox_image_state(original.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.pending.is_some());
+        let backoff = runtime.update_recovery_backoff.lock().await[original.object_id()].clone();
+        assert_eq!(backoff.attempts, 1);
+        assert!(backoff.next_retry > tokio::time::Instant::now());
+        runtime.recover_pending_sandbox_updates().await.unwrap();
+        drop(runtime.update_recovery_sweep.acquire().await.unwrap());
+        // The fake records calls only after the pause, so the timed-out call
+        // has not reached its recording point. No second attempt may enter.
+        assert_eq!(image_calls(&driver).len(), 1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), entered.notified())
+                .await
+                .is_err()
+        );
+        release.add_permits(1);
     }
 
     #[tokio::test]

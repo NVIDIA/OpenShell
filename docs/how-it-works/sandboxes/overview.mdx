@@ -1098,7 +1098,11 @@ conditional request. An update failure or disconnected response can leave a
 pending operation, even when `sandbox.spec.template.image` already names the
 target image. Start, stop, and provisioning retry remain blocked until reconciliation
 succeeds. The gateway retries accepted updates at startup and periodically, even
-if new updates are disabled. If the driver is unavailable or no longer supports
+if new updates are disabled. Failed automatic attempts wait 1, 2, 4, 8, then
+15 minutes before another attempt becomes eligible. Recovery continues at the
+15-minute limit; periodic scans can add up to a minute to the wait. Each gateway
+retries independently, and restarting a gateway resets its retry delay.
+If the driver is unavailable or no longer supports
 updates, restore a compatible driver. Explicit deletion can reclaim a sandbox
 whose update cannot complete; deletion also removes its stored workspace.
 
