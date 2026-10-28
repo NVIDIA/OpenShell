@@ -164,6 +164,18 @@ not required; driver-owned guest TLS fields are rejected.
 | ETW/OCSF audit | Optional Windows Sandboxing ETW consumer |
 | Gateway restart recovery | Not yet supported; live MXC generations remain in-memory |
 
+Workloads receive the proxy CA in `NODE_EXTRA_CA_CERTS` and `DENO_CERT`, and a
+combined bundle in `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and
+`GIT_SSL_CAINFO`. The combined bundle holds the server-authentication roots of
+the host user's Windows certificate store followed by the proxy CA, so clients
+that read it also verify servers behind `tls: skip` endpoints, which the proxy
+does not terminate. Schannel clients such as Windows `curl.exe` ignore these
+variables unless the bundle is passed explicitly. Windows adds a Microsoft
+program root to the store the first time a Schannel client needs it, so the
+bundle lacks program roots that the host has not used yet. If the store roots
+encode to more than 896 KiB of PEM, the supervisor logs a warning and the
+bundle holds only the proxy CA.
+
 UI controls are startup settings in the sandbox policy:
 
 ```yaml
