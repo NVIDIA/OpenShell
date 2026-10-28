@@ -4,7 +4,7 @@
 use crate::color::Colorize;
 use crate::tls::{
     TlsOptions, build_insecure_rustls_config, build_rustls_config, grpc_client,
-    require_tls_materials,
+    require_tls_materials, validate_rustls_materials,
 };
 use bytes::Bytes;
 use dialoguer::{Select, theme::ColorfulTheme};
@@ -21,6 +21,7 @@ use openshell_bootstrap::{
 };
 use openshell_bootstrap::{GatewayMetadataSource, ListedGateway};
 use openshell_core::proto::{ExtensionKind, GetGatewayInfoRequest, HealthRequest, ServiceStatus};
+use rustls::{RootCertStore, pki_types::CertificateDer};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use tonic::{Code, Status};
@@ -716,51 +717,94 @@ fn gateway_mtls_bundle_state(name: &str) -> GatewayMtlsBundle {
         mtls.join("tls.crt"),
         mtls.join("tls.key"),
     ];
-    let present_count = files.iter().filter(|p| p.is_file()).count();
+    // Use symlink_metadata rather than is_file/metadata here. A dangling
+    // symlink is still an existing caller-owned entry and must never be
+    // mistaken for an absent bundle that can be replaced by package files.
+    let mut present = Vec::with_capacity(files.len());
+    for path in &files {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => present.push(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => present.push(false),
+            Err(error) => {
+                return GatewayMtlsBundle::Unusable {
+                    path: path.clone(),
+                    reason: format!("cannot inspect entry: {error}"),
+                };
+            }
+        }
+    }
+    let present_count = present.iter().filter(|present| **present).count();
     if present_count == 0 {
         return GatewayMtlsBundle::Absent;
     }
     if present_count < files.len() {
-        let missing: Vec<PathBuf> = files.iter().filter(|p| !p.is_file()).cloned().collect();
+        let missing: Vec<PathBuf> = files
+            .iter()
+            .zip(&present)
+            .filter(|(_, present)| !**present)
+            .map(|(path, _)| path.clone())
+            .collect();
         return GatewayMtlsBundle::Partial { missing };
     }
-    for (path, is_private_key) in [
-        (mtls.join("ca.crt"), false),
-        (mtls.join("tls.crt"), false),
-        (mtls.join("tls.key"), true),
-    ] {
-        if let Err(reason) = validate_mtls_pem_file(&path, is_private_key) {
-            return GatewayMtlsBundle::Unusable { path, reason };
-        }
+    if let Err((path, reason)) = validate_mtls_bundle(&files) {
+        return GatewayMtlsBundle::Unusable { path, reason };
     }
     GatewayMtlsBundle::Usable
 }
 
-/// Present-but-unusable mTLS files must not silently count as a bundle:
-/// parse each file as the PEM kind it claims to be. An empty or corrupt
-/// file (for example a partially copied key) fails here instead of
-/// producing a registration that reports success but cannot connect.
-fn validate_mtls_pem_file(path: &std::path::Path, is_private_key: bool) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|err| format!("cannot be read: {err}"))?;
-    if bytes.is_empty() {
-        return Err("is empty".to_string());
+/// Validate the same decoded CA, certificate and private-key material that
+/// the CLI's TLS client will use. PEM framing alone is insufficient: a PEM
+/// block can contain malformed DER or a key that does not match the client
+/// certificate while still being accepted by `rustls_pemfile`.
+fn validate_mtls_bundle(files: &[PathBuf; 3]) -> std::result::Result<(), (PathBuf, String)> {
+    let read = |path: &PathBuf| {
+        std::fs::read(path).map_err(|error| (path.clone(), format!("cannot be read: {error}")))
+    };
+    let ca = read(&files[0])?;
+    let cert = read(&files[1])?;
+    let key = read(&files[2])?;
+
+    let mut ca_cursor = std::io::Cursor::new(&ca);
+    let ca_certs = rustls_pemfile::certs(&mut ca_cursor)
+        .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
+        .map_err(|error| {
+            (
+                files[0].clone(),
+                format!("is not a valid CA certificate: {error}"),
+            )
+        })?;
+    if ca_certs.is_empty() {
+        return Err((files[0].clone(), "contains no PEM certificate".to_string()));
     }
-    let mut cursor = std::io::Cursor::new(bytes);
-    if is_private_key {
-        let key = rustls_pemfile::private_key(&mut cursor)
-            .map_err(|err| format!("is not a PEM private key: {err}"))?;
-        if key.is_none() {
-            return Err("contains no PEM private key".to_string());
-        }
-    } else {
-        let certificates = rustls_pemfile::certs(&mut cursor)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| format!("is not a PEM certificate: {err}"))?;
-        if certificates.is_empty() {
-            return Err("contains no PEM certificate".to_string());
-        }
+    let mut roots = RootCertStore::empty();
+    for certificate in ca_certs {
+        roots.add(certificate).map_err(|error| {
+            (
+                files[0].clone(),
+                format!("contains an unusable CA certificate: {error}"),
+            )
+        })?;
     }
-    Ok(())
+
+    let mut cert_cursor = std::io::Cursor::new(&cert);
+    let cert_chain = rustls_pemfile::certs(&mut cert_cursor)
+        .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
+        .map_err(|error| {
+            (
+                files[1].clone(),
+                format!("is not a valid client certificate: {error}"),
+            )
+        })?;
+    if cert_chain.is_empty() {
+        return Err((files[1].clone(), "contains no PEM certificate".to_string()));
+    }
+
+    validate_rustls_materials(&ca, &cert, &key).map_err(|error| {
+        (
+            files[2].clone(),
+            format!("TLS material is unusable: {error}"),
+        )
+    })
 }
 
 fn package_managed_tls_dirs() -> Vec<PathBuf> {
@@ -1731,6 +1775,9 @@ mod tests {
     use std::thread;
     use tonic::Status;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
     fn with_tmp_xdg_and_system(
         tmp: &Path,
         system: &Path,
@@ -2338,6 +2385,120 @@ mod tests {
                 assert!(
                     load_gateway_metadata("ocp").is_err(),
                     "no registration may remain for a rejected bundle"
+                );
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gateway_add_local_rejects_dangling_mtls_symlinks_without_replacing_them() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let package_tls = tmpdir.path().join("package-tls");
+        fs::create_dir_all(package_tls.join("client")).expect("create package tls dir");
+        fs::write(package_tls.join("ca.crt"), "package ca").expect("write package CA");
+        fs::write(package_tls.join("client/tls.crt"), "package cert").expect("write package cert");
+        fs::write(package_tls.join("client/tls.key"), "package key").expect("write package key");
+
+        with_tmp_xdg_env(
+            tmpdir.path(),
+            Environment::new().set("OPENSHELL_LOCAL_TLS_DIR", &package_tls),
+            |tmpdir| {
+                let mtls = tmpdir.join("openshell/gateways/ocp/mtls");
+                fs::create_dir_all(&mtls).expect("create gateway TLS dir");
+                let missing_dir = tmpdir.join("provisioning-not-available");
+                for filename in ["ca.crt", "tls.crt", "tls.key"] {
+                    symlink(missing_dir.join(filename), mtls.join(filename))
+                        .expect("create dangling mTLS symlink");
+                }
+
+                let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+                let error = runtime.block_on(async {
+                    gateway_add(
+                        "https://127.0.0.1:17670",
+                        Some("ocp"),
+                        None,
+                        true,
+                        true,
+                        None,
+                        "openshell-cli",
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect_err("dangling symlinks must fail registration")
+                });
+                let message = error.to_string();
+                assert!(
+                    message.contains("unusable"),
+                    "error must identify the bundle as unusable: {message}"
+                );
+                assert!(
+                    load_gateway_metadata("ocp").is_err(),
+                    "no registration may remain for dangling links"
+                );
+                for filename in ["ca.crt", "tls.crt", "tls.key"] {
+                    let metadata = fs::symlink_metadata(mtls.join(filename))
+                        .expect("original symlink must remain");
+                    assert!(
+                        metadata.file_type().is_symlink(),
+                        "{filename} must not be replaced by a regular package file"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn gateway_add_local_rejects_a_pem_wrapped_invalid_private_key() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let package_tls = tmpdir.path().join("package-tls");
+        fs::create_dir_all(package_tls.join("client")).expect("create package tls dir");
+        fs::write(package_tls.join("ca.crt"), "package ca").expect("write package CA");
+        fs::write(package_tls.join("client/tls.crt"), "package cert").expect("write package cert");
+        fs::write(package_tls.join("client/tls.key"), "package key").expect("write package key");
+
+        with_tmp_xdg_env(
+            tmpdir.path(),
+            Environment::new().set("OPENSHELL_LOCAL_TLS_DIR", &package_tls),
+            |tmpdir| {
+                let mtls = tmpdir.join("openshell/gateways/ocp/mtls");
+                fs::create_dir_all(&mtls).expect("create gateway TLS dir");
+                write_valid_mtls_bundle(&mtls);
+                let invalid_key = "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n";
+                fs::write(mtls.join("tls.key"), invalid_key).expect("write malformed key");
+
+                let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+                let error = runtime.block_on(async {
+                    gateway_add(
+                        "https://127.0.0.1:17670",
+                        Some("ocp"),
+                        None,
+                        true,
+                        true,
+                        None,
+                        "openshell-cli",
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect_err("a malformed decoded key must fail registration")
+                });
+                let message = error.to_string();
+                assert!(
+                    message.contains("unusable") && message.contains("tls.key"),
+                    "error must identify the invalid key: {message}"
+                );
+                assert!(
+                    load_gateway_metadata("ocp").is_err(),
+                    "no registration may remain for an invalid key"
+                );
+                assert_eq!(
+                    fs::read_to_string(mtls.join("tls.key")).unwrap(),
+                    invalid_key,
+                    "the invalid external key must not be replaced by package credentials"
                 );
             },
         );
