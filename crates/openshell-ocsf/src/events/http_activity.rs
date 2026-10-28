@@ -100,7 +100,7 @@ impl Serialize for HttpActivityEvent {
 mod tests {
     use super::*;
     use crate::enums::{ActionId, DispositionId, SeverityId};
-    use crate::objects::{Metadata, Product, Url};
+    use crate::objects::{Metadata, Url};
 
     #[test]
     fn test_http_activity_serialization() {
@@ -113,14 +113,7 @@ mod tests {
                 3,
                 "Get",
                 SeverityId::Informational,
-                Metadata {
-                    version: "1.8.0".to_string(),
-                    product: Product::openshell_sandbox("0.1.0"),
-                    profiles: vec!["security_control".to_string()],
-                    uid: Some("sandbox-abc123".to_string()),
-                    log_source: None,
-                    correlation_uid: None,
-                },
+                Metadata::test(&["security_control"]),
             ),
             http_request: Some(HttpRequest::new(
                 "GET",

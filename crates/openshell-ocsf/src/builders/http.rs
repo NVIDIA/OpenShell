@@ -146,77 +146,20 @@ impl<'a, Context> HttpActivityBuilder<'a, Context> {
     }
 
     #[must_use]
-    pub fn src_endpoint(mut self, ep: Endpoint) -> Self {
-        self.src_endpoint = Some(ep);
-        self
-    }
-    #[must_use]
-    pub fn status_detail(mut self, detail: impl Into<String>) -> Self {
-        self.status_detail = Some(detail.into());
-        self
-    }
-
-    /// Add a source-specific attribute that is not defined by the OCSF class.
-    #[must_use]
-    pub fn unmapped(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
-        self.unmapped.insert(key.to_string(), value.into());
-        self
-    }
-
-    #[must_use]
-    pub fn activity(mut self, id: ActivityId) -> Self {
-        self.activity = id;
-        self
-    }
-
-    #[must_use]
-    pub fn action(mut self, id: ActionId) -> Self {
-        self.action = Some(id);
-        self
-    }
-
-    #[must_use]
-    pub fn disposition(mut self, id: DispositionId) -> Self {
-        self.disposition = Some(id);
-        self
-    }
-
-    #[must_use]
-    pub fn actor_process(mut self, process: crate::objects::Process) -> Self {
-        self.actor = Some(Actor::process(process));
-        self
-    }
-
-    #[must_use]
-    pub fn dst_endpoint(mut self, endpoint: Endpoint) -> Self {
-        self.dst_endpoint = Some(endpoint);
-        self
-    }
-
-    #[must_use]
     pub fn firewall_rule(mut self, name: &str, rule_type: &str) -> Self {
         self.firewall_rule = Some(FirewallRule::new(name, rule_type));
         self
     }
-
-    #[must_use]
-    pub fn severity(mut self, id: SeverityId) -> Self {
-        self.severity = id;
-        self
-    }
-
-    #[must_use]
-    pub fn status(mut self, id: StatusId) -> Self {
-        self.status = Some(id);
-        self
-    }
-
-    #[must_use]
-    pub fn message(mut self, msg: impl Into<String>) -> Self {
-        self.message = Some(msg.into());
-        self
-    }
 }
+
+impl_activity_setter!(HttpActivityBuilder<Context>);
+impl_action_disposition_setters!(HttpActivityBuilder<Context>);
+impl_actor_process_setter!(HttpActivityBuilder<Context>);
+impl_dst_endpoint_setter!(HttpActivityBuilder<Context>);
+impl_src_endpoint_setter!(HttpActivityBuilder<Context>);
+impl_status_detail_setter!(HttpActivityBuilder<Context>);
+impl_unmapped_setter!(HttpActivityBuilder<Context>);
+impl_builder_setters!(HttpActivityBuilder<Context>);
 
 impl HttpActivityBuilder<'_, HasHttpContext> {
     #[must_use]

@@ -89,7 +89,7 @@ impl Serialize for SshActivityEvent {
 mod tests {
     use super::*;
     use crate::enums::{ActionId, AuthTypeId, DispositionId, SeverityId};
-    use crate::objects::{Metadata, Product};
+    use crate::objects::Metadata;
 
     #[test]
     fn test_ssh_activity_serialization() {
@@ -102,14 +102,7 @@ mod tests {
                 1,
                 "Open",
                 SeverityId::Informational,
-                Metadata {
-                    version: "1.8.0".to_string(),
-                    product: Product::openshell_sandbox("0.1.0"),
-                    profiles: vec!["security_control".to_string()],
-                    uid: Some("sandbox-abc123".to_string()),
-                    log_source: None,
-                    correlation_uid: None,
-                },
+                Metadata::test(&["security_control"]),
             ),
             src_endpoint: Some(Endpoint::from_ip_str("10.42.0.1", 48201)),
             dst_endpoint: Some(Endpoint::from_ip_str("10.42.0.2", 2222)),

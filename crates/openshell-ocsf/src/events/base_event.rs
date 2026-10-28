@@ -223,17 +223,9 @@ pub struct BaseEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::objects::Product;
 
     fn test_metadata() -> Metadata {
-        Metadata {
-            version: "1.8.0".to_string(),
-            product: Product::openshell_sandbox("0.1.0"),
-            profiles: vec!["container".to_string(), "host".to_string()],
-            uid: Some("sandbox-abc123".to_string()),
-            log_source: None,
-            correlation_uid: None,
-        }
+        Metadata::test(&["container", "host"])
     }
 
     #[test]

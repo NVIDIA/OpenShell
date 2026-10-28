@@ -24,6 +24,23 @@ pub fn sanitize_reason_for_audit(raw: &str) -> String {
     }
 }
 
+/// Truncate `text` to at most `max` bytes, then append `...` when it was
+/// shortened, so a shortened result is up to `max + 3` bytes.
+///
+/// Slicing on a raw byte index panics when the index falls inside a multibyte
+/// char, so the cut steps back to the nearest char boundary.
+#[must_use]
+pub fn truncate_with_ellipsis(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::sanitize_reason_for_audit;

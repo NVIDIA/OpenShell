@@ -72,7 +72,7 @@ impl Serialize for ProcessActivityEvent {
 mod tests {
     use super::*;
     use crate::enums::{ActionId, DispositionId, LaunchTypeId, SeverityId};
-    use crate::objects::{Metadata, Product};
+    use crate::objects::Metadata;
 
     #[test]
     fn test_process_activity_serialization() {
@@ -85,14 +85,7 @@ mod tests {
                 1,
                 "Launch",
                 SeverityId::Informational,
-                Metadata {
-                    version: "1.8.0".to_string(),
-                    product: Product::openshell_sandbox("0.1.0"),
-                    profiles: vec!["container".to_string()],
-                    uid: Some("sandbox-abc123".to_string()),
-                    log_source: None,
-                    correlation_uid: None,
-                },
+                Metadata::test(&["container"]),
             ),
             process: Process::new("python3", 42).with_cmd_line("python3 /app/main.py"),
             actor: Some(Actor::process(Process::new("openshell-sandbox", 1))),

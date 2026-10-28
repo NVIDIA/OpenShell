@@ -31,6 +31,25 @@ pub struct Metadata {
     pub correlation_uid: Option<String>,
 }
 
+#[cfg(test)]
+impl Metadata {
+    /// Sandbox supervisor metadata for an event with `profiles`, as tests
+    /// construct it.
+    pub(crate) fn test(profiles: &[&str]) -> Self {
+        Self {
+            version: "1.8.0".to_string(),
+            product: Product::openshell_sandbox("0.1.0"),
+            profiles: profiles
+                .iter()
+                .map(|profile| (*profile).to_string())
+                .collect(),
+            uid: Some("sandbox-abc123".to_string()),
+            log_source: None,
+            correlation_uid: None,
+        }
+    }
+}
+
 /// OCSF Product object — identifies the software generating events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Product {
@@ -73,14 +92,7 @@ mod tests {
 
     #[test]
     fn test_metadata_serialization() {
-        let metadata = Metadata {
-            version: "1.8.0".to_string(),
-            product: Product::openshell_sandbox("0.1.0"),
-            profiles: vec!["security_control".to_string(), "container".to_string()],
-            uid: Some("sandbox-abc123".to_string()),
-            log_source: None,
-            correlation_uid: None,
-        };
+        let metadata = Metadata::test(&["security_control", "container"]);
 
         let json = serde_json::to_value(&metadata).unwrap();
         assert_eq!(json["version"], "1.8.0");
@@ -92,12 +104,9 @@ mod tests {
     #[test]
     fn test_metadata_with_log_source() {
         let metadata = Metadata {
-            version: "1.8.0".to_string(),
-            product: Product::openshell_sandbox("0.1.0"),
-            profiles: vec![],
             uid: None,
             log_source: Some("/dev/kmsg".to_string()),
-            correlation_uid: None,
+            ..Metadata::test(&[])
         };
 
         let json = serde_json::to_value(&metadata).unwrap();
