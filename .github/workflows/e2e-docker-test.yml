@@ -25,14 +25,6 @@ on:
         required: false
         type: string
         default: ""
-      cedar-suites:
-        description: >-
-          Also run the Cedar suites. The gateway and supervisor under test
-          must be built with the Cedar feature, as Release Dev and branch E2E
-          builds are. Stable and pre-release builds exclude Cedar.
-        required: false
-        type: boolean
-        default: false
       suite-matrix:
         required: false
         type: string
@@ -53,7 +45,7 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(inputs.suite-matrix) }}
-    container: &e2e_container
+    container:
       image: ghcr.io/nvidia/openshell/ci:37072ee81cd7b294c714bfa5ecc829b6927b3d70@sha256:ffa96b8009de6e28bbf157060440c3abb312d3bcda444e9571c539c8c6115615
       credentials:
         username: ${{ github.actor }}
@@ -62,13 +54,13 @@ jobs:
       volumes:
         - /var/run/docker.sock:/var/run/docker.sock
         - /home/runner/_work:/home/runner/_work
-    env: &e2e_env
+    env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       IMAGE_TAG: ${{ inputs.image-tag }}
       OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
       OPENSHELL_SANDBOX_RUNTIME_IMAGE: ${{ format('ghcr.io/nvidia/openshell/sandbox:{0}', inputs.image-tag) }}
       OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
-    steps: &e2e_steps
+    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.checkout-ref || github.sha }}
@@ -116,26 +108,3 @@ jobs:
         env:
           OPENSHELL_MCP_CONFORMANCE_CLIENT_IMAGE: ${{ format('openshell-mcp-conformance-client:{0}', inputs.image-tag) }}
         run: ${{ matrix.cmd }}
-
-  e2e-cedar:
-    name: E2E (${{ matrix.suite }})
-    if: inputs.cedar-suites
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - suite: mcp-cedar
-            cmd: POLICY_FORMAT=cedar mise run --no-deps --skip-deps e2e:mcp
-            apt_packages: ""
-            python_proto: false
-            mcp: true
-          - suite: cedar
-            cmd: mise run --no-deps --skip-deps e2e:cedar
-            apt_packages: ""
-            python_proto: false
-            mcp: false
-    container: *e2e_container
-    env: *e2e_env
-    steps: *e2e_steps

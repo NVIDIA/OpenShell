@@ -29,7 +29,7 @@ depend on the internet except for confirming that `example.com` is
 unreachable and that the host glob check can reach `api.github.com`.
 
 The sandbox only trusts `host.openshell.internal` when it maps to the host
-gateway address the gateway configured, as in CI. Where it does not (for
+gateway address the gateway configured. Where it does not (for
 example a gateway started with `mise run gateway:docker` on macOS), the suite
 needs an echo service that reflects request bodies. On macOS it defaults to
 `https://httpbin.org/anything`, so it needs internet access there. On other
@@ -41,7 +41,7 @@ CEDAR_E2E_UPSTREAM_URL=https://httpbin.org/anything bash e2e/cedar/test.sh
 
 The test substitutes that URL's host, port, and path into the Cedar policy and
 the middleware selector. Provider assertions require the local echo fixture's
-credential-generation labels and request counts. The default Docker CI suite
+credential-generation labels and request counts. The default local Docker suite
 runs them; a remote upstream override explicitly skips them because that
 service cannot provide trusted credential observations. The fixture uses dummy
 credentials and reports only generation labels, never credential values.
@@ -60,12 +60,12 @@ Against an ephemeral Docker gateway:
 mise run e2e:cedar
 ```
 
-The suite is also part of `mise run e2e`, and CI runs it as the `cedar` entry of
-the Docker E2E matrix in branch E2E and Release Dev. Pre-release qualification
-omits it, because pre-release builds exclude Cedar. When `OPENSHELL_BIN` is
-set, as in CI, the task uses that CLI instead of building one.
+The suite is also part of the local `mise run e2e` task. CI covers Cedar in
+the normal Rust lint and test runs. When `OPENSHELL_BIN` is set, the task uses
+that CLI instead of building one.
 
-Against a gateway you already started with `mise run gateway:docker`:
+Against a gateway you already started with
+`OPENSHELL_BUILD_CEDAR=1 mise run gateway:docker`:
 
 ```shell
 OPENSHELL_GATEWAY=<gateway-name> \

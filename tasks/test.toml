@@ -124,8 +124,8 @@ run = [
   "cargo test -p openshell-crypto --no-default-features --test independent_backend",
   # Run the workspace once without openshell-server so we can run that crate
   # with test-only helpers enabled.
-  "cargo test --workspace --exclude openshell-server",
-  "cargo test -p openshell-server --features test-support",
+  "cargo test --workspace --exclude openshell-server --features dev",
+  "cargo test -p openshell-server --features test-support,dev",
   "cargo nextest run --config-file .config/nextest.toml --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml",
   "cargo nextest run --config-file .config/nextest.toml --manifest-path tests/testkit/Cargo.toml",
 ]
@@ -336,7 +336,6 @@ run = "e2e/rust/e2e-docker.sh"
 ["e2e:cedar"]
 description = "Run the pure-Cedar policy e2e suite (network, filesystem, syscalls, --middleware) against a Docker-backed gateway built with Cedar"
 # Builds the local gateway and supervisor image with the Cedar policy engine.
-# CI supplies a prebuilt gateway and supervisor image instead.
 env = { OPENSHELL_BUILD_CEDAR = "1" }
 run = [
   "if [ -z \"${OPENSHELL_BIN:-}\" ]; then cargo build -p openshell-cli; fi",

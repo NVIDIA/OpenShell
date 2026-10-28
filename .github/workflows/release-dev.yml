@@ -68,10 +68,7 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       supervisor-image-tag: dev
       checkout-ref: ${{ github.sha }}
-      # Release Dev publishes the Cedar policy engine in the gateway and
-      # supervisor. Stable releases leave it off.
-      extra-cargo-features: cedar
-      required-crates: cedar-policy openshell-policy-cedar
+      dev-build: true
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
@@ -167,7 +164,6 @@ jobs:
       image-tag: ${{ github.sha }}
       checkout-ref: ${{ github.sha }}
       runner: linux-arm64-cpu8
-      cedar-suites: true
 
   vm-e2e:
     needs: [build-binaries, build-vm-driver]

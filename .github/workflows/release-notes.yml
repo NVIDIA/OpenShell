@@ -126,12 +126,6 @@ jobs:
             the user-relevant change from the PR's title and description.
             Do not invent benefits, compatibility guarantees, or upgrade steps.
 
-            These notes describe prerelease and stable builds, which exclude
-            features that only development (Release Dev) builds enable, such as
-            Cedar sandbox policies. Do not list such a change under Features or
-            Upgrade notes; mention it under Other as available only in
-            development builds.
-
             Extract breaking changes, changed defaults, deprecations, and
             upgrade instructions from the PR's Release Notes section when
             present; otherwise, use its title and description. Place these in

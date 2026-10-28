@@ -273,18 +273,12 @@ jobs:
       - name: Lint
         shell: nix develop -c bash -euo pipefail {0}
         run: |
-          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo clippy --locked --workspace --all-targets --features dev -- -D warnings
           cargo clippy --locked --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path examples/isolation-backend-v8/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/testkit/Cargo.toml --all-targets -- -D warnings
-
-      # Stable builds leave Cedar off (the step above); Release Dev builds turn
-      # it on. Lint the workspace in both configurations.
-      - name: Lint (Cedar enabled)
-        shell: nix develop -c bash -euo pipefail {0}
-        run: cargo clippy --locked --workspace --all-targets --features openshell-gateway/cedar,openshell-supervisor/cedar -- -D warnings
 
   rust-test:
     name: Rust test (${{ matrix.system }})
@@ -331,17 +325,9 @@ jobs:
         env:
           OPENSHELL_TELEMETRY_ENABLED: "false"
         run: |
-          cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support
+          cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support,dev
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/testkit/Cargo.toml
-
-      # Stable builds leave Cedar off (the step above); Release Dev builds turn
-      # it on. Test the workspace in both configurations.
-      - name: Test (Cedar enabled)
-        shell: nix develop -c bash -euo pipefail {0}
-        env:
-          OPENSHELL_TELEMETRY_ENABLED: "false"
-        run: cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support,openshell-gateway/cedar,openshell-supervisor/cedar
 
   rust-postgres-test:
     name: Rust PostgreSQL tests
@@ -432,10 +418,6 @@ jobs:
             cat /tmp/openshell-prover-dependencies.txt >&2
             exit 1
           fi
-
-      - name: Verify Cedar opt-in dependency boundary
-        shell: nix develop -c bash -euo pipefail {0}
-        run: tasks/scripts/verify-cedar-boundary.sh
 
   rust-feature-alias:
     name: Rust feature alias

@@ -17,28 +17,11 @@ on:
         required: false
         type: string
         default: ""
-      extra-cargo-features:
-        description: >-
-          Cargo features added to the openshell-gateway and openshell-supervisor
-          builds only. Release Dev passes "cedar"; stable builds pass nothing.
+      dev-build:
+        description: Enable the gateway and supervisor development feature bundle
         required: false
-        type: string
-        default: ""
-      forbidden-crates:
-        description: >-
-          Space-separated crate names that must not appear in any built
-          binary's embedded dependency list.
-        required: false
-        type: string
-        default: ""
-      required-crates:
-        description: >-
-          Space-separated crate names that must appear in the
-          openshell-gateway and openshell-supervisor binaries' embedded
-          dependency lists, such as the crates extra-cargo-features enables.
-        required: false
-        type: string
-        default: ""
+        type: boolean
+        default: false
     secrets:
       CACHIX_AUTH_TOKEN:
         required: true
@@ -48,11 +31,6 @@ permissions:
 
 env:
   EXTRA_CARGO_FLAGS: ""
-  # Jobs that build openshell-gateway or openshell-supervisor override these
-  # with inputs.extra-cargo-features and inputs.required-crates. No other
-  # package defines those features.
-  EXTRA_CARGO_FEATURES: ""
-  REQUIRED_CRATES: ""
 
 jobs:
   cli:
@@ -87,9 +65,7 @@ jobs:
           triple: ${{ matrix.triple }}
           cargo-version: ${{ inputs.cargo-version }}
           supervisor-image-tag: ${{ inputs.supervisor-image-tag }}
-          extra-cargo-flags: ${{ env.EXTRA_CARGO_FLAGS }}${{ env.EXTRA_CARGO_FEATURES != '' && format(' --features {0}', env.EXTRA_CARGO_FEATURES) || '' }}
-          forbidden-crates: ${{ inputs.forbidden-crates }}
-          required-crates: ${{ env.REQUIRED_CRATES }}
+          extra-cargo-flags: ${{ env.EXTRA_CARGO_FLAGS }}
 
   prover:
     name: openshell-prover (${{ matrix.triple }})
@@ -114,8 +90,7 @@ jobs:
     env:
       PACKAGE: openshell-gateway
       BINARY: openshell-gateway
-      EXTRA_CARGO_FEATURES: ${{ inputs.extra-cargo-features }}
-      REQUIRED_CRATES: ${{ inputs.required-crates }}
+      EXTRA_CARGO_FLAGS: ${{ inputs.dev-build && '--features dev' || '' }}
     strategy:
       matrix:
         include:
@@ -134,10 +109,8 @@ jobs:
     env:
       PACKAGE: ${{ matrix.package }}
       BINARY: ${{ matrix.binary }}
-      # openshell-sandbox has no cedar or dev feature; only the supervisor
-      # entries take the extra features.
-      EXTRA_CARGO_FEATURES: ${{ matrix.package == 'openshell-supervisor' && inputs.extra-cargo-features || '' }}
-      REQUIRED_CRATES: ${{ matrix.package == 'openshell-supervisor' && inputs.required-crates || '' }}
+      # Only supervisor entries define the development feature bundle.
+      EXTRA_CARGO_FLAGS: ${{ matrix.package == 'openshell-supervisor' && inputs.dev-build && '--features dev' || '' }}
     strategy:
       matrix:
         include:

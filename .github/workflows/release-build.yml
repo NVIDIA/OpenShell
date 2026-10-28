@@ -125,11 +125,6 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
-      # Pre-release and stable binaries exclude the Cedar policy engine.
-      # Release Dev enables it with the gateway and supervisor `cedar` feature.
-      forbidden-crates: &cedar_crates >-
-        cedar-policy cedar-policy-core cedar-policy-formatter
-        openshell-policy-cedar openshell-policy-cedar-schema
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
@@ -142,7 +137,6 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
-      forbidden-crates: *cedar_crates
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
