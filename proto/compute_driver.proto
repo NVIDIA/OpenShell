@@ -117,10 +117,6 @@ message GetCapabilitiesResponse {
   // Gateways require an exact policy match before activating the driver.
   // Empty denotes a legacy driver and requires explicit admission opt-out.
   string resource_admission_policy = 13;
-  // Whether the driver turns SandboxPolicy into platform controls itself
-  // instead of leaving enforcement to the OpenShell supervisor in the
-  // sandbox. The gateway admits only policies such a driver can enforce.
-  bool driver_enforces_policy = 14;
 }
 
 message AuthenticateSandboxRequest {

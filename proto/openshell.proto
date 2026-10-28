@@ -921,11 +921,11 @@ message HealthResponse {
   // Service version.
   string version = 2;
 
-  // Whether this gateway was built with Cedar policy support. Clients must
-  // check this before sending Cedar policies: gateways built without it
-  // reject them, and older gateways silently discard Cedar fields and would
-  // interpret them as empty YAML.
-  bool supports_cedar_policy = 3;
+  reserved 3;
+  reserved "supports_cedar_policy";
+  // Versioned capabilities of this gateway's compiled policy backends.
+  repeated string supported_capabilities = 4;
+
 }
 
 // Current-user request. The identity comes from the authenticated request.
@@ -3212,11 +3212,12 @@ message SupervisorHello {
   // ConfigUpdate payloads, and answers each with its result and admission.
   // Gateways push configuration only to supervisors that set this.
   bool supports_config_push = 7;
-  // The supervisor can enforce Cedar policies, as
-  // GetSandboxConfigRequest.supports_cedar_policy reports when polling.
-  // Gateways never push a Cedar configuration to a supervisor that does not
-  // set this; it receives a configuration that is not admitted instead.
-  bool supports_cedar_policy = 8;
+  reserved 8;
+  reserved "supports_cedar_policy";
+  // Versioned capabilities of the supervisor's compiled policy backends.
+  // Missing capabilities never authorize a policy requiring that backend.
+  repeated string supported_capabilities = 9;
+
 }
 
 // Gateway accepts the supervisor session.

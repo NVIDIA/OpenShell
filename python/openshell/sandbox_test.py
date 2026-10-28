@@ -2258,7 +2258,9 @@ def test_create_negotiates_cedar_before_mutation(
             if support == "error":
                 raise health_error
             if support == "modern":
-                return openshell_pb2.HealthResponse(supports_cedar_policy=True)
+                return openshell_pb2.HealthResponse(
+                    supported_capabilities=["openshell.policy.cedar.v1"]
+                )
             return openshell_pb2.HealthResponse()
 
     stub = Stub()

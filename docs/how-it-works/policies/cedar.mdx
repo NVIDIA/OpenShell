@@ -13,7 +13,7 @@ A sandbox policy can be written in [Cedar](https://www.cedarpolicy.com/) instead
 Cedar's restricted language makes policies easier to analyze, for example to check that a revision grants no more access than the one it replaces. OpenShell accepts only Cedar policy shapes it can enforce exactly as written, and rejects the rest when you submit the policy.
 
 <Note>
-Cedar policies are available only in [development builds](/about/installation#prerelease-and-development-builds). Stable and prerelease gateways and supervisors reject them. Cedar also requires a compute driver whose sandboxes run the OpenShell supervisor, such as Docker, Podman, Kubernetes, or VM. OpenShell tests Cedar end to end on the Docker driver. The Windows MXC driver enforces policy itself, so the gateway rejects Cedar sandboxes on it.
+Cedar policies are available only in [development builds](/about/installation#prerelease-and-development-builds). Stable and prerelease gateways and supervisors reject them. The gateway validates Cedar policies and the supervisor enforces them. OpenShell tests Cedar end to end on the Docker runtime.
 </Note>
 
 ## Apply a Cedar Policy
@@ -24,13 +24,13 @@ Host selectors, including host globs, must not exceed 253 bytes.
 
 The gateway and the sandbox supervisor must both be built with Cedar support. The CLI refuses to send a Cedar policy to a gateway without it and reports `gateway does not advertise Cedar policy support`. Such a gateway also rejects Cedar policies on sandbox create and policy update. If it runs on state that already holds Cedar sandboxes, for example after you switch from a development build to a stable one, it refuses to start those sandboxes, deliver their configuration, change their policy or providers, or show their policy. Delete them with `openshell sandbox delete`, or switch back to a development build. A gateway with Cedar support does not deliver a Cedar policy to a supervisor without it. Stable CLIs read, send, and show Cedar policies, but only a gateway with Cedar support accepts them.
 
-To run Cedar from source, build the gateway and supervisor with the `cedar` Cargo feature. With `OPENSHELL_BUILD_CEDAR=1`, the local Docker gateway task builds both the gateway and the supervisor image with it:
+To build Cedar support from source, enable the experimental feature bundle in both binaries:
 
 ```shell
-OPENSHELL_BUILD_CEDAR=1 mise run gateway:docker
+cargo build -p openshell-gateway -p openshell-supervisor --features experimental
 ```
 
-For a standalone build, use `cargo build -p openshell-gateway --features cedar` and `cargo build -p openshell-supervisor --features cedar`.
+Deploy both binaries using your runtime's normal configuration, or use published Release Dev artifacts. Local gateway and image build tasks do not automatically enable Cedar.
 
 Create a sandbox with a Cedar policy:
 
@@ -44,7 +44,7 @@ Replace the policy on a running sandbox:
 openshell policy set <name> --policy ./policy.cedar --wait
 ```
 
-The CLI sends the file's text to the gateway, which validates it and rejects an invalid policy with the reason. The gateway also returns warnings found while loading the policy, such as an [audit path beside enforced policies](#audit-mode), and the CLI prints them after `sandbox create` and `policy set`. If the sandbox cannot load a revision, the `policy_validation_failure_mode` setting applies as it does for YAML policies. Refer to [Manage Policies](/how-it-works/policies/manage-policies).
+The CLI sends the file's text to the gateway, which validates it and rejects an invalid policy with the reason. If the sandbox cannot load a revision, the `policy_validation_failure_mode` setting applies as it does for YAML policies. Refer to [Manage Policies](/how-it-works/policies/manage-policies).
 
 `openshell policy get <name>` prints the Cedar text of a Cedar sandbox's policy.
 
@@ -482,7 +482,7 @@ A provider's token grant applies to a request only when Cedar allows the request
 
 A few provider rule forms cannot be expressed in Cedar, and OpenShell compiles them so they withhold tokens rather than grant them: allow rules with `?` in a glob, GraphQL `fields` globs, or an endpoint `path` glob other than `*` or a trailing `/**` grant no token, and deny rules with them withhold tokens more broadly; and a glob with `[`, `{`, or `\` withholds every token. The sandbox logs each such rule when it loads the policy. JSON-RPC requests whose method is not uppercase and hash-only GraphQL persisted queries also get no token.
 
-`openshell policy get <name> --full` shows the provider rules delivered to the sandbox in a separate section after the Cedar text and middleware, with a list of the endpoints that carry credentials. `--base` omits them.
+Use `openshell policy get <name> --full --output json` to inspect the provider credential rules and middleware delivered to the sandbox. `--base` omits provider-derived rules.
 
 ```cedar
 permit (

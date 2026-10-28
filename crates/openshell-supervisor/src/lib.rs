@@ -1129,7 +1129,7 @@ pub async fn run_sandbox_instance(
     // Every gateway client of this instance uses its own credentials.
     let gateway = openshell_endpoint.as_deref().map(|endpoint| {
         openshell_core::grpc_client::GatewayEndpoint::new(endpoint, gateway_credentials.clone())
-            .with_cedar_policy_support(SUPPORTS_CEDAR_POLICY)
+            .with_supported_capabilities(supported_policy_capabilities())
     });
     #[cfg(unix)]
     let ssh_host_key = if ssh_socket_path.is_some() {
@@ -1700,7 +1700,7 @@ pub async fn run_sandbox_instance(
             Some(supervisor_session_updates),
             config_apply_tx,
             config_push_updates,
-            SUPPORTS_CEDAR_POLICY,
+            supported_policy_capabilities(),
             ssh_host_key,
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.access.start"))
@@ -2052,10 +2052,13 @@ async fn flush_activity_to_gateway(
 // Baseline filesystem path enrichment
 // ============================================================================
 
-/// Whether this supervisor can enforce Cedar policies. It reports this to
-/// the gateway when fetching configuration and in its session hello, and the
-/// gateway withholds Cedar configuration when it is false.
-const SUPPORTS_CEDAR_POLICY: bool = cfg!(feature = "cedar");
+/// Versioned policy capabilities compiled into this supervisor.
+fn supported_policy_capabilities() -> Vec<String> {
+    openshell_core::extension_protocol::capabilities_if(
+        openshell_core::extension_protocol::POLICY_CEDAR_V1,
+        cfg!(feature = "cedar"),
+    )
+}
 
 /// Minimum read-only paths required for a proxy-mode sandbox child process to
 /// function: dynamic linker, shared libraries, DNS resolution, CA certs,

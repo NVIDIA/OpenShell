@@ -27,7 +27,7 @@ use super::{DeliveryDisposition, MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES, Supervisor
 use crate::ServerState;
 use crate::grpc::policy::{
     build_provider_environment_snapshot_from_inputs, build_sandbox_config_snapshot_from_inputs,
-    is_configuration_rejection, load_sandbox_config_inputs, require_supervisor_cedar_support,
+    is_configuration_rejection, load_sandbox_config_inputs, require_policy_capabilities,
     unadmitted_sandbox_config,
 };
 use crate::persistence::ObjectId;
@@ -867,11 +867,11 @@ impl SessionBootstrap {
 }
 
 /// Build the bootstrap a streamed-apply session is accepted with.
-/// `supports_cedar_policy` is the supervisor's hello capability.
+/// `supported_capabilities` is the supervisor's hello capability.
 pub async fn build_session_bootstrap(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
-    supports_cedar_policy: bool,
+    supported_capabilities: Vec<String>,
 ) -> Result<SessionBootstrap, Status> {
     // Bootstraps share the build permits with session reconciliation, so a
     // burst of reconnects, such as a replica's sessions redirected at
@@ -882,7 +882,7 @@ pub async fn build_session_bootstrap(
         .acquire()
         .await
         .expect("the build semaphore is never closed");
-    let bootstrap = build_config_bootstrap(state, sandbox, supports_cedar_policy).await;
+    let bootstrap = build_config_bootstrap(state, sandbox, supported_capabilities).await;
     let outcome = bootstrap
         .as_ref()
         .map_or("build_failed", |bootstrap| bootstrap.outcome.label());
@@ -905,7 +905,7 @@ pub async fn build_session_bootstrap(
 async fn build_config_bootstrap(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
-    supports_cedar_policy: bool,
+    supported_capabilities: Vec<String>,
 ) -> Result<SessionBootstrap, Status> {
     tokio::time::timeout(CONFIG_BOOTSTRAP_BUILD_TIMEOUT, async {
         let built = async {
@@ -930,7 +930,7 @@ async fn build_config_bootstrap(
             Err(error) => return Err(error),
         };
         if let Err(error) =
-            require_supervisor_cedar_support(supports_cedar_policy, sandbox_config.policy.as_ref())
+            require_policy_capabilities(supported_capabilities, sandbox_config.policy.as_ref())
         {
             return Ok(rejected(error));
         }
@@ -2305,7 +2305,13 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             .await
             .unwrap()
             .expect("sandbox exists");
-        let bootstrap = build_config_bootstrap(state, &sandbox, true).await.unwrap();
+        let bootstrap = build_config_bootstrap(
+            state,
+            &sandbox,
+            vec![openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string()],
+        )
+        .await
+        .unwrap();
         assert_eq!(bootstrap.outcome, BootstrapOutcome::Built);
         bootstrap.config
     }

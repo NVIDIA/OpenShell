@@ -74,19 +74,10 @@ echo "    Output: ${SUPERVISOR_OUTPUT}"
 mkdir -p "${OUTPUT_DIR}"
 ensure_build_nofile_limit
 
-# OPENSHELL_BUILD_CEDAR=1 enables the Cedar policy engine in the host
-# supervisor. The guest sandbox and VM init have no `cedar` feature.
-CEDAR_FEATURE="$(openshell_cedar_feature)"
-
 SUPERVISOR_BUILD_LOG="$(mktemp -t openshell-supervisor-build.XXXXXX.log)"
 run_supervisor_build() {
     local rustc_wrapper_mode="${1:-default}"
     local cargo_prefix=()
-    local supervisor_features=()
-
-    if [ -n "${CEDAR_FEATURE}" ]; then
-        supervisor_features=(--features "${CEDAR_FEATURE}")
-    fi
 
     if [ "${rustc_wrapper_mode}" = "without-rustc-wrapper" ]; then
         cargo_prefix=(env -u RUSTC_WRAPPER)
@@ -105,7 +96,6 @@ run_supervisor_build() {
             --manifest-path "${ROOT}/Cargo.toml"
     fi
     ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-supervisor \
-        ${supervisor_features[@]+"${supervisor_features[@]}"} \
         --manifest-path "${ROOT}/Cargo.toml"
 }
 

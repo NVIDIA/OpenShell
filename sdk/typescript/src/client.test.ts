@@ -950,13 +950,7 @@ describe('create', () => {
       updateConfig: (req) => {
         if (req.settingKey) observed.updateSetting = req;
         else observed.updatePolicy = req;
-        return {
-          version: 5,
-          policyHash: 'hash',
-          settingsRevision: 10n,
-          deleted: false,
-          policyWarnings: [{ message: 'path is audit-only' }],
-        };
+        return { version: 5, policyHash: 'hash', settingsRevision: 10n, deleted: false };
       },
       getSandboxConfig: () => ({
         policy: { version: 1, networkPolicies: {} },
@@ -1005,8 +999,7 @@ describe('create', () => {
     const detached = await sandbox.detachProvider('lookup', 'github', { workspace: 'staging' });
     await sandbox.listProviders('lookup', { workspace: 'staging' }).nextPage();
     await sandbox.getConfig('config', { workspace: 'staging' });
-    const updated = await sandbox.setPolicy('lookup', { version: 1, networkPolicies: {} }, { workspace: 'staging' });
-    expect(updated.policyWarnings).toEqual(['path is audit-only']);
+    await sandbox.setPolicy('lookup', { version: 1, networkPolicies: {} }, { workspace: 'staging' });
     await sandbox.setSetting(
       'lookup',
       'feature.enabled',
@@ -2551,7 +2544,7 @@ describe('Cedar gateway compatibility', () => {
   it.each([false, true])('checks support before every Cedar mutation (support=%s)', async (supported) => {
     let mutations = 0;
     const c = client({
-      health: () => ({ supportsCedarPolicy: supported }),
+      health: () => ({ supportedCapabilities: supported ? ['openshell.policy.cedar.v1'] : [] }),
       createSandbox: () => {
         mutations++;
         return readySandbox('cedar', 'id');
@@ -2580,7 +2573,7 @@ it('advertises Cedar support when reading sandbox-authenticated configuration', 
   const c = client({
     getSandbox: () => readySandbox('cedar', 'id'),
     getSandboxConfig: (request) => {
-      expect(request.supportsCedarPolicy).toBe(true);
+      expect(request.supportedCapabilities).toEqual(['openshell.policy.cedar.v1']);
       return { policy: { cedarPolicySource: 'permit(principal, action, resource);' } };
     },
   });

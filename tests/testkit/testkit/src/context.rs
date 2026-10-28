@@ -433,7 +433,9 @@ impl Sandbox {
     /// The sandbox's effective policy and settings.
     pub async fn config(&self) -> Result<proto::GetSandboxConfigResponse> {
         let request = proto::GetSandboxConfigRequest {
-            supports_cedar_policy: true,
+            supported_capabilities: vec![
+                openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
+            ],
             name: self.name.clone(),
             workspace_scope: self.grpc.scope(),
         };

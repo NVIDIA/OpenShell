@@ -18,7 +18,6 @@
 #   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:docker
 #   OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/... mise run gateway:docker
 #   OPENSHELL_SANDBOX_RUNTIME_IMAGE=ghcr.io/... mise run gateway:docker
-#   OPENSHELL_BUILD_CEDAR=1 mise run gateway:docker  # build gateway and supervisor with Cedar
 #
 # After the gateway is running, point the CLI at it with either:
 #   openshell --gateway docker-dev <command>
@@ -34,7 +33,6 @@ source "${ROOT}/tasks/scripts/gateway-pull-policy.sh"
 # shellcheck source=tasks/scripts/build-env.sh
 source "${ROOT}/tasks/scripts/build-env.sh"
 ensure_build_nofile_limit
-CEDAR_FEATURE="$(openshell_cedar_feature)"
 PORT="${OPENSHELL_SERVER_PORT:-18080}"
 GATEWAY_NAME="${OPENSHELL_DOCKER_GATEWAY_NAME:-docker-dev}"
 STATE_DIR="${OPENSHELL_DOCKER_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-docker}"
@@ -159,15 +157,9 @@ if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
   CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
 fi
 
-GATEWAY_FEATURE_ARGS=()
-if [[ -n "${CEDAR_FEATURE}" ]]; then
-  GATEWAY_FEATURE_ARGS=(--features "${CEDAR_FEATURE}")
-fi
-
 echo "Building openshell-gateway..."
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-gateway --bin openshell-gateway \
-  ${GATEWAY_FEATURE_ARGS[@]+"${GATEWAY_FEATURE_ARGS[@]}"}
+  -p openshell-gateway --bin openshell-gateway
 
 TLS_DIR="${STATE_DIR}/tls"
 echo "Generating local gateway credentials..."

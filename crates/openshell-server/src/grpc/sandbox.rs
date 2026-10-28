@@ -69,10 +69,10 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique_with_catalog,
 };
 use super::validation::{
-    level_matches, require_gateway_cedar_support, require_policy_enforceable_by_driver,
-    source_matches, validate_and_canonicalize_policy_report, validate_dns1123_label,
-    validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
-    validate_policy_safety, validate_sandbox_governance_spec, validate_sandbox_spec,
+    level_matches, require_gateway_cedar_support, source_matches,
+    validate_and_canonicalize_policy_report, validate_dns1123_label, validate_exec_request_fields,
+    validate_no_reserved_provider_policy_keys, validate_policy_safety,
+    validate_sandbox_governance_spec, validate_sandbox_spec,
 };
 use super::{MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN};
 use crate::persistence::current_time_ms;
@@ -585,7 +585,6 @@ async fn handle_create_sandbox_inner(
     let policy_warnings = if let Some(ref mut policy) = spec.policy {
         super::policy::clear_provider_credentialed_markers(policy);
         validate_no_reserved_provider_policy_keys(policy)?;
-        require_policy_enforceable_by_driver(state.compute.driver_enforces_policy(), policy)?;
         let validated = validate_and_canonicalize_policy_report(policy.clone())?;
         *policy = validated.policy;
         validated.warnings
@@ -1827,7 +1826,6 @@ async fn handle_start_sandbox_inner(
     .await?;
     if let Some(policy) = resolved.spec.as_ref().and_then(|spec| spec.policy.as_ref()) {
         require_gateway_cedar_support(policy)?;
-        require_policy_enforceable_by_driver(state.compute.driver_enforces_policy(), policy)?;
     }
     let workspace = resolved.object_workspace().to_string();
     let name = resolved.object_name().to_string();
@@ -1929,7 +1927,6 @@ async fn handle_resume_sandbox_inner(
     .await?;
     if let Some(policy) = resolved.spec.as_ref().and_then(|spec| spec.policy.as_ref()) {
         require_gateway_cedar_support(policy)?;
-        require_policy_enforceable_by_driver(state.compute.driver_enforces_policy(), policy)?;
     }
     let workspace = resolved.object_workspace().to_string();
     let name = resolved.object_name().to_string();
@@ -4230,11 +4227,9 @@ mod tests {
         GpuResourceRequirements, SandboxServiceExposure, ServiceAuthorizationMode, ServiceEndpoint,
     };
 
-    /// A test state whose compute driver records its calls and reports
-    /// whether it enforces sandbox policy itself.
-    async fn test_server_state_with_fake_driver(
-        driver_enforces_policy: bool,
-    ) -> (
+    #[cfg(not(feature = "cedar"))]
+    /// A test state whose compute driver records provisioning calls.
+    async fn test_server_state_with_fake_driver() -> (
         Arc<ServerState>,
         Arc<crate::test_support::FakeComputeDriver>,
     ) {
@@ -4253,7 +4248,6 @@ mod tests {
                         "test",
                         [],
                     )),
-                    driver_enforces_policy,
                     ..Default::default()
                 },
             ),
@@ -4292,6 +4286,7 @@ mod tests {
 
     /// Stores a stopped sandbox whose spec holds a Cedar policy, as a
     /// Cedar-enabled gateway with a supervisor-enforced driver created it.
+    #[cfg(not(feature = "cedar"))]
     async fn put_stopped_cedar_sandbox(state: &ServerState, name: &str) {
         let mut sandbox = test_sandbox(name, Vec::new());
         sandbox.spec.as_mut().unwrap().policy = Some(crate::grpc::test_support::cedar_policy());
@@ -4299,6 +4294,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
     }
 
+    #[cfg(not(feature = "cedar"))]
     fn start_request(name: &str) -> Request<StartSandboxRequest> {
         authed_request(StartSandboxRequest {
             name: name.to_string(),
@@ -4307,85 +4303,10 @@ mod tests {
         })
     }
 
-    /// A driver that enforces sandbox policy itself never receives a Cedar
-    /// policy, which only the `OpenShell` supervisor can enforce.
-    #[tokio::test]
-    async fn create_rejects_cedar_on_a_driver_that_enforces_policy_itself() {
-        let (state, driver) = test_server_state_with_fake_driver(true).await;
-        let error = handle_create_sandbox(
-            &state,
-            create_request_with_policy(
-                "cedar-on-driver",
-                crate::grpc::test_support::cedar_policy(),
-            ),
-        )
-        .await
-        .expect_err("the driver cannot enforce Cedar");
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error:?}");
-        assert!(driver.calls().is_empty(), "{:?}", driver.calls());
-    }
-
-    #[tokio::test]
-    async fn start_rejects_a_stored_cedar_sandbox_on_a_driver_that_enforces_policy_itself() {
-        let (state, driver) = test_server_state_with_fake_driver(true).await;
-        put_stopped_cedar_sandbox(&state, "stored-cedar").await;
-
-        let error = handle_start_sandbox(&state, start_request("stored-cedar"))
-            .await
-            .expect_err("the driver cannot enforce Cedar");
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error:?}");
-        if cfg!(feature = "cedar") {
-            assert!(
-                error.message().contains("enforces sandbox policy itself"),
-                "{error:?}"
-            );
-        }
-        assert!(driver.calls().is_empty(), "{:?}", driver.calls());
-    }
-
-    /// Before its first activation a sandbox's policy may be replaced
-    /// wholesale, skipping the format-switch check, but a driver that enforces
-    /// policy itself must still never receive a Cedar policy.
-    #[tokio::test]
-    async fn policy_repair_cannot_switch_to_cedar_on_a_driver_that_enforces_policy_itself() {
-        let (state, _driver) = test_server_state_with_fake_driver(true).await;
-        let mut sandbox = test_sandbox("repairable", Vec::new());
-        let status = sandbox.status.get_or_insert_with(Default::default);
-        status.configuration_activated = Some(false);
-        status.configuration_admission =
-            Some(openshell_core::proto::SandboxConfigurationAdmission {
-                state: openshell_core::proto::ConfigurationAdmissionState::Pending.into(),
-                ..Default::default()
-            });
-        assert!(crate::policy_store::permits_initial_static_policy_repair(
-            &sandbox
-        ));
-        state.store.put_message(&sandbox).await.unwrap();
-
-        let error = crate::grpc::policy::handle_update_config(
-            &state,
-            authed_request(openshell_core::proto::UpdateConfigRequest {
-                sandbox: "repairable".to_string(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                policy: Some(crate::grpc::test_support::cedar_policy()),
-                ..Default::default()
-            }),
-        )
-        .await
-        .expect_err("the driver cannot enforce Cedar");
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error:?}");
-        if cfg!(feature = "cedar") {
-            assert!(
-                error.message().contains("enforces sandbox policy itself"),
-                "{error:?}"
-            );
-        }
-    }
-
     #[cfg(not(feature = "cedar"))]
     #[tokio::test]
     async fn create_rejects_cedar_without_cedar_support() {
-        let (state, driver) = test_server_state_with_fake_driver(false).await;
+        let (state, driver) = test_server_state_with_fake_driver().await;
         let error = handle_create_sandbox(
             &state,
             create_request_with_policy("cedar", crate::grpc::test_support::cedar_policy()),
@@ -4400,7 +4321,7 @@ mod tests {
     #[cfg(not(feature = "cedar"))]
     #[tokio::test]
     async fn start_rejects_a_stored_cedar_sandbox_without_cedar_support() {
-        let (state, driver) = test_server_state_with_fake_driver(false).await;
+        let (state, driver) = test_server_state_with_fake_driver().await;
         put_stopped_cedar_sandbox(&state, "stored-cedar").await;
 
         let error = handle_start_sandbox(&state, start_request("stored-cedar"))
@@ -4415,7 +4336,7 @@ mod tests {
     #[cfg(not(feature = "cedar"))]
     #[tokio::test]
     async fn resume_rejects_a_stored_cedar_sandbox_without_cedar_support() {
-        let (state, driver) = test_server_state_with_fake_driver(false).await;
+        let (state, driver) = test_server_state_with_fake_driver().await;
         put_stopped_cedar_sandbox(&state, "stored-cedar").await;
 
         let error = handle_resume_sandbox(

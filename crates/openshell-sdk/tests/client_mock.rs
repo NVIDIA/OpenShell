@@ -49,7 +49,7 @@ struct MockState {
     last_get_name: Mutex<Option<String>>,
     last_get_workspace: Mutex<Option<String>>,
     last_create: Mutex<Option<proto::CreateSandboxRequest>>,
-    supports_cedar_policy: bool,
+    supported_capabilities: Vec<String>,
     last_template_create: Mutex<Option<proto::CreateSandboxTemplateRequest>>,
     last_template_get: Mutex<Option<proto::GetSandboxTemplateRequest>>,
     last_template_list: Mutex<Option<proto::ListSandboxTemplatesRequest>>,
@@ -315,7 +315,7 @@ impl OpenShell for TestOpenShell {
             }
         }
         Ok(Response::new(proto::HealthResponse {
-            supports_cedar_policy: self.state.supports_cedar_policy,
+            supported_capabilities: self.state.supported_capabilities.clone(),
             status: proto::ServiceStatus::Healthy.into(),
             version: "test-1.2.3".to_string(),
         }))
@@ -2518,7 +2518,10 @@ async fn watch_logs_addresses_the_sandbox_by_canonical_name() {
 async fn cedar_template_create_checks_gateway_before_mutation() {
     for supported in [false, true] {
         let state = Arc::new(MockState {
-            supports_cedar_policy: supported,
+            supported_capabilities: openshell_core::extension_protocol::capabilities_if(
+                openshell_core::extension_protocol::POLICY_CEDAR_V1,
+                supported,
+            ),
             ..Default::default()
         });
         let endpoint = start_mock(state.clone()).await;

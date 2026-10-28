@@ -16,7 +16,8 @@ layer enforces it:
 | Syscalls | sandbox runtime | `memfd_create`, `ptrace`, user-namespace `unshare`, `mount`, `io_uring_setup`, raw netlink sockets, and direct TCP connects that bypass the proxy return `EPERM`. |
 
 Cedar policies need a gateway and supervisor built with the `cedar` feature:
-a Release Dev build, or a local e2e build with `OPENSHELL_BUILD_CEDAR=1`.
+use published Release Dev artifacts, or explicitly build and deploy both binaries
+with `--features experimental`. The suite does not build or start a gateway.
 
 Syscall filtering is not authored policy, in YAML or Cedar. The syscall checks
 confirm that the sandbox's seccomp restrictions still apply when the policy is
@@ -41,8 +42,8 @@ CEDAR_E2E_UPSTREAM_URL=https://httpbin.org/anything bash e2e/cedar/test.sh
 
 The test substitutes that URL's host, port, and path into the Cedar policy and
 the middleware selector. Provider assertions require the local echo fixture's
-credential-generation labels and request counts. The default local Docker suite
-runs them; a remote upstream override explicitly skips them because that
+credential-generation labels and request counts. A prepared local Docker gateway can
+run them; a remote upstream override explicitly skips them because that
 service cannot provide trusted credential observations. The fixture uses dummy
 credentials and reports only generation labels, never credential values.
 
@@ -54,26 +55,17 @@ policy names them explicitly.
 
 ## Run it
 
-Against an ephemeral Docker gateway:
-
-```shell
-mise run e2e:cedar
-```
-
-The suite is also part of the local `mise run e2e` task. CI covers Cedar in
-the normal Rust lint and test runs. When `OPENSHELL_BIN` is set, the task uses
-that CLI instead of building one.
-
-Against a gateway you already started with
-`OPENSHELL_BUILD_CEDAR=1 mise run gateway:docker`:
+Against an already running development gateway and supervisor:
 
 ```shell
 OPENSHELL_GATEWAY=<gateway-name> \
 OPENSHELL_BIN="$PWD/target/debug/openshell" \
-bash e2e/cedar/test.sh
+mise run e2e:cedar
 ```
 
+The suite is separate from `mise run e2e`. CI covers Cedar through the normal
+Rust lint and test runs. The selected gateway must use a sandbox image that
+provides `curl`, `python3`, and the `/sandbox`, `/opt`, and `/srv` directories.
+
 Set `CEDAR_E2E_KEEP_SANDBOX=1` to keep the sandbox for debugging. The test
-needs `python3` on the host and a sandbox image that provides `curl`,
-`python3`, and the `/sandbox`, `/opt`, and `/srv` directories. `mise run
-e2e:cedar` builds and uses the shared `openshell/e2e-python:dev` workload image.
+needs `python3` on the host.

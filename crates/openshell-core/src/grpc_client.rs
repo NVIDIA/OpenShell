@@ -253,7 +253,7 @@ impl GatewayCredentials {
 pub struct GatewayEndpoint {
     url: Arc<str>,
     credentials: GatewayCredentials,
-    supports_cedar_policy: bool,
+    supported_capabilities: Vec<String>,
 }
 
 impl GatewayEndpoint {
@@ -261,17 +261,15 @@ impl GatewayEndpoint {
         Self {
             url: url.into(),
             credentials,
-            supports_cedar_policy: false,
+            supported_capabilities: Vec::new(),
         }
     }
 
-    /// Declares whether this client can enforce Cedar policies, as reported
-    /// in its sandbox configuration requests. Only a supervisor built with
-    /// Cedar support sets it; the gateway withholds Cedar configuration
-    /// otherwise.
+    /// Advertises the policy capabilities this caller can enforce when
+    /// receiving sandbox configuration. Missing capabilities are unsupported.
     #[must_use]
-    pub fn with_cedar_policy_support(mut self, supported: bool) -> Self {
-        self.supports_cedar_policy = supported;
+    pub fn with_supported_capabilities(mut self, supported: Vec<String>) -> Self {
+        self.supported_capabilities = supported;
         self
     }
 
@@ -289,7 +287,7 @@ impl GatewayEndpoint {
     #[must_use]
     pub fn with_url(&self, url: impl Into<Arc<str>>) -> Self {
         Self::new(url, self.credentials.clone())
-            .with_cedar_policy_support(self.supports_cedar_policy)
+            .with_supported_capabilities(self.supported_capabilities.clone())
     }
 }
 
@@ -1109,7 +1107,12 @@ pub async fn fetch_policy(
 
     debug!("Connected, fetching sandbox policy");
 
-    fetch_policy_with_client(&mut client, sandbox_name, gateway.supports_cedar_policy).await
+    fetch_policy_with_client(
+        &mut client,
+        sandbox_name,
+        gateway.supported_capabilities.clone(),
+    )
+    .await
 }
 
 /// Fetch the authoritative policy and revision metadata in one response.
@@ -1135,7 +1138,7 @@ pub async fn fetch_settings_snapshot(
             &mut client,
             sandbox_name,
             None,
-            gateway.supports_cedar_policy,
+            gateway.supported_capabilities.clone(),
         )
         .await,
     )
@@ -1145,11 +1148,11 @@ async fn fetch_settings_snapshot_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
     sandbox_name: &str,
     workspace: Option<&str>,
-    supports_cedar_policy: bool,
+    supported_capabilities: Vec<String>,
 ) -> Result<SettingsPollResult> {
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            supports_cedar_policy,
+            supported_capabilities,
             workspace_scope: workspace.map(crate::proto::workspace_selector),
             name: sandbox_name.to_string(),
         })
@@ -1167,10 +1170,10 @@ fn learned_workspace_selector(workspace: Option<&str>) -> Option<crate::proto::W
 async fn fetch_policy_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
     sandbox_name: &str,
-    supports_cedar_policy: bool,
+    supported_capabilities: Vec<String>,
 ) -> Result<Option<ProtoSandboxPolicy>> {
     let snapshot =
-        fetch_settings_snapshot_with_client(client, sandbox_name, None, supports_cedar_policy)
+        fetch_settings_snapshot_with_client(client, sandbox_name, None, supported_capabilities)
             .await?;
 
     // version 0 with no policy means the sandbox was created without one.
@@ -1196,7 +1199,10 @@ async fn sync_policy_with_client(
             .await
             .map_err(grpc_status_error)?
             .into_inner();
-        if !info.supports_cedar_policy {
+        if !crate::extension_protocol::has_capability(
+            &info.supported_capabilities,
+            crate::extension_protocol::POLICY_CEDAR_V1,
+        ) {
             return Err(grpc_status_error(Status::failed_precondition(
                 "gateway does not advertise Cedar policy support; Cedar policies require a development build of the gateway and supervisor",
             )));
@@ -1242,7 +1248,7 @@ pub async fn discover_and_sync_policy(
         &mut client,
         sandbox,
         Some(workspace),
-        gateway.supports_cedar_policy,
+        gateway.supported_capabilities.clone(),
     )
     .await?
     .policy
@@ -1284,7 +1290,7 @@ pub async fn sync_policy_and_fetch_snapshot(
             &mut client,
             sandbox,
             Some(workspace),
-            gateway.supports_cedar_policy,
+            gateway.supported_capabilities.clone(),
         )
         .await,
     )
@@ -1777,8 +1783,8 @@ mod token_grant_exchange_tests {
 #[derive(Clone)]
 pub struct CachedOpenShellClient {
     client: OpenShellClient<AuthedChannel>,
-    /// See [`GatewayEndpoint::with_cedar_policy_support`].
-    supports_cedar_policy: bool,
+    /// See [`GatewayEndpoint::with_supported_capabilities`].
+    supported_capabilities: Vec<String>,
     /// Sandbox instance gateway credentials rotated alongside extension
     /// credentials.
     credentials: GatewayCredentials,
@@ -2128,7 +2134,7 @@ impl CachedOpenShellClient {
         let client = connect(gateway).await?;
         Ok(Self {
             client,
-            supports_cedar_policy: gateway.supports_cedar_policy,
+            supported_capabilities: gateway.supported_capabilities.clone(),
             credentials: gateway.credentials.clone(),
             workspace: Arc::new(tokio::sync::OnceCell::new()),
             extension_credentials,
@@ -2150,7 +2156,7 @@ impl CachedOpenShellClient {
             .client
             .clone()
             .get_sandbox_config(GetSandboxConfigRequest {
-                supports_cedar_policy: self.supports_cedar_policy,
+                supported_capabilities: self.supported_capabilities.clone(),
                 workspace_scope,
                 name: sandbox_name.to_string(),
             })

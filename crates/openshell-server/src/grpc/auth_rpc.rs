@@ -348,7 +348,9 @@ pub async fn handle_refresh_sandbox_token(
         ));
     } else {
         let mut config_request = Request::new(GetSandboxConfigRequest {
-            supports_cedar_policy: true,
+            supported_capabilities: vec![
+                openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
+            ],
             name: sandbox_record
                 .metadata
                 .as_ref()

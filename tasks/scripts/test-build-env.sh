@@ -21,15 +21,6 @@ if ! declare -F ensure_build_nofile_limit >/dev/null; then
 fi
 pass "ensure_build_nofile_limit is defined"
 
-# OPENSHELL_BUILD_CEDAR selects the gateway and supervisor `cedar` feature.
-[ -z "$(OPENSHELL_BUILD_CEDAR='' openshell_cedar_feature)" ] || fail "Cedar enabled when OPENSHELL_BUILD_CEDAR is empty"
-[ -z "$(OPENSHELL_BUILD_CEDAR=0 openshell_cedar_feature)" ] || fail "Cedar enabled with OPENSHELL_BUILD_CEDAR=0"
-[ "$(OPENSHELL_BUILD_CEDAR=1 openshell_cedar_feature)" = "cedar" ] || fail "Cedar not enabled with OPENSHELL_BUILD_CEDAR=1"
-if (OPENSHELL_BUILD_CEDAR=yes openshell_cedar_feature >/dev/null 2>&1); then
-  fail "openshell_cedar_feature accepted OPENSHELL_BUILD_CEDAR=yes"
-fi
-pass "openshell_cedar_feature honors OPENSHELL_BUILD_CEDAR"
-
 os="$(uname -s)"
 
 if [ "${os}" != "Darwin" ]; then

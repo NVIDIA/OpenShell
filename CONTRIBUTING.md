@@ -87,7 +87,7 @@ Public skills live in `skills/` and work without an OpenShell source checkout. I
 | `openshell-cli` | CLI usage, sandbox lifecycle, provider management, and BYOC workflows |
 | `debug-openshell-cluster` | Diagnose gateway deployment and health issues |
 | `debug-inference` | Diagnose attached-provider inference, native endpoints, and migration from the retired managed endpoint |
-| `generate-sandbox-policy` | Generate or edit YAML and Cedar sandbox policies while preserving their format and middleware configuration |
+| `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API documentation |
 
 Public skills use `openshell --help` for installed command syntax and published OpenShell documentation for product concepts and configuration. They must not depend on repository-relative source or documentation files.
 
@@ -307,12 +307,12 @@ mise run gateway
 ```
 
 The normal Rust workspace build, check, lint, and test tasks enable the
-`dev` feature bundle. CI uses the same development configuration. Use
-`--features dev` to select it in direct Cargo builds; Cargo's `dev` profile
+`experimental` feature bundle. CI uses the same development configuration. Use
+`--features experimental` to select it in direct Cargo builds; Cargo's `dev` profile
 does not enable it automatically. Prerelease and stable builds leave it off.
 
-On this branch, the development bundle includes Cedar. To enable it in a
-local gateway and its supervisor, run `OPENSHELL_BUILD_CEDAR=1 mise run gateway`.
+On this branch, the development bundle includes Cedar. Build the gateway and
+supervisor with `--features experimental`, or use published Release Dev artifacts.
 
 ## Building the `openshell` CLI
 
@@ -387,7 +387,7 @@ These are the primary `mise` tasks for day-to-day development:
 | --------------- | --------------------------------------------- |
 | `crates/`       | Rust crates                                   |
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
-| `crates/openshell-policy-cedar/` | Validation and evaluation for Cedar-authored sandbox policies, enabled by the `cedar` feature and included in the development `dev` feature |
+| `crates/openshell-policy-cedar/` | Validation and evaluation for Cedar-authored sandbox policies, enabled by the `cedar` feature and included in the development `experimental` feature |
 | `crates/openshell-policy-cedar-schema/` | Canonical Cedar schema and entity, action, and context names, linked only with the `cedar` feature |
 | `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
 | `python/`       | Python SDK and bindings                       |

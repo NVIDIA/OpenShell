@@ -113,33 +113,16 @@ func SandboxPolicyFromProto(p *sbv1.SandboxPolicy) *types.SandboxPolicy {
 		return nil
 	}
 	result := &types.SandboxPolicy{
-		Version:           p.GetVersion(),
-		Filesystem:        filesystemPolicyFromProto(p.GetFilesystem()),
-		Landlock:          landlockPolicyFromProto(p.GetLandlock()),
-		Process:           processPolicyFromProto(p.GetProcess()),
-		CedarPolicySource: p.GetCedarPolicySource(),
+		Version:    p.GetVersion(),
+		Filesystem: filesystemPolicyFromProto(p.GetFilesystem()),
+		Landlock:   landlockPolicyFromProto(p.GetLandlock()),
+		Process:    processPolicyFromProto(p.GetProcess()),
 	}
 	if np := p.GetNetworkPolicies(); np != nil {
 		result.NetworkPolicies = make(map[string]types.NetworkPolicyRule, len(np))
 		for k, v := range np {
 			if converted := NetworkPolicyRuleFromProto(v); converted != nil {
 				result.NetworkPolicies[k] = *converted
-			}
-		}
-	}
-	if rules := p.GetProviderCredentialRules(); rules != nil {
-		result.ProviderCredentialRules = make(map[string]types.NetworkPolicyRule, len(rules))
-		for k, v := range rules {
-			if converted := NetworkPolicyRuleFromProto(v); converted != nil {
-				result.ProviderCredentialRules[k] = *converted
-			}
-		}
-	}
-	if settings := p.GetEndpointSettings(); settings != nil {
-		result.EndpointSettings = make([]types.PolicyNetworkEndpoint, len(settings))
-		for i, ep := range settings {
-			if ep != nil {
-				result.EndpointSettings[i] = policyNetworkEndpointFromProto(ep)
 			}
 		}
 	}
@@ -161,28 +144,15 @@ func SandboxPolicyToProto(p *types.SandboxPolicy) *sbv1.SandboxPolicy {
 		return nil
 	}
 	result := &sbv1.SandboxPolicy{
-		Version:           p.Version,
-		Filesystem:        filesystemPolicyToProto(p.Filesystem),
-		Landlock:          landlockPolicyToProto(p.Landlock),
-		Process:           processPolicyToProto(p.Process),
-		CedarPolicySource: p.CedarPolicySource,
+		Version:    p.Version,
+		Filesystem: filesystemPolicyToProto(p.Filesystem),
+		Landlock:   landlockPolicyToProto(p.Landlock),
+		Process:    processPolicyToProto(p.Process),
 	}
 	if p.NetworkPolicies != nil {
 		result.NetworkPolicies = make(map[string]*sbv1.NetworkPolicyRule, len(p.NetworkPolicies))
 		for k, v := range p.NetworkPolicies {
 			result.NetworkPolicies[k] = NetworkPolicyRuleToProto(&v)
-		}
-	}
-	if p.ProviderCredentialRules != nil {
-		result.ProviderCredentialRules = make(map[string]*sbv1.NetworkPolicyRule, len(p.ProviderCredentialRules))
-		for k, v := range p.ProviderCredentialRules {
-			result.ProviderCredentialRules[k] = NetworkPolicyRuleToProto(&v)
-		}
-	}
-	if p.EndpointSettings != nil {
-		result.EndpointSettings = make([]*sbv1.NetworkEndpoint, len(p.EndpointSettings))
-		for i := range p.EndpointSettings {
-			result.EndpointSettings[i] = policyNetworkEndpointToProto(&p.EndpointSettings[i])
 		}
 	}
 	if p.NetworkMiddlewares != nil {

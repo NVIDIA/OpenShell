@@ -129,9 +129,8 @@ pub struct SessionRuntimeContext {
     /// Publishes whether the current session pushes configuration, so the
     /// runtime stops polling while it does.
     pub config_push_updates: watch::Sender<bool>,
-    /// Whether the supervisor was built with Cedar support. The gateway
-    /// pushes a Cedar configuration only to a session that reports it.
-    pub supports_cedar_policy: bool,
+    /// Versioned policy capabilities advertised by the supervisor.
+    pub supported_capabilities: Vec<String>,
 }
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
@@ -426,7 +425,7 @@ pub fn spawn_with_readiness(
         session_id_updates: runtime.session_id_updates,
         config_apply_tx: runtime.config_apply_tx,
         config_push_updates: runtime.config_push_updates,
-        supports_cedar_policy: runtime.supports_cedar_policy,
+        supported_capabilities: runtime.supported_capabilities,
         ready_tx,
     };
     (tokio::spawn(run_session_loop(config)), ready_rx)
@@ -446,7 +445,7 @@ struct SessionConfig {
     /// Publishes whether the current session pushes configuration. A
     /// reconnect to a gateway that does not push resumes polling.
     config_push_updates: watch::Sender<bool>,
-    supports_cedar_policy: bool,
+    supported_capabilities: Vec<String>,
     ready_tx: watch::Sender<bool>,
 }
 
@@ -601,7 +600,7 @@ fn supervisor_hello(
         redirected,
         supports_session_redirect: true,
         supports_config_push: true,
-        supports_cedar_policy: config.supports_cedar_policy,
+        supported_capabilities: config.supported_capabilities.clone(),
     }
 }
 
@@ -1427,8 +1426,11 @@ mod ocsf_event_tests {
     }
 
     #[tokio::test]
-    async fn hello_reports_the_cedar_support_it_was_given() {
-        for supports_cedar_policy in [false, true] {
+    async fn hello_reports_the_policy_capabilities_it_was_given() {
+        for supported_capabilities in [
+            Vec::new(),
+            vec![openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string()],
+        ] {
             let config = SessionConfig {
                 gateway: grpc_client::GatewayEndpoint::new(
                     "http://127.0.0.1:1",
@@ -1444,11 +1446,11 @@ mod ocsf_event_tests {
                 session_id_updates: None,
                 config_apply_tx: mpsc::channel(1).0,
                 config_push_updates: watch::channel(false).0,
-                supports_cedar_policy,
+                supported_capabilities: supported_capabilities.clone(),
                 ready_tx: watch::channel(false).0,
             };
             let hello = supervisor_hello(&config, false, 3);
-            assert_eq!(hello.supports_cedar_policy, supports_cedar_policy);
+            assert_eq!(hello.supported_capabilities, supported_capabilities);
             assert!(hello.supports_config_push);
             assert_eq!(
                 (hello.sandbox_id.as_str(), hello.connection_epoch),

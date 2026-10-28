@@ -11,7 +11,7 @@ Guide agents through using the `openshell` CLI for sandbox and platform manageme
 
 The OpenShell CLI (`openshell`) is the primary interface for managing sandboxes, providers, policies, settings, exposed services, and gateway registrations. Gateway service lifecycle is handled outside the CLI by packages, systemd, or Helm. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
 
-**Companion skill**: For creating or modifying sandbox policy content (YAML or Cedar network rules, L7 inspection, and middleware), use the `generate-sandbox-policy` skill. This skill covers the CLI *commands* for the policy lifecycle; `generate-sandbox-policy` covers policy *content authoring*.
+**Companion skill**: For creating or modifying sandbox policy YAML content (network rules, L7 inspection, access presets), use the `generate-sandbox-policy` skill. This skill covers the CLI *commands* for the policy lifecycle; `generate-sandbox-policy` covers policy *content authoring*.
 
 **Self-teaching**: The CLI has comprehensive built-in help. When you encounter a command or option not covered in this skill, walk the help tree:
 
@@ -298,7 +298,7 @@ openshell sandbox create \
 Key flags:
 
 - `--provider`: Attach configured credential providers for API keys, tokens, and other secrets (repeatable)
-- `--policy`: Custom policy YAML or `.cedar` file (otherwise uses built-in default or `OPENSHELL_SANDBOX_POLICY` env var). Cedar middleware, endpoint settings, and process identity go in a separate file passed with `--middleware`. Cedar requires a development-channel gateway and supervisor; a stable gateway rejects it.
+- `--policy`: Custom policy YAML (otherwise uses built-in default or `OPENSHELL_SANDBOX_POLICY` env var)
 - `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
 - `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
@@ -562,8 +562,6 @@ This is the most important multi-step workflow. It enables a tight feedback cycl
 
 **Key concept**: Policies have static fields (immutable after activation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
 
-Determine the authored format before editing. A sandbox keeps YAML or Cedar for its lifetime; changing formats requires recreation. Cedar replaces YAML access rules with Cedar source, while middleware, endpoint settings, and process identity use a separate `--middleware` file. Preserve both files when replacing a Cedar policy. Global policies and incremental `policy update` operations support YAML only. Cedar requires a development-channel gateway and supervisor; stable and prerelease gateways reject Cedar policies, and the CLI reports `gateway does not advertise Cedar policy support`. Use the development-channel [Cedar policy guide](https://docs.nvidia.com/openshell/dev/how-it-works/policies/cedar) for Cedar authoring and supported policy shapes.
-
 If startup reports `ConfigurationInvalid`, inspect `openshell sandbox get` and
 repair the complete policy or provider set through the gateway. The workload
 has not started on its first activation, so static fields can also be replaced
@@ -596,7 +594,7 @@ Create sandbox with initial policy
   Pull current policy              │
         │                          │
         ▼                          │
-  Modify policy                    │
+  Modify policy YAML               │
   (use generate-sandbox-policy)    │
         │                          │
         ▼                          │
@@ -630,24 +628,16 @@ Look for `DENIED` log lines. `NET:OPEN [MED] DENIED` marks a blocked connection,
 
 ### Step 3: Pull the current policy
 
-Use structured output to detect the format and save editable files. This example requires `jq`. It writes YAML policy data as JSON, which the policy parser accepts, and writes Cedar configuration as YAML keys with JSON flow values:
-
-```shell
-openshell policy get dev --base --output json > current-policy.json
-if jq -e '(.policy.cedar_policy_source // "") | length > 0' current-policy.json >/dev/null; then
-  jq -j '.policy.cedar_policy_source' current-policy.json > current-policy.cedar
-  jq -r '.policy | {network_middlewares, endpoint_settings, process} | with_entries(select(.value != null)) | to_entries[] | "\(.key): \(.value | tojson)"' \
-    current-policy.json > current-middleware.yaml
-else
-  jq '.policy' current-policy.json > current-policy.yaml
-fi
+```bash
+set -o pipefail
+openshell policy get dev --base | sed '1,/^---$/d' > current-policy.yaml
 ```
 
-Check that `policy get` succeeded before running the extraction. `--base` returns the editable policy without provider-composed entries. Use `--full` only to inspect the effective policy. Table output includes metadata and separators; a Cedar policy can include another section for its middleware, endpoint settings, and process identity, so stripping only the first separator does not produce a reusable policy file. Never save Cedar source under a `.yaml` extension or append its configuration sections to the `.cedar` file.
+`--base` returns the editable policy without provider-composed entries; OpenShell composes attached provider rules separately. The command prints revision details, a `---` line, and then the policy YAML. The `sed` expression keeps only the YAML, because `policy set` cannot parse the revision details. Use `--full` only to inspect the effective policy, not as input to `policy set`.
 
 ### Step 4: Modify the policy
 
-Edit the extracted `.yaml` or `.cedar` file to allow the blocked actions, preserving the sandbox's format and any Cedar middleware file. **For policy content authoring, use the `generate-sandbox-policy` skill.** Its YAML recipes handle:
+Edit `current-policy.yaml` to allow the blocked actions. **For policy content authoring, delegate to the `generate-sandbox-policy` skill.** That skill handles:
 
 - Network endpoint rule structure
 - L4 vs REST, WebSocket, JSON-RPC, and MCP L7 policy decisions
@@ -669,12 +659,6 @@ and `debug-openshell-cluster` to investigate middleware failures.
 
 ```bash
 openshell policy set dev --policy current-policy.yaml --wait
-```
-
-For Cedar, supply the preserved configuration file, even when only the Cedar source changed:
-
-```shell
-openshell policy set dev --policy current-policy.cedar --middleware current-middleware.yaml --wait
 ```
 
 The gateway validates the complete effective candidate—including attached
@@ -843,7 +827,7 @@ openshell logs work-session --tail --source sandbox
 
 When denied actions appear:
 
-1. For YAML sandboxes, prefer incremental updates for additive network changes:
+1. Prefer incremental updates for additive network changes:
    `openshell policy update work-session --add-endpoint api.github.com:443:read-only:rest:enforce --binary /usr/bin/gh --wait`
    `openshell policy update work-session --rule-name allow_api_github_com_443 --binary /usr/bin/gh --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
 
@@ -857,11 +841,13 @@ When denied actions appear:
    one.
 
    `--add-allow` and `--add-deny` require `--rule-name` and the complete binary scope through repeated `--binary` or explicit `--any-binary`. Declare every port on the endpoint in the operation, for example `api.example.com:443,8443:POST:/admin`. Use `--endpoint-path` to disambiguate endpoints within the selected rule; an explicitly empty path selects an endpoint without a path selector. The gateway rejects missing or mismatched scope before persistence. Inspect the current policy and confirm the intended affected scope; do not automatically fill declarations from current policy just to make a rejection pass.
-2. Use full replacement for Cedar sandboxes and for YAML changes that
-   `policy update` cannot express. Follow Workflow 4 to extract the base policy
-   in its existing format, preserve the Cedar middleware file, and apply it
-   with `policy set --wait`. Filesystem, Landlock, and process changes still
-   require recreating the sandbox.
+2. Use full YAML replacement for broad network changes or settings that
+   `policy update` cannot express, including any change that would otherwise
+   require restating a large existing scope. Filesystem, Landlock, and process
+   changes still require recreating the sandbox:
+   `openshell policy get work-session --base | sed '1,/^---$/d' > policy.yaml`
+   Modify the policy with the `generate-sandbox-policy` skill.
+   `openshell policy set work-session --policy policy.yaml --wait`
 3. Verify with `openshell policy list work-session`.
 
 The user does not need to disconnect. Policy updates are hot-reloaded; `--wait` blocks until the sandbox confirms the revision or the timeout expires. Delete the sandbox when the session ends:
@@ -1032,6 +1018,6 @@ $ openshell sandbox upload --help
 
 | Skill | When to use |
 |-------|------------|
-| `generate-sandbox-policy` | Creating or modifying YAML or Cedar policy content, preserving its format and separate Cedar configuration |
+| `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration, and network middleware) |
 | `debug-openshell-cluster` | Diagnosing gateway deployment, runtime, or health failures |
 | `debug-inference` | Diagnosing attached-provider inference, native endpoints, host-backed models, and migration from the retired managed endpoint |

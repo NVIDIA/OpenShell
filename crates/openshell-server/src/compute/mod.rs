@@ -497,9 +497,6 @@ pub struct ComputeDriverInfoSnapshot {
     pub supports_sandbox_authentication: bool,
     /// Whether the driver reports runtime readiness without a supervisor session.
     pub driver_reports_runtime_readiness: bool,
-    /// Whether the driver enforces sandbox policy itself rather than leaving
-    /// it to the `OpenShell` supervisor.
-    pub driver_enforces_policy: bool,
     /// Static portable resource request forms from the startup capability snapshot.
     pub resource_capabilities: Option<DriverResourceCapabilities>,
     /// Directory where rootfs tar files must be staged.
@@ -979,7 +976,6 @@ impl ComputeRuntime {
             gateway_manages_lifecycle: capabilities.gateway_manages_lifecycle,
             supports_sandbox_authentication: capabilities.supports_sandbox_authentication,
             driver_reports_runtime_readiness: capabilities.driver_reports_runtime_readiness,
-            driver_enforces_policy: capabilities.driver_enforces_policy,
             resource_capabilities: capabilities.resource_capabilities,
             rootfs_tar_staging_dir: capabilities.rootfs_tar_staging_dir,
             rootfs_tar_max_bytes: capabilities.rootfs_tar_max_bytes,
@@ -1284,13 +1280,6 @@ impl ComputeRuntime {
     #[must_use]
     pub fn supports_sandbox_authentication(&self) -> bool {
         self.driver_info.supports_sandbox_authentication
-    }
-
-    /// Whether the compute driver enforces sandbox policy itself rather than
-    /// leaving it to the `OpenShell` supervisor.
-    #[must_use]
-    pub fn driver_enforces_policy(&self) -> bool {
-        self.driver_info.driver_enforces_policy
     }
 
     pub(crate) async fn authenticate_sandbox(
@@ -8180,7 +8169,6 @@ impl ComputeDriver for NoopTestDriver {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: self.sandbox_authentication.is_some(),
                 driver_reports_runtime_readiness: false,
-                driver_enforces_policy: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
@@ -8375,7 +8363,6 @@ pub fn new_test_runtime_with_driver(
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication,
             driver_reports_runtime_readiness: false,
-            driver_enforces_policy: false,
             resource_capabilities: None,
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
@@ -8469,6 +8456,43 @@ mod tests {
                 .any(|condition| condition.reason == "ConfigurationAccepted"
                     && condition.status == "True")
         );
+    }
+
+    #[test]
+    fn cedar_readiness_waits_for_supervisor_configuration_admission() {
+        use openshell_core::proto::{
+            ConfigurationAdmissionState as Admission, SandboxConfigurationAdmission,
+        };
+        for connected in [false, true] {
+            let mut sandbox = Sandbox::default();
+            sandbox.set_phase(SandboxPhase::Provisioning as i32);
+            sandbox.spec.get_or_insert_with(Default::default).policy = Some(PublicSandboxPolicy {
+                cedar_policy_source: "permit(principal, action, resource);".to_string(),
+                ..Default::default()
+            });
+            sandbox.status.as_mut().unwrap().configuration_admission =
+                Some(SandboxConfigurationAdmission {
+                    instance_id: "supervisor".to_string(),
+                    state: Admission::Pending.into(),
+                    ..Default::default()
+                });
+            let incoming = ready_driver_sandbox("sandbox", "sandbox");
+            apply_driver_snapshot(&mut sandbox, &incoming, connected, false);
+            assert_eq!(sandbox.phase(), SandboxPhase::Provisioning as i32);
+
+            if connected {
+                sandbox
+                    .status
+                    .as_mut()
+                    .unwrap()
+                    .configuration_admission
+                    .as_mut()
+                    .unwrap()
+                    .state = Admission::Accepted.into();
+                apply_driver_snapshot(&mut sandbox, &incoming, true, false);
+                assert_eq!(sandbox.phase(), SandboxPhase::Ready as i32);
+            }
+        }
     }
 
     #[test]
@@ -8809,7 +8833,6 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
-                driver_enforces_policy: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
@@ -9273,7 +9296,6 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
-                driver_enforces_policy: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
@@ -9573,7 +9595,6 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
-                driver_enforces_policy: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,

@@ -92,16 +92,8 @@ run = "uv run --no-project --with pytest pytest -o \"python_files=*_test.py\" ta
 hide = true
 
 [e2e]
-description = "Run all end-to-end tests (Rust + Python + MCP + Cedar) against a Cedar-enabled gateway and supervisor, as Release Dev does"
-# The suites run concurrently and share target/debug/openshell-gateway and the
-# openshell/supervisor:dev image, so every suite builds the Cedar-enabled
-# configuration that e2e:cedar needs.
-depends = [
-  "OPENSHELL_BUILD_CEDAR=1 e2e:rust",
-  "OPENSHELL_BUILD_CEDAR=1 e2e:python",
-  "OPENSHELL_BUILD_CEDAR=1 e2e:mcp",
-  "e2e:cedar",
-]
+description = "Run all end-to-end tests (Rust + Python + MCP)"
+depends = ["e2e:rust", "e2e:python", "e2e:mcp"]
 
 ["e2e:test"]
 description = "Build the current checkout and run a named host or Nix test-guest E2E suite"
@@ -124,8 +116,8 @@ run = [
   "cargo test -p openshell-crypto --no-default-features --test independent_backend",
   # Run the workspace once without openshell-server so we can run that crate
   # with test-only helpers enabled.
-  "cargo test --workspace --exclude openshell-server --features dev",
-  "cargo test -p openshell-server --features test-support,dev",
+  "cargo test --workspace --exclude openshell-server --features experimental",
+  "cargo test -p openshell-server --features test-support,experimental",
   "cargo nextest run --config-file .config/nextest.toml --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml",
   "cargo nextest run --config-file .config/nextest.toml --manifest-path tests/testkit/Cargo.toml",
 ]
@@ -186,7 +178,7 @@ run = [
 ]
 
 ["e2e:mcp"]
-description = "Run MCP conformance e2e scenarios against one Docker-backed gateway (static defaults for spec 2025-11-25; set OPENSHELL_MCP_CONFORMANCE_SCENARIOS for a focused subset; POLICY_FORMAT=cedar uses the Cedar policy and builds with OPENSHELL_BUILD_CEDAR=1)"
+description = "Run MCP conformance e2e scenarios against one Docker-backed gateway (static defaults for spec 2025-11-25; set OPENSHELL_MCP_CONFORMANCE_SCENARIOS for a focused subset)"
 run = "bash e2e/mcp-conformance.sh"
 
 ["e2e:nodejs"]
@@ -333,16 +325,6 @@ run = "e2e/rust/e2e-kubernetes.sh"
 description = "Run Docker conformance and Rust e2e tests against a standalone gateway"
 run = "e2e/rust/e2e-docker.sh"
 
-["e2e:cedar"]
-description = "Run the pure-Cedar policy e2e suite (network, filesystem, syscalls, --middleware) against a Docker-backed gateway built with Cedar"
-# Builds the local gateway and supervisor image with the Cedar policy engine.
-env = { OPENSHELL_BUILD_CEDAR = "1" }
-run = [
-  "if [ -z \"${OPENSHELL_BIN:-}\" ]; then cargo build -p openshell-cli; fi",
-  "CONTAINER_ENGINE=docker bash tasks/scripts/e2e-build-workload.sh",
-  "OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE=openshell/e2e-python:dev OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY=never e2e/with-docker-gateway.sh bash -lc 'OPENSHELL_BIN=\"${OPENSHELL_BIN:-$PWD/target/debug/openshell}\" bash e2e/cedar/test.sh'",
-]
-
 ["e2e:mechanistic-existing-endpoint"]
 description = "Run #2821 existing inspected-endpoint auto-approval regression"
 run = [
@@ -360,3 +342,7 @@ description = "Test generated local gateway TOML without starting a runtime"
 run = "bash tasks/scripts/test-gateway-config.sh"
 run_windows = "echo Skipping test:gateway-config: Unix gateway scripts do not apply on Windows."
 hide = true
+
+["e2e:cedar"]
+description = "Run the focused Cedar suite against an already running development gateway and supervisor"
+run = "bash e2e/cedar/test.sh"

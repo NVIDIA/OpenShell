@@ -3,10 +3,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# EXTRA_CARGO_FEATURES applies to every component built here. Set
-# OPENSHELL_BUILD_CEDAR=1 to enable the Cedar policy engine, which only the
-# gateway and supervisor define, without breaking the sandbox build.
-
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -174,10 +170,6 @@ build_component_for_arch() {
   if [[ "$component" == "gateway" ]]; then
     features="${features} vendored-z3"
   fi
-  # Only the gateway and supervisor define the `cedar` feature.
-  if [[ -n "$cedar_feature" && ( "$component" == "gateway" || "$component" == "supervisor" ) ]]; then
-    features="${features} ${cedar_feature}"
-  fi
   current_host_os="$(host_os)"
   current_host_arch="$(host_arch)"
 
@@ -270,8 +262,6 @@ case "${OPENSHELL_AUDITABLE:-0}" in
     exit 1
     ;;
 esac
-
-cedar_feature="$(openshell_cedar_feature)"
 
 restore_cargo_toml=0
 trap restore_workspace_version EXIT

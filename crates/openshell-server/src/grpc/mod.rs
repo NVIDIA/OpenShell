@@ -257,7 +257,7 @@ impl OpenShell for OpenShellService {
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         Ok(Response::new(HealthResponse {
-            supports_cedar_policy: validation::SUPPORTS_CEDAR_POLICY,
+            supported_capabilities: validation::supported_policy_capabilities(),
             status: ServiceStatus::Healthy.into(),
             version: openshell_core::VERSION.to_string(),
         }))
@@ -1118,7 +1118,10 @@ pub mod test_support {
                     supports_provider_readiness: false,
                     redirected: false,
                     supports_session_redirect: false,
-                    supports_cedar_policy: features == StreamFeatures::Apply,
+                    supported_capabilities: openshell_core::extension_protocol::capabilities_if(
+                        openshell_core::extension_protocol::POLICY_CEDAR_V1,
+                        features == StreamFeatures::Apply,
+                    ),
                 })),
             })
             .await
@@ -1356,7 +1359,13 @@ mod tests {
             .await
             .expect("health succeeds")
             .into_inner();
-        assert_eq!(health.supports_cedar_policy, cfg!(feature = "cedar"));
+        assert_eq!(
+            openshell_core::extension_protocol::has_capability(
+                &health.supported_capabilities,
+                openshell_core::extension_protocol::POLICY_CEDAR_V1
+            ),
+            cfg!(feature = "cedar")
+        );
     }
 
     #[test]

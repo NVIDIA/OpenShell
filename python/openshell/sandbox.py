@@ -861,7 +861,10 @@ class SandboxClient:
         return self._stub.Health(openshell_pb2.HealthRequest(), timeout=self._timeout)
 
     def _require_cedar_policy_support(self, spec: openshell_pb2.SandboxSpec) -> None:
-        if spec.policy.cedar_policy_source and not self.health().supports_cedar_policy:
+        if (
+            spec.policy.cedar_policy_source
+            and "openshell.policy.cedar.v1" not in self.health().supported_capabilities
+        ):
             raise SandboxError(
                 "gateway does not advertise Cedar policy support; "
                 "Cedar policies require a development build of the gateway and supervisor"

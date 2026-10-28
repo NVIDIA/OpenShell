@@ -29,9 +29,8 @@ func (c *configClient) GetSandbox(ctx context.Context, workspace, sandboxName st
 		return nil, err
 	}
 	resp, err := c.client.GetSandboxConfig(ctx, &sbv1.GetSandboxConfigRequest{
-		SupportsCedarPolicy: true,
-		Name:                sandboxName,
-		WorkspaceScope:      namedWorkspaceScope(workspace),
+		Name:           sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -61,27 +60,9 @@ func (c *configClient) Update(ctx context.Context, workspace string, update *Con
 	if !req.GetGlobal() {
 		req.WorkspaceScope = namedWorkspaceScope(workspace)
 	}
-	if err := requireCedarPolicySupport(ctx, c.client, req.GetPolicy()); err != nil {
-		return nil, err
-	}
 	resp, err := c.client.UpdateConfig(ctx, req)
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
 	return converter.ConfigUpdateResultFromProto(resp), nil
-}
-
-// requireCedarPolicySupport prevents old gateways from decoding Cedar as empty YAML.
-func requireCedarPolicySupport(ctx context.Context, client pb.OpenShellClient, policy *sbv1.SandboxPolicy) error {
-	if policy.GetCedarPolicySource() == "" {
-		return nil
-	}
-	info, err := client.Health(ctx, &pb.HealthRequest{})
-	if err != nil {
-		return converter.FromGRPCError(err)
-	}
-	if !info.GetSupportsCedarPolicy() {
-		return &StatusError{Code: ErrorUnimplemented, Message: "gateway does not advertise Cedar policy support; Cedar policies require a development build of the gateway and supervisor"}
-	}
-	return nil
 }

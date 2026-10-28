@@ -29,7 +29,7 @@ use crate::gateway_members::{GatewayMember, GatewayMemberIndex, MEMBER_TTL};
 use crate::grpc::policy::{
     SandboxConfigInputs, build_provider_environment_snapshot_from_inputs,
     build_sandbox_config_snapshot_from_inputs, is_configuration_rejection,
-    load_sandbox_config_inputs, require_supervisor_cedar_support, unadmitted_sandbox_config,
+    load_sandbox_config_inputs, require_policy_capabilities, unadmitted_sandbox_config,
 };
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex, dialable_peer_endpoint};
 
@@ -339,7 +339,7 @@ impl Deliver for Builder<'_> {
         let started = Instant::now();
         let built = tokio::time::timeout(
             SANDBOX_CONFIG_BUILD_TIMEOUT,
-            build_sandbox_config(state, sandbox_id, record.supports_cedar_policy),
+            build_sandbox_config(state, sandbox_id, record.supported_capabilities.clone()),
         )
         .await;
         let (inputs, sandbox_config) = match built {
@@ -427,7 +427,7 @@ enum BuiltSandboxConfig {
 async fn build_sandbox_config(
     state: &Arc<ServerState>,
     sandbox_id: &str,
-    supports_cedar_policy: bool,
+    supported_capabilities: Vec<String>,
 ) -> Result<Option<BuiltSandboxConfig>, Status> {
     let Some(sandbox) = state
         .store
@@ -454,8 +454,7 @@ async fn build_sandbox_config(
     };
     match built {
         Ok((inputs, snapshot)) => Ok(Some(
-            match require_supervisor_cedar_support(supports_cedar_policy, snapshot.policy.as_ref())
-            {
+            match require_policy_capabilities(supported_capabilities, snapshot.policy.as_ref()) {
                 Ok(()) => BuiltSandboxConfig::Built(Box::new(inputs), snapshot),
                 Err(error) => rejected(error),
             },
@@ -842,7 +841,13 @@ pub fn register_test_apply_session(
     session_id: &str,
 ) -> TestApplySession {
     let captured_seq = state.config_delivery.publications();
-    register_test_apply_session_after(state, sandbox, session_id, captured_seq, true)
+    register_test_apply_session_after(
+        state,
+        sandbox,
+        session_id,
+        captured_seq,
+        vec![openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string()],
+    )
 }
 
 /// Register a test session whose bootstrap was read when the publication
@@ -853,7 +858,7 @@ fn register_test_apply_session_after(
     sandbox: &Sandbox,
     session_id: &str,
     captured_seq: u64,
-    supports_cedar_policy: bool,
+    supported_capabilities: Vec<String>,
 ) -> TestApplySession {
     use crate::persistence::{ObjectId, ObjectWorkspace};
 
@@ -880,7 +885,7 @@ fn register_test_apply_session_after(
             provider_environment: None,
             captured_seq,
             rebuild: false,
-            supports_cedar_policy,
+            supported_capabilities,
         },
     );
     TestApplySession { outbound }
@@ -1642,8 +1647,13 @@ mod tests {
         change_policy(&state, "sandbox", 1).await;
         assert!(!state.config_delivery.publish_sandbox("sandbox"));
 
-        let mut session =
-            register_test_apply_session_after(&state, &sandbox, "session-1", captured_seq, true);
+        let mut session = register_test_apply_session_after(
+            &state,
+            &sandbox,
+            "session-1",
+            captured_seq,
+            vec![openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string()],
+        );
         // Reconciliation is at least 30 seconds away, so only registration
         // can have caught the publication.
         let update = tokio::time::timeout(Duration::from_secs(5), session.outbound.recv())
@@ -1664,7 +1674,10 @@ mod tests {
                 .to_string(),
             ..Default::default()
         };
-        for supports_cedar_policy in [false, true] {
+        for supported_capabilities in [
+            Vec::new(),
+            vec![openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string()],
+        ] {
             let state = push_state().await;
             put_sandbox(&state, "sandbox", &[]).await;
             let sandbox = state
@@ -1684,7 +1697,7 @@ mod tests {
                 &sandbox,
                 "session-1",
                 captured_seq,
-                supports_cedar_policy,
+                supported_capabilities.clone(),
             );
             let message = tokio::time::timeout(Duration::from_secs(5), session.outbound.recv())
                 .await
@@ -1694,7 +1707,10 @@ mod tests {
                 panic!("expected a configuration update");
             };
             let snapshot = update.sandbox_config.expect("sandbox configuration");
-            if supports_cedar_policy {
+            if openshell_core::extension_protocol::has_capability(
+                &supported_capabilities,
+                openshell_core::extension_protocol::POLICY_CEDAR_V1,
+            ) {
                 assert!(snapshot.configuration_admitted);
                 assert_eq!(
                     snapshot.policy.expect("Cedar policy").cedar_policy_source,
@@ -1727,7 +1743,9 @@ mod tests {
                     provider_environment: None,
                     captured_seq: 0,
                     rebuild: false,
-                    supports_cedar_policy: true,
+                    supported_capabilities: vec![
+                        openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
+                    ],
                 }))
             })
             .collect();
@@ -1998,7 +2016,9 @@ mod tests {
             provider_environment: bootstrap.and_then(|bootstrap| bootstrap.provider_environment),
             captured_seq: 0,
             rebuild: false,
-            supports_cedar_policy: true,
+            supported_capabilities: vec![
+                openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
+            ],
         });
         (harness, record)
     }

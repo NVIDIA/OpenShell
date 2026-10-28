@@ -330,17 +330,5 @@ func ConfigUpdateResultFromProto(resp *pb.UpdateConfigResponse) *v1.ConfigUpdate
 		SettingsRevision: resp.GetSettingsRevision(),
 		Deleted:          resp.GetDeleted(),
 		Annotations:      CopyStringMap(resp.GetAnnotations()),
-		PolicyWarnings:   policyWarningsFromProto(resp.GetPolicyWarnings()),
 	}
-}
-
-func policyWarningsFromProto(warnings []*pb.PolicyWarning) []string {
-	if len(warnings) == 0 {
-		return nil
-	}
-	messages := make([]string, 0, len(warnings))
-	for _, warning := range warnings {
-		messages = append(messages, warning.GetMessage())
-	}
-	return messages
 }

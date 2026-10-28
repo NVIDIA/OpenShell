@@ -475,26 +475,6 @@ function Invoke-Check([string] $RustTarget) {
         -CargoArgs "cargo check --workspace $UnsupportedDriverPackageExcludes --target $RustTarget $Z3WorkspaceFeatures" `
         -LogName "build-$RustTarget-check.log"
     Assert-GatewayExcludesUnsupportedDriverCrates $RustTarget
-    Invoke-CedarChecks $RustTarget
-}
-
-function Assert-GatewayExcludesCedarCrates([string] $RustTarget) {
-    # Stable builds leave the Cedar policy engine out; only the gateway's
-    # `cedar` feature may pull it in.
-    $logName = "build-$RustTarget-cedar-tree.log"
-    Invoke-VsCargo `
-        -RustTarget $RustTarget `
-        -CargoArgs "cargo tree -p openshell-gateway --target $RustTarget --features compute-driver-mxc -e normal --prefix none" `
-        -LogName $logName
-
-    $logPath = Join-Path $LogDir $logName
-    $unexpected = @(Select-String `
-        -Path $logPath `
-        -Pattern '^(cedar-policy|cedar-policy-core|cedar-policy-formatter|openshell-policy-cedar|openshell-policy-cedar-schema)\s')
-    if ($unexpected.Count -gt 0) {
-        $packages = ($unexpected.Line | Sort-Object -Unique) -join ", "
-        throw "Cedar policy engine crates entered the Windows gateway dependency graph without the cedar feature: $packages"
-    }
 }
 
 function Assert-GatewayExcludesUnsupportedDriverCrates([string] $RustTarget) {
@@ -527,19 +507,6 @@ function Invoke-Lint([string] $RustTarget) {
         -RustTarget $RustTarget `
         -CargoArgs "cargo check --manifest-path examples/governance-interceptor/Cargo.toml --all-targets --target $RustTarget" `
         -LogName "lint-$RustTarget-governance-interceptor.log"
-    Invoke-CedarChecks $RustTarget
-}
-
-function Invoke-CedarChecks([string] $RustTarget) {
-    Assert-GatewayExcludesCedarCrates $RustTarget
-    # `-p openshell-gateway` takes features of its direct dependencies only;
-    # openshell-server's prebuilt-z3 enables the prover's.
-    $gatewayZ3Features = if ($Z3ServerFeatures) { "--features openshell-server/prebuilt-z3" } else { "" }
-    # Release Dev enables Cedar; check it still compiles with the MXC driver.
-    Invoke-VsCargo `
-        -RustTarget $RustTarget `
-        -CargoArgs "cargo check -p openshell-gateway --target $RustTarget --features compute-driver-mxc,cedar $gatewayZ3Features" `
-        -LogName "build-$RustTarget-check-cedar.log"
 }
 
 function Invoke-Build([string] $RustTarget) {

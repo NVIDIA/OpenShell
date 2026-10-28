@@ -425,7 +425,10 @@ fn main() -> Result<()> {
             openshell_crypto::tls::ensure_default_provider();
             let exit = openshell_supervisor_process::debug_rpc::run(
                 &raw_args[2..],
-                cfg!(feature = "cedar"),
+                openshell_core::extension_protocol::capabilities_if(
+                    openshell_core::extension_protocol::POLICY_CEDAR_V1,
+                    cfg!(feature = "cedar"),
+                ),
             )
             .await?;
             std::process::exit(exit);

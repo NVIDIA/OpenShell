@@ -1013,8 +1013,13 @@ pub(super) fn validate_object_metadata(
 // Policy validation
 // ---------------------------------------------------------------------------
 
-/// Whether this gateway was built with Cedar policy support.
-pub(super) const SUPPORTS_CEDAR_POLICY: bool = cfg!(feature = "cedar");
+/// Versioned policy capabilities compiled into this gateway.
+pub(super) fn supported_policy_capabilities() -> Vec<String> {
+    openshell_core::extension_protocol::capabilities_if(
+        openshell_core::extension_protocol::POLICY_CEDAR_V1,
+        cfg!(feature = "cedar"),
+    )
+}
 
 /// Rejects a Cedar policy when this gateway was built without Cedar support.
 ///
@@ -1022,26 +1027,14 @@ pub(super) const SUPPORTS_CEDAR_POLICY: bool = cfg!(feature = "cedar");
 /// health response says it cannot handle, whatever features other crates in
 /// the same build enable.
 pub(super) fn require_gateway_cedar_support(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
-    if !SUPPORTS_CEDAR_POLICY && policy.is_cedar() {
+    if !openshell_core::extension_protocol::has_capability(
+        &supported_policy_capabilities(),
+        openshell_core::extension_protocol::POLICY_CEDAR_V1,
+    ) && policy.is_cedar()
+    {
         return Err(Status::failed_precondition(
             "this gateway was built without Cedar policy support; Cedar policies require a \
              development build of the gateway and supervisor",
-        ));
-    }
-    Ok(())
-}
-
-/// Rejects a Cedar policy when the compute driver enforces sandbox policy
-/// itself: Cedar is enforced by the `OpenShell` supervisor, which such a driver
-/// does not use.
-pub(super) fn require_policy_enforceable_by_driver(
-    driver_enforces_policy: bool,
-    policy: &ProtoSandboxPolicy,
-) -> Result<(), Status> {
-    if driver_enforces_policy && policy.is_cedar() {
-        return Err(Status::failed_precondition(
-            "the compute driver enforces sandbox policy itself and cannot enforce Cedar \
-             policies; use a compute driver whose sandboxes run the OpenShell supervisor",
         ));
     }
     Ok(())
@@ -1277,15 +1270,6 @@ mod tests {
                 .warnings
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn cedar_policies_require_a_driver_that_leaves_enforcement_to_the_supervisor() {
-        let status = require_policy_enforceable_by_driver(true, &cedar_policy())
-            .expect_err("the driver cannot enforce Cedar");
-        assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
-        assert!(require_policy_enforceable_by_driver(false, &cedar_policy()).is_ok());
-        assert!(require_policy_enforceable_by_driver(true, &ProtoSandboxPolicy::default()).is_ok());
     }
 
     #[test]

@@ -562,8 +562,6 @@ export interface UpdateConfigResult {
   /** u64 rendered as a string. */
   settingsRevision: string;
   deleted: boolean;
-  /** The gateway's load-time warnings for a submitted sandbox policy, one line each. */
-  policyWarnings: string[];
 }
 
 // ---- enum → lowercase string -----------------------------------------------
@@ -701,7 +699,6 @@ function updateConfigResult(resp: UpdateConfigResponse): UpdateConfigResult {
     policyHash: resp.policyHash,
     settingsRevision: resp.settingsRevision.toString(),
     deleted: resp.deleted,
-    policyWarnings: resp.policyWarnings.map((warning) => warning.message),
   };
 }
 
@@ -1218,7 +1215,7 @@ export class SandboxClient {
   async requireCedarPolicySupport(policy?: { cedarPolicySource?: string }): Promise<void> {
     if (!policy?.cedarPolicySource) return;
     const info = await this.grpc.health({});
-    if (!info.supportsCedarPolicy)
+    if (!info.supportedCapabilities.includes('openshell.policy.cedar.v1'))
       throw new SdkError(
         'invalid_config',
         'gateway does not advertise Cedar policy support; Cedar policies require a development build of the gateway and supervisor',
@@ -2012,7 +2009,7 @@ export class SandboxClient {
     try {
       await this.get(name, options);
       const resp = await this.grpc.getSandboxConfig(
-        { ...namedTarget(name, options), supportsCedarPolicy: true },
+        { ...namedTarget(name, options), supportedCapabilities: ['openshell.policy.cedar.v1'] },
         requestCallOptions(options),
       );
       return sandboxConfig(resp);

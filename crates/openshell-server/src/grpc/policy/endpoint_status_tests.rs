@@ -595,7 +595,9 @@ async fn report_endpoint_status_rejects_stale_configuration_epoch() {
         &state,
         with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                supports_cedar_policy: true,
+                supported_capabilities: vec![
+                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
+                ],
                 name: sandbox_id.to_string(),
                 workspace_scope: None,
             }),
@@ -1977,7 +1979,7 @@ async fn replacement_reset_timeout_invalidates_superseded_evidence() {
             redirected: false,
             supports_session_redirect: false,
             supports_config_push: false,
-            supports_cedar_policy: false,
+            supported_capabilities: Vec::new(),
         })),
     };
     let error = gateway_client(Arc::clone(&state))
@@ -2052,7 +2054,7 @@ async fn replacement_reset_retry_does_not_hold_gateway_shutdown() {
             redirected: false,
             supports_session_redirect: false,
             supports_config_push: false,
-            supports_cedar_policy: false,
+            supported_capabilities: Vec::new(),
         })),
     };
     let error = gateway_client(Arc::clone(&state))
@@ -2118,7 +2120,9 @@ async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
         &state,
         with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                supports_cedar_policy: true,
+                supported_capabilities: vec![
+                    openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
+                ],
                 name: sandbox_id.to_string(),
                 workspace_scope: None,
             }),

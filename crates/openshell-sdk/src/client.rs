@@ -145,7 +145,10 @@ impl OpenShellClient {
             let info = self
                 .unary(|mut grpc| async move { grpc.health(proto::HealthRequest {}).await })
                 .await?;
-            if !info.supports_cedar_policy {
+            if !openshell_core::extension_protocol::has_capability(
+                &info.supported_capabilities,
+                openshell_core::extension_protocol::POLICY_CEDAR_V1,
+            ) {
                 return Err(SdkError::from_status(tonic::Status::failed_precondition(
                     "gateway does not advertise Cedar policy support; Cedar policies require a development build of the gateway and supervisor",
                 )));

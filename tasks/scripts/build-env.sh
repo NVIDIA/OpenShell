@@ -8,25 +8,6 @@
 # Source this file (do not execute it) and call the helpers before invoking
 # Cargo on the host.
 
-# openshell_cedar_feature prints the Cargo feature that enables the Cedar
-# policy engine when OPENSHELL_BUILD_CEDAR=1, and prints nothing when it is
-# unset or 0. Stable builds leave Cedar off; Release Dev enables it. Only
-# openshell-gateway and openshell-supervisor define the feature, so callers
-# must add it to those packages alone. Fails on any other value, so assign
-# the result in its own statement:
-#
-#   cedar_feature="$(openshell_cedar_feature)"
-openshell_cedar_feature() {
-    case "${OPENSHELL_BUILD_CEDAR:-0}" in
-        0) ;;
-        1) echo "cedar" ;;
-        *)
-            echo "ERROR: OPENSHELL_BUILD_CEDAR must be 0 or 1, not '${OPENSHELL_BUILD_CEDAR}'." >&2
-            return 1
-            ;;
-    esac
-}
-
 # ensure_build_nofile_limit raises the per-process open-file limit before a
 # host Rust build. Sccache and static *-unknown-linux-musl links can each open
 # hundreds of files simultaneously, exceeding macOS's default soft limit of

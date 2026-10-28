@@ -244,19 +244,13 @@ pub fn print_yaml_line(line: &str) {
 pub fn print_sandbox_policy(policy: &SandboxPolicy) {
     println!("{}", "Policy:".cyan().bold());
     println!();
-    if let Ok(text) = openshell_policy::serialize_sandbox_policy(policy) {
-        // A Cedar policy serializes as its Cedar text, which is not YAML.
-        let cedar = policy.is_cedar();
-        for line in text.lines() {
+    if let Ok(yaml_str) = openshell_policy::serialize_sandbox_policy(policy) {
+        for line in yaml_str.lines() {
             if line == "---" {
                 continue;
             }
             print!("  ");
-            if cedar {
-                println!("{line}");
-            } else {
-                print_yaml_line(line);
-            }
+            print_yaml_line(line);
         }
     }
 }

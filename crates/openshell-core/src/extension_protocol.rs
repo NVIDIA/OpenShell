@@ -12,6 +12,24 @@ use crate::proto::extension::v1::{PeerMetadata, ProtocolVersion};
 pub const PROTOCOL_MAJOR: u32 = 1;
 pub const PROTOCOL_MINOR: u32 = 0;
 
+/// Policy format implemented by a peer's registered Cedar backend.
+pub const POLICY_CEDAR_V1: &str = "openshell.policy.cedar.v1";
+
+/// Whether a peer advertises the required versioned capability.
+#[must_use]
+pub fn has_capability(capabilities: &[String], required: &str) -> bool {
+    capabilities.iter().any(|capability| capability == required)
+}
+
+/// Construct an optional capability advertisement.
+#[must_use]
+pub fn capabilities_if(capability: &str, enabled: bool) -> Vec<String> {
+    enabled
+        .then(|| capability.to_string())
+        .into_iter()
+        .collect()
+}
+
 /// Capability for compute drivers that require gateway-minted launch credentials.
 ///
 /// Drivers require this capability when every launch needs a
@@ -570,5 +588,35 @@ mod tests {
             ),
             Err(NegotiationError::IncompatibleProtocol { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod policy_capability_tests {
+    use super::{POLICY_CEDAR_V1, has_capability};
+    use crate::proto::{HealthResponse, SupervisorHello};
+    use prost::Message;
+
+    #[test]
+    fn capabilities_require_the_exact_versioned_contract() {
+        let unrelated = vec![
+            "openshell.policy.ui.v1".to_string(),
+            "openshell.policy.cedar.v2".to_string(),
+        ];
+        assert!(!has_capability(&unrelated, POLICY_CEDAR_V1));
+        assert!(!has_capability(&[], POLICY_CEDAR_V1));
+        assert!(has_capability(
+            &[POLICY_CEDAR_V1.to_string()],
+            POLICY_CEDAR_V1
+        ));
+    }
+
+    #[test]
+    fn retired_boolean_tags_do_not_advertise_policy_capabilities() {
+        // Former health tag 3 and supervisor hello tag 8.
+        let health = HealthResponse::decode([0x18, 1].as_slice()).unwrap();
+        let hello = SupervisorHello::decode([0x40, 1].as_slice()).unwrap();
+        assert!(health.supported_capabilities.is_empty());
+        assert!(hello.supported_capabilities.is_empty());
     }
 }
