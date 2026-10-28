@@ -49,12 +49,8 @@ struct Args {
     #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
     otlp_ocsf_endpoint: Option<String>,
 
-    /// OCSF schema version that supervisors downgrade exported events to.
-    #[arg(
-        long,
-        env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION",
-        requires = "otlp_ocsf_endpoint"
-    )]
+    /// Deprecated and ignored: `OpenShell` emits OCSF 1.8.0 only.
+    #[arg(long, env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION", hide = true)]
     otlp_ocsf_schema_version: Option<String>,
 
     /// OTLP/gRPC collector endpoint that supervisors relay workload traces
@@ -248,6 +244,11 @@ async fn main() -> Result<()> {
             log_level: &args.log_level,
         },
     );
+    if args.otlp_ocsf_schema_version.is_some() {
+        tracing::warn!(
+            "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION is deprecated and ignored; OpenShell emits OCSF 1.8.0"
+        );
+    }
 
     let managed_ssh_gateway_pod_selector = args
         .managed_ssh_gateway_pod_selector
@@ -305,12 +306,10 @@ async fn main() -> Result<()> {
             supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
             supervisor_otlp_agent_endpoint: args.otlp_agent_endpoint.clone(),
             supervisor_gateway_name: args.gateway_name.clone(),
-            supervisor_ocsf_export: args.otlp_ocsf_endpoint.clone().map(|endpoint| {
-                openshell_core::sandbox_env::OcsfOtlpExport {
-                    endpoint,
-                    schema_version: args.otlp_ocsf_schema_version.clone(),
-                }
-            }),
+            supervisor_ocsf_export: args
+                .otlp_ocsf_endpoint
+                .clone()
+                .map(|endpoint| openshell_core::sandbox_env::OcsfOtlpExport { endpoint }),
             ssh_socket_path: args.sandbox_ssh_socket_path,
             client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
             host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),

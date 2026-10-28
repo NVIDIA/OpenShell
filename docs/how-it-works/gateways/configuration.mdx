@@ -528,7 +528,6 @@ Gateway records use `[openshell.gateway] name` as `device.uid` and `device.name`
 ```toml
 [openshell.gateway.ocsf_log]
 path = "/var/log/openshell/gateway-ocsf.jsonl"
-schema_version = "1.3"
 rotation = "daily"
 max_files = 7
 queue_capacity = 10000
@@ -538,7 +537,7 @@ queue_max_bytes = 16777216
 | Field | Default | Behavior |
 |---|---|---|
 | `path` | Required | Nonempty file path; relative paths use the gateway's working directory. |
-| `schema_version` | Native OCSF 1.8.0 | Optional downgrade target. Accepted values are `1.1` and `1.3`. The configured version applies to every record in the file. |
+| `schema_version` | None | Deprecated and ignored; records are native OCSF 1.8.0. The gateway logs a warning at startup when it is set. |
 | `rotation` | `daily` | Rotate on the first write of a new UTC day. `never` allows unbounded file growth. |
 | `max_files` | `7` | Positive number of rotated segments to retain, in addition to the active file. Rejects explicit use with `rotation = "never"`. |
 | `queue_capacity` | `10000` | Positive queued-record limit. Overflow discards incoming records. |
@@ -546,7 +545,7 @@ queue_max_bytes = 16777216
 
 Unknown fields are rejected. This is one file destination, not an exporter registry. To send the same events to a collector, use [OCSF log export](#ocsf-log-export). The existing `ocsf_json_enabled` sandbox setting remains independent.
 
-For Helm installations, set `server.ocsfLog.enabled` to render this table and optionally set `server.ocsfLog.schemaVersion`. The default `server.ocsfLog.path`, `/tmp/gateway-ocsf.jsonl`, is writable in the gateway container with either the StatefulSet or Deployment workload but does not persist across pod restarts. To keep records, mount a volume with `server.extraVolumes` and `server.extraVolumeMounts` and set the path on it. When replicas share a volume, add `subPathExpr: $(OPENSHELL_POD_NAME)` to the mount so each replica writes its own file.
+For Helm installations, set `server.ocsfLog.enabled` to render this table. The default `server.ocsfLog.path`, `/tmp/gateway-ocsf.jsonl`, is writable in the gateway container with either the StatefulSet or Deployment workload but does not persist across pod restarts. To keep records, mount a volume with `server.extraVolumes` and `server.extraVolumeMounts` and set the path on it. When replicas share a volume, add `subPathExpr: $(OPENSHELL_POD_NAME)` to the mount so each replica writes its own file.
 
 Give each gateway replica its own writable file and an external shipper read access to the containing directory. New files use owner-only permissions on Unix; arrange shipper access deliberately. Rotation renames the active file to a date- and UUID-suffixed sibling. The shipper must follow rotated files and checkpoint its progress. Do not use multiple writers or external copy-truncate rotation on this path.
 
@@ -621,23 +620,24 @@ In-process compute drivers read their backend-specific settings from `[openshell
 
 ### OCSF Log Export
 
-Set `enabled = true` in `[openshell.gateway.otlp.ocsf]` to export gateway OCSF events as OTLP log records. It defaults to `false`, so trace export alone never sends OCSF events. Records go to the table's `endpoint`, or to `[openshell.gateway.otlp]` `endpoint` when it is omitted, with the same resource attributes as spans, under the `openshell.ocsf` instrumentation scope. Use a separate endpoint to send OCSF events to a collector that feeds a SIEM while spans go elsewhere. Sandbox supervisors receive the same endpoint and schema version and export their own OCSF events there directly, so the endpoint must also be reachable from sandboxes. Supervisor records carry the supervisor's resource attributes, including `openshell.sandbox.id` and `openshell.gateway.name`. Supervisors also send the collector headers that the gateway uses for OCSF export, from `OTEL_EXPORTER_OTLP_LOGS_HEADERS` or else `OTEL_EXPORTER_OTLP_HEADERS`, so a collector that requires authentication accepts their records too. The gateway delivers the headers with each sandbox's launch credentials, never through the sandbox environment. Other `OTEL_*` variables do not reach supervisors.
+Set `enabled = true` in `[openshell.gateway.otlp.ocsf]` to export gateway OCSF events as OTLP log records. It defaults to `false`, so trace export alone never sends OCSF events. Records go to the table's `endpoint`, or to `[openshell.gateway.otlp]` `endpoint` when it is omitted, with the same resource attributes as spans, under the `openshell.ocsf` instrumentation scope. Use a separate endpoint to send OCSF events to a collector that feeds a SIEM while spans go elsewhere. Sandbox supervisors receive the same endpoint and export their own OCSF events there directly, so the endpoint must also be reachable from sandboxes. Supervisor records carry the supervisor's resource attributes, including `openshell.sandbox.id` and `openshell.gateway.name`. Supervisors also send the collector headers that the gateway uses for OCSF export, from `OTEL_EXPORTER_OTLP_LOGS_HEADERS` or else `OTEL_EXPORTER_OTLP_HEADERS`, so a collector that requires authentication accepts their records too. The gateway delivers the headers with each sandbox's launch credentials, never through the sandbox environment. Other `OTEL_*` variables do not reach supervisors.
 
 ```toml
 [openshell.gateway.otlp.ocsf]
 enabled        = true
-endpoint       = "http://siem-collector.security.svc:4317" # optional
-schema_version = "1.3"                                     # optional
+endpoint = "http://siem-collector.security.svc:4317" # optional
 ```
 
 Each OCSF event becomes one log record:
 
 | Field | Value |
 |---|---|
-| Body | The OCSF event as a JSON string. With `schema_version` set to `1.1` or `1.3`, the record is downgraded as for [OCSF JSONL output](#ocsf-jsonl-output). |
+| Body | The OCSF event as a JSON string. |
 | Timestamp | The OCSF `time`. The observed timestamp is when the gateway received the event. |
 | Severity | Unknown, Informational, and Other are INFO, Low is WARN, Medium is WARN2, High is ERROR, Critical is ERROR2, and Fatal is FATAL. The severity text is the OCSF severity name. |
-| Attributes | `ocsf.class_uid`, `ocsf.activity_id`, `ocsf.severity_id`, `ocsf.metadata.uid`, and, for events associated with a sandbox, `openshell.sandbox.id`. These come from the event before any downgrade, so they remain when a downgrade removes the fields from the body. |
+| Attributes | `ocsf.class_uid`, `ocsf.activity_id`, `ocsf.severity_id`, `ocsf.metadata.uid`, and, for events associated with a sandbox, `openshell.sandbox.id`. |
+
+`schema_version` in this table is deprecated and ignored; the gateway logs a warning at startup when it is set.
 
 Log export is independent of `RUST_LOG` and of `[openshell.gateway.ocsf_log]`; you can enable both. The gateway queues up to 10,000 records, and up to 16 MiB of records including the batch being exported, without blocking event producers. It exports a batch as soon as 100 records or 1 MiB are queued, or 500 ms after the first record of a batch arrives. A record larger than 1 MiB, such as an event for a request with a very long path, is dropped rather than exported.
 
@@ -669,7 +669,7 @@ The relayed hop does not yet support TLS or authentication to the collector; an 
 
 ### Tuning
 
-`[openshell.gateway.otlp]` decides whether and where to export. How the SDK exports is controlled by the standard OpenTelemetry environment variables, which the gateway reads through the SDK rather than mirroring as TOML keys. They apply to the gateway and its in-process compute drivers. The gateway does not pass them to sandbox supervisors, which receive only the endpoints, the OCSF schema version, and the [OCSF collector headers](#ocsf-log-export).
+`[openshell.gateway.otlp]` decides whether and where to export. How the SDK exports is controlled by the standard OpenTelemetry environment variables, which the gateway reads through the SDK rather than mirroring as TOML keys. They apply to the gateway and its in-process compute drivers. The gateway does not pass them to sandbox supervisors, which receive only the endpoints and the [OCSF collector headers](#ocsf-log-export).
 
 The gateway honors these variables:
 

@@ -58,9 +58,6 @@ fn supervisor_ocsf_export(
     let ocsf = otlp?.ocsf.as_ref()?;
     Some(openshell_core::sandbox_env::OcsfOtlpExport {
         endpoint: ocsf.endpoint.clone(),
-        schema_version: ocsf
-            .schema_version
-            .map(|version| version.as_str().to_string()),
     })
 }
 

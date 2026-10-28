@@ -94,7 +94,6 @@ from sandbox runtimes)",
             std::path::Path::new("/var/log"),
             console_filter,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(std::sync::Mutex::new(String::new())),
         );
         tracing_subscriber::registry()
             .with(logging_layers)

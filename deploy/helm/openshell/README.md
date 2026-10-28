@@ -646,7 +646,7 @@ discovery endpoint or its TLS CA.
 | server.ocsfLog.queueCapacity | int | `10000` | Maximum records waiting for the file writer. |
 | server.ocsfLog.queueMaxBytes | int | `16777216` | Maximum encoded bytes waiting for the file writer. |
 | server.ocsfLog.rotation | string | `"daily"` | Rotate the active file daily in UTC, or never. |
-| server.ocsfLog.schemaVersion | string | `""` | Optional OCSF downgrade target. Empty emits native OCSF 1.8.0. Supported values: "1.1", "1.3". |
+| server.ocsfLog.schemaVersion | string | `""` | Deprecated and ignored: the gateway emits native OCSF 1.8.0 and logs a warning at startup when this is set. |
 | server.oidc.adminRole | string | `""` | Role name for admin access. Leave empty (with userRole also empty) for authentication-only mode. Both must be set or both empty. |
 | server.oidc.audience | string | `"openshell-cli"` | Expected audience claim for the API resource server. This should match the server's --oidc-audience, NOT the CLI client ID. |
 | server.oidc.caConfigMapName | string | `""` | Name of a ConfigMap containing a CA certificate bundle (key: ca.crt) for verifying the OIDC issuer's TLS certificate. Required when the issuer uses a non-public CA (e.g. OpenShift ingress, private PKI). |

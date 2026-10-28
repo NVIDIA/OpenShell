@@ -2928,7 +2928,6 @@ mod tests {
         let config = PodmanComputeConfig {
             supervisor_ocsf_export: Some(openshell_core::sandbox_env::OcsfOtlpExport {
                 endpoint: "http://siem:4317".to_string(),
-                schema_version: Some("1.1".to_string()),
             }),
             ..test_config()
         };
@@ -2936,10 +2935,6 @@ mod tests {
         assert_eq!(
             spec["env"][openshell_core::sandbox_env::OTLP_OCSF_ENDPOINT],
             "http://siem:4317"
-        );
-        assert_eq!(
-            spec["env"][openshell_core::sandbox_env::OTLP_OCSF_SCHEMA_VERSION],
-            "1.1"
         );
         assert!(
             spec["env"]

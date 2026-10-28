@@ -793,6 +793,13 @@ async fn run_from_args(
     if prepared.legacy_compute_driver_env_seen {
         warn!("OPENSHELL_DRIVERS is deprecated; migrate to OPENSHELL_COMPUTE_DRIVER");
     }
+    for field in prepared
+        .config_file
+        .iter()
+        .flat_map(ConfigFile::deprecated_ocsf_schema_versions)
+    {
+        warn!("{field} is deprecated and ignored; OpenShell emits OCSF 1.8.0");
+    }
     if let Some(bundle) = prepared.network_trust.as_ref() {
         info!(
             certificate_count = bundle.certificate_count(),

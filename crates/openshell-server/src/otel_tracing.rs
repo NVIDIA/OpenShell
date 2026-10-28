@@ -171,11 +171,7 @@ impl OtlpExport {
                 let target = target(&ocsf.endpoint)?;
                 Ok::<_, SetupError>(Signal {
                     endpoint: target.endpoint().to_string(),
-                    exporter: OcsfOtlp::start(
-                        target.log_exporter()?,
-                        target.resource().clone(),
-                        ocsf.schema_version,
-                    ),
+                    exporter: OcsfOtlp::start(target.log_exporter()?, target.resource().clone()),
                 })
             })
             .transpose()?;
@@ -727,7 +723,6 @@ mod tests {
                 .log_exporter_with_headers(Some("authorization=Bearer%20collector-token"))
                 .unwrap(),
             target.resource().clone(),
-            None,
         );
         let event =
             ConfigStateChangeBuilder::new(&crate::gateway_ocsf::context("sandbox-1", "sandbox"))

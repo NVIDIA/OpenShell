@@ -8978,9 +8978,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_otlp_environment_carries_only_configured_signals() {
-        use openshell_core::sandbox_env::{
-            OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OTLP_OCSF_SCHEMA_VERSION, OcsfOtlpExport,
-        };
+        use openshell_core::sandbox_env::{OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OcsfOtlpExport};
 
         let names = |config: KubernetesComputeConfig| {
             KubernetesComputeDriver::new_for_test(config)
@@ -9002,16 +9000,12 @@ mod tests {
         let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
             supervisor_ocsf_export: Some(OcsfOtlpExport {
                 endpoint: "http://siem:4317".into(),
-                schema_version: Some("1.1".into()),
             }),
             ..Default::default()
         });
         assert_eq!(
             driver.supervisor_otlp_environment(),
-            [
-                (OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string()),
-                (OTLP_OCSF_SCHEMA_VERSION, "1.1".to_string()),
-            ]
+            [(OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string())]
         );
 
         let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
