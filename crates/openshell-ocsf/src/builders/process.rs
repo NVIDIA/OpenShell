@@ -37,19 +37,9 @@ impl<'a> ProcessActivityBuilder<'a, MissingActor> {
     /// A Process Activity must name its acting process before it can be built.
     ///
     /// ```compile_fail
-    /// use openshell_ocsf::{EventContext, EventOrigin, ProcessActivityBuilder};
+    /// use openshell_ocsf::ProcessActivityBuilder;
     ///
-    /// let ctx = EventContext {
-    ///     sandbox_id: String::new(),
-    ///     sandbox_name: String::new(),
-    ///     container_image: String::new(),
-    ///     hostname: String::new(),
-    ///     product_version: String::new(),
-    ///     proxy_ip: "127.0.0.1".parse().unwrap(),
-    ///     proxy_port: 3128,
-    ///     origin: EventOrigin::Supervisor,
-    /// };
-    /// ProcessActivityBuilder::new(&ctx).build();
+    /// ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx()).build();
     /// ```
     #[must_use]
     pub fn new(ctx: impl Into<ContextRef<'a>>) -> Self {
