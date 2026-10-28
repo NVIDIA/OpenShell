@@ -441,8 +441,9 @@ treat PostgreSQL connection markers or membership TTL expiry as retirement
 proof. SQLite testing supports one gateway process only. Image-update clients
 must call the separate `SandboxUpdates` service on the existing gateway
 listener, not add a method to the baseline `OpenShell` service or inspect new
-public `SandboxStatus` image fields. Pending-operation recovery uses the same
-requested image with a fresh version and the documented request-ID semantics.
+public `SandboxStatus` image fields. Resume a pending operation with
+`SandboxUpdates.UpdateSandbox`, the current resource version, and no selected
+fields, following the documented request-ID semantics.
 
 The kube e2e wrapper creates only one port-forward, to `svc/openshell`; it no
 longer forwards the unauthenticated health listener or runs a `/readyz` e2e
