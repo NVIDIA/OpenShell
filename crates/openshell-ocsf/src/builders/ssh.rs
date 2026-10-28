@@ -69,40 +69,31 @@ impl<'a, EndpointState> SshActivityBuilder<'a, EndpointState> {
     /// Set the source endpoint from an address.
     #[must_use]
     pub fn src_endpoint_addr(
-        self,
+        mut self,
         ip: std::net::IpAddr,
         port: u16,
     ) -> SshActivityBuilder<'a, HasSshEndpoint> {
-        SshActivityBuilder {
-            src_endpoint: Some(Endpoint::from_ip(ip, port)),
-            dst_endpoint: self.dst_endpoint,
-            ctx: self.ctx,
-            activity: self.activity,
-            action: self.action,
-            disposition: self.disposition,
-            severity: self.severity,
-            status: self.status,
-            actor: self.actor,
-            auth_type_id: self.auth_type_id,
-            auth_type_label: self.auth_type_label,
-            protocol_ver: self.protocol_ver,
-            message: self.message,
-            endpoint_state: std::marker::PhantomData,
-        }
+        self.src_endpoint = Some(Endpoint::from_ip(ip, port));
+        self.with_endpoint()
     }
 
     /// Set the destination endpoint.
     #[must_use]
-    pub fn dst_endpoint(self, endpoint: Endpoint) -> SshActivityBuilder<'a, HasSshEndpoint> {
+    pub fn dst_endpoint(mut self, endpoint: Endpoint) -> SshActivityBuilder<'a, HasSshEndpoint> {
+        self.dst_endpoint = Some(endpoint);
+        self.with_endpoint()
+    }
+
+    fn with_endpoint(self) -> SshActivityBuilder<'a, HasSshEndpoint> {
         SshActivityBuilder {
-            src_endpoint: self.src_endpoint,
-            dst_endpoint: Some(endpoint),
             ctx: self.ctx,
             activity: self.activity,
             action: self.action,
             disposition: self.disposition,
             severity: self.severity,
             status: self.status,
+            src_endpoint: self.src_endpoint,
+            dst_endpoint: self.dst_endpoint,
             actor: self.actor,
             auth_type_id: self.auth_type_id,
             auth_type_label: self.auth_type_label,
@@ -126,55 +117,17 @@ impl<'a, EndpointState> SshActivityBuilder<'a, EndpointState> {
         self
     }
 
-    /// Set the event activity identifier.
-    #[must_use]
-    pub fn activity(mut self, id: ActivityId) -> Self {
-        self.activity = id;
-        self
-    }
-
-    /// Set the action taken.
-    #[must_use]
-    pub fn action(mut self, id: ActionId) -> Self {
-        self.action = Some(id);
-        self
-    }
-
-    /// Set the disposition of the action.
-    #[must_use]
-    pub fn disposition(mut self, id: DispositionId) -> Self {
-        self.disposition = Some(id);
-        self
-    }
-
     /// Set the acting process.
     #[must_use]
     pub fn actor_process(mut self, process: crate::objects::Process) -> Self {
         self.actor = Some(Actor::process(process));
         self
     }
-
-    /// Set the event severity.
-    #[must_use]
-    pub fn severity(mut self, id: SeverityId) -> Self {
-        self.severity = id;
-        self
-    }
-
-    /// Set the overall event status.
-    #[must_use]
-    pub fn status(mut self, id: StatusId) -> Self {
-        self.status = Some(id);
-        self
-    }
-
-    /// Set a human-readable event message.
-    #[must_use]
-    pub fn message(mut self, msg: impl Into<String>) -> Self {
-        self.message = Some(msg.into());
-        self
-    }
 }
+
+impl_activity_setter!(SshActivityBuilder<EndpointState>);
+impl_action_disposition_setters!(SshActivityBuilder<EndpointState>);
+impl_builder_setters!(SshActivityBuilder<EndpointState>);
 
 impl SshActivityBuilder<'_, HasSshEndpoint> {
     #[must_use]

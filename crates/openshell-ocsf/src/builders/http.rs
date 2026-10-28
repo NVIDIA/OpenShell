@@ -155,24 +155,6 @@ impl<'a, Context> HttpActivityBuilder<'a, Context> {
     }
 
     #[must_use]
-    pub fn activity(mut self, id: ActivityId) -> Self {
-        self.activity = id;
-        self
-    }
-
-    #[must_use]
-    pub fn action(mut self, id: ActionId) -> Self {
-        self.action = Some(id);
-        self
-    }
-
-    #[must_use]
-    pub fn disposition(mut self, id: DispositionId) -> Self {
-        self.disposition = Some(id);
-        self
-    }
-
-    #[must_use]
     pub fn actor_process(mut self, process: crate::objects::Process) -> Self {
         self.actor = Some(Actor::process(process));
         self
@@ -189,25 +171,11 @@ impl<'a, Context> HttpActivityBuilder<'a, Context> {
         self.firewall_rule = Some(FirewallRule::new(name, rule_type));
         self
     }
-
-    #[must_use]
-    pub fn severity(mut self, id: SeverityId) -> Self {
-        self.severity = id;
-        self
-    }
-
-    #[must_use]
-    pub fn status(mut self, id: StatusId) -> Self {
-        self.status = Some(id);
-        self
-    }
-
-    #[must_use]
-    pub fn message(mut self, msg: impl Into<String>) -> Self {
-        self.message = Some(msg.into());
-        self
-    }
 }
+
+impl_activity_setter!(HttpActivityBuilder<Context>);
+impl_action_disposition_setters!(HttpActivityBuilder<Context>);
+impl_builder_setters!(HttpActivityBuilder<Context>);
 
 impl HttpActivityBuilder<'_, HasHttpContext> {
     #[must_use]
