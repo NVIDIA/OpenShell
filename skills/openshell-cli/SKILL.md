@@ -593,7 +593,9 @@ cleanup completion and settlement of the original driver operation, then run
 timeout diagnostic and storage and does not bypass pending cleanup.
 
 An operation-pending error blocks start, stop, and provisioning retry. The gateway
-retries automatically even when new updates are disabled. Repeated automatic
+limits preflight and each accepted update attempt to one minute each. A timeout
+after acceptance preserves pending intent for recovery; it does not imply rollback.
+The gateway retries automatically even when new updates are disabled. Repeated automatic
 failures back off up to 15 minutes per gateway; restarting a gateway resets the delay.
 To resume immediately,
 read a fresh resource version and call `UpdateSandbox` with no selected fields;

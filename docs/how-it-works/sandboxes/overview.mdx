@@ -1101,7 +1101,12 @@ compute again. This Stop behavior also applies when updates are disabled.
 Cleanup that is still pending cannot be bypassed.
 
 An `ABORTED` version conflict requires another read before you construct a new
-conditional request. An update failure or disconnected response can leave a
+conditional request. The gateway limits driver preflight and each accepted update
+attempt to one minute each. A timed-out preflight does not accept an update.
+An accepted update continues after client cancellation until it completes or
+times out. A timeout releases the sandbox for recovery or deletion; it does not
+roll back an update the driver may have applied.
+An update failure or disconnected response can leave a
 pending operation, even when `sandbox.spec.template.image` already names the
 target image. Start, stop, and provisioning retry remain blocked until reconciliation
 succeeds. The gateway retries accepted updates at startup and periodically, even

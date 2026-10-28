@@ -14,7 +14,7 @@ use tonic::{Request, Status};
 use tracing::info;
 
 const UPDATE_RECOVERY_PAGE_SIZE: u32 = 128;
-const UPDATE_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
+const UPDATE_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 #[derive(Clone)]
 pub(super) struct UpdateRecoveryBackoff {
@@ -211,8 +211,12 @@ impl ComputeRuntime {
             // and reconciliation progress while preflight waits on the driver.
             // The acceptance CAS below rejects any intervening record changes.
             drop(sandbox_guard);
-            self.reconcile_sandbox_update(&current, &intent, true)
-                .await?;
+            tokio::time::timeout(
+                UPDATE_ATTEMPT_TIMEOUT,
+                self.reconcile_sandbox_update(&current, &intent, true),
+            )
+            .await
+            .map_err(|_| Status::deadline_exceeded("sandbox update preflight timed out"))??;
             sandbox_guard = self.lock_sandbox_for_lifecycle(&lifecycle_guard).await;
             // The private intent, selected configuration, and OLD-understood pending
             // operation flag commit in one version-fenced transaction.
@@ -234,7 +238,19 @@ impl ComputeRuntime {
         let runtime = self.clone();
         tokio::spawn(async move {
             let _lifecycle_guard = lifecycle_guard;
-            runtime.complete_image_update(accepted, intent).await
+            // Client cancellation must not cancel accepted work, but a stalled
+            // driver must release the gate for recovery, resume, or deletion.
+            // Timeout is ambiguous: retain any pending intent and its interlock.
+            tokio::time::timeout(
+                UPDATE_ATTEMPT_TIMEOUT,
+                runtime.complete_image_update(accepted, intent),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(Status::deadline_exceeded(
+                    "sandbox update timed out; recovery will retry any pending intent",
+                ))
+            })
         })
         .await
         .map_err(|_| {
@@ -417,7 +433,7 @@ impl ComputeRuntime {
         let Some(_gate) = self.lifecycle_gates.try_lock_for(id) else {
             return Ok(());
         };
-        let deadline = tokio::time::Instant::now() + UPDATE_RECOVERY_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + UPDATE_ATTEMPT_TIMEOUT;
         let read = async {
             let sandbox = self
                 .store
@@ -1022,6 +1038,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timed_out_explicit_update_releases_gate_and_preserves_recovery() {
+        use std::time::Duration;
+
+        for cancel_request in [false, true] {
+            for recovery in ["automatic", "resume", "delete"] {
+                let (runtime, driver, original) = fixture(true).await;
+                let (entered, release) = driver.pause_image_updates();
+                let update = {
+                    let runtime = runtime.clone();
+                    let original = original.clone();
+                    tokio::spawn(async move {
+                        runtime
+                            .update_sandbox_image(
+                                original.object_id(),
+                                "new-image".into(),
+                                original.get_resource_version(),
+                            )
+                            .await
+                    })
+                };
+                entered.notified().await;
+                release.add_permits(1); // Let preflight pass; stall the accepted update.
+                entered.notified().await;
+                let intent = runtime
+                    .store
+                    .get_sandbox_image_state(original.object_id())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .pending
+                    .unwrap();
+                if cancel_request {
+                    update.abort();
+                }
+                tokio::time::pause();
+                tokio::time::advance(UPDATE_ATTEMPT_TIMEOUT).await;
+                tokio::task::yield_now().await;
+                tokio::time::resume();
+                let result = tokio::time::timeout(Duration::from_secs(2), update)
+                    .await
+                    .expect("explicit update must have a bounded lifetime");
+                if cancel_request {
+                    assert!(result.unwrap_err().is_cancelled());
+                } else {
+                    assert_eq!(result.unwrap().unwrap_err().code(), Code::DeadlineExceeded);
+                }
+                drop(
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        runtime.lifecycle_gates.lock_for(original.object_id()),
+                    )
+                    .await
+                    .expect("the detached worker must release its lifecycle gate"),
+                );
+                let pending = runtime
+                    .store
+                    .get_message::<Sandbox>(original.object_id())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                ensure_image_update_interlock(&pending, &intent).unwrap();
+                assert_eq!(
+                    runtime
+                        .store
+                        .get_sandbox_image_state(original.object_id())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .pending,
+                    Some(intent.clone())
+                );
+
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    match recovery {
+                        "automatic" => {
+                            release.add_permits(1);
+                            runtime.recover_pending_sandbox_updates().await.unwrap();
+                            drop(runtime.update_recovery_sweep.acquire().await.unwrap());
+                        }
+                        "resume" => {
+                            release.add_permits(1);
+                            runtime
+                                .update_sandbox_configuration(
+                                    original.object_id(),
+                                    &openshell_core::proto::UpdateSandboxRequest {
+                                        expected_resource_version: pending.get_resource_version(),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        "delete" => {
+                            // Deletion must work while the updater remains stalled.
+                            runtime
+                                .delete_sandbox("default", original.object_name())
+                                .await
+                                .unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                })
+                .await
+                .expect("a timed-out update must permit recovery or deletion");
+                let state = runtime
+                    .store
+                    .get_sandbox_image_state(original.object_id())
+                    .await
+                    .unwrap();
+                if recovery == "delete" {
+                    assert!(state.is_none());
+                    assert!(
+                        runtime
+                            .store
+                            .get_message::<Sandbox>(original.object_id())
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert!(
+                        runtime
+                            .store
+                            .complete_sandbox_image_update(original.object_id(), &intent)
+                            .await
+                            .is_err(),
+                        "late completion cannot resurrect a deleted sandbox"
+                    );
+                } else {
+                    assert!(state.unwrap().pending.is_none());
+                    let calls = image_calls(&driver);
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(calls[0].operation_id, intent.operation_id);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_out_update_preflight_leaves_sandbox_available_for_deletion() {
+        use std::time::Duration;
+
+        let (runtime, driver, original) = fixture(true).await;
+        let (entered, _release) = driver.pause_image_updates();
+        let update = {
+            let runtime = runtime.clone();
+            let original = original.clone();
+            tokio::spawn(async move {
+                runtime
+                    .update_sandbox_image(
+                        original.object_id(),
+                        "new-image".into(),
+                        original.get_resource_version(),
+                    )
+                    .await
+            })
+        };
+        entered.notified().await;
+        tokio::time::pause();
+        tokio::time::advance(UPDATE_ATTEMPT_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        tokio::time::resume();
+        let error = tokio::time::timeout(Duration::from_secs(2), update)
+            .await
+            .expect("preflight must time out before accepting an update")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code(), Code::DeadlineExceeded);
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<Sandbox>(original.object_id())
+                .await
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        assert!(
+            runtime
+                .store
+                .get_sandbox_image_state(original.object_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            runtime.delete_sandbox("default", original.object_name()),
+        )
+        .await
+        .expect("preflight timeout must release the lifecycle gate")
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn timed_out_automatic_update_retains_intent_and_defers_recovery() {
         let (runtime, driver, original) = fixture(true).await;
         driver.set_image_update_error(Some(Code::Unavailable));
@@ -1038,7 +1248,7 @@ mod tests {
         runtime.recover_pending_sandbox_updates().await.unwrap();
         entered.notified().await;
         tokio::time::pause();
-        tokio::time::advance(UPDATE_RECOVERY_TIMEOUT).await;
+        tokio::time::advance(UPDATE_ATTEMPT_TIMEOUT).await;
         tokio::task::yield_now().await;
         tokio::time::resume();
         drop(runtime.update_recovery_sweep.acquire().await.unwrap());
