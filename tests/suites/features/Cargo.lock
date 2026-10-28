@@ -2212,13 +2212,12 @@ dependencies = [
 name = "openshell-test-feature-kubernetes-updates"
 version = "0.0.0"
 dependencies = [
- "hex",
  "openshell-testkit",
- "rand 0.9.5",
  "serde_json",
  "tempfile",
  "tokio",
  "tonic",
+ "uuid",
 ]
 
 [[package]]
