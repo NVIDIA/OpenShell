@@ -139,9 +139,12 @@ the label index without invoking a driver.
 
 New updates require operator activation and compatible gateway membership.
 Accepted updates recover from private durable intent at startup and in periodic
-reconciliation, including when activation is subsequently disabled. An authorized
-`UpdateSandbox` with no selected fields and the current resource version resumes
-the stored intent without reconstructing its selections. Completion retains the
+reconciliation, including when activation is subsequently disabled. Recovery
+pages through a partial database index of pending private update records instead
+of scanning sandboxes or completed receipts. Acceptance and completion maintain
+the indexed status in the same transaction as the intent and lifecycle interlock.
+An authorized `UpdateSandbox` with no selected fields and the current resource
+version resumes the stored intent without reconstructing its selections. Completion retains the
 exact operation receipt for idempotent completion across replicas; a newer update
 invalidates it. Ambiguous results retain the baseline provisioning interlock.
 Explicit deletion can supersede a pending update: the driver only patches the

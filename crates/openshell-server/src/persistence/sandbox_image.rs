@@ -15,9 +15,10 @@ use prost::Message;
 use sqlx::{Postgres, Sqlite, Transaction};
 
 const IMAGE_STATE_OBJECT_TYPE: &str = "sandbox_image_state";
+const IMAGE_STATE_ID_PREFIX: &str = "sandbox-image-state:";
 
 fn state_id(sandbox_id: &str) -> String {
-    format!("sandbox-image-state:{sandbox_id}")
+    format!("{IMAGE_STATE_ID_PREFIX}{sandbox_id}")
 }
 
 fn conflict(current_resource_version: Option<u64>) -> PersistenceError {
@@ -304,6 +305,52 @@ fn project_complete(
 }
 
 impl Store {
+    /// Discover only pending updates through the partial index, without reading
+    /// sandbox records or completed receipts. The cursor is a sandbox ID from
+    /// the preceding page; callers must recheck current intent before recovery.
+    pub(crate) async fn list_pending_sandbox_update_ids(
+        &self,
+        after: Option<&str>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<String>> {
+        let after = after.map_or_else(String::new, state_id);
+        let ids = match self {
+            Self::Sqlite(store) => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM objects
+WHERE object_type = 'sandbox_image_state' AND status = 'pending' AND id > ?1
+ORDER BY id LIMIT ?2",
+                )
+                .bind(&after)
+                .bind(i64::from(limit))
+                .fetch_all(&store.pool)
+                .await
+            }
+            Self::Postgres(store) => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM objects
+WHERE object_type = 'sandbox_image_state' AND status = 'pending' AND id > $1
+ORDER BY id LIMIT $2",
+                )
+                .bind(&after)
+                .bind(i64::from(limit))
+                .fetch_all(&store.pool)
+                .await
+            }
+        }
+        .map_err(|error| map_db_error(&error))?;
+        ids.into_iter()
+            .map(|id| {
+                id.strip_prefix(IMAGE_STATE_ID_PREFIX)
+                    .filter(|sandbox_id| !sandbox_id.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        PersistenceError::Database("invalid sandbox image state identity".into())
+                    })
+            })
+            .collect()
+    }
+
     /// Remove private image state when its owning sandbox is reclaimed.
     pub(crate) async fn delete_sandbox_image_state(
         &self,
@@ -518,13 +565,21 @@ WHERE object_type = 'sandbox' AND id = $1 AND resource_version = $4",
 
         let id = state_id(sandbox_id);
         let state_payload = state.encode_to_vec();
+        // Keep the discovery index in the same transaction as the intent and
+        // public lifecycle interlock. Completed receipts remain stored but are
+        // excluded from recovery scans.
+        let state_status = if state.pending.is_some() {
+            "pending"
+        } else {
+            "completed"
+        };
         let affected = match self {
             Self::Sqlite(tx) => sqlx::query(
                 r#"INSERT INTO "objects" (
-    "object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms"
-) VALUES (?1, ?2, NULL, '', ?3, ?4, ?4)
+    "object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "status"
+) VALUES (?1, ?2, NULL, '', ?3, ?4, ?4, ?5)
 ON CONFLICT ("id") DO UPDATE
-SET "payload" = excluded."payload", "updated_at_ms" = excluded."updated_at_ms",
+SET "payload" = excluded."payload", "updated_at_ms" = excluded."updated_at_ms", "status" = excluded."status",
     "resource_version" = "objects"."resource_version" + 1
 WHERE "objects"."object_type" = ?1 AND "objects"."name" IS NULL AND "objects"."workspace" = ''"#,
             )
@@ -532,15 +587,16 @@ WHERE "objects"."object_type" = ?1 AND "objects"."name" IS NULL AND "objects"."w
             .bind(&id)
             .bind(&state_payload)
             .bind(now_ms)
+            .bind(state_status)
             .execute(&mut **tx)
             .await
             .map(|result| result.rows_affected()),
             Self::Postgres(tx) => sqlx::query(
                 "INSERT INTO objects (
-    object_type, id, name, workspace, payload, created_at_ms, updated_at_ms
-) VALUES ($1, $2, NULL, '', $3, $4, $4)
+    object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, status
+) VALUES ($1, $2, NULL, '', $3, $4, $4, $5)
 ON CONFLICT (id) DO UPDATE
-SET payload = EXCLUDED.payload, updated_at_ms = EXCLUDED.updated_at_ms,
+SET payload = EXCLUDED.payload, updated_at_ms = EXCLUDED.updated_at_ms, status = EXCLUDED.status,
     resource_version = objects.resource_version + 1
 WHERE objects.object_type = $1 AND objects.name IS NULL AND objects.workspace = ''",
             )
@@ -548,6 +604,7 @@ WHERE objects.object_type = $1 AND objects.name IS NULL AND objects.workspace = 
             .bind(&id)
             .bind(&state_payload)
             .bind(now_ms)
+            .bind(state_status)
             .execute(&mut **tx)
             .await
             .map(|result| result.rows_affected()),
@@ -926,6 +983,156 @@ mod tests {
         (store, stored)
     }
 
+    async fn assert_pending_update_discovery(store: &Store) {
+        assert!(
+            store
+                .list_pending_sandbox_update_ids(None, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for id in ["d", "b", "e", "a", "c"] {
+            let mut original = sandbox();
+            let metadata = original.metadata.as_mut().unwrap();
+            metadata.id = id.into();
+            metadata.name = id.into();
+            store.put_message(&original).await.unwrap();
+            if id == "e" {
+                continue; // An ordinary sandbox has no update state.
+            }
+            let original = store.get_message::<Sandbox>(id).await.unwrap().unwrap();
+            // Rejected acceptance must not add a discovery entry.
+            assert!(
+                store
+                    .begin_sandbox_image_update(id, resource_version(&original) + 1, 0, &intent())
+                    .await
+                    .is_err()
+            );
+            store
+                .begin_sandbox_image_update(id, resource_version(&original), 0, &intent())
+                .await
+                .unwrap();
+        }
+        let completed = store
+            .complete_sandbox_image_update("c", &intent())
+            .await
+            .unwrap();
+        let receipt = store.get_sandbox_image_state("c").await.unwrap().unwrap();
+        assert_eq!(receipt.completed, Some(intent()));
+
+        let first = store
+            .list_pending_sandbox_update_ids(None, 2)
+            .await
+            .unwrap();
+        assert_eq!(first, ["a", "b"]);
+        // Removing the first page must not shift the next page past any work.
+        store
+            .complete_sandbox_image_update("a", &intent())
+            .await
+            .unwrap();
+        store.delete_sandbox_image_state("b").await.unwrap();
+        assert_eq!(
+            store
+                .list_pending_sandbox_update_ids(first.last().map(String::as_str), 2)
+                .await
+                .unwrap(),
+            ["d"]
+        );
+        assert!(
+            store
+                .list_pending_sandbox_update_ids(Some("d"), 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let next = StoredSandboxImageUpdate {
+            operation_id: "next-operation".into(),
+            previous_image: "new-image".into(),
+            image: "newer-image".into(),
+            revision: 2,
+            ..Default::default()
+        };
+        store
+            .begin_sandbox_image_update("c", resource_version(&completed), 1, &next)
+            .await
+            .unwrap();
+        // A stale completion must not remove the newer pending entry.
+        assert!(
+            store
+                .complete_sandbox_image_update("c", &intent())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .list_pending_sandbox_update_ids(None, 2)
+                .await
+                .unwrap(),
+            ["c", "d"]
+        );
+        store.delete_sandbox_image_state("d").await.unwrap();
+        store
+            .complete_sandbox_image_update("c", &next)
+            .await
+            .unwrap();
+        // Idempotent completion leaves the entry absent and the receipt intact.
+        store
+            .complete_sandbox_image_update("c", &next)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_pending_sandbox_update_ids(None, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .get_sandbox_image_state("c")
+                .await
+                .unwrap()
+                .unwrap()
+                .completed,
+            Some(next)
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_pending_update_discovery_tracks_transactions_and_pages() {
+        let store = super::super::test_store().await;
+        assert_pending_update_discovery(&store).await;
+        let Store::Sqlite(sqlite) = &store else {
+            unreachable!()
+        };
+        let plan = sqlx::query_as::<_, (i64, i64, i64, String)>(
+            "EXPLAIN QUERY PLAN SELECT id FROM objects
+WHERE object_type = 'sandbox_image_state' AND status = 'pending' AND id > ?1
+ORDER BY id LIMIT ?2",
+        )
+        .bind("")
+        .bind(2_i64)
+        .fetch_all(&sqlite.pool)
+        .await
+        .unwrap();
+        assert!(
+            plan.iter()
+                .any(|row| row.3.contains("sandbox_pending_updates_idx")),
+            "{plan:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run mise run test:rust:postgres"]
+    async fn postgres_pending_update_discovery_tracks_transactions_and_pages() {
+        let schema = super::super::test_postgres::TestSchema::create("pending_updates").await;
+        let store = schema.connect_store().await;
+        assert_pending_update_discovery(&store).await;
+        store.close().await;
+        schema.drop_schema().await;
+    }
+
     #[test]
     fn legacy_image_intent_decodes_without_configuration_selections() {
         let decoded =
@@ -1277,6 +1484,13 @@ BEGIN SELECT RAISE(ABORT, 'injected image state write failure'); END",
                 .unwrap()
                 .is_none()
         );
+        assert!(
+            store
+                .list_pending_sandbox_update_ids(None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         sqlx::query("DROP TRIGGER fail_image_insert")
             .execute(&sqlite.pool)
             .await
@@ -1311,6 +1525,13 @@ BEGIN SELECT RAISE(ABORT, 'injected image state write failure'); END",
         assert_eq!(
             store.get_sandbox_image_state("sandbox-id").await.unwrap(),
             pending
+        );
+        assert_eq!(
+            store
+                .list_pending_sandbox_update_ids(None, 10)
+                .await
+                .unwrap(),
+            ["sandbox-id"]
         );
     }
 

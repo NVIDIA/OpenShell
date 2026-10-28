@@ -13,6 +13,8 @@ use openshell_core::{GetResourceVersion, ObjectId, ObjectName};
 use tonic::{Request, Status};
 use tracing::info;
 
+const UPDATE_RECOVERY_PAGE_SIZE: u32 = 128;
+
 impl ComputeRuntime {
     pub(crate) fn with_sandbox_updates(mut self, enabled: bool) -> Self {
         self.sandbox_updates_enabled = enabled;
@@ -349,31 +351,54 @@ impl ComputeRuntime {
     }
 
     pub(super) async fn recover_pending_sandbox_updates(&self) -> Result<(), String> {
-        use futures::StreamExt as _;
         let Ok(permit) = self.update_recovery_sweep.clone().try_acquire_owned() else {
             return Ok(());
         };
         let ids = self
-            .list_persisted_sandbox_ids("sandbox update recovery")
-            .await?;
+            .store
+            .list_pending_sandbox_update_ids(None, UPDATE_RECOVERY_PAGE_SIZE)
+            .await
+            .map_err(|error| format!("list pending sandbox updates: {error}"))?;
+        if ids.is_empty() {
+            return Ok(());
+        }
         let runtime = self.clone();
         // Recovery must not hold readiness or unrelated reconciliation hostage
         // to a slow remote driver. One bounded sweep per runtime, at most eight
         // operations in flight, with the normal per-sandbox lifecycle gate.
         tokio::spawn(async move {
             let _permit = permit;
+            if let Err(error) = runtime.recover_pending_sandbox_update_pages(ids).await {
+                tracing::warn!(%error, "Sandbox update recovery sweep failed");
+            }
+        });
+        Ok(())
+    }
+
+    async fn recover_pending_sandbox_update_pages(
+        &self,
+        mut ids: Vec<String>,
+    ) -> Result<(), String> {
+        use futures::StreamExt as _;
+        while let Some(after) = ids.last().cloned() {
             futures::stream::iter(ids)
                 .for_each_concurrent(8, |id| {
-                    let runtime = runtime.clone();
-                    async move {
-                        if let Err(error) = runtime.recover_one_sandbox_update(&id).await {
+                    // Each sandbox owns independent locks even though these
+                    // futures are polled concurrently in the same Tokio task.
+                    crate::persistence::lock_order::branch(async move {
+                        if let Err(error) = self.recover_one_sandbox_update(&id).await {
                             tracing::warn!(sandbox_id = %id, %error,
                                 "Sandbox update remains pending; recovery will retry");
                         }
-                    }
+                    })
                 })
                 .await;
-        });
+            ids = self
+                .store
+                .list_pending_sandbox_update_ids(Some(&after), UPDATE_RECOVERY_PAGE_SIZE)
+                .await
+                .map_err(|error| format!("list pending sandbox updates: {error}"))?;
+        }
         Ok(())
     }
 
@@ -559,6 +584,64 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn recovery_drains_multiple_pending_pages_with_updates_disabled() {
+        let (mut runtime, driver, original) = fixture(true).await;
+        runtime.sandbox_updates_enabled = false;
+        let mut expected_ids = Vec::new();
+        for index in 0..129 {
+            let id = format!("pending-{index:03}");
+            let mut sandbox = original.clone();
+            let metadata = sandbox.metadata.as_mut().unwrap();
+            metadata.id.clone_from(&id);
+            metadata.name.clone_from(&id);
+            runtime.store.put_message(&sandbox).await.unwrap();
+            let sandbox = runtime
+                .store
+                .get_message::<Sandbox>(&id)
+                .await
+                .unwrap()
+                .unwrap();
+            runtime
+                .store
+                .begin_sandbox_image_update(
+                    &id,
+                    sandbox.get_resource_version(),
+                    0,
+                    &SandboxImageUpdate {
+                        operation_id: format!("operation-{index}"),
+                        previous_image: "example/workload:old".into(),
+                        image: "example/workload:new".into(),
+                        revision: 1,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            expected_ids.push(id);
+        }
+        runtime.recover_pending_sandbox_updates().await.unwrap();
+        drop(runtime.update_recovery_sweep.acquire().await.unwrap());
+        let mut recovered_ids: Vec<_> = image_calls(&driver)
+            .into_iter()
+            .map(|call| call.sandbox_id)
+            .collect();
+        recovered_ids.sort();
+        assert_eq!(recovered_ids, expected_ids);
+        assert!(
+            runtime
+                .store
+                .list_pending_sandbox_update_ids(None, 128)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // A subsequent empty sweep must not revisit completed updates.
+        runtime.recover_pending_sandbox_updates().await.unwrap();
+        drop(runtime.update_recovery_sweep.acquire().await.unwrap());
+        assert_eq!(image_calls(&driver).len(), expected_ids.len());
     }
 
     #[tokio::test]
