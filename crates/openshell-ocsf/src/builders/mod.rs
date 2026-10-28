@@ -421,29 +421,16 @@ mod tests {
         assert_ne!(uid, "sandbox-abc123");
     }
 
-    #[test]
-    fn test_emitted_device_matches_vendored_schema() {
-        use crate::validation::schema::{
-            load_object_schema, validate_enum_value, validate_required_fields,
-        };
-
-        let device = serde_json::to_value(test_sandbox_context().device()).unwrap();
-        let schema = load_object_schema("device");
-        validate_required_fields(&device, &schema);
-        validate_enum_value(&device, "type_id", &schema);
-    }
-
     /// One event per builder, built with a production-like sandbox context
     /// (container image set), must validate against the vendored 1.8.0 schemas.
     #[test]
     fn every_builder_emits_schema_conformant_events() {
-        use crate::validation::schema::{load_class_schema, validate_required_fields};
-
         let ctx = test_sandbox_context();
         let events = sample_events(&ctx);
         for (class, event) in &events {
             let json = event.to_json().unwrap();
-            validate_required_fields(&json, &load_class_schema(class));
+            openshell_ocsf_validate::validate_event(&json)
+                .unwrap_or_else(|e| panic!("{class}: {e}"));
         }
     }
 

@@ -10331,8 +10331,6 @@ network_policies:
 
     #[test]
     fn accept_errors_include_the_listening_endpoint() {
-        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
-
         let addr = "127.0.0.1:3128".parse().unwrap();
         let error = std::io::Error::other("accept failed");
         for action in [
@@ -10344,7 +10342,7 @@ network_policies:
         ] {
             let event = build_accept_error_event(addr, &error, &action);
             let json = event.to_json().unwrap();
-            validate_required_fields(&json, &load_class_schema("network_activity"));
+            openshell_ocsf_validate::validate_event(&json).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(json["dst_endpoint"]["ip"], "127.0.0.1");
             assert_eq!(json["dst_endpoint"]["port"], 3128);
             assert!(json["message"].as_str().unwrap().contains("accept failed"));
@@ -10353,23 +10351,18 @@ network_policies:
 
     #[test]
     fn connection_errors_include_the_known_peer() {
-        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
-
         let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
-        let schema = load_class_schema("network_activity");
         let json = build_connection_error_event(peer, "Proxy connection error".to_string())
             .to_json()
             .unwrap();
         assert_eq!(json["class_uid"], 4001);
         assert_eq!(json["src_endpoint"]["ip"], "127.0.0.1");
         assert_eq!(json["src_endpoint"]["port"], 54321);
-        validate_required_fields(&json, &schema);
+        openshell_ocsf_validate::validate_event(&json).unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[test]
     fn forward_parse_errors_include_http_context_and_peer() {
-        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
-
         let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
         let json =
             build_forward_parse_error_ocsf_event(Some(peer), "GET", "/[INVALID_REQUEST_TARGET]")
@@ -10383,7 +10376,7 @@ network_policies:
         assert_eq!(json["http_response"]["code"], 400);
         assert_eq!(json["src_endpoint"]["ip"], "127.0.0.1");
         assert_eq!(json["src_endpoint"]["port"], 54321);
-        validate_required_fields(&json, &load_class_schema("http_activity"));
+        openshell_ocsf_validate::validate_event(&json).unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[test]
@@ -13558,8 +13551,6 @@ network_policies:
 
     #[test]
     fn unsupported_forward_scheme_event_omits_request_url() {
-        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
-
         let event =
             build_forward_unsupported_scheme_ocsf_event("GET", "https", "api.example.com", 443);
         let json = event.to_json().unwrap();
@@ -13567,13 +13558,11 @@ network_policies:
         assert_eq!(json["http_request"]["http_method"], "GET");
         assert!(json["http_request"].get("url").is_none());
         assert_eq!(json["http_response"]["code"], 400);
-        validate_required_fields(&json, &load_class_schema("http_activity"));
+        openshell_ocsf_validate::validate_event(&json).unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[test]
     fn credential_endpoint_mismatch_event_includes_method_and_response() {
-        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
-
         let event =
             build_credential_endpoint_mismatch_event("POST", "api.example.com", 443, "bound");
         let json = event.to_json().unwrap();
@@ -13583,7 +13572,7 @@ network_policies:
         assert_eq!(json["http_request"]["http_method"], "POST");
         assert!(json["http_request"].get("url").is_none());
         assert_eq!(json["http_response"]["code"], 403);
-        validate_required_fields(&json, &load_class_schema("http_activity"));
+        openshell_ocsf_validate::validate_event(&json).unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[test]

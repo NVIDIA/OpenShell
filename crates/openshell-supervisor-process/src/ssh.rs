@@ -1566,8 +1566,6 @@ mod tests {
 
     #[test]
     fn ssh_events_name_their_own_server_socket_and_conform_to_ocsf() {
-        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
-
         // A shared supervisor runs one SSH server per sandbox; each server's
         // events must name its own socket.
         for socket in ["/run/openshell/a/ssh.sock", "/run/openshell/b/ssh.sock"] {
@@ -1582,7 +1580,7 @@ mod tests {
                 json["dst_endpoint"],
                 serde_json::json!({"name": socket, "svc_name": "ssh"})
             );
-            validate_required_fields(&json, &load_class_schema("ssh_activity"));
+            openshell_ocsf_validate::validate_event(&json).unwrap_or_else(|e| panic!("{e}"));
         }
     }
 

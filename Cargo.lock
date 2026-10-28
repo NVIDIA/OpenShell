@@ -4941,6 +4941,7 @@ name = "openshell-ocsf"
 version = "0.0.0"
 dependencies = [
  "chrono",
+ "openshell-ocsf-validate",
  "serde",
  "serde_json",
  "serde_repr",
@@ -5215,6 +5216,7 @@ dependencies = [
  "openshell-extension-core",
  "openshell-gateway-interceptors",
  "openshell-ocsf",
+ "openshell-ocsf-validate",
  "openshell-otel",
  "openshell-otel-test-support",
  "openshell-policy",
@@ -5400,6 +5402,7 @@ dependencies = [
  "openshell-driver-vm",
  "openshell-isolation-interface",
  "openshell-ocsf",
+ "openshell-ocsf-validate",
  "openshell-otel",
  "openshell-policy",
  "openshell-policy-schema",
@@ -5449,6 +5452,7 @@ dependencies = [
  "openshell-core",
  "openshell-isolation-interface",
  "openshell-ocsf",
+ "openshell-ocsf-validate",
  "openshell-sandbox-backend",
  "rand 0.10.2",
  "russh",
