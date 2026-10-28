@@ -98,7 +98,6 @@ PORTFORWARD_LOG="${WORKDIR}/portforward.log"
 PORTFORWARD_HEALTH_PID=""
 PORTFORWARD_HEALTH_LOG="${WORKDIR}/portforward-health.log"
 HELM_INSTALLED=0
-WORKSPACE_HELM_INSTALLED=0
 EXTERNAL_PG_FIXTURE_DEPLOYED=0
 EXTERNAL_PG_FIXTURE_SECRET=""
 EXTERNAL_PG_FIXTURE_MANIFEST="${ROOT}/e2e/kubernetes/postgres-fixture.yaml"
@@ -582,10 +581,6 @@ cleanup() {
       cat "${PORTFORWARD_HEALTH_LOG}" || true
       echo "=== end health port-forward log ==="
     fi
-  fi
-
-  if [ "${WORKSPACE_HELM_INSTALLED}" = "1" ]; then
-    helmctl uninstall "${RELEASE_NAME}-workspace" --namespace "${NAMESPACE}" || true
   fi
 
   if [ "${EXTERNAL_PG_FIXTURE_DEPLOYED}" = "1" ] \
@@ -1535,15 +1530,6 @@ else
   # --- Single-install mode (default, existing behavior) ---
   if [ -n "${OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET:-}" ]; then
     deploy_postgres_fixture "${OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET}"
-  fi
-
-  if [ "${OPENSHELL_E2E_KUBE_SPLIT_WORKSPACE:-0}" = "1" ]; then
-    helmctl install "${RELEASE_NAME}-workspace" "${ROOT}/deploy/helm/openshell-workspace" \
-      --namespace "${NAMESPACE}" --create-namespace \
-      --set "gateway.serviceAccount.namespace=${NAMESPACE}" \
-      --wait --timeout 2m
-    WORKSPACE_HELM_INSTALLED=1
-    helm_extra_args+=(--set workspaceResources.enabled=false)
   fi
 
   echo "Installing Helm chart (release=${RELEASE_NAME}, namespace=${NAMESPACE}, tag=${IMAGE_TAG_VALUE})..."

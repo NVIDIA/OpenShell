@@ -255,8 +255,8 @@ run = [
 ]
 
 ["e2e:kubernetes:updates"]
-description = "Validate sandbox updates with split workspace RBAC on both Agent Sandbox APIs"
-env = { OPENSHELL_E2E_KUBE_TEST = "kubernetes_image_update", OPENSHELL_E2E_KUBE_SPLIT_WORKSPACE = "1" }
+description = "Validate sandbox updates with the combined Helm chart on both Agent Sandbox APIs"
+env = { OPENSHELL_E2E_KUBE_TEST = "kubernetes_image_update" }
 run = [
   "e2e/rust/e2e-kubernetes.sh",
   "AGENT_SANDBOX_VERSION=v0.4.6 e2e/rust/e2e-kubernetes.sh",

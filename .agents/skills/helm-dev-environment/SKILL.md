@@ -638,8 +638,8 @@ for dependencies still declared in `Chart.yaml`.
 ## Sandbox update regression lane
 
 Run `mise run e2e:kubernetes:updates` for the testkit update suite against both
-supported Agent Sandbox APIs with `workspaceResources.enabled=false` and the
-separate workspace chart. It verifies stopped-only updates, retained CR/PVC
+supported Agent Sandbox APIs with the combined Helm chart and its bundled
+workspace resources. It verifies stopped-only updates, retained CR/PVC
 identity and contents, command/environment changes, and request replay.
 `OPENSHELL_E2E_UPDATE_ORIGINAL_IMAGE` and `OPENSHELL_E2E_UPDATE_TARGET_IMAGE` can
 select mirrored Alpine 3.21 and 3.22 manifests. Defaults use the public registry
