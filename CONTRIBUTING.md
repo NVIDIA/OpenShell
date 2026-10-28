@@ -29,7 +29,7 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
    will close automatically.
 5. **Get vouched before opening a PR.** Once vouched, you can submit pull requests.
 
-**If you are not vouched, any pull request you open will be automatically closed.** The PR and its discussion are preserved. Once vouched, open a new PR (preferred) or reopen the closed one. It cannot be held open or converted to a draft to bypass the check. Org members and collaborators with push access bypass this check.
+**If you are not vouched, any pull request you open will be automatically closed.** The PR and its discussion are preserved. Once vouched, open a new PR (preferred) or reopen the closed one. It cannot be held open or converted to a draft to bypass the check. Illustrative drafts never bypass the vouch requirement. Org members and collaborators with push access bypass this check.
 
 ### Finding Work
 
@@ -64,7 +64,22 @@ The project includes optional [agent skills](#agent-skills) for using OpenShell 
 
 ## Before You Submit a Change
 
-Do not start substantial issue-backed work until a maintainer has accepted the issue, unless a maintainer directly asks you to investigate or implement it. Once the work is authorized, use your agent to investigate the current code and behavior. If the issue contains earlier diagnostics, verify them rather than relying on them.
+Do not start substantial issue-backed work until a maintainer has accepted the issue, unless a maintainer directly asks you to investigate or implement it. If you want to demonstrate a small proposed approach before work is accepted, see [Illustrative Drafts for Unaccepted Work](#illustrative-drafts-for-unaccepted-work). Once the work is authorized, use your agent to investigate the current code and behavior. If the issue contains earlier diagnostics, verify them rather than relying on them.
+
+### Illustrative Drafts for Unaccepted Work
+
+Contributors may open a draft pull request before an issue is accepted solely to illustrate a proposed approach or explore architectural tradeoffs while discussion is underway.
+
+- **Purpose**: A technical illustration demonstrates an interface, algorithm, or pattern to inform discussion on an unaccepted issue. It is an exploratory sketch, not an early implementation or commitment to merge.
+- **Scope Limits**: An illustrative draft must remain focused on a single component or system boundary. It should be small enough to be readable in minutes, outlining types, traits, or minimal prototypes without expansive implementations. Drafts must never modify enforcement machinery, workflows (`.github/`), CODEOWNERS, or security policies. Substantial implementations must wait for work acceptance. Any specific numeric line-count threshold remains subject to maintainer agreement on the issue.
+- **Required Context**:
+  - Title must follow the standard Conventional Commits format (`<type>(<scope>): <description>`).
+  - Reference the issue with a non-closing link (`Refs #NNN` or `Illustrating #NNN`), not `Closes #NNN` or `Fixes #NNN`.
+  - Include an explicit disclaimer in the PR body: *"This is an unaccepted illustrative draft for discussion on issue #NNN. It carries no maintainer review commitment and is not intended for merge until accepted."*
+- **Review Expectations**: An illustrative draft does not obligate maintainers to review or merge the code. Maintainers may review it speculatively if time permits, or ask the author to step back to discussion or provide a smaller illustration. Do not request reviews from maintainers on illustrative drafts.
+- **Examples**:
+  - *Useful small illustration*: Defining a new trait interface in `crates/openshell-isolation-interface/` and a minimal stub method in a consumer crate to demonstrate an RPC call boundary (~40 lines).
+  - *Too large or broad*: Implementing a complete third-party compute driver, adding multiple crates, or refactoring core shared runtime abstractions across the repository (~2,500 lines) prior to issue acceptance.
 
 Use agents and the repository skills as needed to understand the affected code, evaluate tradeoffs, implement the smallest coherent change, and verify it. The pull request should explain what changed and how it was tested; it should not substitute an agent transcript for the contributor's understanding.
 
@@ -446,9 +461,9 @@ For release notes, describe the user-facing change in a few short, easy-to-read 
 
 Every PR must close an existing issue, except automated dependency updates and the build and flaky-test fixes described below. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
 
-Authors without write access to the target repository must link at least one issue with `state:accepted`, and every linked issue must be accepted. This applies to drafts and direct requests to agents. Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may create a PR without the acceptance label; they must still follow the issue-linking requirement above. PR body text, roadmap placement, other labels, and vouch status do not bypass acceptance.
+Authors without write access to the target repository must link at least one issue with `state:accepted`, and every linked issue must be accepted before a pull request can be marked ready for review. Draft pull requests are exempt from the issue acceptance check while in draft to allow [illustrative drafts](#illustrative-drafts-for-unaccepted-work); opening a draft never implies work acceptance, and the full acceptance gate applies when the PR is marked ready for review. Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may create a PR without the acceptance label; they must still follow the issue-linking requirement above. PR body text, roadmap placement, other labels, and vouch status do not bypass acceptance when a pull request is ready for review.
 
-The `PR Issue Acceptance` workflow reports the native `OpenShell / PR Issue Acceptance` job result for the triggering PR when it is opened, edited, reopened, or updated with new commits. It does not publish a shared commit status; lookup and execution errors fail the job. Link accepted issues in this repository using `Fixes #NNN` or `Closes #NNN`; GitHub recognizes closing references when a PR targets the default branch. Rerun the workflow after issue labels change. Making the job required for merging and configuring any required Actions event policy are separate repository settings; merge-queue support is not included.
+The `PR Issue Acceptance` workflow reports the native `OpenShell / PR Issue Acceptance` job result for the triggering PR when it is opened, edited, reopened, marked ready for review, or updated with new commits. It does not publish a shared commit status; lookup and execution errors fail the job. Link accepted issues in this repository using `Fixes #NNN` or `Closes #NNN`; GitHub recognizes closing references when a PR targets the default branch. Rerun the workflow after issue labels change. Making the job required for merging and configuring any required Actions event policy are separate repository settings; merge-queue support is not included.
 
 Automated dependency update PRs, including Dependabot PRs, are exempt from the separate issue and closing-reference requirement. Human-authored dependency updates follow the normal issue requirement. The exception does not bypass `PR Issue Acceptance` for authors without repository write access or change applicable verification, review, or private vulnerability disclosure requirements.
 

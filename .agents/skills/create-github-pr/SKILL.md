@@ -19,23 +19,20 @@ Create pull requests on GitHub using the `gh` CLI.
 
 ### Verify Contributor Access and Issue Acceptance
 
-Before pushing or creating a PR (including a draft), verify the author's access
-to the target repository, not their fork. For the authenticated `gh` user:
+Before pushing or creating a PR, verify the author's access to the target repository, not their fork. For the authenticated `gh` user:
 
 ```bash
 gh repo view OWNER/REPO --json nameWithOwner,viewerPermission
 gh issue view ISSUE_NUMBER --repo OWNER/REPO --json number,url,labels
 ```
 
-Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may proceed without
-`state:accepted`; keep the issue link and note the missing label. Everyone else
-must link at least one target-repository issue and have `state:accepted` on each.
-Otherwise, preserve local work and report which issue needs acceptance. A direct
-request, roadmap placement, other labels, or vouch status does not bypass this gate.
+Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may proceed without `state:accepted`; keep the issue link and note the missing label.
 
-When acting for another author, verify their permissions. Resolve failed lookups
-before proceeding; retry sandbox network failures outside the sandbox before
-reporting an authentication problem. Vouch requirements still apply separately.
+For contributors without write access:
+- **Ready-for-review PRs**: Must link at least one target-repository issue and have `state:accepted` on each. Otherwise, preserve local work and report which issue needs acceptance. A direct request, roadmap placement, other labels, or vouch status does not bypass this gate.
+- **Illustrative Draft PRs**: If creating a draft for an unaccepted issue under the policy in `CONTRIBUTING.md#illustrative-drafts-for-unaccepted-work`, you may create the PR with `--draft`. The PR must use a non-closing reference (`Refs #NNN`), include the required illustrative disclaimer in the body, and must never be marked ready for review until the issue is accepted. Unvouched contributors must still complete the vouch process first.
+
+When acting for another author, verify their permissions. Resolve failed lookups before proceeding; retry sandbox network failures outside the sandbox before reporting an authentication problem. Vouch requirements still apply separately.
 
 ### Check Config Documentation
 

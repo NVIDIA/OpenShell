@@ -55,11 +55,14 @@ gh api repos/OWNER/REPO/collaborators/AUTHOR/permission --jq .permission
 
 Call out each linked issue missing `state:accepted`, with an issue link. Verified
 `write`, `maintain`, or `admin` access permits the exception; report it as context,
-not a blocking concern. Other authors need at least one target-repository issue,
-and every linked issue must be accepted; report violations under **Potential
-Concerns**. PR body text such as `No issue required` does not bypass this gate.
-Report failed lookups as unverified and continue the code review. For a branch
-without a PR, note that issue acceptance was not verified.
+not a blocking concern. For ready-for-review PRs from other authors, at least one
+target-repository issue must be linked and every linked issue must be accepted;
+report violations under **Potential Concerns**. Draft PRs are exempt while in draft
+per [CONTRIBUTING.md](../../../CONTRIBUTING.md#illustrative-drafts-for-unaccepted-work),
+but note that acceptance is required before ready-for-review or merge. PR body text
+such as `No issue required` does not bypass this gate. Report failed lookups as
+unverified and continue the code review. For a branch without a PR, note that issue
+acceptance was not verified.
 
 ## Step 3: Generate the Diff
 

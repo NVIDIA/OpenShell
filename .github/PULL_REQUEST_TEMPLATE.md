@@ -2,7 +2,7 @@
 <!-- 1-3 sentences: what this PR does and why -->
 
 ## Related Issue
-<!-- Every PR must close an existing issue covering its scope, except automated dependency updates and build or flaky-test fixes from authors with write access. Use Closes #NNN; see CONTRIBUTING.md for the exceptions. Authors without repository write access must link at least one issue with state:accepted. PR body text cannot bypass this acceptance check. -->
+<!-- Every PR must close an existing issue covering its scope, except automated dependency updates and build or flaky-test fixes from authors with write access. Use Closes #NNN; see CONTRIBUTING.md for the exceptions. Authors without repository write access must link at least one issue with state:accepted before the PR is marked ready for review. Illustrative drafts for unaccepted work are exempt while in draft (use Refs #NNN). PR body text cannot bypass this acceptance check. -->
 
 ## Changes
 <!-- Bullet list of key changes -->
