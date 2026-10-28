@@ -76,6 +76,12 @@ too. A rule with an empty `binaries` list matches no binary and allows nothing.
 OpenShell records a hash of each executable the first time it takes part in a
 connection, and denies later connections if the file at that path changes.
 
+On Windows, ordinary executable paths treat `/` and `\` as equivalent. ASCII
+case differences match only when Windows confirms that every parent directory
+of the runtime executable uses case-insensitive lookup. Otherwise, use exact
+case. UNC, device, and verbatim namespace paths retain their exact spelling and
+separators. These comparisons do not change the path used for executable hashing.
+
 ### Connection and Request Checks
 
 OpenShell checks network traffic in two stages:

@@ -331,7 +331,11 @@ fn pc_proxy_scopes_network_policy_to_socket_owner() {
     let wxc = wxc_path().expect("real MXC socket-owner qualification requires wxc-exec");
     probe_processcontainer(&wxc).expect("native ProcessContainer must be live");
     probe_processcontainer_host_loopback(&wxc).expect("native governed loopback must be available");
-    for scenario in ["socket-owner-allow", "socket-owner-deny"] {
+    for scenario in [
+        "socket-owner-allow",
+        "socket-owner-normalized",
+        "socket-owner-deny",
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let target = if cfg!(target_arch = "aarch64") {

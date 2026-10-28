@@ -3364,11 +3364,12 @@ fn admitted_token_grant_owners_once(
     if engine.is_stale() {
         return Err(miette!("policy changed before token grant selection"));
     }
+    let input = l7_request_policy_input(engine, ctx, request);
     let mut engine = engine
         .engine()
         .lock()
         .map_err(|_| miette!("OPA engine lock poisoned"))?;
-    crate::opa::set_regorus_input(&mut engine, l7_request_policy_input(ctx, request))?;
+    crate::opa::set_regorus_input(&mut engine, input)?;
     let owners = engine
         .eval_rule("data.openshell.sandbox.allowed_token_grant_owners".into())
         .map_err(|error| miette!("{error}"))?;
@@ -3384,13 +3385,18 @@ fn admitted_token_grant_owners_once(
         .collect()
 }
 
-fn l7_request_policy_input(ctx: &L7EvalContext, request: &L7RequestInfo) -> serde_json::Value {
+fn l7_request_policy_input(
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+    request: &L7RequestInfo,
+) -> serde_json::Value {
     serde_json::json!({
         "network": { "host": ctx.host, "port": ctx.port },
         "exec": {
             "path": ctx.binary_path,
             "ancestors": ctx.ancestors,
             "cmdline_paths": ctx.cmdline_paths,
+            "match_paths": engine.binary_match_paths(),
         },
         "request": {
             "method": request.action,
@@ -3415,7 +3421,7 @@ fn evaluate_l7_request_once(
         ));
     }
 
-    let input = l7_request_policy_input(ctx, request);
+    let input = l7_request_policy_input(engine, ctx, request);
 
     let mut engine = engine
         .engine()

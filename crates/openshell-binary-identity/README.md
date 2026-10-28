@@ -18,3 +18,10 @@ The crate does not intercept connections, authenticate remote observers, or
 evaluate policy. The isolation backend remains responsible for binding the
 resolved identity to the active boundary and exact accepted connection before
 constructing `PendingTcpOpen`.
+
+On Windows, the crate also exposes a safe query for the case-sensitivity of
+every parent directory of a trusted runtime executable path. Network policy
+matching may fold ASCII case only when all of those directories confirm
+case-insensitive lookup. Namespace paths and failed queries retain exact case
+matching. The query never receives policy-authored paths, and matching does not
+change the original path used for executable hashing.
