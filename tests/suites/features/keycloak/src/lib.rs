@@ -51,7 +51,11 @@ pub const CLIENT_ID_ENV: &str = "OPENSHELL_TEST_KEYCLOAK_CLIENT_ID";
 pub const USERNAME_ENV: &str = "OPENSHELL_TEST_KEYCLOAK_USERNAME";
 pub const PASSWORD_ENV: &str = "OPENSHELL_TEST_KEYCLOAK_PASSWORD";
 /// How long Keycloak has to start answering, e.g. after the environment boots.
-pub const READY_TIMEOUT: Duration = Duration::from_mins(3);
+// The wait runs inside the test, so it must leave room for the test body
+// within the runner's 2-minute per-test budget (`slow-timeout` in
+// tests/runner/src/bundle.rs). Otherwise a slow Keycloak gets the test killed
+// instead of failing with a readiness error.
+pub const READY_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// How to reach the environment's Keycloak realm, and a user in it.
 #[derive(Clone)]
