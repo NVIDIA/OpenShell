@@ -5,10 +5,12 @@ package v1
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -81,6 +83,11 @@ func (s *mockTCPServer) ForwardTcp(stream grpc.BidiStreamingServer[pb.TcpForward
 
 func setupTCPTest(t *testing.T, mock *mockTCPServer) (*tcpClient, func()) {
 	t.Helper()
+	return setupTCPTestWithResolver(t, mock, &stubSandboxResolver{})
+}
+
+func setupTCPTestWithResolver(t *testing.T, mock *mockTCPServer, resolver SandboxInterface) (*tcpClient, func()) {
+	t.Helper()
 	lis := bufconn.Listen(bufSize)
 	srv := grpc.NewServer()
 	pb.RegisterOpenShellServer(srv, mock)
@@ -94,7 +101,7 @@ func setupTCPTest(t *testing.T, mock *mockTCPServer) (*tcpClient, func()) {
 	)
 	require.NoError(t, err)
 
-	return newTCPClient(conn, &stubSandboxResolver{}, nil), func() {
+	return newTCPClient(conn, resolver, nil), func() {
 		_ = conn.Close()
 		srv.Stop()
 	}
@@ -1155,4 +1162,106 @@ func TestTCPListen_TunnelFailureWithContextCancel(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return ln.Close() == nil
 	}, 5*time.Second, 10*time.Millisecond)
+}
+
+// gatedResolver lets a test control how long tunnel setup (Get) takes.
+type gatedResolver struct {
+	stubSandboxResolver
+	gate func(ctx context.Context) error
+}
+
+func (r *gatedResolver) Get(ctx context.Context, workspace, name string) (*Sandbox, error) {
+	if err := r.gate(ctx); err != nil {
+		return nil, err
+	}
+	return r.stubSandboxResolver.Get(ctx, workspace, name)
+}
+
+func echoOnce(addr, msg string) error {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		return err
+	}
+	buf := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return err
+	}
+	if string(buf) != msg {
+		return fmt.Errorf("expected %q, got %q", msg, buf)
+	}
+	return nil
+}
+
+func TestTCPListen_ConcurrentTunnelSetup(t *testing.T) {
+	const numConns = 4
+	var arrived atomic.Int32
+	allArrived := make(chan struct{})
+
+	// Each setup waits for all the others, which only completes when the
+	// accept loop does not serialize tunnel setup.
+	resolver := &gatedResolver{gate: func(ctx context.Context) error {
+		if arrived.Add(1) == numConns {
+			close(allArrived)
+		}
+		select {
+		case <-allArrived:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+			return errors.New("tunnel setup was serialized")
+		}
+	}}
+	client, cleanup := setupTCPTestWithResolver(t, newMockTCPServer(), resolver)
+	defer cleanup()
+
+	ln, err := client.Listen(context.Background(), "default", "my-sandbox", 8080, 0)
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
+
+	errCh := make(chan error, numConns)
+	for i := range numConns {
+		go func() { errCh <- echoOnce(ln.Addr().String(), fmt.Sprintf("msg-%d", i)) }()
+	}
+	for range numConns {
+		require.NoError(t, <-errCh)
+	}
+}
+
+func TestTCPListen_HungSetupDoesNotBlockOthers(t *testing.T) {
+	var calls atomic.Int32
+	resolver := &gatedResolver{gate: func(ctx context.Context) error {
+		if calls.Add(1) == 1 {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	}}
+	client, cleanup := setupTCPTestWithResolver(t, newMockTCPServer(), resolver)
+	defer cleanup()
+
+	ln, err := client.Listen(context.Background(), "default", "my-sandbox", 8080, 0)
+	require.NoError(t, err)
+
+	hung, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = hung.Close() }()
+	require.Eventually(t, func() bool { return calls.Load() == 1 }, 5*time.Second, 5*time.Millisecond)
+
+	require.NoError(t, echoOnce(ln.Addr().String(), "second"))
+
+	// Close cancels the hung setup instead of waiting on it.
+	closed := make(chan error, 1)
+	go func() { closed <- ln.Close() }()
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return while a tunnel setup was hung")
+	}
 }
