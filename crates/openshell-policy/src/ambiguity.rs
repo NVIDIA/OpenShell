@@ -54,8 +54,9 @@ struct EndpointRef<'a> {
 ///
 /// Request authorization rules (`access`, `rules`, and `deny_rules`) may be
 /// contributed by multiple compatible endpoints. Metadata used to establish
-/// or parse a connection must agree whenever the endpoint host, port, and (for
-/// request-specific metadata) path selectors can match the same request.
+/// or parse a connection must agree whenever equally specific endpoint host,
+/// port, and (for request-specific metadata) path selectors can match the
+/// same request.
 #[must_use]
 pub fn find_endpoint_ambiguities(policy: &SandboxPolicy) -> Vec<EndpointAmbiguity> {
     let endpoints = policy
@@ -86,6 +87,8 @@ pub fn find_endpoint_ambiguities(policy: &SandboxPolicy) -> Vec<EndpointAmbiguit
             let overlapping_ports = overlapping_ports(left.endpoint, right.endpoint);
             if overlapping_ports.is_empty()
                 || !host_patterns_overlap(&left.endpoint.host, &right.endpoint.host)
+                || host_selector_specificity(&left.endpoint.host)
+                    != host_selector_specificity(&right.endpoint.host)
             {
                 continue;
             }
@@ -401,6 +404,16 @@ fn host_patterns_overlap(left: &str, right: &str) -> bool {
         return true;
     }
     glob_patterns_overlap(&left.to_ascii_lowercase(), &right.to_ascii_lowercase(), '.')
+}
+
+/// Match Rego's `matched_endpoint_config` host rank.
+///
+/// An endpoint that names a host (exactly or by glob) takes precedence over a
+/// hostless `allowed_ips` endpoint for every request both can match, so the
+/// two never compete for connection or request metadata. Endpoints of equal
+/// rank must agree.
+fn host_selector_specificity(host: &str) -> usize {
+    usize::from(!host.is_empty())
 }
 
 fn path_patterns_overlap(left: &str, right: &str) -> bool {
@@ -1052,6 +1065,70 @@ mod tests {
         assert_eq!(
             find_endpoint_ambiguities(&policy_with(left, right)).len(),
             1
+        );
+    }
+
+    fn hostless(port: u32, allowed_ips: &[&str]) -> NetworkEndpoint {
+        NetworkEndpoint {
+            port,
+            allowed_ips: allowed_ips.iter().map(ToString::to_string).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hosted_endpoint_takes_precedence_over_hostless_connection_metadata() {
+        let open_web = hostless(443, &["172.0.0.0/6", "192.0.0.0/2"]);
+        let mut pinned = endpoint("example.com", 443);
+        pinned.allowed_ips = vec!["172.66.147.243".to_string()];
+        pinned.protocol = "rest".to_string();
+        pinned.path = "/v1/**".to_string();
+
+        assert!(
+            find_endpoint_ambiguities(&policy_with(open_web.clone(), pinned.clone())).is_empty()
+        );
+        assert!(find_endpoint_ambiguities(&policy_with(pinned, open_web)).is_empty());
+    }
+
+    #[test]
+    fn plain_and_wildcard_hosts_take_precedence_over_hostless_endpoints() {
+        let open_web = hostless(443, &["0.0.0.0/0"]);
+
+        assert!(
+            find_endpoint_ambiguities(&policy_with(open_web.clone(), endpoint("github.com", 443)))
+                .is_empty()
+        );
+        let mut wildcard = endpoint("*.example.com", 443);
+        wildcard.tls = NetworkTlsMode::Skip as i32;
+        assert!(find_endpoint_ambiguities(&policy_with(open_web, wildcard)).is_empty());
+    }
+
+    #[test]
+    fn hosted_endpoint_takes_precedence_over_hostless_request_metadata() {
+        let mut open_web = hostless(443, &["0.0.0.0/0"]);
+        open_web.protocol = "rest".to_string();
+        let mut provider = endpoint("example.com", 443);
+        provider.protocol = "graphql".to_string();
+        provider.credential_binding = Some(openshell_core::proto::NetworkCredentialBinding {
+            provider: "example".to_string(),
+        });
+
+        assert!(find_endpoint_ambiguities(&policy_with(open_web, provider)).is_empty());
+    }
+
+    #[test]
+    fn hostless_endpoints_must_still_agree_with_each_other() {
+        let ambiguities = find_endpoint_ambiguities(&policy_with(
+            hostless(443, &["10.0.0.0/8"]),
+            hostless(443, &["192.168.0.0/16"]),
+        ));
+
+        assert_eq!(ambiguities.len(), 1);
+        assert!(
+            ambiguities[0]
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.contains("allowed_ips"))
         );
     }
 
