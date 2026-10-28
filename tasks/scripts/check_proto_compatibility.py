@@ -103,7 +103,8 @@ def compare(candidate: str, baseline: str, allows_breaks: bool) -> int:
         if result.returncode == 100 and allows_breaks:
             print(diagnostics.replace("::error ", "::warning "), end="")
             print(
-                "Breaking changes allowed by the version increment; review migration guidance."
+                "Breaking changes allowed by the version policy or an explicit "
+                "maintainer exception; review migration guidance."
             )
             return 0
         print(diagnostics, end="")
@@ -122,6 +123,15 @@ def main() -> int:
     )
     release = ref.removeprefix("refs/tags/") if ref.startswith("refs/tags/") else None
     stable, train, allows_breaks = train_policy(candidate, release)
+    exception_tag = os.environ.get("PROTO_COMPATIBILITY_EXCEPTION_TAG", "")
+    if exception_tag:
+        if release != exception_tag or not _parse_prerelease_tag(exception_tag):
+            raise ValueError("Protobuf exception must match the exact prerelease tag.")
+        reason = os.environ.get("PROTO_COMPATIBILITY_EXCEPTION_REASON", "").strip()
+        if not reason:
+            raise ValueError("Protobuf exception requires a reason.")
+        print(f"Protobuf compatibility exception for {release}: {reason}", flush=True)
+        allows_breaks = True
     baseline = f"refs/tags/{stable}" if release else candidate
     if not release:
         # merge-tree writes only Git objects, leaving HEAD and the worktree

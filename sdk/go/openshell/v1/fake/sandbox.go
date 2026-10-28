@@ -292,6 +292,7 @@ type fakeSandboxClient struct {
 
 var _ v1.SandboxInterface = (*fakeSandboxClient)(nil)
 var _ v1.SandboxTemplateCreateInterface = (*fakeSandboxClient)(nil)
+var _ v1.SandboxSuspendResumeInterface = (*fakeSandboxClient)(nil)
 
 // newFakeSandboxClient creates a new fakeSandboxClient.
 func newFakeSandboxClient(
@@ -524,6 +525,78 @@ func (c *fakeSandboxClient) Start(_ context.Context, workspace, name string) (*t
 	}
 
 	sb.Status.Phase = types.SandboxReady
+	sb.ResourceVersion++
+
+	updated, err := c.store.Update(workspace, sb)
+	if err != nil {
+		return nil, err
+	}
+
+	c.broadcaster.Broadcast(types.Event[*types.Sandbox]{
+		Type:   types.EventModified,
+		Object: copySandbox(updated),
+	}, name)
+
+	return updated, nil
+}
+
+// Suspend transitions a Ready sandbox to the Suspended phase.
+func (c *fakeSandboxClient) Suspend(_ context.Context, workspace, name string) (*types.Sandbox, error) {
+	return c.transitionFrom(workspace, name, types.SandboxSuspended, types.SandboxReady, types.SandboxSuspending, types.SandboxSuspended)
+}
+
+// Resume transitions a Suspended sandbox back to the Ready phase.
+func (c *fakeSandboxClient) Resume(_ context.Context, workspace, name string, _ ...v1.ResumeOptions) (*types.Sandbox, error) {
+	return c.transitionFrom(workspace, name, types.SandboxReady, types.SandboxSuspended)
+}
+
+// WaitSuspended returns the sandbox once it is in the Suspended phase. In the
+// fake implementation Suspend completes synchronously, so any other phase is
+// reported as an error.
+func (c *fakeSandboxClient) WaitSuspended(ctx context.Context, workspace, name string, _ ...v1.WaitOptions) (*types.Sandbox, error) {
+	if c.closedFunc() {
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+	}
+	if err := ctx.Err(); err != nil {
+		code := types.ErrorInternal
+		switch err {
+		case context.DeadlineExceeded:
+			code = types.ErrorDeadlineExceeded
+		case context.Canceled:
+			code = types.ErrorCancelled
+		}
+		return nil, &types.StatusError{Code: code, Message: err.Error(), Cause: err}
+	}
+
+	sb, err := c.store.Get(workspace, name)
+	if err != nil {
+		return nil, err
+	}
+	if sb.Status.Phase != types.SandboxSuspended {
+		return nil, &types.StatusError{Code: types.ErrorInternal, Message: fmt.Sprintf("sandbox %q is %s, not Suspended", name, sb.Status.Phase)}
+	}
+	return sb, nil
+}
+
+// transitionFrom moves a sandbox to target when its current phase is one of
+// allowed, mirroring the gateway's FAILED_PRECONDITION for other phases.
+func (c *fakeSandboxClient) transitionFrom(workspace, name string, target types.SandboxPhase, allowed ...types.SandboxPhase) (*types.Sandbox, error) {
+	if c.closedFunc() {
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+	}
+
+	sb, err := c.store.Get(workspace, name)
+	if err != nil {
+		return nil, err
+	}
+	if !slices.Contains(allowed, sb.Status.Phase) {
+		return nil, &types.StatusError{Code: types.ErrorConflict, Message: fmt.Sprintf("sandbox %q cannot move from %s to %s", name, sb.Status.Phase, target)}
+	}
+	if sb.Status.Phase == target {
+		return sb, nil
+	}
+
+	sb.Status.Phase = target
 	sb.ResourceVersion++
 
 	updated, err := c.store.Update(workspace, sb)

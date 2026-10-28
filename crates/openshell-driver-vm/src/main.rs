@@ -112,6 +112,11 @@ struct Args {
     )]
     otlp_ocsf_schema_version: Option<String>,
 
+    /// OTLP/gRPC collector endpoint that supervisors relay workload traces
+    /// to. Absent keeps the agent trace relay off.
+    #[arg(long, env = "OPENSHELL_OTLP_AGENT_ENDPOINT")]
+    otlp_agent_endpoint: Option<String>,
+
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
 
@@ -141,6 +146,22 @@ struct Args {
     /// Deprecated; client private keys are rejected.
     #[arg(long = "guest-tls-key", env = "OPENSHELL_VM_TLS_KEY")]
     guest_tls_key: Option<PathBuf>,
+
+    /// Gateway-owned normalized destination trust artifact. This hidden option
+    /// is supplied only by the in-process gateway VM factory.
+    #[arg(long, hide = true)]
+    additional_ca_bundle: Option<PathBuf>,
+
+    /// Expected SHA-256 generation of the gateway-owned destination trust
+    /// artifact. Supplied with the path so the child can authenticate its
+    /// one-time startup read without receiving CA bytes on argv or in env.
+    #[arg(long, hide = true)]
+    additional_ca_digest: Option<String>,
+
+    /// Expected certificate count in the gateway-normalized destination trust
+    /// artifact.
+    #[arg(long, hide = true)]
+    additional_ca_certificate_count: Option<usize>,
 
     /// Corporate forward proxy for supervisor TLS egress.
     #[arg(long, env = "OPENSHELL_VM_UPSTREAM_PROXY")]
@@ -264,6 +285,9 @@ struct Args {
     vm_vsock_control_socket: Option<PathBuf>,
 
     #[arg(long, hide = true)]
+    vm_vsock_runtime_initiated: bool,
+
+    #[arg(long, hide = true)]
     vm_mount: Vec<String>,
 }
 
@@ -316,6 +340,7 @@ async fn main() -> Result<()> {
             .grpc_endpoint
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
         supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
+        supervisor_otlp_agent_endpoint: args.otlp_agent_endpoint.clone(),
         supervisor_gateway_name: args.gateway_name.clone(),
         supervisor_ocsf_export: args.otlp_ocsf_endpoint.clone().map(|endpoint| {
             openshell_core::sandbox_env::OcsfOtlpExport {
@@ -335,6 +360,10 @@ async fn main() -> Result<()> {
         guest_tls_ca: args.guest_tls_ca.clone(),
         guest_tls_cert: args.guest_tls_cert.clone(),
         guest_tls_key: args.guest_tls_key.clone(),
+        additional_ca_bundle: args.additional_ca_bundle.clone(),
+        additional_ca_digest: args.additional_ca_digest.clone(),
+        additional_ca_certificate_count: args.additional_ca_certificate_count,
+        additional_ca_snapshot: None,
         upstream_proxy: openshell_core::UpstreamProxyConfig {
             https_proxy: args.upstream_proxy.clone(),
             no_proxy: args.upstream_no_proxy.clone(),
@@ -673,7 +702,7 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
             (Some(guest_port), Some(host_socket)) => Some(VsockPortMap {
                 guest_port,
                 host_socket,
-                host_initiated: true,
+                host_initiated: !args.vm_vsock_runtime_initiated,
             }),
             (None, None) => None,
             _ => {
@@ -822,6 +851,45 @@ mod tests {
         assert!(!args.upstream_proxy_auth_allow_insecure);
         assert!(!args.upstream_proxy_connect_by_hostname);
         assert!(args.upstream_proxy_ca_bundle.is_none());
+    }
+
+    #[test]
+    fn internal_network_trust_options_have_no_environment_aliases() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--additional-ca-bundle",
+            "/var/lib/openshell/network/additional-ca.crt",
+            "--additional-ca-digest",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--additional-ca-certificate-count",
+            "2",
+        ]);
+        assert_eq!(
+            args.additional_ca_bundle.as_deref(),
+            Some(PathBuf::from("/var/lib/openshell/network/additional-ca.crt").as_path())
+        );
+        assert_eq!(
+            args.additional_ca_digest.as_deref(),
+            Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(args.additional_ca_certificate_count, Some(2));
+
+        temp_env::with_vars(
+            [
+                (
+                    "OPENSHELL_VM_ADDITIONAL_CA_BUNDLE",
+                    Some("/tmp/untrusted.crt"),
+                ),
+                ("OPENSHELL_VM_ADDITIONAL_CA_DIGEST", Some("sha256:bad")),
+                ("OPENSHELL_VM_ADDITIONAL_CA_CERTIFICATE_COUNT", Some("999")),
+            ],
+            || {
+                let args = Args::parse_from(["openshell-driver-vm"]);
+                assert!(args.additional_ca_bundle.is_none());
+                assert!(args.additional_ca_digest.is_none());
+                assert!(args.additional_ca_certificate_count.is_none());
+            },
+        );
     }
 
     #[test]

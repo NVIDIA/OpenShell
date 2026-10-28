@@ -26,6 +26,8 @@ pub const BOOTSTRAP_PATH: &str = "/.openshell/channel/sandbox/bootstrap.json";
 pub const RUNTIME_DESCRIPTOR_PATH: &str = "/.openshell/supervisor/runtime-descriptor.json";
 pub const AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json";
 pub const RESTART_METADATA_PATH: &str = "/.openshell/supervisor/restart-metadata.json";
+pub const CONTROL_ROOT: &str = "/.openshell/channel/control";
+const RUNTIME_INITIATED_SOCKET: &str = "/.openshell/channel/control/control.sock";
 const SOCKET_PATH: &str = "/.openshell/channel/sandbox/control.sock";
 
 #[derive(Serialize)]
@@ -53,6 +55,9 @@ impl PodmanOuterFenceEvidence<'_> {
 
 pub fn supervisor_name(id: &str) -> String {
     format!("openshell-supervisor-{id}")
+}
+pub fn control_volume_name(id: &str) -> String {
+    format!("openshell-control-{id}")
 }
 pub fn channel_volume_name(id: &str) -> String {
     format!("openshell-channel-{id}")
@@ -171,6 +176,7 @@ pub fn resolve_identity(
 
 pub struct BootstrapArchives {
     pub channel: Vec<u8>,
+    pub control: Option<Vec<u8>>,
     pub workspace: Vec<u8>,
     pub supervisor: Vec<u8>,
 }
@@ -178,11 +184,14 @@ pub struct BootstrapArchives {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestartMetadata {
     pub(crate) generation: String,
+    #[serde(default)]
+    pub(crate) runtime_initiated: bool,
     pub(crate) workload_identity: ResolvedWorkloadIdentity,
     pub(crate) child_env: HashMap<String, String>,
 }
 
 pub struct BootstrapArchivesInput<'a> {
+    pub runtime_initiated: bool,
     pub sandbox_id: &'a str,
     pub container_id: &'a str,
     pub generation: &'a str,
@@ -199,6 +208,7 @@ pub fn bootstrap_archives(
     input: BootstrapArchivesInput<'_>,
 ) -> Result<BootstrapArchives, ComputeDriverError> {
     let BootstrapArchivesInput {
+        runtime_initiated,
         sandbox_id,
         container_id,
         generation,
@@ -255,12 +265,22 @@ pub fn bootstrap_archives(
         auth_epoch: launch_authentication.supervisor.auth_epoch,
         gateway_id: launch_authentication.gateway_id.clone(),
         verification_keys,
-        listener: BoundaryListener::Unix {
-            socket_path: PathBuf::from(SOCKET_PATH),
-            tls: SandboxTlsServerConfig {
+        listener: {
+            let tls = SandboxTlsServerConfig {
                 certificate_chain_path: PathBuf::from("/.openshell/channel/sandbox/server.crt"),
                 private_key_path: PathBuf::from("/.openshell/channel/sandbox/server.key"),
-            },
+            };
+            if runtime_initiated {
+                BoundaryListener::RuntimeInitiatedUnix {
+                    socket_path: RUNTIME_INITIATED_SOCKET.into(),
+                    tls,
+                }
+            } else {
+                BoundaryListener::Unix {
+                    socket_path: SOCKET_PATH.into(),
+                    tls,
+                }
+            }
         },
         resource_claims: resource_claims.clone(),
         resource_claim_files: BTreeMap::new(),
@@ -272,8 +292,14 @@ pub fn bootstrap_archives(
         boundary_id: sandbox_id.into(),
         generation: runtime_generation,
         session_id,
-        transport: SandboxTransport::Unix {
-            socket_path: PathBuf::from(SOCKET_PATH),
+        transport: if runtime_initiated {
+            SandboxTransport::RuntimeInitiatedUnix {
+                socket_path: RUNTIME_INITIATED_SOCKET.into(),
+            }
+        } else {
+            SandboxTransport::Unix {
+                socket_path: SOCKET_PATH.into(),
+            }
         },
         tls: SandboxTlsClientConfig {
             server_name: tls.server_name,
@@ -311,6 +337,7 @@ pub fn bootstrap_archives(
         &serde_json::to_vec(&launch_authentication.supervisor).map_err(invalid)?,
     )?;
     let restart_metadata = RestartMetadata {
+        runtime_initiated,
         generation: generation.to_string(),
         workload_identity: identity.clone(),
         child_env,
@@ -319,7 +346,18 @@ pub fn bootstrap_archives(
         RESTART_METADATA_PATH,
         &serde_json::to_vec(&restart_metadata).map_err(invalid)?,
     )?;
+    let control = if runtime_initiated {
+        let mut archive = Archive::new(identity);
+        // The containers can use different rootless user-namespace mappings.
+        // Only this socket volume is writable; keys stay in the read-only
+        // bootstrap volume. The sticky bit protects existing socket inodes.
+        archive.directory(".", 0o1777, false)?;
+        Some(archive.finish()?)
+    } else {
+        None
+    };
     Ok(BootstrapArchives {
+        control,
         channel,
         workspace: workspace.finish()?,
         supervisor: supervisor.finish()?,
@@ -510,6 +548,7 @@ mod tests {
         let authentication = authentication();
         let child_env = HashMap::from([("PATH".to_string(), "/agent/bin".to_string())]);
         let archives = bootstrap_archives(BootstrapArchivesInput {
+            runtime_initiated: false,
             sandbox_id: "sandbox",
             container_id: "container",
             generation: "generation-1",

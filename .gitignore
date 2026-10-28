@@ -190,7 +190,7 @@ temp/
 e2e/gpu/images/.build/
 
 # Ansible Galaxy roles
-/tests/ansible/.roles/
+/tests/tmachine/ansible/.roles/
 
 # Secrets/credentials (should never be committed)
 *.pem

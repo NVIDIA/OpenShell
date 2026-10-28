@@ -41,6 +41,8 @@ const (
 	OpenShell_DeleteSandbox_FullMethodName                 = "/openshell.v1.OpenShell/DeleteSandbox"
 	OpenShell_StopSandbox_FullMethodName                   = "/openshell.v1.OpenShell/StopSandbox"
 	OpenShell_StartSandbox_FullMethodName                  = "/openshell.v1.OpenShell/StartSandbox"
+	OpenShell_SuspendSandbox_FullMethodName                = "/openshell.v1.OpenShell/SuspendSandbox"
+	OpenShell_ResumeSandbox_FullMethodName                 = "/openshell.v1.OpenShell/ResumeSandbox"
 	OpenShell_CreateSshSession_FullMethodName              = "/openshell.v1.OpenShell/CreateSshSession"
 	OpenShell_ExposeService_FullMethodName                 = "/openshell.v1.OpenShell/ExposeService"
 	OpenShell_GetService_FullMethodName                    = "/openshell.v1.OpenShell/GetService"
@@ -87,6 +89,7 @@ const (
 	OpenShell_PeerReportProviderReadiness_FullMethodName   = "/openshell.v1.OpenShell/PeerReportProviderReadiness"
 	OpenShell_PeerReportEndpointStatus_FullMethodName      = "/openshell.v1.OpenShell/PeerReportEndpointStatus"
 	OpenShell_PeerGetSandboxProviderStatus_FullMethodName  = "/openshell.v1.OpenShell/PeerGetSandboxProviderStatus"
+	OpenShell_PeerNotifyConfigUpdate_FullMethodName        = "/openshell.v1.OpenShell/PeerNotifyConfigUpdate"
 	OpenShell_WatchSandbox_FullMethodName                  = "/openshell.v1.OpenShell/WatchSandbox"
 	OpenShell_SubmitPolicyAnalysis_FullMethodName          = "/openshell.v1.OpenShell/SubmitPolicyAnalysis"
 	OpenShell_GetDraftPolicy_FullMethodName                = "/openshell.v1.OpenShell/GetDraftPolicy"
@@ -164,6 +167,12 @@ type OpenShellClient interface {
 	StopSandbox(ctx context.Context, in *StopSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
 	// Start a previously stopped sandbox.
 	StartSandbox(ctx context.Context, in *StartSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
+	// Freeze a ready sandbox and retain its memory state for a later resume.
+	// Requires a compute driver and isolation backend that support state
+	// retention.
+	SuspendSandbox(ctx context.Context, in *SuspendSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
+	// Restore a suspended sandbox in a new runtime generation.
+	ResumeSandbox(ctx context.Context, in *ResumeSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
 	// Create a short-lived SSH session for a sandbox.
 	CreateSshSession(ctx context.Context, in *CreateSshSessionRequest, opts ...grpc.CallOption) (*CreateSshSessionResponse, error)
 	// Create or update a sandbox HTTP service endpoint for local routing.
@@ -217,7 +226,9 @@ type OpenShellClient interface {
 	DeleteProvider(ctx context.Context, in *DeleteProviderRequest, opts ...grpc.CallOption) (*DeleteProviderResponse, error)
 	// Delete a custom provider type profile by id.
 	DeleteProviderProfile(ctx context.Context, in *DeleteProviderProfileRequest, opts ...grpc.CallOption) (*DeleteProviderProfileResponse, error)
-	// Get sandbox settings by id (called by sandbox entrypoint and poll loop).
+	// Get sandbox settings by id (called by users, and by supervisors at startup
+	// and in their poll loop). A supervisor whose session pushes configuration
+	// receives later updates over ConnectSupervisor and stops polling.
 	GetSandboxConfig(ctx context.Context, in *sandboxv1.GetSandboxConfigRequest, opts ...grpc.CallOption) (*sandboxv1.GetSandboxConfigResponse, error)
 	// Get gateway-global settings (read-only runtime configuration; any
 	// authenticated user may read these without requiring Platform Admin).
@@ -242,7 +253,9 @@ type OpenShellClient interface {
 	ReportProviderReadiness(ctx context.Context, in *ReportProviderReadinessRequest, opts ...grpc.CallOption) (*ReportProviderReadinessResponse, error)
 	// Register startup and acknowledge an exact validated runtime configuration.
 	ReportSandboxConfiguration(ctx context.Context, in *ReportSandboxConfigurationRequest, opts ...grpc.CallOption) (*ReportSandboxConfigurationResponse, error)
-	// Get provider environment for a sandbox (called by sandbox supervisor at startup).
+	// Get provider environment for a sandbox (called by the sandbox supervisor at
+	// startup and by its poll loop). Polling projection of the provider
+	// environment delivered over ConnectSupervisor; removed with the polling RPCs.
 	GetSandboxProviderEnvironment(ctx context.Context, in *GetSandboxProviderEnvironmentRequest, opts ...grpc.CallOption) (*GetSandboxProviderEnvironmentResponse, error)
 	// Exchange a stored provider subject token for an intermediate token scoped
 	// to the calling supervisor's SPIFFE identity.
@@ -255,9 +268,11 @@ type OpenShellClient interface {
 	//
 	// The supervisor opens this stream at startup and keeps it alive for the
 	// sandbox lifetime. The gateway uses it to coordinate relay channels for
-	// SSH connect, ExecSandbox, and targetable sandbox services. Raw service
-	// bytes flow over RelayStream calls (separate HTTP/2 streams on the same
-	// connection), not over this stream.
+	// SSH connect, ExecSandbox, targetable sandbox services, and configuration
+	// delivery. Supervisors advertise optional stream features in
+	// SupervisorHello, and the gateway sends only payloads the supervisor
+	// advertises. Raw service bytes flow over RelayStream calls (separate HTTP/2
+	// streams on the same connection), not over this stream.
 	ConnectSupervisor(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SupervisorMessage, GatewayMessage], error)
 	// Persist the canonical main process result before the supervisor exits.
 	ReportMainProcessExit(ctx context.Context, in *ReportMainProcessExitRequest, opts ...grpc.CallOption) (*ReportMainProcessExitResponse, error)
@@ -287,6 +302,9 @@ type OpenShellClient interface {
 	PeerReportProviderReadiness(ctx context.Context, in *ReportProviderReadinessRequest, opts ...grpc.CallOption) (*ReportProviderReadinessResponse, error)
 	PeerReportEndpointStatus(ctx context.Context, in *ReportEndpointStatusRequest, opts ...grpc.CallOption) (*ReportEndpointStatusResponse, error)
 	PeerGetSandboxProviderStatus(ctx context.Context, in *GetSandboxProviderStatusRequest, opts ...grpc.CallOption) (*GetSandboxProviderStatusResponse, error)
+	// Best-effort notification to the replica that owns a supervisor session.
+	// The receiver rebuilds snapshots from authoritative state.
+	PeerNotifyConfigUpdate(ctx context.Context, in *PeerNotifyConfigUpdateRequest, opts ...grpc.CallOption) (*PeerNotifyConfigUpdateResponse, error)
 	// Watch a sandbox and stream updates.
 	//
 	// This stream can include:
@@ -523,6 +541,26 @@ func (c *openShellClient) StartSandbox(ctx context.Context, in *StartSandboxRequ
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SandboxResponse)
 	err := c.cc.Invoke(ctx, OpenShell_StartSandbox_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) SuspendSandbox(ctx context.Context, in *SuspendSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SandboxResponse)
+	err := c.cc.Invoke(ctx, OpenShell_SuspendSandbox_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) ResumeSandbox(ctx context.Context, in *ResumeSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SandboxResponse)
+	err := c.cc.Invoke(ctx, OpenShell_ResumeSandbox_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1016,6 +1054,16 @@ func (c *openShellClient) PeerGetSandboxProviderStatus(ctx context.Context, in *
 	return out, nil
 }
 
+func (c *openShellClient) PeerNotifyConfigUpdate(ctx context.Context, in *PeerNotifyConfigUpdateRequest, opts ...grpc.CallOption) (*PeerNotifyConfigUpdateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PeerNotifyConfigUpdateResponse)
+	err := c.cc.Invoke(ctx, OpenShell_PeerNotifyConfigUpdate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *openShellClient) WatchSandbox(ctx context.Context, in *WatchSandboxRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SandboxStreamEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[7], OpenShell_WatchSandbox_FullMethodName, cOpts...)
@@ -1271,6 +1319,12 @@ type OpenShellServer interface {
 	StopSandbox(context.Context, *StopSandboxRequest) (*SandboxResponse, error)
 	// Start a previously stopped sandbox.
 	StartSandbox(context.Context, *StartSandboxRequest) (*SandboxResponse, error)
+	// Freeze a ready sandbox and retain its memory state for a later resume.
+	// Requires a compute driver and isolation backend that support state
+	// retention.
+	SuspendSandbox(context.Context, *SuspendSandboxRequest) (*SandboxResponse, error)
+	// Restore a suspended sandbox in a new runtime generation.
+	ResumeSandbox(context.Context, *ResumeSandboxRequest) (*SandboxResponse, error)
 	// Create a short-lived SSH session for a sandbox.
 	CreateSshSession(context.Context, *CreateSshSessionRequest) (*CreateSshSessionResponse, error)
 	// Create or update a sandbox HTTP service endpoint for local routing.
@@ -1324,7 +1378,9 @@ type OpenShellServer interface {
 	DeleteProvider(context.Context, *DeleteProviderRequest) (*DeleteProviderResponse, error)
 	// Delete a custom provider type profile by id.
 	DeleteProviderProfile(context.Context, *DeleteProviderProfileRequest) (*DeleteProviderProfileResponse, error)
-	// Get sandbox settings by id (called by sandbox entrypoint and poll loop).
+	// Get sandbox settings by id (called by users, and by supervisors at startup
+	// and in their poll loop). A supervisor whose session pushes configuration
+	// receives later updates over ConnectSupervisor and stops polling.
 	GetSandboxConfig(context.Context, *sandboxv1.GetSandboxConfigRequest) (*sandboxv1.GetSandboxConfigResponse, error)
 	// Get gateway-global settings (read-only runtime configuration; any
 	// authenticated user may read these without requiring Platform Admin).
@@ -1349,7 +1405,9 @@ type OpenShellServer interface {
 	ReportProviderReadiness(context.Context, *ReportProviderReadinessRequest) (*ReportProviderReadinessResponse, error)
 	// Register startup and acknowledge an exact validated runtime configuration.
 	ReportSandboxConfiguration(context.Context, *ReportSandboxConfigurationRequest) (*ReportSandboxConfigurationResponse, error)
-	// Get provider environment for a sandbox (called by sandbox supervisor at startup).
+	// Get provider environment for a sandbox (called by the sandbox supervisor at
+	// startup and by its poll loop). Polling projection of the provider
+	// environment delivered over ConnectSupervisor; removed with the polling RPCs.
 	GetSandboxProviderEnvironment(context.Context, *GetSandboxProviderEnvironmentRequest) (*GetSandboxProviderEnvironmentResponse, error)
 	// Exchange a stored provider subject token for an intermediate token scoped
 	// to the calling supervisor's SPIFFE identity.
@@ -1362,9 +1420,11 @@ type OpenShellServer interface {
 	//
 	// The supervisor opens this stream at startup and keeps it alive for the
 	// sandbox lifetime. The gateway uses it to coordinate relay channels for
-	// SSH connect, ExecSandbox, and targetable sandbox services. Raw service
-	// bytes flow over RelayStream calls (separate HTTP/2 streams on the same
-	// connection), not over this stream.
+	// SSH connect, ExecSandbox, targetable sandbox services, and configuration
+	// delivery. Supervisors advertise optional stream features in
+	// SupervisorHello, and the gateway sends only payloads the supervisor
+	// advertises. Raw service bytes flow over RelayStream calls (separate HTTP/2
+	// streams on the same connection), not over this stream.
 	ConnectSupervisor(grpc.BidiStreamingServer[SupervisorMessage, GatewayMessage]) error
 	// Persist the canonical main process result before the supervisor exits.
 	ReportMainProcessExit(context.Context, *ReportMainProcessExitRequest) (*ReportMainProcessExitResponse, error)
@@ -1394,6 +1454,9 @@ type OpenShellServer interface {
 	PeerReportProviderReadiness(context.Context, *ReportProviderReadinessRequest) (*ReportProviderReadinessResponse, error)
 	PeerReportEndpointStatus(context.Context, *ReportEndpointStatusRequest) (*ReportEndpointStatusResponse, error)
 	PeerGetSandboxProviderStatus(context.Context, *GetSandboxProviderStatusRequest) (*GetSandboxProviderStatusResponse, error)
+	// Best-effort notification to the replica that owns a supervisor session.
+	// The receiver rebuilds snapshots from authoritative state.
+	PeerNotifyConfigUpdate(context.Context, *PeerNotifyConfigUpdateRequest) (*PeerNotifyConfigUpdateResponse, error)
 	// Watch a sandbox and stream updates.
 	//
 	// This stream can include:
@@ -1509,6 +1572,12 @@ func (UnimplementedOpenShellServer) StopSandbox(context.Context, *StopSandboxReq
 }
 func (UnimplementedOpenShellServer) StartSandbox(context.Context, *StartSandboxRequest) (*SandboxResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method StartSandbox not implemented")
+}
+func (UnimplementedOpenShellServer) SuspendSandbox(context.Context, *SuspendSandboxRequest) (*SandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SuspendSandbox not implemented")
+}
+func (UnimplementedOpenShellServer) ResumeSandbox(context.Context, *ResumeSandboxRequest) (*SandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResumeSandbox not implemented")
 }
 func (UnimplementedOpenShellServer) CreateSshSession(context.Context, *CreateSshSessionRequest) (*CreateSshSessionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateSshSession not implemented")
@@ -1647,6 +1716,9 @@ func (UnimplementedOpenShellServer) PeerReportEndpointStatus(context.Context, *R
 }
 func (UnimplementedOpenShellServer) PeerGetSandboxProviderStatus(context.Context, *GetSandboxProviderStatusRequest) (*GetSandboxProviderStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PeerGetSandboxProviderStatus not implemented")
+}
+func (UnimplementedOpenShellServer) PeerNotifyConfigUpdate(context.Context, *PeerNotifyConfigUpdateRequest) (*PeerNotifyConfigUpdateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PeerNotifyConfigUpdate not implemented")
 }
 func (UnimplementedOpenShellServer) WatchSandbox(*WatchSandboxRequest, grpc.ServerStreamingServer[SandboxStreamEvent]) error {
 	return status.Error(codes.Unimplemented, "method WatchSandbox not implemented")
@@ -2046,6 +2118,42 @@ func _OpenShell_StartSandbox_Handler(srv interface{}, ctx context.Context, dec f
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OpenShellServer).StartSandbox(ctx, req.(*StartSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_SuspendSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SuspendSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).SuspendSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_SuspendSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).SuspendSandbox(ctx, req.(*SuspendSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_ResumeSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResumeSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).ResumeSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_ResumeSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).ResumeSandbox(ctx, req.(*ResumeSandboxRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2805,6 +2913,24 @@ func _OpenShell_PeerGetSandboxProviderStatus_Handler(srv interface{}, ctx contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_PeerNotifyConfigUpdate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PeerNotifyConfigUpdateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).PeerNotifyConfigUpdate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_PeerNotifyConfigUpdate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).PeerNotifyConfigUpdate(ctx, req.(*PeerNotifyConfigUpdateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _OpenShell_WatchSandbox_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(WatchSandboxRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -3220,6 +3346,14 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _OpenShell_StartSandbox_Handler,
 		},
 		{
+			MethodName: "SuspendSandbox",
+			Handler:    _OpenShell_SuspendSandbox_Handler,
+		},
+		{
+			MethodName: "ResumeSandbox",
+			Handler:    _OpenShell_ResumeSandbox_Handler,
+		},
+		{
 			MethodName: "CreateSshSession",
 			Handler:    _OpenShell_CreateSshSession_Handler,
 		},
@@ -3374,6 +3508,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PeerGetSandboxProviderStatus",
 			Handler:    _OpenShell_PeerGetSandboxProviderStatus_Handler,
+		},
+		{
+			MethodName: "PeerNotifyConfigUpdate",
+			Handler:    _OpenShell_PeerNotifyConfigUpdate_Handler,
 		},
 		{
 			MethodName: "SubmitPolicyAnalysis",

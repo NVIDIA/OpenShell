@@ -180,6 +180,57 @@ pub struct MessagePage<T> {
 
 const FULL_SCAN_PAGE_SIZE: u32 = 1000;
 
+/// One conditional write of a [`Store::write_atomically`] group.
+#[derive(Debug, Clone)]
+pub enum AtomicWrite {
+    /// Insert a new object at resource version 1; the group fails when it
+    /// exists (or its name is taken).
+    Create {
+        object_type: String,
+        id: String,
+        name: String,
+        workspace: String,
+        payload: Vec<u8>,
+    },
+    /// Replace an object's payload at exactly `expected_version`.
+    Update {
+        object_type: String,
+        id: String,
+        payload: Vec<u8>,
+        expected_version: u64,
+    },
+    /// Delete an object at exactly `expected_version`.
+    Delete {
+        object_type: String,
+        id: String,
+        expected_version: u64,
+    },
+}
+
+impl AtomicWrite {
+    fn key(&self) -> (&str, &str) {
+        match self {
+            Self::Create {
+                object_type, id, ..
+            }
+            | Self::Update {
+                object_type, id, ..
+            }
+            | Self::Delete {
+                object_type, id, ..
+            } => (object_type, id),
+        }
+    }
+}
+
+/// The order a group's writes run in: by `(object_type, id)`, so groups that
+/// share rows take their row locks in one order and cannot deadlock.
+fn atomic_write_order(writes: &[AtomicWrite]) -> Vec<usize> {
+    let mut order = (0..writes.len()).collect::<Vec<_>>();
+    order.sort_by(|left, right| writes[*left].key().cmp(&writes[*right].key()));
+    order
+}
+
 /// Write condition for compare-and-swap operations.
 #[derive(Debug, Clone, Copy)]
 pub enum WriteCondition {
@@ -314,6 +365,14 @@ impl Store {
     /// coordination is needed, `false` for multi-replica backends (`Postgres`).
     pub fn is_single_replica(&self) -> bool {
         matches!(self, Self::Sqlite(_))
+    }
+
+    /// Maximum number of pooled database connections for this backend.
+    pub fn max_connections(&self) -> u32 {
+        match self {
+            Self::Postgres(store) => store.max_connections(),
+            Self::Sqlite(store) => store.max_connections(),
+        }
     }
 
     /// Configured size of the `PostgreSQL` mutation lock pool, or `None` on
@@ -570,6 +629,25 @@ impl Store {
         expected_resource_version: u64,
     ) -> PersistenceResult<bool> {
         store_dispatch_traced!(self.delete_if(object_type, id, expected_resource_version))
+    }
+
+    /// Apply conditional writes to several objects all together or not at
+    /// all, in one transaction on one connection. A create whose object or
+    /// name exists fails the group with `UniqueViolation`; an update or delete
+    /// whose object is absent or at another version fails it with `Conflict`
+    /// (with no current version). Returns each write's result in input order,
+    /// `None` for deletes.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.write_atomically", otel.status_code = tracing::field::Empty, writes = writes.len())
+    )]
+    pub async fn write_atomically(
+        &self,
+        writes: &[AtomicWrite],
+    ) -> PersistenceResult<Vec<Option<WriteResult>>> {
+        store_dispatch_traced!(self.write_atomically(writes))
     }
 
     /// Insert or update a generic named object with an application-owned scope.
@@ -1499,6 +1577,14 @@ impl Store {
     pub(crate) async fn close_for_test(&self) {
         match self {
             Self::Sqlite(store) => store.close_for_test().await,
+            Self::Postgres(_) => unreachable!("tests use SQLite"),
+        }
+    }
+
+    /// Runs raw SQL against the test database.
+    pub(crate) async fn execute_for_test(&self, sql: &'static str) {
+        match self {
+            Self::Sqlite(store) => store.execute_for_test(sql).await,
             Self::Postgres(_) => unreachable!("tests use SQLite"),
         }
     }

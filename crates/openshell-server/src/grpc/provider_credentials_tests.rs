@@ -722,7 +722,8 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
         MultiplexService, extract_peer_certificate_sha256, extract_peer_identity,
     };
     use openshell_core::proto::{
-        GetCurrentUserRequest, ListWorkspacesRequest, open_shell_client::OpenShellClient,
+        GetCurrentUserRequest, ListSandboxesRequest, ListWorkspacesRequest,
+        open_shell_client::OpenShellClient,
     };
     use tonic::transport::{ClientTlsConfig, Endpoint};
 
@@ -730,6 +731,7 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
     let config = &mut Arc::get_mut(&mut state).unwrap().config;
     config.mtls_auth.operator_enabled = true;
     config.mtls_auth.enabled = false;
+    config.auth.allow_unauthenticated_users = false;
     let dir = tempfile::tempdir().unwrap();
     let (ca, ca_key) = crate::tls_test_utils::generate_test_certs_with_ca(dir.path());
     let acceptor = crate::TlsAcceptor::from_files(
@@ -747,16 +749,21 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
     let service = MultiplexService::new(state);
     let server = tokio::spawn(async move {
         loop {
-            let (stream, _) = listener.accept().await.unwrap();
+            let (stream, peer) = listener.accept().await.unwrap();
             openshell_core::net::set_tcp_nodelay_best_effort(&stream);
             let acceptor = acceptor.acceptor();
             let service = service.clone();
             tokio::spawn(async move {
                 if let Ok(stream) = acceptor.accept(stream).await {
                     let identity = extract_peer_identity(&stream);
-                    let fingerprint = extract_peer_certificate_sha256(&stream);
+                    let fingerprint = extract_peer_certificate_sha256(&stream).unwrap();
                     let _ = service
-                        .serve_with_verified_certificate(stream, identity, fingerprint)
+                        .serve_with_verified_certificate(
+                            stream,
+                            identity,
+                            fingerprint,
+                            crate::auth::audit::ConnectionSource::Peer(peer),
+                        )
                         .await;
                 }
             });
@@ -780,11 +787,11 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
                 .distinguished_name
                 .push(rcgen::DnType::OrganizationalUnitName, role);
             params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-            let key = rcgen::KeyPair::generate().unwrap();
-            let cert = params.signed_by(&key, &ca, &ca_key).unwrap();
+            let key = openshell_crypto::pki::generate_keypair().unwrap();
+            let cert = openshell_crypto::pki::signed_by(params, &key, &ca, &ca_key).unwrap();
             tls = tls.identity(tonic::transport::Identity::from_pem(
                 cert.pem(),
-                key.serialize_pem(),
+                key.serialize_pem().unwrap(),
             ));
         }
         let channel = Endpoint::from_shared(format!("https://localhost:{}", address.port()))
@@ -795,10 +802,17 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
             .await
             .unwrap();
         let mut client = OpenShellClient::new(channel);
+        let sandboxes = client
+            .list_sandboxes(ListSandboxesRequest {
+                workspace_scope: Some(workspace_selector("default")),
+                ..Default::default()
+            })
+            .await;
         let response = client
             .get_provider_credentials(request(&["STATIC_KEY"]))
             .await;
         if role == Some("operator") {
+            sandboxes.unwrap();
             assert_eq!(
                 response.unwrap().into_inner().credentials["STATIC_KEY"].value,
                 "static-secret"
@@ -841,7 +855,8 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
                 Code::Unauthenticated
             );
         } else {
-            assert_eq!(response.unwrap_err().code(), Code::PermissionDenied);
+            assert_eq!(sandboxes.unwrap_err().code(), Code::Unauthenticated);
+            assert_eq!(response.unwrap_err().code(), Code::Unauthenticated);
             let mut spoof = Request::new(request(&["STATIC_KEY"]));
             spoof
                 .metadata_mut()
@@ -852,7 +867,7 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
                     .await
                     .unwrap_err()
                     .code(),
-                Code::PermissionDenied
+                Code::Unauthenticated
             );
         }
     }

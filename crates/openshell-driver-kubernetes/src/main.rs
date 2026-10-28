@@ -57,6 +57,11 @@ struct Args {
     )]
     otlp_ocsf_schema_version: Option<String>,
 
+    /// OTLP/gRPC collector endpoint that supervisors relay workload traces
+    /// to. Absent keeps the agent trace relay off.
+    #[arg(long, env = "OPENSHELL_OTLP_AGENT_ENDPOINT")]
+    otlp_agent_endpoint: Option<String>,
+
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
 
@@ -260,6 +265,8 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let driver = KubernetesComputeDriver::new(
         KubernetesComputeConfig {
+            supervisor_topology: None,
+            shared_supervisor: None,
             allow_driver_config: args.admission_config_json.allow_driver_config,
             resource_admission: args.admission_config_json.resource_admission.clone(),
             workspace_mode: args.workspace_mode,
@@ -296,6 +303,7 @@ async fn main() -> Result<()> {
             proxy_ca_bundle: args.proxy_ca_bundle,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
             supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
+            supervisor_otlp_agent_endpoint: args.otlp_agent_endpoint.clone(),
             supervisor_gateway_name: args.gateway_name.clone(),
             supervisor_ocsf_export: args.otlp_ocsf_endpoint.clone().map(|endpoint| {
                 openshell_core::sandbox_env::OcsfOtlpExport {
@@ -327,6 +335,7 @@ async fn main() -> Result<()> {
             sandbox_gid: args.sandbox_gid,
         },
         shutdown_rx,
+        None,
     )
     .await
     .into_diagnostic()?;

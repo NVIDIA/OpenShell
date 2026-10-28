@@ -13,7 +13,7 @@
 //! | providers and workspace-scoped profiles | S(global) X(workspace) |
 //! | one sandbox, admin or supervisor | S(global) S(workspace) X(sandbox) |
 //! | lifecycle, driver watch, reconcile (process-local only) | S(global) X(sandbox) |
-//! | provisioning-deadline reconcile (process-local only) | S(global) S(workspace) X(sandbox) |
+//! | provisioning-deadline reconcile (process-local only, skips a busy sandbox) | S(global) S(workspace) X(sandbox) |
 //!
 //! Ordering rules, which make the scheme deadlock-free:
 //!

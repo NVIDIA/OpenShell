@@ -1,28 +1,44 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Process-wide [`EventContext`] singleton.
+//! Process-wide and sandbox-instance-bound [`EventContext`].
 //!
-//! Initialised once via [`set_ctx`] during sandbox start; read by every event
-//! builder via [`ctx`]. Falls back to a default context when the singleton has
-//! not been set (e.g. unit tests that exercise builders without booting the
-//! sandbox).
+//! A dedicated supervisor initialises the process-wide context once via
+//! [`set_ctx`]. A process hosting several sandbox instances instead binds
+//! each instance's context to the threads of that instance's runtime with
+//! [`bind_thread_ctx`]; a bound context takes precedence. [`ctx`] falls back
+//! to a default context when neither is set (e.g. unit tests that exercise
+//! builders without booting the sandbox).
 
-use crate::{EventContext, EventOrigin};
-use std::sync::{LazyLock, OnceLock};
+use crate::{ContextRef, EventContext, EventOrigin};
+use std::cell::RefCell;
+use std::sync::{Arc, LazyLock, OnceLock};
 
 static OCSF_CTX: OnceLock<EventContext> = OnceLock::new();
 
+/// With `test-support`, producer tests get a production-like sandbox identity
+/// so their events carry the same container and device fields production does.
+#[cfg(any(test, feature = "test-support"))]
+const FALLBACK_SANDBOX: (&str, &str, &str) =
+    ("sandbox-test", "test-sandbox", "example/sandbox:test");
+#[cfg(not(any(test, feature = "test-support")))]
+const FALLBACK_SANDBOX: (&str, &str, &str) = ("", "", "");
+
 static OCSF_CTX_FALLBACK: LazyLock<EventContext> = LazyLock::new(|| EventContext {
-    sandbox_id: String::new(),
-    sandbox_name: String::new(),
-    container_image: String::new(),
+    sandbox_id: FALLBACK_SANDBOX.0.to_string(),
+    sandbox_name: FALLBACK_SANDBOX.1.to_string(),
+    container_image: FALLBACK_SANDBOX.2.to_string(),
     hostname: "test".to_string(),
     product_version: env!("CARGO_PKG_VERSION").to_string(),
     proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
     proxy_port: 3128,
     origin: EventOrigin::Supervisor,
 });
+
+std::thread_local! {
+    /// Context of the hosted sandbox instance whose runtime owns this thread.
+    static THREAD_CTX: RefCell<Option<Arc<EventContext>>> = const { RefCell::new(None) };
+}
 
 /// Initialise the process-wide OCSF sandbox context.
 ///
@@ -32,11 +48,22 @@ pub fn set_ctx(ctx: EventContext) -> bool {
     OCSF_CTX.set(ctx).is_ok()
 }
 
-/// Return a reference to the process-wide [`EventContext`].
+/// Attribute events emitted on the calling thread to one hosted sandbox
+/// instance.
 ///
-/// Falls back to a default context if [`set_ctx`] has not been called (e.g.
-/// during unit tests that exercise individual builders).
+/// Instance runtimes bind every thread they start; `None` unbinds it.
+pub fn bind_thread_ctx(ctx: Option<Arc<EventContext>>) {
+    THREAD_CTX.with(|current| *current.borrow_mut() = ctx);
+}
+
+/// Return the context for events emitted on the calling thread.
+///
+/// An instance-bound context wins over the process-wide one. Falls back to a
+/// default context if neither is set.
 #[must_use]
-pub fn ctx() -> &'static EventContext {
-    OCSF_CTX.get().unwrap_or(&OCSF_CTX_FALLBACK)
+pub fn ctx() -> ContextRef<'static> {
+    if let Some(bound) = THREAD_CTX.with(|current| current.borrow().clone()) {
+        return ContextRef::Shared(bound);
+    }
+    ContextRef::Borrowed(OCSF_CTX.get().unwrap_or(&OCSF_CTX_FALLBACK))
 }

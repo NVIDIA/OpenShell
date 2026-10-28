@@ -80,6 +80,13 @@ impl TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn peer_notify_config_update(
+        &self,
+        _request: tonic::Request<openshell_core::proto::PeerNotifyConfigUpdateRequest>,
+    ) -> Result<Response<openshell_core::proto::PeerNotifyConfigUpdateResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn peer_report_provider_readiness(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
@@ -172,6 +179,20 @@ impl OpenShell for TestOpenShell {
     async fn start_sandbox(
         &self,
         _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::SuspendSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ResumeSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }

@@ -3,7 +3,7 @@
 
 //! Builder for HTTP Activity [4002] events.
 
-use crate::builders::EventContext;
+use crate::builders::ContextRef;
 use crate::enums::{ActionId, ActivityId, DispositionId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{HttpActivityEvent, OcsfEvent};
@@ -11,7 +11,7 @@ use crate::objects::{Actor, Endpoint, FirewallRule, HttpRequest, HttpResponse};
 
 /// Builder for HTTP Activity [4002] events.
 pub struct HttpActivityBuilder<'a, Context = MissingHttpContext> {
-    ctx: &'a EventContext,
+    ctx: ContextRef<'a>,
     activity: ActivityId,
     action: Option<ActionId>,
     disposition: Option<DispositionId>,
@@ -42,7 +42,7 @@ impl<'a> HttpActivityBuilder<'a, MissingHttpContext> {
     /// be built.
     ///
     /// ```compile_fail
-    /// use openshell_ocsf::{EventContext, HttpActivityBuilder};
+    /// use openshell_ocsf::{EventContext, EventOrigin, HttpActivityBuilder};
     ///
     /// let ctx = EventContext {
     ///     sandbox_id: String::new(),
@@ -52,13 +52,14 @@ impl<'a> HttpActivityBuilder<'a, MissingHttpContext> {
     ///     product_version: String::new(),
     ///     proxy_ip: "127.0.0.1".parse().unwrap(),
     ///     proxy_port: 3128,
+    ///     origin: EventOrigin::Supervisor,
     /// };
     /// HttpActivityBuilder::new(&ctx).build();
     /// ```
     #[must_use]
-    pub fn new(ctx: &'a EventContext) -> Self {
+    pub fn new(ctx: impl Into<ContextRef<'a>>) -> Self {
         Self {
-            ctx,
+            ctx: ctx.into(),
             activity: ActivityId::Unknown,
             action: None,
             disposition: None,
@@ -183,7 +184,7 @@ impl<'a, Context> HttpActivityBuilder<'a, Context> {
 
     #[must_use]
     pub fn actor_process(mut self, process: crate::objects::Process) -> Self {
-        self.actor = Some(Actor { process });
+        self.actor = Some(Actor::process(process));
         self
     }
 
@@ -254,7 +255,6 @@ impl HttpActivityBuilder<'_, HasHttpContext> {
             action: self.action,
             disposition: self.disposition,
             observation_point_id: Some(2),
-            is_src_dst_assignment_known: Some(true),
         })
     }
 }

@@ -26,6 +26,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
 | `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
 | `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
+| `crates/openshell-supervisor-control/` | Shared supervisor control | Gateway-owned assignment controller, launch registrations, recovery coordination, and host observations for a supervisor shared by many sandboxes |
 | `crates/openshell-binary-identity/` | Binary identity | Shared trusted procfs executable identity resolution for isolation backends |
 | `crates/openshell-isolation-interface/` | Isolation backend interface | Shared data and validation for the Isolation Backend RPC contracts |
 | `crates/openshell-sandbox-backend/` | OpenShell sandbox backend | Concrete Isolation Backend RPC client and authenticated Sandbox Protocol shared with `openshell-sandbox` |
@@ -36,6 +37,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
 | `crates/openshell-otel/` | OpenTelemetry support | Shared OTLP trace provider, resource, and tracing-layer construction |
 | `crates/openshell-otel-test-support/` | OpenTelemetry test support | Shared loopback OTLP collector fixture for tracing tests |
+| `crates/openshell-crypto/` | Crypto backend | Backend-neutral primitives and TLS, PKI, JWT adapters; AWS-LC implementation |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
 | `crates/openshell-extension-core/` | Extension core | Shared extension identity, JWT claims, bearer-token rotation, and TLS transport primitives |
 | `crates/openshell-gateway/` | Gateway binary composition | Links selected first-party compute drivers into the backend-agnostic server registry |
@@ -49,10 +51,10 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
 | `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
-| `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |
+| [`crates/openshell-driver-mxc/`](https://github.com/NVIDIA/OpenShell/tree/windows/crates/openshell-driver-mxc) (`windows` branch) | Microsoft MXC compute driver | Native Windows ProcessContainer backend; see the Windows branch for the maintained implementation |
+| [`crates/openshell-mxc-boundary/`](https://github.com/NVIDIA/OpenShell/tree/windows/crates/openshell-mxc-boundary) (`windows` branch) | Windows sandbox boundary | Dedicated Windows workload boundary paired with the host supervisor |
 | `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
 | `crates/openshell-prover-cli/` | Policy prover CLI | Standalone local policy boundary checks |
-| `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
 | `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |
 | `crates/openshell-supervisor-middleware-builtins/` | Built-in middleware | First-party in-process middleware implementations |
 | `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and provider credential injection |
@@ -61,6 +63,8 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `python/openshell/` | Python SDK | Python bindings and CLI packaging |
 | `sdk/typescript/` | TypeScript SDK | Native Connect client, curated sandbox API, and generated protobuf types |
 | `proto/` | Protobuf definitions | gRPC service contracts |
+| `tests/testkit/` | E2E testkit | Support library and `#[testkit::test]` attribute for SDK-driven E2E suites |
+| `tests/suites/` | E2E suites | One directory per test family, such as `conformance` |
 | `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |
 | `docs/` | Published docs | MDX pages, navigation, and content assets |
 | `fern/` | Docs site config | Fern site config, components, and theme assets |
@@ -184,7 +188,7 @@ Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-reposito
 - Format: `<type>(<scope>): <description>` (scope is optional)
 - Common types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `ci`, `perf`
 - Sign off on each commit for DCO compliance. Use the `--signoff` option to `git commit` to add the `Signed-off-by` footer to ensure the user's configured email address is used.
-- Never mention Claude or any AI agent in commits (no author attribution, no Co-Authored-By, no references in commit messages)
+- Never mention Claude or any AI agent in commits, PR descriptions, or issues (no author attribution, no Co-Authored-By, no "Generated with" footers)
 
 ## Go SDK (`sdk/go/`)
 
@@ -235,6 +239,7 @@ When behavior, commands, or development workflows change, review the related age
 
 ## Security
 
+- Route first-party security-sensitive cryptographic operations through `openshell-crypto`. If an operation is missing, extend the facade and backend implementation instead of adding a direct cryptographic implementation in an application crate. Preserve protocol compatibility and propagate backend failures without fallback. Protocol/parsing types and documented non-security or dependency-owned exceptions remain permitted; classify exceptions explicitly. Follow [Cryptography and FIPS](crates/openshell-crypto/CRYPTO.md).
 - Never commit secrets, API keys, or credentials. If a file looks like it contains secrets (`.env`, `credentials.json`, etc.), do not stage it.
 - Do not run destructive operations (force push, hard reset, database drops) without explicit human confirmation.
 - Scope changes to the issue at hand. Do not make unrelated changes in the same branch.

@@ -41,9 +41,15 @@ pub const RELAY_EXPIRED_TOTAL: &str = "openshell_server_relay_expired_total";
 pub const ROUTED_REQUEST_ATTEMPTS_TOTAL: &str = "openshell_server_routed_request_attempts_total";
 pub const MUTATION_LOCK_TIMEOUTS_TOTAL: &str = "openshell_server_mutation_lock_timeouts_total";
 pub const MUTATION_LOCK_ERRORS_TOTAL: &str = "openshell_server_mutation_lock_errors_total";
+pub const PROVISIONING_DEADLINE_SKIPS_TOTAL: &str =
+    "openshell_server_provisioning_deadline_skips_total";
 // Histograms (explicit buckets, see BUCKETED_HISTOGRAMS)
 pub const RELAY_CLAIM_DURATION_SECONDS: &str = "openshell_server_relay_claim_duration_seconds";
 pub const PEER_REQUEST_DURATION_SECONDS: &str = "openshell_server_peer_request_duration_seconds";
+pub const SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS: &str =
+    "openshell_supervisor_config_build_duration_seconds";
+pub const SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS: &str =
+    "openshell_supervisor_config_apply_duration_seconds";
 pub const MUTATION_LOCK_WAIT_SECONDS: &str = "openshell_server_mutation_lock_wait_seconds";
 pub const MUTATION_LOCK_HOLD_SECONDS: &str = "openshell_server_mutation_lock_hold_seconds";
 
@@ -54,6 +60,7 @@ const LABEL_GRPC_CODE: &str = "grpc_code";
 const LABEL_RELAY_KIND: &str = "relay_kind";
 const LABEL_ROUTE: &str = "route";
 const LABEL_SCOPE: &str = "scope";
+const LABEL_OVERDUE: &str = "overdue";
 
 /// Buckets for the new latency histograms, 1 ms to 15 s. The top buckets cover the 10 s relay
 /// claim and lock timeouts and the 15 s routed-relay wait.
@@ -63,9 +70,11 @@ const LATENCY_BUCKETS_SECONDS: [f64; 14] = [
 
 /// Only these names render as Prometheus histograms. Every existing `*_duration_seconds` metric
 /// keeps its summary format, so current dashboards are unaffected.
-const BUCKETED_HISTOGRAMS: [&str; 4] = [
+const BUCKETED_HISTOGRAMS: [&str; 6] = [
     RELAY_CLAIM_DURATION_SECONDS,
     PEER_REQUEST_DURATION_SECONDS,
+    SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
+    SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS,
     MUTATION_LOCK_WAIT_SECONDS,
     MUTATION_LOCK_HOLD_SECONDS,
 ];
@@ -328,6 +337,11 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
         Unit::Count,
         "Mutation lock acquisitions that failed without timing out, such as a lock connection PostgreSQL did not open."
     );
+    describe_counter!(
+        PROVISIONING_DEADLINE_SKIPS_TOTAL,
+        Unit::Count,
+        "Times the provisioning deadline scan skipped a sandbox because its local mutation locks were busy."
+    );
     describe_histogram!(
         RELAY_CLAIM_DURATION_SECONDS,
         Unit::Seconds,
@@ -337,6 +351,16 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
         PEER_REQUEST_DURATION_SECONDS,
         Unit::Seconds,
         "Latency of outbound requests to the owning replica. For relays, until the owner's supervisor claimed the relay."
+    );
+    describe_histogram!(
+        SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
+        Unit::Seconds,
+        "Time to build one pushed supervisor configuration, including store reads and credential resolution."
+    );
+    describe_histogram!(
+        SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS,
+        Unit::Seconds,
+        "Time from queuing a pushed configuration update on the supervisor session to receiving its apply result."
     );
     describe_histogram!(
         MUTATION_LOCK_WAIT_SECONDS,
@@ -373,6 +397,10 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
     for scope in LockScope::ALL {
         counter!(MUTATION_LOCK_TIMEOUTS_TOTAL, LABEL_SCOPE => scope.label()).increment(0);
         counter!(MUTATION_LOCK_ERRORS_TOTAL, LABEL_SCOPE => scope.label()).increment(0);
+    }
+    for overdue in [false, true] {
+        counter!(PROVISIONING_DEADLINE_SKIPS_TOTAL, LABEL_OVERDUE => overdue_label(overdue))
+            .increment(0);
     }
     if let Some(capacity) = mutation_lock_connections {
         describe_gauge!(
@@ -485,6 +513,17 @@ pub fn record_lock_timeout(scope: LockScope) {
 /// acquisition is not counted.
 pub fn record_lock_error(scope: LockScope) {
     counter!(MUTATION_LOCK_ERRORS_TOTAL, LABEL_SCOPE => scope.label()).increment(1);
+}
+
+/// The provisioning deadline scan skipped a sandbox whose local mutation locks stayed busy. An
+/// `overdue` sandbox was already past its deadline, so the skip delays its expiry.
+pub fn record_provisioning_deadline_skip(overdue: bool) {
+    counter!(PROVISIONING_DEADLINE_SKIPS_TOTAL, LABEL_OVERDUE => overdue_label(overdue))
+        .increment(1);
+}
+
+const fn overdue_label(overdue: bool) -> &'static str {
+    if overdue { "true" } else { "false" }
 }
 
 /// Counts one local relay setup or outbound peer attempt exactly once, and times peer requests.
@@ -676,6 +715,14 @@ mod tests {
                 "openshell_server_mutation_lock_errors_total{scope=\"sandbox\"}",
                 0,
             ),
+            (
+                "openshell_server_provisioning_deadline_skips_total{overdue=\"false\"}",
+                0,
+            ),
+            (
+                "openshell_server_provisioning_deadline_skips_total{overdue=\"true\"}",
+                0,
+            ),
         ] {
             assert_eq!(metrics.value(series), Some(expected), "{series}");
         }
@@ -772,6 +819,16 @@ mod tests {
         .record(sample);
         histogram!(MUTATION_LOCK_WAIT_SECONDS, LABEL_SCOPE => "sandbox").record(sample);
         histogram!(MUTATION_LOCK_HOLD_SECONDS, LABEL_SCOPE => "sandbox").record(sample);
+        histogram!(
+            SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
+            "outcome" => "ok"
+        )
+        .record(sample);
+        histogram!(
+            SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS,
+            "outcome" => "CONFIG_APPLY_OUTCOME_APPLIED"
+        )
+        .record(sample);
         histogram!(
             "openshell_server_grpc_request_duration_seconds",
             "method" => "ListSandboxes",

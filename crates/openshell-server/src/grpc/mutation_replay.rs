@@ -157,7 +157,9 @@ pub(super) async fn run<M: Mutation>(
     let request_id = validate_request_id(request.get_ref().request_id())?;
     let principal = super::extract_principal(&request)?;
     let Some(identity) = principal.user_identity() else {
-        return Err(Status::permission_denied(
+        return Err(crate::auth::audit::deny(
+            &principal,
+            crate::auth::audit::AuthzDenial::MethodNotPermitted,
             "request admission requires a user principal",
         ));
     };
@@ -227,7 +229,7 @@ pub(super) async fn run<M: Mutation>(
     let state = Arc::clone(state);
     // Spawn BEFORE attempting MustCreate. Cancellation during the database write
     // must not drop the owner between durable admission and execution.
-    tokio::spawn(async move {
+    tokio::spawn(crate::auth::audit::in_current_request(async move {
         let _permit = permit;
         execute_owned(
             &state,
@@ -239,7 +241,7 @@ pub(super) async fn run<M: Mutation>(
             scope,
         )
         .await
-    })
+    }))
     .await
     .map_err(|_| uncertain())?
 }
@@ -642,7 +644,7 @@ async fn member_scope(
     )
     .await?;
     if let Some(role) = role {
-        workspace::authorize_member_role(role, authz.grant)?;
+        workspace::authorize_member_role(role, authz.grant, principal)?;
     }
     named_scope(state, &authz.workspace).await
 }

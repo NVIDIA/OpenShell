@@ -52,7 +52,7 @@ impl TokenGrantClient {
     fn builder() -> reqwest::ClientBuilder {
         // A process may already have installed this provider. Installation is
         // idempotent for this caller and never relaxes peer authentication.
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(30))
@@ -523,22 +523,23 @@ mod tests {
         TokenGrantClient,
         tokio::task::JoinHandle<CapturedRequest>,
     ) {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let ca_key = rcgen::KeyPair::generate().expect("CA key");
-        let ca = ca_params.self_signed(&ca_key).expect("CA certificate");
-        let key = rcgen::KeyPair::generate().expect("server key");
-        let certificate = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-            .expect("server params")
-            .signed_by(&key, &ca, &ca_key)
+        let ca_key = openshell_crypto::pki::generate_keypair().expect("CA key");
+        let ca = openshell_crypto::pki::self_signed(ca_params, &ca_key).expect("CA certificate");
+        let key = openshell_crypto::pki::generate_keypair().expect("server key");
+        let params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("server params");
+        let certificate = openshell_crypto::pki::signed_by(params, &key, &ca, &ca_key)
             .expect("server certificate");
-        let config = rustls::ServerConfig::builder()
+        let config = openshell_crypto::tls::server_builder()
             .with_no_client_auth()
             .with_single_cert(
                 vec![certificate.der().clone()],
-                rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der())
-                    .expect("server key"),
+                rustls::pki_types::PrivateKeyDer::try_from(
+                    key.serialize_der().expect("export server key"),
+                )
+                .expect("server key"),
             )
             .expect("server config");
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));

@@ -148,6 +148,23 @@ workspace for repeated exec, stop, start, and delete operations. List methods
 return lazy `Pager` instances; use `list_all()` only when you want to fetch the
 complete collection.
 
+## Implement a Credential Driver
+
+The SDK includes generated message classes, type stubs, and gRPC bindings for
+the credential-driver and extension protocols:
+
+```python
+from openshell._proto import credential_driver_pb2, credential_driver_pb2_grpc
+from openshell._proto import datamodel_pb2, extension_pb2
+```
+
+Subclass `credential_driver_pb2_grpc.CredentialDriverServicer` and register your
+implementation with `add_CredentialDriverServicer_to_server()` from the same
+module. Clients use `CredentialDriverStub`. The generated messages share
+`datamodel_pb2.CredentialHandle` and `extension_pb2.PeerMetadata` with the SDK.
+Use bindings from the same OpenShell release as your gateway; these modules
+expose the internal credential-driver contract.
+
 ## Next Steps
 
 - Review [Manage Sandboxes](/how-it-works/sandboxes/overview) for labels, templates, services, and Python SDK examples.

@@ -353,6 +353,145 @@ the in-cluster Service DNS, release namespace, service port, and disableTls
 flag — so the default value works for any release name or namespace without
 override.
 */}}
+{{/*
+Whether the gateway supervisor topology is enabled. Read from the
+raw gateway configuration so openshell.effectiveKubernetesConfig can use it.
+*/}}
+{{- define "openshell.supervisorEnabled" -}}
+{{- $kubernetes := get (.Values.gatewayConfig | default dict) "openshell.drivers.kubernetes" | default dict -}}
+{{- if eq (get $kubernetes "supervisor_topology" | default "") "gateway" -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Whether the shared supervisor PodDisruptionBudget renders. A missing
+podDisruptionBudget map or enabled value means enabled on older releases.
+*/}}
+{{- define "openshell.supervisorPodDisruptionBudgetEnabled" -}}
+{{- $pdb := get (.Values.supervisor | default dict) "podDisruptionBudget" | default dict -}}
+{{- $enabled := ternary (get $pdb "enabled") true (kindIs "map" $pdb) -}}
+{{- if not (and (kindIs "bool" $enabled) (not $enabled)) -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Name of the shared supervisor Deployment and Service (and, with `-token`, its token Secret):
+the fullname with a fixed suffix, within the 63-character Service name limit.
+A fullname without room for the suffix keeps a prefix and a hash of the whole
+fullname, so the name never collapses into another release resource's name.
+*/}}
+{{- define "openshell.supervisorName" -}}
+{{- $suffix := "-supervisor" -}}
+{{- $base := include "openshell.fullname" . -}}
+{{- $room := sub 63 (len $suffix) | int -}}
+{{- if gt (len $base) $room -}}
+{{- $base = printf "%s-%s" ($base | trunc (sub $room 9 | int) | trimSuffix "-") ($base | sha256sum | trunc 8) -}}
+{{- end -}}
+{{- printf "%s%s" $base $suffix -}}
+{{- end }}
+
+{{/*
+Pod labels of the shared supervisor; its Service selects exactly these.
+*/}}
+{{- define "openshell.supervisorSelectorLabels" -}}
+app.kubernetes.io/name: openshell-supervisor
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: supervisor
+{{- end }}
+
+{{/*
+A chart value as a whole number, or nothing when it is not one. Helm parses
+YAML numbers as float64, so whole floats count; booleans, strings, and
+fractions do not.
+*/}}
+{{- define "openshell.wholeNumber" -}}
+{{- if has (kindOf .) (list "int" "int8" "int16" "int32" "int64" "uint" "uint8" "uint16" "uint32" "uint64" "float32" "float64") -}}
+{{- $whole := int64 . -}}
+{{- if eq (float64 .) (float64 $whole) -}}{{- $whole -}}{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Shared supervisor replica count. A missing value (for example after `helm
+upgrade --reuse-values` from a release that predates it) means 1.
+*/}}
+{{- define "openshell.supervisorReplicas" -}}
+{{- $supervisor := .Values.supervisor | default dict -}}
+{{- $value := get $supervisor "replicas" -}}
+{{- if or (not (hasKey $supervisor "replicas")) (kindIs "invalid" $value) -}}
+1
+{{- else -}}
+{{- $replicas := include "openshell.wholeNumber" $value -}}
+{{- if or (eq $replicas "") (lt (int64 $replicas) 1) -}}
+{{- fail "supervisor.replicas must be an integer of at least 1" -}}
+{{- end -}}
+{{- $replicas -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Seconds a sandbox runtime keeps its workload frozen after losing a pool
+member's supervision, or nothing when unset so the gateway applies its pool
+default.
+*/}}
+{{- define "openshell.supervisorRecoveryTimeoutSeconds" -}}
+{{- $supervisor := .Values.supervisor | default dict -}}
+{{- $value := get $supervisor "recoveryTimeoutSeconds" -}}
+{{- if and (hasKey $supervisor "recoveryTimeoutSeconds") (not (kindIs "invalid" $value)) (ne (toString $value) "") -}}
+{{- $timeout := include "openshell.wholeNumber" $value -}}
+{{- if or (eq $timeout "") (lt (int64 $timeout) 30) (gt (int64 $timeout) 300) -}}
+{{- fail "supervisor.recoveryTimeoutSeconds must be an integer between 30 and 300, or null for the default" -}}
+{{- end -}}
+{{- $timeout -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The gateway's [openshell.gateway.supervisor_pool] tuning table as YAML, or
+nothing. The shared supervisor always runs as a high-availability pool that
+the gateway coordinates; the chart owns the table only to set the recovery
+deadline (supervisor.recoveryTimeoutSeconds; none leaves the gateway default).
+It never depends on supervisor.replicas, so scaling never changes the gateway
+configuration. Renders nothing without the gateway topology. Validates the
+supervisor values whenever the topology is selected, and refuses a
+hand-written table in either TOML form.
+*/}}
+{{- define "openshell.supervisorPoolConfig" -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- if or (hasKey $gatewayConfig "openshell.gateway.supervisor_pool") (hasKey (get $gatewayConfig "openshell.gateway" | default dict) "supervisor_pool") -}}
+{{- fail "supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds" -}}
+{{- end -}}
+{{- if include "openshell.supervisorEnabled" . -}}
+{{- if ne (include "openshell.supervisorAutoscalingEnabled" .) "true" -}}
+{{- $_ := include "openshell.supervisorReplicas" . -}}
+{{- end -}}
+{{- $recoveryTimeout := include "openshell.supervisorRecoveryTimeoutSeconds" . -}}
+{{- if $recoveryTimeout -}}
+{{- toYaml (dict "recovery_timeout_secs" (int64 $recoveryTimeout)) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Namespace selector for the sandbox namespaces of this gateway's workspace
+mode: the shared namespace, the managed namespaces it labels, or the
+operator-labeled namespaces.
+*/}}
+{{- define "openshell.supervisorSandboxNamespaces" -}}
+{{- $kubernetes := .kubernetes -}}
+{{- $mode := get $kubernetes "workspace_mode" | default "shared" -}}
+{{- if eq $mode "managed" -}}
+matchLabels:
+  openshell.ai/managed-by: openshell
+  openshell.ai/gateway-id: {{ get $kubernetes "gateway_id" | quote }}
+{{- else if eq $mode "operator" -}}
+{{- $label := regexSplit "==?" (get $kubernetes "operator_namespace_label") 2 -}}
+matchLabels:
+  {{ index $label 0 }}: {{ index $label 1 | quote }}
+{{- else -}}
+matchLabels:
+  kubernetes.io/metadata.name: {{ get $kubernetes "namespace" | quote }}
+{{- end -}}
+{{- end }}
+
 {{- define "openshell.grpcEndpoint" -}}
 {{- if .Values.server.grpcEndpoint -}}
 {{- .Values.server.grpcEndpoint -}}
@@ -561,6 +700,10 @@ like user-supplied schema-v2 fields during compatibility resolution. */}}
 {{- if not (hasKey $kubernetes "supervisor_image") -}}{{- $_ := set $kubernetes "supervisor_image" (include "openshell.supervisorImage" .) -}}{{- end -}}
 {{- if not (hasKey $runtimeConfig "boundary_port") -}}{{- $_ := set $runtimeConfig "boundary_port" 5500 -}}{{- end -}}
 {{- $_ := set $kubernetes "sandbox_runtime" $runtimeConfig -}}
+{{/* The chart owns the shared supervisor and the Secret that delivers its token. */}}
+{{- if include "openshell.supervisorEnabled" . -}}
+{{- $_ := set $kubernetes "shared_supervisor" (dict "service_name" (include "openshell.supervisorName" .) "service_namespace" .Release.Namespace "runtime_port" 5500 "token_secret_name" (printf "%s-token" (include "openshell.supervisorName" .))) -}}
+{{- end -}}
 {{- toYaml $kubernetes -}}
 {{- end }}
 
@@ -568,6 +711,41 @@ like user-supplied schema-v2 fields during compatibility resolution. */}}
 Validate chart values that Helm would otherwise accept silently.
 */}}
 {{- define "openshell.validateValues" -}}
+{{- $kubernetes := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
+{{- if hasKey $kubernetes "supervisor_topology" -}}
+{{- $topology := get $kubernetes "supervisor_topology" -}}
+{{- if not (has $topology (list "gateway" "workspace")) -}}
+{{- fail "supervisor_topology must be gateway or workspace; omit it to disable the shared supervisor" -}}
+{{- end -}}
+{{- if eq $topology "workspace" -}}
+{{- fail "supervisor_topology=workspace is not implemented" -}}
+{{- end -}}
+{{- $gateway := get (.Values.gatewayConfig | default dict) "openshell.gateway" | default dict -}}
+{{- if ne (get $gateway "compute_driver" | default "kubernetes") "kubernetes" -}}
+{{- fail "supervisor_topology requires the kubernetes compute driver" -}}
+{{- end -}}
+{{- if or (get $kubernetes "https_proxy") (get $kubernetes "proxy_ca_bundle") (get $kubernetes "proxy_auth_secret_name") (get $kubernetes "provider_spiffe_workload_api_socket_path") -}}
+{{- fail "supervisor_topology=gateway does not support upstream proxy settings or provider SPIFFE identity" -}}
+{{- end -}}
+{{- if .Values.server.disableTls -}}
+{{- fail "supervisor_topology=gateway requires gateway TLS; the supervisor token travels only over TLS" -}}
+{{- end -}}
+{{- if and (eq (get $kubernetes "workspace_mode" | default "shared") "operator") (not (regexMatch "^[A-Za-z0-9][-A-Za-z0-9_./]*==?[-A-Za-z0-9_.]*$" (get $kubernetes "operator_namespace_label" | default ""))) -}}
+{{- fail "supervisor_topology=gateway in operator workspace mode requires operator_namespace_label of the form key=value" -}}
+{{- end -}}
+{{- end -}}
+{{- if hasKey (get (.Values.gatewayConfig | default dict) "openshell.drivers.kubernetes" | default dict) "shared_supervisor" -}}
+{{- fail "shared_supervisor is rendered by the chart; set only supervisor_topology" -}}
+{{- end -}}
+{{- include "openshell.validateSupervisorAutoscaling" . -}}
+{{- $pdb := get (.Values.supervisor | default dict) "podDisruptionBudget" | default dict -}}
+{{- if not (kindIs "map" $pdb) -}}
+{{- fail "supervisor.podDisruptionBudget must be a map" -}}
+{{- end -}}
+{{- if and (hasKey $pdb "enabled") (not (kindIs "invalid" (get $pdb "enabled"))) (not (kindIs "bool" (get $pdb "enabled"))) -}}
+{{- fail "supervisor.podDisruptionBudget.enabled must be a boolean" -}}
+{{- end -}}
+{{- $_ := include "openshell.supervisorPoolConfig" . -}}
 {{- $workloadKind := include "openshell.workloadKind" . -}}
 {{- $workload := .Values.workload | default dict -}}
 {{- $maxReplicas := int (include "openshell.maxReplicas" .) -}}

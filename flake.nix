@@ -126,12 +126,12 @@
           qemuPkgs = testGuestPkgs;
           firmwarePkgs = testGuestPkgs;
         };
-        testMachines = import ./tests/config.nix {
-          inherit pkgs toolchains;
+        testMachines = import ./tests/tmachine/config.nix {
+          inherit pkgs toolchains rustToolchain;
           qemuPkgs = tmachineRuntimePkgs;
           firmwarePkgs = tmachineRuntimePkgs;
         };
-        artifacts = pkgs.callPackage ./tests/artifacts.nix { inherit rustToolchain toolchains; };
+        artifacts = pkgs.callPackage ./tests/tmachine/artifacts.nix { inherit rustToolchain toolchains; };
         checkProtobufCompatibility = pkgs.writeShellApplication {
           name = "check-protobuf-compatibility";
           runtimeInputs = [
@@ -164,6 +164,10 @@
           build-artifacts-deb = {
             type = "app";
             program = "${artifacts.deb}/bin/build-artifacts-deb";
+          };
+          build-artifacts-rpm = {
+            type = "app";
+            program = "${artifacts.rpm}/bin/build-artifacts-rpm";
           };
           build-artifacts-test-archives = {
             type = "app";
@@ -199,6 +203,7 @@
           tmachine = testMachines.package;
           tmachine-config = testMachines.config;
           tmachine-unwrapped = testMachines.unwrapped;
+          openshell-test-runner = testMachines.testRunner;
         };
 
         devShells = {
@@ -215,7 +220,7 @@
               ];
 
               shellHook = ''
-                export ANSIBLE_CONFIG="$(git rev-parse --show-toplevel)/tests/ansible/ansible.cfg"
+                export ANSIBLE_CONFIG="$(git rev-parse --show-toplevel)/tests/tmachine/ansible/ansible.cfg"
               '';
             }
           );

@@ -1861,6 +1861,68 @@ async fn gateway_client(state: Arc<ServerState>) -> OpenShellClient<tonic::trans
 }
 
 #[tokio::test]
+async fn session_resets_invalidate_evidence_when_stored_configuration_is_invalid() {
+    for disconnect in [false, true] {
+        let sandbox_id = "endpoint-invalid-configuration";
+        let (state, _) = sandbox_with_accepted_endpoint_result(sandbox_id, false).await;
+        let before = stored_sandbox(&state, sandbox_id).await;
+        assert_eq!(
+            before.status.as_ref().unwrap().endpoint_statuses[0].last_result,
+            i32::from(EndpointResult::HttpResponseReceived)
+        );
+        let mut invalid_policy = mcp_policy_with_versions(&["2025-11-25"]);
+        invalid_policy
+            .network_policies
+            .get_mut("mcp")
+            .unwrap()
+            .endpoints[0]
+            .protocol = "rest".to_string();
+        state
+            .store
+            .put_policy_revision(
+                "invalid-policy",
+                sandbox_id,
+                "default",
+                2,
+                &invalid_policy.encode_to_vec(),
+                "invalid",
+            )
+            .await
+            .unwrap();
+        let error = active_endpoint_context(&state, &before)
+            .await
+            .err()
+            .expect("stored policy fails validation");
+        assert!(crate::grpc::policy::is_configuration_rejection(&error));
+        if disconnect {
+            state
+                .supervisor_sessions
+                .remove_if_current(sandbox_id, "session-a");
+            reset_endpoint_status_after_supervisor_disconnect(&state, sandbox_id)
+                .await
+                .expect("disconnect invalidates evidence without decoding invalid policy");
+        } else {
+            register_session(&state, sandbox_id, "session-b");
+            reset_endpoint_status_for_supervisor_session(&state, sandbox_id, "session-b")
+                .await
+                .expect("replacement invalidates evidence without decoding invalid policy");
+        }
+        let stored = stored_sandbox(&state, sandbox_id).await;
+        let endpoint = &stored.status.as_ref().unwrap().endpoint_statuses[0];
+        assert_eq!(
+            endpoint.endpoint_id,
+            before.status.as_ref().unwrap().endpoint_statuses[0].endpoint_id
+        );
+        assert_eq!(
+            endpoint.last_result,
+            i32::from(EndpointResult::NoObservedExchange)
+        );
+        assert!(endpoint.last_reported_time.is_none());
+        assert!(endpoint.last_failure.is_none());
+    }
+}
+
+#[tokio::test]
 async fn replacement_reset_timeout_invalidates_superseded_evidence() {
     let sandbox_id = "endpoint-replacement-reset-timeout";
     // Session A stays registered, so the replacement supersedes it before A's
@@ -1884,6 +1946,7 @@ async fn replacement_reset_timeout_invalidates_superseded_evidence() {
             supports_provider_readiness: false,
             redirected: false,
             supports_session_redirect: false,
+            supports_config_push: false,
         })),
     };
     let error = gateway_client(Arc::clone(&state))
@@ -1957,6 +2020,7 @@ async fn replacement_reset_retry_does_not_hold_gateway_shutdown() {
             supports_provider_readiness: false,
             redirected: false,
             supports_session_redirect: false,
+            supports_config_push: false,
         })),
     };
     let error = gateway_client(Arc::clone(&state))
@@ -2392,4 +2456,77 @@ async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
     assert!(cleared.endpoint_statuses.is_empty());
     assert_eq!(cleared.conditions, replaced.conditions);
     assert_eq!(cleared.phase, replaced.phase);
+}
+
+#[tokio::test]
+async fn late_result_for_an_older_revision_keeps_the_newer_policy_active() {
+    let state = test_server_state().await;
+    let sandbox_id = "endpoint-late-policy-result";
+    let mut older_policy = mcp_policy_with_versions(&["2025-11-25"]);
+    older_policy
+        .network_policies
+        .get_mut("mcp")
+        .expect("MCP policy")
+        .endpoints[0]
+        .host = "older.example.com".to_string();
+    let mut newer_policy = older_policy.clone();
+    newer_policy
+        .network_policies
+        .get_mut("mcp")
+        .expect("MCP policy")
+        .endpoints[0]
+        .host = "newer.example.com".to_string();
+    let initial_newer = initial_endpoint_status(&newer_policy.network_policies["mcp"].endpoints[0]);
+    state
+        .store
+        .put_message(&test_sandbox(
+            sandbox_id,
+            sandbox_id,
+            older_policy.clone(),
+            Vec::new(),
+        ))
+        .await
+        .expect("store sandbox");
+    for (version, policy) in [(1, &older_policy), (2, &newer_policy)] {
+        state
+            .store
+            .put_policy_revision(
+                &format!("{sandbox_id}-v{version}"),
+                sandbox_id,
+                "default",
+                version,
+                &policy.encode_to_vec(),
+                &deterministic_policy_hash(policy),
+            )
+            .await
+            .expect("store policy revision");
+    }
+    acknowledge_loaded_policy(&state, sandbox_id, 1).await;
+    acknowledge_loaded_policy(&state, sandbox_id, 2).await;
+    let active = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("active status");
+    assert_eq!(active.current_policy_version, 2);
+    assert_eq!(active.endpoint_statuses, vec![initial_newer]);
+
+    // The older revision's result arrives last, as one queued by a supervisor
+    // session that was replaced before the result was written.
+    acknowledge_loaded_policy(&state, sandbox_id, 1).await;
+
+    let after = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("status after the late result");
+    assert_eq!(after.current_policy_version, 2);
+    assert_eq!(after.endpoint_statuses, active.endpoint_statuses);
+    for (version, status) in [(1, "superseded"), (2, "loaded")] {
+        let revision = state
+            .store
+            .get_policy_by_version(sandbox_id, version)
+            .await
+            .expect("load policy revision")
+            .expect("policy revision exists");
+        assert_eq!(revision.status, status, "policy revision {version}");
+    }
 }

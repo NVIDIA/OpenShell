@@ -87,6 +87,28 @@ pub struct L7EvalContext {
     pub(crate) endpoint_observation_tx: Option<EndpointObservationSender>,
 }
 
+impl L7EvalContext {
+    /// Whether the inspected transport is plaintext rather than TLS-terminated.
+    fn is_plaintext(&self) -> bool {
+        self.request_default_port == Some(80)
+    }
+
+    /// HTTP scheme of the inspected transport.
+    pub(crate) fn request_scheme(&self) -> &'static str {
+        if self.is_plaintext() { "http" } else { "https" }
+    }
+
+    /// WebSocket scheme of the inspected transport.
+    pub(crate) fn websocket_scheme(&self) -> &'static str {
+        if self.is_plaintext() { "ws" } else { "wss" }
+    }
+
+    /// OCSF URL for `target` on the inspected transport.
+    pub(crate) fn ocsf_url(&self, target: &str) -> OcsfUrl {
+        OcsfUrl::new(self.request_scheme(), &self.host, target, self.port)
+    }
+}
+
 fn request_default_port(ctx: &L7EvalContext) -> Option<u16> {
     ctx.request_default_port
 }
@@ -731,7 +753,7 @@ where
         Some(http_response_middleware_relay(
             &request,
             ctx,
-            "https",
+            ctx.request_scheme(),
             request_id,
             response_chain,
             engine.middleware_runner(),
@@ -1469,7 +1491,7 @@ where
                     chain,
                     engine.middleware_runner(),
                     ctx,
-                    "wss",
+                    ctx.websocket_scheme(),
                 )
                 .await;
                 let preflight = match preflight {
@@ -1679,10 +1701,7 @@ fn build_l7_request_event(
         .action(action_id)
         .disposition(disposition_id)
         .severity(severity)
-        .http_request(HttpRequest::new(
-            action,
-            OcsfUrl::new("http", &ctx.host, redacted_target, ctx.port),
-        ))
+        .http_request(HttpRequest::new(action, ctx.ocsf_url(redacted_target)))
         .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
         .firewall_rule(&ctx.policy_name, engine_type)
         .message(message)
@@ -1729,7 +1748,7 @@ pub(crate) async fn websocket_middleware_preflight(
     let requested_subprotocols =
         crate::l7::rest::websocket_requested_subprotocols(&req.raw_header[..header_end])?;
     let input = websocket_preflight_input(
-        openshell_ocsf::ctx::ctx(),
+        &openshell_ocsf::ctx::ctx(),
         ctx,
         req,
         scheme,
@@ -2141,7 +2160,7 @@ where
                 .severity(severity)
                 .http_request(HttpRequest::new(
                     &request_info.action,
-                    OcsfUrl::new("http", &ctx.host, &redacted_target, ctx.port),
+                    ctx.ocsf_url(&redacted_target),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                 .firewall_rule(&ctx.policy_name, "l7")
@@ -2216,7 +2235,7 @@ where
                     chain,
                     engine.middleware_runner(),
                     ctx,
-                    "wss",
+                    ctx.websocket_scheme(),
                 )
                 .await;
                 let preflight = match preflight {
@@ -2565,7 +2584,7 @@ where
                 .severity(severity)
                 .http_request(HttpRequest::new(
                     &request_info.action,
-                    OcsfUrl::new("http", &ctx.host, &redacted_target, ctx.port),
+                    ctx.ocsf_url(&redacted_target),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                 .firewall_rule(&ctx.policy_name, jsonrpc_engine_type(config.protocol))
@@ -2851,7 +2870,7 @@ where
                 .severity(severity)
                 .http_request(HttpRequest::new(
                     &request_info.action,
-                    OcsfUrl::new("http", &ctx.host, &redacted_target, ctx.port),
+                    ctx.ocsf_url(&redacted_target),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                 .firewall_rule(&ctx.policy_name, "l7-graphql")
@@ -3322,7 +3341,7 @@ fn emit_transformed_body_decision(
         .severity(severity)
         .http_request(HttpRequest::new(
             &request_info.action,
-            OcsfUrl::new("http", &ctx.host, &request_info.target, ctx.port),
+            ctx.ocsf_url(&request_info.target),
         ))
         .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
         .firewall_rule(&ctx.policy_name, engine_type)
@@ -3556,7 +3575,7 @@ where
                 .severity(SeverityId::Informational)
                 .http_request(HttpRequest::new(
                     &req.action,
-                    OcsfUrl::new("http", &ctx.host, &redacted_target, ctx.port),
+                    ctx.ocsf_url(&redacted_target),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                 .message(format!(
@@ -3589,7 +3608,7 @@ where
                     req,
                     client,
                     ctx,
-                    "http",
+                    ctx.request_scheme(),
                     openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
                 )
                 .await?;
@@ -3663,7 +3682,7 @@ where
         let resolver = ctx.secret_resolver.as_deref();
         let response_middleware = response_selection
             .as_ref()
-            .map(|exchange| exchange.response_relay(&req_with_auth, ctx, "http"));
+            .map(|exchange| exchange.response_relay(&req_with_auth, ctx, ctx.request_scheme()));
 
         // Forward request with credential rewriting and relay the response.
         // relay_http_request_with_resolver handles both directions: it sends
@@ -4766,9 +4785,7 @@ network_policies:
                     seconds: 2,
                     nanos: 0,
                 }),
-                tls_ca_cert_pem: Vec::new(),
-                audience: String::new(),
-                allow_insecure_transport: false,
+                ..Default::default()
             }],
         )
         .await
@@ -5260,22 +5277,19 @@ network_policies:
         tokio_rustls::client::TlsStream<tokio::io::DuplexStream>,
         tokio_rustls::server::TlsStream<tokio::io::DuplexStream>,
     ) {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = rcgen::CertificateParams::new(vec!["api.example.test".into()])
-            .unwrap()
-            .self_signed(&key)
-            .unwrap();
-        let server_config = rustls::ServerConfig::builder()
+        let key = openshell_crypto::pki::generate_keypair().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["api.example.test".into()]).unwrap();
+        let cert = openshell_crypto::pki::self_signed(params, &key).unwrap();
+        let server_config = openshell_crypto::tls::server_builder()
             .with_no_client_auth()
             .with_single_cert(
                 vec![cert.der().clone()],
-                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der().unwrap()).into(),
             )
             .unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.der().clone()).unwrap();
-        let client_config = rustls::ClientConfig::builder()
+        let client_config = openshell_crypto::tls::client_builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
@@ -7392,6 +7406,109 @@ network_policies:
         }
     }
 
+    #[test]
+    fn inspected_schemes_follow_transport() {
+        for (port, http, ws) in [
+            (Some(80), "http", "ws"),
+            (Some(443), "https", "wss"),
+            (None, "https", "wss"),
+        ] {
+            let ctx = L7EvalContext {
+                request_default_port: port,
+                ..Default::default()
+            };
+            assert_eq!(ctx.request_scheme(), http);
+            assert_eq!(ctx.websocket_scheme(), ws);
+        }
+    }
+
+    /// Records the scheme each request reaches middleware with.
+    struct SchemeRecorder(Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[tonic::async_trait]
+    impl openshell_core::middleware::InProcessMiddleware for SchemeRecorder {
+        async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+            LimitService {
+                name: "test/scheme",
+                max_body_bytes: 1024,
+                replacement: None,
+            }
+            .describe()
+            .await
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            request: openshell_core::middleware::HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
+            self.0.lock().unwrap().push(request.target().scheme.clone());
+            Ok(openshell_core::proto::HttpRequestResult {
+                decision: openshell_core::proto::Decision::Allow as i32,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn middleware_request_scheme_matches_inspected_transport() {
+        use openshell_supervisor_middleware::{ChainEntry, ChainRunner, OnError};
+
+        let (_config, tunnel_engine, ctx) =
+            middleware_relay_context("openshell/regex", "fail_closed");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+            vec![Arc::new(SchemeRecorder(seen.clone()))],
+            Vec::new(),
+        )
+        .await
+        .expect("connect named middleware services");
+        let runner = ChainRunner::from_registry(registry);
+        let chain = vec![ChainEntry {
+            name: "scheme".into(),
+            implementation: "test/scheme".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        }];
+
+        for (port, scheme) in [(Some(80), "http"), (Some(443), "https")] {
+            let ctx = L7EvalContext {
+                request_default_port: port,
+                ..ctx.clone()
+            };
+            let req = crate::l7::provider::L7Request {
+                action: "GET".into(),
+                target: "/v1/messages".into(),
+                query_params: std::collections::HashMap::new(),
+                raw_header: b"GET /v1/messages HTTP/1.1\r\nHost: api.example.test\r\n\r\n".to_vec(),
+                body_length: crate::l7::provider::BodyLength::None,
+            };
+            let (_app, mut client) = tokio::io::duplex(8192);
+            let result = apply_middleware_chain_with_request_id(
+                req,
+                &mut client,
+                &ctx,
+                chain.clone(),
+                &runner,
+                tunnel_engine.generation_guard(),
+                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+                "test-request-id",
+            )
+            .await
+            .expect("apply middleware chain");
+            assert!(matches!(result, MiddlewareApplyResult::Allowed(_)));
+            assert_eq!(seen.lock().unwrap().pop().as_deref(), Some(scheme));
+        }
+    }
+
     #[tokio::test]
     async fn all_unresolved_fail_open_forwards_body_unbuffered() {
         // A chain whose only entry is an unregistered binding has no resolvable
@@ -7485,7 +7602,7 @@ network_policies:
         };
 
         let input = middleware_request_input(
-            openshell_ocsf::ctx::ctx(),
+            &openshell_ocsf::ctx::ctx(),
             "http",
             &req,
             &ctx,
@@ -7694,7 +7811,7 @@ network_policies:
         assert_eq!(denied_json["unmapped"]["failed"], false);
         assert_eq!(
             denied_http.format_shorthand(),
-            "HTTP:POST [MED] DENIED POST http://api.example.test:443/v1/messages \
+            "HTTP:POST [MED] DENIED POST https://api.example.test/v1/messages \
              [policy:rest_api engine:middleware] \
              [failed:false transformed:false \
              reason:middleware_denied:content-guard:content_match]"
@@ -7808,6 +7925,88 @@ network_policies:
             .expect("relay should finish")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn passthrough_middleware_scheme_follows_transport() {
+        use openshell_supervisor_middleware::{ChainRunner, MiddlewareRegistry};
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for (port, transport, scheme) in [(8443, 443, "https"), (443, 80, "http")] {
+            seen.lock().unwrap().clear();
+            let data = format!(
+                r#"
+network_middlewares:
+  scheme:
+    middleware: test/scheme
+    on_error: fail_closed
+    endpoints:
+      include: ["api.example.test"]
+network_policies:
+  passthrough_api:
+    name: passthrough_api
+    endpoints:
+      - host: api.example.test
+        port: {port}
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+            );
+            let engine = Arc::new(OpaEngine::from_strings(TEST_POLICY, &data).unwrap());
+            let registry = MiddlewareRegistry::connect_services(
+                vec![Arc::new(SchemeRecorder(seen.clone()))],
+                Vec::new(),
+            )
+            .await
+            .expect("connect named middleware services");
+            engine.set_middleware_runner_for_tests(ChainRunner::from_registry(registry));
+            let generation_guard = engine
+                .generation_guard(engine.current_generation())
+                .unwrap();
+            let ctx = L7EvalContext {
+                host: "api.example.test".into(),
+                port,
+                request_default_port: Some(transport),
+                policy_name: "passthrough_api".into(),
+                binary_path: "/usr/bin/curl".into(),
+                ..Default::default()
+            };
+
+            let (mut app, mut relay_client) = tokio::io::duplex(8192);
+            let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+            let relay = tokio::spawn(async move {
+                relay_passthrough_with_credentials(
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    &ctx,
+                    &generation_guard,
+                    Some(engine.as_ref()),
+                )
+                .await
+            });
+
+            let request = format!(
+                "GET /v1/messages HTTP/1.1\r\nHost: api.example.test:{port}\r\nConnection: close\r\n\r\n"
+            );
+            app.write_all(request.as_bytes()).await.unwrap();
+            let mut upstream_request = [0u8; 1024];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                upstream.read(&mut upstream_request),
+            )
+            .await
+            .expect("request should reach upstream")
+            .unwrap();
+            assert_eq!(*seen.lock().unwrap(), [scheme]);
+
+            drop(app);
+            drop(upstream);
+            tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+                .await
+                .expect("relay should finish")
+                .unwrap()
+                .ok();
+        }
     }
 
     #[tokio::test]
@@ -8903,6 +9102,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "gateway.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "route_api".into(),
             ..Default::default()
         };
@@ -8921,8 +9121,32 @@ network_policies:
         assert_eq!(event.base().severity, SeverityId::Medium);
         assert_eq!(
             event.format_shorthand(),
-            "HTTP:GET [MED] DENIED GET http://gateway.example.test:443/other [policy:route_api engine:l7] [reason:L7_REQUEST deny GET gateway.example.test:443/other reason=no L7 endpoint path matched request]"
+            "HTTP:GET [MED] DENIED GET https://gateway.example.test/other [policy:route_api engine:l7] [reason:L7_REQUEST deny GET gateway.example.test:443/other reason=no L7 endpoint path matched request]"
         );
+    }
+
+    #[test]
+    fn request_event_url_scheme_follows_transport() {
+        for (port, transport, scheme, url) in [
+            (80, 80, "http", "http://api.example.test/v1"),
+            (443, 443, "https", "https://api.example.test/v1"),
+            (8443, 443, "https", "https://api.example.test:8443/v1"),
+            (443, 80, "http", "http://api.example.test:443/v1"),
+        ] {
+            let ctx = L7EvalContext {
+                host: "api.example.test".into(),
+                port,
+                request_default_port: Some(transport),
+                policy_name: "api".into(),
+                ..Default::default()
+            };
+
+            let event = build_l7_request_event(&ctx, "GET", "/v1", "allow", "l7", "ok", None);
+
+            let json = event.to_json().unwrap();
+            assert_eq!(json["http_request"]["url"]["scheme"], scheme);
+            assert!(event.format_shorthand().contains(url), "{url}");
+        }
     }
 
     #[tokio::test]

@@ -846,6 +846,7 @@ mod tests {
             "/openshell.v1.OpenShell/PeerReportProviderReadiness",
             "/openshell.v1.OpenShell/PeerReportEndpointStatus",
             "/openshell.v1.OpenShell/PeerGetSandboxProviderStatus",
+            "/openshell.v1.OpenShell/PeerNotifyConfigUpdate",
         ] {
             assert!(matches!(
                 auth.authenticate(&headers, path).await.unwrap(),
@@ -859,7 +860,7 @@ mod tests {
                 .principal()
                 .is_none()
         );
-        assert_eq!(resolver.seen_tokens.lock().unwrap().len(), 4);
+        assert_eq!(resolver.seen_tokens.lock().unwrap().len(), 5);
     }
 
     fn identity() -> ResolvedGatewayPeerIdentity {

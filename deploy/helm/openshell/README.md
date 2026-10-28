@@ -17,6 +17,23 @@ namespace. The gateway and workspace releases can then be upgraded and removed
 independently. Use Kubernetes `operator` workspace mode when one gateway serves
 multiple pre-provisioned workspace namespaces.
 
+## Certificate hook metadata
+
+Use `pkiInitJob.podLabels` and `pkiInitJob.podAnnotations` to add metadata to the
+Pod templates of the `<fullname>-certgen` and `<fullname>-certgen-backend-ca`
+Jobs. These settings apply to both hooks when enabled and do not affect gateway
+or sandbox Pods. Chart-owned Pod labels take precedence when custom keys
+conflict.
+
+For example, disable Istio sidecar injection for the hook Pods in an injected
+namespace:
+
+```yaml
+pkiInitJob:
+  podAnnotations:
+    sidecar.istio.io/inject: "false"
+```
+
 ## Cluster-scoped vs namespaced objects
 
 Most objects in this chart are namespaced and land in the release namespace.
@@ -190,8 +207,80 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
 - [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - CI overlay for multi-replica external PostgreSQL testing
 - [`ci/values-autoscaling.yaml`](ci/values-autoscaling.yaml) - CI overlay for rendering the optional gateway HorizontalPodAutoscaler
+- [`ci/values-supervisor-autoscaling.yaml`](ci/values-supervisor-autoscaling.yaml) - CI overlay for rendering the optional shared supervisor memory HorizontalPodAutoscaler
 - [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE provider token grants
 - [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
+
+### Additional destination CAs
+
+Create an operator-owned ConfigMap with a `ca.crt` key when sandboxes must reach
+TLS destinations signed by a private CA:
+
+```shell
+kubectl create configmap private-destination-ca -n openshell \
+  --from-file=ca.crt=/path/to/ca.crt
+```
+
+Then set the source ConfigMap name:
+
+```yaml
+supervisor:
+  network:
+    additionalCaConfigMapName: private-destination-ca
+```
+
+The chart mounts the source into the gateway and renders
+`[openshell.supervisor.network].additional_ca_bundle`. The gateway validates
+and normalizes the one certificate-only PEM bundle at startup. The Kubernetes
+driver creates a separate managed ConfigMap in each target sandbox namespace
+and mounts it only in the dedicated supervisor Pod at
+`/etc/openshell/tls/additional/ca-bundle.pem`. That supervisor receives the
+path through `--additional-ca-bundle` and folds the bundle into system roots.
+The configured roots augment default destination trust. They do not configure
+the corporate proxy, OIDC, or gateway callback mTLS trust.
+
+Changing only the source ConfigMap does not roll or reload the gateway. Restart
+the gateway, then recreate or restart affected sandboxes to use the new roots.
+Removing `additionalCaConfigMapName` removes the global TOML setting; newly
+created or recreated sandbox pods then have no additional-CA volume or mount.
+Existing running sandbox supervisors retain their startup trust until they are
+restarted or recreated.
+
+The driver creates one immutable, content-addressed ConfigMap generation in
+each target namespace. Names begin with
+`openshell-additional-ca-` and include DNS-safe hashes of the effective
+gateway ID and normalized bundle generation. Existing objects are accepted only
+when their ownership labels, generation annotation, immutability, and exact
+`ca.crt` data match; the driver never patches or updates them.
+
+Kubernetes cannot restrict `create` by `resourceNames`, and `resourceNames`
+cannot express the digest-bearing name prefix needed for `get`. Enabling this
+feature therefore gives the gateway/driver service account namespace-wide
+ConfigMap `get` and `create` permissions in shared mode. In managed/operator
+modes, the chart's ClusterRoleBinding makes those permissions cluster-wide for
+the bound service account. The chart does not grant ConfigMap `list`, `watch`,
+`patch`, `update`, or `delete`. Use a dedicated gateway service account and
+namespace-scoped bindings when this boundary matters. If you render the TOML
+setting outside this Helm value, grant `get` and `create` in every target
+sandbox namespace.
+
+Disabling the setting intentionally does not delete driver-managed generations:
+the gateway has no ConfigMap list/delete permissions, and an older object may
+still be referenced by a running or stopped sandbox. An operator with separate
+list/delete authority can inventory the gateway's generations by label:
+
+```shell
+kubectl -n <sandbox-namespace> get configmap \
+  -l 'openshell.ai/managed-by=openshell,openshell.ai/gateway-id=<effective-gateway-id>'
+```
+
+Before deleting a named generation, verify that no Sandbox resource or pod
+volume in that namespace references it. Delete only the confirmed unreferenced
+name; removing a referenced generation can make a later pod start or reschedule
+fail closed.
+
+A configured CA can authenticate every policy-permitted TLS endpoint with a
+matching certificate chain and hostname. Scope private CAs accordingly.
 
 ### Database backend
 
@@ -360,6 +449,19 @@ Disabling autoscaling renders `spec.replicas` from `replicaCount` again,
 which defaults to 1, so set `replicaCount` to the replica count you want in
 that upgrade.
 
+Set `supervisor.autoscaling.enabled=true` with the shared supervisor topology
+to autoscale its Deployment independently of the gateway. It uses average
+memory per Pod (`supervisor.autoscaling.targetMemoryAverageValue`, default
+`512Mi`) through the resource metrics API, usually provided by Metrics Server.
+Defaults keep two to four members and remove at most one member every two
+minutes after a five-minute stabilization window. The HPA owns replicas, so
+`supervisor.replicas` is ignored. Enabling it on an existing Deployment has
+the same temporary reset-to-one risk described above; pick up new defaults
+with `--reset-then-reuse-values`. When disabling it, set `supervisor.replicas`
+explicitly. Existing sandboxes stay on their owners when scaling up, and
+memory-based scaling does not guarantee spare capacity for handoff. See the
+[shared supervisor autoscaling guide](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#autoscale-shared-supervisors-by-memory).
+
 ## Secret bootstrap
 
 By default, a pre-install/pre-upgrade hook Job runs `openshell-gateway generate-certs`
@@ -450,6 +552,8 @@ discovery endpoint or its TLS CA.
 | openshiftRoute.host | string | `""` | Hostname for the Route. Must match a SAN on the gateway's server cert. |
 | pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets. When certManager.enabled=true, cert-manager owns TLS and this same hook runs in JWT-only mode even if pkiInitJob.enabled remains true. |
 | pkiInitJob.failOnTimeout | bool | `true` | Fail the helm install/upgrade if cert-manager does not issue the certificate within the polling timeout. When true (default), the install fails immediately if the timeout is reached, providing clear feedback that BackendTLSPolicy is non-functional. When false, the hook succeeds with a warning and you can run `helm upgrade` after cert-manager issues the certificate to create the backend CA ConfigMap. If you set this to false and see "TLS error: Secret is not supplied by SDS" when connecting to the gateway, check if the TLS secret exists and run `helm upgrade` to create the ConfigMap. |
+| pkiInitJob.podAnnotations | object | `{}` | Additional annotations on both certificate hook Pods. |
+| pkiInitJob.podLabels | object | `{}` | Additional labels on both certificate hook Pods. Chart-owned labels take precedence. |
 | pkiInitJob.securityContext.allowPrivilegeEscalation | bool | `false` | Whether the certgen hook container can gain additional privileges. |
 | pkiInitJob.securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the certgen hook container. |
 | pkiInitJob.securityContext.runAsNonRoot | bool | `true` | Require the certgen hook container to run as a non-root user. |
@@ -527,6 +631,7 @@ discovery endpoint or its TLS CA.
 | server.enableUserNamespaces | bool | `false` | Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox pods. Requires Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), plus a supporting container runtime and Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host UID and capabilities become namespaced. |
 | server.enableWebsocketTunnel | bool | `false` | Enable the WebSocket tunnel used by CLI/SDK clients behind an authenticated edge proxy. Leave disabled for direct gateway installs. |
 | server.externalDbSecret | string | `""` | Name of a pre-existing Opaque Secret containing a PostgreSQL connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL from this Secret instead of using dbUrl. The Secret must contain a `uri` key, e.g. postgresql://user:pass@host:5432/dbname. |
+| server.extraEnv | list | `[]` | Additional environment variables for the gateway container, such as OTEL_* exporter settings. Entries can read from a Secret with valueFrom. |
 | server.extraVolumeMounts | list | `[]` | Additional volume mounts for the gateway container. |
 | server.extraVolumes | list | `[]` | Additional volumes for the gateway pod. |
 | server.grpcEndpoint | string | `""` | gRPC endpoint sandboxes call back into the gateway. Leave empty to derive it from the chart fullname, release namespace, service port, and disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080. Override only when sandboxes must reach the gateway via a different hostname (e.g. an external ingress or a host alias). |
@@ -566,6 +671,7 @@ discovery endpoint or its TLS CA.
 | server.sandboxJwt.ttlSecs | int | `3600` | Token TTL in seconds. Defaults to 3600 (1h). |
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |
 | server.sandboxUid | string | `""` | UID for sandbox pods (`sandbox_uid`). Empty (default) = use the OpenShift SCC namespace annotation if present, otherwise the driver default. Must be an integer between 1 and 4294967294. |
+| server.serviceHostnameFormat | string | `""` | Hostname format for exposed sandbox services. Empty or "readable" keeps readable `<workspace>--<sandbox>[--<service>]` hostnames; "hashed" mints opaque one-label hostnames discriminated by the gateway installation name (server.name, defaulting to the release name). The name must be unique among all gateways sharing the service base domain, and renaming the installation changes every minted hostname. |
 | server.telemetryEnabled | bool | `true` | Enable anonymous OpenShell telemetry from the gateway and the sandbox supervisors it launches. |
 | server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
 | server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Only used when enableMtls is true. Set to "" to disable client certificate verification for HTTPS-only mode. |
@@ -580,11 +686,26 @@ discovery endpoint or its TLS CA.
 | serviceAccount.annotations | object | `{}` | Annotations to add to the generated service account. |
 | serviceAccount.create | bool | `true` | Create a service account for the gateway. |
 | serviceAccount.name | string | `""` | Existing service account name to use when serviceAccount.create is false. |
+| supervisor.affinity | object | `{}` | Affinity rules for the shared supervisor pod, rendered only when gatewayConfig selects supervisor_topology = "gateway". Top-level affinity applies only to the gateway pod. |
+| supervisor.autoscaling.behavior | object | `{"scaleDown":{"policies":[{"periodSeconds":120,"type":"Pods","value":1}],"stabilizationWindowSeconds":300}}` | HPA scaling behavior. Remove at most one member every two minutes, after a five-minute stabilization window, to allow ownership handoff. |
+| supervisor.autoscaling.enabled | bool | `false` | Enable memory-based autoscaling of the shared supervisor Deployment. Requires supervisor_topology = "gateway" and the Kubernetes resource metrics API (usually Metrics Server). When enabled, the HPA owns the replica count and supervisor.replicas is ignored. |
+| supervisor.autoscaling.maxReplicas | int | `4` | Maximum supervisor replicas. |
+| supervisor.autoscaling.minReplicas | int | `2` | Minimum supervisor replicas. Keep at least 2 for failover capacity. |
+| supervisor.autoscaling.targetMemoryAverageValue | string | `"512Mi"` | Target average memory working set per supervisor Pod, as a positive Kubernetes quantity. This is an absolute value, not a percentage of requests. Scaling up adds capacity for new sandboxes; it does not move existing sandboxes away from a busy member. |
 | supervisor.image.digest | string | `""` | Supervisor image digest. When set, this takes precedence over tag. |
 | supervisor.image.pullPolicy | string | `nil` | Supervisor image pull policy. Empty uses global.image.pullPolicy. Prefer always, if_not_present, or never; the chart also accepts legacy Kubernetes spellings Always, IfNotPresent, and Never. |
 | supervisor.image.registry | string | `""` | Supervisor image registry. Empty uses global.image.registry. |
 | supervisor.image.repository | string | `"openshell/supervisor"` | Supervisor image repository. |
 | supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
+| supervisor.network.additionalCaConfigMapName | string | `""` | Name of an operator-owned ConfigMap with a `ca.crt` key containing additional destination CA certificates for sandbox supervisors. Empty disables additional destination trust. |
+| supervisor.podDisruptionBudget.enabled | bool | `true` | Render a PodDisruptionBudget with maxUnavailable 1 for the shared supervisor, used only when gatewayConfig selects supervisor_topology = "gateway". Disable it only when maintenance must evict more than one supervisor Pod at a time, or evict a member while another is unavailable. |
+| supervisor.podSecurityContext.fsGroup | int | `65534` | fsGroup assigned to the shared supervisor pod. |
+| supervisor.podSecurityContext.runAsGroup | int | `65534` | Primary GID assigned to the shared supervisor pod. |
+| supervisor.podSecurityContext.runAsNonRoot | bool | `true` | Require the shared supervisor to run as a non-root user. |
+| supervisor.podSecurityContext.runAsUser | int | `65534` | UID assigned to the shared supervisor pod. |
+| supervisor.podSecurityContext.seccompProfile.type | string | `"RuntimeDefault"` | Seccomp profile applied to the shared supervisor pod. |
+| supervisor.recoveryTimeoutSeconds | int | `60` | Seconds a sandbox workload stays frozen after losing its pool member's supervision before the sandbox runtime terminates it, rendered as [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an integer from 30 to 300. Null leaves the gateway's pool default of 60 seconds. |
+| supervisor.replicas | int | `1` | Shared supervisor pool members, used only when gatewayConfig selects supervisor_topology = "gateway". The gateway always coordinates the shared supervisor as a high-availability pool: when a member fails or leaves, another member takes over its sandboxes without restarting their workloads. 1 has no failover; use 2 or more to survive losing a member. Only the supervisor Deployment's replica count depends on this value, so changing it neither restarts the gateway nor replaces running members. Ignored when supervisor.autoscaling.enabled is true. |
 | supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
 | upstreamProxy | object | `{"authAllowInsecure":false,"authSecret":{"key":"","name":""},"caBundle":{"configMapName":"","key":"ca.crt"},"connectByHostname":false,"noProxy":"","url":""}` | Operator-owned corporate forward proxy for policy-approved TLS egress from Kubernetes sandboxes. The workload cannot select or override it. |

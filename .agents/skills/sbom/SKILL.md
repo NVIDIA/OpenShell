@@ -17,6 +17,10 @@ SBOMs are **release artifacts only** -- they are generated on demand and not com
 
 Pushed gateway, sandbox, and supervisor images carry an SPDX SBOM and minimal SLSA provenance as OCI attestations. Branch E2E, Release Dev, Release, and Pre-release image binaries embed cargo-auditable metadata, so their image SBOMs include linked Rust crates.
 
+Stable Release builds retain images and attestations in OCI archive artifacts.
+Publication copies every platform and attestation to GHCR with preserved digests,
+then runs the SBOM verification before updating `latest`.
+
 ## Prerequisites
 
 - `mise install` has been run (installs Syft and other tools)

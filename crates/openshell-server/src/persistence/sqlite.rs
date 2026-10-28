@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
-    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error,
-    map_migrate_error,
+    AtomicWrite, DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
+    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, atomic_write_order,
+    current_time_ms, map_db_error, map_migrate_error,
 };
 use crate::policy_store::{
     AtomicPolicyRevisionWrite, apply_draft_chunk_evaluation, draft_chunk_evaluation_inputs_match,
@@ -209,9 +209,17 @@ impl SqliteStore {
         self.close().await;
     }
 
-    /// Test support only: the pool's effective connection ceiling.
+    /// Runs raw SQL against the test database.
     #[cfg(test)]
-    pub(crate) fn max_connections_for_test(&self) -> u32 {
+    pub(crate) async fn execute_for_test(&self, sql: &'static str) {
+        sqlx::raw_sql(sql)
+            .execute(&self.pool)
+            .await
+            .expect("test SQL");
+    }
+
+    /// The pool's effective connection ceiling.
+    pub fn max_connections(&self) -> u32 {
         self.pool.options().get_max_connections()
     }
 
@@ -518,6 +526,104 @@ RETURNING "resource_version", "created_at_ms", "updated_at_ms"
                 Ok(write_result_from_row(&row))
             }
         }
+    }
+
+    pub async fn write_atomically(
+        &self,
+        writes: &[AtomicWrite],
+    ) -> PersistenceResult<Vec<Option<WriteResult>>> {
+        let now_ms = current_time_ms();
+        let mut results = vec![None; writes.len()];
+        // Dropping the transaction on an early return rolls every write back.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        for index in atomic_write_order(writes) {
+            match &writes[index] {
+                AtomicWrite::Create {
+                    object_type,
+                    id,
+                    name,
+                    workspace,
+                    payload,
+                } => {
+                    sqlx::query(
+                        r#"
+INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, '{}', 1)
+"#,
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(name)
+                    .bind(workspace)
+                    .bind(payload)
+                    .bind(now_ms)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+                    results[index] = Some(WriteResult {
+                        resource_version: 1,
+                        created_at_ms: now_ms,
+                        updated_at_ms: now_ms,
+                    });
+                }
+                AtomicWrite::Update {
+                    object_type,
+                    id,
+                    payload,
+                    expected_version,
+                } => {
+                    let row = sqlx::query(
+                        r#"
+UPDATE "objects"
+SET "payload" = ?4, "updated_at_ms" = ?5, "resource_version" = "resource_version" + 1
+WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+RETURNING "resource_version", "created_at_ms", "updated_at_ms"
+"#,
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(i64::try_from(*expected_version).unwrap_or(i64::MAX))
+                    .bind(payload)
+                    .bind(now_ms)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?
+                    .ok_or(PersistenceError::Conflict {
+                        current_resource_version: None,
+                    })?;
+                    results[index] = Some(write_result_from_row(&row));
+                }
+                AtomicWrite::Delete {
+                    object_type,
+                    id,
+                    expected_version,
+                } => {
+                    let deleted = sqlx::query(
+                        r#"
+DELETE FROM "objects"
+WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+"#,
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(i64::try_from(*expected_version).unwrap_or(i64::MAX))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+                    if deleted.rows_affected() == 0 {
+                        return Err(PersistenceError::Conflict {
+                            current_resource_version: None,
+                        });
+                    }
+                }
+            }
+        }
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(results)
     }
 
     pub async fn delete_if(
@@ -1280,6 +1386,36 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)
         .bind("pending")
         .bind(wrapped_payload)
         .bind(now_ms)
+        .bind(workspace)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    pub async fn put_initial_policy_revision(
+        &self,
+        record: &PolicyRecord,
+        workspace: &str,
+    ) -> PersistenceResult<()> {
+        let wrapped_payload = policy_payload_from_record(record)?;
+        sqlx::query(
+            r#"
+INSERT INTO "objects" (
+    "object_type", "id", "scope", "version", "status", "payload", "created_at_ms", "updated_at_ms", "workspace"
+)
+SELECT ?1, ?2, ?3, 1, ?4, ?5, ?6, ?6, ?7
+WHERE EXISTS (SELECT 1 FROM "objects" WHERE "object_type" = 'sandbox' AND "id" = ?3)
+  AND NOT EXISTS (SELECT 1 FROM "objects" WHERE "object_type" = ?1 AND "scope" = ?3)
+ON CONFLICT DO NOTHING
+"#,
+        )
+        .bind(POLICY_OBJECT_TYPE)
+        .bind(&record.id)
+        .bind(&record.sandbox_id)
+        .bind(&record.status)
+        .bind(wrapped_payload)
+        .bind(record.created_at_ms)
         .bind(workspace)
         .execute(&self.pool)
         .await

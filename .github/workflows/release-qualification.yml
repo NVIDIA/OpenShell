@@ -30,6 +30,10 @@ permissions:
 
 env:
   RELEASE_TAG: ${{ inputs.release-tag }}
+  # TEMPORARY (#4976): squash-merge and revert after v0.1.6 publication is verified.
+  # See CI.md's "Remove the v0.1.6 exception" procedure.
+  PROTO_COMPATIBILITY_EXCEPTION_TAG: ${{ inputs.is-prerelease && startsWith(inputs.release-tag, 'v0.1.6-pre.') && inputs.release-tag || '' }}
+  PROTO_COMPATIBILITY_EXCEPTION_REASON: Release captain accepted protobuf breaking changes for the v0.1.6 prerelease train; migration guidance must accompany the release.
 
 defaults:
   run:
@@ -212,6 +216,11 @@ jobs:
             echo "| Docker E2E | ${DOCKER_E2E_RESULT} |"
             echo "| VM E2E | ${VM_E2E_RESULT} |"
             echo
+            if [[ -n "${PROTO_COMPATIBILITY_EXCEPTION_TAG}" ]]; then
+              echo "- Protobuf compatibility exception: \`${PROTO_COMPATIBILITY_EXCEPTION_TAG}\`"
+              echo "- Reason: ${PROTO_COMPATIBILITY_EXCEPTION_REASON}"
+              echo
+            fi
             echo "Advisory compatibility findings do not affect the qualification result."
             echo "See the Compatibility Review job and compatibility-review-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT} artifact in [this run](${run_url})."
           } >> "${GITHUB_STEP_SUMMARY}"

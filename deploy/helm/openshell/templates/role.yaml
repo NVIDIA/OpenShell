@@ -1,7 +1,9 @@
 {{- $kubernetesConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
 {{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}
 {{- $allowDriverConfig := get $kubernetesConfig "allow_driver_config" | default false -}}
-{{- if and (eq $workspaceMode "shared") (include "openshell.workspaceResourcesEnabled" .) (include "openshell.rbacCreate" .) }}
+{{- $supervisorNetwork := .Values.supervisor.network | default dict -}}
+{{- $additionalCaEnabled := ne (get $supervisorNetwork "additionalCaConfigMapName" | default "") "" -}}
+{{- if and (eq $workspaceMode "shared") (or (include "openshell.workspaceResourcesEnabled" .) $additionalCaEnabled) (include "openshell.rbacCreate" .) }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 apiVersion: rbac.authorization.k8s.io/v1
@@ -12,6 +14,7 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
+  {{- if include "openshell.workspaceResourcesEnabled" . }}
   {{- if $allowDriverConfig }}
   # Metadata-only admission of caller-selected PVCs requires get permission.
   - apiGroups: [""]
@@ -67,4 +70,13 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get"]
+  {{- end }}
+  {{- if $additionalCaEnabled }}
+  # Immutable, content-addressed destination-CA generations are verified by
+  # exact name. The driver intentionally has no list/watch/patch/update/delete
+  # capability for ConfigMaps, so retained generations cannot be mutated.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create"]
+  {{- end }}
 {{- end }}

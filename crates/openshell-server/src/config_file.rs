@@ -26,9 +26,11 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
-use openshell_core::proto::SupervisorMiddlewareService;
+use openshell_core::proto::{
+    SupervisorMiddlewareBinding, SupervisorMiddlewareBindingPolicy, SupervisorMiddlewareService,
+};
 use openshell_core::{
-    GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
+    ExtensionBindingPolicy, GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
     GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig,
 };
 use serde::{Deserialize, Serialize};
@@ -147,6 +149,9 @@ pub struct GatewayFileSection {
     /// Security posture when a sandbox rejects a candidate policy generation.
     #[serde(default)]
     pub policy_validation_failure_mode: Option<openshell_core::PolicyValidationFailureMode>,
+    /// Supervisor configuration delivery; omitted uses the release default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_delivery_mode: Option<openshell_core::config::ConfigDeliveryMode>,
 
     // ── Service routing ──────────────────────────────────────────────────
     /// Subject Alternative Names configured on the gateway server certificate.
@@ -156,6 +161,11 @@ pub struct GatewayFileSection {
     /// Enable plaintext HTTP routing for loopback sandbox service URLs.
     #[serde(default)]
     pub enable_loopback_service_http: Option<bool>,
+    /// Hostname format for exposed sandbox services: `readable` (default) or
+    /// `hashed` (opaque one-label hostnames discriminated by the gateway
+    /// installation name).
+    #[serde(default)]
+    pub service_hostname_format: Option<openshell_core::config::ServiceHostnameFormat>,
     /// Enable the WebSocket tunnel for an authenticated edge proxy.
     #[serde(default)]
     pub enable_websocket_tunnel: Option<bool>,
@@ -189,6 +199,9 @@ pub struct GatewayFileSection {
     pub otlp: Option<OtlpConfig>,
     #[serde(default)]
     pub ocsf_log: Option<OcsfLogConfig>,
+    /// Tuning of the shared supervisor pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_pool: Option<SupervisorPoolConfig>,
 
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
@@ -197,6 +210,25 @@ pub struct GatewayFileSection {
     // rejected in [`load`].
     #[serde(default)]
     pub database_url: Option<String>,
+}
+
+/// `[openshell.gateway.supervisor_pool]`: optional tuning of the shared
+/// supervisor pool.
+///
+/// The shared supervisor always runs as a pool that the gateway coordinates
+/// for high availability: it places each sandbox instance on a live member by
+/// consistent hash, records its owner durably, and moves the instances of a
+/// failed or leaving member to another member, which adopts their running
+/// workloads. Without this table the defaults apply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorPoolConfig {
+    /// Seconds a sandbox runtime keeps its workload frozen after losing its
+    /// supervisor before terminating it, from 30 to 300. The pool's
+    /// supervisors offer it to each runtime; unset offers
+    /// [`openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_timeout_secs: Option<u32>,
 }
 
 /// Gateway listener TLS fields accepted in `gateway.toml`.
@@ -285,12 +317,13 @@ impl TryFrom<RawOcsfLogConfig> for OcsfLogConfig {
 /// `[openshell.gateway.otlp]` section and its per-signal tables.
 ///
 /// `endpoint` is the collector for every enabled signal, and on its own
-/// enables trace export. `[otlp.traces]` overrides the trace endpoint, and
+/// enables trace export. `[otlp.traces]` overrides the trace endpoint,
 /// `[otlp.ocsf]` with `enabled = true` exports OCSF events as log records,
-/// optionally to a different endpoint. `[otlp.metrics]` with `enabled = true`,
-/// or `metrics = true`, pushes gateway metrics. SDK tuning knobs are deliberately
-/// absent. See [`crate::otel_tracing`] for what this table owns and what the
-/// `OTEL_*` environment variables own.
+/// `[otlp.agent]` with `enabled = true` relays workload traces, and
+/// `[otlp.metrics]` with `enabled = true`, or `metrics = true`, pushes gateway
+/// metrics, each optionally to a different endpoint. SDK tuning knobs are
+/// deliberately absent. See [`crate::otel_tracing`] for what this table owns
+/// and what the `OTEL_*` environment variables own.
 ///
 /// Endpoints are resolved when parsing, so each enabled signal carries its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,6 +352,14 @@ pub struct OtlpConfig {
         serialize_with = "serialize_enabled"
     )]
     pub metrics: Option<OtlpMetricsConfig>,
+
+    /// Relay of workload traces from sandboxes, when enabled.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_enabled"
+    )]
+    pub agent: Option<AgentOtlpConfig>,
 }
 
 /// Writes `enabled = true` so that a serialized config parses back to the
@@ -346,6 +387,12 @@ impl OtlpConfig {
     /// The collector that receives traces, when trace export is enabled.
     pub fn traces_endpoint(&self) -> Option<&str> {
         self.traces.as_ref().map(|traces| traces.endpoint.as_str())
+    }
+
+    /// The collector that receives relayed workload traces, when the agent
+    /// trace relay is enabled.
+    pub fn agent_endpoint(&self) -> Option<&str> {
+        self.agent.as_ref().map(|agent| agent.endpoint.as_str())
     }
 }
 
@@ -375,6 +422,14 @@ pub struct OcsfOtlpConfig {
     pub schema_version: Option<OcsfSchemaVersion>,
 }
 
+/// `[openshell.gateway.otlp.agent]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOtlpConfig {
+    /// OTLP/gRPC collector endpoint that sandbox supervisors forward
+    /// workload traces to.
+    pub endpoint: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawOtlpConfig {
@@ -388,6 +443,8 @@ struct RawOtlpConfig {
     ocsf: Option<RawOcsfOtlp>,
     #[serde(default)]
     metrics: Option<RawOtlpMetrics>,
+    #[serde(default)]
+    agent: Option<RawAgentOtlp>,
 }
 
 /// `metrics = true`, or a table with an optional endpoint.
@@ -401,6 +458,15 @@ enum RawOtlpMetrics {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawOtlpMetricsTable {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    endpoint: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAgentOtlp {
     #[serde(default)]
     enabled: bool,
     #[serde(default)]
@@ -465,9 +531,18 @@ impl TryFrom<RawOtlpConfig> for OtlpConfig {
                 })
             })
             .transpose()?;
-        if traces.is_none() && ocsf.is_none() && metrics.is_none() {
+        let agent = raw
+            .agent
+            .filter(|agent| agent.enabled)
+            .map(|agent| {
+                Ok::<_, String>(AgentOtlpConfig {
+                    endpoint: endpoint_for("agent", agent.endpoint)?,
+                })
+            })
+            .transpose()?;
+        if traces.is_none() && ocsf.is_none() && metrics.is_none() && agent.is_none() {
             return Err(
-                "otlp needs an endpoint, or otlp.ocsf or otlp.metrics with enabled = true"
+                "otlp needs an endpoint, or otlp.ocsf, otlp.metrics or otlp.agent with enabled = true"
                     .to_string(),
             );
         }
@@ -476,6 +551,7 @@ impl TryFrom<RawOtlpConfig> for OtlpConfig {
             traces,
             ocsf,
             metrics,
+            agent,
         })
     }
 }
@@ -491,6 +567,22 @@ pub struct SupervisorFileSection {
     /// operator-owned and changes require a gateway restart.
     #[serde(default)]
     pub middleware: Vec<MiddlewareServiceFileConfig>,
+    /// Shared network-supervisor configuration. This is intentionally outside
+    /// the compute-driver tables so every supported driver consumes the same
+    /// startup contract.
+    #[serde(default)]
+    pub network: SupervisorNetworkFileSection,
+}
+
+/// `[openshell.supervisor.network]` configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorNetworkFileSection {
+    /// Gateway-local pre-assembled PEM bundle whose certificates augment the
+    /// supervisor's destination trust roots. The gateway validates and stages
+    /// this single file during startup before any compute driver is constructed.
+    #[serde(default)]
+    pub additional_ca_bundle: Option<PathBuf>,
 }
 
 impl ConfigFile {
@@ -555,6 +647,12 @@ pub struct MiddlewareServiceFileConfig {
     /// Default RPC timeout using an integer with an `ms` or `s` suffix.
     #[serde(default)]
     pub timeout: Option<String>,
+    /// Which advertised operation/phase pairs the operator authorizes.
+    #[serde(default)]
+    pub binding_policy: ExtensionBindingPolicy,
+    /// Required operation/phase pairs for an allowlist or exact policy.
+    #[serde(default)]
+    pub bindings: Vec<SupervisorMiddlewareBinding>,
 }
 
 impl TryFrom<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
@@ -574,9 +672,25 @@ impl TryFrom<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
             None => Vec::new(),
         };
 
+        let binding_policy = match config.binding_policy {
+            // Preserve the wire config and revision of registrations using the default.
+            ExtensionBindingPolicy::Dynamic => SupervisorMiddlewareBindingPolicy::Unspecified,
+            ExtensionBindingPolicy::Allowlist => SupervisorMiddlewareBindingPolicy::Allowlist,
+            ExtensionBindingPolicy::Exact => SupervisorMiddlewareBindingPolicy::Exact,
+        };
+        // Binding order has no meaning and must not change the configuration revision.
+        // Keep duplicates so registration validation can report them.
+        let mut bindings: Vec<_> = config
+            .bindings
+            .iter()
+            .map(|binding| *binding as i32)
+            .collect();
+        bindings.sort_unstable();
         Ok(Self {
             name: config.name.clone(),
             grpc_endpoint: config.grpc_endpoint.clone(),
+            binding_policy: binding_policy.into(),
+            bindings,
             max_payload_bytes: config.max_payload_bytes,
             request_timeout: config
                 .timeout
@@ -844,6 +958,20 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
             message: "omit the field to use default encrypted gateway credential storage, or specify exactly one external credential driver",
         });
     }
+    if file
+        .openshell
+        .gateway
+        .supervisor_pool
+        .and_then(|pool| pool.recovery_timeout_secs)
+        .is_some_and(|timeout| {
+            !openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_RANGE.contains(&timeout)
+        })
+    {
+        return Err(ConfigFileError::InvalidValue {
+            field: "openshell.gateway.supervisor_pool.recovery_timeout_secs",
+            message: "must be between 30 and 300 seconds",
+        });
+    }
     if let Some((name, _)) = file
         .openshell
         .drivers
@@ -851,6 +979,19 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
         .find(|(_, value)| !value.is_table())
     {
         return Err(ConfigFileError::InvalidDriverTable { name: name.clone() });
+    }
+    if file
+        .openshell
+        .supervisor
+        .network
+        .additional_ca_bundle
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(ConfigFileError::InvalidValue {
+            field: "openshell.supervisor.network.additional_ca_bundle",
+            message: "path must not be empty",
+        });
     }
 
     openshell_core::isolation_registration::validate_registrations(
@@ -1148,6 +1289,32 @@ compute_driver = 42
     }
 
     #[test]
+    fn service_hostname_format_parses_and_serializes() {
+        let file = toml::from_str::<ConfigFile>(
+            r#"
+[openshell]
+version = 2
+
+[openshell.gateway]
+service_hostname_format = "hashed"
+"#,
+        )
+        .expect("service hostname format parses");
+
+        assert_eq!(
+            file.openshell.gateway.service_hostname_format,
+            Some(openshell_core::config::ServiceHostnameFormat::Hashed)
+        );
+
+        let serialized = toml::to_string(&file).expect("config serializes");
+        assert!(serialized.contains("service_hostname_format = \"hashed\""));
+
+        let unset = toml::from_str::<ConfigFile>("[openshell]\nversion = 2\n")
+            .expect("file without the field parses");
+        assert!(unset.openshell.gateway.service_hostname_format.is_none());
+    }
+
+    #[test]
     fn parses_full_example() {
         let toml = r#"
 [openshell]
@@ -1435,11 +1602,53 @@ service_name = "openshell-gateway-dev"
     }
 
     #[test]
+    fn otlp_agent_relay_is_off_unless_enabled() {
+        for agent in ["", "enabled = false\n", "endpoint = 'http://agents:4317'\n"] {
+            let otlp = otlp(&format!(
+                "[openshell.gateway.otlp]\nendpoint = 'http://127.0.0.1:4317'\n\n\
+                 [openshell.gateway.otlp.agent]\n{agent}"
+            ));
+            assert_eq!(
+                otlp.agent_endpoint(),
+                None,
+                "enabled the relay with {agent:?}"
+            );
+        }
+        let otlp = otlp("[openshell.gateway.otlp]\nendpoint = 'http://127.0.0.1:4317'\n");
+        assert_eq!(otlp.agent_endpoint(), None);
+    }
+
+    #[test]
+    fn otlp_agent_relay_defaults_to_the_shared_endpoint() {
+        let otlp = otlp(
+            "[openshell.gateway.otlp]\nendpoint = 'http://shared:4317'\n\n\
+             [openshell.gateway.otlp.traces]\nendpoint = 'http://traces:4317'\n\n\
+             [openshell.gateway.otlp.agent]\nenabled = true\n",
+        );
+        assert_eq!(otlp.traces_endpoint(), Some("http://traces:4317"));
+        assert_eq!(otlp.agent_endpoint(), Some("http://shared:4317"));
+    }
+
+    #[test]
+    fn otlp_agent_relay_uses_its_own_endpoint() {
+        let otlp = otlp(
+            "[openshell.gateway.otlp.agent]\nenabled = true\nendpoint = 'http://agents:4317'\n",
+        );
+        assert_eq!(otlp.traces_endpoint(), None);
+        assert_eq!(otlp.agent_endpoint(), Some("http://agents:4317"));
+
+        let tmp = write_tmp("[openshell.gateway.otlp.agent]\nenabled = true\n");
+        let error = load(tmp.path()).expect_err("an enabled relay needs an endpoint");
+        assert!(format!("{error:#}").contains("otlp.agent needs an endpoint"));
+    }
+
+    #[test]
     fn otlp_config_round_trips() {
         let tmp = write_tmp(
             "[openshell.gateway.otlp]\nendpoint = 'http://shared:4317'\nservice_name = 'gw'\n\n\
              [openshell.gateway.otlp.ocsf]\nenabled = true\nschema_version = '1.3'\n\n\
-             [openshell.gateway.otlp.metrics]\nenabled = true\nendpoint = 'http://metrics:4317'\n",
+             [openshell.gateway.otlp.metrics]\nenabled = true\nendpoint = 'http://metrics:4317'\n\n\
+             [openshell.gateway.otlp.agent]\nenabled = true\nendpoint = 'http://agents:4317'\n",
         );
         let file = load(tmp.path()).unwrap();
         let encoded = toml::to_string(&file).unwrap();
@@ -1508,6 +1717,29 @@ policy_validation_failure_mode = "keep_old"
     }
 
     #[test]
+    fn parses_delivery_mode_and_rejects_unknown_value() {
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway]
+config_delivery_mode = "push"
+"#,
+        );
+        let file = load(tmp.path()).unwrap();
+        assert_eq!(
+            file.openshell.gateway.config_delivery_mode,
+            Some(openshell_core::config::ConfigDeliveryMode::Push)
+        );
+
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway]
+config_delivery_mode = "enabled"
+"#,
+        );
+        assert!(load(tmp.path()).is_err());
+    }
+
+    #[test]
     fn parses_gateway_auth_config() {
         let toml = r"
 [openshell.gateway.auth]
@@ -1520,9 +1752,69 @@ allow_unauthenticated_users = true
     }
 
     #[test]
+    fn parses_supervisor_network_additional_ca_bundle() {
+        let tmp = write_tmp(
+            r#"
+[openshell.supervisor.network]
+additional_ca_bundle = "/etc/openshell/ca-bundle.crt"
+"#,
+        );
+
+        let file = load(tmp.path()).expect("network supervisor config parses");
+        assert_eq!(
+            file.openshell.supervisor.network.additional_ca_bundle,
+            Some(PathBuf::from("/etc/openshell/ca-bundle.crt"))
+        );
+    }
+
+    #[test]
+    fn supervisor_network_additional_ca_bundle_defaults_to_unset() {
+        let file: ConfigFile = toml::from_str("[openshell.supervisor]\n").expect("valid config");
+        assert!(
+            file.openshell
+                .supervisor
+                .network
+                .additional_ca_bundle
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn supervisor_network_rejects_unknown_fields() {
+        let tmp = write_tmp(
+            r"
+[openshell.supervisor.network]
+unknown = true
+",
+        );
+        assert!(matches!(
+            load(tmp.path()),
+            Err(ConfigFileError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn supervisor_network_rejects_empty_ca_bundle_path() {
+        let tmp = write_tmp(
+            r#"
+[openshell.supervisor.network]
+additional_ca_bundle = ""
+"#,
+        );
+        let error = load(tmp.path()).expect_err("empty source paths must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("openshell.supervisor.network.additional_ca_bundle")
+        );
+        assert!(error.to_string().contains("must not be empty"));
+    }
+
+    #[test]
     fn parses_supervisor_middleware_registration() {
-        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-            .expect("test certificate");
+        let certificate =
+            openshell_crypto::pki::generate_simple_self_signed(vec!["localhost".to_string()])
+                .expect("test certificate");
         let mut ca = tempfile::Builder::new()
             .suffix(".pem")
             .tempfile()
@@ -1551,6 +1843,8 @@ timeout = "2s"
                 allow_insecure_transport: false,
                 max_payload_bytes: 262_144,
                 timeout: Some("2s".into()),
+                binding_policy: ExtensionBindingPolicy::Dynamic,
+                bindings: vec![],
             }]
         );
         let registration =
@@ -1569,6 +1863,40 @@ timeout = "2s"
     }
 
     #[test]
+    fn supervisor_middleware_binding_policy_reaches_wire_configuration() {
+        use SupervisorMiddlewareBinding::{HttpRequestPreCredentials, HttpResponsePreReturn};
+        use SupervisorMiddlewareBindingPolicy::{Allowlist, Unspecified};
+
+        let toml = r#"
+name = "guard"
+grpc_endpoint = "https://guard.example:50051"
+max_payload_bytes = 1024
+"#;
+        let parse = |text: &str| {
+            let config: MiddlewareServiceFileConfig = ::toml::from_str(text).unwrap();
+            SupervisorMiddlewareService::try_from(&config).unwrap()
+        };
+        let default = parse(toml);
+        assert_eq!(default.binding_policy, Unspecified as i32);
+        assert!(default.bindings.is_empty());
+
+        let registration = parse(&format!(
+            r#"{toml}
+binding_policy = "allowlist"
+bindings = ["http_response_pre_return", "http_request_pre_credentials"]
+"#
+        ));
+        assert_eq!(registration.binding_policy, Allowlist as i32);
+        assert_eq!(
+            registration.bindings,
+            [
+                HttpRequestPreCredentials as i32,
+                HttpResponsePreReturn as i32
+            ]
+        );
+    }
+
+    #[test]
     fn middleware_registration_defaults_audience_to_name() {
         let mut config = MiddlewareServiceFileConfig {
             name: "local-guard".into(),
@@ -1578,6 +1906,8 @@ timeout = "2s"
             allow_insecure_transport: false,
             max_payload_bytes: 262_144,
             timeout: None,
+            binding_policy: ExtensionBindingPolicy::Dynamic,
+            bindings: vec![],
         };
 
         let registration = SupervisorMiddlewareService::try_from(&config).unwrap();
@@ -1610,6 +1940,8 @@ timeout = "2s"
             allow_insecure_transport: false,
             max_payload_bytes: 262_144,
             timeout: None,
+            binding_policy: ExtensionBindingPolicy::Dynamic,
+            bindings: vec![],
         };
 
         let error = SupervisorMiddlewareService::try_from(&config)
@@ -1625,14 +1957,15 @@ timeout = "2s"
         use std::io::Write as _;
 
         let certificate =
-            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("test certificate");
+            openshell_crypto::pki::generate_simple_self_signed(vec!["localhost".into()])
+                .expect("test certificate");
         let mut ca = tempfile::Builder::new()
             .suffix(".pem")
             .tempfile()
             .expect("CA tempfile");
         ca.write_all(certificate.cert.pem().as_bytes())
             .expect("write certificate");
-        ca.write_all(certificate.key_pair.serialize_pem().as_bytes())
+        ca.write_all(certificate.key_pair.serialize_pem().unwrap().as_bytes())
             .expect("write private key");
         let config = MiddlewareServiceFileConfig {
             name: "local-guard".into(),
@@ -1642,6 +1975,8 @@ timeout = "2s"
             allow_insecure_transport: false,
             max_payload_bytes: 262_144,
             timeout: None,
+            binding_policy: ExtensionBindingPolicy::Dynamic,
+            bindings: vec![],
         };
 
         let error = SupervisorMiddlewareService::try_from(&config)
@@ -1808,6 +2143,50 @@ database_lock_max_connections = 0
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_the_supervisor_pool_tuning() {
+        let pool = |table: &str| {
+            let tmp = write_tmp(&format!("[openshell.gateway.supervisor_pool]\n{table}"));
+            load(tmp.path()).map(|file| file.openshell.gateway.supervisor_pool)
+        };
+        let configured = pool("recovery_timeout_secs = 90\n").unwrap().unwrap();
+        assert_eq!(configured.recovery_timeout_secs, Some(90));
+        assert_eq!(pool("").unwrap().unwrap().recovery_timeout_secs, None);
+        let tmp = write_tmp("[openshell.gateway]\n");
+        assert!(
+            load(tmp.path())
+                .unwrap()
+                .openshell
+                .gateway
+                .supervisor_pool
+                .is_none()
+        );
+        // Recovery stays bounded, and unknown keys, including the removed
+        // `enabled` switch, are refused.
+        assert_eq!(
+            pool("recovery_timeout_secs = 30\n")
+                .unwrap()
+                .unwrap()
+                .recovery_timeout_secs,
+            Some(30)
+        );
+        for out_of_range in ["10", "29", "301"] {
+            assert!(matches!(
+                pool(&format!("recovery_timeout_secs = {out_of_range}\n")),
+                Err(ConfigFileError::InvalidValue {
+                    field: "openshell.gateway.supervisor_pool.recovery_timeout_secs",
+                    ..
+                })
+            ));
+        }
+        for unknown in ["enabled = true\n", "high_availability = true\n"] {
+            assert!(
+                matches!(pool(unknown), Err(ConfigFileError::Parse { .. })),
+                "{unknown}"
+            );
+        }
     }
 
     #[test]

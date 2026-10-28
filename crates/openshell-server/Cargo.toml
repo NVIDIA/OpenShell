@@ -11,6 +11,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+openshell-crypto = { workspace = true, features = ["tls-kube", "tls-sqlx"] }
 openshell-bootstrap = { path = "../openshell-bootstrap" }
 openshell-core = { path = "../openshell-core", default-features = false, features = ["jwt", "oauth"] }
 openshell-driver-db-credstore = { path = "../openshell-driver-db-credstore" }
@@ -24,6 +25,7 @@ openshell-policy = { path = "../openshell-policy" }
 openshell-prover = { path = "../openshell-prover" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
+openshell-supervisor-control = { path = "../openshell-supervisor-control" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 
 # Kubernetes client used by ServiceAccount bootstrap authentication and the
@@ -106,7 +108,7 @@ async-trait = "0.1"
 url = { workspace = true }
 glob = { workspace = true }
 hex = "0.4"
-russh = "0.63.1"
+russh = "0.64.1"
 rand = { workspace = true }
 rand-ssh = { package = "rand", version = "0.10" }
 petname = "2"
@@ -139,7 +141,7 @@ tokio = { workspace = true, features = ["test-util"] }
 openshell-providers = { path = "../openshell-providers", features = ["example-profiles"] }
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 base64 = { workspace = true }
-hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "aws-lc-rs"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging"] }
 rcgen = { workspace = true }
 rsa = { version = "0.9", features = ["pem"] }
 tokio-tungstenite = { workspace = true }

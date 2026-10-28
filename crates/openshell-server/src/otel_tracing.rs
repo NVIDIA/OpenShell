@@ -121,6 +121,9 @@ pub struct OtlpExport {
     traces: Option<Signal<SdkTracerProvider>>,
     ocsf: Option<Signal<OcsfOtlp>>,
     metrics: Option<Signal<SdkMeterProvider>>,
+    /// Validated collector that supervisors relay workload traces to. The
+    /// gateway itself exports nothing for this signal.
+    agent_endpoint: Option<String>,
 }
 
 /// One signal's exporter and the endpoint it sends to.
@@ -191,11 +194,22 @@ impl OtlpExport {
                 Ok::<_, SetupError>(Signal::new(&target, target.meter_provider()?))
             })
             .transpose()?;
+        let agent_endpoint = cfg
+            .agent_endpoint()
+            .map(|endpoint| target(endpoint).map(|target| target.endpoint().to_string()))
+            .transpose()?;
         Ok(Self {
             traces,
             ocsf,
             metrics,
+            agent_endpoint,
         })
+    }
+
+    /// The collector that supervisors relay workload traces to, when the
+    /// agent trace relay is enabled.
+    pub fn agent_endpoint(&self) -> Option<&str> {
+        self.agent_endpoint.as_deref()
     }
 
     /// The collector receiving traces, when trace export is enabled.
@@ -611,6 +625,7 @@ mod tests {
             }),
             ocsf: None,
             metrics: None,
+            agent: None,
         }
     }
 
@@ -970,10 +985,15 @@ mod tests {
         bad_ocsf.ocsf = Some(ocsf_config("definitely not a url"));
         let mut bad_metrics = config();
         bad_metrics.metrics = Some(metrics_config("definitely not a url"));
+        let mut bad_agent = config();
+        bad_agent.agent = Some(crate::config_file::AgentOtlpConfig {
+            endpoint: "definitely not a url".into(),
+        });
         for cfg in [
             with_traces_endpoint("definitely not a url"),
             bad_ocsf,
             bad_metrics,
+            bad_agent,
         ] {
             let (export, err) = OtlpExport::start(Some(&cfg), GatewayResourceAttributes::default());
             assert!(

@@ -125,19 +125,19 @@ async fn vm_gateway_restart_preserves_running_and_stopped_intent() {
             .expect("create VM sandbox that will remain stopped");
     let (stop_output, stop_code) = run_cli(&["sandbox", "stop", &stopped_sandbox.name]).await;
     assert_eq!(stop_code, 0, "sandbox stop should succeed:\n{stop_output}");
-    wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_secs(120))
+    wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_mins(2))
         .await
         .expect("VM sandbox should be stopped before gateway restart");
 
     gateway.stop().expect("stop e2e gateway");
-    wait_for_vm_stopped_marker(&sandbox.name, true, Duration::from_secs(60))
+    wait_for_vm_stopped_marker(&sandbox.name, true, Duration::from_mins(1))
         .await
         .expect("gateway shutdown should stop the running-intent VM through its driver");
     gateway.start().expect("restart e2e gateway");
-    wait_for_healthy(Duration::from_secs(120))
+    wait_for_healthy(Duration::from_mins(2))
         .await
         .expect("gateway should become healthy after restart");
-    wait_for_vm_stopped_marker(&sandbox.name, false, Duration::from_secs(120))
+    wait_for_vm_stopped_marker(&sandbox.name, false, Duration::from_mins(2))
         .await
         .expect("gateway startup should restart the running-intent VM");
 
@@ -147,7 +147,7 @@ async fn vm_gateway_restart_preserves_running_and_stopped_intent() {
         "sandbox '{}' should still be listed after gateway restart. Names: {names:?}",
         sandbox.name
     );
-    wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_secs(120))
+    wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_mins(2))
         .await
         .expect("explicitly stopped VM sandbox should remain stopped after restart");
 
@@ -155,7 +155,7 @@ async fn vm_gateway_restart_preserves_running_and_stopped_intent() {
         &sandbox.name,
         &["cat", START_FILE],
         "before-restart",
-        Duration::from_secs(240),
+        Duration::from_mins(4),
     )
     .await
     .expect("VM sandbox should become ready again with its overlay state preserved");

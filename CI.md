@@ -19,7 +19,7 @@ Merge queue validation is a second integration gate for `main`. After a PR has p
 
 ### Protobuf API compatibility
 
-`Protobuf Compatibility` runs in Branch Checks, Release, and Pre-release through the shared
+`Protobuf Compatibility` runs in Branch Checks and Pre-release through the shared
 `check-protobuf-compatibility` action and Nix app. The app supplies Python, Buf,
 and Git from the flake lockfile.
 It uses Buf's `FILE` policy for the `proto/`
@@ -48,6 +48,14 @@ remains in Actions. This checks
 protobuf compatibility; SDK/configuration compatibility and migration review
 remain separate qualification work.
 
+The release qualification workflow has a release-captain-approved exception
+for all `v0.1.6-pre.N` candidates, including replacement candidates after a failed
+run. It still runs Buf and fails on compilation or tooling
+errors, but accepts detected protobuf breaking changes for that tag. The run
+summary and qualification JSON's `exceptions` array record the scope and reason.
+Other versions retain the normal version policy. Remove the workflow exception
+after promotion; release notes must describe the accepted changes and migration.
+
 Fetch the target and tags to check committed branch changes locally, replacing
 `origin/main` for another target:
 
@@ -67,11 +75,42 @@ For an intentional minor-train incompatibility, record the Buf finding,
 linked issue, consumer impact, and migration plan in the PR. Keep the finding
 visible; do not disable the job or add a broad Buf ignore rule.
 
-Windows PR checks are opt-in: add `test:windows`, then select **Re-run all jobs**
+### Remove the v0.1.6 exception
+
+Squash-merge [PR #4976](https://github.com/NVIDIA/OpenShell/pull/4976) so the
+exception, checker support, qualification metadata, tests, and temporary guidance
+can be removed together with one revert. After verifying stable v0.1.6 publication,
+open a cleanup PR from current `main` and revert that PR's squash-merge commit:
+
+```shell
+git revert --no-commit <PR-4976-squash-merge-sha>
+git commit --signoff -m "revert(ci): remove temporary v0.1.6 protobuf exception"
+```
+
+Use the final squash-merge SHA shown on the merged PR, not a branch commit SHA.
+Validate the reverted workflow with Actionlint and run the normal protobuf check
+before merging the cleanup. Reverting the whole PR restores normal enforcement
+and removes the exception mechanism; do not leave the bypass support behind.
+
+### Windows validation
+
+Native Windows implementation and releases use the
+[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows), independently
+of the `main` release train described in this document. Shared documentation on
+`main` must retain that branch placement. See [WINDOWS.md](WINDOWS.md) for the
+native MSVC build and MXC runtime requirements.
+
+The [Windows MSVC workflow on `windows`](https://github.com/NVIDIA/OpenShell/blob/windows/.github/workflows/windows-msvc.yml)
+runs native x64 and ARM64 lanes. Windows PR checks are opt-in: add
+`test:windows`, then select **Re-run all jobs**
 on the current Windows MSVC run. Subsequent mirrored commits run them automatically.
 Windows checks are not required for merging and do not run in merge queues.
-Main and manual runs also build release binaries, with `continue-on-error: true`
-so Windows failures do not fail the workflow.
+Pushes to `windows` and manual runs on that branch seed the lint/test caches and run dependent
+release binary builds. Those jobs use `continue-on-error: true`, so inspect
+their individual results rather than treating a green workflow as qualification.
+The jobs do not upload or publish the binaries. Native Windows packages are
+not supplied through the `main` installer or release train. Real MXC runtime qualification requires a
+capable host and the [Windows runtime tests](https://github.com/NVIDIA/OpenShell/blob/windows/TESTING.md#native-windows-validation).
 
 ### Advisory compatibility review
 
@@ -279,7 +318,7 @@ reviewed and accepted for v0.1.0 and will be addressed in 0.1.x releases.
 Scanner failures still fail qualification.
 
 Failed pre-release builds, publication, or qualification send notifications via Slack using a webhook and
-at-mentioning the triage engineer with a link to the failure. The webhook is
+at-mentioning the triage engineer, with links to each failed job and to the run. The webhook is
 stored in the repository secret `SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL` and the
 mention is stored in the repository secret `SLACK_OPENSHELL_TRIAGE_MENTION`.
 Successful pre-release builds post a top-level message to the same webhook
@@ -322,11 +361,12 @@ jobs:
 ```
 
 Set `needs: security` on a downstream promotion job to require successful scans.
-`Release` and `Pre-release` share `release-build.yml`, `release-publish.yml`, and
-`release-qualification.yml`. Release builds, qualifies, then publishes. Pre-release
-builds, then publishes and qualifies in parallel within the same run, using native job dependencies.
+`Release` and `Pre-release` share `release-build.yml` and `release-publish.yml`.
+Pre-release builds, then publishes and calls `release-qualification.yml` in
+parallel within the same run, using native job dependencies.
 Its platform package artifacts are uploaded after versioned images and the chart,
 so the installer can use them while qualification runs or after it fails.
+The pre-release snap artifact is published to the `latest/beta` channel.
 The implemented `release-tag-v1` profile is an incremental subset of RFC 0014
 qualification. Failed checks fail the parent workflow and retain evidence in Actions.
 
@@ -337,6 +377,94 @@ workflow attempts to publish passing and failing summaries to
 The summary contains qualification results and policy coverage only; artifact
 identity belongs in the release manifest. The run ID and attempt distinguish
 reruns without overwriting earlier evidence.
+
+`release-notes.yml` uses Claude Code Action through NVIDIA Inference Hub to
+summarize PRs since the previous stable tag. Prereleases retain a `release-notes`
+artifact, with advisory failures. Stable releases publish the promoted
+prerelease's preview with the prerelease tag replaced by the stable tag. If that
+preview is missing or expired, stable publication generates new notes and
+requires generation to succeed. The promotion summary states whether notes were
+reused or regenerated. Configure the `LLM_INFERENCE_API_KEY` Actions secret and
+the `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL` Actions variables.
+
+To preview notes without building or publishing:
+
+```shell
+gh workflow run release.yml --ref main \
+  -f tag=v0.1.4 -f notes-only=true
+```
+
+Both release workflows accept an optional `tag` input. After seeding a version
+series with a `vMAJOR.MINOR.PATCH-pre.1` tag on the intended branch, dispatch
+Pre-release without a tag to create its next candidate:
+
+```shell
+gh workflow run release-prerelease.yml --ref main
+```
+
+Pre-release chooses the highest release series reachable from the selected
+branch and requires that series' `-pre.1` seed in its history. It stops if the
+version is already stable or no series exists. Candidate numbers account for
+all tags in the same series across the repository, and tag creation is serialized
+with Release Auto-Tag. The new tag points to the branch's dispatch commit;
+build, publication, qualification, and notifications use the resolved tag.
+An explicit tag continues to build that existing candidate. Manual tagless runs
+create a candidate even without new commits, so use an explicit tag for retries.
+Release Auto-Tag continues to skip unchanged commits and inactive series on `main`.
+
+Dispatch Release from the intended release branch:
+
+```shell
+gh workflow run release.yml --ref main
+```
+
+Without `tag`, Release detects the highest prerelease version reachable from
+that branch, then selects a qualified candidate within that version. It stops
+if none qualifies or that version is already stable. Supply a stable version
+to select it explicitly or retry a stable release:
+
+```shell
+gh workflow run release.yml --ref main -f tag=v0.4.3
+```
+
+For a support release, replace `main` with its support branch. Release chooses
+the highest-numbered `v0.4.3-pre.N` reachable from the selected branch with a
+successful Pre-release run triggered by the tag or dispatched on that branch.
+The support branch must contain these workflow definitions. Start each new
+support patch series with an explicit seed such as `v0.4.4-pre.1`; subsequent
+Pre-release and Release dispatches can omit `tag`. If the branch's history also
+contains a higher version series, supply `tag` explicitly to choose the intended
+support version.
+The entire Pre-release run must succeed, including publication. If qualification
+passes but publication fails, rerun the failed jobs before promoting the candidate.
+It verifies the qualification summary's
+tag, commit, profile, run, attempt, and passing result before creating `v0.4.3`
+at the same commit. Missing or expired evidence blocks promotion. The promotion
+summary and `stable-promotion-*` artifact retain the selected candidate and evidence link.
+Successful reruns can retain passing evidence from an earlier attempt of the
+same run; the promotion record links to the attempt that produced that evidence.
+Release rebuilds all stable artifacts with the stable version and publishes
+without rerunning qualification. These artifacts have different embedded versions
+from the qualified prerelease. Existing stable tags are never moved; a retry must
+resolve to the same qualified candidate.
+
+Stable image builds save multi-platform OCI archives as workflow artifacts without
+pushing to GHCR. Publication copies those archives, including their attestations,
+to the stable version tags and verifies their SBOMs before updating `latest`.
+The qualified prerelease's commit-SHA image tags remain unchanged.
+
+Release is manually dispatched; pushing a stable tag does not trigger publication.
+Stable runs serialize across branches. A version older than the highest stable
+Git tag publishes versioned artifacts while preserving shared latest channels:
+GHCR `latest`, GitHub's latest release, npm `latest`, and snap `latest/stable`.
+Each publisher rechecks the current remote stable tags immediately before
+updating its shared channel, including when a past publishing job is rerun.
+This protection applies to runs created with these workflow definitions.
+Its npm package uses a `release-X.Y` dist-tag, and its snap files remain in the
+GitHub Release rather than updating a Snap Store support track.
+Docs publish an immutable version and already prevent latest from moving
+backward. Release Auto-Tag continues on `main`; support branch prereleases can
+use tag pushes or manual Pre-release dispatch from that branch.
 
 `CACHIX_AUTH_TOKEN` is optional. The parent publishes SARIF from CodeQL, Trivy,
 and workflow reports against the candidate tag and commit. Existing standalone
@@ -561,6 +689,8 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/actions/setup-e2e-*` | Shared artifact, Podman, KVM, and kind setup used by the runtime lanes. |
 | `.github/workflows/helm-lint.yml` | Helm chart validation. PR mirror pushes skip lint jobs unless Helm inputs changed; merge groups always validate Helm because they represent the final integration state. |
 | `.github/actions/setup-nix/action.yml` | Installs Nix and configures the OpenShell Cachix cache, using read-only cache access when no authentication token is available. |
+| `.github/actions/setup-rust/action.yml` | Restores the Rust target and registry cache. Other branches can restore only their own caches and `main`'s, so per-binary release build caches are saved only on `main`. |
+| `.github/workflows/rust-cache.yml` | Builds the Branch Checks test targets on each push to `main` to save the `rust-checks` cache that PR mirrors and merge groups restore. Skips the build when the cache already matches. |
 | `.github/actions/pr-gate/action.yml` | Composite action that resolves PR metadata and verifies the required label is set for PR mirror pushes. Non-push events are allowed through. |
 | `.github/actions/pr-merge-base/action.yml` | Composite action that resolves and fetches the merge-base commit for `pull-request/<N>` push workflows. |
 | `.github/workflows/required-ci-gates.yml` | Posts required PR-head and merge-group statuses for gated CI workflows. This is what branch protection and merge queue should require. |
@@ -580,13 +710,18 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | File | Role |
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
-| `.github/workflows/release-tag.yml` | Release orchestrator for stable tags: build, qualify, publish. Automatic tag triggers exclude `-pre.*`. |
-| `.github/workflows/release-prerelease.yml` | Pre-release orchestrator, triggered by prerelease tag pushes or dispatched by Release Auto-Tag or manually: build, then publish and qualify in parallel. Qualification failure fails the run and sends the failure notification; published artifacts remain available. |
+| `.github/workflows/release.yml` | Manually promote the latest qualified prerelease for a version and branch, create its stable tag, then rebuild and publish. Support releases preserve shared latest channels. Publishes the prerelease's notes preview, retagged, or generates notes when it is unavailable. The notes-only mode generates a release notes preview artifact. |
+| `.github/workflows/release-auto-tag.yml` | Weekdays at 14:00 Europe/Zurich, tags the next `-pre.N` on `main` when commits landed since the latest one, then dispatches Pre-release. It skips when the train has no `-pre.1` or its version is already stable, so push each train's `-pre.1` tag by hand. |
+| `.github/workflows/release-prerelease.yml` | Pre-release orchestrator, triggered by prerelease tag pushes or dispatched by Release Auto-Tag or manually. A tagless dispatch creates the next candidate on its branch; explicit tags select existing candidates. Builds, then publishes and qualifies in parallel. Qualification failure fails the run and sends the failure notification; published artifacts remain available. |
 | `.github/workflows/release-build.yml` | Shared version computation, binary and image builds, and package builds. Validates that the tag matches the caller's release kind. |
 | `.github/workflows/release-publish.yml` | Shared artifact assembly, OCI image tags and Helm chart publication, and package publication. Stable releases also publish to GitHub Releases, snap, npm, PyPI, and Fern. |
+| `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by prerelease previews, notes-only previews, and stable publication when no preview is reused. |
 | `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev, Release, and Pre-release without Store credentials or publication. |
-| `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts to the Store without rebuilding. Release Dev calls it directly for `latest/edge` after snap builds and requires it to succeed before creating the dev release. Release calls it through `release-publish.yml` for `latest/stable` after qualification and release publication succeed. |
+| `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts directly to a Store channel without rebuilding. Release Dev uses `latest/edge`, Pre-release uses `latest/beta`, and Release uses `latest/stable` for the stable rebuild. Uploads queue per channel and architecture, so tagged beta and stable jobs recheck repository tags after earlier publication finishes and before updating their floating channels. Manual dispatch uploads the `snap-linux-*` artifacts from `artifact-run-id`. |
+| `.github/workflows/sdk-typescript-publish.yml` | Publishes the TypeScript SDK to GitHub Packages. Called by stable Release; manual dispatch publishes a given tag and npm version. |
+| `.github/workflows/sdk-go-tag.yml` | Creates the `sdk/go/vX.Y.Z` tag and asks the Go module proxy to fetch it. Called by stable Release; manual dispatch tags a given version and commit. |
+| `.github/workflows/wheel-publish.yml` | Triggers the GitLab pipeline that publishes wheels from a GitHub Release to PyPI. Called by stable Release; manual dispatch republishes a given tag. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts
