@@ -16,7 +16,7 @@ CI/CD workflows, release pipelines, build targets, packaging, and artifact publi
 
 ### area:drivers
 
-Infrastructure orchestration, including compute scheduling, secret management, runtime integrations (GPU, Docker, virtual machines, Kata Containers, and Kubernetes), deployment topologies, and pause/resume lifecycle operations. Includes host OS and architecture support (including amd64 and arm64), backend-specific isolation (including Windows AppContainer and isolation sessions), and compatibility.
+Infrastructure orchestration, including compute scheduling, secret management, runtime integrations (GPU, Docker, Podman, virtual machines, Kata Containers, and Kubernetes), deployment topologies, and pause/resume lifecycle operations. Includes host OS and architecture support (including amd64 and arm64), backend-specific isolation (including Windows AppContainer and isolation sessions), and compatibility.
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
@@ -105,6 +105,7 @@ Architecture documentation, README maintenance, project website updates, and aut
 | --- | --- | --- |
 | Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
 | Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
+| Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
 
 ### topic:dx
 
@@ -116,6 +117,7 @@ Ensure OpenShell is easy to contribute to for humans and agents.
 | John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
 | Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
 | Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
+| Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
 
 ### topic:gpu
 
@@ -156,6 +158,7 @@ General network transport, connectivity, and proxy behavior not covered by the m
 | John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
 | Adrien Langou | [@alangou](https://github.com/alangou) | NVIDIA |
 | Shiju | [@shiju-nv](https://github.com/shiju-nv) | NVIDIA |
+| Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
 
 ### topic:observability
 
@@ -165,6 +168,7 @@ Logging, metrics, tracing, telemetry, dashboards, event correlation, and the col
 | --- | --- | --- |
 | Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
 | Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
+| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
 
 ### topic:operability
 
@@ -183,6 +187,7 @@ Startup time, latency, throughput, resource overhead, scalability, and benchmark
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
 | Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
+| Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
 | Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
 | Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
 
@@ -195,6 +200,7 @@ Policy authoring, validation, proving, distribution, enforcement, and policy erg
 | Adrien Langou | [@alangou](https://github.com/alangou) | NVIDIA |
 | Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
 | Shiju | [@shiju-nv](https://github.com/shiju-nv) | NVIDIA |
+| John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
 
 ### topic:reliability
 
@@ -226,6 +232,7 @@ Vulnerability management, static/dynamic analysis, FSR (Functional Security Requ
 | Adrien Langou | [@alangou](https://github.com/alangou) | NVIDIA |
 | John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
 | Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
+| Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
 
 ### topic:testing
 
@@ -235,3 +242,4 @@ Unit, integration, regression, conformance, and end-to-end testing, including te
 | --- | --- | --- |
 | Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
 | Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
+| Evan Lezar | [@elezar](https://github.com/elezar) | NVIDIA |
