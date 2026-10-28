@@ -144,8 +144,21 @@ connection or request, and every matching rule adds the access it allows. A
 matching deny rule takes precedence over any allow, regardless of where either
 appears in the file. If one matching rule inspects requests and another does
 not, OpenShell inspects the connection, and the rule without `protocol` adds no
-request access. Endpoints that can match the same host and port must also agree
-on settings such as `tls` and `allowed_ips`, or OpenShell rejects the policy.
+request access.
+
+Settings such as `tls`, `allowed_ips`, `protocol`, and credentials come from the
+most specific endpoint that matches the connection or request, including its
+binary. An endpoint that names a host takes precedence over an endpoint without
+`host`, and a more specific `path` takes precedence over a broader one. Equally
+specific endpoints that can match the same host and port must agree on these
+settings, or OpenShell rejects the policy.
+
+For example, a rule without `host` that allows public addresses on port 443 can
+coexist with a provider rule that pins `api.example.com` to one address. Requests
+from the provider's binaries to `api.example.com` use the pinned address and the
+provider's credentials. Other hosts and other binaries use the rule without
+`host`. An endpoint that names a host without setting `allowed_ips` does not
+inherit the address list of a rule without `host`.
 
 For example, suppose one rule allows `GET /repos/**` on a host and another rule
 for the same host, port, and binary denies `GET /repos/private/**`. OpenShell
@@ -397,7 +410,8 @@ internal_api:
 When an endpoint sets `allowed_ips`, every address its hostname resolves to must
 fall within the list, including public addresses. Account for DNS rotation and
 service failover before pinning addresses. All endpoints that share a host and
-port must use the same `allowed_ips` list.
+port must use the same `allowed_ips` list, unless one names the host and the
+other omits `host`. Refer to [Overlapping Rules](#overlapping-rules).
 
 Verify that a request to the service succeeds. If it is denied, the sandbox log
 shows the resolved address and reason. Review both the hostname and the address

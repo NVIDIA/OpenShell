@@ -220,7 +220,9 @@ OpenShell rejects an endpoint that breaks these rules:
   such as `path`, `enforcement`, `access`, `rules`, credential rewriting or
   signing, or protocol options.
 - Endpoints whose hosts can match the same name on the same port, including
-  through wildcards, must use the same `tls` and `allowed_ips` values.
+  through wildcards, must use the same `tls` and `allowed_ips` values. An
+  endpoint that names a host takes precedence over an endpoint without `host`,
+  so the two need not agree.
   Inspected endpoints that can match the same request must also agree on
   `protocol`, `enforcement`, and credential settings.
 

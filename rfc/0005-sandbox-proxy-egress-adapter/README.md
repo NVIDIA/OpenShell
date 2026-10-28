@@ -565,6 +565,12 @@ adapter wire middleware separately.
 1. Should overlapping endpoint metadata be rejected at policy load time, or
    should one documented policy/endpoint precedence key select the complete
    decision? The initial compatibility refactor does not choose between them.
+   **Resolved ([#4662](https://github.com/NVIDIA/OpenShell/issues/4662)):**
+   both, by specificity. Among endpoints whose host, port, path, and binary
+   match, an endpoint that names a host takes precedence over a hostless
+   endpoint, and then the more specific path takes precedence. Binaries filter
+   but do not rank. Equally specific endpoints must agree on metadata, or
+   policy load rejects them.
 2. What mismatch-free observation window is sufficient before the
    deterministic decision replaces the legacy endpoint queries?
 3. Should metadata loopback be modeled as an adapter inside
