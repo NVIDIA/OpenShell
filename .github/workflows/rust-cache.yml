@@ -62,6 +62,6 @@ jobs:
         shell: nix develop -c bash -euo pipefail {0}
         run: |
           cargo test --locked -p openshell-crypto --no-default-features --test independent_backend --no-run
-          cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support --no-run
+          cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support,dev --no-run
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --no-run
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/testkit/Cargo.toml --no-run

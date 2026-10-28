@@ -54,6 +54,8 @@ uuid = { workspace = true }
 
 [features]
 default = ["telemetry", "bundled-ca-roots"]
+# Opt-in bundle for development-only features; stable builds leave it off.
+dev = []
 system-ca-roots = ["telemetry"]
 defaults-without-telemetry = ["bundled-ca-roots"]
 telemetry = ["openshell-core/telemetry"]

@@ -17,6 +17,11 @@ on:
         required: false
         type: string
         default: ""
+      dev-build:
+        description: Enable the gateway and supervisor development feature bundle
+        required: false
+        type: boolean
+        default: false
     secrets:
       CACHIX_AUTH_TOKEN:
         required: true
@@ -85,6 +90,7 @@ jobs:
     env:
       PACKAGE: openshell-gateway
       BINARY: openshell-gateway
+      EXTRA_CARGO_FLAGS: ${{ inputs.dev-build && '--features dev' || '' }}
     strategy:
       matrix:
         include:
@@ -103,6 +109,8 @@ jobs:
     env:
       PACKAGE: ${{ matrix.package }}
       BINARY: ${{ matrix.binary }}
+      # Only supervisor entries define the development feature bundle.
+      EXTRA_CARGO_FLAGS: ${{ matrix.package == 'openshell-supervisor' && inputs.dev-build && '--features dev' || '' }}
     strategy:
       matrix:
         include:
