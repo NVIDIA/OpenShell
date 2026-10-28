@@ -92,6 +92,16 @@ fn select_supervisor_otlp_endpoint(
         .map(|endpoint| supervisor_collector_endpoint(endpoint, environment))
 }
 
+fn select_supervisor_otlp_agent_endpoint(
+    config: &PodmanComputeConfig,
+    environment: PodmanEndpointEnvironment,
+) -> Option<String> {
+    config
+        .supervisor_otlp_agent_endpoint
+        .as_deref()
+        .map(|endpoint| supervisor_collector_endpoint(endpoint, environment))
+}
+
 fn select_supervisor_ocsf_export(
     config: &PodmanComputeConfig,
     environment: PodmanEndpointEnvironment,
@@ -686,6 +696,8 @@ impl PodmanComputeDriver {
             select_supervisor_otlp_endpoint(&config, PodmanEndpointEnvironment::current());
         config.supervisor_ocsf_export =
             select_supervisor_ocsf_export(&config, PodmanEndpointEnvironment::current());
+        config.supervisor_otlp_agent_endpoint =
+            select_supervisor_otlp_agent_endpoint(&config, PodmanEndpointEnvironment::current());
         if endpoint_was_selected {
             info!(
                 grpc_endpoint = %config.grpc_endpoint,
@@ -3575,6 +3587,29 @@ mod tests {
         );
         assert_eq!(
             select_supervisor_ocsf_export(
+                &PodmanComputeConfig::default(),
+                PodmanEndpointEnvironment::PodmanMachine
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn supervisor_agent_endpoint_uses_host_alias_for_loopback_on_podman_machine() {
+        let config = PodmanComputeConfig {
+            supervisor_otlp_agent_endpoint: Some("http://127.0.0.1:4317".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        assert_eq!(
+            select_supervisor_otlp_agent_endpoint(
+                &config,
+                PodmanEndpointEnvironment::PodmanMachine
+            )
+            .as_deref(),
+            Some("http://host.containers.internal:4317")
+        );
+        assert_eq!(
+            select_supervisor_otlp_agent_endpoint(
                 &PodmanComputeConfig::default(),
                 PodmanEndpointEnvironment::PodmanMachine
             ),

@@ -91,7 +91,9 @@ When the gateway exports OTLP traces, the driver sets
 `OPENSHELL_OTLP_ENDPOINT` on the supervisor Pod to the gateway's endpoint and
 `TRACEPARENT` to the trace context of the operation that created the Pod. The
 supervisor exports its spans there and parents its startup span on that
-context. The endpoint is not configurable in driver TOML.
+context. When `[openshell.gateway.otlp.agent]` is enabled, the driver also
+sets `OPENSHELL_OTLP_AGENT_ENDPOINT`, which starts the supervisor's agent trace
+relay. Neither endpoint is configurable in driver TOML.
 
 The driver creates one namespace-wide `NetworkPolicy` before it releases any
 workload Pod. It selects every OpenShell workload, denies all workload egress,
@@ -257,8 +259,9 @@ fails closed.
 
 The topology does not support upstream proxies or provider SPIFFE identity, and
 the shared supervisor is a single point of failure for the sandboxes it hosts.
-Shared sandbox instances export no supervisor OTLP traces or OCSF events; the driver
-warns at startup when the gateway configures that export.
+Shared sandbox instances export no supervisor OTLP traces or OCSF events and do
+not relay agent traces; the driver warns at startup when the gateway configures
+any of them.
 When the setting is removed, reconciliation suspends shared generations, and a
 restart creates the dedicated generation's boundary Service the shared one never
 had.

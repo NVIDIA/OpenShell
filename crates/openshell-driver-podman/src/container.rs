@@ -754,6 +754,12 @@ fn build_env(
                 .map(|(name, value)| (name.to_string(), value)),
         );
     }
+    if let Some(endpoint) = &config.supervisor_otlp_agent_endpoint {
+        env.insert(
+            openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT.into(),
+            endpoint.clone(),
+        );
+    }
     if let Some(name) = &config.supervisor_gateway_name {
         env.insert(
             openshell_core::sandbox_env::GATEWAY_NAME.into(),
@@ -2934,6 +2940,22 @@ mod tests {
         assert_eq!(
             spec["env"][openshell_core::sandbox_env::OTLP_OCSF_SCHEMA_VERSION],
             "1.1"
+        );
+        assert!(
+            spec["env"]
+                .get(openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT)
+                .is_none(),
+            "the agent trace relay stays off unless the gateway enables it"
+        );
+
+        let config = PodmanComputeConfig {
+            supervisor_otlp_agent_endpoint: Some("http://agents:4317".to_string()),
+            ..test_config()
+        };
+        let spec = build_container_spec(&sandbox, &config);
+        assert_eq!(
+            spec["env"][openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT],
+            "http://agents:4317"
         );
 
         let config = PodmanComputeConfig {

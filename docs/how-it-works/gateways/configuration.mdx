@@ -558,7 +558,7 @@ Allow enough retention and disk space for shipper outages. Graceful shutdown all
 
 ## OTLP Export
 
-`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP/gRPC. Omit the table to disable export. Its `endpoint` is the collector for every signal the gateway exports and, on its own, enables trace export. `[openshell.gateway.otlp.traces]` sends spans to a different collector. [OCSF log export](#ocsf-log-export) is off until `[openshell.gateway.otlp.ocsf]` sets `enabled = true`, and can use its own collector.
+`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP/gRPC. Omit the table to disable export. Its `endpoint` is the collector for every signal the gateway exports and, on its own, enables trace export. `[openshell.gateway.otlp.traces]` sends spans to a different collector. [OCSF log export](#ocsf-log-export) is off until `[openshell.gateway.otlp.ocsf]` sets `enabled = true`, and the [agent trace relay](#agent-trace-relay) is off until `[openshell.gateway.otlp.agent]` sets `enabled = true`. Each can use its own collector.
 
 The gateway already uses the Rust `tracing` framework for structured logs sent to stdout and the sandbox log stream. Enabling this section adds an OpenTelemetry layer to the same tracing subscriber. It exports span trees to an OTLP collector without exporting, replacing, or redirecting the existing diagnostic log events.
 
@@ -586,14 +586,16 @@ The gateway passes the trace endpoint to compute drivers and sandbox supervisors
 
 For Helm deployments, set `server.otlp.endpoint` to render this table. The
 optional `server.otlp.serviceName` value overrides the gateway service name;
-driver service names remain fixed. Set the `traces` and `ocsf` tables through
-`gatewayConfig`, which renders each key as a TOML table:
+driver service names remain fixed. Set the `traces`, `ocsf`, and `agent` tables
+through `gatewayConfig`, which renders each key as a TOML table:
 
 ```yaml
 gatewayConfig:
   openshell.gateway.otlp.traces:
     endpoint: https://traces-backend:4317
   openshell.gateway.otlp.ocsf:
+    enabled: true
+  openshell.gateway.otlp.agent:
     enabled: true
 ```
 
@@ -644,6 +646,26 @@ A failed batch is retried with backoff for up to four attempts, so delivery is a
 A collector can accept a batch while rejecting some of its records, an OTLP partial success. The gateway counts such a batch as exported, and the exporter logs the number of rejected records as a warning. Gap records and `openshell_ocsf_otlp_dropped_total` cover only records the gateway dropped, so check the collector's own metrics for records it rejected.
 
 Metrics include `openshell_ocsf_otlp_queued_total`, `openshell_ocsf_otlp_exported_total`, `openshell_ocsf_otlp_dropped_total` (with a `reason` label of `queue_capacity`, `queue_bytes`, `oversized`, `export_failed`, `serialization`, or `closed`), `openshell_ocsf_otlp_export_errors_total`, and `openshell_ocsf_otlp_retries_total`.
+
+### Agent trace relay
+
+Set `enabled = true` in `[openshell.gateway.otlp.agent]` to have each sandbox forward the workload's own traces. It defaults to `false`, so trace export alone never changes the workload environment. Traces go to the table's `endpoint`, or to `[openshell.gateway.otlp]` `endpoint` when it is omitted, and that endpoint must be reachable from sandboxes.
+
+```toml
+[openshell.gateway.otlp.agent]
+enabled  = true
+endpoint = "http://agent-collector.observability.svc:4317" # optional
+```
+
+While the relay is active, the sandbox runtime sets `OTEL_EXPORTER_OTLP_ENDPOINT=http://192.0.0.8:4318` and `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` in every workload process, and sets `OTEL_EXPORTER_OTLP_COMPRESSION` and `OTEL_EXPORTER_OTLP_TRACES_COMPRESSION` to `none`, so a standard OpenTelemetry SDK exports without configuration. These are lowest-precedence defaults. They are not set when the sandbox creation request or an environment passed to `openshell sandbox exec` names `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or when the image `ENV` names one for the main process, since `openshell sandbox exec` sessions do not inherit the image environment, and an endpoint the workload sets itself, for example with a shell `export`, takes precedence over them. A workload that exports elsewhere does so subject to the sandbox's network policy, and its traces carry no relay attribution. Provider credentials cannot redirect traces. While the relay is off, nothing is injected. Because the generic endpoint is set, an SDK that also exports metrics or logs sends them to the relay, which answers with an empty OTLP success and discards them. To keep metrics and logs, point those exporters elsewhere with `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` and `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`. The address is a reserved label rather than a network destination: the supervisor serves it inside the sandbox boundary and forwards accepted batches to the collector over OTLP/gRPC. The collector's address is never visible inside the sandbox.
+
+Every forwarded resource carries `openshell.sandbox.id`, with the same value as the supervisor's own spans, and `openshell.telemetry.source=agent`. Values the agent supplies for those two keys are replaced at the resource level; span and scope attributes pass through unchanged, so filter and join on the resource attributes. Filter on `openshell.telemetry.source` to separate agent traces from infrastructure traces, and join on `openshell.sandbox.id` to correlate them.
+
+Agents must export traces as OTLP/HTTP protobuf with compression disabled. The relay answers 415 to JSON bodies and to any `Content-Encoding` other than `identity`, 413 to bodies larger than 2 MiB, to requests with more than 512 `ResourceSpans` entries, and to requests whose resource attributes exceed 8192 in number or 256 KiB in total, 408 to requests whose body does not arrive within 30 seconds, and 503 with `Retry-After` while its buffer of 32 batches is full, which standard SDKs retry with backoff. Error responses carry a protobuf `google.rpc.Status` whose message states the reason. While the relay is off, connections to the relay address are refused immediately.
+
+Delivery is best-effort. The relay answers 200 once a batch is buffered and makes one export attempt per batch, so a batch is lost if the collector is unavailable at that moment. The supervisor logs the first failed export and a periodic summary of failures. Before the sandbox reports that its main process exited, and before a suspended sandbox's supervisor exits, the relay flushes buffered batches for up to 5 seconds, and skips that wait when its most recent export failed. It keeps serving `openshell sandbox exec` sessions after the main process exits and flushes once more when the sandbox is torn down.
+
+The relayed hop does not yet support TLS or authentication to the collector; an `https` endpoint leaves the relay inactive with a logged reason. Protect the hop at the network layer, for example with a collector-side ingress policy.
 
 ### Tuning
 

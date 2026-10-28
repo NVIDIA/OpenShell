@@ -330,6 +330,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         bridge_default_endpoint: Some("https://host.docker.internal:8443".to_string()),
         host_gateway_ip: None,
         supervisor_ocsf_export: None,
+        supervisor_otlp_agent_endpoint: None,
         supervisor_gateway_name: None,
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
@@ -1516,7 +1517,8 @@ fn docker_child_environment_strips_supervisor_control_keys() {
 #[test]
 fn supervisor_otlp_environment_carries_only_configured_signals() {
     use openshell_core::sandbox_env::{
-        GATEWAY_NAME, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OTLP_OCSF_SCHEMA_VERSION, OcsfOtlpExport,
+        GATEWAY_NAME, OTLP_AGENT_ENDPOINT, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT,
+        OTLP_OCSF_SCHEMA_VERSION, OcsfOtlpExport,
     };
 
     let mut config = runtime_config();
@@ -1539,6 +1541,13 @@ fn supervisor_otlp_environment_carries_only_configured_signals() {
             format!("{OTLP_OCSF_ENDPOINT}=http://siem:4317"),
             format!("{OTLP_OCSF_SCHEMA_VERSION}=1.3"),
         ]
+    );
+
+    config.supervisor_ocsf_export = None;
+    config.supervisor_otlp_agent_endpoint = Some("http://agents:4317".to_string());
+    assert_eq!(
+        supervisor_otlp_environment(&config),
+        [format!("{OTLP_AGENT_ENDPOINT}=http://agents:4317")]
     );
 
     config.supervisor_gateway_name = Some("prod-west".to_string());
