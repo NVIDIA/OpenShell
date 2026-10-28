@@ -111,7 +111,7 @@ Write the smallest update that tells users exactly what changed and what they ne
 - **Keep each page URL equal to its file path** under `docs/`. Rename the file when you rename a page, add a `fern/docs.yml` redirect for the old URL, and set a relative `slug:` when the nav label does not produce the file name. `mise run docs` runs `docs:nav`, which fails otherwise.
 - **Use `keywords` as a comma-separated string**.
 - **Do not add a duplicate H1**. Fern renders the page title from frontmatter.
-- **Keep development-only features on development-only pages**. A feature that stable and prerelease builds exclude, such as Cedar policies, belongs on a page with `development-only: true` in frontmatter, which only the `dev` docs version publishes. Do not link to that page or describe the feature from other pages. Refer to `fern/README.md`.
+- **Keep development-only features on development-only pages**. A feature that stable and prerelease builds exclude belongs on a page with `development-only: true` in frontmatter, which only the `dev` docs version publishes. Do not link to that page or describe the feature from other pages. Refer to `fern/README.md`.
 - **Always write NVIDIA in all caps.** Wrong: Nvidia, nvidia.
 - **Always capitalize OpenShell correctly.** Wrong: openshell, Openshell, openShell.
 - **Do not number section titles.** Wrong: "Section 1: Deploy a Gateway" or "Step 3: Verify." Use plain descriptive titles.

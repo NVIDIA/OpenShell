@@ -55,7 +55,7 @@ The sync workflow still accepts an optional Fern availability badge, but the cur
 
 The sync and publish workflows share the `docs-website` concurrency group. This serializes writes and publication. Queued runs remain pending instead of replacing one another.
 
-A page whose front matter sets `development-only: true` documents a feature that stable and prerelease builds exclude, such as Cedar policies. Only the `dev` snapshot publishes it: every other sync deletes the page from its `pages-<slug>/` copy and drops the page's entries from that version's navigation. Fern ignores the front matter field, but it rejects unknown keys in `docs/index.yml`, so the marker lives in the page. `fern check` does not report links to the removed page, so pages published in other versions must not link to a development-only page or document its feature.
+A page whose front matter sets `development-only: true` documents a feature that stable and prerelease builds exclude. Only the `dev` snapshot publishes it: every other sync deletes the page from its `pages-<slug>/` copy and drops the page's entries from that version's navigation. Fern ignores the front matter field, but it rejects unknown keys in `docs/index.yml`, so the marker lives in the page. `fern check` does not report links to the removed page, so pages published in other versions must not link to a development-only page or document its feature.
 
 The `dev` snapshot also owns the shared Fern configuration, components, assets, and CSS on `docs-website`. The `latest` snapshot copies its documentation, navigation, and redirects but does not replace shared components, assets, or CSS. This keeps the site configuration aligned with `main` while preserving the released content.
 

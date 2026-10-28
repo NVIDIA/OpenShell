@@ -42,9 +42,8 @@ tag, or start a second `Pre-release` run for a tag; it has no concurrency guard.
   picks the highest `-pre.N` on `main` whose whole `Pre-release` run passed,
   creates the stable tag on that commit, and publishes without requalifying.
 - Pre-release and stable builds leave the `dev` feature disabled. Release
-  Dev enables it (currently including Cedar), and the normal lint and test
-  runs cover Cedar alongside the rest of the workspace; there are no separate
-  Cedar CI lanes.
+  Dev enables it through `dev-build: true`. Normal workspace builds, lint,
+  and tests enable `dev` without separate CI lanes for development features.
 
 ## Setup
 
