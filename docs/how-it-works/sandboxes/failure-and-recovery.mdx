@@ -12,7 +12,7 @@ A running sandbox depends on three things: the gateway, which manages the sandbo
 | Failure | Sandbox | Policy enforcement | Recovery |
 |---|---|---|---|
 | Gateway unreachable | Keeps running until the outage limit, then stopped | Installed policy stays enforced | Automatic if the gateway returns before the limit; after a stop, run `openshell sandbox start` |
-| Supervisor unreachable | Paused for up to 30 seconds, then stopped | No new network access | Automatic if the same supervisor reconnects within 30 seconds |
+| Supervisor unreachable | Paused, then stopped after the recovery window | No new network access | Automatic if the same supervisor reconnects, or a shared pool member takes over, within the window |
 | Sandbox process or compute runtime fails | Processes lost; reports `Error` | No workload left to enforce | Signal kills recover when the gateway restarts; otherwise run `openshell sandbox delete` |
 
 A stopped sandbox keeps its policies, provider attachments, settings, and persistent workspace. Its processes and their memory are not restored.
@@ -23,11 +23,13 @@ The supervisor keeps enforcing the policy it already has and retries its gateway
 
 If the gateway does not return within the outage limit, the supervisor stops the sandbox so it does not run indefinitely on policy nobody can change. When the gateway returns, the sandbox reports `Error` with reason `GatewayUnreachable`.
 
+With multiple gateway replicas, losing one replica is not an outage. Its supervisors reconnect to another replica, and their sandboxes keep running.
+
 ### Supervisor Unreachable
 
-OpenShell pauses the sandbox and starts a 30 second recovery window. If the supervisor reconnects and passes its security checks within the window, the sandbox resumes with its memory intact. Otherwise, OpenShell stops it.
+OpenShell pauses the sandbox and starts a recovery window. If a supervisor reconnects and passes its security checks within the window, the sandbox resumes with its memory intact. Otherwise, OpenShell stops it.
 
-A replacement supervisor cannot take over a running sandbox, so if the supervisor crashed rather than lost its link, the sandbox always stops.
+The window is 30 seconds for a dedicated supervisor and 60 seconds for a Kubernetes shared supervisor pool (`supervisor_topology = "gateway"`). A dedicated supervisor that crashed cannot be replaced, so its sandbox stops. In a shared pool, another member takes over the sandbox, and the crashed supervisor's credentials stop working.
 
 ### Sandbox Process or Compute Runtime Fails
 
@@ -50,6 +52,13 @@ For example, to give long-running jobs 10 minutes:
 gateway_outage_limit_secs = 600
 ```
 
-The supervisor reconnect backoff, the 30 second supervisor recovery window, and which compute failures the gateway recovers are fixed.
+Set the shared supervisor pool's recovery window, from 30 to 300 seconds, in `[openshell.gateway.supervisor_pool]`. Refer to [Shared Supervisor Pool](/how-it-works/gateways/configuration#shared-supervisor-pool).
+
+```toml
+[openshell.gateway.supervisor_pool]
+recovery_timeout_secs = 120
+```
+
+The supervisor reconnect backoff, the 30 second window for dedicated supervisors, and which compute failures the gateway recovers are fixed.
 
 A sandbox's restart policy, set with `--restart-policy`, applies only when its main process exits. It does not restart a sandbox after any of the failures on this page. Refer to [Sandboxes](/how-it-works/sandboxes/overview) for restart policy.
