@@ -5,9 +5,8 @@
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use openshell_core::proto::{
-    GetSandboxConfigRequest, NetworkActivitySummary, NetworkEndpoint, NetworkPolicyRule,
-    PolicyChunk, SubmitPolicyAnalysisRequest, UpdateConfigRequest,
-    open_shell_client::OpenShellClient,
+    GetSandboxConfigRequest, NetworkActivitySummary, PolicyChunk, SubmitPolicyAnalysisRequest,
+    UpdateConfigRequest, open_shell_client::OpenShellClient,
 };
 use openshell_crypto::jwt::encode;
 use serde::Serialize;
@@ -59,9 +58,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let before = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            supports_cedar_policy: true,
             name: sandbox_name.clone(),
-            workspace_scope: Some(default_workspace()),
+            workspace_scope: None,
+            ..Default::default()
         })
         .await?
         .into_inner();
@@ -69,46 +68,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .policy
         .clone()
         .ok_or("governed sandbox did not have an active policy")?;
-    let added_rule = if widened_policy.cedar_policy_source.is_empty() {
-        let mut added_rule = widened_policy
-            .network_policies
-            .values()
-            .next()
-            .cloned()
-            .ok_or("governed policy did not contain a network rule to clone")?;
-        added_rule.name = "sandbox-added".to_string();
-        let endpoint_to_change = added_rule
-            .endpoints
-            .first_mut()
-            .ok_or("governed policy network rule did not contain an endpoint")?;
-        endpoint_to_change.host = "sandbox-added.example".to_string();
-        widened_policy
-            .network_policies
-            .insert("sandbox_added".to_string(), added_rule.clone());
-        added_rule
-    } else {
-        // A Cedar policy is widened by adding a permit to its text. The
-        // proposal below still carries a YAML rule, which is what a sandbox
-        // proposes.
-        widened_policy.cedar_policy_source.push_str(
-            "\npermit (principal, action == Sandbox::Action::\"NetworkConnect\",\n\
-             resource == Sandbox::NetworkEndpoint::\"sandbox-added.example:443\");\n",
-        );
-        NetworkPolicyRule {
-            name: "sandbox-added".to_string(),
-            endpoints: vec![NetworkEndpoint {
-                host: "sandbox-added.example".to_string(),
-                port: 443,
-                ..Default::default()
-            }],
-            ..Default::default()
-        }
-    };
+    let mut added_rule = widened_policy
+        .network_policies
+        .values()
+        .next()
+        .cloned()
+        .ok_or("governed policy did not contain a network rule to clone")?;
+    added_rule.name = "sandbox-added".to_string();
+    let endpoint_to_change = added_rule
+        .endpoints
+        .first_mut()
+        .ok_or("governed policy network rule did not contain an endpoint")?;
+    endpoint_to_change.host = "sandbox-added.example".to_string();
+    widened_policy
+        .network_policies
+        .insert("sandbox_added".to_string(), added_rule.clone());
 
     let policy_result = client
         .update_config(UpdateConfigRequest {
             sandbox: sandbox_name.clone(),
-            workspace_scope: Some(default_workspace()),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             policy: Some(widened_policy),
             ..Default::default()
         })
@@ -118,7 +99,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proposal_result = client
         .submit_policy_analysis(SubmitPolicyAnalysisRequest {
             name: sandbox_name.clone(),
-            workspace_scope: Some(default_workspace()),
             proposed_chunks: vec![PolicyChunk {
                 rule_name: "sandbox_added".to_string(),
                 proposed_rule: Some(added_rule),
@@ -134,7 +114,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client
         .submit_policy_analysis(SubmitPolicyAnalysisRequest {
             name: sandbox_name.clone(),
-            workspace_scope: Some(default_workspace()),
             network_activity_summaries: vec![NetworkActivitySummary {
                 network_activity_count: 1,
                 ..Default::default()
@@ -147,9 +126,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let after = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            supports_cedar_policy: true,
             name: sandbox_name,
-            workspace_scope: Some(default_workspace()),
+            workspace_scope: None,
+            ..Default::default()
         })
         .await?
         .into_inner();
@@ -200,9 +179,4 @@ fn expect_permission_denied<T>(
         .into()),
         Ok(_) => Err(format!("{operation} unexpectedly succeeded").into()),
     }
-}
-
-/// The workspace the smoke suite's sandbox runs in.
-fn default_workspace() -> openshell_core::proto::WorkspaceSelector {
-    openshell_core::proto::workspace_selector("default".to_string())
 }
