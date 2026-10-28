@@ -224,15 +224,13 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
         !openshell_bin.is_empty(),
         "the installer did not put openshell on the guest's PATH"
     );
-    let mut env = vec![
+    let env = [
         format!("OPENSHELL_GATEWAY={}", run.gateway),
         format!("OPENSHELL_BIN={openshell_bin}"),
     ];
-    env.extend(
-        test_env::read(session)
-            .await
-            .context("read the variables the environment publishes for tests")?,
-    );
+    test_env::check(session)
+        .await
+        .context("check the variables the environment publishes for tests")?;
 
     let guest = GUEST_DIR;
     checked(
@@ -297,9 +295,15 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
         nextest.extend(["-E", filter]);
     }
     // nextest writes its output to a file in the guest, so a run that times
-    // out or loses SSH still leaves a log for `collect_results`.
+    // out or loses SSH still leaves a log for `collect_results`. The guest
+    // shell exports the published variables itself, so their values, which
+    // can be credentials, never appear in the command (or its errors).
     let log = format!("{guest}/{NEXTEST_LOG}");
-    let mut command = vec!["sh", "-c", r#"exec "$@" >"$0" 2>&1"#, &log];
+    let script = format!(
+        r#"exec >"$0" 2>&1; {}; exec "$@""#,
+        test_env::export_script(test_env::ENV_DIR)
+    );
+    let mut command = vec!["sh", "-c", &script, &log];
     command.extend(nextest);
     let output = session.exec_timeout(&command, RUN_TIMEOUT).await?;
     Ok(Status::of_nextest(

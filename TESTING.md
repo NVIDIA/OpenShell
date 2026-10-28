@@ -260,8 +260,10 @@ service.
   cached as a disk) and writes the variables as `KEY=VALUE` lines to
   `/etc/openshell-test/env.d/<service>.env`. Pass files the playbook needs
   through the environment's setup `inputs`, and add them to the tmachine disk
-  cache key in `e2e-suites.yml`. The runner passes the variables to the tests
-  and rejects names without the `OPENSHELL_TEST_` prefix.
+  cache key in `e2e-suites.yml`. The runner rejects names without the
+  `OPENSHELL_TEST_` prefix, and the tests get the variables in the guest, so
+  values never appear in a runner command. Values are taken literally, without
+  quoting.
 - **Fixture.** In the suite's `src/lib.rs`, define the variable names as
   constants and a `<Service>Context::new(cx)` that reads them, waits for the
   service, and wraps the testkit `Context`. Each test calls it on its first
