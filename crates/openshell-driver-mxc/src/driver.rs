@@ -40,6 +40,8 @@ const DRIVER_NAME: &str = "mxc";
 const DRIVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_IMAGE_SENTINEL: &str = "mxc:process-container";
 const HOST_AUTH_BUNDLE_FILE: &str = "supervisor-auth.json";
+/// Directory in the sandbox host state directory for the proxy CA files.
+const HOST_PROXY_TLS_DIR: &str = "proxy-tls";
 const HOST_RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
 const BOUNDARY_CONFIG_FILE: &str = "boundary.json";
 const BOUNDARY_TLS_CERT_FILE: &str = "sandbox.crt";
@@ -836,6 +838,17 @@ fn spawn_supervisor(
     auth_bundle_path: &Path,
     main: &openshell_core::sandbox_env::MainProcessConfig,
 ) -> Result<Child, String> {
+    supervisor_command(context, descriptor_path, auth_bundle_path, main)?
+        .spawn()
+        .map_err(|error| format!("start host openshell-supervisor: {error}"))
+}
+
+fn supervisor_command(
+    context: &LifecycleContext,
+    descriptor_path: &Path,
+    auth_bundle_path: &Path,
+    main: &openshell_core::sandbox_env::MainProcessConfig,
+) -> Result<Command, String> {
     let main_process_spec = mxc_main_process_spec(main)?;
     let mut command = Command::new(&context.config.supervisor_binary_path);
     command
@@ -865,6 +878,14 @@ fn spawn_supervisor(
         )
         .env(openshell_core::sandbox_env::SANDBOX_ID, &context.sandbox.id)
         .env(openshell_core::sandbox_env::SANDBOX, &context.sandbox.name)
+        // The supervisor's default `/etc/openshell-tls` resolves to
+        // `\etc\openshell-tls` on the current drive, where every sandbox on
+        // the host would write and read the same CA files. Keep them with the
+        // sandbox's host state, which `delete_sandbox` removes.
+        .env(
+            openshell_core::sandbox_env::PROXY_TLS_DIR,
+            context.host_state_dir.join(HOST_PROXY_TLS_DIR),
+        )
         .env(
             openshell_core::sandbox_env::LOG_LEVEL,
             openshell_core::driver_utils::sandbox_log_level(&context.sandbox, "info"),
@@ -878,9 +899,7 @@ fn spawn_supervisor(
             server_name,
         );
     }
-    command
-        .spawn()
-        .map_err(|error| format!("start host openshell-supervisor: {error}"))
+    Ok(command)
 }
 
 fn mxc_main_process_spec(
@@ -1475,6 +1494,50 @@ mod tests {
             .validate_sandbox_create(&sandbox)
             .expect("static preflight");
         assert!(!backend.config.state_dir.exists());
+    }
+
+    #[test]
+    fn host_supervisor_proxy_tls_dir_is_in_sandbox_host_state() {
+        let (backend, sandbox, dir) = preflight_fixture();
+        let host_state_dir = backend
+            .config
+            .state_dir
+            .join(&sandbox.id)
+            .join("generation");
+        let context = LifecycleContext {
+            invoker: backend.invoker.clone(),
+            config: backend.config.clone(),
+            gateway: backend.gateway.clone(),
+            registry: backend.registry.clone(),
+            watch_tx: backend.watch_tx.clone(),
+            attribution: backend.attribution.clone(),
+            sandbox_config: sandbox_config(&sandbox).unwrap(),
+            sandbox,
+            generation: "generation".into(),
+            host_state_dir: host_state_dir.clone(),
+            boundary_state_dir: dir.path().join("boundary"),
+            policy_mapper: backend.policy_mapper.clone(),
+        };
+        let main = mxc_main_process_config(
+            context.sandbox.spec.as_ref(),
+            &context.sandbox_config.command,
+        );
+        let command = supervisor_command(
+            &context,
+            &host_state_dir.join(HOST_RUNTIME_DESCRIPTOR_FILE),
+            &host_state_dir.join(HOST_AUTH_BUNDLE_FILE),
+            &main,
+        )
+        .unwrap();
+        let tls_dir = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == openshell_core::sandbox_env::PROXY_TLS_DIR)
+            .and_then(|(_, value)| value);
+        assert_eq!(
+            tls_dir.map(Path::new),
+            Some(host_state_dir.join(HOST_PROXY_TLS_DIR).as_path())
+        );
     }
 
     fn with_ui_policy(
