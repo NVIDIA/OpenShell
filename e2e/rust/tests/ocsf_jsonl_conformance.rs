@@ -222,8 +222,9 @@ async fn supervisor_jsonl_conforms_to_the_native_schema() {
     // every required class appears.
     let mut records = Vec::new();
     let mut last_error = None;
+    let mut last_exec_error = None;
     for _ in 0..12 {
-        let _ = guard.exec(&["python3", "-c", &traffic]).await;
+        last_exec_error = guard.exec(&["python3", "-c", &traffic]).await.err();
         tokio::time::sleep(Duration::from_secs(5)).await;
         match supervisor_records(&engine, &guard.name) {
             Ok(found) => {
@@ -241,9 +242,11 @@ async fn supervisor_jsonl_conforms_to_the_native_schema() {
     let missing = missing_classes(&records);
     assert!(
         missing.is_empty(),
-        "missing OCSF classes {missing:?} in {} records; last copy error: {}",
+        "missing OCSF classes {missing:?} in {} records; last copy error: {}; \
+         last exec error: {}",
         records.len(),
-        last_error.as_deref().unwrap_or("none")
+        last_error.as_deref().unwrap_or("none"),
+        last_exec_error.as_deref().unwrap_or("none")
     );
     let mut failures = Vec::new();
     for record in &records {
