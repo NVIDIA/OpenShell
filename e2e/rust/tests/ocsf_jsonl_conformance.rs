@@ -135,13 +135,7 @@ fn supervisor_records(engine: &ContainerEngine, sandbox: &str) -> Result<Vec<Val
     let filter = format!("label=openshell.ai/sandbox-name={sandbox}");
     let ps = engine
         .command()
-        .args([
-            "ps",
-            "--filter",
-            &filter,
-            "--format",
-            "{{index .Labels \"openshell.ai/sandbox-id\"}}",
-        ])
+        .args(["ps", "--filter", &filter, "--format", "json"])
         .output()
         .map_err(|e| format!("could not run ps: {e}"))?;
     if !ps.status.success() {
@@ -150,11 +144,13 @@ fn supervisor_records(engine: &ContainerEngine, sandbox: &str) -> Result<Vec<Val
             String::from_utf8_lossy(&ps.stderr)
         ));
     }
-    let ids = String::from_utf8_lossy(&ps.stdout);
-    let id = ids
-        .lines()
-        .map(str::trim)
-        .find(|id| !id.is_empty())
+    // Podman 6 renders `.Labels` in a --format template as a string, so read
+    // the label from the JSON output, where it is an object in every version.
+    let containers: Vec<Value> =
+        serde_json::from_slice(&ps.stdout).map_err(|e| format!("parse ps output: {e}"))?;
+    let id = containers
+        .iter()
+        .find_map(|container| container["Labels"]["openshell.ai/sandbox-id"].as_str())
         .ok_or_else(|| format!("no container matches {filter}"))?;
 
     let dir = tempfile::tempdir().map_err(|e| format!("temp dir: {e}"))?;
