@@ -3647,8 +3647,9 @@ impl ComputeRuntime {
 
         let mut delete_resource_version = record.resource_version;
         let mut sandbox = decode_sandbox_record(&record)?;
-        if provisioning_deadline::driver_operation_pending(&sandbox)
-            && sandbox.phase() != SandboxPhase::Deleting as i32
+        if self
+            .pending_driver_operation_blocks_cleanup(&sandbox)
+            .await?
         {
             return Ok(false);
         }
@@ -3675,10 +3676,11 @@ impl ComputeRuntime {
             return Err(error);
         }
 
-        match self
-            .store
-            .delete_if(Sandbox::object_type(), sandbox_id, delete_resource_version)
-            .await
+        match Box::pin(
+            self.store
+                .delete_sandbox_with_image_state_if(sandbox_id, delete_resource_version),
+        )
+        .await
         {
             Ok(true) => {
                 self.cleanup_removed_sandbox_state(sandbox_id);
@@ -4445,8 +4447,9 @@ impl ComputeRuntime {
                     continue;
                 }
             };
-            if provisioning_deadline::driver_operation_pending(&sandbox)
-                && sandbox.phase() != SandboxPhase::Deleting as i32
+            if self
+                .pending_driver_operation_blocks_cleanup(&sandbox)
+                .await?
             {
                 warn!(
                     sandbox_id,
@@ -6178,8 +6181,9 @@ impl ComputeRuntime {
             // Timeout cleanup can emit Deleted before an explicit stop exposes
             // Stopped for repair. A delayed (or repeated) event must retain that
             // recovery record too; explicit deletion still transitions to Deleting.
-            if (provisioning_deadline::driver_operation_pending(sandbox)
-                && sandbox.phase() != SandboxPhase::Deleting as i32)
+            if self
+                .pending_driver_operation_blocks_cleanup(sandbox)
+                .await?
                 || (provisioning_deadline::timed_out(sandbox)
                     && matches!(
                         SandboxPhase::try_from(sandbox.phase()),
@@ -6220,8 +6224,9 @@ impl ComputeRuntime {
         sandbox: &Sandbox,
         expected_resource_version: u64,
     ) -> Result<(), String> {
-        if provisioning_deadline::driver_operation_pending(sandbox)
-            && sandbox.phase() != SandboxPhase::Deleting as i32
+        if self
+            .pending_driver_operation_blocks_cleanup(sandbox)
+            .await?
         {
             return Ok(());
         }
@@ -6232,10 +6237,8 @@ impl ComputeRuntime {
     }
 
     async fn cleanup_sandbox_owned_records(&self, sandbox: &Sandbox) -> Result<(), String> {
-        self.store
-            .delete_sandbox_image_state(sandbox.object_id())
-            .await
-            .map_err(|error| format!("delete sandbox image state: {error}"))?;
+        // Keep private update intent until atomic sandbox removal: a cleanup
+        // failure or CAS conflict must leave evidence for the deletion retry.
         self.cleanup_ssh_identity(sandbox)
             .await
             .map_err(|error| error.to_string())?;
@@ -6551,8 +6554,9 @@ impl ComputeRuntime {
             }
 
             let sandbox = decode_sandbox_record(&current_record)?;
-            if provisioning_deadline::driver_operation_pending(&sandbox)
-                && sandbox.phase() != SandboxPhase::Deleting as i32
+            if self
+                .pending_driver_operation_blocks_cleanup(&sandbox)
+                .await?
             {
                 return Ok(());
             }

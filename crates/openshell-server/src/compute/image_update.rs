@@ -422,6 +422,28 @@ impl ComputeRuntime {
             .map_err(|_| Status::deadline_exceeded("sandbox update recovery timed out"))?
     }
 
+    /// Only explicit deletion of the matching update may bypass the driver
+    /// interlock. Deleting alone says nothing about an outstanding create/start.
+    pub(super) async fn pending_driver_operation_blocks_cleanup(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<bool, String> {
+        if !super::provisioning_deadline::driver_operation_pending(sandbox) {
+            return Ok(false);
+        }
+        if sandbox.phase() != SandboxPhase::Deleting as i32 {
+            return Ok(true);
+        }
+        let state = self
+            .store
+            .get_sandbox_image_state(sandbox.object_id())
+            .await
+            .map_err(|error| format!("read pending sandbox update for cleanup: {error}"))?;
+        Ok(state
+            .and_then(|state| state.pending)
+            .is_none_or(|intent| ensure_image_update_interlock(sandbox, &intent).is_err()))
+    }
+
     pub(super) async fn ensure_no_pending_image_update(
         &self,
         sandbox: &Sandbox,
@@ -496,6 +518,7 @@ mod tests {
     use crate::compute::{
         COMPUTE_RUNTIME_IDENTITY_ANNOTATION, apply_driver_snapshot, provisioning_deadline,
     };
+    use crate::persistence::ObjectType;
     use crate::sandbox_index::SandboxIndex;
     use crate::sandbox_watch::SandboxWatchBus;
     use crate::supervisor_session::SupervisorSessionRegistry;
@@ -852,6 +875,196 @@ mod tests {
                 .code(),
             Code::Aborted
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_does_not_bypass_unrelated_pending_driver_operations() {
+        for missing_intent in [false, true] {
+            let (runtime, driver, original) = fixture(true).await;
+            driver.set_image_update_error(Some(Code::Unavailable));
+            runtime
+                .update_sandbox_image(
+                    original.object_id(),
+                    "new-image".into(),
+                    original.get_resource_version(),
+                )
+                .await
+                .unwrap_err();
+            let mut deleting = runtime
+                .store
+                .get_message::<Sandbox>(original.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            deleting.set_phase(SandboxPhase::Deleting as i32);
+            if missing_intent {
+                runtime
+                    .store
+                    .delete_sandbox_image_state(original.object_id())
+                    .await
+                    .unwrap();
+            } else {
+                deleting
+                    .status
+                    .as_mut()
+                    .unwrap()
+                    .provisioning
+                    .as_mut()
+                    .unwrap()
+                    .driver_operation_id = "unrelated-create-or-start".into();
+            }
+            runtime.store.put_message(&deleting).await.unwrap();
+            let deleting = runtime
+                .store
+                .get_message::<Sandbox>(original.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            let version = deleting.get_resource_version();
+            driver.clear_calls();
+
+            runtime
+                .recover_persisted_lifecycle_transitions()
+                .await
+                .unwrap();
+            runtime.apply_deleted(original.object_id()).await.unwrap();
+            {
+                let _guard = runtime.lock_sandbox_local(original.object_id()).await;
+                runtime
+                    .apply_deleted_if_version_locked(&deleting, version)
+                    .await
+                    .unwrap();
+                assert!(
+                    !runtime
+                        .remove_sandbox_record_if_version_locked(original.object_id(), version)
+                        .await
+                        .unwrap()
+                );
+            }
+            let record = runtime
+                .store
+                .get(Sandbox::object_type(), original.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            runtime
+                .prune_missing_sandbox(record, i64::MAX, 0)
+                .await
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .delete_sandbox("default", original.object_name())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                if missing_intent {
+                    Code::FailedPrecondition
+                } else {
+                    Code::Aborted
+                }
+            );
+            assert_eq!(
+                runtime
+                    .store
+                    .get_message::<Sandbox>(original.object_id())
+                    .await
+                    .unwrap(),
+                Some(deleting)
+            );
+            assert!(driver.calls().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_pending_update_can_retry_failed_record_removal() {
+        let (mut runtime, driver, original) = fixture(true).await;
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!("sqlite://{}", directory.path().join("delete.db").display());
+        runtime.store = Arc::new(
+            crate::persistence::Store::connect(&database_url)
+                .await
+                .unwrap(),
+        );
+        crate::ensure_default_workspace(&runtime.store)
+            .await
+            .unwrap();
+        runtime.store.put_message(&original).await.unwrap();
+        driver.set_image_update_error(Some(Code::Unavailable));
+        runtime
+            .update_sandbox_image(
+                original.object_id(),
+                "new-image".into(),
+                original.get_resource_version(),
+            )
+            .await
+            .unwrap_err();
+        let mut deleting = runtime
+            .store
+            .get_message::<Sandbox>(original.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        deleting.set_phase(SandboxPhase::Deleting as i32);
+        runtime.store.put_message(&deleting).await.unwrap();
+        let pending = runtime
+            .store
+            .get_sandbox_image_state(original.object_id())
+            .await
+            .unwrap();
+        let pool = sqlx::SqlitePool::connect(&database_url).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_sandbox_delete BEFORE DELETE ON objects
+WHEN OLD.object_type = 'sandbox'
+BEGIN SELECT RAISE(ABORT, 'injected sandbox deletion failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(runtime.apply_deleted(original.object_id()).await.is_err());
+        let retained = runtime
+            .store
+            .get_message::<Sandbox>(original.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.phase(), SandboxPhase::Deleting as i32);
+        assert_eq!(
+            runtime
+                .store
+                .get_sandbox_image_state(original.object_id())
+                .await
+                .unwrap(),
+            pending
+        );
+        assert!(
+            !runtime
+                .pending_driver_operation_blocks_cleanup(&retained)
+                .await
+                .unwrap()
+        );
+
+        sqlx::query("DROP TRIGGER fail_sandbox_delete")
+            .execute(&pool)
+            .await
+            .unwrap();
+        runtime.apply_deleted(original.object_id()).await.unwrap();
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>(original.object_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .store
+                .get_sandbox_image_state(original.object_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        pool.close().await;
     }
 
     #[tokio::test]

@@ -149,7 +149,10 @@ exact operation receipt for idempotent completion across replicas; a newer updat
 invalidates it. Ambiguous results retain the baseline provisioning interlock.
 Explicit deletion can supersede a pending update: the driver only patches the
 original immutable resource and never creates a replacement. The Deleting CAS
-prevents delayed completion, and successful deletion reclaims private intent.
+prevents delayed completion. Cleanup bypasses the pending-driver guard only when
+the pending operation ID matches the persisted update intent. Final removal
+deletes the sandbox and private intent atomically, retaining that evidence if
+cleanup fails or loses a resource-version race.
 
 Metadata replacement preserves gateway-owned keys, including retention, while
 other user keys under OpenShell domains remain editable. Completion preserves

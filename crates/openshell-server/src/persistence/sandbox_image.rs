@@ -351,7 +351,55 @@ ORDER BY id LIMIT $2",
             .collect()
     }
 
-    /// Remove private image state when its owning sandbox is reclaimed.
+    /// Remove a sandbox and its private update state in the same transaction.
+    /// Failed cleanup must retain the intent that authorizes deletion to bypass
+    /// the pending driver operation interlock.
+    pub(crate) async fn delete_sandbox_with_image_state_if(
+        &self,
+        sandbox_id: &str,
+        expected_resource_version: u64,
+    ) -> PersistenceResult<bool> {
+        let mut tx = ImageTransaction::begin(self).await?;
+        let sandbox = match tx.lock_sandbox(sandbox_id).await {
+            Ok(sandbox) => sandbox,
+            Err(PersistenceError::Conflict {
+                current_resource_version: None,
+            }) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if resource_version(&sandbox) != expected_resource_version {
+            return Err(conflict(Some(resource_version(&sandbox))));
+        }
+        let image_state_id = state_id(sandbox_id);
+        for (object_type, id) in [
+            ("sandbox", sandbox_id),
+            (IMAGE_STATE_OBJECT_TYPE, image_state_id.as_str()),
+        ] {
+            match &mut tx {
+                ImageTransaction::Sqlite(tx) => {
+                    sqlx::query("DELETE FROM objects WHERE object_type = ?1 AND id = ?2")
+                        .bind(object_type)
+                        .bind(id)
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(|error| map_db_error(&error))?;
+                }
+                ImageTransaction::Postgres(tx) => {
+                    sqlx::query("DELETE FROM objects WHERE object_type = $1 AND id = $2")
+                        .bind(object_type)
+                        .bind(id)
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(|error| map_db_error(&error))?;
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Remove private image state independently to exercise recovery fixtures.
+    #[cfg(test)]
     pub(crate) async fn delete_sandbox_image_state(
         &self,
         sandbox_id: &str,
@@ -981,6 +1029,135 @@ mod tests {
             .unwrap()
             .unwrap();
         (store, stored)
+    }
+
+    async fn assert_atomic_sandbox_deletion(store: &Store) {
+        store.put_message(&sandbox()).await.unwrap();
+        let original = store
+            .get_message::<Sandbox>("sandbox-id")
+            .await
+            .unwrap()
+            .unwrap();
+        let accepted = store
+            .begin_sandbox_image_update("sandbox-id", resource_version(&original), 0, &intent())
+            .await
+            .unwrap();
+        let pending = store.get_sandbox_image_state("sandbox-id").await.unwrap();
+        assert!(matches!(
+            store
+                .delete_sandbox_with_image_state_if("sandbox-id", resource_version(&original))
+                .await,
+            Err(PersistenceError::Conflict { .. })
+        ));
+        assert_eq!(
+            store.get_message::<Sandbox>("sandbox-id").await.unwrap(),
+            Some(accepted.clone())
+        );
+        assert_eq!(
+            store.get_sandbox_image_state("sandbox-id").await.unwrap(),
+            pending
+        );
+        assert!(
+            store
+                .delete_sandbox_with_image_state_if("sandbox-id", resource_version(&accepted))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .get_message::<Sandbox>("sandbox-id")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_sandbox_image_state("sandbox-id")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !store
+                .delete_sandbox_with_image_state_if("sandbox-id", resource_version(&accepted))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .complete_sandbox_image_update("sandbox-id", &intent())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_sandbox_deletion_preserves_intent_on_conflict() {
+        let store = super::super::test_store().await;
+        assert_atomic_sandbox_deletion(&store).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_private_state_deletion_failure_rolls_back_sandbox_removal() {
+        let (store, original) = fixture().await;
+        let accepted = store
+            .begin_sandbox_image_update("sandbox-id", resource_version(&original), 0, &intent())
+            .await
+            .unwrap();
+        let pending = store.get_sandbox_image_state("sandbox-id").await.unwrap();
+        let Store::Sqlite(sqlite) = &store else {
+            panic!("expected SQLite");
+        };
+        sqlx::query(
+            "CREATE TRIGGER fail_image_delete BEFORE DELETE ON objects
+WHEN OLD.object_type = 'sandbox_image_state'
+BEGIN SELECT RAISE(ABORT, 'injected image state deletion failure'); END",
+        )
+        .execute(&sqlite.pool)
+        .await
+        .unwrap();
+        assert!(
+            store
+                .delete_sandbox_with_image_state_if("sandbox-id", resource_version(&accepted))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.get_message::<Sandbox>("sandbox-id").await.unwrap(),
+            Some(accepted.clone())
+        );
+        assert_eq!(
+            store.get_sandbox_image_state("sandbox-id").await.unwrap(),
+            pending
+        );
+        sqlx::query("DROP TRIGGER fail_image_delete")
+            .execute(&sqlite.pool)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .delete_sandbox_with_image_state_if("sandbox-id", resource_version(&accepted))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .get_sandbox_image_state("sandbox-id")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run mise run test:rust:postgres"]
+    async fn postgres_sandbox_deletion_preserves_intent_on_conflict() {
+        let schema =
+            super::super::test_postgres::TestSchema::create("sandbox_update_deletion").await;
+        let store = schema.connect_store().await;
+        assert_atomic_sandbox_deletion(&store).await;
+        store.close().await;
+        schema.drop_schema().await;
     }
 
     async fn assert_pending_update_discovery(store: &Store) {
