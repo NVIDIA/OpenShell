@@ -18,8 +18,11 @@ run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts
 hide = true
 
 ["rust:lockfiles:check"]
-description = "Verify all tracked Cargo lockfiles are current"
-run = "tasks/scripts/check-cargo-lockfiles.sh"
+description = "Verify all tracked Cargo lockfiles are current and aligned with the root"
+run = [
+  "tasks/scripts/check-cargo-lockfiles.sh",
+  "uv run tasks/scripts/check_cargo_lockfile_alignment.py",
+]
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/check-cargo-lockfiles.ps1"
 hide = true
 
@@ -34,6 +37,9 @@ run = [
   "cargo clippy --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings",
   "cargo clippy --manifest-path examples/isolation-backend-v8/Cargo.toml --all-targets -- -D warnings",
   "cargo clippy --manifest-path tests/testkit/Cargo.toml --all-targets -- -D warnings",
+  "cargo clippy --manifest-path tests/tmachine/Cargo.toml --all-targets -- -D warnings",
+  "cargo clippy --manifest-path tests/runner/Cargo.toml --all-targets -- -D warnings",
+  "cargo clippy --manifest-path tests/suites/conformance/Cargo.toml -p sandbox --all-targets -- -D warnings",
 ]
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 lint native"
 hide = true
@@ -47,6 +53,9 @@ run = [
   "cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all",
   "cargo fmt --manifest-path examples/isolation-backend-v8/Cargo.toml --all",
   "cargo fmt --manifest-path tests/testkit/Cargo.toml --all",
+  "cargo fmt --manifest-path tests/tmachine/Cargo.toml --all",
+  "cargo fmt --manifest-path tests/runner/Cargo.toml --all",
+  "cargo fmt --manifest-path tests/suites/conformance/Cargo.toml -p sandbox",
 ]
 hide = true
 
@@ -59,6 +68,9 @@ run = [
   "cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check",
   "cargo fmt --manifest-path examples/isolation-backend-v8/Cargo.toml --all -- --check",
   "cargo fmt --manifest-path tests/testkit/Cargo.toml --all -- --check",
+  "cargo fmt --manifest-path tests/tmachine/Cargo.toml --all -- --check",
+  "cargo fmt --manifest-path tests/runner/Cargo.toml --all -- --check",
+  "cargo fmt --manifest-path tests/suites/conformance/Cargo.toml -p sandbox -- --check",
 ]
 hide = true
 

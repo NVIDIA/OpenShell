@@ -17,6 +17,9 @@ python/openshell/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
 e2e/rust/              # Rust CLI E2E tests
 tests/testkit/         # Support library for SDK-driven E2E suites
+tests/suites/          # E2E suites, grouped by test family
+tests/tmachine/        # QEMU test machines, Ansible playbooks, and the Session API
+tests/runner/          # openshell-test-runner: runs a test family in a tmachine environment
 ```
 
 ## Rust Tests
@@ -177,6 +180,55 @@ gateway the same way the CLI does, through `OPENSHELL_GATEWAY_ENDPOINT`,
 by `OPENSHELL_BIN`. See
 [tests/testkit/README.md](tests/testkit/README.md) for how to write and run
 tests.
+
+Suites live under `tests/suites/<family>/`. Each family is a Cargo workspace
+with its own lockfile. Run the `conformance` suites against a local Docker
+gateway with:
+
+```shell
+mise run e2e:testkit
+```
+
+Workspaces that build root crates through path dependencies must lock shared
+crates at the versions in the root `Cargo.lock`; otherwise CI can build against
+dependencies the Nix toolchain doesn't support. `mise run rust:lockfiles:check`
+verifies this, and `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`
+re-locks a workspace from the root lockfile. Add new testkit workspaces to
+`ALIGNED_WORKSPACES` in that script.
+
+### Running suites in a tmachine environment (`tests/runner/`)
+
+`openshell-test-runner` runs a test family inside a tmachine VM, against the
+OpenShell that the VM's installer set up.
+
+```shell
+nix run .#openshell-test-runner -- \
+  --environment ubuntu-docker-rootful --installer deb \
+  --family conformance --package sandbox
+```
+
+It needs KVM, and tmachine only boots guests of the host's architecture. The
+runner points the tests at the installed CLI and the gateway the installer
+registered (`--gateway`, default `openshell`). A run passes if nextest
+succeeds; nextest fails a run with no tests. The runner exits with 1 when a
+test failed and 2 when the run could not complete, for example because the
+environment didn't come up. It writes `junit.xml`, `nextest.log` and, after a
+failure, the guest's diagnostics to `artifacts/test-results/` (`--results`),
+even when the run timed out.
+
+`--filter <filterset>` narrows the tests with a nextest filterset, and
+`--keep` leaves the VM running until you press Enter. Two runs on one host
+need different `TMACHINE_SSH_PORT` values (default 2222). The installer
+inputs, such as the Debian package and the images, come from `artifacts/`,
+built by `nix run .#build-artifacts` or downloaded by CI.
+
+A flaky or broken test is marked `#[ignore = "<issue link>"]`, which takes it
+out of every environment until it's fixed.
+
+**CI.** `.github/workflows/e2e-suites.yml` lists the environments and suites as
+an explicit matrix and runs the runner once per row. Branch E2E calls it when
+the `test:e2e` label is set, and a failure fails the Core E2E result. To run
+a suite in another environment on CI, add a row.
 
 ### Python E2E (`e2e/python/`)
 
