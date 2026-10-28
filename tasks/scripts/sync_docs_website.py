@@ -28,10 +28,6 @@ SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 DISPLAY_VERSION_RE = re.compile(r"\bv?(\d+\.\d+\.\d+(?:[.-]?[A-Za-z0-9]+)*)\b")
 VERSION_AVAILABILITIES = {"beta", "deprecated", "ga", "stable"}
 SNAPSHOT_METADATA_FILE = ".docs-snapshots.yml"
-# Front matter key for pages published only in the `dev` snapshot. Fern ignores
-# unknown front matter keys but rejects unknown keys in navigation entries.
-DEVELOPMENT_ONLY_KEY = "development-only"
-FRONT_MATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---", re.S)
 YamlMapping = dict[str, object]
 
 
@@ -292,53 +288,8 @@ def prefix_navigation_paths(value: object, pages_dir: str) -> object:
     return value
 
 
-def is_development_only(page: Path) -> bool:
-    match = FRONT_MATTER_RE.match(page.read_text(encoding="utf-8"))
-    if match is None:
-        return False
-    front_matter = yaml.safe_load(match.group(1))
-    return (
-        isinstance(front_matter, dict)
-        and front_matter.get(DEVELOPMENT_ONLY_KEY) is True
-    )
-
-
-def remove_development_only_pages(pages: Path) -> set[str]:
-    """Delete pages marked development-only and return their docs-relative paths."""
-    removed: set[str] = set()
-    for page in sorted(pages.rglob("*.mdx")):
-        if is_development_only(page):
-            page.unlink()
-            removed.add(page.relative_to(pages).as_posix())
-    return removed
-
-
-def drop_navigation_paths(value: object, removed: set[str]) -> object:
-    if isinstance(value, dict):
-        for child in cast("YamlMapping", value).values():
-            drop_navigation_paths(child, removed)
-    elif isinstance(value, list):
-        items = cast("list[object]", value)
-        items[:] = [
-            item
-            for item in items
-            if not (
-                isinstance(item, dict)
-                and str(cast("YamlMapping", item).get("path", "")).removeprefix("./")
-                in removed
-            )
-        ]
-        for item in items:
-            drop_navigation_paths(item, removed)
-    return value
-
-
-def version_navigation(
-    source_index: Path, pages_dir: str, removed: set[str] | None = None
-) -> YamlMapping:
+def version_navigation(source_index: Path, pages_dir: str) -> YamlMapping:
     data = read_yaml(source_index)
-    if removed:
-        drop_navigation_paths(data, removed)
     prefix_navigation_paths(data, pages_dir)
     return data
 
@@ -526,11 +477,6 @@ def write_snapshot(
 ) -> None:
     pages_dir = f"pages-{entry.slug}"
     reset_directory(source_docs, target_fern / pages_dir)
-    # Only the dev snapshot documents development-only features, which stable
-    # and prerelease builds exclude.
-    removed: set[str] = set()
-    if entry.slug != "dev":
-        removed = remove_development_only_pages(target_fern / pages_dir)
     if refresh_shared:
         merge_directory(source_fern / "assets", target_fern / "assets", overwrite=True)
         merge_directory(
@@ -549,7 +495,7 @@ def write_snapshot(
     versions_dir.mkdir(parents=True, exist_ok=True)
     write_yaml(
         versions_dir / f"{entry.slug}.yml",
-        version_navigation(source_docs / "index.yml", pages_dir, removed),
+        version_navigation(source_docs / "index.yml", pages_dir),
     )
     update_docs_yml(target_fern / "docs.yml", entry, target_fern)
 
