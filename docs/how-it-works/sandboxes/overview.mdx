@@ -1008,7 +1008,8 @@ longer need its retained state.
 
 To change the configuration of a retained `Completed` or `Error/MainProcessFailed`
 sandbox, run `sandbox stop` first. Stop cleans up compute and moves the sandbox
-to `Stopped`, preserving its exit code until the next start.
+to `Stopped`, preserving its exit code until the next start. This stop behavior
+also applies when sandbox updates are disabled.
 
 If an infrastructure failure leaves a sandbox in `Error`, fix the reported cause, then run `sandbox stop` followed by `sandbox start`. Wait for stop to succeed before starting. This retains the sandbox and its persistent workspace on backends that support restarting stopped sandboxes; it cannot recover deleted resources or storage.
 
