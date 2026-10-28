@@ -42,10 +42,10 @@ impl std::str::FromStr for OcsfSchemaVersion {
 }
 
 /// Fields to strip when downgrading to v1.3.0 or earlier.
-const STRIP_FOR_V1_3: &[&str] = &["ai_model", "container", "observation_point_id"];
+const STRIP_FOR_V1_3: &[&str] = &["ai_model", "container", "observation_point_id", "trace"];
 
 /// Profile names to remove from `metadata.profiles` when downgrading to v1.3.0 or earlier.
-const STRIP_PROFILES_V1_3: &[&str] = &["ai_operation", "container"];
+const STRIP_PROFILES_V1_3: &[&str] = &["ai_operation", "container", "trace"];
 
 /// Downgrade a serialized OCSF event to the target schema version.
 ///
@@ -153,6 +153,41 @@ mod tests {
             "observation_point_id": 2,
             "unmapped": {"key": "value"}
         })
+    }
+
+    fn assert_trace_removed(target: &str) {
+        let ctx = crate::builders::test_sandbox_context();
+        let mut event = crate::NetworkActivityBuilder::new(&ctx)
+            .action(crate::ActionId::Denied)
+            .src_endpoint_addr("192.0.2.5".parse().unwrap(), 51234)
+            .dst_endpoint(crate::Endpoint::from_ip("192.0.2.1".parse().unwrap(), 443))
+            .trace(crate::TraceCorrelation {
+                uid: "0af7651916cd43dd8448eb211c80319c".to_string(),
+            })
+            .build()
+            .to_json()
+            .unwrap();
+        assert!(event.get("trace").is_some());
+        assert!(downgrade_event(&mut event, target));
+        assert!(event.get("trace").is_none());
+        assert!(
+            !event["metadata"]["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == "trace")
+        );
+        assert_eq!(event["metadata"]["version"], target);
+    }
+
+    #[test]
+    fn trace_object_and_profile_are_removed_for_1_3() {
+        assert_trace_removed("1.3.0");
+    }
+
+    #[test]
+    fn trace_object_and_profile_are_removed_for_1_1() {
+        assert_trace_removed("1.1.0");
     }
 
     #[test]

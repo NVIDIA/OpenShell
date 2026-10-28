@@ -826,6 +826,18 @@
                 "security_control"
             ],
             "type_name": "Integer"
+        },
+        "trace": {
+            "type": "object_t",
+            "description": "The trace object contains information about distributed traces which are critical to observability and describe how requests move through a system, capturing each step's timing and status.",
+            "group": "primary",
+            "requirement": "recommended",
+            "object_type": "trace",
+            "object_name": "Trace",
+            "caption": "Trace",
+            "profiles": [
+                "trace"
+            ]
         }
     },
     "name": "base_event",
@@ -842,7 +854,8 @@
         "linux/linux_users",
         "macos/macos_users",
         "osint",
-        "security_control"
+        "security_control",
+        "trace"
     ],
     "category_uid": 0
 }

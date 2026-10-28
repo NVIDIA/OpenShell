@@ -386,7 +386,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
                     "rejecting endpoint: unrecognized credential_signing value {other:?}"
                 ))
                 .build();
-            openshell_ocsf::ocsf_emit!(event);
+            crate::telemetry::egress_emit!(event);
             return None;
         }
         _ => CredentialSigning::None,
@@ -402,7 +402,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
             .state(openshell_ocsf::StateId::Disabled, "invalid")
             .message("rejecting endpoint: credential_signing requires signing_service".to_string())
             .build();
-        openshell_ocsf::ocsf_emit!(event);
+        crate::telemetry::egress_emit!(event);
         return None;
     }
 
@@ -429,8 +429,12 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     })
 }
 
-pub(crate) fn emit_uninspected_credential_finding(host: &str, policy_name: &str, surface: &str) {
-    let event = openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+pub(crate) fn build_uninspected_credential_finding(
+    host: &str,
+    policy_name: &str,
+    surface: &str,
+) -> openshell_ocsf::OcsfEvent {
+    openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(openshell_ocsf::SeverityId::High)
         .finding_info(openshell_ocsf::FindingInfo::new(
             "openshell.credentials.traffic_uninspectable",
@@ -443,8 +447,7 @@ pub(crate) fn emit_uninspected_credential_finding(host: &str, policy_name: &str,
             ("disposition", "denied"),
         ])
         .message("Uninspected credential-bearing traffic denied")
-        .build();
-    openshell_ocsf::ocsf_emit!(event);
+        .build()
 }
 
 impl L7EndpointConfig {

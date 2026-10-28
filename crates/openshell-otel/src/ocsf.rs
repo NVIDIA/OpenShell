@@ -510,6 +510,42 @@ mod tests {
     }
 
     #[test]
+    fn trace_body_obeys_native_and_older_schema_contracts() {
+        let event = ConfigStateChangeBuilder::new(&event_context("sandbox-1"))
+            .trace(openshell_ocsf::TraceCorrelation {
+                uid: "0af7651916cd43dd8448eb211c80319c".to_string(),
+            })
+            .build();
+        let native_body = body(&record(&event, None));
+        assert_eq!(native_body, native(&event));
+        assert_eq!(
+            native_body["trace"]["uid"],
+            "0af7651916cd43dd8448eb211c80319c"
+        );
+        assert!(
+            native_body["metadata"]["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|profile| profile == "trace")
+        );
+
+        for target in [OcsfSchemaVersion::V1_1, OcsfSchemaVersion::V1_3] {
+            let downgraded = body(&record(&event, Some(target)));
+            assert_eq!(downgraded["metadata"]["version"], target.as_str());
+            assert!(downgraded.get("trace").is_none());
+            assert!(
+                !downgraded["metadata"]["profiles"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|profile| profile == "trace")
+            );
+        }
+        assert_eq!(native(&event), native_body);
+    }
+
+    #[test]
     fn timestamps_are_event_time_and_observed_time() {
         let event = event("sandbox-1", SeverityId::Informational);
         let observed = SystemTime::UNIX_EPOCH + Duration::from_secs(42);

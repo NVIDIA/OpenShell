@@ -748,6 +748,10 @@ async fn run_from_args(
     let prepared = prepare_server_config_with_drivers(&mut args, &matches, &compute_drivers)?;
     validate_user_auth(&prepared.config)?;
 
+    openshell_ocsf::register_trace_correlation_extractor(
+        openshell_otel::current_ocsf_trace_correlation,
+    );
+
     // Initialize OCSF identity before tracing can emit gateway events.
     let gateway_identity = crate::gateway_ocsf::GatewayIdentity {
         name: prepared.config.name.clone(),

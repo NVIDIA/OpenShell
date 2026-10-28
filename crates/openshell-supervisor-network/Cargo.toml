@@ -68,9 +68,11 @@ bundled-ca-roots = ["dep:webpki-roots"]
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
 
 openshell-driver-vm = { path = "../openshell-driver-vm", default-features = false, features = ["allocation-tracking"] }
+openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 openshell-otel = { path = "../openshell-otel" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 temp-env = "0.3"
 tokio = { workspace = true, features = ["test-util"] }

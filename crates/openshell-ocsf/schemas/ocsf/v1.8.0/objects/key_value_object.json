@@ -1,0 +1,36 @@
+{
+    "attributes": {
+        "name": {
+            "type": "string_t",
+            "description": "The name of the key.",
+            "requirement": "required",
+            "caption": "Name",
+            "type_name": "String"
+        },
+        "value": {
+            "type": "string_t",
+            "description": "The value associated to the key.",
+            "requirement": "recommended",
+            "caption": "Value",
+            "type_name": "String"
+        },
+        "values": {
+            "type": "string_t",
+            "description": "Optional, the values associated to the key. You can populate this attribute, when you have multiple values for the same key.",
+            "is_array": true,
+            "requirement": "recommended",
+            "caption": "Values",
+            "type_name": "String"
+        }
+    },
+    "name": "key_value_object",
+    "description": "A generic object allowing to define a <code>{key:value}</code> pair.",
+    "extends": "object",
+    "constraints": {
+        "at_least_one": [
+            "value",
+            "values"
+        ]
+    },
+    "caption": "Key:Value object"
+}

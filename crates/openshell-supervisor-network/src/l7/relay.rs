@@ -20,6 +20,7 @@ use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::rest::WebSocketExtensionMode;
 use crate::l7::{EndpointObserver, EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
+use crate::telemetry::egress_emit;
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::endpoint_status::{EndpointObservationSender, EndpointResult};
@@ -27,7 +28,6 @@ use openshell_core::secrets::{self, SecretResolver};
 use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
     HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl,
-    ocsf_emit,
 };
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -287,8 +287,14 @@ where
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()?;
 
-    ocsf_emit!(build_request_authority_mismatch_event(ctx, method));
-    ocsf_emit!(build_request_authority_mismatch_finding(ctx));
+    crate::telemetry::emit_decision(
+        [
+            build_request_authority_mismatch_event(ctx, method),
+            build_request_authority_mismatch_finding(ctx),
+        ],
+        None,
+        false,
+    );
     Ok(())
 }
 
@@ -338,7 +344,7 @@ where
                     crate::l7::mcp::selected_revision_context(request, version)
                 );
                 let summary = l7_protocol_log_summary(None, Some(&info));
-                ocsf_emit!(build_l7_request_event(
+                egress_emit!(build_l7_request_event(
                     ctx,
                     &request.action,
                     redacted_target,
@@ -419,7 +425,7 @@ where
     }
     let reason = error.rejection_detail(request);
     let summary = l7_protocol_log_summary(None, Some(info));
-    ocsf_emit!(build_l7_request_event(
+    egress_emit!(build_l7_request_event(
         ctx,
         &request.action,
         redacted_target,
@@ -613,15 +619,9 @@ where
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()?;
 
-    ocsf_emit!(build_credential_resolution_event(
-        ctx,
-        method,
-        endpoint_mismatch
-    ));
-
-    if endpoint_mismatch {
-        ocsf_emit!(build_credential_endpoint_mismatch_finding(ctx));
-    }
+    let event = build_credential_resolution_event(ctx, method, endpoint_mismatch);
+    let finding = endpoint_mismatch.then(|| build_credential_endpoint_mismatch_finding(ctx));
+    crate::telemetry::emit_decision(std::iter::once(event).chain(finding), None, false);
     Ok(())
 }
 
@@ -1015,7 +1015,7 @@ fn emit_parse_rejection(ctx: &L7EvalContext, detail: &str, engine_type: &str) {
         ))
         .status_detail(detail)
         .build();
-    ocsf_emit!(event);
+    egress_emit!(event);
     emit_activity(ctx, true, "l7_parse_rejection");
 }
 
@@ -1131,7 +1131,7 @@ where
                     .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                     .message("SQL L7 provider not yet implemented, falling back to passthrough")
                     .build();
-                ocsf_emit!(event);
+                egress_emit!(event);
             }
             tokio::io::copy_bidirectional(client, upstream)
                 .await
@@ -1664,7 +1664,7 @@ fn emit_l7_request_log(
         reason,
         protocol_summary,
     );
-    ocsf_emit!(event);
+    egress_emit!(event);
     emit_activity(ctx, decision_str == "deny", "l7_policy");
 }
 
@@ -1830,7 +1830,7 @@ where
     } else {
         "raw bidirectional relay (L7 enforcement no longer active)"
     };
-    ocsf_emit!(
+    egress_emit!(
         NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Other)
             .activity_name("Upgrade")
@@ -2169,7 +2169,7 @@ where
                     request_info.action, ctx.host, ctx.port, redacted_target, reason,
                 ))
                 .build();
-            ocsf_emit!(event);
+            egress_emit!(event);
         }
 
         if allowed || config.enforcement == EnforcementMode::Audit {
@@ -2377,7 +2377,7 @@ pub(crate) fn emit_policy_reload(
     port: u16,
     policy_name: &str,
 ) {
-    ocsf_emit!(
+    egress_emit!(
         NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
@@ -2597,7 +2597,7 @@ where
                     &reason,
                 ))
                 .build();
-            ocsf_emit!(event);
+            egress_emit!(event);
         }
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
@@ -2879,7 +2879,7 @@ where
                     request_info.action, ctx.host, ctx.port, redacted_target, reason,
                 ))
                 .build();
-            ocsf_emit!(event);
+            egress_emit!(event);
         }
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
@@ -3350,7 +3350,7 @@ fn emit_transformed_body_decision(
             request_info.action, ctx.host, ctx.port, request_info.target, reason
         ))
         .build();
-    ocsf_emit!(event);
+    egress_emit!(event);
 }
 
 fn jsonrpc_policy_input(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> serde_json::Value {
@@ -3583,7 +3583,7 @@ where
                     req.action, ctx.host, ctx.port, redacted_target,
                 ))
                 .build();
-            ocsf_emit!(event);
+            egress_emit!(event);
         }
 
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -3753,6 +3753,63 @@ where
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    use crate::telemetry::tests::{assert_deny_resolves, exported};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authority_mismatch_domain_and_finding_share_one_trace() {
+        let (events, received) = exported("warn", || {
+            let ctx = L7EvalContext {
+                host: "blocked.example".to_string(),
+                port: 443,
+                ..Default::default()
+            };
+            let mut response = Vec::new();
+            futures::executor::block_on(reject_request_authority_mismatch(
+                &mut response,
+                &ctx,
+                "POST",
+            ))
+            .unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 403 Forbidden"));
+        })
+        .await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(received.spans.len(), 1);
+        assert_eq!(events[0]["trace"]["uid"], events[1]["trace"]["uid"]);
+        assert_deny_resolves(&events, &received, true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_level_l7_relay_deny_uid_resolves_to_one_span_root_trace() {
+        let (events, received) = exported("warn", || {
+            let ctx = L7EvalContext {
+                host: "blocked.example".to_string(),
+                port: 443,
+                policy_name: "rest-policy".to_string(),
+                ..Default::default()
+            };
+            emit_parse_rejection(&ctx, "ambiguous framing", "l7-rest");
+        })
+        .await;
+        assert_eq!(events.len(), 1);
+        assert_deny_resolves(&events, &received, true);
+        assert_eq!(received.spans.len(), 1);
+        crate::telemetry::tests::assert_deny_attribute(
+            &received,
+            "openshell.policy.name",
+            "rest-policy",
+        );
+        crate::telemetry::tests::assert_deny_attribute(
+            &received,
+            "server.address",
+            "blocked.example",
+        );
+    }
 }
 
 #[cfg(test)]

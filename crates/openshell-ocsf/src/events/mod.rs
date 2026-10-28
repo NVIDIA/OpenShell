@@ -156,6 +156,22 @@ impl OcsfEvent {
             Self::Base(e) => &e.base,
         }
     }
+
+    /// Returns mutable base data common to all event classes.
+    pub(crate) fn base_mut(&mut self) -> &mut BaseEventData {
+        match self {
+            Self::NetworkActivity(e) => &mut e.base,
+            Self::HttpActivity(e) => &mut e.base,
+            Self::SshActivity(e) => &mut e.base,
+            Self::ProcessActivity(e) => &mut e.base,
+            Self::Authentication(e) => &mut e.base,
+            Self::DetectionFinding(e) => &mut e.base,
+            Self::ApplicationLifecycle(e) => &mut e.base,
+            Self::DeviceConfigStateChange(e) => &mut e.base,
+            Self::ApiActivity(e) => &mut e.base,
+            Self::Base(e) => &mut e.base,
+        }
+    }
 }
 
 #[cfg(test)]

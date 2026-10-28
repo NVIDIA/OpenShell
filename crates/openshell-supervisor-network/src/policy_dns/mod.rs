@@ -35,10 +35,11 @@ pub(crate) use store::{
 use crate::opa::OpaEngine;
 use crate::proxy::destination::{build_validation_plan, filter_resolved_addresses};
 use crate::proxy::is_host_gateway_alias;
+use crate::telemetry::egress_emit;
 use openshell_core::host_pattern::HostSelector;
 use openshell_ocsf::{
     ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint,
-    NetworkActivityBuilder, SeverityId, StateId, StatusId, ocsf_emit,
+    NetworkActivityBuilder, SeverityId, StateId, StatusId,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -489,7 +490,7 @@ fn dns_query_endpoint(name: &NormalizedName) -> Endpoint {
 }
 
 fn emit_dns_denial(name: &NormalizedName, detail: &str, message: &str) {
-    ocsf_emit!(build_dns_denial_event(name, detail, message));
+    egress_emit!(build_dns_denial_event(name, detail, message));
 }
 
 fn build_dns_denial_event(
@@ -576,7 +577,7 @@ fn emit_dns_failure(
     detail: &str,
     message: &str,
 ) {
-    ocsf_emit!(build_dns_failure_event(
+    egress_emit!(build_dns_failure_event(
         name,
         family,
         eligible_endpoints,
@@ -587,11 +588,11 @@ fn emit_dns_failure(
 }
 
 fn emit_mapping_publication(record: &ResolvedEndpointRecord) {
-    ocsf_emit!(build_mapping_publication_event(record));
+    egress_emit!(build_mapping_publication_event(record));
 }
 
 fn emit_observation_publication(record: &ResolvedEndpointRecord) {
-    ocsf_emit!(build_observation_publication_event(record));
+    egress_emit!(build_observation_publication_event(record));
 }
 
 fn build_observation_publication_event(
