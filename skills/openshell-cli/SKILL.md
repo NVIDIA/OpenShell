@@ -529,7 +529,9 @@ the operation that removes retained state.
 
 Before updating a retained `Completed` or `Error/MainProcessFailed` sandbox,
 run `sandbox stop`. It cleans up compute and transitions to `Stopped`, retaining
-the exit code until the next start.
+the exit code until the next start. If the terminal sandbox's compute resource
+is already gone, stop succeeds and preserves its terminal phase and exit code;
+configuration updates require retained compute.
 
 The sandbox's SSH host identity survives stop/start and runtime restarts.
 API clients can read its public fingerprint from the sandbox resource or

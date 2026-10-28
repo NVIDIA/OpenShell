@@ -1011,6 +1011,10 @@ sandbox, run `sandbox stop` first. Stop cleans up compute and moves the sandbox
 to `Stopped`, preserving its exit code until the next start. This stop behavior
 also applies when sandbox updates are disabled.
 
+If the terminal sandbox's compute resource is already gone, stop succeeds and
+preserves its terminal phase and exit code. Configuration updates require a
+retained compute resource.
+
 If an infrastructure failure leaves a sandbox in `Error`, fix the reported cause, then run `sandbox stop` followed by `sandbox start`. Wait for stop to succeed before starting. This retains the sandbox and its persistent workspace on backends that support restarting stopped sandboxes; it cannot recover deleted resources or storage.
 
 For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.

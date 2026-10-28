@@ -17,6 +17,226 @@ async fn stored(runtime: &ComputeRuntime, id: &str) -> Sandbox {
 }
 
 #[tokio::test]
+async fn terminal_stop_preserves_result_when_compute_is_missing() {
+    for exit_code in [0, 1, 137] {
+        let driver = ControlledDriver::new();
+        driver.set_stop_outcome(ControlledLifecycleOutcome::NotFound);
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record("terminal-id", "terminal", SandboxPhase::Ready);
+        apply_main_process_exit(&mut sandbox, "exited-instance", exit_code);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let session = ssh_session_record("old-session", sandbox.object_id());
+        runtime.store.put_message(&session).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+
+        for _ in 0..2 {
+            let result = runtime.stop_sandbox("default", "terminal").await.unwrap();
+            assert_eq!(result.phase(), sandbox.phase());
+            assert_eq!(result.status.as_ref().unwrap().exit_code, Some(exit_code));
+            assert_eq!(
+                result.status.as_ref().unwrap().main_process_instance_id,
+                "exited-instance"
+            );
+            assert_eq!(
+                ready_condition(&result).unwrap().reason,
+                ready_condition(&sandbox).unwrap().reason
+            );
+            assert_eq!(result.spec, sandbox.spec);
+            assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+            assert!(
+                runtime
+                    .store
+                    .get_message::<SshSession>(session.object_id())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            let record = runtime
+                .store
+                .get(Sandbox::object_type(), sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            runtime
+                .prune_missing_sandbox(record, openshell_core::time::now_ms(), 0)
+                .await
+                .unwrap();
+            assert_eq!(stored(&runtime, sandbox.object_id()).await, result);
+        }
+        assert_eq!(driver.start_calls(), 0);
+        assert_eq!(driver.delete_calls(), 0);
+    }
+}
+
+#[tokio::test]
+async fn terminal_stop_recovers_from_persisted_result_after_restart_or_pruning() {
+    for exit_code in [0, 1, 137] {
+        for startup in [false, true] {
+            let driver = ControlledDriver::new();
+            driver.set_stop_outcome(ControlledLifecycleOutcome::NotFound);
+            let runtime = test_runtime(driver).await;
+            let mut sandbox = sandbox_record("terminal-id", "terminal", SandboxPhase::Ready);
+            apply_main_process_exit(&mut sandbox, "exited-instance", exit_code);
+            runtime.store.put_message(&sandbox).await.unwrap();
+            let terminal = stored(&runtime, sandbox.object_id()).await;
+            // Simulate a gateway dying after persisting Stopping, with no
+            // in-memory pre-stop snapshot available to either recovery path.
+            runtime
+                .write_lifecycle_phase(
+                    &terminal,
+                    SandboxPhase::Stopping,
+                    "StopRequested",
+                    "Stop requested",
+                )
+                .await
+                .unwrap();
+            let session = ssh_session_record("old-session", sandbox.object_id());
+            runtime.store.put_message(&session).await.unwrap();
+            register_test_supervisor_session(&runtime, sandbox.object_id());
+
+            if startup {
+                runtime
+                    .recover_persisted_lifecycle_transitions()
+                    .await
+                    .unwrap();
+            } else {
+                let record = runtime
+                    .store
+                    .get(Sandbox::object_type(), sandbox.object_id())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                runtime
+                    .prune_missing_sandbox(record, openshell_core::time::now_ms(), 0)
+                    .await
+                    .unwrap();
+            }
+            let result = stored(&runtime, sandbox.object_id()).await;
+            assert_eq!(result.phase(), terminal.phase());
+            assert_eq!(result.status.as_ref().unwrap().exit_code, Some(exit_code));
+            assert_eq!(
+                ready_condition(&result).unwrap().reason,
+                ready_condition(&terminal).unwrap().reason
+            );
+            assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+            assert!(
+                runtime
+                    .store
+                    .get_message::<SshSession>(session.object_id())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_stop_keeps_uncertain_compute_pending_until_explicit_retry() {
+    let driver = ControlledDriver::new();
+    driver.set_stop_outcome(ControlledLifecycleOutcome::NotFound);
+    driver.set_get_outcome(ControlledGetOutcome::Error("lookup unavailable"));
+    let runtime = test_runtime(driver.clone()).await;
+    let mut sandbox = sandbox_record("terminal-id", "terminal", SandboxPhase::Ready);
+    apply_main_process_exit(&mut sandbox, "exited-instance", 0);
+    runtime.store.put_message(&sandbox).await.unwrap();
+
+    assert_eq!(
+        runtime
+            .stop_sandbox("default", "terminal")
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    let pending = stored(&runtime, sandbox.object_id()).await;
+    assert_eq!(pending.phase(), SandboxPhase::Stopping as i32);
+    assert_eq!(pending.status.as_ref().unwrap().exit_code, Some(0));
+    runtime
+        .recover_persisted_lifecycle_transitions()
+        .await
+        .unwrap();
+    assert_eq!(stored(&runtime, sandbox.object_id()).await, pending);
+
+    driver.set_get_outcome(ControlledGetOutcome::Missing);
+    let result = runtime.stop_sandbox("default", "terminal").await.unwrap();
+    assert_eq!(result.phase(), SandboxPhase::Completed as i32);
+    assert_eq!(result.status.as_ref().unwrap().exit_code, Some(0));
+}
+
+#[tokio::test]
+async fn terminal_stop_recovery_does_not_overwrite_concurrent_changes() {
+    let driver = ControlledDriver::new();
+    driver.set_stop_outcome(ControlledLifecycleOutcome::NotFound);
+    driver.block_get();
+    let runtime = test_runtime(driver.clone()).await;
+    let mut sandbox = sandbox_record("terminal-id", "terminal", SandboxPhase::Ready);
+    apply_main_process_exit(&mut sandbox, "exited-instance", 0);
+    runtime.store.put_message(&sandbox).await.unwrap();
+    let stop = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.stop_sandbox("default", "terminal").await })
+    };
+    driver.get_started.notified().await;
+    let pending = stored(&runtime, sandbox.object_id()).await;
+    let deleting = runtime
+        .write_lifecycle_phase(
+            &pending,
+            SandboxPhase::Deleting,
+            "DeleteRequested",
+            "Delete requested",
+        )
+        .await
+        .unwrap();
+    driver.release_get();
+
+    assert!(stop.await.unwrap().is_err());
+    assert_eq!(stored(&runtime, sandbox.object_id()).await, deleting);
+}
+
+#[tokio::test]
+async fn stop_without_terminal_result_still_reports_missing_compute() {
+    let driver = ControlledDriver::new();
+    driver.set_stop_outcome(ControlledLifecycleOutcome::NotFound);
+    let runtime = test_runtime(driver).await;
+    let sandbox = sandbox_record("running-id", "running", SandboxPhase::Ready);
+    runtime.store.put_message(&sandbox).await.unwrap();
+    assert_eq!(
+        runtime
+            .stop_sandbox("default", "running")
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    let pending = stored(&runtime, sandbox.object_id()).await;
+    assert_eq!(pending.phase(), SandboxPhase::Stopping as i32);
+    assert_eq!(pending.status.as_ref().unwrap().exit_code, None);
+    runtime
+        .recover_persisted_lifecycle_transitions()
+        .await
+        .unwrap();
+    assert_eq!(stored(&runtime, sandbox.object_id()).await, pending);
+    let record = runtime
+        .store
+        .get(Sandbox::object_type(), sandbox.object_id())
+        .await
+        .unwrap()
+        .unwrap();
+    runtime
+        .prune_missing_sandbox(record, openshell_core::time::now_ms(), 0)
+        .await
+        .unwrap();
+    let failed = stored(&runtime, sandbox.object_id()).await;
+    assert_eq!(failed.phase(), SandboxPhase::Error as i32);
+    assert_eq!(
+        ready_condition(&failed).unwrap().reason,
+        "ComputeResourceMissing"
+    );
+}
+
+#[tokio::test]
 async fn failed_gateway_start_can_be_stopped_and_retried() {
     let driver = ControlledDriver::new();
     driver.set_start_outcome(ControlledLifecycleOutcome::Error(

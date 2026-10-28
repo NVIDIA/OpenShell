@@ -2203,8 +2203,12 @@ impl ComputeRuntime {
                 Ok(settled)
             }
             Err(err) => {
-                self.recover_failed_lifecycle(&lifecycle_guard, &transition, &previous, true)
-                    .await;
+                if let Some(terminal) = self
+                    .recover_failed_lifecycle(&lifecycle_guard, &transition, &previous, true)
+                    .await
+                {
+                    return Ok(terminal);
+                }
                 Err(Status::new(
                     err.code(),
                     format!("{} sandbox failed: {}", operation.verb(), err.message()),
@@ -2681,7 +2685,8 @@ impl ComputeRuntime {
                 settled,
             }) => {
                 provisioning_operation::ensure_current_result(&settled, &settled)?;
-                self.recover_failed_lifecycle(&lifecycle_guard, &settled, &previous, false)
+                let _ = self
+                    .recover_failed_lifecycle(&lifecycle_guard, &settled, &previous, false)
                     .await;
                 Err(Status::new(
                     err.code(),
@@ -2934,7 +2939,7 @@ impl ComputeRuntime {
         transition: &Sandbox,
         previous: &Sandbox,
         expected_stopped: bool,
-    ) {
+    ) -> Option<Sandbox> {
         let sandbox_id = transition.object_id();
         let sandbox_name = transition.object_name();
         let observed = tokio::time::timeout(
@@ -2946,6 +2951,14 @@ impl ComputeRuntime {
         let _sandbox_guard = self.lock_sandbox_for_lifecycle(lifecycle_guard).await;
 
         match observed {
+            Ok(None) if terminal_stop_exit_code(transition).is_some() => {
+                match self.restore_missing_terminal_stop(transition).await {
+                    Ok(terminal) => return Some(terminal),
+                    Err(error) => {
+                        warn!(sandbox_id, %error, "Failed to restore terminal result after stop");
+                    }
+                }
+            }
             Ok(Some(snapshot)) if snapshot.id == sandbox_id && snapshot.status.is_some() => {
                 let backend_phase = derive_phase(snapshot.status.as_ref());
                 let observed_stopped = backend_phase == SandboxPhase::Stopped
@@ -3014,6 +3027,38 @@ impl ComputeRuntime {
                 );
             }
         }
+        None
+    }
+
+    /// Called under the sandbox mutation lock after an authoritative lookup
+    /// confirms absent compute. The persisted exit code survives a gateway
+    /// restart; Stopping only retains it when stop began from a terminal result.
+    async fn restore_missing_terminal_stop(&self, transition: &Sandbox) -> Result<Sandbox, Status> {
+        let exit_code = terminal_stop_exit_code(transition)
+            .ok_or_else(|| Status::failed_precondition("stop has no terminal result to restore"))?;
+        let instance_id = transition
+            .status
+            .as_ref()
+            .unwrap()
+            .main_process_instance_id
+            .clone();
+        let restored = self
+            .store
+            .update_message_cas::<Sandbox, _>(
+                transition.object_id(),
+                sandbox_resource_version(transition),
+                |sandbox| apply_main_process_exit(sandbox, &instance_id, exit_code),
+            )
+            .await
+            .map_err(|error| {
+                crate::grpc::persistence_error_to_status(error, "restore terminal sandbox result")
+            })?;
+        self.sandbox_index.update_from_sandbox(&restored);
+        self.sandbox_watch_bus.notify(restored.object_id());
+        self.cleanup_stopped_sandbox_sessions(&restored)
+            .await
+            .map_err(Status::internal)?;
+        Ok(restored)
     }
 
     async fn reconcile_lifecycle_snapshot(
@@ -4472,12 +4517,20 @@ impl ComputeRuntime {
                     }
                 }
                 SandboxPhase::Stopping => {
-                    self.recover_quiesce_transition(QuiesceOperation::Stop, &sandbox)
-                        .await;
+                    self.recover_quiesce_transition(
+                        QuiesceOperation::Stop,
+                        &sandbox,
+                        &lifecycle_guard,
+                    )
+                    .await;
                 }
                 SandboxPhase::Suspending => {
-                    self.recover_quiesce_transition(QuiesceOperation::Suspend, &sandbox)
-                        .await;
+                    self.recover_quiesce_transition(
+                        QuiesceOperation::Suspend,
+                        &sandbox,
+                        &lifecycle_guard,
+                    )
+                    .await;
                 }
                 SandboxPhase::Starting => {
                     if let Err(error) = self.validate_isolation_backend_binding(&sandbox) {
@@ -4552,7 +4605,7 @@ impl ComputeRuntime {
                             if let ProvisioningOperationError::Driver { settled, .. } = err
                                 && in_flight_resume_intent(&settled).is_some()
                             {
-                                Box::pin(self.recover_failed_lifecycle(
+                                let _ = Box::pin(self.recover_failed_lifecycle(
                                     &lifecycle_guard,
                                     &settled,
                                     &sandbox,
@@ -4571,12 +4624,24 @@ impl ComputeRuntime {
 
     /// Re-issue the idempotent driver call of a stop or suspend interrupted
     /// by a gateway restart, then commit its settled phase.
-    async fn recover_quiesce_transition(&self, operation: QuiesceOperation, sandbox: &Sandbox) {
+    async fn recover_quiesce_transition(
+        &self,
+        operation: QuiesceOperation,
+        sandbox: &Sandbox,
+        lifecycle_guard: &SandboxLifecycleGuard,
+    ) {
         let sandbox_id = sandbox.object_id();
         if let Err(err) = self
             .call_quiesce_driver(operation, sandbox_id, sandbox.object_name())
             .await
         {
+            if terminal_stop_exit_code(sandbox).is_some()
+                && Box::pin(self.recover_failed_lifecycle(lifecycle_guard, sandbox, sandbox, true))
+                    .await
+                    .is_some()
+            {
+                return;
+            }
             warn!(sandbox_id, operation = operation.verb(), error = %err, "Failed to recover sandbox lifecycle transition");
             return;
         }
@@ -6602,6 +6667,13 @@ impl ComputeRuntime {
 
         let sandbox = decode_sandbox_record(&current_record)?;
         let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+        if terminal_stop_exit_code(&sandbox).is_some() {
+            return self
+                .restore_missing_terminal_stop(&sandbox)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+        }
         if phase == SandboxPhase::Completed
             || is_failed_main_process_result(&sandbox)
             || provisioning_deadline::timed_out(&sandbox)
@@ -6795,6 +6867,16 @@ fn has_specific_infrastructure_error(sandbox: &Sandbox) -> bool {
                 condition.r#type == "Ready" && condition.reason == "ContainerExited"
             })
         })
+}
+
+fn terminal_stop_exit_code(sandbox: &Sandbox) -> Option<i32> {
+    if sandbox.phase() != SandboxPhase::Stopping as i32
+        || provisioning_deadline::timed_out(sandbox)
+        || provisioning_deadline::driver_operation_pending(sandbox)
+    {
+        return None;
+    }
+    sandbox.status.as_ref()?.exit_code
 }
 
 fn is_failed_main_process_result(sandbox: &Sandbox) -> bool {
