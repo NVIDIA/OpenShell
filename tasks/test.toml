@@ -23,6 +23,7 @@ depends = [
   "test:docs-website",
   "test:docs-nav",
   "test:maintainer-approval",
+  "test:review-readiness",
 ]
 
 ["test:docs-website"]
@@ -89,6 +90,11 @@ hide = true
 ["test:maintainer-approval"]
 description = "Test the maintainer approval gate and change-alert tools"
 run = "uv run --no-project --with pytest pytest -o \"python_files=*_test.py\" tasks/scripts/check_maintainer_approval_test.py tasks/scripts/alert_maintainer_change_test.py"
+hide = true
+
+["test:review-readiness"]
+description = "Test PR review readiness and reviewer reconciliation"
+run = "uv run --no-project python -m unittest discover -s tasks/scripts -p check_review_readiness_test.py"
 hide = true
 
 [e2e]
