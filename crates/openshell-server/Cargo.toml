@@ -120,8 +120,8 @@ notify = "8"
 
 [features]
 default = ["telemetry"]
-# Opt-in bundle for development-only features; stable builds leave it off.
-dev = []
+# Opt-in bundle for experimental features; stable builds leave it off.
+experimental = []
 ## Compile in anonymous telemetry emission (forwards to openshell-core/telemetry).
 ## On by default; build with `--no-default-features` for a telemetry-free gateway
 ## that contains no telemetry endpoint, HTTP client, or emission code.

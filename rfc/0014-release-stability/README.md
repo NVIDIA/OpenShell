@@ -115,7 +115,7 @@ without a compatibility guarantee. Graduation adds a Stable `v1` package
 instead of renaming the Experimental package in place.
 
 Unreleased features use named compile-time flags such as `unstable-<feature>`,
-collected under a `dev` compilation flag. Development releases enable them; stable
+collected under an `experimental` compilation flag. Development releases enable them; stable
 releases and pre-releases exclude them from service binaries, the CLI,
 configuration, and documentation. For now, SDK distributions may include their
 generated types and client methods when the SDK naming convention communicates

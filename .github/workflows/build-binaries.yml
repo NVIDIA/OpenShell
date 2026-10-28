@@ -18,7 +18,7 @@ on:
         type: string
         default: ""
       dev-build:
-        description: Enable the gateway and supervisor development feature bundle
+        description: Enable the gateway and supervisor experimental feature bundle
         required: false
         type: boolean
         default: false
@@ -90,7 +90,7 @@ jobs:
     env:
       PACKAGE: openshell-gateway
       BINARY: openshell-gateway
-      EXTRA_CARGO_FLAGS: ${{ inputs.dev-build && '--features dev' || '' }}
+      EXTRA_CARGO_FLAGS: ${{ inputs.dev-build && '--features experimental' || '' }}
     strategy:
       matrix:
         include:
@@ -109,8 +109,8 @@ jobs:
     env:
       PACKAGE: ${{ matrix.package }}
       BINARY: ${{ matrix.binary }}
-      # Only supervisor entries define the development feature bundle.
-      EXTRA_CARGO_FLAGS: ${{ matrix.package == 'openshell-supervisor' && inputs.dev-build && '--features dev' || '' }}
+      # Only supervisor entries define the experimental feature bundle.
+      EXTRA_CARGO_FLAGS: ${{ matrix.package == 'openshell-supervisor' && inputs.dev-build && '--features experimental' || '' }}
     strategy:
       matrix:
         include:
