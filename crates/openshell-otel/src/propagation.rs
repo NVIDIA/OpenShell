@@ -185,8 +185,9 @@ impl tonic::service::Interceptor for TraceContextInterceptor {
 /// Reads W3C trace-context propagation fields from process environment
 /// variables (`TRACEPARENT` and `TRACESTATE`).
 ///
-/// CI systems (GitHub Actions, GitLab CI, Jenkins OpenTelemetry plugins)
-/// export these variables to propagate the pipeline trace to child processes.
+/// OpenTelemetry integrations in CI systems (for example the Jenkins
+/// OpenTelemetry plugin or an OpenTelemetry GitHub Action) export these
+/// variables to propagate the pipeline trace to child processes.
 /// Both upper-case and lower-case spellings are accepted; blank values are
 /// treated as unset.
 #[derive(Debug, Clone, Default)]
@@ -306,13 +307,17 @@ mod tests {
         opentelemetry_sdk::trace::InMemorySpanExporter,
         impl tracing::Subscriber + Send + Sync,
     ) {
+        use opentelemetry::trace::TracerProvider as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry().with(crate::layer(&provider, "env-test"));
+        // Built directly from `tracing_opentelemetry` so the test runs even
+        // without the `export` feature.
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("env-test")));
         (provider, exporter, subscriber)
     }
 
@@ -383,6 +388,7 @@ mod tests {
 
     #[test]
     fn invalid_environment_carrier_leaves_the_span_unparented() {
+        use opentelemetry::trace::TracerProvider as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let _tracing_lock = crate::test_lock();
@@ -390,7 +396,8 @@ mod tests {
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry().with(crate::layer(&provider, "env-test"));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("env-test")));
 
         tracing::subscriber::with_default(subscriber, || {
             let span = tracing::info_span!("orphan");
@@ -405,12 +412,14 @@ mod tests {
 
     #[test]
     fn interceptor_adds_traceparent_only_inside_an_exported_span() {
+        use opentelemetry::trace::TracerProvider as _;
         use tonic::service::Interceptor as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let _tracing_lock = crate::test_lock();
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
-        let subscriber = tracing_subscriber::registry().with(crate::layer(&provider, "rpc-test"));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("rpc-test")));
 
         let (outside, inside) = tracing::subscriber::with_default(subscriber, || {
             let outside = TraceContextInterceptor
@@ -457,20 +466,30 @@ mod tests {
         }
     }
 
-    fn snapshot_env(names: &[&'static str]) -> Vec<(&'static str, Option<String>)> {
-        names
-            .iter()
-            .map(|name| (*name, std::env::var(name).ok()))
-            .collect()
+    /// Restores snapshotted environment variables when dropped, so a failed
+    /// assertion cannot leak them into later tests sharing the process.
+    struct EnvRestore(Vec<(&'static str, Option<String>)>);
+
+    impl EnvRestore {
+        fn snapshot(names: &[&'static str]) -> Self {
+            Self(
+                names
+                    .iter()
+                    .map(|name| (*name, std::env::var(name).ok()))
+                    .collect(),
+            )
+        }
     }
 
-    #[allow(unsafe_code)]
-    fn restore_env(saved: &[(&'static str, Option<String>)]) {
-        for (name, value) in saved {
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
+    impl Drop for EnvRestore {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
                 }
             }
         }
@@ -478,9 +497,9 @@ mod tests {
 
     #[test]
     #[allow(unsafe_code)]
-    fn env_trace_context_from_env_reads_both_spellings_and_skips_blanks() {
+    fn env_trace_context_from_env_trims_and_skips_blanks() {
         let _tracing_lock = crate::test_lock();
-        let saved = snapshot_env(&[TRACEPARENT_ENV, "traceparent", TRACESTATE_ENV, "tracestate"]);
+        let _restore = EnvRestore::snapshot(&[TRACEPARENT_ENV, TRACESTATE_ENV]);
         let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 
         // Upper-case spelling with surrounding whitespace.
@@ -491,6 +510,28 @@ mod tests {
         let padded = EnvTraceContext::from_env();
         assert_eq!(padded.traceparent.as_deref(), Some(traceparent));
         assert_eq!(padded.tracestate.as_deref(), Some("vendor=value"));
+
+        // Blank values are treated as unset.
+        unsafe {
+            std::env::set_var(TRACEPARENT_ENV, "   ");
+            std::env::set_var(TRACESTATE_ENV, "");
+        }
+        let blank = EnvTraceContext::from_env();
+        assert_eq!(blank.traceparent, None);
+        assert_eq!(blank.tracestate, None);
+    }
+
+    /// Windows treats environment names case-insensitively, so the lower-case
+    /// fallback cannot be exercised there: `TRACEPARENT` and `traceparent`
+    /// are the same variable.
+    #[test]
+    #[cfg(not(windows))]
+    #[allow(unsafe_code)]
+    fn env_trace_context_from_env_reads_lower_case_spelling() {
+        let _tracing_lock = crate::test_lock();
+        let _restore =
+            EnvRestore::snapshot(&[TRACEPARENT_ENV, "traceparent", TRACESTATE_ENV, "tracestate"]);
+        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 
         // Lower-case-only spelling.
         unsafe {
@@ -511,15 +552,6 @@ mod tests {
         let shadowed = EnvTraceContext::from_env();
         assert_eq!(shadowed.traceparent.as_deref(), Some(traceparent));
         assert_eq!(shadowed.tracestate, None);
-
-        // Blank values in both spellings are treated as unset.
-        unsafe {
-            std::env::set_var("traceparent", "");
-        }
-        let blank = EnvTraceContext::from_env();
-        assert_eq!(blank.traceparent, None);
-
-        restore_env(&saved);
     }
 
     #[test]

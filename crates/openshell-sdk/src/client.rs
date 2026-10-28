@@ -1710,6 +1710,31 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn auth_interceptor_clone_sees_refreshed_token() {
+        use tonic::service::Interceptor as _;
+
+        // The clone handed out by `auth_interceptor()` must share the live
+        // bearer slot: callers compose other concerns (e.g. the CLI's
+        // trace-forwarding gateway interceptor) around it, and a forced OIDC
+        // refresh must reach those already-built stacks.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = oidc_client_with_refresher(Arc::clone(&calls));
+        let mut interceptor = client.auth_interceptor();
+
+        assert!(client.force_refresh().await.unwrap());
+
+        let request = interceptor.call(tonic::Request::new(())).unwrap();
+        assert_eq!(
+            request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer token-1"),
+            "refreshed token must reach the cloned interceptor"
+        );
+    }
+
     #[test]
     fn store_bearer_rejects_malformed_token_and_keeps_previous() {
         let slot: BearerSlot = Arc::new(RwLock::new(None));
