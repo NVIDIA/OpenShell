@@ -75,6 +75,11 @@ navigation:
     - page: "Schema Reference"
       path: how-it-works/policies/schema.mdx
       slug: schema
+    # Development-only page (front matter `development-only: true`). Release
+    # docs snapshots omit it; see fern/README.md.
+    - page: "Cedar Policies"
+      path: how-it-works/policies/cedar.mdx
+      slug: cedar
   - page: "Inference"
     path: how-it-works/inference.mdx
 - section: "Extensibility"

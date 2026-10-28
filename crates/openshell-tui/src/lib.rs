@@ -894,6 +894,7 @@ async fn fetch_sandbox_detail(app: &mut App) {
     // Step 2: Fetch the current live policy (includes updates since creation).
     if found {
         let policy_req = openshell_core::proto::GetSandboxConfigRequest {
+            supports_cedar_policy: true,
             name: sandbox_name,
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 app.selected_sandbox_workspace(),
@@ -2900,6 +2901,7 @@ async fn refresh_sandbox_policy(app: &mut App) {
     let workspace = app.selected_sandbox_workspace();
 
     let policy_req = openshell_core::proto::GetSandboxConfigRequest {
+        supports_cedar_policy: true,
         name: sandbox_name,
         workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
     };

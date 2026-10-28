@@ -36,7 +36,6 @@ use crate::l7::tls::{
     write_ca_files,
 };
 use crate::l7::token_grant_injection::SpiffeTokenGrantResolver;
-use crate::opa::OpaEngine;
 use crate::policy_local::{DenialLogSource, PolicyLocalContext};
 use crate::proxy::ProxyHandle;
 use crate::token_grant::SandboxInstanceTokenGrants;
@@ -272,14 +271,13 @@ pub struct Networking {
 ///
 /// # Errors
 ///
-/// Returns an error if proxy mode is requested but the proxy configuration,
-/// OPA engine, or identity cache is missing, or if the proxy server fails to
-/// start.
+/// Returns an error if proxy mode is requested but the proxy configuration
+/// or policy engine is missing, or if the proxy server fails to start.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_networking(
     policy: &SandboxPolicy,
     proxy_bind_ip: Option<IpAddr>,
-    opa_engine: Option<&Arc<OpaEngine>>,
+    network_engine: Option<&crate::policy_engine::PolicyEngine>,
     retained_proto: Option<&ProtoSandboxPolicy>,
     entrypoint_pid: Arc<AtomicU32>,
     process_enabled: bool,
@@ -297,6 +295,11 @@ pub async fn run_networking(
     network_mediation_source: Option<Arc<NetworkMediationSource>>,
     proxy_listener: Option<ProxyListenerConfig>,
 ) -> Result<Networking> {
+    // The authoritative engine: Cedar for a Cedar-authored policy, otherwise
+    // OPA. It also supplies middleware and per-tunnel evaluators; see
+    // `crate::policy_engine`.
+    let network_engine = network_engine.cloned();
+
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
     // it can publish updated policy snapshots after a successful reload.
@@ -329,7 +332,7 @@ pub async fn run_networking(
     // listener immediately (so the OS backlog queues early SYN packets) but
     // defers `accept()` until symlink resolution completes. This eliminates
     // the race where an in-flight request observes a generation transition
-    // during the OPA engine reload.
+    // during the policy engine's symlink resolution.
     let (engine_ready_tx, engine_ready_rx) = tokio::sync::watch::channel(false);
     #[cfg(target_os = "linux")]
     let transparent_engine_ready_rx = engine_ready_rx.clone();
@@ -340,7 +343,7 @@ pub async fn run_networking(
     // namespace becomes accessible via /proc/<pid>/root/. The task starts
     // before run_process spawns the child, so first wait for the orchestrator
     // to publish a non-zero PID, then poll for proc-root readiness.
-    if let (Some(engine), Some(proto)) = (opa_engine, retained_proto) {
+    if let (Some(engine), Some(proto)) = (network_engine.as_ref(), retained_proto) {
         if process_enabled {
             let resolve_engine = engine.clone();
             let resolve_proto = proto.clone();
@@ -381,21 +384,7 @@ pub async fn run_networking(
                             attempt = attempt,
                             "Container filesystem accessible, resolving policy binary symlinks"
                         );
-                        match resolve_engine.reload_from_proto_with_pid(&resolve_proto, pid) {
-                            Ok(_) => {
-                                info!(
-                                    pid = pid,
-                                    "Policy binary symlink resolution complete \
-                                 (check logs above for per-binary results)"
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to rebuild OPA engine with symlink resolution \
-                                 (non-fatal, falling back to literal path matching): {e}"
-                                );
-                            }
-                        }
+                        resolve_policy_binary_symlinks(&resolve_engine, &resolve_proto, pid);
                         let _ = engine_ready_tx.send(true);
                         return;
                     }
@@ -423,9 +412,11 @@ pub async fn run_networking(
         let _ = engine_ready_tx.send(true);
     }
 
-    // Identity cache for SHA256 TOFU when OPA is active. Only consumed by
-    // the proxy, so it's owned here.
-    let identity_cache = opa_engine.map(|_| Arc::new(BinaryIdentityCache::new()));
+    // Identity cache for SHA256 TOFU when a policy engine is active. Only
+    // consumed by the proxy, so it's owned here.
+    let identity_cache = network_engine
+        .as_ref()
+        .map(|_| Arc::new(BinaryIdentityCache::new()));
 
     // Load a provisioned CA when the boundary lifetime outlives this control
     // process; otherwise generate an ephemeral CA.
@@ -546,9 +537,9 @@ pub async fn run_networking(
     };
 
     let mediated_policy_dns = if let Some(source) = network_mediation_source.clone() {
-        let engine = opa_engine
-            .cloned()
-            .ok_or_else(|| miette::miette!("Mediated DNS requires an OPA engine"))?;
+        let engine = network_engine.clone().ok_or_else(|| {
+            miette::miette!("Mediated DNS requires a network policy engine (OPA or Cedar)")
+        })?;
         Some(crate::policy_dns::PolicyDnsRuntime::start_mediated(
             engine,
             source,
@@ -565,12 +556,10 @@ pub async fn run_networking(
             miette::miette!("Network mode is set to proxy but no proxy configuration was provided")
         })?;
 
-        let engine = opa_engine.cloned().ok_or_else(|| {
-            miette::miette!("Proxy mode requires an OPA engine (--rego-policy and --rego-data)")
-        })?;
-
         let cache = identity_cache.clone().ok_or_else(|| {
-            miette::miette!("Proxy mode requires an identity cache (OPA engine must be configured)")
+            miette::miette!(
+                "Proxy mode requires an identity cache (a policy engine must be configured)"
+            )
         })?;
 
         // If the orchestrator gave us a proxy bind IP (the host-side veth IP
@@ -588,10 +577,14 @@ pub async fn run_networking(
                 })
             });
 
+        let active_network_engine = network_engine.clone().ok_or_else(|| {
+            miette::miette!("Proxy mode requires a network policy engine (OPA or Cedar)")
+        })?;
+
         let proxy_handle = ProxyHandle::start_with_bind_addr(
             proxy_policy,
             bind_addr,
-            engine,
+            active_network_engine,
             cache,
             entrypoint_pid.clone(),
             tls_state,
@@ -622,15 +615,15 @@ pub async fn run_networking(
 
     #[cfg(target_os = "linux")]
     let (policy_dns, transparent_tcp) = if let Some(runtime) = transparent_runtime {
-        let engine = opa_engine
-            .cloned()
-            .ok_or_else(|| miette::miette!("transparent TCP requires an OPA policy engine"))?;
+        let active_network_engine = network_engine.clone().ok_or_else(|| {
+            miette::miette!("transparent TCP requires a network policy engine (OPA or Cedar)")
+        })?;
         let cache = identity_cache
             .clone()
             .ok_or_else(|| miette::miette!("transparent TCP requires a process identity cache"))?;
         let trusted_gateway = crate::proxy::detect_trusted_host_gateway();
         let dns = crate::policy_dns::PolicyDnsRuntime::start(
-            engine.clone(),
+            active_network_engine.clone(),
             runtime.dns_udp,
             runtime.dns_tcp,
             trusted_gateway,
@@ -640,7 +633,7 @@ pub async fn run_networking(
         let transparent = crate::proxy::TransparentTcpHandle::start(
             runtime.listeners,
             dns.store.clone(),
-            engine,
+            active_network_engine,
             cache,
             entrypoint_pid,
             agent_proposals,
@@ -664,6 +657,55 @@ pub async fn run_networking(
         #[cfg(target_os = "linux")]
         _transparent_tcp: transparent_tcp,
     })
+}
+
+/// Resolves the policy's binary symlinks once the entrypoint process is known.
+///
+/// A YAML sandbox rebuilds its OPA engine from `proto` with symlink
+/// resolution. A Cedar sandbox resolves the binary paths its policies test in
+/// `context.binary_aliases`; it builds no OPA engine. Failures are non-fatal:
+/// binary paths are then matched literally.
+fn resolve_policy_binary_symlinks(
+    engine: &crate::policy_engine::PolicyEngine,
+    proto: &ProtoSandboxPolicy,
+    pid: u32,
+) {
+    match engine {
+        crate::policy_engine::PolicyEngine::Opa(opa) => {
+            match opa.reload_from_proto_with_pid(proto, pid) {
+                Ok(_) => {
+                    info!(
+                        pid = pid,
+                        "Policy binary symlink resolution complete \
+                         (check logs above for per-binary results)"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to rebuild OPA engine with symlink resolution \
+                         (non-fatal, falling back to literal path matching): {e}"
+                    );
+                }
+            }
+        }
+        crate::policy_engine::PolicyEngine::Cedar(cedar) => {
+            match cedar.resolve_binary_symlinks(pid) {
+                Ok(()) => {
+                    info!(
+                        pid = pid,
+                        "Policy binary symlink resolution complete \
+                     (check logs above for per-binary results)"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to resolve Cedar policy binary symlinks \
+                     (non-fatal, binary_aliases stays empty): {e}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

@@ -1143,6 +1143,12 @@ fn handled_fields_inventory() {
             m.insert("redactor".to_owned(), middleware_config());
             m
         },
+        // Fields of policies only the sandbox supervisor enforces. The
+        // gateway admits none of them for this driver, which reports
+        // `driver_enforces_policy`, so the inventory leaves them empty.
+        cedar_policy_source: String::new(),
+        provider_credential_rules: std::collections::HashMap::new(),
+        endpoint_settings: Vec::new(),
     };
 
     // Validate so the test itself doesn't carry a bad policy.

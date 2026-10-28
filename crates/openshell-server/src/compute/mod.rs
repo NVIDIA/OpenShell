@@ -497,6 +497,9 @@ pub struct ComputeDriverInfoSnapshot {
     pub supports_sandbox_authentication: bool,
     /// Whether the driver reports runtime readiness without a supervisor session.
     pub driver_reports_runtime_readiness: bool,
+    /// Whether the driver enforces sandbox policy itself rather than leaving
+    /// it to the `OpenShell` supervisor.
+    pub driver_enforces_policy: bool,
     /// Static portable resource request forms from the startup capability snapshot.
     pub resource_capabilities: Option<DriverResourceCapabilities>,
     /// Directory where rootfs tar files must be staged.
@@ -977,6 +980,7 @@ impl ComputeRuntime {
             gateway_manages_lifecycle: capabilities.gateway_manages_lifecycle,
             supports_sandbox_authentication: capabilities.supports_sandbox_authentication,
             driver_reports_runtime_readiness: capabilities.driver_reports_runtime_readiness,
+            driver_enforces_policy: capabilities.driver_enforces_policy,
             resource_capabilities: capabilities.resource_capabilities,
             rootfs_tar_staging_dir: capabilities.rootfs_tar_staging_dir,
             rootfs_tar_max_bytes: capabilities.rootfs_tar_max_bytes,
@@ -1295,6 +1299,13 @@ impl ComputeRuntime {
     #[must_use]
     pub fn supports_sandbox_authentication(&self) -> bool {
         self.driver_info.supports_sandbox_authentication
+    }
+
+    /// Whether the compute driver enforces sandbox policy itself rather than
+    /// leaving it to the `OpenShell` supervisor.
+    #[must_use]
+    pub fn driver_enforces_policy(&self) -> bool {
+        self.driver_info.driver_enforces_policy
     }
 
     pub(crate) async fn authenticate_sandbox(
@@ -1808,14 +1819,13 @@ impl ComputeRuntime {
                     Some(guard) => guard,
                     None => runtime.lock_sandbox_for_lifecycle(&lifecycle_guard).await,
                 };
-                runtime
-                    .compensate_failed_create_inner(
-                        &created,
-                        lifecycle_guard,
-                        sandbox_guard,
-                        original,
-                    )
-                    .await
+                Box::pin(runtime.compensate_failed_create_inner(
+                    &created,
+                    lifecycle_guard,
+                    sandbox_guard,
+                    original,
+                ))
+                .await
             }
             .instrument(request_span),
         )
@@ -4767,7 +4777,8 @@ impl ComputeRuntime {
 
     async fn reconcile_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
-            if let Err(err) = self.reconcile_store_with_backend(ORPHAN_GRACE_PERIOD).await {
+            if let Err(err) = Box::pin(self.reconcile_store_with_backend(ORPHAN_GRACE_PERIOD)).await
+            {
                 warn!(error = %err, "Store reconciliation sweep failed");
             }
             tokio::select! {
@@ -4779,7 +4790,7 @@ impl ComputeRuntime {
 
     async fn restart_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
-            if let Err(err) = self.restart_due_sandboxes().await {
+            if let Err(err) = Box::pin(self.restart_due_sandboxes()).await {
                 warn!(error = %err, "Sandbox restart sweep failed");
             }
             tokio::select! {
@@ -5314,7 +5325,8 @@ impl ComputeRuntime {
                 continue;
             }
 
-            self.prune_missing_sandbox(record, sweep_started_at_ms, grace_ms)
+            // Boxed so this sweep's future stays small for its callers.
+            Box::pin(self.prune_missing_sandbox(record, sweep_started_at_ms, grace_ms))
                 .await
                 .inspect_err(|_| crate::otel_tracing::mark_error(&tracing::Span::current()))?;
         }
@@ -5408,7 +5420,8 @@ impl ComputeRuntime {
             && (driver_snapshot_confirms_stopped(&incoming)
                 || driver_snapshot_reports_runtime_restart(&incoming));
         if existing_phase != SandboxPhase::Starting && !ready_container_exit {
-            return self.apply_sandbox_update_locked(incoming, existing).await;
+            // Boxed so this update's future stays small for its callers.
+            return Box::pin(self.apply_sandbox_update_locked(incoming, existing)).await;
         }
 
         // Any snapshot can already be queued when StartSandbox moves the
@@ -5457,7 +5470,7 @@ impl ComputeRuntime {
             Ok(Some(_) | None) | Err(_) => {}
         }
 
-        self.apply_sandbox_update_locked(incoming, existing).await
+        Box::pin(self.apply_sandbox_update_locked(incoming, existing)).await
     }
 
     async fn apply_sandbox_update_locked(
@@ -8201,6 +8214,7 @@ impl ComputeDriver for NoopTestDriver {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: self.sandbox_authentication.is_some(),
                 driver_reports_runtime_readiness: false,
+                driver_enforces_policy: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
@@ -8395,6 +8409,7 @@ pub fn new_test_runtime_with_driver(
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication,
             driver_reports_runtime_readiness: false,
+            driver_enforces_policy: false,
             resource_capabilities: None,
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
@@ -8829,6 +8844,7 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                driver_enforces_policy: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
@@ -9292,6 +9308,7 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                driver_enforces_policy: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
@@ -9591,6 +9608,7 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                driver_enforces_policy: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
@@ -9918,8 +9936,7 @@ mod tests {
                 .unwrap();
             assert_eq!(retained.phase(), SandboxPhase::Deleting as i32);
             assert_eq!(credentials.stored_credential_count(), Some(1));
-            runtime
-                .reconcile_store_with_backend(Duration::ZERO)
+            Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
                 .await
                 .unwrap();
             assert!(
@@ -10017,8 +10034,7 @@ mod tests {
         assert_eq!(retained.phase(), SandboxPhase::Deleting as i32);
         assert_eq!(credentials.stored_credential_count(), Some(1));
         driver.set_get_outcome(ControlledGetOutcome::Missing);
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
         assert!(
@@ -11157,7 +11173,7 @@ mod tests {
         });
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        runtime.restart_due_sandboxes().await.unwrap();
+        Box::pin(runtime.restart_due_sandboxes()).await.unwrap();
 
         assert_eq!(driver.stop_calls(), 1);
         assert_eq!(driver.start_calls(), 1);
@@ -15079,8 +15095,7 @@ mod tests {
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
@@ -15120,7 +15135,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            runtime.reconcile_store_with_backend(Duration::ZERO),
+            Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO)),
         )
         .await
         .expect("prune sweep blocked on the stuck driver delete call")
@@ -16488,8 +16503,7 @@ mod tests {
         runtime.sandbox_index.update_from_sandbox(&sandbox);
         register_test_supervisor_session(&runtime, "sb-1");
 
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
@@ -16557,8 +16571,7 @@ mod tests {
         runtime.sandbox_index.update_from_sandbox(&sandbox);
 
         let traced = test_exporter::install_traced();
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
@@ -16636,8 +16649,7 @@ mod tests {
         }))
         .await;
 
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
@@ -16685,8 +16697,7 @@ mod tests {
         runtime.sandbox_index.update_from_sandbox(&sandbox);
         register_test_supervisor_session(&runtime, "sb-1");
 
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 
@@ -16749,8 +16760,7 @@ mod tests {
 
         let mut watch_rx = runtime.sandbox_watch_bus.subscribe(sandbox.object_id());
 
-        runtime
-            .reconcile_store_with_backend(Duration::ZERO)
+        Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO))
             .await
             .unwrap();
 

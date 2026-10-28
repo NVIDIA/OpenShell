@@ -29,7 +29,7 @@ use crate::gateway_members::{GatewayMember, GatewayMemberIndex, MEMBER_TTL};
 use crate::grpc::policy::{
     SandboxConfigInputs, build_provider_environment_snapshot_from_inputs,
     build_sandbox_config_snapshot_from_inputs, is_configuration_rejection,
-    load_sandbox_config_inputs, unadmitted_sandbox_config,
+    load_sandbox_config_inputs, require_supervisor_cedar_support, unadmitted_sandbox_config,
 };
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex, dialable_peer_endpoint};
 
@@ -339,7 +339,7 @@ impl Deliver for Builder<'_> {
         let started = Instant::now();
         let built = tokio::time::timeout(
             SANDBOX_CONFIG_BUILD_TIMEOUT,
-            build_sandbox_config(state, sandbox_id),
+            build_sandbox_config(state, sandbox_id, record.supports_cedar_policy),
         )
         .await;
         let (inputs, sandbox_config) = match built {
@@ -412,8 +412,9 @@ impl Deliver for Builder<'_> {
 
 enum BuiltSandboxConfig {
     Built(Box<SandboxConfigInputs>, SandboxConfigSnapshot),
-    /// The stored configuration is invalid, so the supervisor receives the
-    /// not-admitted configuration polling serves and fails closed.
+    /// The stored configuration is invalid, or is a Cedar policy the
+    /// supervisor cannot enforce, so the supervisor receives a not-admitted
+    /// configuration and fails closed.
     Rejected {
         sandbox_config: SandboxConfigSnapshot,
         providers: HashSet<String>,
@@ -426,6 +427,7 @@ enum BuiltSandboxConfig {
 async fn build_sandbox_config(
     state: &Arc<ServerState>,
     sandbox_id: &str,
+    supports_cedar_policy: bool,
 ) -> Result<Option<BuiltSandboxConfig>, Status> {
     let Some(sandbox) = state
         .store
@@ -441,19 +443,24 @@ async fn build_sandbox_config(
         Ok::<_, Status>((inputs, snapshot))
     }
     .await;
+    let rejected = |error: Status| BuiltSandboxConfig::Rejected {
+        sandbox_config: unadmitted_sandbox_config(state, &sandbox, &error),
+        providers: sandbox
+            .spec
+            .as_ref()
+            .map(|spec| spec.providers.iter().cloned().collect())
+            .unwrap_or_default(),
+        error_code: error.code(),
+    };
     match built {
-        Ok((inputs, snapshot)) => Ok(Some(BuiltSandboxConfig::Built(Box::new(inputs), snapshot))),
-        Err(error) if is_configuration_rejection(&error) => {
-            Ok(Some(BuiltSandboxConfig::Rejected {
-                sandbox_config: unadmitted_sandbox_config(state, &sandbox, &error),
-                providers: sandbox
-                    .spec
-                    .as_ref()
-                    .map(|spec| spec.providers.iter().cloned().collect())
-                    .unwrap_or_default(),
-                error_code: error.code(),
-            }))
-        }
+        Ok((inputs, snapshot)) => Ok(Some(
+            match require_supervisor_cedar_support(supports_cedar_policy, snapshot.policy.as_ref())
+            {
+                Ok(()) => BuiltSandboxConfig::Built(Box::new(inputs), snapshot),
+                Err(error) => rejected(error),
+            },
+        )),
+        Err(error) if is_configuration_rejection(&error) => Ok(Some(rejected(error))),
         Err(error) => Err(error),
     }
 }
@@ -835,7 +842,7 @@ pub fn register_test_apply_session(
     session_id: &str,
 ) -> TestApplySession {
     let captured_seq = state.config_delivery.publications();
-    register_test_apply_session_after(state, sandbox, session_id, captured_seq)
+    register_test_apply_session_after(state, sandbox, session_id, captured_seq, true)
 }
 
 /// Register a test session whose bootstrap was read when the publication
@@ -846,6 +853,7 @@ fn register_test_apply_session_after(
     sandbox: &Sandbox,
     session_id: &str,
     captured_seq: u64,
+    supports_cedar_policy: bool,
 ) -> TestApplySession {
     use crate::persistence::{ObjectId, ObjectWorkspace};
 
@@ -872,6 +880,7 @@ fn register_test_apply_session_after(
             provider_environment: None,
             captured_seq,
             rebuild: false,
+            supports_cedar_policy,
         },
     );
     TestApplySession { outbound }
@@ -1006,13 +1015,22 @@ mod tests {
     /// Commit a new policy revision, so the next sandbox configuration build
     /// differs from the bootstrap the session acknowledged.
     async fn change_policy(state: &ServerState, sandbox_id: &str, version: i64) {
-        use crate::policy_store::PolicyStoreExt as _;
-        use prost::Message as _;
-
         let policy = openshell_core::proto::SandboxPolicy {
             version: 1,
             ..Default::default()
         };
+        put_policy(state, sandbox_id, version, &policy).await;
+    }
+
+    async fn put_policy(
+        state: &ServerState,
+        sandbox_id: &str,
+        version: i64,
+        policy: &openshell_core::proto::SandboxPolicy,
+    ) {
+        use crate::policy_store::PolicyStoreExt as _;
+        use prost::Message as _;
+
         state
             .store
             .put_policy_revision(
@@ -1021,7 +1039,7 @@ mod tests {
                 "default",
                 version,
                 &policy.encode_to_vec(),
-                &crate::grpc::policy::deterministic_policy_hash(&policy),
+                &crate::grpc::policy::deterministic_policy_hash(policy),
             )
             .await
             .unwrap();
@@ -1625,7 +1643,7 @@ mod tests {
         assert!(!state.config_delivery.publish_sandbox("sandbox"));
 
         let mut session =
-            register_test_apply_session_after(&state, &sandbox, "session-1", captured_seq);
+            register_test_apply_session_after(&state, &sandbox, "session-1", captured_seq, true);
         // Reconciliation is at least 30 seconds away, so only registration
         // can have caught the publication.
         let update = tokio::time::timeout(Duration::from_secs(5), session.outbound.recv())
@@ -1633,6 +1651,67 @@ mod tests {
             .expect("registration delivers the missed publication")
             .expect("outbound message");
         assert!(is_config_update(&update));
+    }
+
+    #[cfg(feature = "cedar")]
+    #[tokio::test]
+    async fn reconciliation_withholds_cedar_from_a_session_without_cedar_support() {
+        let cedar = openshell_core::proto::SandboxPolicy {
+            version: 1,
+            cedar_policy_source: "permit(principal, action == \
+                Sandbox::Action::\"NetworkConnect\", resource == \
+                Sandbox::NetworkEndpoint::\"api.github.com:443\");"
+                .to_string(),
+            ..Default::default()
+        };
+        for supports_cedar_policy in [false, true] {
+            let state = push_state().await;
+            put_sandbox(&state, "sandbox", &[]).await;
+            let sandbox = state
+                .store
+                .get_message::<Sandbox>("sandbox")
+                .await
+                .unwrap()
+                .unwrap();
+            // The sandbox switches to a Cedar policy after the session read
+            // its bootstrap.
+            let captured_seq = state.config_delivery.publications();
+            put_policy(&state, "sandbox", 1, &cedar).await;
+            assert!(!state.config_delivery.publish_sandbox("sandbox"));
+
+            let mut session = register_test_apply_session_after(
+                &state,
+                &sandbox,
+                "session-1",
+                captured_seq,
+                supports_cedar_policy,
+            );
+            let message = tokio::time::timeout(Duration::from_secs(5), session.outbound.recv())
+                .await
+                .expect("registration delivers the missed publication")
+                .expect("outbound message");
+            let Some(gateway_message::Payload::ConfigUpdate(update)) = message.payload else {
+                panic!("expected a configuration update");
+            };
+            let snapshot = update.sandbox_config.expect("sandbox configuration");
+            if supports_cedar_policy {
+                assert!(snapshot.configuration_admitted);
+                assert_eq!(
+                    snapshot.policy.expect("Cedar policy").cedar_policy_source,
+                    cedar.cedar_policy_source
+                );
+            } else {
+                // Never an empty policy an older supervisor would apply as
+                // YAML.
+                assert!(!snapshot.configuration_admitted);
+                assert!(snapshot.policy.is_none(), "{snapshot:?}");
+                assert!(
+                    snapshot.configuration_error.contains("Cedar"),
+                    "{}",
+                    snapshot.configuration_error
+                );
+            }
+        }
     }
 
     #[test]
@@ -1648,6 +1727,7 @@ mod tests {
                     provider_environment: None,
                     captured_seq: 0,
                     rebuild: false,
+                    supports_cedar_policy: true,
                 }))
             })
             .collect();
@@ -1918,6 +1998,7 @@ mod tests {
             provider_environment: bootstrap.and_then(|bootstrap| bootstrap.provider_environment),
             captured_seq: 0,
             rebuild: false,
+            supports_cedar_policy: true,
         });
         (harness, record)
     }

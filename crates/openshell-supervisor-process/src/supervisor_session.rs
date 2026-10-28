@@ -129,6 +129,9 @@ pub struct SessionRuntimeContext {
     /// Publishes whether the current session pushes configuration, so the
     /// runtime stops polling while it does.
     pub config_push_updates: watch::Sender<bool>,
+    /// Whether the supervisor was built with Cedar support. The gateway
+    /// pushes a Cedar configuration only to a session that reports it.
+    pub supports_cedar_policy: bool,
 }
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
@@ -423,6 +426,7 @@ pub fn spawn_with_readiness(
         session_id_updates: runtime.session_id_updates,
         config_apply_tx: runtime.config_apply_tx,
         config_push_updates: runtime.config_push_updates,
+        supports_cedar_policy: runtime.supports_cedar_policy,
         ready_tx,
     };
     (tokio::spawn(run_session_loop(config)), ready_rx)
@@ -442,6 +446,7 @@ struct SessionConfig {
     /// Publishes whether the current session pushes configuration. A
     /// reconnect to a gateway that does not push resumes polling.
     config_push_updates: watch::Sender<bool>,
+    supports_cedar_policy: bool,
     ready_tx: watch::Sender<bool>,
 }
 
@@ -581,6 +586,25 @@ enum SessionOutcome {
     },
 }
 
+/// The hello opening a session: identity and the capabilities this
+/// supervisor reports to the gateway.
+fn supervisor_hello(
+    config: &SessionConfig,
+    redirected: bool,
+    connection_epoch: u64,
+) -> SupervisorHello {
+    SupervisorHello {
+        sandbox_id: config.sandbox_id.clone(),
+        instance_id: config.instance_id.clone(),
+        connection_epoch,
+        supports_provider_readiness: true,
+        redirected,
+        supports_session_redirect: true,
+        supports_config_push: true,
+        supports_cedar_policy: config.supports_cedar_policy,
+    }
+}
+
 async fn run_single_session(
     config: &SessionConfig,
     target: &grpc_client::GatewayEndpoint,
@@ -603,15 +627,11 @@ async fn run_single_session(
 
     // Send hello as the first message.
     tx.send(SupervisorMessage {
-        payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
-            sandbox_id: config.sandbox_id.clone(),
-            instance_id: config.instance_id.clone(),
-            connection_epoch,
-            supports_provider_readiness: true,
+        payload: Some(supervisor_message::Payload::Hello(supervisor_hello(
+            config,
             redirected,
-            supports_session_redirect: true,
-            supports_config_push: true,
-        })),
+            connection_epoch,
+        ))),
     })
     .await
     .map_err(|_| "failed to queue hello")?;
@@ -1404,6 +1424,37 @@ mod ocsf_event_tests {
             .err()
             .expect("missing SSH adapter must fail explicitly");
         assert!(error.to_string().contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn hello_reports_the_cedar_support_it_was_given() {
+        for supports_cedar_policy in [false, true] {
+            let config = SessionConfig {
+                gateway: grpc_client::GatewayEndpoint::new(
+                    "http://127.0.0.1:1",
+                    grpc_client::GatewayCredentials::from_gateway_token("test-token")
+                        .expect("test credentials"),
+                ),
+                sandbox_id: "sbx-1".into(),
+                ssh_socket_path: std::path::PathBuf::new(),
+                port_forward: rpc_test::loopback(Arc::new(UnusedLoopbackConnector)),
+                expected_ssh_peer_pid: None,
+                terminating: Arc::new(AtomicBool::new(false)),
+                instance_id: "instance-1".into(),
+                session_id_updates: None,
+                config_apply_tx: mpsc::channel(1).0,
+                config_push_updates: watch::channel(false).0,
+                supports_cedar_policy,
+                ready_tx: watch::channel(false).0,
+            };
+            let hello = supervisor_hello(&config, false, 3);
+            assert_eq!(hello.supports_cedar_policy, supports_cedar_policy);
+            assert!(hello.supports_config_push);
+            assert_eq!(
+                (hello.sandbox_id.as_str(), hello.connection_epoch),
+                ("sbx-1", 3)
+            );
+        }
     }
 
     #[test]

@@ -12,7 +12,7 @@
 //! drifting as more adapters are added.
 
 use super::destination::DestinationValidationPlan;
-use crate::opa::NetworkAction;
+use crate::policy_types::NetworkAction;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -37,13 +37,15 @@ pub(super) struct EndpointDecision {
     pub(super) l7_route: Option<L7RouteSnapshot>,
     /// Destination authorization selected from the captured endpoint metadata.
     pub(super) destination: Option<DestinationValidationPlan>,
-    /// Raw endpoint configs returned with the authoritative egress decision.
-    pub(super) policy_configs: Vec<regorus::Value>,
+    /// Endpoint configs returned with the authoritative egress decision.
+    pub(super) policy_configs: Vec<crate::policy_types::EndpointConfig>,
     /// Full endpoint identities and metadata captured in the same generation.
     #[allow(dead_code, reason = "consumed when the policy DNS adapter lands")]
-    pub(super) matched_endpoints: Vec<crate::opa::MatchedEndpoint>,
+    pub(super) matched_endpoints: Vec<crate::policy_types::MatchedEndpoint>,
     /// Whether policy matched the requested hostname exactly (not by glob).
     pub(super) exact_declared_host: bool,
+    /// For a Cedar sandbox, how resolved addresses are checked.
+    pub(super) cedar_destination: Option<crate::cedar_only::CedarDestination>,
 }
 
 impl Default for EndpointDecision {
@@ -55,16 +57,20 @@ impl Default for EndpointDecision {
             policy_configs: Vec::new(),
             matched_endpoints: Vec::new(),
             exact_declared_host: false,
+            cedar_destination: None,
         }
     }
 }
 
 impl EndpointDecision {
-    pub(super) fn from_authorization(authorization: &crate::opa::EgressAuthorization) -> Self {
+    pub(super) fn from_authorization(
+        authorization: &crate::policy_types::EgressAuthorization,
+    ) -> Self {
         Self {
             policy_configs: authorization.endpoint_configs.clone(),
             matched_endpoints: authorization.matched_endpoints.clone(),
             exact_declared_host: authorization.exact_declared_endpoint_host,
+            cedar_destination: authorization.cedar_destination.clone(),
             ..Self::default()
         }
     }
@@ -156,6 +162,8 @@ pub(super) struct EgressDecision {
     pub(super) action: NetworkAction,
     /// Policy generation used for the complete authorization snapshot.
     pub(super) policy_generation: u64,
+    /// Engine that made the decision (`opa` or `cedar`), for OCSF events.
+    pub(super) engine: &'static str,
     /// Whether process identity evidence was available to policy evaluation.
     pub(super) identity: ProcessIdentityEvidence,
     /// Endpoint behavior hydrated for destination validation and relays.
@@ -248,6 +256,7 @@ mod tests {
             intent,
             action,
             policy_generation: 1,
+            engine: "opa",
             identity: ProcessIdentityEvidence::Available,
             endpoint: EndpointDecision::default(),
             binary: None,

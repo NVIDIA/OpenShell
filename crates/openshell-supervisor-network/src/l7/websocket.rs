@@ -8,7 +8,8 @@
 
 use crate::l7::relay::{L7EvalContext, evaluate_l7_request};
 use crate::l7::{EnforcementMode, L7RequestInfo};
-use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
+use crate::policy_engine::TunnelPolicyEngine;
+use crate::policy_types::PolicyGenerationGuard;
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::provider_credentials::ProviderCredentialState;
@@ -2191,7 +2192,8 @@ fn protocol_failure_message(host: &str, port: u16) -> String {
 mod tests {
     use super::*;
     use crate::l7::relay::L7EvalContext;
-    use crate::opa::{NetworkInput, OpaEngine};
+    use crate::opa::OpaEngine;
+    use crate::policy_types::NetworkInput;
     use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
         SupervisorMiddleware, SupervisorMiddlewareServer,
     };

@@ -3848,6 +3848,9 @@ async fn profile_attached_sandbox_diagnostics(
     let validate_policy_composition =
         super::policy::provider_policy_composition_enabled(store).await?;
     for sandbox in sandboxes {
+        if super::policy::skip_sandbox_with_unsupported_cedar_policy(&sandbox) {
+            continue;
+        }
         let sandbox_name = sandbox.object_name().to_string();
         let sandbox_workspace = sandbox.object_workspace().to_string();
         let spec = sandbox.spec.as_ref().expect("filtered by scan_sandboxes");
@@ -6504,6 +6507,57 @@ mod tests {
                 .message
                 .contains("import would create ambiguous dynamic token grants")
         }));
+    }
+
+    /// A sandbox a Cedar-enabled gateway created must not fail profile imports
+    /// for its whole workspace on a gateway built without Cedar.
+    #[cfg(not(feature = "cedar"))]
+    #[tokio::test]
+    async fn import_provider_profile_skips_attached_cedar_sandbox_without_cedar_support() {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            "default",
+            provider_with_values("provider-cedar", "cedar-attached"),
+        )
+        .await
+        .unwrap();
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-cedar-id".to_string(),
+                    name: "sandbox-cedar".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec!["provider-cedar".to_string()],
+                    policy: Some(crate::grpc::test_support::cedar_policy()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let response = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("cedar-attached")),
+                    source: "cedar-attached.yaml".to_string(),
+                }],
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+            }),
+        )
+        .await
+        .expect("a stored Cedar sandbox must not fail the import")
+        .into_inner();
+        assert!(response.imported, "{:?}", response.diagnostics);
     }
 
     #[tokio::test]

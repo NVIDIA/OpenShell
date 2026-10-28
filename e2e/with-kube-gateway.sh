@@ -1133,8 +1133,9 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
     external_gateway="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
     external_driver="${OPENSHELL_EXTERNAL_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-kubernetes}"
     if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
+      cedar_feature="$(openshell_cedar_feature)"
       cargo build -p openshell-gateway --bin openshell-gateway \
-        --no-default-features --features telemetry,vendored-z3
+        --no-default-features --features "telemetry,vendored-z3${cedar_feature:+,${cedar_feature}}"
     fi
     if [ -z "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" ]; then
       cargo build -p openshell-driver-kubernetes --bin openshell-driver-kubernetes

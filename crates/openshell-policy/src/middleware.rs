@@ -286,6 +286,22 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
                 }
             }
         }
+        // A Cedar policy's `tls: skip` comes from its endpoint settings.
+        for setting in &policy.endpoint_settings {
+            let overlaps_tls_skip = requires_inspection
+                && setting.tls == NetworkTlsMode::Skip as i32
+                && compiled_selector.as_ref().is_some_and(|selector| {
+                    HostPattern::new(&setting.host)
+                        .is_ok_and(|endpoint| selector.may_match_pattern(&endpoint))
+                });
+            if overlaps_tls_skip {
+                violations.push(PolicyViolation::MiddlewareTlsSkipConflict {
+                    middleware_name: name.clone(),
+                    policy_name: "endpoint_settings".to_string(),
+                    host: setting.host.clone(),
+                });
+            }
+        }
     }
 
     violations

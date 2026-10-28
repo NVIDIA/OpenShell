@@ -348,6 +348,7 @@ pub async fn handle_refresh_sandbox_token(
         ));
     } else {
         let mut config_request = Request::new(GetSandboxConfigRequest {
+            supports_cedar_policy: true,
             name: sandbox_record
                 .metadata
                 .as_ref()

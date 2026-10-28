@@ -17,6 +17,13 @@ on:
         required: false
         type: string
         default: ""
+      forbidden-crates:
+        description: >-
+          Space-separated crate names that must not appear in the driver's
+          embedded dependency list.
+        required: false
+        type: string
+        default: ""
     secrets:
       CACHIX_AUTH_TOKEN:
         required: true
@@ -111,3 +118,4 @@ jobs:
           cargo-version: ${{ inputs['cargo-version'] }}
           supervisor-image-tag: ${{ inputs['supervisor-image-tag'] }}
           entitlements-file: ${{ matrix.entitlements-file }}
+          forbidden-crates: ${{ inputs['forbidden-crates'] }}

@@ -65,6 +65,10 @@ struct SandboxState {
     fail_list_provider_profiles: Arc<AtomicBool>,
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
+    provider_create_requests: Arc<AtomicUsize>,
+    policy_update_requests: Arc<AtomicUsize>,
+    /// The policy `GetSandboxConfig` returns.
+    sandbox_config_policy: Arc<Mutex<Option<openshell_core::proto::SandboxPolicy>>>,
     expose_service_requests: Arc<Mutex<Vec<openshell_core::proto::ExposeServiceRequest>>>,
     fail_delete_sandbox_message: Arc<Mutex<Option<String>>>,
     vm_error_after_started: Arc<AtomicBool>,
@@ -162,6 +166,7 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         Ok(Response::new(HealthResponse {
+            supports_cedar_policy: false,
             status: ServiceStatus::Healthy.into(),
             version: "test".to_string(),
         }))
@@ -171,7 +176,7 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::GetGatewayInfoRequest>,
     ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
-        Err(Status::unimplemented("unused"))
+        Err(Status::permission_denied("platform administrator required"))
     }
 
     async fn create_sandbox(
@@ -224,6 +229,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
             service_urls,
+            ..Default::default()
         }))
     }
 
@@ -278,6 +284,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
+            ..Default::default()
         }))
     }
 
@@ -429,7 +436,10 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<GetSandboxConfigRequest>,
     ) -> Result<Response<GetSandboxConfigResponse>, Status> {
-        Ok(Response::new(GetSandboxConfigResponse::default()))
+        Ok(Response::new(GetSandboxConfigResponse {
+            policy: self.state.sandbox_config_policy.lock().await.clone(),
+            ..Default::default()
+        }))
     }
 
     async fn get_gateway_config(
@@ -565,6 +575,9 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<CreateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
+        self.state
+            .provider_create_requests
+            .fetch_add(1, Ordering::SeqCst);
         Ok(Response::new(ProviderResponse::default()))
     }
 
@@ -973,6 +986,9 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
     ) -> Result<Response<openshell_core::proto::UpdateConfigResponse>, Status> {
+        self.state
+            .policy_update_requests
+            .fetch_add(1, Ordering::SeqCst);
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -3105,7 +3121,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
             install_fake_forwarding_ssh(&fake_ssh_dir);
             let (endpoint, tls) = (server.endpoint.as_str(), &tls);
             let (forward_port, result) = Box::pin(with_free_forward_port(|spec| async move {
-                run::sandbox_create(
+                Box::pin(run::sandbox_create(
                     endpoint,
                     "openshell",
                     run::SandboxCreateConfig {
@@ -3117,7 +3133,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
                     },
                     "default",
                     tls,
-                )
+                ))
                 .await
             }))
             .await;
@@ -4172,6 +4188,171 @@ async fn service_forward_falls_back_to_session_tokens_once_for_a_legacy_gateway(
             .all(|init| matches!(init.target, Some(tcp_forward_init::Target::Tcp(_))))
     );
     forward.abort();
+}
+
+#[tokio::test]
+async fn cedar_policy_rejects_legacy_gateway_before_any_mutation() {
+    let server = run_server().await;
+    let dir = helpers::tempdir().unwrap();
+    let path = dir.path().join("policy.cedar");
+    fs::write(&path, r#"permit(principal, action == Sandbox::Action::"NetworkConnect", resource == Sandbox::NetworkEndpoint::"api.github.com:443");"#).unwrap();
+    let path = path.to_str().unwrap();
+    let tls = test_tls(&server);
+    let error = run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("cedar-legacy"),
+            providers: &["github".to_string()],
+            auto_providers_override: Some(true),
+            policy: Some(path),
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("Cedar policy support"),
+        "{error}"
+    );
+    for global in [false, true] {
+        let files = run::PolicyFiles {
+            policy: path,
+            middleware: None,
+        };
+        let result = if global {
+            run::sandbox_policy_set_global(&server.endpoint, files, true, false, 1, "default", &tls)
+                .await
+        } else {
+            run::sandbox_policy_set(
+                &server.endpoint,
+                "cedar-legacy",
+                files,
+                false,
+                1,
+                "default",
+                &tls,
+            )
+            .await
+        };
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("Cedar policy support"),
+            "{error}"
+        );
+    }
+    assert!(create_requests(&server).await.is_empty());
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .provider_create_requests
+            .load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .policy_update_requests
+            .load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn policy_update_rejects_a_cedar_sandbox_before_merging() {
+    let server = run_server().await;
+    *server.openshell.state.sandbox_config_policy.lock().await =
+        Some(openshell_core::proto::SandboxPolicy {
+            version: 1,
+            cedar_policy_source: r#"permit(principal, action == Sandbox::Action::"NetworkConnect", resource == Sandbox::NetworkEndpoint::"api.github.com:443");"#.to_string(),
+            ..Default::default()
+        });
+    let tls = test_tls(&server);
+    for dry_run in [true, false] {
+        let error = run::sandbox_policy_update(
+            &server.endpoint,
+            "cedar-sandbox",
+            &["api.example.com:443".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            false,
+            None,
+            dry_run,
+            false,
+            1,
+            "default",
+            &tls,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("openshell policy set"),
+            "dry_run={dry_run}: {error}"
+        );
+    }
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .policy_update_requests
+            .load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn cedar_discovery_sync_rejects_legacy_gateway_before_policy_mutation() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let gateway = TestOpenShell::default();
+    let service = gateway.clone();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(OpenShellServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    Environment::from_pairs(&[("OPENSHELL_SANDBOX_TOKEN", "compatibility-test-token")])
+        .run_async(async {
+            let policy = openshell_core::proto::SandboxPolicy {
+                cedar_policy_source: "permit(principal, action, resource);".to_string(),
+                ..Default::default()
+            };
+            let gateway_endpoint = openshell_core::grpc_client::GatewayEndpoint::new(
+                endpoint.clone(),
+                openshell_core::grpc_client::GatewayCredentials::from_gateway_token(
+                    "compatibility-test-token",
+                )
+                .expect("test credentials"),
+            );
+            let error = openshell_core::grpc_client::sync_policy(
+                &gateway_endpoint,
+                "cedar-legacy",
+                &policy,
+                "default",
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("Cedar policy support"),
+                "{error}"
+            );
+            assert_eq!(
+                gateway.state.policy_update_requests.load(Ordering::SeqCst),
+                0
+            );
+        })
+        .await;
+    server.abort();
 }
 
 #[tokio::test]

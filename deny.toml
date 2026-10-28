@@ -72,6 +72,7 @@ registries = []
 [bans]
 deny = [
     { name = "ring", wrappers = ["rustls", "rustls-webpki"], reason = "Use the selected crypto backend instead. These wrappers are allowed for z3-sys's prebuilt archive downloader." },
+    { name = "stacker", deny-multiple-versions = true, reason = "Cedar's stack checks read the thread-local of the stacker that openshell-policy-cedar grows the stack with; a second version would not share it." },
 ]
 multiple-versions = "warn"
 wildcards = "allow"
@@ -84,4 +85,5 @@ external-default-features = "allow"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# OpenShell's Cedar (ai-openshell), pinned by commit in Cargo.toml.
+allow-git = ["https://github.com/ai-openshell/cedar.git"]

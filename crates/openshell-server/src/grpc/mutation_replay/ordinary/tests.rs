@@ -797,6 +797,62 @@ async fn config_and_clear_receipts_preserve_revision_and_parent_lifetime() {
     );
 }
 
+#[cfg(feature = "cedar")]
+#[tokio::test]
+async fn sandbox_and_config_replays_return_stored_policy_warnings() {
+    let (_directory, state) = protected_state().await;
+    let mut create = create_sandbox("warned");
+    create.spec.as_mut().unwrap().policy =
+        Some(crate::grpc::test_support::cedar_policy_with_warning());
+    let created = run(&state, authed_request(create.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(created.policy_warnings.len(), 1, "{created:?}");
+    assert_eq!(
+        replay(&state, create).await.policy_warnings,
+        created.policy_warnings
+    );
+
+    let update = UpdateConfigRequest {
+        sandbox: "warned".into(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        policy: Some(crate::grpc::test_support::cedar_policy_with_warning()),
+        request_id: id(),
+        ..Default::default()
+    };
+    let updated = run(&state, authed_request(update.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(updated.policy_warnings.len(), 1, "{updated:?}");
+    assert_eq!(replay(&state, update).await, updated);
+}
+
+/// Receipts written before policy warnings were returned replay with none.
+#[test]
+fn legacy_sandbox_and_config_receipts_replay_without_policy_warnings() {
+    let Success::Ordinary(Outcome::Sandbox {
+        policy_warnings, ..
+    }) = serde_json::from_str(r#"{"Ordinary":{"Sandbox":{"id":"sandbox","changed":false}}}"#)
+        .unwrap()
+    else {
+        panic!("legacy sandbox receipt");
+    };
+    assert!(policy_warnings.is_empty());
+    let Success::Ordinary(Outcome::Config {
+        policy_warnings, ..
+    }) = serde_json::from_str(
+        r#"{"Ordinary":{"Config":{"sandbox_id":"sandbox","version":2,"policy_hash":"hash",
+            "settings_revision":0,"deleted":false,"annotations":{}}}}"#,
+    )
+    .unwrap()
+    else {
+        panic!("legacy config receipt");
+    };
+    assert!(policy_warnings.is_empty());
+}
+
 #[tokio::test]
 async fn refresh_receipts_never_replay_a_new_grant_epoch() {
     let state = test_server_state().await;
@@ -1087,11 +1143,11 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
         )),
         request_id: id(),
     };
-    let approved = run(&state, authed_request(approve.clone()))
+    let approved = Box::pin(run(&state, authed_request(approve.clone())))
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(replay(&state, approve.clone()).await, approved);
+    assert_eq!(Box::pin(replay(&state, approve.clone())).await, approved);
     replay(&state, edit).await;
     let undo = UndoDraftChunkRequest {
         sandbox: name.into(),
@@ -1106,7 +1162,7 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
         .unwrap()
         .into_inner();
     assert_eq!(replay(&state, undo).await, undone);
-    assert_eq!(replay(&state, approve).await, approved);
+    assert_eq!(Box::pin(replay(&state, approve)).await, approved);
     let reject = RejectDraftChunkRequest {
         sandbox: name.into(),
         chunk_id: submitted.accepted_chunk_ids[1].clone(),

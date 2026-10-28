@@ -4,8 +4,8 @@
 # Standalone gateway tasks
 
 ["build:gateway"]
-description = "Build the standalone openshell-gateway binary"
-run = "bash -c 'source tasks/scripts/build-env.sh && ensure_build_nofile_limit && cargo build -p openshell-gateway --bin openshell-gateway'"
+description = "Build the standalone openshell-gateway binary (OPENSHELL_BUILD_CEDAR=1 enables the Cedar policy engine)"
+run = "bash -c 'source tasks/scripts/build-env.sh && ensure_build_nofile_limit && cedar_feature=\"$(openshell_cedar_feature)\" && cargo build -p openshell-gateway --bin openshell-gateway --features \"$cedar_feature\"'"
 hide = true
 
 ["gateway"]

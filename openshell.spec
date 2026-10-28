@@ -98,6 +98,13 @@ management, agent execution, and provider access via gRPC.
 # Extract vendored Cargo dependencies and configure offline build
 tar xf %{SOURCE1}
 %cargo_prep -v vendor
+# %%cargo_prep only redirects crates-io to the vendor directory. Git
+# dependencies need their own [source."git+..."] replacement tables, which
+# deploy/rpm/create-vendor-archive.sh captures from `cargo vendor` when
+# building Source1. Absent when the lockfile has no git dependencies.
+if [ -f vendor/.cargo-git-sources.toml ]; then
+  cat vendor/.cargo-git-sources.toml >> .cargo/config.toml
+fi
 
 # Patch workspace version from placeholder to actual build identity.
 sed -i 's/^version = "0.0.0"/version = "%{openshell_cargo_version}"/' Cargo.toml

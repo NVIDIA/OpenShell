@@ -950,7 +950,13 @@ describe('create', () => {
       updateConfig: (req) => {
         if (req.settingKey) observed.updateSetting = req;
         else observed.updatePolicy = req;
-        return { version: 5, policyHash: 'hash', settingsRevision: 10n, deleted: false };
+        return {
+          version: 5,
+          policyHash: 'hash',
+          settingsRevision: 10n,
+          deleted: false,
+          policyWarnings: [{ message: 'path is audit-only' }],
+        };
       },
       getSandboxConfig: () => ({
         policy: { version: 1, networkPolicies: {} },
@@ -999,7 +1005,8 @@ describe('create', () => {
     const detached = await sandbox.detachProvider('lookup', 'github', { workspace: 'staging' });
     await sandbox.listProviders('lookup', { workspace: 'staging' }).nextPage();
     await sandbox.getConfig('config', { workspace: 'staging' });
-    await sandbox.setPolicy('lookup', { version: 1, networkPolicies: {} }, { workspace: 'staging' });
+    const updated = await sandbox.setPolicy('lookup', { version: 1, networkPolicies: {} }, { workspace: 'staging' });
+    expect(updated.policyWarnings).toEqual(['path is audit-only']);
     await sandbox.setSetting(
       'lookup',
       'feature.enabled',
@@ -2538,4 +2545,44 @@ describe('raw escape hatch', () => {
     // The shared transport is exposed for building extra clients.
     expect(sandbox.transport).toBeDefined();
   });
+});
+
+describe('Cedar gateway compatibility', () => {
+  it.each([false, true])('checks support before every Cedar mutation (support=%s)', async (supported) => {
+    let mutations = 0;
+    const c = client({
+      health: () => ({ supportsCedarPolicy: supported }),
+      createSandbox: () => {
+        mutations++;
+        return readySandbox('cedar', 'id');
+      },
+      updateConfig: () => {
+        mutations++;
+        return {};
+      },
+    });
+    const policy = { cedarPolicySource: 'permit(principal, action, resource);' };
+    const calls = [
+      () => c.create({ policy }),
+      () => c.create({ rawSpec: { policy } }),
+      () => c.createFromTemplate({ workloadTemplate: 'python', policy }),
+      () => c.setPolicy('cedar', policy),
+    ];
+    for (const call of calls) {
+      if (supported) await call();
+      else await expect(call()).rejects.toThrow('Cedar policy support');
+    }
+    expect(mutations).toBe(supported ? calls.length : 0);
+  });
+});
+
+it('advertises Cedar support when reading sandbox-authenticated configuration', async () => {
+  const c = client({
+    getSandbox: () => readySandbox('cedar', 'id'),
+    getSandboxConfig: (request) => {
+      expect(request.supportsCedarPolicy).toBe(true);
+      return { policy: { cedarPolicySource: 'permit(principal, action, resource);' } };
+    },
+  });
+  expect((await c.getConfig('cedar')).policy?.cedarPolicySource).toContain('permit');
 });

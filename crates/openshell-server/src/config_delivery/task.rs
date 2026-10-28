@@ -55,12 +55,16 @@ pub struct Registration {
     /// The bootstrap could not resolve part of the configuration, so the
     /// session rebuilds it at once rather than at its first reconciliation.
     pub rebuild: bool,
+    /// The supervisor reported Cedar support in its hello.
+    pub supports_cedar_policy: bool,
 }
 
 #[derive(Debug)]
 pub(super) struct SessionRecord {
     pub(super) sandbox_id: String,
     pub(super) session_id: String,
+    /// The supervisor can enforce Cedar policies; see [`Registration`].
+    pub(super) supports_cedar_policy: bool,
     workspace: String,
     marks: Mutex<Marks>,
     wake: Notify,
@@ -94,6 +98,7 @@ impl SessionRecord {
         Self {
             sandbox_id: registration.sandbox_id,
             session_id: registration.session_id,
+            supports_cedar_policy: registration.supports_cedar_policy,
             workspace: registration.workspace,
             marks: Mutex::new(Marks {
                 providers: registration.providers,
@@ -337,6 +342,7 @@ mod tests {
             provider_environment: None,
             captured_seq: 0,
             rebuild: false,
+            supports_cedar_policy: true,
         }))
     }
 

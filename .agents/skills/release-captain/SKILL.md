@@ -41,6 +41,10 @@ tag, or start a second `Pre-release` run for a tag; it has no concurrency guard.
 - `Release` (`release.yml`) is dispatched by hand with the stable version. It
   picks the highest `-pre.N` on `main` whose whole `Pre-release` run passed,
   creates the stable tag on that commit, and publishes without requalifying.
+- Pre-release and stable builds exclude development-only features such as
+  Cedar policies. Qualification has no `cedar` or `mcp-cedar` E2E suite; those
+  run only in `Release Dev` and branch E2E, so their absence from a
+  `Pre-release` run is expected.
 
 ### Patch-train protobuf exception
 

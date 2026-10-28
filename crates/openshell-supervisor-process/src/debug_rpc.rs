@@ -29,15 +29,16 @@ use openshell_core::grpc_client::{
 };
 
 /// Entry point for the `debug-rpc` subcommand. Returns the process exit
-/// code; `main` propagates it.
-pub async fn run(args: &[String]) -> Result<i32> {
+/// code; `main` propagates it. `supports_cedar_policy` is the supervisor's
+/// compiled Cedar support, reported in configuration requests.
+pub async fn run(args: &[String], supports_cedar_policy: bool) -> Result<i32> {
     let cmd = args
         .first()
         .map(String::as_str)
         .ok_or_else(|| miette::miette!("{}", USAGE))?;
 
     match cmd {
-        "get-sandbox-config" => run_get_sandbox_config(&args[1..]).await,
+        "get-sandbox-config" => run_get_sandbox_config(&args[1..], supports_cedar_policy).await,
         "refresh" => run_refresh().await,
         "show-token" => run_show_token(),
         "show-principal" => run_show_principal(),
@@ -73,12 +74,13 @@ async fn open_client() -> Result<OpenShellClient<AuthedChannel>> {
     Ok(OpenShellClient::new(channel))
 }
 
-async fn run_get_sandbox_config(args: &[String]) -> Result<i32> {
+async fn run_get_sandbox_config(args: &[String], supports_cedar_policy: bool) -> Result<i32> {
     let sandbox_name = parse_flag(args, "--sandbox")
         .ok_or_else(|| miette::miette!("get-sandbox-config: --sandbox <NAME> is required"))?;
     let mut client = open_client().await?;
     let resp = client
         .get_sandbox_config(GetSandboxConfigRequest {
+            supports_cedar_policy,
             name: sandbox_name.to_string(),
             workspace_scope: None,
         })

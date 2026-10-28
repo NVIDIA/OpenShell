@@ -111,6 +111,14 @@ pub fn persistence_error_to_status(
     }
 }
 
+/// Wraps a policy's load-time warnings for a response.
+fn policy_warnings(warnings: Vec<String>) -> Vec<openshell_core::proto::PolicyWarning> {
+    warnings
+        .into_iter()
+        .map(|message| openshell_core::proto::PolicyWarning { message })
+        .collect()
+}
+
 /// Apply the public missing-target contract after authorization and parent checks.
 fn deletion_outcome(deleted: bool, allow_missing: bool, resource: &str) -> Result<i32, Status> {
     use openshell_core::proto::DeletionOutcome;
@@ -249,6 +257,7 @@ impl OpenShell for OpenShellService {
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         Ok(Response::new(HealthResponse {
+            supports_cedar_policy: validation::SUPPORTS_CEDAR_POLICY,
             status: ServiceStatus::Healthy.into(),
             version: openshell_core::VERSION.to_string(),
         }))
@@ -746,7 +755,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ApproveDraftChunkRequest>,
     ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        Box::pin(mutation_replay::run(&self.state, request)).await
     }
 
     async fn reject_draft_chunk(
@@ -1037,6 +1046,8 @@ pub mod test_support {
         Legacy,
         /// Applies and acknowledges streamed configuration.
         Apply,
+        /// Applies streamed configuration but cannot enforce Cedar policies.
+        ApplyWithoutCedar,
     }
 
     /// Serve `state` on loopback and open a supervisor stream whose hello
@@ -1099,11 +1110,15 @@ pub mod test_support {
                 payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
                     sandbox_id: sandbox_id.into(),
                     instance_id: "instance".into(),
-                    supports_config_push: features == StreamFeatures::Apply,
+                    supports_config_push: matches!(
+                        features,
+                        StreamFeatures::Apply | StreamFeatures::ApplyWithoutCedar
+                    ),
                     connection_epoch,
                     supports_provider_readiness: false,
                     redirected: false,
                     supports_session_redirect: false,
+                    supports_cedar_policy: features == StreamFeatures::Apply,
                 })),
             })
             .await
@@ -1281,6 +1296,37 @@ pub mod test_support {
             None,
         )))
     }
+
+    /// A Cedar policy that permits one network endpoint and loads without
+    /// warnings.
+    pub fn cedar_policy() -> openshell_core::proto::SandboxPolicy {
+        openshell_core::proto::SandboxPolicy {
+            version: 1,
+            cedar_policy_source: r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+                resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#
+                .to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A valid Cedar policy whose audit-only `@path` forbid produces one
+    /// load-time warning.
+    #[cfg(feature = "cedar")]
+    pub fn cedar_policy_with_warning() -> openshell_core::proto::SandboxPolicy {
+        openshell_core::proto::SandboxPolicy {
+            cedar_policy_source: r#"
+permit (principal, action == Sandbox::Action::"HttpRequest",
+        resource == Sandbox::NetworkEndpoint::"api.example.com:443")
+when { context.method == "GET" };
+@path("/admin/**") @enforcement("audit")
+forbid (principal, action == Sandbox::Action::"HttpRequest",
+        resource == Sandbox::NetworkEndpoint::"api.example.com:443")
+when { context.method == "DELETE" };
+"#
+            .to_string(),
+            ..cedar_policy()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,6 +1345,19 @@ mod tests {
         MemoryResourceCapabilities as DriverMemoryResourceCapabilities,
         ResourceCapabilities as DriverResourceCapabilities,
     };
+
+    /// Clients decide whether to offer Cedar from the health response, so it
+    /// reports exactly what this build of the gateway accepts.
+    #[tokio::test]
+    async fn health_reports_whether_this_build_supports_cedar() {
+        let service = OpenShellService::new(test_support::test_server_state().await);
+        let health = service
+            .health(Request::new(HealthRequest {}))
+            .await
+            .expect("health succeeds")
+            .into_inner();
+        assert_eq!(health.supports_cedar_policy, cfg!(feature = "cedar"));
+    }
 
     #[test]
     fn public_resource_capabilities_preserves_reported_fields() {

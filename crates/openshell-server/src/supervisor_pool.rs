@@ -4776,17 +4776,23 @@ mod tests {
 
     #[tokio::test]
     async fn a_restarted_member_of_a_full_pool_re_adopts_its_routes_in_place() {
-        a_restarted_member_of_a_full_pool_re_adopts_its_routes_in_place_on(&Fixture::new().await)
-            .await;
+        Box::pin(
+            a_restarted_member_of_a_full_pool_re_adopts_its_routes_in_place_on(
+                &Fixture::new().await,
+            ),
+        )
+        .await;
     }
 
     #[tokio::test]
     #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
     async fn postgres_a_restarted_member_of_a_full_pool_re_adopts_its_routes_in_place() {
         let schema = TestSchema::create("supervisor_pool").await;
-        a_restarted_member_of_a_full_pool_re_adopts_its_routes_in_place_on(&Fixture::with_store(
-            schema.connect_store().await,
-        ))
+        Box::pin(
+            a_restarted_member_of_a_full_pool_re_adopts_its_routes_in_place_on(
+                &Fixture::with_store(schema.connect_store().await),
+            ),
+        )
         .await;
         schema.drop_schema().await;
     }

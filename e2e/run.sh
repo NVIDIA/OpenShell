@@ -234,6 +234,15 @@ target_dir="$(e2e_cargo_target_dir "${ROOT}" mise x -- cargo)"
 
 ensure_build_nofile_limit
 
+# OPENSHELL_BUILD_CEDAR=1 adds the Cedar policy engine to the gateway and
+# supervisor, the only packages that define the `cedar` feature.
+cedar_feature="$(openshell_cedar_feature)"
+supervisor_features=()
+if [ -n "${cedar_feature}" ]; then
+	supervisor_features=(--features "${cedar_feature}")
+fi
+gateway_feature_list="vendored-z3${cedar_feature:+,${cedar_feature}}"
+
 echo "==> Building native host openshell CLI"
 mise x -- cargo build "${cargo_jobs[@]}" -p openshell-cli --bin openshell
 host_cli_bin="${target_dir}/debug/openshell"
@@ -254,7 +263,8 @@ mise x -- cargo zigbuild "${cargo_jobs[@]}" \
 	--release \
 	--target "${linux_musl_target}" \
 	-p openshell-supervisor \
-	--bin openshell-supervisor
+	--bin openshell-supervisor \
+	${supervisor_features[@]+"${supervisor_features[@]}"}
 linux_supervisor_bin="${target_dir}/${linux_musl_target}/release/openshell-supervisor"
 
 host_gateway_bin=
@@ -264,7 +274,7 @@ if [ "${mode}" = host ]; then
 	mise x -- cargo build "${cargo_jobs[@]}" \
 		-p openshell-gateway \
 		--bin openshell-gateway \
-		--features vendored-z3
+		--features "${gateway_feature_list}"
 	host_gateway_bin="${target_dir}/debug/openshell-gateway"
 else
 	echo "==> Building Linux openshell-gateway (${linux_gateway_zig_target})"
@@ -280,7 +290,7 @@ else
 			--target "${linux_gateway_zig_target}" \
 			-p openshell-gateway \
 			--bin openshell-gateway \
-			--features vendored-z3
+			--features "${gateway_feature_list}"
 	)
 	guest_gateway_bin="${target_dir}/${linux_gateway_rust_target}/release/openshell-gateway"
 fi

@@ -2198,6 +2198,8 @@ struct ConfigPushSetup {
     /// The admission the sandbox record holds, so a reconnect that reports
     /// the same admission writes nothing.
     persisted_admission: Option<openshell_core::proto::SandboxConfigurationAdmission>,
+    /// The supervisor reported Cedar support in its hello.
+    supports_cedar_policy: bool,
 }
 
 /// Everything needed to accept a supervisor session once its bootstrap is
@@ -2476,6 +2478,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
                 provider_environment: bootstrap_provider_environment,
                 captured_seq: setup.captured_seq,
                 rebuild,
+                supports_cedar_policy: setup.supports_cedar_policy,
             },
         );
     }
@@ -2609,9 +2612,13 @@ pub async fn handle_connect_supervisor(
             .status
             .as_ref()
             .and_then(|status| status.configuration_admission.clone()),
+        supports_cedar_policy: hello.supports_cedar_policy,
     });
     let bootstrap = if pushes_config {
-        Some(config_session::build_session_bootstrap(state, &sandbox).await?)
+        Some(
+            config_session::build_session_bootstrap(state, &sandbox, hello.supports_cedar_policy)
+                .await?,
+        )
     } else {
         None
     };

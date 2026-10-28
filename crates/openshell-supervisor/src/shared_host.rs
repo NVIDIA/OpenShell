@@ -1517,7 +1517,8 @@ async fn run_stream(
     end
 }
 
-#[cfg(test)]
+// Hosted sandbox instances require a Unix host.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::sandbox_instance_host::SandboxInstanceAdmission;

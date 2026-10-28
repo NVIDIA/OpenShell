@@ -512,7 +512,7 @@ enum Commands {
     #[command(alias = "sb", after_help = SANDBOX_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Sandbox {
         #[command(subcommand)]
-        command: Option<SandboxCommands>,
+        command: Option<Box<SandboxCommands>>,
     },
 
     /// Manage port forwarding to a sandbox.
@@ -1531,10 +1531,18 @@ enum SandboxCommands {
         #[arg(long = "provider")]
         providers: Vec<String>,
 
-        /// Path to a custom sandbox policy YAML file.
+        /// Path to a custom sandbox policy file: YAML, or Cedar with a `.cedar` extension
+        /// (Cedar requires a development build of the gateway).
         /// Overrides the built-in default and the `OPENSHELL_SANDBOX_POLICY` env var.
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: Option<String>,
+
+        /// Path to a middleware file: YAML with `network_middlewares` and, for a Cedar
+        /// policy, `endpoint_settings` and `process` sections. Adds supervisor middleware,
+        /// endpoint settings, and the process identity to the policy; required to use
+        /// middleware with a Cedar policy.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        middleware: Option<String>,
 
         /// Forward a local port to the sandbox before the initial command or shell starts.
         /// Accepts [`bind_address`:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
@@ -1645,7 +1653,7 @@ enum SandboxCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
-        /// Print only the active policy YAML (same policy as the default view; stdout only).
+        /// Print only the active policy, as YAML or Cedar source (stdout only).
         #[arg(long, conflicts_with = "output")]
         policy_only: bool,
 
@@ -2162,9 +2170,18 @@ enum PolicyCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
-        /// Path to the policy YAML file.
+        /// Path to the policy file: YAML, or Cedar with a `.cedar` extension (Cedar
+        /// requires a development build of the gateway).
+        /// Global policies must be YAML.
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: String,
+
+        /// Path to a middleware file: YAML with `network_middlewares` and, for a Cedar
+        /// policy, `endpoint_settings` and `process` sections. Adds supervisor middleware,
+        /// endpoint settings, and the process identity to the policy; required to use
+        /// middleware with a Cedar policy.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        middleware: Option<String>,
 
         /// Apply as a gateway-global policy for all sandboxes.
         #[arg(long)]
@@ -3072,6 +3089,7 @@ async fn run_async() -> Result<()> {
                 PolicyCommands::Set {
                     name,
                     policy,
+                    middleware,
                     global,
                     yes,
                     wait,
@@ -3086,7 +3104,10 @@ async fn run_async() -> Result<()> {
                         }
                         run::sandbox_policy_set_global(
                             &ctx.endpoint,
-                            &policy,
+                            run::PolicyFiles {
+                                policy: &policy,
+                                middleware: middleware.as_deref(),
+                            },
                             yes,
                             wait,
                             timeout,
@@ -3099,7 +3120,10 @@ async fn run_async() -> Result<()> {
                         run::sandbox_policy_set(
                             &ctx.endpoint,
                             &name,
-                            &policy,
+                            run::PolicyFiles {
+                                policy: &policy,
+                                middleware: middleware.as_deref(),
+                            },
                             wait,
                             timeout,
                             &cli.workspace,
@@ -3379,7 +3403,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Sandbox {
             command: Some(command),
         }) => {
-            match command {
+            match *command {
                 SandboxCommands::Create {
                     name,
                     template,
@@ -3395,6 +3419,7 @@ async fn run_async() -> Result<()> {
                     driver_config_json,
                     providers,
                     policy,
+                    middleware,
                     forward,
                     expose,
                     expose_authorization_mode,
@@ -3483,6 +3508,7 @@ async fn run_async() -> Result<()> {
                             editor,
                             providers: &providers,
                             policy: policy.as_deref(),
+                            middleware: middleware.as_deref(),
                             forward,
                             expose,
                             expose_authorization_mode: expose_authorization_mode.into(),
@@ -4461,11 +4487,13 @@ mod tests {
         .expect("sandbox provider attach should parse");
 
         let Some(Commands::Sandbox {
-            command:
-                Some(SandboxCommands::Provider(SandboxProviderCommands::Attach {
-                    name, provider, ..
-                })),
+            command: Some(command),
         }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        let SandboxCommands::Provider(SandboxProviderCommands::Attach { name, provider, .. }) =
+            *command
         else {
             panic!("expected sandbox provider attach command");
         };
@@ -4484,15 +4512,18 @@ mod tests {
             argv.extend(args);
             let cli = Cli::try_parse_from(argv).map_err(|e| e.kind())?;
             let Some(Commands::Sandbox {
-                command:
-                    Some(SandboxCommands::Exec {
-                        sandbox,
-                        name,
-                        command,
-                        tty,
-                        ..
-                    }),
+                command: Some(command),
             }) = cli.command
+            else {
+                panic!("expected sandbox subcommand");
+            };
+            let SandboxCommands::Exec {
+                sandbox,
+                name,
+                command,
+                tty,
+                ..
+            } = *command
             else {
                 panic!("expected sandbox exec command");
             };
@@ -4575,9 +4606,12 @@ mod tests {
             ])
             .expect("readiness flags should parse");
             let Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Provider(command)),
+                command: Some(command),
             }) = cli.command
             else {
+                panic!("expected sandbox subcommand");
+            };
+            let SandboxCommands::Provider(command) = *command else {
                 panic!("expected provider command")
             };
             let (SandboxProviderCommands::Attach { readiness, .. }
@@ -5421,13 +5455,17 @@ mod tests {
     fn remaining_list_commands_default_output_to_table() {
         let sandbox_provider = Cli::try_parse_from(["openshell", "sandbox", "provider", "list"])
             .expect("sandbox provider list should parse");
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = sandbox_provider.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
         assert!(matches!(
-            sandbox_provider.command,
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Provider(SandboxProviderCommands::List {
-                    output: OutputFormat::Table,
-                    ..
-                })),
+            *command,
+            SandboxCommands::Provider(SandboxProviderCommands::List {
+                output: OutputFormat::Table,
+                ..
             })
         ));
 
@@ -5482,9 +5520,12 @@ mod tests {
                 Cli::try_parse_from(["openshell", "sandbox", "provider", "list", "-o", format])
                     .unwrap_or_else(|error| panic!("sandbox provider list -o {format}: {error}"));
             let Some(Commands::Sandbox {
-                command:
-                    Some(SandboxCommands::Provider(SandboxProviderCommands::List { output, .. })),
+                command: Some(command),
             }) = sandbox_provider.command
+            else {
+                panic!("expected sandbox subcommand");
+            };
+            let SandboxCommands::Provider(SandboxProviderCommands::List { output, .. }) = *command
             else {
                 panic!("expected sandbox provider list command");
             };
@@ -5537,14 +5578,18 @@ mod tests {
         let cli = Cli::try_parse_from(["openshell", "sandbox", "list"])
             .expect("sandbox list should parse");
 
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
         assert!(matches!(
-            cli.command,
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::List {
-                    output: OutputFormat::Table,
-                    ..
-                })
-            })
+            *command,
+            SandboxCommands::List {
+                output: OutputFormat::Table,
+                ..
+            }
         ));
     }
 
@@ -5552,52 +5597,52 @@ mod tests {
     fn sandbox_stop_and_start_accept_optional_names() {
         let stop = Cli::try_parse_from(["openshell", "sandbox", "stop", "demo"])
             .expect("stop command should parse");
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = stop.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
         assert!(matches!(
-            stop.command,
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Stop { name: Some(ref name) }),
-            }) if name == "demo"
+            *command,
+            SandboxCommands::Stop { name: Some(ref name) } if name == "demo"
         ));
 
         let start = Cli::try_parse_from(["openshell", "sandbox", "start"])
             .expect("start command should parse");
-        assert!(matches!(
-            start.command,
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Start { name: None }),
-            })
-        ));
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = start.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        assert!(matches!(*command, SandboxCommands::Start { name: None }));
     }
 
     #[test]
     fn sandbox_suspend_and_resume_accept_optional_names() {
-        let suspend = Cli::try_parse_from(["openshell", "sandbox", "suspend", "demo"])
-            .expect("suspend command should parse");
+        let sandbox_command = |args: &[&str]| {
+            let Some(Commands::Sandbox {
+                command: Some(command),
+            }) = Cli::try_parse_from(args)
+                .expect("sandbox command should parse")
+                .command
+            else {
+                panic!("expected sandbox subcommand");
+            };
+            *command
+        };
         assert!(matches!(
-            suspend.command,
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Suspend { name: Some(ref name) }),
-            }) if name == "demo"
+            sandbox_command(&["openshell", "sandbox", "suspend", "demo"]),
+            SandboxCommands::Suspend { name: Some(ref name) } if name == "demo"
         ));
-
-        let resume = Cli::try_parse_from(["openshell", "sandbox", "resume"])
-            .expect("resume command should parse");
         assert!(matches!(
-            resume.command,
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Resume { name: None }),
-            })
+            sandbox_command(&["openshell", "sandbox", "resume"]),
+            SandboxCommands::Resume { name: None }
         ));
-
-        let named = Cli::try_parse_from(["openshell", "sandbox", "resume", "demo"])
-            .expect("named resume should parse");
         assert!(matches!(
-            named.command,
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Resume {
-                    name: Some(ref name),
-                }),
-            }) if name == "demo"
+            sandbox_command(&["openshell", "sandbox", "resume", "demo"]),
+            SandboxCommands::Resume { name: Some(ref name) } if name == "demo"
         ));
     }
 
@@ -5606,14 +5651,18 @@ mod tests {
         let cli = Cli::try_parse_from(["openshell", "sandbox", "list", "-o", "json"])
             .expect("sandbox list -o json should parse");
 
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
         assert!(matches!(
-            cli.command,
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::List {
-                    output: OutputFormat::Json,
-                    ..
-                })
-            })
+            *command,
+            SandboxCommands::List {
+                output: OutputFormat::Json,
+                ..
+            }
         ));
     }
 
@@ -5622,14 +5671,18 @@ mod tests {
         let cli = Cli::try_parse_from(["openshell", "sandbox", "list", "-o", "yaml"])
             .expect("sandbox list -o yaml should parse");
 
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
         assert!(matches!(
-            cli.command,
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::List {
-                    output: OutputFormat::Yaml,
-                    ..
-                })
-            })
+            *command,
+            SandboxCommands::List {
+                output: OutputFormat::Yaml,
+                ..
+            }
         ));
     }
 
@@ -6262,11 +6315,13 @@ mod tests {
             result.err()
         );
         if let Ok(cli) = result {
-            if let Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Create { name, .. }),
-                ..
+            let Some(Commands::Sandbox {
+                command: Some(command),
             }) = cli.command
-            {
+            else {
+                panic!("expected sandbox subcommand");
+            };
+            if let SandboxCommands::Create { name, .. } = *command {
                 assert_eq!(name.as_deref(), Some("my-sb"));
             } else {
                 panic!("expected SandboxCommands::Create");
@@ -6285,11 +6340,13 @@ mod tests {
             result.err()
         );
         if let Ok(cli) = result {
-            if let Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Create { name, .. }),
-                ..
+            let Some(Commands::Sandbox {
+                command: Some(command),
             }) = cli.command
-            {
+            else {
+                panic!("expected sandbox subcommand");
+            };
+            if let SandboxCommands::Create { name, .. } = *command {
                 assert_eq!(name, None);
             } else {
                 panic!("expected SandboxCommands::Create");
@@ -6309,11 +6366,14 @@ mod tests {
             "owner=platform",
         ])
         .unwrap();
-        match cli.command {
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Create { annotations, .. }),
-                ..
-            }) => assert_eq!(
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create { annotations, .. } => assert_eq!(
                 annotations,
                 vec![
                     "policy-source-file=/home/you/my policy.yaml".to_string(),
@@ -6327,11 +6387,14 @@ mod tests {
     #[test]
     fn sandbox_create_restart_policy_defaults_to_never() {
         let cli = Cli::try_parse_from(["openshell", "sandbox", "create"]).unwrap();
-        match cli.command {
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Create { restart_policy, .. }),
-                ..
-            }) => assert_eq!(restart_policy, "never"),
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create { restart_policy, .. } => assert_eq!(restart_policy, "never"),
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
     }
@@ -6346,11 +6409,16 @@ mod tests {
             "on-failure",
         ])
         .unwrap();
-        match cli.command {
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Create { restart_policy, .. }),
-                ..
-            }) => assert_eq!(restart_policy, "on-failure"),
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create { restart_policy, .. } => {
+                assert_eq!(restart_policy, "on-failure");
+            }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
     }
@@ -6382,14 +6450,16 @@ mod tests {
         ])
         .expect("sandbox create --detach should parse");
 
-        match cli.command {
-            Some(Commands::Sandbox {
-                command:
-                    Some(SandboxCommands::Create {
-                        detach, command, ..
-                    }),
-                ..
-            }) => {
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create {
+                detach, command, ..
+            } => {
                 assert!(detach);
                 assert_eq!(command, ["worker", "--serve"]);
             }
@@ -6410,17 +6480,19 @@ mod tests {
         ])
         .expect("detached ephemeral sandbox should parse");
 
-        match cli.command {
-            Some(Commands::Sandbox {
-                command:
-                    Some(SandboxCommands::Create {
-                        detach,
-                        no_keep,
-                        command,
-                        ..
-                    }),
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create {
+                detach,
+                no_keep,
+                command,
                 ..
-            }) => {
+            } => {
                 assert!(detach);
                 assert!(no_keep);
                 assert_eq!(command, ["worker"]);
@@ -6451,11 +6523,14 @@ mod tests {
     fn sandbox_create_approval_mode_defaults_to_manual() {
         let cli = Cli::try_parse_from(["openshell", "sandbox", "create"])
             .expect("sandbox create with no flags should parse");
-        match cli.command {
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Create { approval_mode, .. }),
-                ..
-            }) => {
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create { approval_mode, .. } => {
                 assert_eq!(approval_mode, "manual");
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
@@ -6468,11 +6543,14 @@ mod tests {
         let cli =
             Cli::try_parse_from(["openshell", "sandbox", "create", "--approval-mode", "auto"])
                 .expect("--approval-mode auto should parse");
-        match cli.command {
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Create { approval_mode, .. }),
-                ..
-            }) => {
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create { approval_mode, .. } => {
                 assert_eq!(approval_mode, "auto");
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
@@ -6546,17 +6624,19 @@ mod tests {
         ])
         .expect("sandbox create resource flags should parse");
 
-        match cli.command {
-            Some(Commands::Sandbox {
-                command:
-                    Some(SandboxCommands::Create {
-                        cpu,
-                        memory,
-                        command,
-                        ..
-                    }),
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create {
+                cpu,
+                memory,
+                command,
                 ..
-            }) => {
+            } => {
                 assert_eq!(cpu.as_deref(), Some("500m"));
                 assert_eq!(memory.as_deref(), Some("2Gi"));
                 assert_eq!(command, vec!["claude".to_string()]);
@@ -6577,14 +6657,16 @@ mod tests {
         ])
         .expect("sandbox create driver config JSON flag should parse");
 
-        match cli.command {
-            Some(Commands::Sandbox {
-                command:
-                    Some(SandboxCommands::Create {
-                        driver_config_json, ..
-                    }),
-                ..
-            }) => {
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create {
+                driver_config_json, ..
+            } => {
                 assert_eq!(driver_config_json.as_deref(), Some(json));
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
@@ -6604,16 +6686,18 @@ mod tests {
         ])
         .expect("sandbox create template flag should parse");
 
-        match cli.command {
-            Some(Commands::Sandbox {
-                command:
-                    Some(SandboxCommands::Create {
-                        template,
-                        providers,
-                        ..
-                    }),
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create {
+                template,
+                providers,
                 ..
-            }) => {
+            } => {
                 assert_eq!(template.as_deref(), Some("gpu-kata"));
                 assert_eq!(providers, vec!["github".to_string()]);
             }
@@ -6677,25 +6761,27 @@ mod tests {
         ])
         .expect("sandbox template create should parse");
 
-        match cli.command {
-            Some(Commands::Sandbox {
-                command:
-                    Some(SandboxCommands::Template(SandboxTemplateCommands::Create {
-                        name,
-                        image,
-                        cpu,
-                        memory,
-                        gpu,
-                        driver_config_json,
-                        ready_within,
-                        max_burst,
-                        labels,
-                        annotations,
-                        envs,
-                        no_credential_warnings,
-                        output,
-                    })),
-                ..
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Template(SandboxTemplateCommands::Create {
+                name,
+                image,
+                cpu,
+                memory,
+                gpu,
+                driver_config_json,
+                ready_within,
+                max_burst,
+                labels,
+                annotations,
+                envs,
+                no_credential_warnings,
+                output,
             }) => {
                 assert_eq!(name, "gpu-kata");
                 assert_eq!(image.as_deref(), Some("registry.example.com/agent:latest"));
@@ -6733,17 +6819,19 @@ mod tests {
         ])
         .expect("sandbox template list should parse");
 
-        match cli.command {
-            Some(Commands::Sandbox {
-                command:
-                    Some(SandboxCommands::Template(SandboxTemplateCommands::List {
-                        page_size,
-                        page_token,
-                        label_selector,
-                        names,
-                        all_workspaces,
-                        ..
-                    })),
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Template(SandboxTemplateCommands::List {
+                page_size,
+                page_token,
+                label_selector,
+                names,
+                all_workspaces,
                 ..
             }) => {
                 assert_eq!(page_size, 25);
@@ -6775,12 +6863,14 @@ mod tests {
         let cli = Cli::try_parse_from(["openshell", "sandbox", "template", "create", "base"])
             .expect("sandbox template create without --image should parse");
 
-        match cli.command {
-            Some(Commands::Sandbox {
-                command:
-                    Some(SandboxCommands::Template(SandboxTemplateCommands::Create { image, .. })),
-                ..
-            }) => {
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Template(SandboxTemplateCommands::Create { image, .. }) => {
                 assert_eq!(image, None);
             }
             other => panic!("expected SandboxTemplateCommands::Create, got: {other:?}"),
@@ -6799,12 +6889,14 @@ mod tests {
         ])
         .expect("sandbox template create --gpu should parse");
 
-        match cli.command {
-            Some(Commands::Sandbox {
-                command:
-                    Some(SandboxCommands::Template(SandboxTemplateCommands::Create { gpu, .. })),
-                ..
-            }) => {
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Template(SandboxTemplateCommands::Create { gpu, .. }) => {
                 assert_eq!(gpu, Some(GpuCliRequest::DriverDefault));
             }
             other => panic!("expected SandboxTemplateCommands::Create, got: {other:?}"),
@@ -6816,11 +6908,14 @@ mod tests {
         let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu"])
             .expect("sandbox create --gpu should parse");
 
-        match cli.command {
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Create { gpu, .. }),
-                ..
-            }) => {
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create { gpu, .. } => {
                 assert_eq!(gpu, Some(GpuCliRequest::DriverDefault));
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
@@ -6832,11 +6927,14 @@ mod tests {
         let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu", "2"])
             .expect("sandbox create --gpu 2 should parse");
 
-        match cli.command {
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Create { gpu, .. }),
-                ..
-            }) => {
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create { gpu, .. } => {
                 assert_eq!(gpu, Some(GpuCliRequest::Count(2)));
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
@@ -6848,11 +6946,14 @@ mod tests {
         let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu", "--", "claude"])
             .expect("sandbox create --gpu -- claude should parse");
 
-        match cli.command {
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Create { gpu, command, .. }),
-                ..
-            }) => {
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create { gpu, command, .. } => {
                 assert_eq!(gpu, Some(GpuCliRequest::DriverDefault));
                 assert_eq!(command, vec!["claude".to_string()]);
             }
@@ -6873,11 +6974,14 @@ mod tests {
         ])
         .expect("sandbox create --gpu 2 -- claude should parse");
 
-        match cli.command {
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Create { gpu, command, .. }),
-                ..
-            }) => {
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create { gpu, command, .. } => {
                 assert_eq!(gpu, Some(GpuCliRequest::Count(2)));
                 assert_eq!(command, vec!["claude".to_string()]);
             }
@@ -6897,11 +7001,14 @@ mod tests {
         let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu=2"])
             .expect("sandbox create --gpu=2 should parse");
 
-        match cli.command {
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Create { gpu, .. }),
-                ..
-            }) => {
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create { gpu, .. } => {
                 assert_eq!(gpu, Some(GpuCliRequest::Count(2)));
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
@@ -6930,16 +7037,19 @@ mod tests {
         ])
         .expect("sandbox create --expose should parse");
 
-        match cli.command {
-            Some(Commands::Sandbox {
-                command:
-                    Some(SandboxCommands::Create {
-                        expose,
-                        expose_authorization_mode,
-                        detach,
-                        ..
-                    }),
-            }) => {
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create {
+                expose,
+                expose_authorization_mode,
+                detach,
+                ..
+            } => {
                 assert_eq!(expose, Some(4500));
                 assert_eq!(
                     expose_authorization_mode,
@@ -6984,14 +7094,17 @@ mod tests {
             "bearer-passthrough",
         ])
         .expect("create-time authorization mode should parse with --expose");
-        match cli.command {
-            Some(Commands::Sandbox {
-                command:
-                    Some(SandboxCommands::Create {
-                        expose_authorization_mode,
-                        ..
-                    }),
-            }) => assert_eq!(
+        let Some(Commands::Sandbox {
+            command: Some(command),
+        }) = cli.command
+        else {
+            panic!("expected sandbox subcommand");
+        };
+        match *command {
+            SandboxCommands::Create {
+                expose_authorization_mode,
+                ..
+            } => assert_eq!(
                 expose_authorization_mode,
                 CliServiceAuthorizationMode::BearerPassthrough
             ),

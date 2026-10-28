@@ -4,7 +4,8 @@
 //! Canonical policy encoding and deterministic policy hashes.
 
 use crate::proto::{
-    NetworkMiddlewareConfig, NetworkPolicyRule, SandboxPolicy as ProtoSandboxPolicy,
+    NetworkEndpoint, NetworkMiddlewareConfig, NetworkPolicyRule,
+    SandboxPolicy as ProtoSandboxPolicy,
 };
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -41,46 +42,71 @@ fn append_sorted_message_map<M: Message>(
     }
 }
 
+/// Remove every protobuf map nested inside an endpoint so prost encodes it deterministically.
+fn clear_endpoint_maps(endpoint: &mut NetworkEndpoint) {
+    endpoint.graphql_persisted_queries.clear();
+    for rule in &mut endpoint.rules {
+        if let Some(allow) = &mut rule.allow {
+            allow.query.clear();
+            allow.params.clear();
+        }
+    }
+    for deny in &mut endpoint.deny_rules {
+        deny.query.clear();
+        deny.params.clear();
+    }
+}
+
+/// Append the maps removed by [`clear_endpoint_maps`] in sorted key order.
+fn append_sorted_endpoint_maps(out: &mut Vec<u8>, endpoint: &NetworkEndpoint) {
+    append_sorted_message_map(
+        out,
+        b"graphql_persisted_queries",
+        &endpoint.graphql_persisted_queries,
+    );
+    for (rule_index, rule) in endpoint.rules.iter().enumerate() {
+        out.extend_from_slice(&canonical_size(rule_index));
+        if let Some(allow) = &rule.allow {
+            append_sorted_message_map(out, b"allow_query", &allow.query);
+            append_sorted_message_map(out, b"allow_params", &allow.params);
+        }
+    }
+    for (rule_index, deny) in endpoint.deny_rules.iter().enumerate() {
+        out.extend_from_slice(&canonical_size(rule_index));
+        append_sorted_message_map(out, b"deny_query", &deny.query);
+        append_sorted_message_map(out, b"deny_params", &deny.params);
+    }
+}
+
 /// Encode a policy rule without depending on randomized protobuf map order.
 pub fn canonical_rule_bytes(rule: &NetworkPolicyRule) -> Vec<u8> {
     let mut map_free = rule.clone();
     for endpoint in &mut map_free.endpoints {
-        endpoint.graphql_persisted_queries.clear();
-        for rule in &mut endpoint.rules {
-            if let Some(allow) = &mut rule.allow {
-                allow.query.clear();
-                allow.params.clear();
-            }
-        }
-        for deny in &mut endpoint.deny_rules {
-            deny.query.clear();
-            deny.params.clear();
-        }
+        clear_endpoint_maps(endpoint);
     }
 
     let mut out = Vec::new();
     append_canonical_message(&mut out, &map_free);
     for (endpoint_index, endpoint) in rule.endpoints.iter().enumerate() {
         out.extend_from_slice(&canonical_size(endpoint_index));
-        append_sorted_message_map(
-            &mut out,
-            b"graphql_persisted_queries",
-            &endpoint.graphql_persisted_queries,
-        );
-        for (rule_index, rule) in endpoint.rules.iter().enumerate() {
-            out.extend_from_slice(&canonical_size(rule_index));
-            if let Some(allow) = &rule.allow {
-                append_sorted_message_map(&mut out, b"allow_query", &allow.query);
-                append_sorted_message_map(&mut out, b"allow_params", &allow.params);
-            }
-        }
-        for (rule_index, deny) in endpoint.deny_rules.iter().enumerate() {
-            out.extend_from_slice(&canonical_size(rule_index));
-            append_sorted_message_map(&mut out, b"deny_query", &deny.query);
-            append_sorted_message_map(&mut out, b"deny_params", &deny.params);
-        }
+        append_sorted_endpoint_maps(&mut out, endpoint);
     }
     out
+}
+
+fn append_sorted_rule_map(
+    out: &mut Vec<u8>,
+    label: &[u8],
+    rules: &HashMap<String, NetworkPolicyRule>,
+) {
+    let mut entries = rules.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(key, _)| key.as_str());
+    append_canonical_bytes(out, label);
+    out.extend_from_slice(&canonical_size(entries.len()));
+    for (key, rule) in entries {
+        append_canonical_bytes(out, key.as_bytes());
+        append_canonical_bytes(out, &canonical_rule_bytes(rule));
+    }
 }
 
 fn canonical_struct_bytes(value: &prost_types::Struct) -> Vec<u8> {
@@ -147,17 +173,14 @@ fn canonical_policy_bytes(policy: &ProtoSandboxPolicy) -> Vec<u8> {
     let mut map_free = policy.clone();
     map_free.network_policies.clear();
     map_free.network_middlewares.clear();
+    map_free.provider_credential_rules.clear();
+    for endpoint in &mut map_free.endpoint_settings {
+        clear_endpoint_maps(endpoint);
+    }
     let mut out = Vec::new();
     append_canonical_message(&mut out, &map_free);
 
-    let mut policy_entries = policy.network_policies.iter().collect::<Vec<_>>();
-    policy_entries.sort_by_key(|(key, _)| key.as_str());
-    append_canonical_bytes(&mut out, b"network_policies");
-    out.extend_from_slice(&canonical_size(policy_entries.len()));
-    for (key, rule) in policy_entries {
-        append_canonical_bytes(&mut out, key.as_bytes());
-        append_canonical_bytes(&mut out, &canonical_rule_bytes(rule));
-    }
+    append_sorted_rule_map(&mut out, b"network_policies", &policy.network_policies);
 
     let mut middleware_entries = policy.network_middlewares.iter().collect::<Vec<_>>();
     middleware_entries.sort_by_key(|(key, _)| key.as_str());
@@ -166,6 +189,24 @@ fn canonical_policy_bytes(policy: &ProtoSandboxPolicy) -> Vec<u8> {
     for (key, middleware) in middleware_entries {
         append_canonical_bytes(&mut out, key.as_bytes());
         append_canonical_bytes(&mut out, &canonical_middleware_bytes(middleware));
+    }
+
+    // The Cedar-only sections below are appended only when populated so that
+    // every policy hash computed before these fields existed stays unchanged.
+    if !policy.provider_credential_rules.is_empty() {
+        append_sorted_rule_map(
+            &mut out,
+            b"provider_credential_rules",
+            &policy.provider_credential_rules,
+        );
+    }
+    if !policy.endpoint_settings.is_empty() {
+        append_canonical_bytes(&mut out, b"endpoint_settings");
+        out.extend_from_slice(&canonical_size(policy.endpoint_settings.len()));
+        for (endpoint_index, endpoint) in policy.endpoint_settings.iter().enumerate() {
+            out.extend_from_slice(&canonical_size(endpoint_index));
+            append_sorted_endpoint_maps(&mut out, endpoint);
+        }
     }
     out
 }
@@ -247,9 +288,204 @@ fn token_grant_owner(domain: &[u8], identity: &[u8], policy: &[u8], index: usize
 }
 
 #[cfg(test)]
+mod policy_hash_tests {
+    use super::*;
+    use crate::proto::{GraphqlOperation, NetworkBinary};
+
+    const ROUND_TRIPS: usize = 50;
+
+    fn provider_rule(host: &str) -> NetworkPolicyRule {
+        NetworkPolicyRule {
+            endpoints: vec![NetworkEndpoint {
+                host: host.into(),
+                path: "/v1/**".into(),
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/client".into(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn operation(name: &str) -> GraphqlOperation {
+        GraphqlOperation {
+            operation_type: "query".into(),
+            operation_name: name.into(),
+            fields: vec![name.to_ascii_lowercase()],
+        }
+    }
+
+    fn cedar_policy_with_provider_rules() -> ProtoSandboxPolicy {
+        ProtoSandboxPolicy {
+            cedar_policy_source: "permit(principal, action, resource);".into(),
+            provider_credential_rules: HashMap::from([
+                ("alpha".into(), provider_rule("alpha.example.test")),
+                ("beta".into(), provider_rule("beta.example.test")),
+            ]),
+            ..Default::default()
+        }
+    }
+
+    fn cedar_policy_with_endpoint_settings() -> ProtoSandboxPolicy {
+        ProtoSandboxPolicy {
+            cedar_policy_source: "permit(principal, action, resource);".into(),
+            endpoint_settings: vec![NetworkEndpoint {
+                host: "graphql.example.test".into(),
+                graphql_persisted_queries: HashMap::from([
+                    ("GetUser".into(), operation("GetUser")),
+                    ("ListRepos".into(), operation("ListRepos")),
+                ]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Hash the policy after each of many protobuf round-trips, which reshuffle
+    /// `HashMap` iteration order, and return the distinct hashes observed.
+    fn round_trip_hashes(policy: &ProtoSandboxPolicy) -> std::collections::BTreeSet<String> {
+        let mut hashes = std::collections::BTreeSet::new();
+        let mut current = policy.clone();
+        for _ in 0..ROUND_TRIPS {
+            current = ProtoSandboxPolicy::decode(current.encode_to_vec().as_slice())
+                .expect("policy round-trips through protobuf");
+            hashes.insert(deterministic_policy_hash(&current));
+        }
+        hashes
+    }
+
+    #[test]
+    fn provider_credential_rules_hash_is_stable_across_round_trips() {
+        let hashes = round_trip_hashes(&cedar_policy_with_provider_rules());
+        assert_eq!(hashes.len(), 1, "distinct hashes observed: {hashes:?}");
+    }
+
+    #[test]
+    fn endpoint_settings_persisted_queries_hash_is_stable_across_round_trips() {
+        let hashes = round_trip_hashes(&cedar_policy_with_endpoint_settings());
+        assert_eq!(hashes.len(), 1, "distinct hashes observed: {hashes:?}");
+    }
+
+    #[test]
+    fn cedar_map_insertion_order_does_not_change_hash() {
+        let forward = cedar_policy_with_provider_rules();
+        let mut reversed = ProtoSandboxPolicy {
+            provider_credential_rules: HashMap::new(),
+            ..forward.clone()
+        };
+        let mut entries = forward.provider_credential_rules.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|(key, _)| key.as_str());
+        for (key, rule) in entries.into_iter().rev() {
+            reversed
+                .provider_credential_rules
+                .insert(key.clone(), rule.clone());
+        }
+        assert_eq!(
+            deterministic_policy_hash(&forward),
+            deterministic_policy_hash(&reversed)
+        );
+
+        let forward = cedar_policy_with_endpoint_settings();
+        let mut reversed = forward.clone();
+        let queries = &mut reversed.endpoint_settings[0].graphql_persisted_queries;
+        let mut entries = std::mem::take(queries).into_iter().collect::<Vec<_>>();
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        queries.extend(entries.into_iter().rev());
+        assert_eq!(
+            deterministic_policy_hash(&forward),
+            deterministic_policy_hash(&reversed)
+        );
+    }
+
+    #[test]
+    fn cedar_map_value_changes_change_hash() {
+        let original = cedar_policy_with_provider_rules();
+        let mut changed = original.clone();
+        changed
+            .provider_credential_rules
+            .get_mut("beta")
+            .expect("beta rule")
+            .endpoints[0]
+            .path = "/v2/**".into();
+        assert_ne!(
+            deterministic_policy_hash(&original),
+            deterministic_policy_hash(&changed)
+        );
+
+        let original = cedar_policy_with_endpoint_settings();
+        let mut changed = original.clone();
+        changed.endpoint_settings[0]
+            .graphql_persisted_queries
+            .get_mut("GetUser")
+            .expect("GetUser operation")
+            .operation_type = "mutation".into();
+        assert_ne!(
+            deterministic_policy_hash(&original),
+            deterministic_policy_hash(&changed)
+        );
+    }
+
+    #[test]
+    fn policies_without_cedar_fields_keep_legacy_canonical_bytes() {
+        // Mirrors the canonical encoding that shipped before the Cedar-only
+        // sections were added, so hashes persisted by older gateways still match.
+        fn legacy_canonical_policy_bytes(policy: &ProtoSandboxPolicy) -> Vec<u8> {
+            let mut map_free = policy.clone();
+            map_free.network_policies.clear();
+            map_free.network_middlewares.clear();
+            let mut out = Vec::new();
+            append_canonical_message(&mut out, &map_free);
+
+            let mut policy_entries = policy.network_policies.iter().collect::<Vec<_>>();
+            policy_entries.sort_by_key(|(key, _)| key.as_str());
+            append_canonical_bytes(&mut out, b"network_policies");
+            out.extend_from_slice(&canonical_size(policy_entries.len()));
+            for (key, rule) in policy_entries {
+                append_canonical_bytes(&mut out, key.as_bytes());
+                append_canonical_bytes(&mut out, &canonical_rule_bytes(rule));
+            }
+
+            let mut middleware_entries = policy.network_middlewares.iter().collect::<Vec<_>>();
+            middleware_entries.sort_by_key(|(key, _)| key.as_str());
+            append_canonical_bytes(&mut out, b"network_middlewares");
+            out.extend_from_slice(&canonical_size(middleware_entries.len()));
+            for (key, middleware) in middleware_entries {
+                append_canonical_bytes(&mut out, key.as_bytes());
+                append_canonical_bytes(&mut out, &canonical_middleware_bytes(middleware));
+            }
+            out
+        }
+
+        let yaml_policy = ProtoSandboxPolicy {
+            network_policies: HashMap::from([
+                ("alpha".into(), provider_rule("alpha.example.test")),
+                ("beta".into(), provider_rule("beta.example.test")),
+            ]),
+            network_middlewares: HashMap::from([(
+                "audit".into(),
+                NetworkMiddlewareConfig {
+                    name: "audit".into(),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(
+            canonical_policy_bytes(&yaml_policy),
+            legacy_canonical_policy_bytes(&yaml_policy)
+        );
+        assert_eq!(
+            canonical_policy_bytes(&ProtoSandboxPolicy::default()),
+            legacy_canonical_policy_bytes(&ProtoSandboxPolicy::default())
+        );
+    }
+}
+
+#[cfg(test)]
 mod token_grant_owner_tests {
     use super::*;
-    use crate::proto::{NetworkBinary, NetworkEndpoint};
+    use crate::proto::NetworkBinary;
 
     fn profile_rule() -> NetworkPolicyRule {
         NetworkPolicyRule {

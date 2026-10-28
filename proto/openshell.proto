@@ -920,6 +920,12 @@ message HealthResponse {
 
   // Service version.
   string version = 2;
+
+  // Whether this gateway was built with Cedar policy support. Clients must
+  // check this before sending Cedar policies: gateways built without it
+  // reject them, and older gateways silently discard Cedar fields and would
+  // interpret them as empty YAML.
+  bool supports_cedar_policy = 3;
 }
 
 // Current-user request. The identity comes from the authenticated request.
@@ -1538,6 +1544,17 @@ message SandboxResponse {
   // Service URLs created by CreateSandbox, keyed by service name. The empty
   // key identifies the unnamed service. Other sandbox RPCs return an empty map.
   map<string, string> service_urls = 2;
+  // Load-time warnings for the policy CreateSandbox accepted. Other sandbox
+  // RPCs return none.
+  repeated PolicyWarning policy_warnings = 3;
+}
+
+// A policy shape the gateway accepted that is likely not what the author
+// meant, such as an audit-only path beside enforced rules for the same
+// endpoint. Warnings never change enforcement.
+message PolicyWarning {
+  // One-line description for display.
+  string message = 1;
 }
 
 // List sandboxes response.
@@ -2859,8 +2876,8 @@ message UpdateConfigRequest {
   // The new policy to apply.
   //
   // Sandbox scope (`global=false`):
-  // - only network_policies may differ from create-time
-  //   policy; static fields must match version 1.
+  // - only network_policies and cedar_policy_source may differ from
+  //   create-time policy; static fields must match version 1.
   //
   // Global scope (`global=true`):
   // - applies to all sandboxes in full (no merge).
@@ -2968,6 +2985,9 @@ message UpdateConfigResponse {
   bool deleted = 4;
   // Sandbox metadata annotations after the update. Empty for global updates.
   map<string, string> annotations = 5;
+  // Load-time warnings for the submitted sandbox policy. Empty for global
+  // and settings updates.
+  repeated PolicyWarning policy_warnings = 6;
 }
 
 // Get sandbox policy status request.
@@ -3192,6 +3212,11 @@ message SupervisorHello {
   // ConfigUpdate payloads, and answers each with its result and admission.
   // Gateways push configuration only to supervisors that set this.
   bool supports_config_push = 7;
+  // The supervisor can enforce Cedar policies, as
+  // GetSandboxConfigRequest.supports_cedar_policy reports when polling.
+  // Gateways never push a Cedar configuration to a supervisor that does not
+  // set this; it receives a configuration that is not admitted instead.
+  bool supports_cedar_policy = 8;
 }
 
 // Gateway accepts the supervisor session.

@@ -233,6 +233,14 @@ pub fn host_matches(pattern: &str, host: &str) -> Result<bool, String> {
 
 /// Conservatively determine whether two DNS host patterns can match the same
 /// concrete host.
+///
+/// Compares the patterns label by label and treats any two globs in one
+/// label as overlapping, so it may report an overlap that no host has, such
+/// as between `a*.example.com` and `b*.example.com`. Cedar policy analysis
+/// (`openshell-policy-cedar`) decides its load-time ambiguity checks with its
+/// own exact, work-bounded overlap instead, since overreporting there would
+/// reject valid policies; its tests check that this function reports every
+/// overlap that one finds among the host shapes Cedar emits.
 pub fn host_patterns_overlap(left: &str, right: &str) -> Result<bool, String> {
     let left = HostPattern::new(left)?;
     let right = HostPattern::new(right)?;

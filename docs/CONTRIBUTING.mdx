@@ -86,6 +86,7 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing"
 - `keywords` is a comma-separated string for page metadata.
 - `position` controls ordering for pages discovered through a `folder:` entry.
 - `slug` optionally overrides the page URL with a full path from the docs root.
+- `development-only: true` publishes the page only in the `dev` docs version. Use it for features that stable and prerelease builds exclude, and do not link to the page or describe the feature from other pages. Refer to `fern/README.md`.
 
 For explicit entries in `docs/index.yml`, keep `page:`. Fern still requires it. If the page defines `sidebar-title`, set `page:` to that value. Otherwise set `page:` to the frontmatter `title`.
 

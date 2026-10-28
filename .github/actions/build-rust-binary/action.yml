@@ -29,6 +29,14 @@ inputs:
     description: Additional flags passed to cargo build
     required: false
     default: ""
+  forbidden-crates:
+    description: Space-separated crate names that must not appear in the binary's embedded cargo-auditable dependency list
+    required: false
+    default: ""
+  required-crates:
+    description: Space-separated crate names that must appear in the binary's embedded cargo-auditable dependency list
+    required: false
+    default: ""
   entitlements-file:
     description: Path to an entitlements plist for macOS ad-hoc codesigning (skipped when empty or not on macOS)
     required: false
@@ -65,12 +73,41 @@ runs:
       env:
         INPUTS_BINARY: ${{ inputs.binary }}
         INPUTS_TRIPLE: ${{ inputs.triple }}
+        INPUTS_FORBIDDEN_CRATES: ${{ inputs.forbidden-crates }}
+        INPUTS_REQUIRED_CRATES: ${{ inputs.required-crates }}
       run: |
         binary="target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY}"
         # Confirm the binary runs and reports the expected name.
         "$binary" --version | grep -q "^${INPUTS_BINARY} "
         # Confirm Syft can decode the embedded cargo-auditable metadata.
-        SYFT_CHECK_FOR_APP_UPDATE=false syft "file:${binary}" -o cyclonedx-json | grep 'pkg:cargo/' > /dev/null
+        sbom="$(SYFT_CHECK_FOR_APP_UPDATE=false syft "file:${binary}" -o cyclonedx-json)"
+        grep -q 'pkg:cargo/' <<< "$sbom"
+        # Reject crates this build must not link, such as the Cedar policy
+        # engine in stable release binaries.
+        read -ra forbidden_crates <<< "${INPUTS_FORBIDDEN_CRATES}"
+        found=()
+        for crate in "${forbidden_crates[@]}"; do
+          if grep -Fq "\"pkg:cargo/${crate}@" <<< "$sbom"; then
+            found+=("$crate")
+          fi
+        done
+        if [ "${#found[@]}" -gt 0 ]; then
+          echo "::error::${INPUTS_BINARY} (${INPUTS_TRIPLE}) embeds forbidden crates: ${found[*]}" >&2
+          exit 1
+        fi
+        # Require crates this build must link, such as the Cedar policy engine
+        # in Cedar-enabled builds, so the check above cannot pass vacuously.
+        read -ra required_crates <<< "${INPUTS_REQUIRED_CRATES}"
+        missing=()
+        for crate in "${required_crates[@]}"; do
+          if ! grep -Fq "\"pkg:cargo/${crate}@" <<< "$sbom"; then
+            missing+=("$crate")
+          fi
+        done
+        if [ "${#missing[@]}" -gt 0 ]; then
+          echo "::error::${INPUTS_BINARY} (${INPUTS_TRIPLE}) lacks required crates: ${missing[*]}" >&2
+          exit 1
+        fi
 
     - name: Codesign with entitlements
       if: inputs.entitlements-file != '' && runner.os == 'macOS'

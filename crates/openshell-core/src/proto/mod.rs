@@ -94,6 +94,15 @@ pub use openshell::*;
 pub use sandbox::v1::*;
 pub use test::ObjectForTest;
 
+impl SandboxPolicy {
+    /// Returns whether this policy is authored in Cedar: a non-empty
+    /// `cedar_policy_source` selects the Cedar engine instead of OPA.
+    #[must_use]
+    pub fn is_cedar(&self) -> bool {
+        !self.cedar_policy_source.is_empty()
+    }
+}
+
 /// Build a selector for one explicitly named workspace.
 pub fn workspace_selector(workspace: impl Into<String>) -> WorkspaceSelector {
     WorkspaceSelector {

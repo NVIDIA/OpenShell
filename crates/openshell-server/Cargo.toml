@@ -126,6 +126,9 @@ default = ["telemetry"]
 telemetry = ["openshell-core/telemetry"]
 vendored-z3 = ["openshell-prover/vendored-z3"]
 prebuilt-z3 = ["openshell-prover/prebuilt-z3"]
+## Validate and serve Cedar-authored sandbox policies, and advertise Cedar
+## support to clients. Without it, the gateway rejects Cedar policies.
+cedar = ["openshell-policy/cedar"]
 test-support = []
 
 [build-dependencies]

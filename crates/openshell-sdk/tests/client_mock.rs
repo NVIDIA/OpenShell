@@ -49,6 +49,7 @@ struct MockState {
     last_get_name: Mutex<Option<String>>,
     last_get_workspace: Mutex<Option<String>>,
     last_create: Mutex<Option<proto::CreateSandboxRequest>>,
+    supports_cedar_policy: bool,
     last_template_create: Mutex<Option<proto::CreateSandboxTemplateRequest>>,
     last_template_get: Mutex<Option<proto::GetSandboxTemplateRequest>>,
     last_template_list: Mutex<Option<proto::ListSandboxTemplatesRequest>>,
@@ -314,6 +315,7 @@ impl OpenShell for TestOpenShell {
             }
         }
         Ok(Response::new(proto::HealthResponse {
+            supports_cedar_policy: self.state.supports_cedar_policy,
             status: proto::ServiceStatus::Healthy.into(),
             version: "test-1.2.3".to_string(),
         }))
@@ -364,6 +366,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox_with_phase(&name, proto::SandboxPhase::Provisioning)),
             service_urls,
+            ..Default::default()
         }))
     }
 
@@ -434,6 +437,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
+            ..Default::default()
         }))
     }
 
@@ -451,6 +455,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
+            ..Default::default()
         }))
     }
 
@@ -468,6 +473,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
+            policy_warnings: Vec::new(),
         }))
     }
 
@@ -485,6 +491,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
+            policy_warnings: Vec::new(),
         }))
     }
 
@@ -526,6 +533,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
+            ..Default::default()
         }))
     }
 
@@ -2503,5 +2511,37 @@ async fn watch_logs_addresses_the_sandbox_by_canonical_name() {
             selected_workspace(&reqs[0].workspace_scope),
             Some(workspace)
         );
+    }
+}
+
+#[tokio::test]
+async fn cedar_template_create_checks_gateway_before_mutation() {
+    for supported in [false, true] {
+        let state = Arc::new(MockState {
+            supports_cedar_policy: supported,
+            ..Default::default()
+        });
+        let endpoint = start_mock(state.clone()).await;
+        let client = OpenShellClient::connect(ClientConfig::new(&endpoint))
+            .await
+            .unwrap();
+        let spec = || SandboxTemplateCreateSpec {
+            template_name: "python".to_string(),
+            policy: Some(proto::SandboxPolicy {
+                cedar_policy_source: "permit(principal, action, resource);".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let result = client.create_sandbox_from_template(spec()).await;
+        assert_eq!(result.is_ok(), supported);
+        assert_eq!(state.last_create.lock().await.is_some(), supported);
+        *state.last_create.lock().await = None;
+        let result = client
+            .workspace("staging")
+            .create_sandbox_from_template(spec())
+            .await;
+        assert_eq!(result.is_ok(), supported);
+        assert_eq!(state.last_create.lock().await.is_some(), supported);
     }
 }
