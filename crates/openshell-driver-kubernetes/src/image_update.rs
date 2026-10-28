@@ -21,6 +21,8 @@ use std::sync::LazyLock;
 // Deliberately separate from the runtime bootstrap operation annotations. Those
 // annotations drive reconciliation and only describe create/start/stop.
 const IMAGE_UPDATE_ANNOTATION: &str = "openshell.ai/sandbox-image-update";
+// Kubernetes limits the sum of all annotation keys and values, in bytes.
+const MAX_ANNOTATION_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct ImageUpdateRecord {
@@ -162,6 +164,21 @@ impl KubernetesComputeDriver {
         let repeat = prepare_update(&mut candidate, request, configuration)?;
         if let Some(configuration) = configuration {
             prepare_configuration(&mut candidate, configuration, repeat)?;
+        }
+        // Check the encoded candidate before preflight succeeds and the gateway
+        // durably accepts an intent. Raw argv limits do not account for JSON
+        // escaping, operation evidence, or existing annotations.
+        let annotation_bytes: usize = candidate
+            .metadata
+            .annotations
+            .iter()
+            .flat_map(|annotations| annotations.iter())
+            .map(|(key, value)| key.len() + value.len())
+            .sum();
+        if annotation_bytes > MAX_ANNOTATION_BYTES {
+            return Err(KubernetesDriverError::InvalidArgument(format!(
+                "sandbox update exceeds Kubernetes annotation size limit ({annotation_bytes} > {MAX_ANNOTATION_BYTES} bytes)"
+            )));
         }
         // Revalidate the saved provenance and attachment UIDs against current
         // operator policy, even for retries. Do not manufacture new provenance

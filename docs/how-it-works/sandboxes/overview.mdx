@@ -1034,7 +1034,10 @@ volume claim. It does not delete and recreate the sandbox, reseed its existing
 workspace from the new image, or change the trusted supervisor and sandbox
 runtime images. Omitted fields retain their current values. A supplied command
 replaces the argv list without shell expansion; an empty list restores the default
-login shell resolved from the workload image. A supplied environment map replaces
+login shell resolved from the workload image. The Kubernetes driver rejects an
+update before acceptance if the encoded command and other custom-resource
+annotations exceed Kubernetes' combined 256 KiB annotation limit.
+A supplied environment map replaces
 sandbox-level overrides; clearing it restores any template-provided defaults.
 Labels and annotations replace user metadata on the gateway resource, preserve
 system-owned keys, and do not set Kubernetes pod metadata. Attempts to supply

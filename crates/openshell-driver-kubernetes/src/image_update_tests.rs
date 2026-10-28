@@ -790,6 +790,78 @@ async fn configuration_update_atomically_changes_restart_inputs_and_retries_with
 }
 
 #[tokio::test]
+async fn configuration_update_rejects_oversized_encoded_annotations_without_writes() {
+    use openshell_core::proto::compute::v1::{
+        SandboxMainProcessUpdate, UpdateSandboxConfigurationRequest,
+    };
+    // Both commands fit the gateway's count, per-argument, and total byte
+    // limits. The second exceeds the annotation budget only after JSON escaping.
+    let mut full_command = vec!["/bin/echo".to_string()];
+    full_command.extend((0..7).map(|_| "a".repeat(32 * 1024)));
+    full_command.push("a".repeat(32 * 1024 - "/bin/echo".len()));
+    let mut escaped_command = vec!["/bin/echo".to_string()];
+    escaped_command.extend((0..8).map(|_| "\"".repeat(16 * 1024)));
+    for version in [SANDBOX_VERSION_V1ALPHA1, SANDBOX_VERSION_V1BETA1] {
+        for command in [&full_command, &escaped_command] {
+            let (driver, state) = fixture(version, false);
+            state.lock().unwrap().sandbox["metadata"]["annotations"]
+                [ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC] = serde_json::json!(
+                openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(None).unwrap()
+            );
+            let before = state.lock().unwrap().sandbox.clone();
+            let mut update = UpdateSandboxConfigurationRequest {
+                preconditions: Some(request()),
+                main_process: Some(SandboxMainProcessUpdate {
+                    command: command.clone(),
+                    tty: false,
+                }),
+                environment: None,
+            };
+            for validate_only in [true, false] {
+                update.preconditions.as_mut().unwrap().validate_only = validate_only;
+                let error = driver
+                    .update_sandbox_configuration(&update)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, KubernetesDriverError::InvalidArgument(_)));
+                assert!(error.to_string().contains("annotation size limit"));
+                let state = state.lock().unwrap();
+                assert_eq!(state.sandbox, before);
+                assert!(state.patches.is_empty());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn image_update_annotation_budget_includes_existing_keys_and_values() {
+    for version in [SANDBOX_VERSION_V1ALPHA1, SANDBOX_VERSION_V1BETA1] {
+        let (driver, state) = fixture(version, false);
+        let mut request = request();
+        request.validate_only = true;
+        let mut candidate: DynamicObject =
+            serde_json::from_value(state.lock().unwrap().sandbox.clone()).unwrap();
+        prepare_update(&mut candidate, &request, None).unwrap();
+        let existing_bytes: usize = candidate
+            .metadata
+            .annotations
+            .unwrap()
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum();
+        let key = "operator.example/padding";
+        let padding = "a".repeat(MAX_ANNOTATION_BYTES - existing_bytes - key.len());
+        state.lock().unwrap().sandbox["metadata"]["annotations"][key] = serde_json::json!(padding);
+        driver.update_sandbox_image(&request).await.unwrap();
+        state.lock().unwrap().sandbox["metadata"]["annotations"][key] =
+            serde_json::json!(format!("{padding}a"));
+        let error = driver.update_sandbox_image(&request).await.unwrap_err();
+        assert!(matches!(error, KubernetesDriverError::InvalidArgument(_)));
+        assert!(state.lock().unwrap().patches.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn configuration_update_rejects_reserved_environment_without_writes() {
     use openshell_core::proto::compute::v1::{
         SandboxEnvironmentUpdate, UpdateSandboxConfigurationRequest,
