@@ -531,7 +531,7 @@ mod tests {
             "TLS certificate config reloaded successfully"
         );
         assert_eq!(event["metadata"]["product"]["name"], "OpenShell Gateway");
-        assert!(event.get("container").is_none());
+        assert!(event["device"].get("container").is_none());
     }
 
     #[test]

@@ -234,7 +234,7 @@ mod tests {
             json["metadata"]["profiles"],
             serde_json::json!(["security_control", "host"])
         );
-        assert!(json.get("container").is_none());
+        assert!(json["device"].get("container").is_none());
         assert!(json["metadata"].get("correlation_uid").is_none());
     }
 

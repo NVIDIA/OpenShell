@@ -63,10 +63,6 @@ pub struct BaseEventData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<Device>,
 
-    /// Container info (Container profile).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub container: Option<Container>,
-
     /// AI model info (`ai_operation` profile, OCSF v1.8.0+).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ai_model: Option<AiModel>,
@@ -113,9 +109,6 @@ impl Serialize for BaseEventData {
         if let Some(ref device) = self.device {
             map.serialize_entry("device", device)?;
         }
-        if let Some(ref container) = self.container {
-            map.serialize_entry("container", container)?;
-        }
         if let Some(ref ai_model) = self.ai_model {
             map.serialize_entry("ai_model", ai_model)?;
         }
@@ -160,7 +153,6 @@ impl BaseEventData {
             status_detail: None,
             metadata,
             device: None,
-            container: None,
             ai_model: None,
             unmapped: None,
         }
@@ -191,9 +183,10 @@ impl BaseEventData {
         self.device = Some(device);
     }
 
-    /// Set container info.
-    pub fn set_container(&mut self, container: Container) {
-        self.container = Some(container);
+    /// The sandbox the event concerns, carried by `device.container`.
+    #[must_use]
+    pub fn container(&self) -> Option<&Container> {
+        self.device.as_ref()?.container.as_ref()
     }
 
     /// Set AI model info (`ai_operation` profile).

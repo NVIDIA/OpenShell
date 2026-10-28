@@ -106,27 +106,14 @@ fn validate(value: &Value, schema: &Value, check_required: bool) {
     } else {
         schema["name"].as_str().unwrap_or("object")
     };
-    validate_attributes(
-        value,
-        schema,
-        declared.as_deref(),
-        root,
-        is_event,
-        check_required,
-    );
+    validate_attributes(value, schema, declared.as_deref(), root, check_required);
 }
-
-/// Top-level attributes `OpenShell` emits that no OCSF version defines, pending a
-/// design decision. Remove an entry once the emitters stop producing it.
-/// - `container`: identifies the affected sandbox (NVIDIA/OpenShell#4915).
-const KNOWN_UNDEFINED_EVENT_ATTRIBUTES: &[&str] = &["container"];
 
 fn validate_attributes(
     value: &Value,
     schema: &Value,
     declared: Option<&[&str]>,
     path: &str,
-    event_root: bool,
     check_required: bool,
 ) {
     let attrs = attribute_map(schema);
@@ -150,9 +137,6 @@ fn validate_attributes(
     }
 
     for name in obj.keys() {
-        if event_root && KNOWN_UNDEFINED_EVENT_ATTRIBUTES.contains(&name.as_str()) {
-            continue;
-        }
         let Some(def) = attrs.get(name) else {
             panic!("Undefined attribute '{path}.{name}'");
         };
@@ -192,24 +176,12 @@ fn validate_attributes(
         match child {
             Value::Array(items) => {
                 for item in items {
-                    validate_attributes(
-                        item,
-                        &child_schema,
-                        declared,
-                        &child_path,
-                        false,
-                        check_required,
-                    );
+                    validate_attributes(item, &child_schema, declared, &child_path, check_required);
                 }
             }
-            other => validate_attributes(
-                other,
-                &child_schema,
-                declared,
-                &child_path,
-                false,
-                check_required,
-            ),
+            other => {
+                validate_attributes(other, &child_schema, declared, &child_path, check_required);
+            }
         }
     }
 }
@@ -320,6 +292,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_top_level_container() {
+        let schema = load_class_schema("base_event");
+        let mut event = minimal_base_event();
+        event["container"] = serde_json::json!({"name": "sandbox"});
+        let message = panic_message(std::panic::catch_unwind(|| {
+            validate_known_fields(&event, &schema);
+        }));
+        assert!(message.contains("event.container"), "{message}");
+    }
+
+    #[test]
     fn object_schemas_are_validated_as_objects_not_events() {
         let device = load_object_schema("device");
         // An object carries no `metadata.profiles`, so profile membership is
@@ -330,8 +313,7 @@ mod tests {
         });
         validate_required_fields(&value, &device);
 
-        // The top-level `container` exemption applies to events only, so an
-        // object whose schema does not define `container` rejects it.
+        // An object whose schema does not define `container` rejects it.
         let user = load_object_schema("user");
         let value = serde_json::json!({"name": "u", "container": {"name": "sandbox"}});
         let message = panic_message(std::panic::catch_unwind(|| {

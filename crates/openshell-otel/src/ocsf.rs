@@ -402,8 +402,7 @@ fn log_record(
         record.add_attribute("ocsf.metadata.uid", uid.clone());
     }
     if let Some(sandbox_id) = base
-        .container
-        .as_ref()
+        .container()
         .and_then(|container| container.uid.clone())
         .filter(|id| !id.is_empty())
     {
@@ -506,7 +505,7 @@ mod tests {
         let event = event("sandbox-1", SeverityId::Informational);
         let body = body(&record(&event, Some(OcsfSchemaVersion::V1_3)));
         assert_eq!(body["metadata"]["version"], "1.3");
-        assert!(body.get("container").is_none());
+        assert!(body["device"].get("container").is_none());
     }
 
     #[test]

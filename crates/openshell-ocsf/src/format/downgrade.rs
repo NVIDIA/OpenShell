@@ -42,7 +42,7 @@ impl std::str::FromStr for OcsfSchemaVersion {
 }
 
 /// Fields to strip when downgrading to v1.3.0 or earlier.
-const STRIP_FOR_V1_3: &[&str] = &["ai_model", "container", "observation_point_id"];
+const STRIP_FOR_V1_3: &[&str] = &["ai_model", "observation_point_id"];
 
 /// Profile names to remove from `metadata.profiles` when downgrading to v1.3.0 or earlier.
 const STRIP_PROFILES_V1_3: &[&str] = &["ai_operation", "container"];
@@ -74,6 +74,13 @@ pub fn downgrade_event(event: &mut Value, target_version: &str) -> bool {
             if obj.remove(*field).is_some() {
                 modified = true;
             }
+        }
+        if obj
+            .get_mut("device")
+            .and_then(Value::as_object_mut)
+            .is_some_and(|device| device.remove("container").is_some())
+        {
+            modified = true;
         }
 
         if let Some(profiles) = obj
@@ -148,8 +155,7 @@ mod tests {
                 "version": crate::OCSF_VERSION,
                 "profiles": ["security_control", "network_proxy", "container", "host"]
             },
-            "device": {"hostname": "sandbox-1"},
-            "container": {"name": "test-sandbox"},
+            "device": {"hostname": "sandbox-1", "container": {"name": "test-sandbox"}},
             "observation_point_id": 2,
             "unmapped": {"key": "value"}
         })
@@ -161,9 +167,9 @@ mod tests {
         let modified = downgrade_event(&mut event, "1.3.0");
 
         assert!(modified);
-        assert!(event.get("container").is_none());
+        assert!(event["device"].get("container").is_none());
         assert!(event.get("observation_point_id").is_none());
-        assert!(event.get("device").is_some());
+        assert_eq!(event["device"]["hostname"], "sandbox-1");
         assert!(event.get("unmapped").is_some());
     }
 
@@ -173,7 +179,7 @@ mod tests {
         let modified = downgrade_event(&mut event, "1.1.0");
 
         assert!(modified);
-        assert!(event.get("container").is_none());
+        assert!(event["device"].get("container").is_none());
         assert!(event.get("observation_point_id").is_none());
     }
 
@@ -249,7 +255,7 @@ mod tests {
                 "version": crate::OCSF_VERSION,
                 "profiles": ["container"]
             },
-            "container": {"name": "sandbox-1"}
+            "device": {"container": {"name": "sandbox-1"}}
         });
         let modified = downgrade_event(&mut event, "1.1.0");
 

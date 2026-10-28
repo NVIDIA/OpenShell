@@ -214,7 +214,7 @@ mod tests {
             );
             assert_eq!(json["metadata"]["profiles"], profiles, "{sandbox_id:?}");
             assert_eq!(
-                json.get("container").is_some(),
+                json["device"].get("container").is_some(),
                 !sandbox_id.is_empty(),
                 "{sandbox_id:?}"
             );

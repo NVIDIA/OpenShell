@@ -21402,8 +21402,7 @@ mod tests {
         assert_eq!(events.len(), 2);
         for event in &events {
             assert_eq!(event["metadata"]["product"]["name"], "OpenShell Gateway");
-            assert_eq!(event["container"]["uid"], "sb-123");
-            assert!(event["container"].get("image").is_none());
+            assert_eq!(event["device"]["container"]["uid"], "sb-123");
         }
         assert_eq!(events[0]["unmapped"]["policy_hash"], "sha256:manual");
         assert!(events[0]["unmapped"].get("auto").is_none());
@@ -21514,7 +21513,7 @@ mod tests {
         let rejected = rejected_events(&events);
         assert_eq!(rejected.len(), 1, "events: {events:?}");
         let event = rejected[0];
-        assert_eq!(event["container"]["uid"], "sb-reject-audit");
+        assert_eq!(event["device"]["container"]["uid"], "sb-reject-audit");
         assert_eq!(event["unmapped"]["chunk_id"], chunk_id);
         assert_eq!(
             event["unmapped"]["rejection_reason"],

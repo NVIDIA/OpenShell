@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(json["dst_endpoint"]["domain"], "api.example.com");
         assert_eq!(json["actor"]["process"]["name"], "python3");
         assert_eq!(json["firewall_rule"]["name"], "default-egress");
-        assert_eq!(json["container"]["name"], "my-sandbox");
+        assert_eq!(json["device"]["container"]["name"], "my-sandbox");
         assert_eq!(json["device"]["hostname"], "sandbox-abc123");
         assert_eq!(json["is_src_dst_assignment_known"], true);
     }
