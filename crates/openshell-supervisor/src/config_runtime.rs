@@ -738,7 +738,7 @@ impl ConfigRuntime {
         );
         let provider = match client
             .fetch_provider_environment(
-                &ctx.endpoint,
+                &ctx.gateway,
                 &ctx.sandbox_id,
                 ctx.provider_credentials.requires_stable_placeholders(),
             )
@@ -1159,7 +1159,7 @@ impl ConfigRuntime {
 
 pub async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     let client = openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
-        &ctx.endpoint,
+        &ctx.gateway,
         ctx.extension_credentials.clone(),
     )
     .await?;
@@ -1198,7 +1198,7 @@ async fn report_runtime_configuration(
         );
     }
     openshell_core::grpc_client::report_sandbox_configuration(
-        &ctx.endpoint,
+        &ctx.gateway,
         &ctx.sandbox_id,
         instance_id,
         Some(snapshot),
@@ -1618,6 +1618,7 @@ mod tests {
     use super::*;
     use crate::tests::{
         proto_policy_fixture, proto_tcp_policy_fixture, settings_poll_result, startup_provider,
+        test_gateway,
     };
     use crate::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1779,7 +1780,7 @@ mod tests {
 
         async fn fetch_provider_environment(
             &self,
-            _endpoint: &str,
+            _gateway: &openshell_core::grpc_client::GatewayEndpoint,
             _sandbox_id: &str,
             _requires_stable_placeholders: bool,
         ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
@@ -1826,12 +1827,12 @@ mod tests {
 
         async fn fetch_provider_environment(
             &self,
-            endpoint: &str,
+            gateway: &openshell_core::grpc_client::GatewayEndpoint,
             sandbox_id: &str,
             requires_stable_placeholders: bool,
         ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
             self.inner
-                .fetch_provider_environment(endpoint, sandbox_id, requires_stable_placeholders)
+                .fetch_provider_environment(gateway, sandbox_id, requires_stable_placeholders)
                 .await
         }
 
@@ -2074,7 +2075,7 @@ mod tests {
 
         async fn fetch_provider_environment(
             &self,
-            _endpoint: &str,
+            _gateway: &openshell_core::grpc_client::GatewayEndpoint,
             sandbox_id: &str,
             requires_stable_placeholders: bool,
         ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
@@ -2212,12 +2213,12 @@ mod tests {
 
         async fn fetch_provider_environment(
             &self,
-            endpoint: &str,
+            gateway: &openshell_core::grpc_client::GatewayEndpoint,
             sandbox_id: &str,
             requires_stable_placeholders: bool,
         ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
             self.inner
-                .fetch_provider_environment(endpoint, sandbox_id, requires_stable_placeholders)
+                .fetch_provider_environment(gateway, sandbox_id, requires_stable_placeholders)
                 .await
         }
 
@@ -2709,7 +2710,7 @@ mod tests {
             );
         }
         PolicyPollLoopContext {
-            endpoint: String::new(),
+            gateway: test_gateway(),
             sandbox_id: "sandbox-test".to_string(),
             sandbox: "sandbox-test-name".to_string(),
             opa_engine,

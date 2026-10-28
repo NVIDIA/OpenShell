@@ -21,7 +21,7 @@ use openshell_ocsf::{
 
 use crate::process::{ProcessHandle, ProcessStatus, ResolvedWorkspace};
 
-fn ocsf_ctx() -> &'static openshell_ocsf::EventContext {
+fn ocsf_ctx() -> openshell_ocsf::ContextRef<'static> {
     openshell_ocsf::ctx::ctx()
 }
 
@@ -86,6 +86,9 @@ pub async fn spawn_workload(
             launcher.clone(),
         ));
 
+    // The delegated workload runs behind OpenShell's mediated network path,
+    // so the generated trust files remain authoritative for its TLS settings.
+    let tls_environment_mode = crate::child_env::TlsEnvironmentMode::Override;
     #[cfg(target_os = "linux")]
     let mut handle = ProcessHandle::spawn(
         launcher,
@@ -95,6 +98,7 @@ pub async fn spawn_workload(
         interactive,
         policy,
         ca_file_paths.as_ref(),
+        tls_environment_mode,
         &provider_env,
     )
     .wrap_err("spawn delegated workload process")?;
@@ -106,6 +110,7 @@ pub async fn spawn_workload(
         interactive,
         policy,
         ca_file_paths.as_ref(),
+        tls_environment_mode,
         &provider_env,
     )?;
 
@@ -219,6 +224,12 @@ pub struct AgentSignaler {
 
 #[cfg(unix)]
 impl AgentSignaler {
+    /// Process ID of the agent's process group leader.
+    #[cfg(test)]
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
     fn deliver(&self, signal: nix::sys::signal::Signal) -> Result<()> {
         let _guard = self
             .signal_lock

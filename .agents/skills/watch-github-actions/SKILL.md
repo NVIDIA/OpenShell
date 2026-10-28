@@ -125,8 +125,11 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
-`Release Tag` temporarily omits Codex Security from its `Security Scan` job.
-Other scanners and qualification gates still run. Use the standalone
+For tmachine Kubernetes conformance failures, inspect the `tmachine-diagnostics-*` artifact. The K3s report includes Agent Sandbox controller state, leader leases, events, and current and previous controller logs. The conformance playbook checks reconciliation after guest boot with a temporary scheduling-gated Sandbox probe before running tests. Distinguish a failed controller probe from a failed conformance scenario; gateway connectivity and controller Deployment availability do not prove reconciliation works.
+
+`Pre-release` temporarily omits Codex Security from its `Security Scan` job.
+`Release` uses the passing prerelease qualification result. Other scanners and
+qualification gates still run. Use the standalone
 `Codex Security Release Qualification` workflow for manual investigation.
 
 For `Codex Security`, an exit code of 2 with partial coverage is an incomplete
@@ -166,16 +169,46 @@ the shared `check-protobuf-compatibility` action with `nix run .#check-protobuf-
 During `0.x`, a minor train permits compatibility findings
 as warnings; a patch train or no active train rejects them. Compare the current
 train's version with the latest stable release; commit messages are irrelevant.
+For the patch-train `v0.1.6-pre.N` exception, inspect the run summary and the
+qualification JSON's `exceptions` array; see `release-captain` for disposition.
 Compilation, baseline, and tool errors remain fatal. The `protobuf_compatibility` suite participates in
-the `release-tag-v1` qualification profile. Release and Pre-release call the reusable
-`release-qualification.yml` workflow to run the checks and collect their results.
-Release builds, qualifies, then publishes. Pre-release builds, then publishes
-and qualifies in parallel in the same run. Failed, cancelled, or skipped required suites fail
+the `release-tag-v1` qualification profile. Pre-release calls the reusable
+`release-qualification.yml` workflow after building, in parallel with publication. Release
+selects the latest passing prerelease for the requested version and branch,
+verifies its qualification evidence, creates the stable tag at its exact commit,
+then rebuilds and publishes without rerunning qualification. The promotion job
+summary and `stable-promotion-*` artifact record the candidate and evidence.
+Both workflows accept optional tags. Tagless Pre-release creates the next
+candidate in the selected branch's seeded series; inspect Resolve Prerelease Tag
+for the actual tag and commit. Tagless Release infers the highest reachable
+prerelease version and stops if it is already stable. Explicit tags select an
+existing candidate or stable version for retries. Release Auto-Tag and manual
+candidate creation share a concurrency group; pending tag-resolution jobs can
+be waiting for that lock.
+Failed, cancelled, or skipped required suites fail
 qualification; stable publication is blocked, while published pre-release
 artifacts remain available. The Pre-release failure notification includes the
 run link. Both callers share `release-build.yml` and `release-publish.yml`.
 Qualification evidence remains in Actions; publishing a copy to OCI storage is best effort.
 Snap Store uploads happen only for stable releases after qualification passes.
+
+For a release notes preview, dispatch `release.yml` with `notes-only=true` and
+`tag=<stable-tag>`. The generator resolves the previous reachable stable tag;
+only `release-notes.yml` exposes an optional `previous-stable-tag` override.
+This runs the same
+`release-notes.yml` generator as stable publication and retains the `release-notes`
+artifact. Promotion, tag creation, builds, qualification, and publication are
+skipped. Check the `Prepare release notes` step before diagnosing model or
+GitHub API failures; it requires `LLM_INFERENCE_API_KEY`, `ANTHROPIC_BASE_URL`, and
+`ANTHROPIC_MODEL` in the repository Actions settings.
+
+Pre-release also runs `release-notes.yml` after building, alongside publication
+and qualification, and keeps the notes only in the `release-notes` artifact.
+This job is advisory: a notes failure emits a warning without failing the
+prerelease run or blocking promotion. Stable publication reuses the promoted
+prerelease's `release-notes` artifact, retagged, and generates notes only when
+that preview is unavailable. The `Select Qualified Prerelease` summary says
+which happened.
 
 For `Codex Compatibility Review`, inspect its job summary and the
 `compatibility-review-run-<run-id>-attempt-<attempt>` artifact. Confirm the

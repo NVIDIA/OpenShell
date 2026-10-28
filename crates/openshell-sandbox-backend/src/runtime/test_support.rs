@@ -109,6 +109,19 @@ struct Peer {
     terminal: Option<Arc<dyn BoundaryTerminal>>,
     processes: Mutex<HashMap<String, Arc<dyn BoundaryProcess>>>,
     terminals: Mutex<HashMap<String, Arc<dyn BoundaryTerminal>>>,
+    suspend: Option<Suspension>,
+    main_released: std::sync::atomic::AtomicBool,
+    main_release: tokio::sync::Notify,
+}
+
+/// Optional suspend/resume behavior for an in-process test backend.
+#[derive(Clone)]
+pub struct Suspension {
+    /// Reference returned by every `SuspendBoundary` call and the only one
+    /// `ResumeBoundary` restores.
+    pub reference: Vec<u8>,
+    /// Counts `SuspendBoundary` calls.
+    pub calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 type Stream<F = p::ExchangeFrame> =
@@ -151,6 +164,25 @@ impl Peer {
             if matches!(request.request, Request::AcceptNetwork) {
                 drop(handler);
                 return std::future::pending().await;
+            }
+            // A suspendable peer keeps the main process running until the
+            // supervisor signals or terminates it.
+            if self.suspend.is_some() {
+                use std::sync::atomic::Ordering;
+                match &request.request {
+                    Request::Wait { .. } => loop {
+                        let released = self.main_release.notified();
+                        if self.main_released.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        released.await;
+                    },
+                    Request::Signal { .. } | Request::Terminate { .. } => {
+                        self.main_released.store(true, Ordering::SeqCst);
+                        self.main_release.notify_waiters();
+                    }
+                    _ => {}
+                }
             }
             let response = handler(request.request).unwrap_or_else(|e| Response::Error {
                 kind: match e.kind() {
@@ -656,14 +688,13 @@ impl super::BoundaryTransportConnector for Connector {
 fn client(peer: Peer) -> Arc<BoundaryClient> {
     let session_id = "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
     let material = w::generate_sandbox_tls_material(session_id).unwrap();
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let certs = rustls_pemfile::certs(&mut material.certificate_chain_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let key = rustls_pemfile::private_key(&mut material.private_key_pem.as_bytes())
         .unwrap()
         .unwrap();
-    let mut config = rustls::ServerConfig::builder()
+    let mut config = openshell_crypto::tls::server_builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .unwrap();
@@ -687,7 +718,7 @@ fn client(peer: Peer) -> Arc<BoundaryClient> {
         tonic::transport::Server::builder()
             .add_service(
                 crate::backend_proto::isolation_backend_server::IsolationBackendServer::new(
-                    Service(Arc::new(Peer::default())),
+                    Service(server_peer.clone()),
                 ),
             )
             .add_service(SandboxProtocolServer::new(Service(server_peer)))
@@ -723,12 +754,15 @@ fn client(peer: Peer) -> Arc<BoundaryClient> {
     .unwrap();
     let mut client =
         BoundaryClient::with_backend(descriptor, bearer, crate::BACKEND_NAME.into(), vec![]);
-    client.connector = Some(Arc::new(Connector {
+    client.transport = crate::BoundaryTransport::connector(Arc::new(Connector {
         peer,
         address,
         task,
     }));
     client.boundary_handle.set("test".into()).unwrap();
+    // Fixtures stand for an attached, confirmed boundary, whose mediation
+    // sources accept at once.
+    client.confirmed.send_replace(true);
     Arc::new(client)
 }
 pub fn process(process: Arc<dyn BoundaryProcess>) -> Arc<crate::BoundaryProcess> {
@@ -739,6 +773,7 @@ pub fn process(process: Arc<dyn BoundaryProcess>) -> Arc<crate::BoundaryProcess>
         }),
         process_id: "main".into(),
         exec: false,
+        adopted: false,
     })
 }
 pub fn terminal(terminal: Arc<dyn BoundaryTerminal>) -> Arc<crate::BoundaryTerminal> {
@@ -804,9 +839,15 @@ impl crate::backend_proto::isolation_backend_server::IsolationBackend for Servic
         tonic::Response<crate::backend_proto::DescribeIsolationBackendResponse>,
         tonic::Status,
     > {
+        let mut backend = crate::isolation_protocol::metadata("test-peer");
+        if self.0.suspend.is_some() {
+            backend
+                .supported_capabilities
+                .push(crate::isolation_protocol::SUSPEND_RESUME_CAPABILITY.into());
+        }
         Ok(tonic::Response::new(
             crate::backend_proto::DescribeIsolationBackendResponse {
-                backend: Some(crate::isolation_protocol::metadata("test-peer")),
+                backend: Some(backend),
             },
         ))
     }
@@ -825,13 +866,37 @@ impl crate::backend_proto::isolation_backend_server::IsolationBackend for Servic
         &self,
         _: tonic::Request<crate::backend_proto::SuspendBoundaryRequest>,
     ) -> Result<tonic::Response<crate::backend_proto::SuspendBoundaryResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("test peer"))
+        let Some(suspend) = &self.0.suspend else {
+            return Err(tonic::Status::unimplemented("test peer"));
+        };
+        suspend
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(tonic::Response::new(
+            crate::backend_proto::SuspendBoundaryResponse {
+                restore_reference: suspend.reference.clone(),
+            },
+        ))
     }
     async fn resume_boundary(
         &self,
-        _: tonic::Request<crate::backend_proto::ResumeBoundaryRequest>,
+        request: tonic::Request<crate::backend_proto::ResumeBoundaryRequest>,
     ) -> Result<tonic::Response<crate::backend_proto::OpenBoundaryResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("test peer"))
+        let Some(suspend) = &self.0.suspend else {
+            return Err(tonic::Status::unimplemented("test peer"));
+        };
+        if request.into_inner().restore_reference != suspend.reference {
+            return Err(tonic::Status::failed_precondition(
+                "unknown restore reference",
+            ));
+        }
+        Ok(tonic::Response::new(
+            crate::backend_proto::OpenBoundaryResponse {
+                boundary_id: "test".into(),
+                outcome: crate::backend_proto::open_boundary_response::LaunchOutcome::Restored
+                    as i32,
+            },
+        ))
     }
 }
 
@@ -846,8 +911,36 @@ pub fn backend(
     bearer: SessionBearerTokenSlot,
     handler: Handler,
 ) -> crate::OpenShellRuntimeBackend {
+    suspendable_backend(
+        name,
+        sandbox,
+        generation,
+        payload,
+        ca,
+        credentials,
+        bearer,
+        handler,
+        None,
+    )
+}
+
+/// Like [`backend`], optionally advertising suspend/resume. A suspendable
+/// peer never answers `Wait`, so the main process runs until suspension.
+#[allow(clippy::too_many_arguments)]
+pub fn suspendable_backend(
+    name: String,
+    sandbox: SandboxContext,
+    generation: String,
+    payload: Vec<u8>,
+    ca: Arc<Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>>,
+    credentials: ProviderCredentialState,
+    bearer: SessionBearerTokenSlot,
+    handler: Handler,
+    suspend: Option<Suspension>,
+) -> crate::OpenShellRuntimeBackend {
     let peer = client(Peer {
         handler: Mutex::new(Some(handler)),
+        suspend,
         ..Peer::default()
     });
     let mut descriptor = peer.runtime_descriptor.clone();
@@ -861,7 +954,7 @@ pub fn backend(
     )
     .unwrap();
     let mut backend = crate::OpenShellRuntimeBackend::new(ca, credentials, bearer);
-    backend.connector.clone_from(&peer.connector);
+    backend.transport.clone_from(&peer.transport);
     backend.delegated = Some(crate::runtime::DelegatedRuntime {
         backend_name: name,
         descriptor,

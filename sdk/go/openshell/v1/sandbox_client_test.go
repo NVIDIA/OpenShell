@@ -42,6 +42,7 @@ type mockSandboxServer struct {
 	detachErr            error
 	listProvErr          error
 	createRequest        *pb.CreateSandboxRequest
+	resumeRequest        *pb.ResumeSandboxRequest
 	watchEvents          []*pb.SandboxStreamEvent
 	watchErr             error
 	watchPostEventsErr   error
@@ -172,6 +173,31 @@ func (s *mockSandboxServer) StopSandbox(_ context.Context, req *pb.StopSandboxRe
 func (s *mockSandboxServer) StartSandbox(_ context.Context, req *pb.StartSandboxRequest) (*pb.SandboxResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	name := req.GetName()
+	sb, ok := s.sandboxes[name]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
+	}
+	sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_STARTING
+	return &pb.SandboxResponse{Sandbox: proto.Clone(sb).(*pb.Sandbox)}, nil
+}
+
+func (s *mockSandboxServer) SuspendSandbox(_ context.Context, req *pb.SuspendSandboxRequest) (*pb.SandboxResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	name := req.GetName()
+	sb, ok := s.sandboxes[name]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
+	}
+	sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_SUSPENDED
+	return &pb.SandboxResponse{Sandbox: proto.Clone(sb).(*pb.Sandbox)}, nil
+}
+
+func (s *mockSandboxServer) ResumeSandbox(_ context.Context, req *pb.ResumeSandboxRequest) (*pb.SandboxResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resumeRequest = req
 	name := req.GetName()
 	sb, ok := s.sandboxes[name]
 	if !ok {
@@ -665,6 +691,36 @@ func TestSandboxStopAndStart(t *testing.T) {
 	starting, err := client.Start(context.Background(), "team-a", "lifecycle")
 	require.NoError(t, err)
 	assert.Equal(t, SandboxStarting, starting.Status.Phase)
+}
+
+func TestSandboxSuspendAndResume(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.sandboxes["frozen"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Name: "frozen", Workspace: "team-a"},
+		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_READY},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	suspended, err := client.Suspend(context.Background(), "team-a", "frozen")
+	require.NoError(t, err)
+	assert.Equal(t, SandboxSuspended, suspended.Status.Phase)
+
+	waited, err := client.WaitSuspended(context.Background(), "team-a", "frozen")
+	require.NoError(t, err)
+	assert.Equal(t, SandboxSuspended, waited.Status.Phase)
+
+	_, err = client.WaitReady(context.Background(), "team-a", "frozen")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "suspended")
+
+	resumed, err := client.Resume(context.Background(), "team-a", "frozen", ResumeOptions{RestartIfRestoreFails: true})
+	require.NoError(t, err)
+	assert.Equal(t, SandboxStarting, resumed.Status.Phase)
+	mock.mu.Lock()
+	assert.True(t, mock.resumeRequest.GetRestartIfRestoreFails())
+	assert.Equal(t, "frozen", mock.resumeRequest.GetName())
+	mock.mu.Unlock()
 }
 
 // --- T030: AttachProvider, DetachProvider, ListProviders tests ---

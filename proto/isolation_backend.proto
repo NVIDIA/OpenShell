@@ -44,6 +44,11 @@ service IsolationBackend {
   // Reopening the same session and generation returns the same result. The
   // descriptor must bind to the same provisioned resource; a different resource
   // binding fails.
+  // A trusted driver may prepare retained state through its native backend
+  // integration. In that case OpenBoundary selects RESTORED, or
+  // COLD_START_FALLBACK only when the driver explicitly permitted it. The
+  // backend enforces this choice; reference handoff is private to the driver
+  // and backend and does not require supervisor bootstrap fields.
   // Driver deletion invalidates all handles and retained-state references,
   // including abandoned launches and suspended boundaries.
   rpc OpenBoundary(OpenBoundaryRequest) returns (OpenBoundaryResponse);
@@ -55,10 +60,14 @@ service IsolationBackend {
   // calls and streams are rejected and the old workload cannot make progress.
   rpc SuspendBoundary(SuspendBoundaryRequest) returns (SuspendBoundaryResponse);
 
-  // Restore a suspended boundary using the fresh launch in ResumeBoundaryRequest.
-  // Follow SandboxProtocol admission while keeping the restored workload frozen
-  // until StartAgent. A permitted cold start is reported. Unsupported optional
-  // suspend/resume RPCs return UNIMPLEMENTED without advancing lifecycle state.
+  // Prepare a suspended boundary using the fresh launch in ResumeBoundaryRequest.
+  // Validate the reference and reserve its binding without executing workload
+  // instructions. The backend may defer actual restoration until StartAgent,
+  // after Attach and Confirm have admitted the new generation's policy.
+  // Restore failures discovered then fail StartAgent; preparing a boundary does
+  // not guarantee that restoration will succeed. An eagerly restored workload
+  // must remain frozen until StartAgent. Unsupported optional suspend/resume
+  // RPCs return UNIMPLEMENTED without advancing lifecycle state.
   rpc ResumeBoundary(ResumeBoundaryRequest) returns (OpenBoundaryResponse);
 }
 
@@ -95,8 +104,12 @@ message OpenBoundaryResponse {
     LAUNCH_OUTCOME_COLD_START_FALLBACK = 3;
   }
 
-  // Required. Distinguishes restoration from cold-start fallback; admission
-  // follows SandboxProtocol for either outcome.
+  // Required. Selects the launch path; it is not proof of completed restoration.
+  // RESTORED may select a restore deferred until StartAgent. That call must
+  // either complete this path or fail. The selected path is immutable on replay;
+  // it must not silently change to a cold start if deferred restoration fails.
+  // COLD_START_FALLBACK may be selected only when explicitly permitted.
+  // Admission follows SandboxProtocol for every path.
   LaunchOutcome outcome = 2;
 }
 
@@ -127,5 +140,5 @@ message ResumeBoundaryRequest {
   // boot from the image and persistent volumes is permitted and reported as
   // LAUNCH_OUTCOME_COLD_START_FALLBACK. This never permits unauthorized or
   // superseded references to select a new launch.
-  bool allow_cold_start_fallback = 3;
+  bool restart_if_restore_fails = 3;
 }

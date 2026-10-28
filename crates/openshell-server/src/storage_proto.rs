@@ -156,10 +156,17 @@ mod tests {
     // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
     // closures and TokenGrantStatus to public reports. Older rows have no grant
     // record; absent report extensions retain compatibility without a rewrite.
+    // Supervisor middleware binding policy and selectors are public-only. An
+    // absent policy preserves dynamic discovery; older supervisors ignore both fields.
+    // Suspend/resume adds two public request messages without durable request
+    // admission, the restart_if_restore_fails resume option, and the SUSPENDING
+    // and SUSPENDED values to the shared
+    // SandboxPhase enum. Stored rows never carried those values, so prior
+    // payloads decode unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "a91e2244a2c1a8e369efe85bd0e4f2769f0f29f6263137280fe38e8a8da3cc6e";
+        "f24c9b77a85f59ae9ab60f783d45654d78bf566fcf260f9131f1aba39fa4b59b";
     const DURABLE_SCHEMA_SHA256: &str =
-        "d4dc7abdb91b919db1f7be0d4652e30cbfda86f3b2ed9b59d5de1f76a2bf691d";
+        "ffb20595e36032a9476d1c6956e2dcdc814f85286fc4735751e5ec6f499ea9ed";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "ac1ffc4b5b81467de27270a4e33f6db1e31eeb2c52f79750dbaaf19515eadbb2";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -535,6 +542,7 @@ mod tests {
         let mut compiled_method_count = 0;
         let mut isolation_methods = BTreeSet::new();
         let mut sandbox_protocol_methods = BTreeSet::new();
+        let mut supervisor_host_methods = BTreeSet::new();
         for file in &public.file {
             let package = file.package.as_deref().unwrap_or_default();
             for service in &file.service {
@@ -556,6 +564,14 @@ mod tests {
                             .name
                             .as_deref()
                             .expect("sandbox protocol method name")
+                    }));
+                }
+                // Private gateway-to-shared-supervisor protocol: served by the
+                // gateway but never part of the public SDK surface.
+                if package == "openshell.supervisor.host.v1" {
+                    assert_eq!(service_name, "SupervisorHost");
+                    supervisor_host_methods.extend(service.method.iter().map(|method| {
+                        method.name.as_deref().expect("supervisor host method name")
                     }));
                 }
                 if !matches!(
@@ -594,6 +610,7 @@ mod tests {
             sandbox_protocol_methods,
             BTreeSet::from(["Exchange", "Mediate"])
         );
+        assert_eq!(supervisor_host_methods, BTreeSet::from(["Attach"]));
         for signature in PROVIDER_READINESS_RPC_SIGNATURES {
             assert!(
                 methods.iter().any(|method| method == signature),
@@ -614,16 +631,17 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            103 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            106 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
-                + sandbox_protocol_methods.len(),
+                + sandbox_protocol_methods.len()
+                + supervisor_host_methods.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
@@ -633,11 +651,16 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
+        assert!(
+            methods
+                .iter()
+                .all(|method| !method.contains(".supervisor.host."))
+        );
 
         let public_closure = schema_closure(&index, public_roots);
         let durable_closure =
@@ -679,7 +702,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (328, 29),
+                (330, 31),
                 (95, 22),
                 (83, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

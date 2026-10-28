@@ -21,7 +21,7 @@ This output is separate from the supervisor stderr and file output described bel
 
 Gateway records use the configured gateway name for both `device.uid` and `device.name`. Replicas of one installation share that identity; `device.hostname` identifies the emitting replica. Assign distinct gateway names to installations whose events are collected together. Reusing a name, including the default name, groups those installations under the same identity. Renaming a gateway changes its audit identity.
 
-The gateway emits an Authentication (`class_uid: 3002`) event when it rejects a gRPC request during authentication. The caller receives the same error either way. `auth_protocol` names the mechanism involved, when one applies: `OpenID` for OIDC bearer tokens, or `mtls`, `sandbox_jwt`, `compute_driver`, or `k8s_service_account`. `status_detail` holds the reason category:
+The gateway emits an Authentication (`class_uid: 3002`) event when it rejects a gRPC request during authentication. The caller receives the same error either way. It also emits one when a handler rejects a credential it checks itself: the SSH session token of a `ForwardTcp` SSH connection, or a compute-driver identity on `IssueSandboxToken` that no longer matches the sandbox's recorded runtime. Those events identify the already-authenticated caller in `user`. `auth_protocol` names the mechanism involved, when one applies: `OpenID` for OIDC bearer tokens, or `mtls`, `sandbox_jwt`, `compute_driver`, `k8s_service_account`, or `ssh_session_token`. `status_detail` holds the reason category:
 
 | Reason | Severity | Meaning |
 |---|---|---|
@@ -37,7 +37,26 @@ The gateway emits an Authentication (`class_uid: 3002`) event when it rejects a 
 
 `src_endpoint` holds the address of the connection's immediate peer, which is the proxy or load balancer when one fronts the gateway, or the name `edge-tunnel` for requests carried over the WebSocket tunnel. `metadata.correlation_uid` holds the request's `x-request-id` when it is a UUID. The gateway generates one when the client sends none and returns it in the response. A client-supplied ID is recorded as sent, so it identifies the request, not the client.
 
+The gateway also emits an Informational Authentication event with `status: Success` the first time a replica accepts a credential, such as a bearer token, client certificate, or SSH session token. Later requests with the same credential emit nothing, so supervisor polling does not repeat the event. A refreshed token or renewed certificate is a new credential and logs on again, as does a credential still in use an hour later. Each replica records its own logons, and a replica tracking more than 16,384 credentials forgets the oldest early. `user` identifies the principal the same way `actor.user` does for authorization denials, described below. The `src_endpoint` and `metadata.correlation_uid` come from the request that logged on. A sandbox credential on `IssueSandboxToken` or `RefreshSandboxToken` logs on only after the gateway has checked the sandbox's recorded runtime or token lineage, so a credential that fails that check records no successful logon. Requests admitted by `auth.allow_unauthenticated_users`, or by a gateway with no authentication configured, emit no success event, though SSH session tokens they present still log on. To select only rejected requests, filter Authentication events on `status_id: 2` (Failure) rather than on `class_uid` alone.
+
 These events never include presented credentials, other request headers, or verification error text.
+
+The gateway emits an API Activity (`class_uid: 6003`) event with Medium severity when its method, role, scope, sandbox, workspace, or operator checks refuse an authenticated caller. `actor.user` identifies the principal: its `type` is `User`, `Admin` for an mTLS operator, `Sandbox`, or `Gateway Peer`, and `uid` is the subject, sandbox ID, or gateway replica ID. `api.operation` names the gRPC method, and `resources` names the sandbox, workspace, or extension service that was refused, when one applies, by `uid` for a sandbox ID or by `name` otherwise. `status_detail` holds the reason category:
+
+| Reason | Meaning |
+|---|---|
+| `method_not_permitted` | The principal type may not call the method, or may not call it with these arguments. |
+| `unknown_method` | The gateway does not recognize the method, for example one added in a newer client. |
+| `missing_role` | The caller lacks the OIDC role the method requires. |
+| `missing_scope` | The caller's token lacks the scope the method requires. |
+| `cross_sandbox` | A sandbox principal referenced a sandbox other than its own, by ID or by name. |
+| `not_workspace_member` | The caller is not a member of the workspace. |
+| `insufficient_workspace_role` | The caller's workspace role is below the one the operation requires. |
+| `platform_admin_required` | The operation spans workspaces or assigns the workspace admin role. |
+| `operator_required` | The operation requires a verified mTLS operator. |
+| `extension_service_not_selected` | A sandbox requested a credential for an extension service its policy does not select. A policy update can race the request, so this raises no finding. |
+
+When a sandbox principal is refused with `method_not_permitted`, `cross_sandbox`, or `platform_admin_required`, the gateway also emits a High-severity Detection Finding (`class_uid: 2004`) with `finding_info.uid` `sandbox-authorization-boundary`. Supervisors never make these requests, so the sandbox's credential may be compromised. Both events carry the same `metadata.correlation_uid`. Some methods answer a refused request with "not found" so callers cannot probe for resources; the event still records the denial.
 
 Without JSONL enabled, gateway OCSF events still appear as shorthand in console output, subject to the diagnostic log filter. Events associated with a sandbox also appear in its gateway log stream; gateway-wide events have no sandbox association.
 
@@ -268,6 +287,7 @@ The `class_uid` field identifies the event type:
 | 3002 | Authentication | `AUTH:` |
 | 5019 | Device Config State Change | `CONFIG:` |
 | 6002 | Application Lifecycle | `LIFECYCLE:` |
+| 6003 | API Activity | `API:` |
 
 HTTP Activity records include request or response details. Rejections that have
 parsed a request, including early credential-binding failures, include safe

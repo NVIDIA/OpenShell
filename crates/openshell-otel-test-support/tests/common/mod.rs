@@ -3,19 +3,18 @@
 
 //! Shared TLS export scenario for the one-test-per-binary TLS tests.
 
+use openshell_crypto::pki::{self, Certificate, KeyPair};
 use openshell_otel::{OtlpExportConfig, ServiceName, provider_for};
 use openshell_otel_test_support::{OtlpTestServer, ReceivedTraces};
-use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-};
+use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa};
 use tonic::transport::Identity;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 fn new_ca() -> (Certificate, KeyPair) {
-    let key = KeyPair::generate().unwrap();
+    let key = pki::generate_keypair().unwrap();
     let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    (params.self_signed(&key).unwrap(), key)
+    (pki::self_signed(params, &key).unwrap(), key)
 }
 
 /// Export one gzip span to a TLS collector and return the flush outcome and
@@ -35,12 +34,10 @@ pub async fn export_span_over_tls(server_trusted: bool) -> (bool, ReceivedTraces
         (&other_ca, &other_key)
     };
 
-    let server_key = KeyPair::generate().unwrap();
+    let server_key = pki::generate_keypair().unwrap();
     let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let server_cert = server_params
-        .signed_by(&server_key, signer, signer_key)
-        .unwrap();
+    let server_cert = pki::signed_by(server_params, &server_key, signer, signer_key).unwrap();
 
     let roots = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(roots.path(), trusted_ca.pem()).unwrap();
@@ -52,7 +49,7 @@ pub async fn export_span_over_tls(server_trusted: bool) -> (bool, ReceivedTraces
 
     let collector = OtlpTestServer::start_tls(Identity::from_pem(
         server_cert.pem(),
-        server_key.serialize_pem(),
+        server_key.serialize_pem().unwrap(),
     ))
     .await;
     let (provider, error) = provider_for(Some(OtlpExportConfig {

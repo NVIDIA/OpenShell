@@ -203,6 +203,15 @@ pub struct PodmanComputeConfig {
     /// system CA bundle. The bundle must exist and contain at least one
     /// certificate; this is validated on the gateway host at sandbox-create
     /// time, not deferred until the supervisor container starts.
+    ///
+    /// Populated only from the `--sandbox-additional-ca-bundle` CLI argument
+    /// (or `OPENSHELL_SANDBOX_ADDITIONAL_CA_BUNDLE`) for standalone drivers.
+    /// Deliberately excluded from driver JSON config (`#[serde(skip)]` +
+    /// `deny_unknown_fields`): gateway-managed deployments must use the
+    /// global `[openshell.supervisor.network]` setting so every driver
+    /// receives the same staged bundle, and a per-driver path in operator
+    /// JSON is rejected instead of silently diverging from it.
+    #[serde(skip)]
     pub additional_ca_bundle: Option<String>,
     /// User namespace mode for sandbox containers (e.g. `auto`, `private`).
     /// When unset, containers use the default user namespace.
@@ -650,6 +659,15 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_driver_specific_destination_ca_setting() {
+        let error = serde_json::from_value::<PodmanComputeConfig>(serde_json::json!({
+            "additional_ca_bundle": ["/operator/ca.crt"]
+        }))
+        .expect_err("destination trust is global, not a Podman driver setting");
+        assert!(error.to_string().contains("additional_ca_bundle"));
+    }
+
+    #[test]
     fn default_config_disables_health_checks() {
         assert_eq!(
             PodmanComputeConfig::default().health_check_interval_secs,
@@ -930,9 +948,11 @@ mod tests {
 
     /// Generate a real, valid self-signed CA certificate PEM for tests.
     fn generate_test_ca_pem() -> String {
-        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let key_pair = openshell_crypto::pki::generate_keypair().unwrap();
         let params = rcgen::CertificateParams::new(Vec::new()).unwrap();
-        params.self_signed(&key_pair).unwrap().pem()
+        openshell_crypto::pki::self_signed(params, &key_pair)
+            .unwrap()
+            .pem()
     }
 
     #[test]

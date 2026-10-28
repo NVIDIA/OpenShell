@@ -265,12 +265,15 @@ jobs:
   publish-snap:
     name: Publish snap
     needs: build-snap
+    permissions:
+      actions: read
+      contents: read
     uses: ./.github/workflows/snap-publish.yml
     with:
       upload-channel: latest/edge
       github-environment: latest/edge
     secrets:
-      publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+      SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   # ---------------------------------------------------------------------------
   # Create / update the dev GitHub Release with CLI, gateway, driver, and wheels

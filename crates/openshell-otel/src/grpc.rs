@@ -118,6 +118,10 @@ pub mod rpc {
         "StartSandbox",
         "openshell.compute.v1.ComputeDriver/StartSandbox",
     );
+    pub const SUSPEND_SANDBOX: ComputeDriverRpc = ComputeDriverRpc::new(
+        "SuspendSandbox",
+        "openshell.compute.v1.ComputeDriver/SuspendSandbox",
+    );
     pub const DELETE_SANDBOX: ComputeDriverRpc = ComputeDriverRpc::new(
         "DeleteSandbox",
         "openshell.compute.v1.ComputeDriver/DeleteSandbox",
@@ -194,6 +198,7 @@ pub fn compute_driver_rpc_operation(path: &str) -> Option<ComputeDriverRpc> {
         Some("ListSandboxes") => Some(rpc::LIST_SANDBOXES),
         Some("StopSandbox") => Some(rpc::STOP_SANDBOX),
         Some("StartSandbox") => Some(rpc::START_SANDBOX),
+        Some("SuspendSandbox") => Some(rpc::SUSPEND_SANDBOX),
         Some("DeleteSandbox") => Some(rpc::DELETE_SANDBOX),
         Some("WatchSandboxes") => Some(rpc::WATCH_SANDBOXES),
         Some("EnsureWorkspace") => Some(rpc::ENSURE_WORKSPACE),
@@ -316,6 +321,7 @@ mod tests {
             rpc::LIST_SANDBOXES,
             rpc::STOP_SANDBOX,
             rpc::START_SANDBOX,
+            rpc::SUSPEND_SANDBOX,
             rpc::DELETE_SANDBOX,
             rpc::WATCH_SANDBOXES,
             rpc::ENSURE_WORKSPACE,

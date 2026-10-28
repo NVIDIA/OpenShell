@@ -4,6 +4,14 @@
 
 Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) for OpenShell. The gateway spawns this binary as a subprocess and talks to it over the `openshell.compute.v1.ComputeDriver` Unix-socket surface. `openshell-supervisor` runs as a native host process, while `openshell-sandbox` runs as capability-free PID 1 inside each microVM and applies guest-local isolation over virtio-vsock.
 
+New VM generations initiate the control connection to host CID 2 over vsock.
+Libkrun forwards that guest connection to the supervisor's protected Unix
+socket; QEMU uses a host vsock listener on a per-guest port and checks the guest
+CID before TLS authentication. Existing protocol roles and authorization stay
+unchanged. Running legacy generations retain their original descriptors;
+newly booted generations require matching embedded runtime and supervisor
+binaries.
+
 The driver embeds libkrun, libkrunfw, the guest OCI unpacker, the portable guest sandbox, and the custom kernel runtime. Each sandbox boots from a cached immutable bootstrap ext4 root disk plus a per-sandbox writable overlay disk. When the requested sandbox image differs from the bootstrap image, the driver prepares a read-only image ext4 disk inside a bootstrap VM and mounts that unpacked rootfs as the sandbox lowerdir.
 
 ## How it fits together

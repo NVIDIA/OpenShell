@@ -27,9 +27,8 @@ use openshell_isolation_interface::contract::{
     BackendDescriptor, BackendError, BinaryIdentity, BoundaryConfirmation, BoundaryExitStatus,
     BoundarySignal, ExecSpec, ExecutableIdentity, ProvisioningEvidence, ResolveError, ShellSpec,
 };
-use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
@@ -166,8 +165,10 @@ impl NativeLinuxSandboxAuditEvidence {
 ///
 /// The supervisor generates this value in memory and presents it on every
 /// attach, including transport reconnects. The sandbox pins the first value it
-/// accepts for its process lifetime, so a replacement supervisor cannot reuse
-/// launch credentials to take over an existing runtime generation.
+/// accepts, so a replacement supervisor cannot reuse launch credentials to
+/// take over an existing runtime generation. Only a gateway-signed takeover
+/// grant for a higher credential epoch, naming the replacement's identity,
+/// moves the pin (see [`crate::sandbox_auth`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SupervisorInstanceId(uuid::Uuid);
 
@@ -238,7 +239,99 @@ impl<'de> Deserialize<'de> for SupervisorInstanceId {
 #[error("supervisor instance ID must be a non-nil canonical lowercase UUID")]
 pub struct SupervisorInstanceIdError;
 
-pub use openshell_core::isolation_registration::SandboxTransport;
+/// Backend-owned transport for a driver-provisioned runtime. The serialized
+/// variants preserve existing runtime descriptors independently of operator
+/// endpoint registration in core.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum SandboxTransport {
+    Unix {
+        socket_path: PathBuf,
+    },
+    Tcp {
+        /// Logical HTTP authority used for routing.
+        authority: String,
+        /// Concrete connection candidates pinned by the operator or driver.
+        addresses: Vec<std::net::SocketAddr>,
+    },
+    Vsock {
+        guest_cid: u32,
+        port: u32,
+    },
+    /// The supervisor accepts a connection from its sandbox runtime. TLS and
+    /// gRPC roles stay unchanged.
+    RuntimeInitiatedTcp {
+        authority: String,
+        listen_address: std::net::SocketAddr,
+    },
+    RuntimeInitiatedUnix {
+        socket_path: PathBuf,
+    },
+    RuntimeInitiatedVsock {
+        guest_cid: u32,
+        port: u32,
+    },
+    /// The runtime dials a supervisor shared by several sandbox instances and
+    /// names this instance's opaque route handle before the pinned TLS
+    /// handshake.
+    /// Only a host that owns the shared listener can serve this transport.
+    RuntimeInitiatedRouted {
+        authority: String,
+        route: String,
+    },
+}
+
+impl SandboxTransport {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let valid = match self {
+            Self::Unix { socket_path } | Self::RuntimeInitiatedUnix { socket_path } => {
+                openshell_core::paths::is_posix_absolute(socket_path)
+            }
+            Self::Tcp {
+                authority,
+                addresses,
+            } => {
+                !authority.is_empty()
+                    && !addresses.is_empty()
+                    && addresses
+                        .iter()
+                        .all(|address| address.port() != 0 && !address.ip().is_unspecified())
+            }
+            Self::RuntimeInitiatedTcp {
+                authority,
+                listen_address,
+            } => !authority.is_empty() && listen_address.port() != 0,
+            Self::Vsock { guest_cid, port } | Self::RuntimeInitiatedVsock { guest_cid, port } => {
+                *guest_cid >= 3 && *guest_cid != u32::MAX && *port != 0 && *port != u32::MAX
+            }
+            Self::RuntimeInitiatedRouted { authority, route } => {
+                !authority.is_empty() && crate::runtime_routed::validate_route_handle(route).is_ok()
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err("invalid boundary control transport endpoint")
+        }
+    }
+}
+
+impl From<openshell_core::isolation_registration::SandboxTransport> for SandboxTransport {
+    fn from(endpoint: openshell_core::isolation_registration::SandboxTransport) -> Self {
+        use openshell_core::isolation_registration::SandboxTransport as RegisteredEndpoint;
+        match endpoint {
+            RegisteredEndpoint::Unix { socket_path } => Self::Unix { socket_path },
+            RegisteredEndpoint::Tcp {
+                authority,
+                addresses,
+            } => Self::Tcp {
+                authority,
+                addresses,
+            },
+            RegisteredEndpoint::Vsock { guest_cid, port } => Self::Vsock { guest_cid, port },
+        }
+    }
+}
 
 /// Supervisor-side, generation-pinned TLS server authentication.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,7 +389,7 @@ pub fn generate_sandbox_tls_material(
     session_id: SandboxSessionId,
 ) -> Result<SandboxTlsMaterial, BackendError> {
     let server_name = format!("sandbox.{session_id}.openshell.internal");
-    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ED25519)
+    let ca_key = openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_ED25519)
         .map_err(|error| BackendError::Descriptor(format!("generate sandbox CA key: {error}")))?;
     let mut ca_params = CertificateParams::default();
     ca_params.not_before = rcgen::date_time_ymd(1975, 1, 1);
@@ -306,13 +399,14 @@ pub fn generate_sandbox_tls_material(
         .distinguished_name
         .push(DnType::CommonName, "OpenShell sandbox session CA");
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca = ca_params.self_signed(&ca_key).map_err(|error| {
+    let ca = openshell_crypto::pki::self_signed(ca_params, &ca_key).map_err(|error| {
         BackendError::Descriptor(format!("generate sandbox CA certificate: {error}"))
     })?;
 
-    let sandbox_key = KeyPair::generate_for(&rcgen::PKCS_ED25519).map_err(|error| {
-        BackendError::Descriptor(format!("generate sandbox TLS server key: {error}"))
-    })?;
+    let sandbox_key =
+        openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_ED25519).map_err(|error| {
+            BackendError::Descriptor(format!("generate sandbox TLS server key: {error}"))
+        })?;
     let mut sandbox_params = CertificateParams::new(vec![server_name.clone()])
         .map_err(|error| BackendError::Descriptor(format!("build sandbox certificate: {error}")))?;
     sandbox_params.not_before = rcgen::date_time_ymd(1975, 1, 1);
@@ -321,8 +415,7 @@ pub fn generate_sandbox_tls_material(
         .distinguished_name
         .push(DnType::CommonName, "OpenShell sandbox runtime");
     sandbox_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let sandbox = sandbox_params
-        .signed_by(&sandbox_key, &ca, &ca_key)
+    let sandbox = openshell_crypto::pki::signed_by(sandbox_params, &sandbox_key, &ca, &ca_key)
         .map_err(|error| {
             BackendError::Descriptor(format!("sign sandbox TLS server certificate: {error}"))
         })?;
@@ -331,7 +424,9 @@ pub fn generate_sandbox_tls_material(
         server_name,
         trust_anchor_pem: ca.pem(),
         certificate_chain_pem: sandbox.pem(),
-        private_key_pem: sandbox_key.serialize_pem(),
+        private_key_pem: sandbox_key
+            .serialize_pem()
+            .map_err(|error| BackendError::Descriptor(format!("export sandbox key: {error}")))?,
     })
 }
 
@@ -352,6 +447,29 @@ pub enum BoundaryListener {
     /// TLS over guest `AF_VSOCK`.
     Vsock {
         control_port: u32,
+        tls: SandboxTlsServerConfig,
+    },
+    /// The boundary dials the supervisor's listener and serves TLS and gRPC
+    /// over that outbound connection. Only driver-resolved addresses are used.
+    RuntimeInitiatedTlsTcp {
+        /// Stable logical Service authority, for diagnostics.
+        authority: String,
+        /// Driver-resolved supervisor endpoints, tried in order.
+        addresses: Vec<std::net::SocketAddr>,
+        tls: SandboxTlsServerConfig,
+        /// Route handle sent before TLS to a supervisor shared by several
+        /// sandbox instances. Absent for a dedicated supervisor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<String>,
+    },
+    /// Dial the supervisor over the driver's protected shared Unix socket.
+    RuntimeInitiatedUnix {
+        socket_path: PathBuf,
+        tls: SandboxTlsServerConfig,
+    },
+    /// Dial the host supervisor through the VM's vsock device.
+    RuntimeInitiatedVsock {
+        host_port: u32,
         tls: SandboxTlsServerConfig,
     },
 }
@@ -461,6 +579,25 @@ pub struct BoundaryConfig {
     /// Driver-resolved environment exposed only to workload processes.
     #[serde(default)]
     pub child_env: std::collections::HashMap<String, String>,
+}
+
+/// Default time a runtime keeps a workload frozen, after losing its
+/// supervisor, for an authenticated supervisor to recover it.
+pub const DEFAULT_SUPERVISOR_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Accepted bounds, in seconds, of a recovery deadline a supervisor offers.
+///
+/// A supervisor offers it at attach (see [`Request::Attach`]). Recovery is
+/// always bounded: a workload never runs unsupervised, and a frozen workload
+/// is terminated once its deadline passes.
+pub const SUPERVISOR_RECOVERY_TIMEOUT_RANGE: std::ops::RangeInclusive<u32> = 10..=300;
+
+/// The recovery deadline of an offer of `seconds`, if
+/// [`SUPERVISOR_RECOVERY_TIMEOUT_RANGE`] allows it.
+#[must_use]
+pub fn supervisor_recovery_timeout(seconds: u32) -> Option<Duration> {
+    SUPERVISOR_RECOVERY_TIMEOUT_RANGE
+        .contains(&seconds)
+        .then(|| Duration::from_secs(u64::from(seconds)))
 }
 
 impl fmt::Debug for BoundaryConfig {
@@ -592,7 +729,9 @@ impl RequestEnvelope {
         };
         let payload_digest = request_envelope_digest(&request, exec_admission_deadline_unix_ms)?;
         Ok(Self {
-            request_id: uuid::Uuid::new_v4().to_string(),
+            request_id: uuid::Builder::from_random_bytes(openshell_crypto::random_bytes::<16>()?)
+                .into_uuid()
+                .to_string(),
             payload_digest,
             exec_admission_deadline_unix_ms,
             request,
@@ -623,6 +762,8 @@ pub(crate) fn request_envelope_digest(
     request: &Request,
     exec_admission_deadline_unix_ms: Option<u64>,
 ) -> Result<String, FrameError> {
+    use std::fmt::Write as _;
+
     // Stable local replay fingerprint of decoded protobuf fields. Maps use
     // BTreeMap in generated messages; neither clients nor the wire carry this.
     let envelope = RequestEnvelope {
@@ -632,8 +773,12 @@ pub(crate) fn request_envelope_digest(
         request: request.clone(),
     };
     let payload = crate::protobuf::encode(&envelope)?;
-    let digest = Sha256::digest(payload);
-    Ok(format!("{digest:x}"))
+    let digest = openshell_crypto::sha256(&payload)?;
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(encoded)
 }
 
 impl fmt::Debug for RequestEnvelope {
@@ -654,6 +799,16 @@ pub enum Request {
     Attach {
         supervisor_instance_id: SupervisorInstanceId,
         policy: Box<SandboxPolicyWire>,
+        /// Gateway-signed takeover grant, present only when this process
+        /// replaces the generation's current owner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supervisor_takeover: Option<String>,
+        /// Seconds the runtime should keep the workload frozen after losing
+        /// this connection's supervision, offered by the supervisor and
+        /// bounded by [`SUPERVISOR_RECOVERY_TIMEOUT_RANGE`]. Absent keeps
+        /// [`DEFAULT_SUPERVISOR_RECOVERY_TIMEOUT`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supervisor_recovery_timeout_secs: Option<u32>,
     },
     Confirm,
     StartAgent {
@@ -735,9 +890,16 @@ impl fmt::Debug for Request {
             Self::Attach {
                 supervisor_instance_id: _,
                 policy: _,
+                supervisor_takeover,
+                supervisor_recovery_timeout_secs,
             } => formatter
                 .debug_struct("Attach")
                 .field("policy", &"<redacted>")
+                .field("takeover", &supervisor_takeover.is_some())
+                .field(
+                    "supervisor_recovery_timeout_secs",
+                    supervisor_recovery_timeout_secs,
+                )
                 .finish(),
             Self::Confirm => formatter.write_str("Confirm"),
             Self::StartAgent {
@@ -891,6 +1053,10 @@ pub struct MediationTimingWire {
 pub struct SessionSnapshotWire {
     pub generation: String,
     pub processes: Vec<ProcessSnapshotWire>,
+    /// Launch controls bound by the first attach, if any. A replacement
+    /// supervisor reattaches with exactly these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_policy: Option<Box<SandboxPolicyWire>>,
 }
 
 /// Stable generation-scoped process state available to a replacement supervisor.
@@ -1384,6 +1550,8 @@ where
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
+    #[error("control frame cryptography failed: {0}")]
+    Crypto(#[from] openshell_crypto::CryptoError),
     #[error("invalid protobuf message: {0}")]
     Protobuf(String),
     #[error("control frame is truncated")]

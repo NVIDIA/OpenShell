@@ -103,6 +103,61 @@ them. The cluster CNI must enforce ingress and egress `NetworkPolicy` for every
 sandbox namespace. Kubernetes accepts policy objects without confirming
 enforcement, so operators must verify CNI support before running sandboxes.
 
+### Control connection direction
+
+Every new runtime generation uses `runtime-initiated` control. The Sandbox
+annotation `openshell.ai/sandbox-runtime-control-connection` records the mode,
+bound to `openshell.ai/sandbox-runtime-control-generation`. A missing marker or
+a different current runtime generation identifies a legacy,
+`supervisor-initiated` generation, which keeps working until replaced. Stop/start
+upgrades it automatically: with both old Pods removed, the driver adds the
+supervisor Service and records the new mode and generation
+before releasing the replacement workload. Gateway recovery that recreates both
+Pods also upgrades the generation. Reconciliation never migrates a running
+generation. An unknown annotation value fails closed; there is no rollout flag.
+
+Only the dial direction differs. In both modes the sandbox runtime presents the
+generation-pinned TLS server identity and serves gRPC, and the supervisor
+verifies that identity, acts as the gRPC client, and sends the Sandbox Protocol
+JWT. The per-sandbox Service `os-boundary-<id>` always selects the paired
+workload Pod. A separate `os-supervisor-<id>` Service always selects the paired
+supervisor Pod. New gateways create both Services, retaining the legacy
+Service's UID, ClusterIP, and selector across restarts so an older gateway can
+still replace the generation during a rolling upgrade.
+
+For `runtime-initiated`:
+
+- The bootstrap Secret gives the runtime the Service ClusterIP and port. The
+  runtime retries with capped backoff until the supervisor listens, so neither
+  Pod waits on the other during bootstrap. The Service sets
+  `publishNotReadyAddresses` because the supervisor becomes Ready only after
+  the runtime attaches through it. The workload still cannot reach the control
+  port.
+- A per-sandbox `NetworkPolicy` `os-control-<id>` selects only this sandbox's
+  two Pods and admits one flow, from its workload Pod to its supervisor Pod on
+  `boundary_port` over TCP, as workload egress and supervisor ingress.
+  Supervisors may already be ingress-isolated by the managed SSH ingress policy;
+  when that policy is disabled, this one isolates them. Exec, file sync, and
+  logs need no other supervisor ingress because the supervisor opens those
+  connections. The CNI must still allow kubelet readiness probes. The
+  namespace-wide policies are unchanged.
+- The policy's UID and resourceVersion are bound into the boundary resource
+  claims and outer-fence evidence. Reconciliation suspends the workload if the
+  policy disappears, diverges, or changes generation, or if the active control
+  Service no longer selects the role the recorded mode requires.
+- Both Services and the control policy are owned by the Sandbox resource and are
+  deleted only with that sandbox.
+
+Deploy a gateway, supervisor image, and sandbox runtime image that all support
+`runtime-initiated` before using it. Older binaries reject the new descriptor
+shapes and fail closed.
+
+During a mixed-version rollout, an old gateway can restart a sandbox by
+creating its own compatible supervisor/runtime pair through the legacy
+Service. It preserves unknown annotations, so the mode marker is accepted only
+for its recorded generation. Do not replace an individual generation's
+supervisor or runtime binary with one that cannot read its descriptor.
+
 Each sandbox generation uses two immutable bootstrap Secrets. A trusted init
 container stages the sandbox bootstrap into memory, and the sandbox removes it
 before starting untrusted code. The other Secret is mounted only by the
@@ -110,7 +165,8 @@ supervisor; when `proxy_ca_bundle` is configured it also carries the operator's
 corporate proxy CA bundle, which the gateway reads from its own filesystem so
 the anchor stays in the gateway's trust domain rather than the sandbox
 namespace. The TLS channel binds the namespace, Sandbox CR, workload Pod,
-supervisor Pod, and shared network-policy identities. Stop deletes the workload
+supervisor Pod, and shared network-policy identities, plus the per-sandbox
+control policy for `runtime-initiated` sandboxes. Stop deletes the workload
 and supervisor Pods. Start rotates both Secrets and creates a new supervisor
 Pod before releasing a new workload Pod. It also renders the trusted init
 container again from gateway config, so a sandbox created by an older gateway
@@ -122,6 +178,90 @@ enforces them. Keep sandbox namespaces administrative: untrusted principals
 must not create permissive policies, create Pods, read bootstrap Secrets, or
 spoof the OpenShell role labels. Exact supervisor-to-sandbox authorization is
 still enforced by TLS, JWT claims, session generation, and recorded Pod UIDs.
+
+### Shared supervisor topology
+
+With `supervisor_topology = "gateway"`, each new runtime
+generation becomes a sandbox instance on one supervisor process that Helm
+deploys in the gateway namespace, instead of a supervisor Pod and boundary
+Service of its own. A sandbox instance is one running generation of a stable
+Sandbox resource. The generation's placement is recorded on the Sandbox
+resource (`openshell.ai/sandbox-runtime-supervisor-topology: gateway` and the
+instance route in `openshell.ai/sandbox-runtime-supervisor-session`, whose key
+keeps its established name) when the generation starts. Every later lifecycle decision reads the record, so changing the setting
+never reinterprets a running generation, and an unknown or incomplete record
+fails closed.
+
+- **Ownership.** The gateway owns which instances the shared supervisor
+  hosts. It constructs an `openshell_supervisor_control::SharedSupervision`
+  when the gateway binary builds this driver with
+  `KubernetesComputeDriver::with_shared_supervision`, serves its assignments
+  to the supervisor over the private `openshell.supervisor.host.v1` stream,
+  and mints the supervisor token the supervisor dials it with over TLS (see
+  the `openshell-supervisor` README); that token authorizes only the
+  assignment stream. The coordinator owns the control contracts (launch
+  material is persisted before an instance is assigned, recovery is
+  compare-and-replace against a baseline read before the list, an incomplete
+  recovery never replaces the published set, host observations are
+  interpreted once); this driver adapts them to Kubernetes objects. The
+  standalone driver binary cannot host the topology and refuses a
+  configuration that selects it.
+- **Supervisor token delivery.** The gateway renews the token at half its
+  lifetime (the `gateway_jwt` extension-token TTL, 15 minutes by default,
+  bounded to one hour) and the coordinator retries a failed delivery until it
+  succeeds or a newer token supersedes it. The driver's part is the write: it
+  replaces the `token` key of the chart-created
+  `shared_supervisor.token_secret_name` Secret in `service_namespace`, which
+  the supervisor Pod mounts, and names a missing Secret or a denied patch in
+  the retried error.
+- **Create and start.** The driver creates a per-sandbox egress allowance
+  `os-shared-control-<id>` from the workload Pod to the Pods the shared
+  supervisor's Service selects, on the runtime port, binds its UID and
+  resourceVersion into the boundary evidence, and builds the instance's
+  registration (route, sandbox name, main process spec and agent image from
+  the Sandbox resource, the provisioned runtime descriptor, the generation's
+  launch credentials, its proxy CA, and the current trace context). The
+  coordinator validates and encodes it, persists the launch material through
+  the driver into the generation's `os-supervisor-<id>-<generation>` Secret (key
+  `instance.json`, owned by the workload Pod), and then assigns the instance
+  before the driver releases the workload Pod. Assignment does not wait for
+  the supervisor, so create still returns before the gateway persists the
+  generation. The runtime identity's last component is the instance route,
+  which no Pod UID can equal, so `authenticate_sandbox` cannot vouch for a
+  shared generation.
+- **Readiness.** A shared generation is available while the coordinator
+  reports its instance as supervised and accepted by the gateway and the
+  driver finds its fence and egress allowance. An instance the supervisor has
+  reconciled past and does not host, hosts for another sandbox, or reports as
+  ended is unavailable, and reconciliation suspends the workload. A
+  disconnected supervisor is unknown and a supervisor that has not yet
+  reconciled to the assignment is degraded; neither suspends anything.
+  Bootstrap completion waits on the same verdict within the bootstrap grace.
+- **Stop and delete.** The driver withdraws the instance before suspending or
+  deleting the workload, and the generation cleanup deletes its launch
+  Secret. Every reconciliation also recovers the desired set from the Sandbox
+  resources that may run: the driver begins the recovery before it lists
+  them, lists the shared generations that may run with their routes, and
+  reads each launch Secret's bytes on request; the coordinator reuses current
+  assignments, decodes and binds persisted material to the recorded route and
+  sandbox, keeps the previous set when any read fails, and refuses a list
+  that raced a lifecycle edit. Instances of deleted Sandboxes and of stops
+  made while the gateway was down are withdrawn, and a restarted gateway
+  recovers its assignments before it sends anything.
+- **Isolation.** The supervisor token is a profile of its own, separate from
+  every instance's credentials; the gateway refuses it on every other RPC and
+  refuses every other identity on the assignment stream, and ends a stream
+  when the token that opened it expires. Sandboxes cannot reach the stream,
+  and the routing preface only selects which generation-pinned TLS identity
+  the supervisor demands.
+
+The topology does not support upstream proxies or provider SPIFFE identity, and
+the shared supervisor is a single point of failure for the sandboxes it hosts.
+Shared sandbox instances export no supervisor OTLP traces or OCSF events; the driver
+warns at startup when the gateway configures that export.
+When the setting is removed, reconciliation suspends shared generations, and a
+restart creates the dedicated generation's boundary Service the shared one never
+had.
 
 ## Sandbox Resource
 

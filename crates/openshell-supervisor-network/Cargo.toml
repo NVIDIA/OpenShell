@@ -12,7 +12,9 @@ rust-version.workspace = true
 
 [dependencies]
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
+sha2 = { workspace = true }
 openshell-binary-identity = { path = "../openshell-binary-identity" }
+openshell-crypto = { workspace = true }
 openshell-core = { path = "../openshell-core", features = ["oauth"] }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
@@ -37,7 +39,7 @@ hickory-proto = "0.26.1"
 ipnet = "2"
 miette = { workspace = true }
 prost-types = { workspace = true }
-rcgen = { workspace = true, features = ["x509-parser"] }
+rcgen = { workspace = true }
 regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob", "yaml"] }
 reqwest = { workspace = true }
 rustls = { workspace = true }
@@ -47,7 +49,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
 sha1 = "0.10"
-sha2 = { workspace = true }
 spiffe = { workspace = true }
 tempfile = "3"
 thiserror = { workspace = true }

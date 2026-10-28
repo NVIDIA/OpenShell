@@ -17,7 +17,7 @@ use super::method_authz::{AuthMode, Role};
 const AUTHORIZATION_EXTENSION: &str = "openshell.options.v1.authorization";
 
 /// Gateway-served protobuf packages.
-const GATEWAY_PACKAGES: &[&str] = &["openshell.v1"];
+const GATEWAY_PACKAGES: &[&str] = &["openshell.v1", "openshell.supervisor.host.v1"];
 
 /// Bearer-authenticated methods that deliberately require no role or scope.
 ///
@@ -125,6 +125,7 @@ impl DescriptorAuthTable {
                     "dual" => AuthMode::Dual,
                     "peer" => AuthMode::Peer,
                     "operator" => AuthMode::Operator,
+                    "supervisor" => AuthMode::Supervisor,
                     other => {
                         return Err(format!("method {path}: unknown auth_mode '{other}'"));
                     }
