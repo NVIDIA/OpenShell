@@ -87,7 +87,7 @@ Public skills live in `skills/` and work without an OpenShell source checkout. I
 | `openshell-cli` | CLI usage, sandbox lifecycle, provider management, and BYOC workflows |
 | `debug-openshell-cluster` | Diagnose gateway deployment and health issues |
 | `debug-inference` | Diagnose attached-provider inference, native endpoints, and migration from the retired managed endpoint |
-| `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API documentation |
+| `generate-sandbox-policy` | Generate or edit YAML and Cedar sandbox policies while preserving their format and middleware configuration |
 
 Public skills use `openshell --help` for installed command syntax and published OpenShell documentation for product concepts and configuration. They must not depend on repository-relative source or documentation files.
 
@@ -311,6 +311,9 @@ The normal Rust workspace build, check, lint, and test tasks enable the
 `--features dev` to select it in direct Cargo builds; Cargo's `dev` profile
 does not enable it automatically. Prerelease and stable builds leave it off.
 
+On this branch, the development bundle includes Cedar. To enable it in a
+local gateway and its supervisor, run `OPENSHELL_BUILD_CEDAR=1 mise run gateway`.
+
 ## Building the `openshell` CLI
 
 Inside this repository, `openshell` is a local shortcut script at `scripts/bin/openshell`. The script will
@@ -384,6 +387,8 @@ These are the primary `mise` tasks for day-to-day development:
 | --------------- | --------------------------------------------- |
 | `crates/`       | Rust crates                                   |
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
+| `crates/openshell-policy-cedar/` | Validation and evaluation for Cedar-authored sandbox policies, enabled by the `cedar` feature and included in the development `dev` feature |
+| `crates/openshell-policy-cedar-schema/` | Canonical Cedar schema and entity, action, and context names, linked only with the `cedar` feature |
 | `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
 | `python/`       | Python SDK and bindings                       |
 | `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |
@@ -430,7 +435,7 @@ mise run docs
 
 PRs that touch `docs/**` or `fern/**` are validated by `.github/workflows/branch-docs.yml`, and they get a preview when `FERN_TOKEN` is available to the workflow.
 
-Release Dev publishes the `dev` docs version from `main`. Release publishes an immutable stable version and updates `latest`. See [fern/README.md](fern/README.md) for the source layout, version model, and publishing workflows.
+Release Dev publishes the `dev` docs version from `main`. Release publishes an immutable stable version and updates `latest`. A page with `development-only: true` in its frontmatter, such as the Cedar policy guide, is published only in `dev`; keep links to it and descriptions of its feature off other pages. See [fern/README.md](fern/README.md) for the source layout, version model, and publishing workflows.
 
 `docs/` is the source-of-truth docs tree. `fern/` contains the site configuration, components, theme assets, and its README.
 

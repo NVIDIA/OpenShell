@@ -95,15 +95,22 @@ else
   echo "==> Skipping embedded VM runtime prep; prebuilt VM driver was supplied"
 fi
 
+# OPENSHELL_BUILD_CEDAR=1 adds the Cedar policy engine to the gateway and
+# host supervisor, the only packages that define the `cedar` feature.
+cedar_feature="$(openshell_cedar_feature)"
 build_packages=()
+build_features=()
 if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     echo "==> Building driver-free openshell-gateway"
     cargo build \
       -p openshell-gateway --bin openshell-gateway \
-      --no-default-features --features telemetry
+      --no-default-features --features "telemetry${cedar_feature:+,${cedar_feature}}"
   else
     build_packages+=(-p openshell-gateway)
+    if [ -n "${cedar_feature}" ]; then
+      build_features+=("openshell-gateway/${cedar_feature}")
+    fi
   fi
 else
   echo "==> Using prebuilt openshell-gateway at ${GATEWAY_BIN}"
@@ -118,6 +125,9 @@ if [ -z "${OPENSHELL_VM_SUPERVISOR_BIN:-}" ]; then
   # explicitly so a stale target/debug binary cannot disagree with the
   # freshly embedded guest sandbox protocol.
   build_packages+=(-p openshell-supervisor)
+  if [ -n "${cedar_feature}" ]; then
+    build_features+=("openshell-supervisor/${cedar_feature}")
+  fi
 else
   echo "==> Using prebuilt VM host supervisor at ${OPENSHELL_VM_SUPERVISOR_BIN}"
 fi
@@ -127,6 +137,9 @@ else
   echo "==> Using prebuilt openshell CLI at ${CLI_BIN}"
 fi
 
+if [ "${#build_features[@]}" -gt 0 ]; then
+  build_packages+=(--features "$(IFS=,; echo "${build_features[*]}")")
+fi
 if [ "${#build_packages[@]}" -gt 0 ]; then
   echo "==> Building ${build_packages[*]}"
   cargo build "${build_packages[@]}"

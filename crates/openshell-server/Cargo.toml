@@ -121,13 +121,16 @@ notify = "8"
 [features]
 default = ["telemetry"]
 # Opt-in bundle for development-only features; stable builds leave it off.
-dev = []
+dev = ["cedar"]
 ## Compile in anonymous telemetry emission (forwards to openshell-core/telemetry).
 ## On by default; build with `--no-default-features` for a telemetry-free gateway
 ## that contains no telemetry endpoint, HTTP client, or emission code.
 telemetry = ["openshell-core/telemetry"]
 vendored-z3 = ["openshell-prover/vendored-z3"]
 prebuilt-z3 = ["openshell-prover/prebuilt-z3"]
+## Validate and serve Cedar-authored sandbox policies, and advertise Cedar
+## support to clients. Without it, the gateway rejects Cedar policies.
+cedar = ["openshell-policy/cedar"]
 test-support = []
 
 [build-dependencies]

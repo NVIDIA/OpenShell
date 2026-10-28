@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Process identity for policy.cedar, passed with --middleware beside it. A
+# Cedar policy has no `process` section; this is the `process` section of
+# policy.yaml. The launcher keeps the YAML policy (see README.md), so this
+# file is for starting a gator sandbox from policy.cedar by hand.
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox

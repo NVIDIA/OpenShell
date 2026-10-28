@@ -10,7 +10,8 @@
 
 use super::*;
 use crate::l7::token_grant_injection::{TokenGrantRequest, TokenGrantResolver};
-use crate::opa::{NetworkInput, OpaEngine};
+use crate::opa::OpaEngine;
+use crate::policy_types::NetworkInput;
 use crate::token_grant::test_support::{CacheAcquisition, CachedTokenGrantResolver};
 use openshell_core::proto::{
     ProviderCredentialTokenGrant, ProviderCredentialTokenGrantType, ProviderProfileCredential,
@@ -279,7 +280,7 @@ impl Fixture {
         body_pending: Option<Arc<Notify>>,
     ) -> Connection {
         let configs = self.configs.clone();
-        let middleware_engine = self.engine.clone();
+        let middleware_engine = PolicyEngine::from(self.engine.clone());
         let engine = self
             .engine
             .clone_engine_for_tunnel(self.generation)

@@ -55,11 +55,14 @@ uuid = { workspace = true }
 [features]
 default = ["telemetry", "bundled-ca-roots"]
 # Opt-in bundle for development-only features; stable builds leave it off.
-dev = []
+dev = ["cedar"]
 system-ca-roots = ["telemetry"]
 defaults-without-telemetry = ["bundled-ca-roots"]
 telemetry = ["openshell-core/telemetry"]
 bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
+# Enforces Cedar-authored sandbox policies and advertises Cedar support to
+# the gateway. Included by `dev`; off by default.
+cedar = ["openshell-supervisor-network/cedar", "openshell-policy/cedar"]
 
 [dev-dependencies]
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }

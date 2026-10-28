@@ -92,6 +92,7 @@ pub async fn start_boundary_access(
     supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
     config_apply_tx: tokio::sync::mpsc::Sender<crate::supervisor_session::ConfigApplyRequest>,
     config_push_updates: tokio::sync::watch::Sender<bool>,
+    supports_cedar_policy: bool,
     host_key: Option<russh::keys::PrivateKey>,
 ) -> Result<BoundaryAccess> {
     let instance_id = uuid::Uuid::new_v4().to_string();
@@ -130,6 +131,7 @@ pub async fn start_boundary_access(
                     session_id_updates: supervisor_session_updates,
                     config_apply_tx,
                     config_push_updates,
+                    supports_cedar_policy,
                 },
             );
             (Some(task), Some(accepted))
@@ -373,6 +375,7 @@ mod tests {
             None,
             tokio::sync::mpsc::channel(1).0,
             tokio::sync::watch::channel(false).0,
+            false,
             None,
         )
         .await
@@ -414,6 +417,7 @@ mod tests {
             None,
             tokio::sync::mpsc::channel(1).0,
             tokio::sync::watch::channel(false).0,
+            false,
             None,
         )
         .await;

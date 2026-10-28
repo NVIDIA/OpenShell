@@ -4,7 +4,7 @@
 //! Supervisor middleware application for L7 requests.
 
 use crate::l7::relay::L7EvalContext;
-use crate::opa::PolicyGenerationGuard;
+use crate::policy_types::PolicyGenerationGuard;
 use miette::{Result, miette};
 use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
@@ -873,8 +873,8 @@ fn safe_middleware_headers(headers: &[u8]) -> Result<SafeMiddlewareHeaders> {
     })
 }
 
-pub fn middleware_network_input(ctx: &L7EvalContext) -> crate::opa::NetworkInput {
-    crate::opa::NetworkInput {
+pub fn middleware_network_input(ctx: &L7EvalContext) -> crate::policy_types::NetworkInput {
+    crate::policy_types::NetworkInput {
         host: ctx.host.clone(),
         port: ctx.port,
         binary_path: PathBuf::from(&ctx.binary_path),

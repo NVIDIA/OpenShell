@@ -119,4 +119,7 @@ type ConfigUpdateResult struct {
 	Deleted bool
 	// Annotations contains sandbox metadata annotations after the update.
 	Annotations map[string]string
+	// PolicyWarnings are the gateway's load-time warnings for a submitted
+	// sandbox policy, one line each. They never change enforcement.
+	PolicyWarnings []string
 }

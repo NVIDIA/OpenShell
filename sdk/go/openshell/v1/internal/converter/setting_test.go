@@ -538,6 +538,7 @@ func TestConfigUpdateResultFromProto(t *testing.T) {
 		SettingsRevision: 55,
 		Deleted:          true,
 		Annotations:      map[string]string{"sandbox_id": "sb-123"},
+		PolicyWarnings:   []*pb.PolicyWarning{{Message: "path `/admin/**` is audit-only"}},
 	}
 
 	result := ConfigUpdateResultFromProto(resp)
@@ -548,6 +549,7 @@ func TestConfigUpdateResultFromProto(t *testing.T) {
 	assert.Equal(t, uint64(55), result.SettingsRevision)
 	assert.True(t, result.Deleted)
 	assert.Equal(t, map[string]string{"sandbox_id": "sb-123"}, result.Annotations)
+	assert.Equal(t, []string{"path `/admin/**` is audit-only"}, result.PolicyWarnings)
 
 	resp.Annotations["sandbox_id"] = "MUTATED"
 	assert.Equal(t, "sb-123", result.Annotations["sandbox_id"], "annotations must be deep copied")
@@ -563,6 +565,7 @@ func TestConfigUpdateResultFromProto_DefaultValues(t *testing.T) {
 	assert.Empty(t, result.PolicyHash)
 	assert.Zero(t, result.SettingsRevision)
 	assert.False(t, result.Deleted)
+	assert.Nil(t, result.PolicyWarnings)
 }
 
 func TestConfigUpdateResultFromProto_Nil(t *testing.T) {

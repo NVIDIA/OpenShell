@@ -117,6 +117,7 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         Ok(Response::new(HealthResponse {
+            supports_cedar_policy: false,
             status: ServiceStatus::Healthy.into(),
             version: "test".to_string(),
         }))
@@ -186,6 +187,7 @@ impl OpenShell for TestOpenShell {
                 ..Default::default()
             }),
             service_urls: std::collections::HashMap::new(),
+            ..Default::default()
         }))
     }
 

@@ -32,6 +32,8 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-sandbox-backend/` | OpenShell sandbox backend | Concrete Isolation Backend RPC client and authenticated Sandbox Protocol shared with `openshell-sandbox` |
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, and process constraints |
 | `crates/openshell-policy-schema/` | Authored policy schema | Dependency-light YAML/JSON representation, bounded parsing, and pure authored-language semantics |
+| `crates/openshell-policy-cedar/` | Cedar policy engine | Validation, Landlock/L7/DNS derivation, and evaluation for Cedar-authored sandbox policies; linked only with the gateway and supervisor `cedar` feature (development builds) |
+| `crates/openshell-policy-cedar-schema/` | Cedar policy schema | Canonical Cedar schema and entity, action, and context names; linked only with the `cedar` feature |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
 | `crates/openshell-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |

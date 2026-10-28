@@ -68,6 +68,14 @@ pub fn matches(pattern: &str, path: &str) -> bool {
     EndpointPathPattern::new(pattern).matches(path)
 }
 
+/// Rank an endpoint path pattern as the L7 relay ranks the patterns matching
+/// one request: the pattern with the most characters other than `*` is the
+/// most specific. The empty pattern ranks lowest.
+#[must_use]
+pub fn path_specificity(pattern: &str) -> usize {
+    pattern.chars().filter(|c| *c != '*').count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{EndpointPathPattern, matches};

@@ -42,7 +42,7 @@ The launcher:
 - For `--harness codex`, configures gateway-managed refresh for `CODEX_AUTH_ACCESS_TOKEN` and rotates it before launching the sandbox.
 - Passes the non-secret Codex account ID from host auth as `CODEX_ACCOUNT_ID`. The harness writes it literally into `auth.json` for local workspace discovery; access tokens remain opaque provider placeholders and refresh tokens remain gateway-only.
 - Enables `agent_policy_proposals_enabled` and `proposal_approval_mode=auto` at gateway scope.
-- Uses the gator image policy copied to `/etc/openshell/policy.yaml`.
+- Uses the gator image policy copied to `/etc/openshell/policy.yaml`. `policy.cedar` is the same policy in Cedar, with `middleware.yaml` carrying its process identity for `--middleware`; an image policy must be YAML, and policy proposals merge YAML rules, so the launcher keeps the YAML policy.
 - Installs the gator-specific `gh` wrapper from `gator/bin/gh` as `/usr/local/bin/gh` to fail closed when same-head-SHA history cannot be checked, prevent duplicate dispositions, and require versioned review payloads.
 - Installs `gator/bin/review-feedback-ledger` as `/usr/local/bin/review-feedback-ledger` so reviews receive tree- and patch-aware scope, prior summaries and findings, resolution state, convergence telemetry, and the three-round Warning budget.
   Patch identity uses fetched merge-base/head trees in a temporary bare Git

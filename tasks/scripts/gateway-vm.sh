@@ -318,9 +318,17 @@ if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
   CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
 fi
 
+# Only the gateway and supervisor define the `cedar` feature.
+CEDAR_FEATURE="$(openshell_cedar_feature)"
+CEDAR_FEATURE_ARGS=()
+if [[ -n "${CEDAR_FEATURE}" ]]; then
+  CEDAR_FEATURE_ARGS=(--features "openshell-gateway/${CEDAR_FEATURE},openshell-supervisor/${CEDAR_FEATURE}")
+fi
+
 echo "==> Building openshell-gateway, openshell-driver-vm, and native control supervisor"
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-gateway -p openshell-driver-vm -p openshell-supervisor
+  -p openshell-gateway -p openshell-driver-vm -p openshell-supervisor \
+  ${CEDAR_FEATURE_ARGS[@]+"${CEDAR_FEATURE_ARGS[@]}"}
 
 if [ "$(uname -s)" = "Darwin" ]; then
   echo "==> Codesigning openshell-driver-vm (Hypervisor entitlement)"

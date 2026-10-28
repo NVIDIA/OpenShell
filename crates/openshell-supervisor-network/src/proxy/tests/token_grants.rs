@@ -28,7 +28,7 @@ network_policies:
 
 fn forward_inspection_fixture() -> (
     crate::l7::L7EndpointConfig,
-    crate::opa::TunnelPolicyEngine,
+    crate::policy_engine::TunnelPolicyEngine,
     crate::l7::relay::L7EvalContext,
     crate::l7::token_grant_injection::test_support::TokenGrantTestFixture,
 ) {

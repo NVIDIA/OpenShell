@@ -4,6 +4,12 @@
 
 # Shared helpers for local gateway-backed e2e wrappers. Driver-specific setup,
 # cleanup, and runtime behavior stay in the Docker/Podman wrapper scripts.
+#
+# Set OPENSHELL_BUILD_CEDAR=1 to build the gateway (and, through the image
+# build scripts, the supervisor) with the Cedar policy engine.
+
+# shellcheck source=tasks/scripts/build-env.sh disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/../../tasks/scripts/build-env.sh"
 
 # E2E traffic is synthetic and must not contribute to product usage metrics.
 # Keep an explicit override so telemetry-specific tests can opt back in.
@@ -396,10 +402,16 @@ e2e_build_gateway_binaries() {
   local gateway_var=$3
   local cli_var=$4
   local target_dir
+  local cedar_feature
   local jobs=()
+  local gateway_features=()
 
   if [ -n "${CARGO_BUILD_JOBS:-}" ]; then
     jobs=(-j "${CARGO_BUILD_JOBS}")
+  fi
+  cedar_feature="$(openshell_cedar_feature)" || exit 2
+  if [ -n "${cedar_feature}" ]; then
+    gateway_features=(--features "${cedar_feature}")
   fi
 
   target_dir="$(e2e_cargo_target_dir "${root}")"
@@ -412,10 +424,12 @@ e2e_build_gateway_binaries() {
     if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
       cargo build ${jobs[@]+"${jobs[@]}"} \
         -p openshell-gateway --bin openshell-gateway \
-        --no-default-features --features telemetry
+        --no-default-features --features telemetry \
+        ${gateway_features[@]+"${gateway_features[@]}"}
     else
       cargo build ${jobs[@]+"${jobs[@]}"} \
-        -p openshell-gateway --bin openshell-gateway
+        -p openshell-gateway --bin openshell-gateway \
+        ${gateway_features[@]+"${gateway_features[@]}"}
     fi
   else
     echo "Using prebuilt openshell gateway at ${OPENSHELL_GATEWAY_BIN}"
@@ -437,6 +451,29 @@ e2e_build_gateway_binaries() {
     echo "ERROR: expected openshell CLI binary at ${!cli_var}" >&2
     exit 1
   fi
+}
+
+# Run an openshell command that sends a Cedar policy, such as `sandbox create`
+# or `policy set`. The CLI refuses to send Cedar to a gateway that does not
+# advertise Cedar support before it provisions or changes anything, so the
+# first such command doubles as the preflight for suites that need Cedar. On
+# that refusal, explain how to get a Cedar-enabled gateway.
+e2e_run_cedar_cli() {
+  local stderr_file
+  local status=0
+
+  stderr_file="$(mktemp "${TMPDIR:-/tmp}/openshell-cedar-cli.XXXXXX")"
+  "$@" 2>"${stderr_file}" || status=$?
+  cat "${stderr_file}" >&2
+  if [ "${status}" -ne 0 ] \
+    && grep -qF "does not advertise Cedar" "${stderr_file}"; then
+    echo "ERROR: the gateway was built without the Cedar policy engine." >&2
+    echo "       Locally, build the gateway and supervisor with OPENSHELL_BUILD_CEDAR=1" >&2
+    echo "       (mise run e2e:cedar and POLICY_FORMAT=cedar mise run e2e:mcp set it)." >&2
+    echo "       Otherwise test Release Dev artifacts; stable releases exclude Cedar." >&2
+  fi
+  rm -f "${stderr_file}"
+  return "${status}"
 }
 
 e2e_build_external_driver() {

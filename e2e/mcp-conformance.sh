@@ -16,6 +16,18 @@ CONFORMANCE_REF="${OPENSHELL_MCP_CONFORMANCE_REF:-b9041ea41b0188581803459dbae71b
 CLIENT_IMAGE="${OPENSHELL_MCP_CONFORMANCE_CLIENT_IMAGE:-openshell-mcp-conformance-client:local}"
 SCENARIOS="${OPENSHELL_MCP_CONFORMANCE_SCENARIOS:-}"
 SPEC_VERSION="${OPENSHELL_MCP_CONFORMANCE_SPEC_VERSION:-2025-11-25}"
+# POLICY_FORMAT=cedar runs the client sandbox with policy-template.cedar:
+#
+#   POLICY_FORMAT=cedar mise run e2e:mcp
+#
+# Cedar needs a gateway and supervisor built with the Cedar policy engine, so
+# local builds default to OPENSHELL_BUILD_CEDAR=1 in that mode. A prebuilt
+# gateway or supervisor image must come from a Cedar-enabled build, such as
+# Release Dev.
+export POLICY_FORMAT="${POLICY_FORMAT:-yaml}"
+if [ "${POLICY_FORMAT}" = "cedar" ]; then
+  export OPENSHELL_BUILD_CEDAR="${OPENSHELL_BUILD_CEDAR:-1}"
+fi
 TIMEOUT_MS="${OPENSHELL_MCP_CONFORMANCE_TIMEOUT_MS:-900000}"
 FORCE_REBUILD="${OPENSHELL_MCP_CONFORMANCE_FORCE_REBUILD:-0}"
 DOCKER_PULL="${OPENSHELL_MCP_CONFORMANCE_DOCKER_PULL:-0}"
@@ -303,7 +315,7 @@ build_client_image() {
     pull_args=(--pull)
   fi
 
-  docker build "${pull_args[@]}" \
+  docker build ${pull_args[@]+"${pull_args[@]}"} \
     --label "${CLIENT_IMAGE_REF_LABEL}=${conformance_head}" \
     --label "${CLIENT_IMAGE_DOCKERFILE_LABEL}=${dockerfile_hash}" \
     --label "${CLIENT_IMAGE_DOCKERIGNORE_LABEL}=${dockerignore_hash}" \
@@ -319,32 +331,46 @@ create_client_sandbox() {
     return
   fi
 
-  local sandbox_name policy_file openshell
+  local sandbox_name policy_file middleware_file openshell
+  local -a render_args middleware_args create_runner
   sandbox_name="mcp-client-$$"
-  policy_file="$(mktemp "${TMPDIR:-/tmp}/openshell-mcp-conformance-base-policy.XXXXXX.yaml")"
+  policy_file="$(mktemp "${TMPDIR:-/tmp}/openshell-mcp-conformance-base-policy.XXXXXX.${POLICY_FORMAT}")"
+  middleware_file=""
+  middleware_args=()
+  create_runner=()
   openshell="$(openshell_bin)"
+  render_args=(
+    "http://192.0.2.1:1/" "${policy_file}"
+    "${ROOT}/e2e/mcp-conformance/policy-template.${POLICY_FORMAT}"
+    "${SPEC_VERSION}"
+  )
+  if [ "${POLICY_FORMAT}" = "cedar" ]; then
+    middleware_file="$(mktemp "${TMPDIR:-/tmp}/openshell-mcp-conformance-base-middleware.XXXXXX.yaml")"
+    render_args+=("${middleware_file}" "${ROOT}/e2e/mcp-conformance/middleware-template.yaml")
+    middleware_args=(--middleware "${middleware_file}")
+    # Fail fast, with a rebuild hint, when the gateway was built without Cedar.
+    create_runner=(e2e_run_cedar_cli)
+  fi
 
   # The upstream runner binds its per-scenario test server with listen(0), and
   # the port can be outside the OS ephemeral range. Create the reusable sandbox
   # with a harmless placeholder; the client wrapper installs the exact policy
   # for each scenario URL before executing the TypeScript client.
-  python3 "${ROOT}/e2e/mcp-conformance/render-policy.py" \
-    "http://192.0.2.1:1/" "${policy_file}" \
-    "${ROOT}/e2e/mcp-conformance/policy-template.yaml" \
-    "${SPEC_VERSION}" >/dev/null
+  python3 "${ROOT}/e2e/mcp-conformance/render-policy.py" "${render_args[@]}" >/dev/null
 
   echo "Creating MCP conformance client sandbox ${sandbox_name}..." >&2
-  if ! "${openshell}" sandbox create \
+  if ! ${create_runner[@]+"${create_runner[@]}"} "${openshell}" sandbox create \
     --name "${sandbox_name}" \
     --from "${CLIENT_IMAGE}" \
     --policy "${policy_file}" \
+    ${middleware_args[@]+"${middleware_args[@]}"} \
     --no-tty \
     --detach \
     -- sleep infinity; then
-    rm -f "${policy_file}"
+    rm -f "${policy_file}" "${middleware_file}"
     return 1
   fi
-  rm -f "${policy_file}"
+  rm -f "${policy_file}" "${middleware_file}"
 
   export OPENSHELL_MCP_CONFORMANCE_CLIENT_SANDBOX="${sandbox_name}"
   export OPENSHELL_MCP_CONFORMANCE_POLICY_WAIT="${OPENSHELL_MCP_CONFORMANCE_POLICY_WAIT:-1}"
@@ -390,7 +416,7 @@ create_runner_container() {
   if ! docker run -d --rm \
     --name "${RUNNER_CONTAINER}" \
     --network "${network}" \
-    "${add_host_args[@]}" \
+    ${add_host_args[@]+"${add_host_args[@]}"} \
     "${CLIENT_IMAGE}" \
     sleep infinity >/dev/null; then
     RUNNER_CONTAINER=""

@@ -20,11 +20,11 @@ use openshell_core::proto::{
     DeleteSandboxRequest, DeleteSandboxResponse, DeleteServiceRequest, DeleteServiceResponse,
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
     EditDraftChunkResponse, ExposeServiceRequest, ImportProviderProfilesRequest,
-    ImportProviderProfilesResponse, Provider, ProviderMutationReceipt, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderResponse, RejectDraftChunkRequest, RejectDraftChunkResponse,
-    RotateProviderCredentialRequest, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
-    ServiceEndpointResponse, StartSandboxRequest, StopSandboxRequest, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    ImportProviderProfilesResponse, PolicyWarning, Provider, ProviderMutationReceipt,
+    ProviderProfile, ProviderProfileDiagnostic, ProviderResponse, RejectDraftChunkRequest,
+    RejectDraftChunkResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
+    Sandbox, SandboxResponse, ServiceEndpointResponse, StartSandboxRequest, StopSandboxRequest,
+    UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
     WorkspaceSelector,
 };
@@ -156,6 +156,8 @@ pub(in crate::grpc) enum Outcome {
         changed: bool,
         #[serde(default)]
         service_urls: HashMap<String, String>,
+        #[serde(default)]
+        policy_warnings: Vec<String>,
     },
     SandboxDeletion {
         id: String,
@@ -188,6 +190,8 @@ pub(in crate::grpc) enum Outcome {
         settings_revision: u64,
         deleted: bool,
         annotations: HashMap<String, String>,
+        #[serde(default)]
+        policy_warnings: Vec<String>,
     },
     Policy {
         sandbox_id: String,
@@ -414,11 +418,16 @@ fn sandbox_receipt(
     sandbox: Option<&Sandbox>,
     changed: bool,
     service_urls: HashMap<String, String>,
+    policy_warnings: &[PolicyWarning],
 ) -> Result<Outcome, Status> {
     Ok(Outcome::Sandbox {
         id: sandbox.ok_or_else(uncertain)?.object_id().into(),
         changed,
         service_urls,
+        policy_warnings: policy_warnings
+            .iter()
+            .map(|warning| warning.message.clone())
+            .collect(),
     })
 }
 
@@ -434,6 +443,7 @@ macro_rules! sandbox_mutation {
                 response.get_ref().sandbox.as_ref(),
                 false,
                 HashMap::new(),
+                &[],
             ),
             async |store: &Store, outcome: Outcome| {
                 let Outcome::Sandbox { id, .. } = outcome else {
@@ -442,6 +452,7 @@ macro_rules! sandbox_mutation {
                 Ok(SandboxResponse {
                     sandbox: Some(live(store, &id).await?),
                     service_urls: HashMap::new(),
+                    policy_warnings: Vec::new(),
                 })
             }
         );
@@ -457,10 +468,14 @@ scoped_mutation!(
         response.get_ref().sandbox.as_ref(),
         false,
         response.get_ref().service_urls.clone(),
+        &response.get_ref().policy_warnings,
     ),
     async |store: &Store, outcome: Outcome| {
         let Outcome::Sandbox {
-            id, service_urls, ..
+            id,
+            service_urls,
+            policy_warnings,
+            ..
         } = outcome
         else {
             return Err(replay_unavailable());
@@ -468,6 +483,7 @@ scoped_mutation!(
         Ok(SandboxResponse {
             sandbox: Some(live(store, &id).await?),
             service_urls,
+            policy_warnings: crate::grpc::policy_warnings(policy_warnings),
         })
     }
 );
@@ -913,6 +929,11 @@ mutation!(
             settings_revision: value.settings_revision,
             deleted: value.deleted,
             annotations: value.annotations.clone(),
+            policy_warnings: value
+                .policy_warnings
+                .iter()
+                .map(|warning| warning.message.clone())
+                .collect(),
         })
     },
     async |store: &Store, outcome: Outcome| {
@@ -923,6 +944,7 @@ mutation!(
             settings_revision,
             deleted,
             annotations,
+            policy_warnings,
         } = outcome
         else {
             return Err(replay_unavailable());
@@ -936,6 +958,7 @@ mutation!(
             settings_revision,
             deleted,
             annotations,
+            policy_warnings: crate::grpc::policy_warnings(policy_warnings),
         })
     }
 );

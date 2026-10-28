@@ -60,6 +60,7 @@ HOST_ENV_ALLOWLIST = frozenset(
         "OPENSHELL_MCP_CONFORMANCE_POLICY_WAIT_TIMEOUT",
         "OPENSHELL_PROVISION_TIMEOUT",
         "PATH",
+        "POLICY_FORMAT",
         "RUSTUP_HOME",
         "TMP",
         "TEMP",

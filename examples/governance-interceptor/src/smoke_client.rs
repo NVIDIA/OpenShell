@@ -60,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get_sandbox_config(GetSandboxConfigRequest {
             name: sandbox_name.clone(),
             workspace_scope: None,
+            ..Default::default()
         })
         .await?
         .into_inner();
@@ -127,6 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get_sandbox_config(GetSandboxConfigRequest {
             name: sandbox_name,
             workspace_scope: None,
+            ..Default::default()
         })
         .await?
         .into_inner();

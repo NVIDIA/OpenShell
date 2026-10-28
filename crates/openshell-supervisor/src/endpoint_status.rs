@@ -13,7 +13,6 @@ use openshell_core::endpoint_status::{
     EndpointConfigVersion, EndpointInventoryEntry, EndpointObservationSender,
     EndpointStatusCommand, EndpointStatusReceiver, EndpointStatusTracker, endpoint_id,
 };
-use openshell_core::mcp::is_mcp_protocol;
 use openshell_core::proto::SandboxPolicy;
 use tokio::time::timeout;
 use tracing::warn;
@@ -355,14 +354,14 @@ fn apply_command(
 /// Collect the MCP endpoints whose HTTP exchanges provide status observations.
 pub fn mcp_endpoint_inventory(policy: &SandboxPolicy) -> Vec<EndpointInventoryEntry> {
     let mut endpoints = BTreeMap::new();
-    for endpoint in policy
-        .network_policies
-        .values()
-        .flat_map(|rule| &rule.endpoints)
-        .filter(|endpoint| is_mcp_protocol(&endpoint.protocol))
+    for endpoint in openshell_policy::endpoint_status::configured_mcp_endpoints(policy)
+        .unwrap_or_else(|_| {
+            warn!("invalid policy has no endpoint status inventory");
+            Vec::new()
+        })
     {
         endpoints
-            .entry(endpoint_id(endpoint))
+            .entry(endpoint_id(&endpoint))
             .and_modify(|credentialed| *credentialed |= endpoint.provider_credentialed)
             .or_insert(endpoint.provider_credentialed);
     }
@@ -1189,6 +1188,32 @@ mod tests {
             vec![EndpointInventoryEntry {
                 endpoint_id: endpoint_id(&endpoint),
                 uses_provider_credentials: true,
+            }]
+        );
+    }
+
+    #[cfg(feature = "cedar")]
+    #[test]
+    fn cedar_mcp_inventory_uses_configured_wildcard_identity() {
+        let policy = SandboxPolicy {
+            cedar_policy_source: r#"
+@protocol("mcp") @path("/mcp/**")
+permit (principal, action == Sandbox::Action::"HttpRequest", resource)
+when { resource.host like("*.example.com", ".") && resource.port == 443 };
+"#
+            .to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            mcp_endpoint_inventory(&policy),
+            vec![EndpointInventoryEntry {
+                endpoint_id: endpoint_id(&NetworkEndpoint {
+                    host: "*.example.com".to_string(),
+                    port: 443,
+                    path: "/mcp/**".to_string(),
+                    ..Default::default()
+                }),
+                uses_provider_credentials: false,
             }]
         );
     }

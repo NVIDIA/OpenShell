@@ -19,6 +19,7 @@ openshell-core = { path = "../openshell-core", features = ["oauth"] }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
+openshell-policy-cedar = { path = "../openshell-policy-cedar", optional = true }
 openshell-policy-schema = { path = "../openshell-policy-schema" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
 
@@ -34,6 +35,7 @@ bytes = { workspace = true }
 flate2 = "1"
 futures = { workspace = true }
 glob = { workspace = true }
+globset = { version = "0.4", default-features = false, optional = true }
 hex = "0.4"
 hickory-proto = "0.26.1"
 ipnet = "2"
@@ -63,6 +65,9 @@ webpki-roots = { workspace = true, optional = true }
 [features]
 default = ["bundled-ca-roots"]
 bundled-ca-roots = ["dep:webpki-roots"]
+# Enforces Cedar-authored sandbox policies. Without it, the supervisor
+# rejects Cedar policies. Enabled through `openshell-supervisor/cedar`.
+cedar = ["dep:openshell-policy-cedar", "dep:globset", "openshell-policy/cedar"]
 
 [dev-dependencies]
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
@@ -70,6 +75,8 @@ openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = 
 openshell-driver-vm = { path = "../openshell-driver-vm", default-features = false, features = ["allocation-tracking"] }
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 openshell-otel = { path = "../openshell-otel" }
+# Only the Cedar parity tests use it. It does not enable Cedar.
+openshell-providers = { path = "../openshell-providers" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 temp-env = "0.3"

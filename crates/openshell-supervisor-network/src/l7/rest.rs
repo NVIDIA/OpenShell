@@ -23,7 +23,7 @@ use http_response::{
 use crate::l7::EndpointObserver;
 use crate::l7::http::{parse_chunk_size_line, validate_chunk_trailer_line};
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
-use crate::opa::PolicyGenerationGuard;
+use crate::policy_types::PolicyGenerationGuard;
 use aws_sigv4::http_request::SignableBody;
 use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, miette};
@@ -6189,7 +6189,7 @@ mod tests {
             .expect("install MCP test inventory");
         let reset = receiver.recv().await.expect("inventory reset");
         assert!(matches!(reset, EndpointStatusCommand::Reset { .. }));
-        let value = regorus::Value::from_json_str(&format!(
+        let value = serde_json::from_str::<crate::policy_types::EndpointConfig>(&format!(
             r#"{{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"{endpoint_id}","policy_hash":"policy","provider_credentialed":true}}"#
         ))
         .expect("parse MCP config JSON");
@@ -6204,7 +6204,7 @@ mod tests {
         for disconnect_client in [false, true] {
             let (observer, mut receiver) = test_endpoint_observer().await;
             let config = crate::l7::parse_l7_config(
-                &regorus::Value::from_json_str(
+                &serde_json::from_str::<crate::policy_types::EndpointConfig>(
                     r#"{"protocol":"mcp","mcp_versions":["2025-11-25"]}"#,
                 )
                 .expect("parse MCP config JSON"),

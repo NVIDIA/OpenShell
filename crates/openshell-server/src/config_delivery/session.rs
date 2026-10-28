@@ -27,7 +27,8 @@ use super::{DeliveryDisposition, MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES, Supervisor
 use crate::ServerState;
 use crate::grpc::policy::{
     build_provider_environment_snapshot_from_inputs, build_sandbox_config_snapshot_from_inputs,
-    is_configuration_rejection, load_sandbox_config_inputs, unadmitted_sandbox_config,
+    is_configuration_rejection, load_sandbox_config_inputs, require_supervisor_cedar_support,
+    unadmitted_sandbox_config,
 };
 use crate::persistence::ObjectId;
 use crate::supervisor_session::{AcceptedSession, SupervisorSessionRegistry};
@@ -866,9 +867,11 @@ impl SessionBootstrap {
 }
 
 /// Build the bootstrap a streamed-apply session is accepted with.
+/// `supports_cedar_policy` is the supervisor's hello capability.
 pub async fn build_session_bootstrap(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
+    supports_cedar_policy: bool,
 ) -> Result<SessionBootstrap, Status> {
     // Bootstraps share the build permits with session reconciliation, so a
     // burst of reconnects, such as a replica's sessions redirected at
@@ -879,7 +882,7 @@ pub async fn build_session_bootstrap(
         .acquire()
         .await
         .expect("the build semaphore is never closed");
-    let bootstrap = build_config_bootstrap(state, sandbox).await;
+    let bootstrap = build_config_bootstrap(state, sandbox, supports_cedar_policy).await;
     let outcome = bootstrap
         .as_ref()
         .map_or("build_failed", |bootstrap| bootstrap.outcome.label());
@@ -896,10 +899,13 @@ pub async fn build_session_bootstrap(
 
 /// Build both parts of a session's configuration from one load of their
 /// inputs. Only a failure to read the stored configuration refuses the
-/// session; anything the supervisor can act on is delivered.
+/// session; anything the supervisor can act on is delivered. A Cedar policy
+/// a supervisor without Cedar support cannot enforce is delivered not
+/// admitted, as an invalid stored configuration is.
 async fn build_config_bootstrap(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
+    supports_cedar_policy: bool,
 ) -> Result<SessionBootstrap, Status> {
     tokio::time::timeout(CONFIG_BOOTSTRAP_BUILD_TIMEOUT, async {
         let built = async {
@@ -908,22 +914,26 @@ async fn build_config_bootstrap(
             Ok::<_, Status>((inputs, sandbox_config))
         }
         .await;
+        let rejected = |error: Status| {
+            let sandbox_config = unadmitted_sandbox_config(state, sandbox, &error);
+            SessionBootstrap {
+                config: SupervisorConfig {
+                    provider_environment: super::unresolved_provider_environment(&sandbox_config),
+                    sandbox_config,
+                },
+                outcome: BootstrapOutcome::Rejected,
+            }
+        };
         let (inputs, sandbox_config) = match built {
             Ok(built) => built,
-            Err(error) if is_configuration_rejection(&error) => {
-                let sandbox_config = unadmitted_sandbox_config(state, sandbox, &error);
-                return Ok(SessionBootstrap {
-                    config: SupervisorConfig {
-                        provider_environment: super::unresolved_provider_environment(
-                            &sandbox_config,
-                        ),
-                        sandbox_config,
-                    },
-                    outcome: BootstrapOutcome::Rejected,
-                });
-            }
+            Err(error) if is_configuration_rejection(&error) => return Ok(rejected(error)),
             Err(error) => return Err(error),
         };
+        if let Err(error) =
+            require_supervisor_cedar_support(supports_cedar_policy, sandbox_config.policy.as_ref())
+        {
+            return Ok(rejected(error));
+        }
         let provider_environment = tokio::time::timeout(
             super::PROVIDER_ENVIRONMENT_BUILD_TIMEOUT,
             build_provider_environment_snapshot_from_inputs(state, &inputs, true, true),
@@ -2295,7 +2305,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             .await
             .unwrap()
             .expect("sandbox exists");
-        let bootstrap = build_config_bootstrap(state, &sandbox).await.unwrap();
+        let bootstrap = build_config_bootstrap(state, &sandbox, true).await.unwrap();
         assert_eq!(bootstrap.outcome, BootstrapOutcome::Built);
         bootstrap.config
     }
@@ -2533,6 +2543,89 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             stored_sandbox(&state, sandbox_id).await.phase(),
             SandboxPhase::Ready as i32
         );
+    }
+
+    /// The bootstrap a push supervisor advertising `features` is accepted
+    /// with.
+    async fn accepted_bootstrap(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        features: StreamFeatures,
+    ) -> SandboxConfigSnapshot {
+        let mut harness =
+            crate::grpc::test_support::connect_supervisor_stream(state, sandbox_id, features)
+                .await
+                .expect("push supervisor connects");
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected SessionAccepted");
+        };
+        assert!(accepted.config_push_enabled);
+        accepted
+            .bootstrap
+            .and_then(|bootstrap| bootstrap.sandbox_config)
+            .expect("bootstrap carries a sandbox configuration")
+    }
+
+    async fn push_state_with_policy(sandbox_id: &str, policy: SandboxPolicy) -> Arc<ServerState> {
+        let state = push_state().await;
+        let mut sandbox = sandbox_record(sandbox_id, sandbox_id);
+        sandbox.spec = Some(SandboxSpec {
+            policy: Some(policy),
+            ..Default::default()
+        });
+        state.store.put_message(&sandbox).await.unwrap();
+        state
+    }
+
+    #[cfg(feature = "cedar")]
+    #[tokio::test]
+    async fn push_bootstrap_withholds_cedar_from_a_supervisor_without_cedar_support() {
+        let sandbox_id = "sb-push-cedar";
+        let policy = SandboxPolicy {
+            version: 1,
+            cedar_policy_source: "permit(principal, action == \
+                Sandbox::Action::\"NetworkConnect\", resource == \
+                Sandbox::NetworkEndpoint::\"api.github.com:443\");"
+                .to_string(),
+            ..Default::default()
+        };
+
+        let state = push_state_with_policy(sandbox_id, policy.clone()).await;
+        let capable = accepted_bootstrap(&state, sandbox_id, StreamFeatures::Apply).await;
+        assert!(capable.configuration_admitted);
+        assert_eq!(
+            capable
+                .policy
+                .expect("Cedar policy delivered")
+                .cedar_policy_source,
+            policy.cedar_policy_source
+        );
+
+        // Never an empty policy an older supervisor would apply as YAML.
+        let state = push_state_with_policy(sandbox_id, policy).await;
+        let incapable =
+            accepted_bootstrap(&state, sandbox_id, StreamFeatures::ApplyWithoutCedar).await;
+        assert!(!incapable.configuration_admitted);
+        assert!(incapable.policy.is_none(), "{incapable:?}");
+        assert!(
+            incapable.configuration_error.contains("Cedar"),
+            "{}",
+            incapable.configuration_error
+        );
+    }
+
+    #[tokio::test]
+    async fn push_bootstrap_delivers_yaml_to_a_supervisor_without_cedar_support() {
+        let sandbox_id = "sb-push-yaml";
+        let state =
+            push_state_with_policy(sandbox_id, openshell_policy::restrictive_default_policy())
+                .await;
+        let bootstrap =
+            accepted_bootstrap(&state, sandbox_id, StreamFeatures::ApplyWithoutCedar).await;
+        assert!(bootstrap.configuration_admitted);
+        assert!(bootstrap.policy.is_some());
     }
 
     #[test]

@@ -8,6 +8,9 @@
 //! [`crate::client::OpenShellClient`] doesn't expose the RPC or field you
 //! need. The high-level surface is sandbox-focused for MVP; providers,
 //! policy, logs, settings, SSH, and forwarding all live here.
+//! Before sending a Cedar policy, call
+//! [`crate::OpenShellClient::require_cedar_policy_support`] to reject older
+//! gateways that would discard Cedar fields.
 //!
 //! ```ignore
 //! use openshell_sdk::{ClientConfig, OpenShellClient};

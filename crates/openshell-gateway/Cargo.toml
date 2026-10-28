@@ -42,7 +42,7 @@ openshell-driver-mxc = { path = "../openshell-driver-mxc", optional = true }
 [features]
 default = ["telemetry", "in-tree-compute-drivers"]
 # Opt-in bundle for development-only features; stable builds leave it off.
-dev = ["openshell-server/dev"]
+dev = ["openshell-server/dev", "cedar"]
 in-tree-compute-drivers = [
     "compute-driver-docker",
     "compute-driver-kubernetes",
@@ -76,6 +76,9 @@ telemetry = ["openshell-core/telemetry", "openshell-server/telemetry"]
 ## `rust:verify:defaults-without-telemetry`.
 defaults-without-telemetry = ["in-tree-compute-drivers"]
 vendored-z3 = ["openshell-server/vendored-z3"]
+## Validate and serve Cedar-authored sandbox policies. Included by `dev`;
+## off by default.
+cedar = ["openshell-server/cedar"]
 
 [lints]
 workspace = true

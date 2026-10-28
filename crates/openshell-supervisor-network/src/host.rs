@@ -33,6 +33,7 @@ use crate::l7::tls::{
     write_ca_files,
 };
 use crate::opa::OpaEngine;
+use crate::policy_engine::PolicyEngine;
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::ProxyHandle;
 
@@ -96,7 +97,7 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         ));
     }
 
-    let engine = Arc::new(OpaEngine::from_proto(&config.policy)?);
+    let engine = PolicyEngine::from(Arc::new(OpaEngine::from_proto(&config.policy)?));
     let (_workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
     let policy_local_ctx = Arc::new(PolicyLocalContext::new(
         Some(config.policy.clone()),
