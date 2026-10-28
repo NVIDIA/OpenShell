@@ -41,6 +41,9 @@ tag, or start a second `Pre-release` run for a tag; it has no concurrency guard.
 - `Release` (`release.yml`) is dispatched by hand with the stable version. It
   picks the highest `-pre.N` on `main` whose whole `Pre-release` run passed,
   creates the stable tag on that commit, and publishes without requalifying.
+- Pre-release and stable builds leave the `dev` feature disabled. Release
+  Dev enables it through `dev-build: true`. Normal workspace builds, lint,
+  and tests enable `dev` without separate CI lanes for development features.
 
 ## Setup
 
