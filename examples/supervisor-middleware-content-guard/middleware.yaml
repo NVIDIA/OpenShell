@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Middleware for policy.cedar, passed with --middleware. It is the
+# network_middlewares section of policy.yaml, which a Cedar policy cannot
+# carry because middleware is configuration rather than access control.
+
+network_middlewares:
+  prototype-content-guard:
+    name: Prototype content guard
+    middleware: content-guard-example
+    order: 10
+    config:
+      mode: redact
+      terms:
+        - prototype-secret
+        - internal-only
+      replacement: "[FILTERED]"
+    on_error: fail_closed
+    endpoints:
+      include:
+        - httpbin.org
+        - host.openshell.internal

@@ -14,14 +14,29 @@
 #   6. Shows logs and cleans up
 #
 # Usage: bash examples/sandbox-policy-quickstart/demo.sh
+#
+# POLICY_FORMAT=cedar runs the same walkthrough with a Cedar policy: the
+# sandbox starts from the filesystem rules of policy.cedar, and step 4 sets
+# the whole of policy.cedar, since Cedar policies are replaced, not merged.
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SANDBOX_NAME="policy-demo"
 SSH_CONFIG=$(mktemp)
+POLICY_FORMAT="${POLICY_FORMAT:-yaml}"
+case "$POLICY_FORMAT" in
+    yaml | cedar) ;;
+    *)
+        printf 'POLICY_FORMAT must be yaml or cedar\n' >&2
+        exit 2
+        ;;
+esac
+POLICY_DIR=$(mktemp -d)
 
 cleanup() {
     rm -f "$SSH_CONFIG"
+    rm -rf "$POLICY_DIR"
     printf '\n'
     step "Cleaning up"
     openshell sandbox delete "$SANDBOX_NAME" 2>/dev/null || true
@@ -84,11 +99,23 @@ wait_for_ssh() {
 # ------------------------------------------------------------------
 
 step "1/7  Creating sandbox \"${SANDBOX_NAME}\" (default-deny networking)"
-run openshell sandbox create \
-    --name "$SANDBOX_NAME" \
-    --no-auto-providers \
-    --no-tty \
-    -- echo "sandbox ready"
+if [[ "$POLICY_FORMAT" == "cedar" ]]; then
+    # The filesystem rules of policy.cedar, without its network rules.
+    sed '/^\/\/ network_policies\.github_api:/,$d' "${SCRIPT_DIR}/policy.cedar" \
+        > "${POLICY_DIR}/initial.cedar"
+    run openshell sandbox create \
+        --name "$SANDBOX_NAME" \
+        --policy "${POLICY_DIR}/initial.cedar" \
+        --no-auto-providers \
+        --no-tty \
+        --detach
+else
+    run openshell sandbox create \
+        --name "$SANDBOX_NAME" \
+        --no-auto-providers \
+        --no-tty \
+        --detach
+fi
 
 step "Connecting to sandbox"
 openshell sandbox ssh-config "$SANDBOX_NAME" > "$SSH_CONFIG"
@@ -118,11 +145,17 @@ openshell logs "$SANDBOX_NAME" --since 1m --source sandbox -n 10 2>&1 \
 # ------------------------------------------------------------------
 
 step "4/7  Adding a read-only GitHub API rule"
-run openshell policy update "$SANDBOX_NAME" \
-    --rule-name github_api \
-    --binary /usr/bin/curl \
-    --add-endpoint api.github.com:443:read-only:rest:enforce \
-    --wait
+if [[ "$POLICY_FORMAT" == "cedar" ]]; then
+    run openshell policy set "$SANDBOX_NAME" \
+        --policy "${SCRIPT_DIR}/policy.cedar" \
+        --wait
+else
+    run openshell policy update "$SANDBOX_NAME" \
+        --rule-name github_api \
+        --binary /usr/bin/curl \
+        --add-endpoint api.github.com:443:read-only:rest:enforce \
+        --wait
+fi
 
 # ------------------------------------------------------------------
 
@@ -140,10 +173,12 @@ sandbox_exec curl -sS --max-time 10 https://api.github.com/octocat | sed 's/^/  
 
 step "6/7  Attempting POST — should be BLOCKED by L7"
 printf "  ${BOLD}\$ curl -sS -X POST https://api.github.com/repos/octocat/hello-world/issues -d '{\"title\":\"oops\"}'${RESET}\n"
+# ssh joins its arguments into one remote command line, so quote the header
+# and body for the remote shell.
 RESPONSE=$(sandbox_exec curl -sS --max-time 10 -X POST \
     https://api.github.com/repos/octocat/hello-world/issues \
-    -H "Content-Type: application/json" \
-    -d '{"title":"oops"}')
+    -H "'Content-Type: application/json'" \
+    -d "'{\"title\":\"oops\"}'")
 printf "  ${YELLOW}%s${RESET}\n" "$RESPONSE"
 
 # ------------------------------------------------------------------

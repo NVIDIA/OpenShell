@@ -18,6 +18,10 @@ and keeps it running for interactive use.
 Options:
   --test-suite, --test  Run the governance smoke test suite, then stop.
   -h, --help            Show this help.
+
+Environment:
+  POLICY_FORMAT         Governance policy format: yaml (default) uses
+                        policy.yaml; cedar uses policy.cedar.
 EOF
 }
 
@@ -39,11 +43,20 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
+POLICY_FORMAT="${POLICY_FORMAT:-yaml}"
+case "$POLICY_FORMAT" in
+  yaml | cedar) ;;
+  *)
+    echo "POLICY_FORMAT must be yaml or cedar" >&2
+    exit 2
+    ;;
+esac
+
 TMPDIR="$(mktemp -d)"
 LOG_DIR="$TMPDIR/logs"
 JWT_DIR="$TMPDIR/jwt"
 GATEWAY_CONFIG="$TMPDIR/gateway.toml"
-POLICY_FILE="$TMPDIR/policy.yaml"
+POLICY_FILE="$TMPDIR/policy.$POLICY_FORMAT"
 PROFILE_DIR="$TMPDIR/profiles"
 SETUP_LOG="$LOG_DIR/setup.log"
 GATEWAY_LOG="$LOG_DIR/gateway.log"
@@ -344,6 +357,7 @@ gateway_id = "$RUN_ID"
 [[openshell.gateway.interceptors]]
 name = "provider-governance"
 grpc_endpoint = "http://$INTERCEPTOR_ADDR"
+allow_insecure_transport = true
 order = 10
 failure_policy = "fail_closed"
 binding_policy = "allowlist"
@@ -437,6 +451,77 @@ configure_gateway() {
   wait_for_profile "slack"
 }
 
+# Rewrites the governance policy file with an added example_api rule, which
+# the interceptor reloads and propagates to running sandboxes.
+write_reloaded_policy() {
+  if [[ "$POLICY_FORMAT" == "cedar" ]]; then
+    cat >"$POLICY_FILE" <<'EOF'
+permit (
+    principal is Sandbox::Process,
+    action in [Sandbox::Action::"ReadFile", Sandbox::Action::"WriteFile"],
+    resource is Sandbox::FilesystemPath
+)
+when {
+    resource in Sandbox::FilesystemPath::"/sandbox"
+    || resource in Sandbox::FilesystemPath::"/tmp"
+    || resource in Sandbox::FilesystemPath::"/dev/null"
+};
+
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"ReadFile",
+    resource is Sandbox::FilesystemPath
+)
+when {
+    resource in Sandbox::FilesystemPath::"/usr"
+    || resource in Sandbox::FilesystemPath::"/lib"
+    || resource in Sandbox::FilesystemPath::"/proc"
+    || resource in Sandbox::FilesystemPath::"/dev/urandom"
+    || resource in Sandbox::FilesystemPath::"/app"
+    || resource in Sandbox::FilesystemPath::"/etc"
+    || resource in Sandbox::FilesystemPath::"/var/log"
+};
+
+@id("example_api/connect")
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"NetworkConnect",
+    resource == Sandbox::NetworkEndpoint::"example.com:443"
+);
+
+@id("example_api/read-only")
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"example.com:443"
+)
+when { ["GET", "HEAD", "OPTIONS"].contains(context.method) };
+EOF
+    return
+  fi
+  cat >"$POLICY_FILE" <<'EOF'
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_write: [/sandbox, /tmp, /dev/null]
+
+landlock:
+  compatibility: best_effort
+
+network_policies:
+  example_api:
+    name: example-api
+    endpoints:
+    - host: example.com
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+EOF
+}
+
 run_suite() {
   expect_output_contains "lists github profile" "github" "${CLI[@]}" profile list
   expect_output_contains "lists slack profile" "slack" "${CLI[@]}" profile list
@@ -510,27 +595,7 @@ EOF
   fi
   pass "reads initial governance profile signature"
 
-  cat >"$POLICY_FILE" <<'EOF'
-version: 1
-
-filesystem_policy:
-  include_workdir: true
-  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
-  read_write: [/sandbox, /tmp, /dev/null]
-
-landlock:
-  compatibility: best_effort
-
-network_policies:
-  example_api:
-    name: example-api
-    endpoints:
-    - host: example.com
-      port: 443
-      protocol: rest
-      enforcement: enforce
-      access: read-only
-EOF
+  write_reloaded_policy
   wait_for_output_contains "gateway sees policy.yaml reload" "example_api" "${CLI[@]}" policy get "$SANDBOX_NAME" --full -o json
   local policy_reload_hash
   policy_reload_hash="$(policy_hash_for_sandbox "$SANDBOX_NAME")"
@@ -618,7 +683,7 @@ EOF
   fi
   wait_for_output_contains "running sandbox logs github profile reload" "$profile_reload_hash" "${CLI[@]}" logs "$SANDBOX_NAME" --source sandbox --since 90s
 
-  expect_failure "denies policy replacement" "${CLI[@]}" policy set "$SANDBOX_NAME" --policy "$EXAMPLE_DIR/policy.yaml"
+  expect_failure "denies policy replacement" "${CLI[@]}" policy set "$SANDBOX_NAME" --policy "$EXAMPLE_DIR/policy.$POLICY_FORMAT"
 
   run_step "deletes governed sandbox" "${CLI[@]}" sandbox delete "$SANDBOX_NAME"
 }
@@ -664,7 +729,7 @@ run_setup_step "building governance interceptor" cargo build --quiet --manifest-
 run_setup_step "building CLI" cargo build --quiet -p openshell-cli --bin openshell
 
 generate_gateway_jwt_bundle
-cp "$EXAMPLE_DIR/policy.yaml" "$POLICY_FILE"
+cp "$EXAMPLE_DIR/policy.$POLICY_FORMAT" "$POLICY_FILE"
 write_gateway_config
 start_interceptor
 start_gateway

@@ -6,7 +6,16 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-POLICY_FILE="${SCRIPT_DIR}/policy.yaml"
+# POLICY_FORMAT=cedar uses policy.cedar instead of policy.yaml.
+POLICY_FORMAT="${POLICY_FORMAT:-yaml}"
+case "$POLICY_FORMAT" in
+    yaml | cedar) ;;
+    *)
+        printf 'POLICY_FORMAT must be yaml or cedar\n' >&2
+        exit 2
+        ;;
+esac
+POLICY_FILE="${SCRIPT_DIR}/policy.${POLICY_FORMAT}"
 CLIENT_FILE="${SCRIPT_DIR}/redis_client.py"
 
 SANDBOX_NAME="${SANDBOX_NAME:-tcp-redis-demo}"
@@ -135,7 +144,7 @@ run openshell sandbox create \
     --upload "${CLIENT_FILE}:/sandbox" \
     --no-auto-providers \
     --no-tty \
-    -- echo 'sandbox ready'
+    --detach
 
 printf '\nRunning native Redis commands from the sandbox...\n'
 run openshell sandbox exec \

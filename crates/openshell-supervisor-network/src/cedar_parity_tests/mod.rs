@@ -30,6 +30,7 @@
 //! tally printed gives the totals (cases, same, known differences) for the
 //! whole run.
 
+mod examples;
 mod ported_opa_a;
 mod ported_opa_b;
 mod ported_phase1;

@@ -77,6 +77,11 @@ The example policy allows any sandbox binary to use this one Redis endpoint so
 the demo works across base images with different Python installation paths. In
 a production policy, replace `/**` with the exact path of the client binary.
 
+`policy.cedar` is the same policy in Cedar, with `@transport("tcp")` in place of
+`protocol: tcp`. Run the demo with `POLICY_FORMAT=cedar` to use it.
+Cedar needs a development build of the gateway and supervisor: Release Dev,
+or `OPENSHELL_BUILD_CEDAR=1` for local e2e builds.
+
 ## Configuration
 
 Override resource names or the image without editing the files:
