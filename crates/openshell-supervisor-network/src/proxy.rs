@@ -15,9 +15,9 @@ use openshell_sandbox_backend::test_support as rpc_test;
 use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
-#[cfg(any(target_os = "linux", test))]
-use crate::policy_dns::PolicyEndpointId;
-use crate::policy_dns::{MappingLookup, MappingLookupError, ResolvedEndpointStore};
+use crate::policy_dns::{
+    MappingLookup, MappingLookupError, PolicyEndpointId, ResolvedEndpointStore,
+};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::upstream_proxy::{self, UpstreamProxyConfig};
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
@@ -83,7 +83,8 @@ enum ProxyAcceptError {
 
 use self::destination::{
     DestinationDenial, DestinationDenialKind, DestinationRequest, DestinationValidationPlan,
-    build_pinned_validation_plan, build_validation_plan, validate_destination,
+    build_pinned_validation_plan, build_validation_plan, filter_resolved_addresses,
+    validate_destination,
 };
 use self::egress::{
     EgressDecision, EgressIntent, EndpointDecision, IdentityUnavailableReason, L7ConfigSnapshot,
@@ -743,6 +744,20 @@ async fn preauthorize_transparent_open(
         let _ = completion.send(TcpOpenDecision::Denied(denial));
         return None;
     }
+    if let Err(denial) =
+        hydrate_destination_plan(&mut decision, backend_host_gateway, trusted_host_gateway)
+    {
+        warn!(%destination, reason = %denial.reason, "Denied staged transparent destination");
+        emit_staged_transparent_denial(
+            destination,
+            mapped_host,
+            &binary_identity,
+            &denial.reason,
+            "transparent_tcp_destination_denied",
+        );
+        let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
+        return None;
+    }
     // A synthetic destination may dial only the addresses pinned for the
     // generation that produced this decision. Re-acquiring the mapping at that
     // generation keeps a policy reload between correlation and authorization
@@ -783,20 +798,6 @@ async fn preauthorize_transparent_open(
             }
         },
     };
-    if let Err(denial) =
-        hydrate_destination_plan(&mut decision, backend_host_gateway, trusted_host_gateway)
-    {
-        warn!(%destination, reason = %denial.reason, "Denied staged transparent destination");
-        emit_staged_transparent_denial(
-            destination,
-            mapped_host,
-            &binary_identity,
-            &denial.reason,
-            "transparent_tcp_destination_denied",
-        );
-        let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
-        return None;
-    }
     if let Some(plan) = pinned_plan {
         decision.endpoint.destination = Some(plan);
     }
@@ -950,8 +951,9 @@ fn resolve_transparent_target(
 }
 
 /// Re-acquire a policy DNS mapping at the generation that produced
-/// `decision` and pin its addresses. Observation records, stale mappings, and
-/// unmapped ports fail closed.
+/// `decision`, select only process-authorized endpoint contracts, and apply
+/// the hydrated destination restrictions before pinning. Observation records,
+/// stale mappings, unmatched endpoints, and unmapped ports fail closed.
 fn pinned_transparent_plan(
     store: &ResolvedEndpointStore,
     destination: SocketAddr,
@@ -963,8 +965,29 @@ fn pinned_transparent_plan(
         decision.policy_generation,
         std::time::Instant::now(),
     )?;
-    build_pinned_validation_plan(mapping.pinned_addresses())
-        .map_err(|_| MappingLookupError::InvalidMapping)
+    let endpoint_ids = decision
+        .endpoint
+        .matched_endpoints
+        .iter()
+        .map(|endpoint| PolicyEndpointId {
+            policy_name: endpoint.policy_name.clone(),
+            endpoint_index: endpoint.endpoint_index,
+        })
+        .collect::<Vec<_>>();
+    let addresses = mapping.pinned_addresses_for(&endpoint_ids)?;
+    let plan = decision
+        .endpoint
+        .destination
+        .as_ref()
+        .ok_or(MappingLookupError::InvalidMapping)?;
+    let addresses = filter_resolved_addresses(
+        plan,
+        mapping.record.normalized_name.as_str(),
+        destination.port(),
+        &addresses,
+    )
+    .map_err(|_| MappingLookupError::InvalidMapping)?;
+    build_pinned_validation_plan(addresses).map_err(|_| MappingLookupError::InvalidMapping)
 }
 
 fn valid_policy_local_request(method: &str, target: &str, request_headers: &str) -> bool {
@@ -7859,6 +7882,161 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     }
 
     #[tokio::test]
+    async fn staged_transparent_pins_preserve_process_destination_authorization() {
+        for (family, private, public, second_public) in [
+            (
+                crate::policy_dns::AddressFamily::Ipv4,
+                "10.2.3.4",
+                "8.8.8.8",
+                "8.8.4.4",
+            ),
+            (
+                crate::policy_dns::AddressFamily::Ipv6,
+                "fd12::4",
+                "2001:4860:4860::8888",
+                "2001:4860:4860::8844",
+            ),
+        ] {
+            let private = private.parse::<IpAddr>().unwrap();
+            let public = public.parse::<IpAddr>().unwrap();
+            let second_public = second_public.parse::<IpAddr>().unwrap();
+            for endpoint in [
+                "host: '*.service.example'",
+                "host: db.service.example, advisor_proposed: true",
+            ] {
+                // No contract for the caller, mixed pins in its contract, a
+                // compatible union, explicit narrow permission, and no usable pin.
+                for case in 0..6 {
+                    let allowed_ips = if case == 3 {
+                        format!(", allowed_ips: ['{private}']")
+                    } else {
+                        String::new()
+                    };
+                    let other_binary = if case == 5 {
+                        "/usr/bin/curl"
+                    } else {
+                        "/usr/bin/psql"
+                    };
+                    let policy = format!(
+                        r"
+network_policies:
+  other_binary:
+    name: other_binary
+    endpoints: [{{ host: db.service.example, port: 5432, protocol: tcp }}]
+    binaries: [{{ path: {other_binary} }}]
+  caller:
+    name: caller
+    endpoints:
+      - {{ {endpoint}, port: 5432, protocol: tcp{allowed_ips} }}
+      - {{ {endpoint}, port: 5432, protocol: tcp{allowed_ips} }}
+    binaries: [{{ path: /usr/bin/curl }}]
+filesystem_policy: {{ include_workdir: true, read_only: [], read_write: [] }}
+landlock: {{ compatibility: best_effort }}
+process: {{ run_as_user: sandbox, run_as_group: sandbox }}
+"
+                    );
+                    let engine = native_identity_engine(
+                        include_str!("../data/sandbox-policy.rego"),
+                        &policy_with_native_executable_paths(&policy),
+                    )
+                    .unwrap();
+                    let store = policy_dns_test_store();
+                    let contract = |policy_name: &str, endpoint_index, addresses: Vec<IpAddr>| {
+                        crate::policy_dns::ResolvedPortContract {
+                            endpoint_id: PolicyEndpointId {
+                                policy_name: policy_name.to_string(),
+                                endpoint_index,
+                            },
+                            port: 5432,
+                            destination_plan: DestinationValidationPlan {
+                                address_authorization:
+                                    destination::AddressAuthorization::ExactDeclaredHost,
+                            },
+                            pinned_addresses: addresses,
+                        }
+                    };
+                    let mut contracts = vec![contract("other_binary", 0, vec![private])];
+                    if case != 0 {
+                        contracts.push(contract(
+                            "caller",
+                            0,
+                            if case == 4 {
+                                vec![private]
+                            } else {
+                                vec![private, public]
+                            },
+                        ));
+                    }
+                    if case == 2 {
+                        contracts.push(contract("caller", 1, vec![second_public]));
+                    }
+                    let record = store
+                        .publish(
+                            crate::policy_dns::PublishRequest {
+                                normalized_name: crate::policy_dns::NormalizedName::parse(
+                                    "db.service.example",
+                                )
+                                .unwrap(),
+                                family,
+                                allocation_identity: [1; 32],
+                                policy_generation: engine.current_generation(),
+                                ttl: std::time::Duration::from_secs(30),
+                                contracts,
+                            },
+                            engine.current_generation(),
+                            std::time::Instant::now(),
+                        )
+                        .unwrap();
+                    let (open, completion) = staged_curl_open(
+                        SocketAddr::new(record.synthetic_address, 5432),
+                        engine.current_generation(),
+                    );
+                    let accepted = preauthorize_transparent_open(
+                        open,
+                        Some(&store),
+                        &engine,
+                        &BinaryIdentityCache::new(),
+                        None,
+                        None,
+                        false,
+                        None,
+                    )
+                    .await;
+                    if case == 0 || case == 4 {
+                        assert!(accepted.is_none(), "{endpoint}: case {case}, {family:?}");
+                        assert_eq!(
+                            completion.await.unwrap(),
+                            TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination)
+                        );
+                    } else {
+                        let (_, _, _, transparent) = accepted.expect("authorized endpoint pins");
+                        assert_eq!(completion.await.unwrap(), TcpOpenDecision::RelayReady);
+                        let (_, connector) =
+                            transparent.and_then(|open| open.authorization).unwrap();
+                        let expected = match case {
+                            2 => vec![
+                                SocketAddr::new(public, 5432),
+                                SocketAddr::new(second_public, 5432),
+                            ],
+                            3 => vec![SocketAddr::new(private, 5432)],
+                            5 => vec![
+                                SocketAddr::new(private, 5432),
+                                SocketAddr::new(public, 5432),
+                            ],
+                            _ => vec![SocketAddr::new(public, 5432)],
+                        };
+                        assert_eq!(
+                            connector.addrs(),
+                            expected,
+                            "{endpoint}: case {case}, {family:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn staged_transparent_open_proposes_a_denied_observation_hostname() {
         let engine = native_identity_engine(
             include_str!("../data/sandbox-policy.rego"),
@@ -7988,12 +8166,14 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             engine.current_generation(),
         );
         let decide = |host: &str, port| {
-            authorize_supplied_identity(
+            let mut decision = authorize_supplied_identity(
                 &engine,
                 &BinaryIdentityCache::new(),
                 EgressIntent::connect(host.to_string(), port),
                 &open.binary_identity,
-            )
+            );
+            hydrate_destination_plan(&mut decision, None, None).unwrap();
+            decision
         };
         let mapped_destination = SocketAddr::new(mapped.synthetic_address, 5432);
 
