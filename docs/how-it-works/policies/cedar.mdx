@@ -6,7 +6,6 @@ sidebar-title: "Cedar Policies"
 description: "Author an OpenShell sandbox policy in Cedar instead of YAML and understand which Cedar policy shapes OpenShell accepts."
 keywords: "Generative AI, Cybersecurity, Policy, Cedar, Network Policy, Landlock, Sandbox, Security"
 position: 8
-development-only: true
 ---
 
 A sandbox policy can be written in [Cedar](https://www.cedarpolicy.com/) instead of YAML. Cedar then decides every network connection, every inspected HTTP or JSON-RPC request, and the filesystem paths Landlock allows. A sandbox uses one format for its whole lifetime: YAML policies are evaluated by the built-in Rego engine, and Cedar policies by Cedar.
