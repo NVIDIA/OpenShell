@@ -379,6 +379,11 @@ pub struct ServerState {
     /// alongside `gateway_ring` so a redirect can name a dialable address.
     pub gateway_peers: Arc<std::sync::RwLock<HashMap<String, String>>>,
 
+    /// Replica serving the shared supervisor pool member that owns each
+    /// sandbox, keyed by sandbox ID. Refreshed by every pool reconciliation
+    /// pass so a pool sandbox's session is placed with its supervisor.
+    pub pool_session_parents: supervisor_pool::SessionParents,
+
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
@@ -519,6 +524,7 @@ impl ServerState {
             service_route_index,
             gateway_ring: Arc::new(std::sync::RwLock::new(gateway_ring::GatewayRing::default())),
             gateway_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            pool_session_parents: supervisor_pool::SessionParents::default(),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
@@ -842,6 +848,7 @@ pub(crate) async fn run_server(
             authority.clone(),
             state.credentials.clone(),
             state.replica_id.clone(),
+            state.pool_session_parents.clone(),
         )
         .start(shutdown_rx.clone());
         spawn_supervisor_token_refresh(authority, ttl, controller.clone(), shutdown_rx.clone());
