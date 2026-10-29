@@ -12,6 +12,7 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
+openshell-crypto = { path = "../../crates/openshell-crypto" }
 anyhow = "1"
 async-stream = "0.3"
 openshell-core = { path = "../../crates/openshell-core", default-features = false, features = ["jwt"] }

@@ -13,8 +13,8 @@ license = "Apache-2.0"
 repository = "https://github.com/NVIDIA/OpenShell"
 
 [workspace.dependencies]
-# Product backend selection. Consumer crates inherit this choice.
-openshell-crypto = { path = "crates/openshell-crypto", default-features = false, features = ["aws-lc"] }
+# Libraries inherit only the facade. Executable packages select their backend.
+openshell-crypto = { path = "crates/openshell-crypto", default-features = false }
 # Async runtime
 tokio = { version = "1.53.3", features = ["full"] }
 
@@ -74,7 +74,7 @@ opentelemetry-proto = { version = "0.33", default-features = false, features = [
 opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 opentelemetry-http = { version = "0.33", default-features = false }
-opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "gzip-tonic", "tls-aws-lc", "tls-roots", "trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "gzip-tonic", "tls-provider-agnostic", "tls-roots", "trace"] }
 tracing-opentelemetry = { version = "0.34", default-features = false, features = ["tracing-log"] }
 
 # Metrics

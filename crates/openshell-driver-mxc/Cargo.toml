@@ -37,7 +37,7 @@ openshell-supervisor-network = { path = "../openshell-supervisor-network" }
 windows = { workspace = true }
 
 [dev-dependencies]
-openshell-crypto = { workspace = true }
+openshell-crypto = { workspace = true, features = ["aws-lc"] }
 tokio = { workspace = true }
 # tempfile is not a workspace dependency; 3.27 is already resolved in Cargo.lock.
 tempfile = "3"

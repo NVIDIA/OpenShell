@@ -379,6 +379,7 @@ fn configure_gateway_tls(
     ca_pem: Vec<u8>,
     server_name: Option<&str>,
 ) -> Result<Endpoint> {
+    openshell_crypto::tls::ensure_default_provider();
     let mut tls_config = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem));
     if let Some(server_name) = server_name.filter(|name| !name.is_empty()) {
         tls_config = tls_config.domain_name(server_name);
