@@ -1330,6 +1330,23 @@ openshell sandbox create --name mxc-demo --detach --policy policy.yaml `
   --driver-config-json $config
 ```
 
+To hide files or directories inside the policy's filesystem grants, such as
+credential files in a writable working directory, add `denied_paths`:
+
+```shell
+$config = '{"mxc":{"command":["C:\\Windows\\System32\\cmd.exe","/d","/c","agent.cmd"],"cwd":"C:\\work","denied_paths":["C:\\work\\profile\\.env","C:\\work\\profile\\auth.json"]}}'
+```
+
+The workload cannot read or write a denied file, list a denied directory, or
+create a denied path. A denied file's name, size, timestamps and attributes
+remain visible to the workload, and a hard link to the file at another path
+the workload can read still exposes its contents. Each entry must be an
+absolute path that starts with a drive letter and whose parent directory
+exists, and must not equal or contain a filesystem grant, compared after
+resolving 8.3 short names and junctions and ignoring letter case. The driver
+rejects other entries before provisioning. Denied paths are fixed at sandbox
+creation.
+
 Supply workload environment through `sandbox create --env` or `--env-from`;
 it is not part of gateway configuration. The command runs from host files,
 not an OCI workload image.

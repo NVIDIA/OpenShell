@@ -148,6 +148,41 @@ command is supplied, the driver passes `mxc.command` to the supervisor rather
 than starting a scratch workload. An explicit generic canonical command retains
 precedence. Environment belongs in `--env` or `--env-from`, not gateway configuration.
 
+The optional `mxc.denied_paths` lists paths the workload cannot use, including
+inside the policy's filesystem grants: it cannot read or write a denied file,
+list a denied directory, or create a denied path. The driver passes the list to
+MXC as `filesystem.deniedPaths`. For example, to keep a profile directory
+writable while hiding its credential files:
+
+```powershell
+$config = '{"mxc":{"command":["C:\\Windows\\System32\\cmd.exe","/d","/c","agent.cmd"],"cwd":"C:\\work","denied_paths":["C:\\work\\profile\\.env","C:\\work\\profile\\auth.json"]}}'
+```
+
+Each entry must be an absolute path that starts with a drive letter, such as
+`C:\work\profile\.env`; forward slashes are converted to backslashes. A denied
+path may be absent, in which case the workload cannot create it, but its parent
+directory must exist because MXC refuses to start the ProcessContainer
+otherwise; to cover a missing directory, deny the directory itself. An entry
+must not equal or contain a filesystem grant, including the generation staging
+directory under `cwd` and the sandbox executable: MXC drops a grant that equals
+a denied path and keeps access to a grant nested inside a denied directory.
+MXC matches paths after resolving 8.3 short names and junctions and ignoring
+letter case, so preflight compares them the same way (following symbolic links
+too) and rejects these cases before provisioning. The parts of a path that
+do not exist, or that cannot be resolved, are compared as written.
+
+A denied file's name, size, timestamps and attributes remain visible to the
+workload, for example when it lists the parent directory; only the contents
+are protected. A deny covers the listed path: a hard link to the same file,
+created on the host before launch at a path the workload can read, still
+exposes the contents.
+
+Denied paths only remove access and are fixed at sandbox creation. They require
+a host whose `wxc-exec.exe --probe` reports
+`probes.baseContainerSupportsDenyPaths: true`. When the list is not empty, the
+driver sends MXC `fallback.allowDaclMutation: false`, so on a host without that
+support the launch fails and MXC does not change the ACLs of host files.
+
 When gateway TLS is enabled, configure the gateway-owned `guest_tls_ca`.
 The host supervisor verifies the gateway certificate with that CA and uses
 main's launch authentication bundle. Gateway client certificates and keys are
