@@ -411,7 +411,8 @@ namespace.
 
 The namespaced Role covers sandbox lifecycle, supervisor resources, and identity.
 Both the gateway chart and separate workspace chart grant these permissions.
-Stopped-sandbox updates need Pod listing to detect remaining workload or supervisor Pods:
+Stopped-sandbox updates use direct Pod `get` requests to check known workload and
+supervisor Pod names for remaining Pods.
 
 | API Group | Resource | Verbs |
 |---|---|---|

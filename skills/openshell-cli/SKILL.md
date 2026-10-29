@@ -570,8 +570,9 @@ complete the published
 [activation checklist](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#activate-sandbox-updates)
 before enabling `enable_sandbox_updates`. Keep it false during a rolling
 upgrade and never enable it merely to bypass a failed compatibility check.
-After activation, the RPC initially supports only stopped Kubernetes sandboxes;
-other drivers return `UNIMPLEMENTED`. Stop and
+After activation, image, command, and environment updates initially support only
+stopped Kubernetes sandboxes; other drivers return `UNIMPLEMENTED` for those
+fields. Metadata-only updates also support stopped sandboxes on other drivers. Stop and
 wait for `Stopped`, read the sandbox's current resource version through
 `GetSandbox`, call raw `UpdateSandbox` with the named workspace, sandbox name,
 selected image, command, environment overrides, labels or annotations, and required nonzero `expected_resource_version`, then start after
