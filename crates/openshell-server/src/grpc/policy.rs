@@ -5412,6 +5412,8 @@ pub(super) async fn handle_push_sandbox_logs(
     state: &Arc<ServerState>,
     request: Request<tonic::Streaming<PushSandboxLogsRequest>>,
 ) -> Result<Response<PushSandboxLogsResponse>, Status> {
+    const MAX_BATCH_LINES: usize = 100;
+
     let principal = request
         .extensions()
         .get::<Principal>()
@@ -5437,9 +5439,19 @@ pub(super) async fn handle_push_sandbox_logs(
         )
         .await?;
 
-        // A supervisor can replay up to 200 buffered lines after reconnecting.
-        let logs: Vec<_> = batch.logs.into_iter().take(200).collect();
+        let received_lines = batch.logs.len();
+        let logs: Vec<_> = batch.logs.into_iter().take(MAX_BATCH_LINES).collect();
         validate_sandbox_log_timestamps(&logs)?;
+
+        if received_lines > logs.len() {
+            warn!(
+                sandbox_id = %batch.sandbox_id,
+                received_lines,
+                accepted_lines = logs.len(),
+                dropped_lines = received_lines - logs.len(),
+                "Truncated sandbox log batch"
+            );
+        }
 
         for log in logs {
             let mut log = log;
@@ -8267,7 +8279,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_sandbox_logs_accepts_a_full_reconnect_buffer_and_caps_larger_batches() {
+    async fn push_sandbox_logs_accepts_batched_replay_and_warns_on_truncation() {
         use openshell_core::proto::open_shell_client::OpenShellClient;
         use openshell_core::proto::open_shell_server::OpenShellServer;
         use tokio_stream::wrappers::TcpListenerStream;
@@ -8303,7 +8315,28 @@ mod tests {
             .await
             .unwrap();
 
-        for count in [200, 0, 1, 50, 100, 101, 199, 201] {
+        let diagnostics = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter("off,openshell_server::grpc::policy=warn")
+            .with_writer(std::sync::Mutex::new(diagnostics.reopen().unwrap()))
+            .finish();
+        // This test uses a current-thread runtime, including the gateway tasks.
+        let _capture = tracing::subscriber::set_default(subscriber);
+        let mut seen_warnings = 0;
+
+        for (batch_size, count, accepted_count) in [
+            (200, 200, 100),
+            (1, 0, 0),
+            (1, 1, 1),
+            (50, 50, 50),
+            (100, 100, 100),
+            (101, 101, 100),
+            (199, 199, 100),
+            (201, 201, 100),
+            (50, 200, 200),
+            (50, 201, 201),
+        ] {
             state.tracing_log_bus.remove(sandbox_id);
             let logs: Vec<_> = (0..count)
                 .map(|index| SandboxLogLine {
@@ -8318,7 +8351,7 @@ mod tests {
                 .collect();
             let expected: Vec<_> = logs
                 .iter()
-                .take(200)
+                .take(accepted_count)
                 .cloned()
                 .map(|mut log| {
                     log.sandbox_id = sandbox_id.to_string();
@@ -8326,11 +8359,16 @@ mod tests {
                     log
                 })
                 .collect();
-            client
-                .push_sandbox_logs(tokio_stream::iter([PushSandboxLogsRequest {
+            let received_lines = logs.len();
+            let requests: Vec<_> = logs
+                .chunks(batch_size)
+                .map(|chunk| PushSandboxLogsRequest {
                     sandbox_id: sandbox_id.to_string(),
-                    logs,
-                }]))
+                    logs: chunk.to_vec(),
+                })
+                .collect();
+            client
+                .push_sandbox_logs(tokio_stream::iter(requests))
                 .await
                 .unwrap();
 
@@ -8350,9 +8388,34 @@ mod tests {
             assert_eq!(
                 received.len(),
                 expected.len(),
-                "gateway ingestion of a request containing {count} log lines"
+                "gateway ingestion of {count} log lines in batches of {batch_size}"
             );
-            assert_eq!(received, expected, "request containing {count} log lines");
+            assert_eq!(
+                received, expected,
+                "{count} log lines, batches of {batch_size}"
+            );
+
+            let warnings: Vec<serde_json::Value> = std::fs::read_to_string(diagnostics.path())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let emitted = &warnings[seen_warnings..];
+            assert_eq!(emitted.len(), usize::from(received_lines > accepted_count));
+            if let Some(warning) = emitted.first() {
+                assert_eq!(warning["level"], "WARN");
+                assert_eq!(
+                    warning["fields"],
+                    serde_json::json!({
+                        "message": "Truncated sandbox log batch",
+                        "sandbox_id": sandbox_id,
+                        "received_lines": received_lines,
+                        "accepted_lines": accepted_count,
+                        "dropped_lines": received_lines - accepted_count,
+                    })
+                );
+            }
+            seen_warnings = warnings.len();
         }
         server.abort();
     }
