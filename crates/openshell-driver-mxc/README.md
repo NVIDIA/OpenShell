@@ -148,11 +148,11 @@ command is supplied, the driver passes `mxc.command` to the supervisor rather
 than starting a scratch workload. An explicit generic canonical command retains
 precedence. Environment belongs in `--env` or `--env-from`, not gateway configuration.
 
-The optional `mxc.denied_paths` lists paths the workload cannot use, including
-inside the policy's filesystem grants: it cannot read or write a denied file,
-list a denied directory, or create a denied path. The driver passes the list to
-MXC as `filesystem.deniedPaths`. For example, to keep a profile directory
-writable while hiding its credential files:
+The optional `mxc.denied_paths` lists paths the workload cannot open, including
+inside the policy's filesystem grants: it cannot read, write or delete a denied
+file, list a denied directory, or create a denied path by name. The driver
+passes the list to MXC as `filesystem.deniedPaths`. For example, with a policy
+that grants `C:\work\profile` read-write, to hide the credential files in it:
 
 ```powershell
 $config = '{"mxc":{"command":["C:\\Windows\\System32\\cmd.exe","/d","/c","agent.cmd"],"cwd":"C:\\work","denied_paths":["C:\\work\\profile\\.env","C:\\work\\profile\\auth.json"]}}'
@@ -160,22 +160,43 @@ $config = '{"mxc":{"command":["C:\\Windows\\System32\\cmd.exe","/d","/c","agent.
 
 Each entry must be an absolute path that starts with a drive letter, such as
 `C:\work\profile\.env`; forward slashes are converted to backslashes. A denied
-path may be absent, in which case the workload cannot create it, but its parent
-directory must exist because MXC refuses to start the ProcessContainer
-otherwise; to cover a missing directory, deny the directory itself. An entry
-must not equal or contain a filesystem grant, including the generation staging
-directory under `cwd` and the sandbox executable: MXC drops a grant that equals
-a denied path and keeps access to a grant nested inside a denied directory.
-MXC matches paths after resolving 8.3 short names and junctions and ignoring
-letter case, so preflight compares them the same way (following symbolic links
-too) and rejects these cases before provisioning. The parts of a path that
-do not exist, or that cannot be resolved, are compared as written.
+path may be absent, but its parent directory must exist because MXC refuses to
+start the ProcessContainer otherwise; to cover a missing directory, deny the
+directory itself. An entry must not equal or contain a filesystem grant,
+including the generation staging directory under `cwd` and the sandbox
+executable: MXC drops a grant that equals a denied path and keeps access to a
+grant nested inside a denied directory.
 
-A denied file's name, size, timestamps and attributes remain visible to the
-workload, for example when it lists the parent directory; only the contents
-are protected. A deny covers the listed path: a hard link to the same file,
-created on the host before launch at a path the workload can read, still
-exposes the contents.
+MXC applies denied paths and grants to paths. The workload can rename a
+directory when the directory and its parent are both writable to it, and
+everything below that directory then sits at a path no denied path or read-only
+grant names. Preflight therefore rejects an entry below such a directory: two
+or more levels below a read-write grant root, inside a read-write grant nested
+in another read-write grant, or below a read-only grant whose root is two or
+more levels inside a read-write grant. The error names the directory; deny it
+instead, or move the entry directly into the read-write grant root. Entries
+directly inside a read-write grant root whose parent the workload cannot write,
+and entries below a read-only grant root that cannot be renamed, are accepted.
+
+MXC resolves 8.3 short names, junctions and letter case, and accepts grants in
+the `\\.\C:\`, `\\?\C:\`, `\??\C:\`, `\\?\GLOBALROOT\Device\...` and
+`\\?\Volume{...}\` spellings, so preflight compares resolved drive paths
+(following symbolic links too). The parts of a drive path that do not exist, or
+that cannot be resolved, are compared as written. While `denied_paths` is not
+empty, preflight rejects a grant it cannot resolve to a drive path: a UNC path,
+which MXC grants no access through, a path without a drive letter, or a device
+path that does not resolve.
+
+A denied path protects contents. The file's name, size, timestamps and
+attributes remain visible to the workload, for example when it lists the parent
+directory, and a hard link to the same file, created on the host before launch
+at a path the workload can read, still exposes the contents. MXC does not check
+the target of a rename against `deniedPaths`: when the parent directory is
+writable, the workload can rename one of its own files onto a denied name,
+which replaces a denied file on the host, or creates the file or directory when
+it is absent. The original contents stay unreadable, and an existing denied
+directory cannot be replaced. Denying the directory that holds such files
+prevents this, because nothing can be renamed into a denied directory.
 
 Denied paths only remove access and are fixed at sandbox creation. They require
 a host whose `wxc-exec.exe --probe` reports

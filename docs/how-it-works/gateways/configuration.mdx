@@ -1331,21 +1331,35 @@ openshell sandbox create --name mxc-demo --detach --policy policy.yaml `
 ```
 
 To hide files or directories inside the policy's filesystem grants, such as
-credential files in a writable working directory, add `denied_paths`:
+credential files in a writable working directory, add `denied_paths`. With a
+policy that grants `C:\work\profile` read-write:
 
 ```shell
 $config = '{"mxc":{"command":["C:\\Windows\\System32\\cmd.exe","/d","/c","agent.cmd"],"cwd":"C:\\work","denied_paths":["C:\\work\\profile\\.env","C:\\work\\profile\\auth.json"]}}'
 ```
 
-The workload cannot read or write a denied file, list a denied directory, or
-create a denied path. A denied file's name, size, timestamps and attributes
-remain visible to the workload, and a hard link to the file at another path
-the workload can read still exposes its contents. Each entry must be an
-absolute path that starts with a drive letter and whose parent directory
-exists, and must not equal or contain a filesystem grant, compared after
-resolving 8.3 short names and junctions and ignoring letter case. The driver
-rejects other entries before provisioning. Denied paths are fixed at sandbox
-creation.
+The workload cannot open a denied path: it cannot read, write or delete a
+denied file, list a denied directory, or create a denied path by name. A denied
+file's name, size, timestamps and attributes remain visible, and a hard link to
+the file at another path the workload can read still exposes its contents. MXC
+does not check the target of a rename against denied paths, so in a writable
+directory the workload can rename its own file onto a denied name: this
+replaces the denied file on the host, or creates it when it is absent, without
+exposing the original contents. An existing denied directory cannot be
+replaced, and denying the directory that holds such files prevents this.
+
+Each entry must be an absolute path that starts with a drive letter and whose
+parent directory exists, and must not equal or contain a filesystem grant.
+MXC enforces paths: the workload can rename a directory that is writable to it
+when the directory's parent is writable too, and an entry below that directory
+is then readable under a new path. The driver rejects such entries, including
+entries two or more levels below a read-write grant root and entries inside a
+read-write grant nested in another one; the error names the directory to deny
+instead. Paths are compared after resolving 8.3 short names, junctions, letter
+case, and the `\\.\`, `\\?\`, `\??\`, `GLOBALROOT` and volume GUID spellings
+MXC accepts for grants; with denied paths, a UNC grant or one that does not
+resolve to a local drive is rejected. These checks run before provisioning.
+Denied paths are fixed at sandbox creation.
 
 Supply workload environment through `sandbox create --env` or `--env-from`;
 it is not part of gateway configuration. The command runs from host files,

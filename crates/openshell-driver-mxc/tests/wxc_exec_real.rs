@@ -1005,6 +1005,369 @@ fn pc_oneshot_out_of_policy_write_denied() {
     );
 }
 
+// ── Denied paths and directory renames ───────────────────────────────────────
+
+/// Set in the environment of a `ProcessContainer` that runs this test binary
+/// as the workload of `pc_accepted_denied_paths_survive_directory_renames`.
+/// The value is the JSON plan `denied_paths_rename_workload` follows.
+const RENAME_WORKLOAD_PLAN: &str = "OPENSHELL_MXC_RENAME_WORKLOAD_PLAN";
+
+/// Contents of every denied file in the rename fixtures.
+const RENAME_SECRET: &str = "openshell-mxc-rename-fixture-secret";
+
+/// Workload half of `pc_accepted_denied_paths_survive_directory_renames`. It
+/// does nothing unless `RENAME_WORKLOAD_PLAN` is set. With a plan it reads
+/// each protected file, then renames each listed path through the Win32
+/// rename call, reads every protected file below it at its new path, renames
+/// it back, and writes what happened to the report file. Command-shell `ren` and `move` cannot stand in for this: in a
+/// `ProcessContainer` they fail for every path in a read-write grant, with or
+/// without denied paths.
+#[test]
+#[ignore = "requires real wxc-exec"]
+fn denied_paths_rename_workload() {
+    let Ok(plan) = std::env::var(RENAME_WORKLOAD_PLAN) else {
+        return;
+    };
+    let plan: serde_json::Value = serde_json::from_str(&plan).expect("workload plan");
+    let strings = |key: &str| -> Vec<PathBuf> {
+        plan[key]
+            .as_array()
+            .expect("plan list")
+            .iter()
+            .map(|value| PathBuf::from(value.as_str().expect("plan path")))
+            .collect()
+    };
+    let (protected, renamed) = (strings("protected"), strings("renamed"));
+    let read = |path: &Path| match std::fs::read_to_string(path) {
+        Ok(contents) => format!("read {}: {contents}", path.display()),
+        Err(error) => format!("read {}: error {error}", path.display()),
+    };
+    let mut report = Vec::new();
+    for path in &protected {
+        report.push(read(path));
+    }
+    for target in &renamed {
+        let mut moved = target.clone().into_os_string();
+        moved.push(".moved");
+        let moved = PathBuf::from(moved);
+        if let Err(error) = std::fs::rename(target, &moved) {
+            report.push(format!("rename {}: error {error}", target.display()));
+            continue;
+        }
+        report.push(format!("rename {}: renamed", target.display()));
+        for path in &protected {
+            if let Ok(rest) = path.strip_prefix(target) {
+                report.push(read(&moved.join(rest)));
+            }
+        }
+        if let Err(error) = std::fs::rename(&moved, target) {
+            report.push(format!("rename back {}: error {error}", moved.display()));
+        }
+    }
+    report.push("done".to_string());
+    std::fs::write(
+        plan["report"].as_str().expect("report path"),
+        report.join("\n"),
+    )
+    .expect("write report");
+}
+
+/// One filesystem layout for `pc_accepted_denied_paths_survive_directory_renames`,
+/// relative to its fixture directory.
+struct RenameShape {
+    name: &'static str,
+    read_write: &'static [&'static str],
+    read_only: &'static [&'static str],
+    denied: &'static [&'static str],
+}
+
+/// The driver's preflight result for a layout under `root`.
+fn rename_shape_preflight(
+    wxc: &Path,
+    root: &Path,
+    shape: &RenameShape,
+) -> Result<(), tonic::Status> {
+    use openshell_core::proto::compute::v1::{
+        DriverSandbox, DriverSandboxSpec, DriverSandboxTemplate,
+    };
+    let absolute = |paths: &[&str]| -> Vec<String> {
+        paths
+            .iter()
+            .map(|path| root.join(path).to_string_lossy().into_owned())
+            .collect()
+    };
+    let test_binary = std::env::current_exe()
+        .expect("test binary")
+        .to_string_lossy()
+        .into_owned();
+    let backend = openshell_driver_mxc::MxcComputeBackend::new(
+        "rename-shapes",
+        openshell_driver_mxc::MxcComputeConfig {
+            allow_driver_config: true,
+            wxc_exec_path: wxc.to_string_lossy().into_owned(),
+            grpc_endpoint: "http://127.0.0.1:1".into(),
+            supervisor_binary_path: test_binary.clone(),
+            sandbox_binary_path: test_binary,
+            state_dir: root.join("not-created"),
+            ..Default::default()
+        },
+    );
+    let serde_json::Value::Object(config) = serde_json::json!({
+        "command": ["C:\\Windows\\System32\\cmd.exe", "/c", "exit 0"],
+        "cwd": root.join("run"),
+        "denied_paths": absolute(shape.denied),
+    }) else {
+        unreachable!()
+    };
+    let sandbox = DriverSandbox {
+        id: "rename-shapes".into(),
+        name: "rename-shapes".into(),
+        spec: Some(DriverSandboxSpec {
+            policy: Some(SandboxPolicy {
+                version: 1,
+                filesystem: Some(FilesystemPolicy {
+                    read_write: absolute(shape.read_write),
+                    read_only: absolute(shape.read_only),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(
+                    openshell_core::proto_struct::json_object_to_struct(config).expect("config"),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    backend.validate_sandbox_create(&sandbox)
+}
+
+/// Whether `wxc-exec --probe` reports a base container that enforces
+/// `deniedPaths` without changing host ACLs.
+fn probe_denied_paths(wxc: &Path) -> Result<(), String> {
+    let out = Command::new(wxc)
+        .arg("--probe")
+        .output()
+        .map_err(|e| format!("wxc-exec --probe spawn failed: {e}"))?;
+    let probe: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("could not parse wxc-exec --probe JSON: {e}"))?;
+    let supported = probe
+        .pointer("/probes/baseContainerSupportsDenyPaths")
+        .and_then(serde_json::Value::as_bool);
+    let augmentation = probe["needsDaclAugmentation"].as_bool();
+    if supported == Some(true) && augmentation == Some(false) {
+        Ok(())
+    } else {
+        Err(format!(
+            "baseContainerSupportsDenyPaths={supported:?}, needsDaclAugmentation={augmentation:?}"
+        ))
+    }
+}
+
+/// Every denied-path layout the driver accepts keeps the denied files
+/// unreadable when the workload renames the directories above them (or the
+/// denied paths themselves). The layouts include the ones the driver rejects
+/// because a rename exposes them; on a driver that accepted those, this test
+/// fails with the denied contents in the workload's report.
+#[test]
+#[ignore = "requires real wxc-exec"]
+fn pc_accepted_denied_paths_survive_directory_renames() {
+    let Some(wxc) = wxc_path() else {
+        eprintln!("SKIP: wxc-exec not found");
+        return;
+    };
+    if let Err(reason) = probe_processcontainer(&wxc) {
+        eprintln!("SKIP: processcontainer not live: {reason}");
+        return;
+    }
+    if let Err(reason) = probe_denied_paths(&wxc) {
+        eprintln!("SKIP: denied paths not enforced by the base container: {reason}");
+        return;
+    }
+    let shapes = [
+        RenameShape {
+            name: "two levels below a read-write grant",
+            read_write: &["work"],
+            read_only: &[],
+            denied: &["work\\profile\\.env"],
+        },
+        RenameShape {
+            name: "directly inside a read-write grant nested in another",
+            read_write: &["work", "work\\profile"],
+            read_only: &[],
+            denied: &["work\\profile\\.env"],
+        },
+        RenameShape {
+            name: "below a read-only grant two levels inside a read-write grant",
+            read_write: &["work"],
+            read_only: &["work\\profile\\sub"],
+            denied: &["work\\profile\\sub\\.env"],
+        },
+        RenameShape {
+            name: "directly inside a read-write grant",
+            read_write: &["work"],
+            read_only: &[],
+            denied: &["work\\.env", "work\\secrets"],
+        },
+        RenameShape {
+            name: "below a read-only grant",
+            read_write: &[],
+            read_only: &["work"],
+            denied: &["work\\profile\\.env"],
+        },
+        RenameShape {
+            name: "below a read-only grant inside a read-write grant",
+            read_write: &["work"],
+            read_only: &["work\\profile"],
+            denied: &["work\\profile\\.env", "work\\profile\\sub\\.env"],
+        },
+        RenameShape {
+            name: "directly inside a read-write grant within a read-only grant",
+            read_write: &["work\\profile"],
+            read_only: &["work"],
+            denied: &["work\\profile\\.env"],
+        },
+    ];
+    let must_accept = [
+        "directly inside a read-write grant",
+        "below a read-only grant",
+        "below a read-only grant inside a read-write grant",
+        "directly inside a read-write grant within a read-only grant",
+    ];
+    let test_binary = std::env::current_exe().expect("test binary");
+    let mut failures = Vec::new();
+    for (index, shape) in shapes.iter().enumerate() {
+        let fixture = tempfile::tempdir().expect("rename fixture");
+        let root = fixture.path();
+        let run = root.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        for directory in ["work\\profile\\sub", "work\\secrets"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        let secret_files = [
+            "work\\.env",
+            "work\\secrets\\key.txt",
+            "work\\profile\\.env",
+            "work\\profile\\sub\\.env",
+        ];
+        for file in secret_files {
+            std::fs::write(root.join(file), RENAME_SECRET).unwrap();
+        }
+        match rename_shape_preflight(&wxc, root, shape) {
+            Err(status) => {
+                assert_eq!(
+                    status.code(),
+                    tonic::Code::InvalidArgument,
+                    "{}: {}",
+                    shape.name,
+                    status.message()
+                );
+                eprintln!("{}: refused at preflight: {}", shape.name, status.message());
+                if must_accept.contains(&shape.name) {
+                    failures.push(format!("{}: refused: {}", shape.name, status.message()));
+                }
+                continue;
+            }
+            Ok(()) => eprintln!("{}: accepted at preflight", shape.name),
+        }
+        // The workload renames each denied path and every directory above it
+        // inside the fixture, and reads the fixture files they protect.
+        let mut renamed: Vec<PathBuf> = Vec::new();
+        for denied in shape.denied {
+            for relative in Path::new(denied).ancestors() {
+                let path = root.join(relative);
+                if !relative.as_os_str().is_empty() && !renamed.contains(&path) {
+                    renamed.push(path);
+                }
+            }
+        }
+        let protected: Vec<PathBuf> = secret_files
+            .iter()
+            .map(|file| root.join(file))
+            .filter(|file| {
+                shape
+                    .denied
+                    .iter()
+                    .any(|denied| file.starts_with(root.join(denied)))
+            })
+            .collect();
+        let report = run.join("report.txt");
+        let absolute = |paths: &[&str]| -> Vec<String> {
+            paths
+                .iter()
+                .map(|path| root.join(path).to_string_lossy().into_owned())
+                .collect()
+        };
+        let plan = serde_json::json!({
+            "report": report,
+            "protected": protected,
+            "renamed": renamed,
+        });
+        let mut read_write = vec![run.to_string_lossy().into_owned()];
+        read_write.extend(absolute(shape.read_write));
+        let mut read_only = absolute(shape.read_only);
+        read_only.push(test_binary.to_string_lossy().into_owned());
+        let config = serde_json::json!({
+            "version": "1.0.0",
+            "containerId": format!("pc-denied-rename-{index}"),
+            "containment": "processcontainer",
+            "process": {
+                "commandLine": format!(
+                    "\"{}\" denied_paths_rename_workload --exact --ignored --test-threads=1",
+                    test_binary.display()
+                ),
+                "cwd": run,
+                "env": [format!("{RENAME_WORKLOAD_PLAN}={plan}")],
+                "inheritDefaultEnv": true,
+                "timeout": 60_000,
+            },
+            "filesystem": {
+                "readwritePaths": read_write,
+                "readonlyPaths": read_only,
+                "deniedPaths": absolute(shape.denied),
+            },
+            "processContainer": { "leastPrivilege": false },
+            "fallback": { "allowDaclMutation": false },
+            "ui": { "disable": true, "clipboard": "none", "injection": false },
+        });
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_string(&config).unwrap().as_bytes());
+        let out = Command::new(&wxc)
+            .arg("--config-base64")
+            .arg(&b64)
+            .output()
+            .expect("wxc-exec spawn");
+        let report = std::fs::read_to_string(&report).unwrap_or_else(|error| {
+            panic!(
+                "{}: no workload report ({error})\nstdout={}\nstderr={}",
+                shape.name,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        eprintln!("{}:\n{report}", shape.name);
+        assert!(report.ends_with("done"), "{}: {report}", shape.name);
+        if report.contains(RENAME_SECRET) {
+            failures.push(format!(
+                "{}: denied contents read after a rename",
+                shape.name
+            ));
+        }
+        for file in secret_files {
+            assert_eq!(
+                std::fs::read_to_string(root.join(file)).ok().as_deref(),
+                Some(RENAME_SECRET),
+                "{}: {file} changed on the host",
+                shape.name
+            );
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 // ── Isolation session enforcement tests ──────────────────────────────────────
 
 /// Full `isolation_session` round trip: provision → start → exec → stop →
