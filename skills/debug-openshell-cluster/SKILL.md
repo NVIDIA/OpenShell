@@ -1473,10 +1473,13 @@ request admission semantics: use a new ID or no ID for the explicit resume reque
 and never change the original payload under its original ID. See the
 [recovery contract](https://docs.nvidia.com/openshell/latest/sdk/api-errors#sandbox-image-update-recovery).
 
-Split Helm deployments need the current `openshell-workspace` Role, including
-`get` and `list` on Pods. The update preflight must find remaining Pods by owner
-UID and controller-recorded name as well as labels. Upgrade the workspace chart
-alongside the gateway chart; a label selector does not remove the `list` permission.
+Split Helm deployments need the current `openshell-workspace` Role. Update
+preflight requires `get` on Pods: it checks the controller-recorded workload
+name, the Sandbox resource name, and `os-supervisor-<sandbox-id>` directly.
+Any remaining Pod at those names, including a terminating Pod, blocks the update.
+The checks make at most three Pod reads regardless of namespace size and do not
+discover unexpectedly named Pods. Upgrade the workspace chart alongside the
+gateway chart.
 
 ### Step 7: Check VM-Backed Gateways
 

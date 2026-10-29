@@ -4,18 +4,19 @@
 //! Storage-preserving, stopped-only workload image mutation.
 
 use super::{
-    KUBE_API_TIMEOUT, KubernetesComputeDriver, KubernetesDriverError, LABEL_SANDBOX_ID,
-    LABEL_SANDBOX_NAME, SANDBOX_POD_NAME_ANNOTATION, SANDBOX_VERSION_V1BETA1,
-    WORKSPACE_INIT_CONTAINER_NAME, accepts_auth_namespace, admission_error, annotation_or_label,
+    KUBE_API_TIMEOUT, KubernetesComputeDriver, KubernetesDriverError, LABEL_SANDBOX_NAME,
+    SANDBOX_POD_NAME_ANNOTATION, SANDBOX_VERSION_V1BETA1, WORKSPACE_INIT_CONTAINER_NAME,
+    accepts_auth_namespace, admission_error, annotation_or_label,
     is_kube_resource_version_conflict, parse_kubernetes_runtime_identity, sandbox_id_from_object,
     sandbox_runtime_bootstrap_in_progress, select_expected_sandbox_runtime,
 };
+use crate::sandbox_runtime::SandboxRuntimeNames;
 use k8s_openapi::api::core::v1::Pod;
 use kube::Api;
 use kube::api::{DynamicObject, ListParams, Patch, PatchParams};
 use openshell_core::proto::compute::v1::SandboxUpdatePreconditions;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
 // Deliberately separate from the runtime bootstrap operation annotations. Those
@@ -89,7 +90,7 @@ impl KubernetesComputeDriver {
             .gate_for(&request.sandbox_id)
             .lock_owned()
             .await;
-        // Include discovery, admission and Pod pagination in a single bound.
+        // Include discovery, admission and Pod reads in a single bound.
         let result = tokio::time::timeout(
             KUBE_API_TIMEOUT,
             self.update_sandbox_image_inner(request, configuration),
@@ -255,31 +256,41 @@ impl KubernetesComputeDriver {
         namespace: &str,
     ) -> Result<(), KubernetesDriverError> {
         let pods = Api::<Pod>::namespaced(self.client.clone(), namespace);
-        // The controller's workload Pod need not carry the OpenShell sandbox
-        // label. Inspect owner UIDs and recorded names as well as labels and
-        // annotations, and reject terminating Pods too. Listing the namespace
-        // also catches supervisors from earlier runtime generations.
-        let mut params = ListParams::default().limit(500);
-        loop {
-            let page = pods
-                .list(&params)
+        let names = SandboxRuntimeNames::new(sandbox_id);
+        // Check both the controller-recorded and default workload names. The
+        // dedicated supervisor name is stable across generations; check it even
+        // with shared supervision to catch a leftover dedicated Pod. Direct
+        // reads keep preflight independent of the number of namespace Pods.
+        let pod_names: BTreeSet<_> = [
+            object.metadata.name.as_deref(),
+            object
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(SANDBOX_POD_NAME_ANNOTATION))
+                .map(String::as_str),
+            Some(names.supervisor_pod.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|name| !name.is_empty())
+        .collect();
+        for name in pod_names {
+            // Terminating Pods still block updates. Only a 404 proves absence;
+            // authorization, transport and other API failures must propagate.
+            if pods
+                .get_opt(name)
                 .await
-                .map_err(KubernetesDriverError::from_kube)?;
-            if page
-                .items
-                .iter()
-                .any(|pod| image_update_pod_matches(pod, object, sandbox_id))
+                .map_err(KubernetesDriverError::from_kube)?
+                .is_some()
             {
                 return Err(KubernetesDriverError::Precondition(
                     "cannot update image while sandbox workload or supervisor Pods still exist"
                         .into(),
                 ));
             }
-            match page.metadata.continue_.filter(|token| !token.is_empty()) {
-                Some(token) => params = params.continue_token(&token),
-                None => return Ok(()),
-            }
         }
+        Ok(())
     }
 }
 
@@ -596,36 +607,6 @@ fn prepare_configuration(
         agent["env"] = serde_json::json!(retained);
     }
     Ok(())
-}
-
-fn image_update_pod_matches(pod: &Pod, object: &DynamicObject, sandbox_id: &str) -> bool {
-    let metadata = &pod.metadata;
-    metadata.owner_references.as_ref().is_some_and(|owners| {
-        owners
-            .iter()
-            .any(|owner| Some(owner.uid.as_str()) == object.metadata.uid.as_deref())
-    }) || metadata
-        .labels
-        .as_ref()
-        .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
-        .map(String::as_str)
-        == Some(sandbox_id)
-        || metadata
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.get(LABEL_SANDBOX_ID))
-            .map(String::as_str)
-            == Some(sandbox_id)
-        || metadata.name.as_deref().is_some_and(|name| {
-            Some(name) == object.metadata.name.as_deref()
-                || object
-                    .metadata
-                    .annotations
-                    .as_ref()
-                    .and_then(|annotations| annotations.get(SANDBOX_POD_NAME_ANNOTATION))
-                    .map(String::as_str)
-                    == Some(name)
-        })
 }
 
 #[cfg(test)]

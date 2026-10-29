@@ -5,7 +5,7 @@ use super::super::{
     ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION, ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE,
     ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING, ANNOTATION_SANDBOX_RUNTIME_LOG_LEVEL,
     ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC, ANNOTATION_SANDBOX_RUNTIME_READINESS,
-    KubernetesComputeConfig, LABEL_SANDBOX_WORKSPACE, OperatorNamespaceAllowlist,
+    KubernetesComputeConfig, LABEL_SANDBOX_ID, LABEL_SANDBOX_WORKSPACE, OperatorNamespaceAllowlist,
     SANDBOX_BOOTSTRAP_CONTAINER_NAME, SANDBOX_BOOTSTRAP_VOLUME_NAME, SANDBOX_GROUP,
     SANDBOX_VERSION_V1ALPHA1, WORKSPACE_INIT_MOUNT_PATH, WorkspaceMode,
 };
@@ -23,7 +23,7 @@ struct ApiState {
     calls: Vec<(http::Method, String)>,
     patches: Vec<serde_json::Value>,
     conflict: bool,
-    pods_continue: bool,
+    pod_error: Option<(String, http::StatusCode)>,
 }
 
 fn response(
@@ -129,14 +129,13 @@ fn fixture(
         calls: Vec::new(),
         patches: Vec::new(),
         conflict: false,
-        pods_continue: false,
+        pod_error: None,
     }));
     let service_state = state.clone();
     let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
         let state = service_state.clone();
         async move {
             let path = request.uri().path().to_string();
-            let query = request.uri().query().unwrap_or_default().to_string();
             let method = request.method().clone();
             let body = request.into_body().collect().await.unwrap().to_bytes();
             let mut state = state.lock().unwrap();
@@ -152,12 +151,38 @@ fn fixture(
                     http::Method::GET,
                     "/api/v1/namespaces/openshell/persistentvolumeclaims/team-data",
                 ) => state.pvc.clone(),
-                (http::Method::GET, "/api/v1/namespaces/openshell/pods") => {
-                    if state.pods_continue && !query.contains("continue=") {
-                        serde_json::json!({"apiVersion":"v1", "kind":"PodList", "metadata":{"continue":"page-two"}, "items":[]})
-                    } else {
-                        serde_json::json!({"apiVersion":"v1", "kind":"PodList", "metadata":{}, "items":state.pods})
+                (http::Method::GET, path)
+                    if path.starts_with("/api/v1/namespaces/openshell/pods/") =>
+                {
+                    let name = path
+                        .strip_prefix("/api/v1/namespaces/openshell/pods/")
+                        .unwrap();
+                    if let Some((error_name, status)) = &state.pod_error
+                        && error_name == name
+                    {
+                        return Ok(response(
+                            *status,
+                            serde_json::json!({
+                                "apiVersion":"v1", "kind":"Status", "status":"Failure",
+                                "reason":status.canonical_reason().unwrap(),
+                                "message":"pod read failed", "code":status.as_u16()
+                            }),
+                        ));
                     }
+                    let Some(pod) = state
+                        .pods
+                        .iter()
+                        .find(|pod| pod["metadata"]["name"] == name)
+                    else {
+                        return Ok(response(
+                            http::StatusCode::NOT_FOUND,
+                            serde_json::json!({
+                                "apiVersion":"v1", "kind":"Status", "status":"Failure",
+                                "reason":"NotFound", "message":"pod not found", "code":404
+                            }),
+                        ));
+                    };
+                    pod.clone()
                 }
                 (http::Method::PATCH, path) if path.ends_with("/sandboxes/sandbox-cr") => {
                     let mutation: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -253,7 +278,7 @@ async fn image_update_preflight_validates_without_writes_and_apply_rechecks() {
                 .iter()
                 .any(|(_, path)| path.ends_with("/persistentvolumeclaims/team-data"))
         );
-        assert!(state.calls.iter().any(|(_, path)| path.ends_with("/pods")));
+        assert_eq!(pod_read_names(&state).len(), 3);
     }
     // Operator approval can change between preflight and apply. Both requests
     // independently enforce the entire stopped/admission check.
@@ -461,27 +486,123 @@ async fn image_update_rejects_running_bootstrapping_and_unspecified_operating_st
     }
 }
 
+fn pod_read_names(state: &ApiState) -> Vec<&str> {
+    state
+        .calls
+        .iter()
+        .filter_map(|(method, path)| {
+            assert_ne!(
+                path, "/api/v1/namespaces/openshell/pods",
+                "must not list Pods"
+            );
+            let name = path.strip_prefix("/api/v1/namespaces/openshell/pods/")?;
+            assert_eq!(method, http::Method::GET);
+            Some(name)
+        })
+        .collect()
+}
+
 #[tokio::test]
-async fn image_update_checks_actual_workload_and_supervisor_pods_including_later_pages() {
-    for metadata in [
-        serde_json::json!({"name":"controller-workload", "ownerReferences":[{"apiVersion":"agents.x-k8s.io/v1beta1", "kind":"Sandbox", "name":"sandbox-cr", "uid":"resource-uid"}]}),
-        serde_json::json!({"name":"supervisor", "labels":{LABEL_SANDBOX_ID:"sandbox-1"}}),
-        serde_json::json!({"name":"recorded-workload", "deletionTimestamp":"2026-10-15T18:00:00Z"}),
-        serde_json::json!({"name":"workload-with-annotation", "annotations":{LABEL_SANDBOX_ID:"sandbox-1"}}),
-    ] {
-        let (driver, state) = fixture(SANDBOX_VERSION_V1BETA1, false);
-        {
-            let mut state = state.lock().unwrap();
-            state
-                .pods
-                .push(serde_json::json!({"apiVersion":"v1", "kind":"Pod", "metadata":metadata}));
-            state.pods_continue = true;
+async fn image_update_rejects_existing_known_pods_including_terminating_pods() {
+    for version in [SANDBOX_VERSION_V1ALPHA1, SANDBOX_VERSION_V1BETA1] {
+        for name in ["sandbox-cr", "recorded-workload", "os-supervisor-sandbox-1"] {
+            for terminating in [false, true] {
+                let (driver, state) = fixture(version, false);
+                let mut metadata = serde_json::json!({"name":name});
+                if terminating {
+                    metadata["deletionTimestamp"] = "2026-10-15T18:00:00Z".into();
+                }
+                state.lock().unwrap().pods.push(serde_json::json!({
+                    "apiVersion":"v1", "kind":"Pod", "metadata":metadata
+                }));
+                for validate_only in [true, false] {
+                    let result = driver
+                        .update_sandbox_image(&SandboxUpdatePreconditions {
+                            validate_only,
+                            ..request()
+                        })
+                        .await;
+                    assert!(
+                        matches!(result, Err(KubernetesDriverError::Precondition(message)) if message.contains("Pods still exist")),
+                        "{version}: {name}, terminating={terminating}, validate_only={validate_only}"
+                    );
+                    assert!(state.lock().unwrap().patches.is_empty());
+                }
+            }
         }
-        let result = driver.update_sandbox_image(&request()).await;
-        assert!(
-            matches!(result, Err(KubernetesDriverError::Precondition(message)) if message.contains("Pods still exist"))
-        );
-        assert!(state.lock().unwrap().patches.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn image_update_reads_only_distinct_known_pod_names() {
+    for version in [SANDBOX_VERSION_V1ALPHA1, SANDBOX_VERSION_V1BETA1] {
+        for recorded_name in [
+            None,
+            Some(""),
+            Some("sandbox-cr"),
+            Some("recorded-workload"),
+            Some("os-supervisor-sandbox-1"),
+        ] {
+            let (driver, state) = fixture(version, false);
+            {
+                let mut state = state.lock().unwrap();
+                let annotations = state.sandbox["metadata"]["annotations"]
+                    .as_object_mut()
+                    .unwrap();
+                annotations.remove(SANDBOX_POD_NAME_ANNOTATION);
+                if let Some(name) = recorded_name {
+                    annotations.insert(SANDBOX_POD_NAME_ANNOTATION.into(), name.into());
+                }
+                state.pods.push(serde_json::json!({
+                    "apiVersion":"v1", "kind":"Pod", "metadata":{"name":"unrelated-workload"}
+                }));
+            }
+            for validate_only in [true, false] {
+                state.lock().unwrap().calls.clear();
+                driver
+                    .update_sandbox_image(&SandboxUpdatePreconditions {
+                        validate_only,
+                        ..request()
+                    })
+                    .await
+                    .unwrap();
+                let state = state.lock().unwrap();
+                let mut actual = pod_read_names(&state);
+                actual.sort_unstable();
+                let mut expected = vec!["os-supervisor-sandbox-1", "sandbox-cr"];
+                if recorded_name == Some("recorded-workload") {
+                    expected.insert(1, "recorded-workload");
+                }
+                assert_eq!(actual, expected, "{version}: {recorded_name:?}");
+                assert_eq!(state.patches.len(), usize::from(!validate_only));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn image_update_propagates_known_pod_read_errors_without_writes() {
+    for version in [SANDBOX_VERSION_V1ALPHA1, SANDBOX_VERSION_V1BETA1] {
+        for name in ["sandbox-cr", "recorded-workload", "os-supervisor-sandbox-1"] {
+            for status in [
+                http::StatusCode::FORBIDDEN,
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+            ] {
+                let (driver, state) = fixture(version, false);
+                state.lock().unwrap().pod_error = Some((name.into(), status));
+                for validate_only in [true, false] {
+                    let error = driver
+                        .update_sandbox_image(&SandboxUpdatePreconditions {
+                            validate_only,
+                            ..request()
+                        })
+                        .await
+                        .unwrap_err();
+                    assert!(error.to_string().contains("pod read failed"), "{error}");
+                    assert!(state.lock().unwrap().patches.is_empty());
+                }
+            }
+        }
     }
 }
 

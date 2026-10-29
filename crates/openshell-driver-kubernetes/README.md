@@ -309,7 +309,11 @@ linked factories opt in through `build_with_configuration_updates`.
 The request identifies the sandbox, original resource UID, expected image,
 operation ID, and monotonic revision. The driver checks the suspended state,
 completed bootstrap, current resource UID, and absence of workload and supervisor
-Pods, including Pods found only by owner UID or recorded name. It revalidates
+Pods by directly reading the controller-recorded workload name, the Sandbox
+resource name, and the stable dedicated-supervisor name. Duplicate names are
+read once, and terminating Pods block updates. These checks make at most three
+Pod reads regardless of namespace size; they do not discover unexpectedly named
+Pods. The driver revalidates
 external-resource admission before patching the existing resource with a
 `resourceVersion` condition. The patch includes the verified UID; Kubernetes
 immutable-UID validation also rejects a same-name replacement. No resource or
