@@ -44,6 +44,7 @@ libc = "0.2"
 rustix = { workspace = true, features = ["fs", "process"] }
 
 [dev-dependencies]
+openshell-crypto = { workspace = true, features = ["aws-lc"] }
 jsonwebtoken = { workspace = true }
 
 [lints]

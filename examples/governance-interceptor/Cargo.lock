@@ -1909,6 +1909,7 @@ name = "openshell-extension-core"
 version = "0.0.0"
 dependencies = [
  "hyper-util",
+ "openshell-crypto",
  "serde",
  "thiserror",
  "tokio",

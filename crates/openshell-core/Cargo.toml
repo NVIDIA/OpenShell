@@ -67,6 +67,7 @@ tonic-prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
+openshell-crypto = { workspace = true, features = ["aws-lc"] }
 h2 = "0.4"
 rcgen = { workspace = true }
 tempfile = "3"

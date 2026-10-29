@@ -8,6 +8,14 @@
 //! - Configuration management
 //! - Common error types
 //! - Build version metadata
+//!
+//! # Cryptography
+//!
+//! This library does not select a crypto implementation. Add `openshell-crypto`
+//! with its default features for AWS-LC, or disable those defaults and install
+//! your own `CryptoContext` before constructing TLS/JWT clients or using crypto.
+//! Existing Rustls process providers are preserved by dependency-owned clients;
+//! selecting a context does not replace an already installed process provider.
 
 pub mod activity;
 pub mod auth;

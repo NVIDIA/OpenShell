@@ -56,6 +56,7 @@ run = [
   "cargo fmt --manifest-path tests/tmachine/Cargo.toml --all",
   "cargo fmt --manifest-path tests/runner/Cargo.toml --all",
   "cargo fmt --manifest-path tests/suites/conformance/Cargo.toml -p sandbox",
+  "cargo fmt --manifest-path tests/crypto-consumer/Cargo.toml --all",
 ]
 hide = true
 
@@ -71,6 +72,7 @@ run = [
   "cargo fmt --manifest-path tests/tmachine/Cargo.toml --all -- --check",
   "cargo fmt --manifest-path tests/runner/Cargo.toml --all -- --check",
   "cargo fmt --manifest-path tests/suites/conformance/Cargo.toml -p sandbox -- --check",
+  "cargo fmt --manifest-path tests/crypto-consumer/Cargo.toml --all -- --check",
 ]
 hide = true
 
@@ -114,3 +116,7 @@ run = [
   # Guard: webpki-root-certs must not appear either (webpki-roots re-exports it).
   "bash -c 'if cargo tree -p openshell-supervisor -i webpki-root-certs --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-root-certs; then echo \"ERROR: webpki-root-certs found in system CA roots build\" >&2; exit 1; fi'",
 ]
+
+["rust:verify:library-crypto"]
+description = "Verify isolated library backend selection and executable AWS-LC defaults"
+run = "bash tasks/scripts/verify-library-crypto.sh"

@@ -324,3 +324,11 @@ gh run rerun <run-id>
    ```bash
    gh run rerun <run-id> --failed
    ```
+
+## Crypto backend independence
+
+For failures in Branch Checks' crypto independence step, run
+`mise run rust:verify:library-crypto` from the checkout. It checks external library
+consumer graphs and TLS/JWT behavior separately from workspace tests, then checks
+executable backend defaults. Do not add AWS-LC to a shared library to make a test
+pass; standalone library tests select their backend in development dependencies.

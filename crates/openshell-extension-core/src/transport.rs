@@ -125,6 +125,7 @@ pub async fn connect_channel(config: &ExtensionChannelConfig) -> Result<Channel,
 
     let mut endpoint = standard_endpoint(&config.endpoint)?;
     if config.endpoint.starts_with("https://") {
+        openshell_crypto::tls::ensure_default_provider();
         let tls = match &config.server_trust {
             ExtensionServerTrust::PlatformRoots => ClientTlsConfig::new().with_enabled_roots(),
             ExtensionServerTrust::CustomCaPem(pem) => {

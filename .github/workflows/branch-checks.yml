@@ -327,6 +327,7 @@ jobs:
             exit 1
           fi
           cargo test --locked -p openshell-crypto --no-default-features --test independent_backend
+          mise run rust:verify:library-crypto
 
       - name: Test
         shell: nix develop -c bash -euo pipefail {0}

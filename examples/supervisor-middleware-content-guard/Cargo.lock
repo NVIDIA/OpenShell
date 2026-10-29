@@ -2063,6 +2063,7 @@ name = "openshell-extension-core"
 version = "0.0.0"
 dependencies = [
  "hyper-util",
+ "openshell-crypto",
  "serde",
  "thiserror",
  "tokio",
@@ -2101,6 +2102,7 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "openshell-core",
+ "openshell-crypto",
  "openshell-policy",
  "prost-types",
  "tokio",

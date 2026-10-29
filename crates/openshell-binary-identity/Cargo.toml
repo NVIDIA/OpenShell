@@ -16,3 +16,6 @@ openshell-crypto = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+openshell-crypto = { workspace = true, features = ["aws-lc"] }

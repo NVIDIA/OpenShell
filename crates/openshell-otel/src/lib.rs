@@ -233,6 +233,7 @@ impl OtlpTarget {
     {
         let builder = builder.with_endpoint(self.endpoint.clone());
         if self.tls {
+            openshell_crypto::tls::ensure_default_provider();
             // Tonic trusts nothing by default, so enable the platform roots.
             builder.with_tls_config(ClientTlsConfig::new().with_enabled_roots())
         } else {

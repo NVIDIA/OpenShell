@@ -15,6 +15,7 @@ publish = false
 name = "testkit"
 
 [dependencies]
+openshell-crypto = { path = "../../../crates/openshell-crypto" }
 openshell-bootstrap = { path = "../../../crates/openshell-bootstrap" }
 openshell-core = { path = "../../../crates/openshell-core", default-features = false }
 openshell-sdk = { path = "../../../crates/openshell-sdk" }
