@@ -8092,6 +8092,21 @@ mod tests {
         assert_eq!(process.run_as_group, "1234");
     }
 
+    #[test]
+    fn create_sandbox_accepts_more_than_128_labels() {
+        let request = CreateSandboxRequest {
+            name: "many-labels".into(),
+            spec: Some(SandboxSpec::default()),
+            labels: (0..129)
+                .map(|index| (format!("label-{index}"), "value".into()))
+                .collect(),
+            ..Default::default()
+        };
+        for workload_template in ["", "workload-template"] {
+            validate_create_sandbox_request_pre_io(&request, workload_template).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn create_sandbox_still_rejects_long_label_values() {
         let state = test_server_state().await;

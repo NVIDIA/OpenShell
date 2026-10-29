@@ -459,20 +459,10 @@ pub(super) fn validate_string_map(
     Ok(())
 }
 
-/// Labels share a bounded metadata budget but use Kubernetes value syntax.
+/// Validate label keys and values using Kubernetes syntax.
 pub(super) fn validate_labels(
     labels: &std::collections::HashMap<String, String>,
 ) -> Result<(), Status> {
-    const MAX_METADATA_LABELS_ENTRIES: usize = 128;
-    if labels.len() > MAX_METADATA_LABELS_ENTRIES {
-        return Err(invalid_argument(
-            "labels",
-            format!(
-                "labels exceeds maximum entries ({} > {MAX_METADATA_LABELS_ENTRIES})",
-                labels.len()
-            ),
-        ));
-    }
     for (key, value) in labels {
         validate_label_key(key)?;
         validate_label_value(value)?;

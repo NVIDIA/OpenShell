@@ -318,6 +318,19 @@ async fn public_image_update_replays_without_reapplying_or_touching_same_name_re
 }
 
 #[test]
+fn configuration_update_accepts_more_than_128_labels() {
+    let update = UpdateSandboxRequest {
+        labels: Some(openshell_core::proto::SandboxMapUpdate {
+            values: (0..129)
+                .map(|index| (format!("label-{index}"), "value".into()))
+                .collect(),
+        }),
+        ..request()
+    };
+    validate_image_update_request(&update).unwrap();
+}
+
+#[test]
 fn configuration_update_presence_and_reserved_metadata() {
     let mut update = request();
     update.image = None;
