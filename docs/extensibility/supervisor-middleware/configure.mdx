@@ -138,7 +138,9 @@ The map key, such as `content-guard`, is the entry's stable identity in logs. Ea
 </ParamField>
 
 <ParamField path="endpoints.include" type="string[]" required={true}>
-  Destination hosts to run the middleware for. Uses the same host patterns as network policy endpoints. A pattern matches a host on every port and cannot include a port. Write IPv6 addresses and patterns without brackets, such as `2001:db8:*`.
+  Destination hosts to run the middleware for. Uses the same host patterns as network policy endpoints. A pattern matches a host on every port and cannot include a port. An IPv6 host must be a complete address without brackets, such as `2001:db8::1`; IPv6 wildcard patterns are not supported.
+
+  Policies written for earlier releases that include a port, such as `api.example.com:443`, or an IPv6 wildcard, such as `2001:db8:*`, now fail validation. Remove the port, and list IPv6 addresses individually. Patterns with a port never matched traffic.
 </ParamField>
 
 <ParamField path="endpoints.exclude" type="string[]">

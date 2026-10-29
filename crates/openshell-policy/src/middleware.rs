@@ -181,49 +181,22 @@ where
 
 /// Parse one middleware selector pattern. Selectors match hostnames on every
 /// port, so a `host:port` pattern would parse as a hostname that never matches
-/// and silently leave the entry unselected. A pattern containing `:` must
-/// instead be an IPv6 address or glob, such as `2001:db8::1` or `2001:db8:*`.
+/// and silently leave the entry unselected. The only pattern that may contain
+/// `:` is a complete IPv6 address without brackets, such as `2001:db8::1`.
+/// IPv6 globs are rejected: `cafe:*` cannot be told apart from a mistyped
+/// `host:port`.
 fn selector_pattern(pattern: &str) -> Result<HostPattern, String> {
-    if pattern.contains(':') {
-        validate_ipv6_selector_pattern(pattern)?;
+    if pattern.contains(':') && pattern.parse::<std::net::Ipv6Addr>().is_err() {
+        let reason = if pattern.starts_with('[') {
+            "write IPv6 addresses without brackets"
+        } else {
+            "':' is only allowed in a complete IPv6 address"
+        };
+        return Err(format!(
+            "{reason}; selectors match hosts on every port and cannot include one"
+        ));
     }
     HostPattern::new(pattern)
-}
-
-/// Accept the IPv6 text the proxy matches, which arrives without brackets.
-/// Reject the shapes of a `host:port` authority.
-fn validate_ipv6_selector_pattern(pattern: &str) -> Result<(), String> {
-    const NO_PORT: &str = "':' is only allowed in IPv6 addresses and patterns; \
-                           selectors match hosts on every port and cannot include one";
-
-    let bracketed = pattern
-        .strip_prefix('[')
-        .and_then(|rest| rest.split_once(']'))
-        .is_some_and(|(address, _)| address.contains(':'));
-    if bracketed {
-        return Err("write IPv6 addresses without brackets; \
-                    selectors match hosts on every port and cannot include one"
-            .into());
-    }
-    if !pattern.chars().all(|ch| {
-        ch.is_ascii_hexdigit() || matches!(ch, ':' | '.' | '*' | '?' | '[' | ']' | '!' | '-')
-    }) {
-        return Err(NO_PORT.into());
-    }
-    let Some((head, tail)) = pattern.rsplit_once(':') else {
-        return Ok(());
-    };
-    // IPv6 text only has dots in an embedded IPv4 tail, and a single ':'
-    // followed by digits reads as a port, as in `10.0.0.1:443` or `*:443`.
-    let port_suffix =
-        !head.contains(':') && !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit());
-    if head.contains('.') || port_suffix {
-        return Err(NO_PORT.into());
-    }
-    if !pattern.contains(['*', '?', '[']) && pattern.parse::<std::net::Ipv6Addr>().is_err() {
-        return Err("not a valid IPv6 address".into());
-    }
-    Ok(())
 }
 
 pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {

@@ -3308,7 +3308,11 @@ network_policies:
             ("*:443", None, "cannot include one"),
             ("[2001:db8::1]:443", None, "without brackets"),
             ("[2001:db8::1]", None, "without brackets"),
-            ("2001:db8::1::2", None, "not a valid IPv6 address"),
+            ("2001:db8::1::2", None, "complete IPv6 address"),
+            ("cafe:*", None, "complete IPv6 address"),
+            ("beef:443", None, "complete IPv6 address"),
+            ("2001:4860:*", None, "complete IPv6 address"),
+            ("fe80::*", None, "complete IPv6 address"),
         ] {
             let mut policy = restrictive_default_policy();
             let mut middleware = middleware_config("openshell/regex");
@@ -3349,18 +3353,8 @@ network_policies:
     }
 
     #[test]
-    fn validate_accepts_ipv6_middleware_selector_patterns() {
-        for pattern in [
-            "2001:db8::1",
-            "2001:DB8::1",
-            "::1",
-            "2001:4860:*",
-            "2001:*",
-            "fe80::*",
-            "*::*",
-            "2001:db8::[0-9a-f]",
-            "::ffff:10.0.*",
-        ] {
+    fn validate_accepts_ipv6_middleware_selector_addresses() {
+        for pattern in ["2001:db8::1", "2001:DB8::1", "::1", "::ffff:10.0.0.1"] {
             let mut policy = restrictive_default_policy();
             let mut middleware = middleware_config("openshell/regex");
             middleware.endpoints.as_mut().unwrap().include = vec![pattern.into()];
@@ -3370,10 +3364,9 @@ network_policies:
             }
         }
 
-        // The proxy matches IPv6 hosts without brackets, and `*` spans ':'.
-        assert!(middleware_host_matches("2001:4860:*", "2001:4860:4860::8888").unwrap());
+        // The proxy matches IPv6 hosts without brackets.
         assert!(middleware_host_matches("2001:DB8::1", "2001:db8::1").unwrap());
-        assert!(!middleware_host_matches("2001:4860:*", "2001:db8::1").unwrap());
+        assert!(!middleware_host_matches("2001:db8::1", "2001:db8::2").unwrap());
     }
 
     #[test]
