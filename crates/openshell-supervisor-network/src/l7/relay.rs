@@ -2809,10 +2809,22 @@ where
             .await?;
             let req = match middleware_result {
                 MiddlewareApplyResult::Allowed(request) => request,
-                MiddlewareApplyResult::Streamed { .. } | MiddlewareApplyResult::RequestTimeout => {
+                MiddlewareApplyResult::Streamed { .. } => {
                     return Err(miette!(
                         "body-aware request middleware must collect the request body"
                     ));
+                }
+                // The body was read before middleware ran, so the client
+                // cannot stall it; answer like the REST path if it happens.
+                MiddlewareApplyResult::RequestTimeout => {
+                    crate::l7::middleware::send_request_timeout_response(
+                        &request_info.action,
+                        client,
+                        ctx,
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
                 }
                 MiddlewareApplyResult::Denied { denial, failure } => {
                     if let Some(observer) = observer.as_ref() {
@@ -3098,10 +3110,22 @@ where
             .await?;
             let req = match middleware_result {
                 MiddlewareApplyResult::Allowed(request) => request,
-                MiddlewareApplyResult::Streamed { .. } | MiddlewareApplyResult::RequestTimeout => {
+                MiddlewareApplyResult::Streamed { .. } => {
                     return Err(miette!(
                         "body-aware request middleware must collect the request body"
                     ));
+                }
+                // The body was read before middleware ran, so the client
+                // cannot stall it; answer like the REST path if it happens.
+                MiddlewareApplyResult::RequestTimeout => {
+                    crate::l7::middleware::send_request_timeout_response(
+                        &request_info.action,
+                        client,
+                        ctx,
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
                 }
                 MiddlewareApplyResult::Denied { denial, failure } => {
                     let denied_request = crate::l7::provider::L7Request {
