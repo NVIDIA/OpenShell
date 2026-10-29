@@ -144,30 +144,42 @@ mod tests {
         assert!(!err.to_string().contains("hunter2"), "{err}");
     }
 
-    /// Run the export script with the local `sh` and return the variables it
-    /// exported with the given prefix.
-    fn exported(dir: &std::path::Path) -> Vec<String> {
-        let script = format!("{}; env", export_script(dir.to_str().unwrap()));
+    /// Run the export script with the local `sh` and return the values of
+    /// `names` it exported, unset ones as empty. Only shell builtins run, as
+    /// the Nix build sandbox has no `env` on its PATH.
+    fn exported(dir: &std::path::Path, names: &[&str]) -> Vec<String> {
+        let script = format!(
+            r#"{}; for name in "$@"; do eval "printf '%s=%s\n' \"\$name\" \"\${{$name-}}\""; done"#,
+            export_script(dir.to_str().unwrap())
+        );
         let output = std::process::Command::new("sh")
-            .args(["-c", &script])
+            .args(["-c", &script, "sh"])
+            .args(names)
             .env_clear()
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
-        let mut vars: Vec<String> = String::from_utf8(output.stdout)
+        String::from_utf8(output.stdout)
             .unwrap()
             .lines()
-            .filter(|line| line.starts_with(ENV_PREFIX))
             .map(str::to_string)
-            .collect();
-        vars.sort();
-        vars
+            .collect()
     }
 
     #[test]
     fn export_script_exports_what_the_parser_accepts() {
+        let names = [
+            "OPENSHELL_TEST_EQUALS",
+            "OPENSHELL_TEST_LAST",
+            "OPENSHELL_TEST_SHELL",
+            "OPENSHELL_TEST_SPACES",
+            "OPENSHELL_TEST_X",
+        ];
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(exported(dir.path()), Vec::<String>::new());
+        assert_eq!(
+            exported(dir.path(), &names),
+            names.map(|name| format!("{name}="))
+        );
 
         let a = "# Published by keycloak.yaml\n\nOPENSHELL_TEST_SPACES=a b  c\nOPENSHELL_TEST_SHELL=$HOME`id`$(id)\\n'\"\nOPENSHELL_TEST_EQUALS=a=b=\n";
         // The last line has no newline and must still be exported.
@@ -179,12 +191,13 @@ mod tests {
         parse_env("b.env", b).unwrap();
 
         assert_eq!(
-            exported(dir.path()),
+            exported(dir.path(), &names),
             [
                 "OPENSHELL_TEST_EQUALS=a=b=",
                 "OPENSHELL_TEST_LAST=1",
                 "OPENSHELL_TEST_SHELL=$HOME`id`$(id)\\n'\"",
                 "OPENSHELL_TEST_SPACES=a b  c",
+                "OPENSHELL_TEST_X=",
             ]
         );
     }
