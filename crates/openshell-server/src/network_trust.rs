@@ -413,6 +413,7 @@ fn verify_existing_artifact(path: &Path, normalized: &[u8], digest: &str) -> Res
         })
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn set_artifact_directory_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -429,6 +430,7 @@ fn set_artifact_directory_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn set_artifact_file_permissions(file: &fs::File, path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -449,6 +451,7 @@ fn set_artifact_file_permissions(file: &fs::File, path: &Path) -> Result<()> {
 /// Durably record a successful hard-link publication on platforms that permit
 /// syncing directories. This follows the same `File::open(...).sync_all()`
 /// pattern used for other atomic state writes in the repository.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn sync_artifact_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {

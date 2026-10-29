@@ -15,7 +15,6 @@ use std::time::Duration;
 use openshell_e2e::harness::cli::run_cli;
 use openshell_e2e::harness::container::{ContainerEngine, ContainerHttpServer};
 use openshell_e2e::harness::sandbox::SandboxGuard;
-use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
 use serde_json::Value;
 use tempfile::NamedTempFile;
 
@@ -101,22 +100,6 @@ network_policies:
 /// SSH session that runs the traffic).
 const REQUIRED_CLASSES: [u64; 3] = [4001, 4002, 4007];
 
-fn class_schema_name(class_uid: u64) -> Option<&'static str> {
-    Some(match class_uid {
-        0 => "base_event",
-        1007 => "process_activity",
-        2004 => "detection_finding",
-        3002 => "authentication",
-        4001 => "network_activity",
-        4002 => "http_activity",
-        4007 => "ssh_activity",
-        5019 => "device_config_state_change",
-        6002 => "application_lifecycle",
-        6003 => "api_activity",
-        _ => return None,
-    })
-}
-
 async fn set_sandbox_setting(sandbox: &str, key: &str, value: &str) {
     let (output, code) =
         run_cli(&["settings", "set", sandbox, "--key", key, "--value", value]).await;
@@ -135,13 +118,7 @@ fn supervisor_records(engine: &ContainerEngine, sandbox: &str) -> Result<Vec<Val
     let filter = format!("label=openshell.ai/sandbox-name={sandbox}");
     let ps = engine
         .command()
-        .args([
-            "ps",
-            "--filter",
-            &filter,
-            "--format",
-            "{{index .Labels \"openshell.ai/sandbox-id\"}}",
-        ])
+        .args(["ps", "--filter", &filter, "--format", "json"])
         .output()
         .map_err(|e| format!("could not run ps: {e}"))?;
     if !ps.status.success() {
@@ -150,11 +127,13 @@ fn supervisor_records(engine: &ContainerEngine, sandbox: &str) -> Result<Vec<Val
             String::from_utf8_lossy(&ps.stderr)
         ));
     }
-    let ids = String::from_utf8_lossy(&ps.stdout);
-    let id = ids
-        .lines()
-        .map(str::trim)
-        .find(|id| !id.is_empty())
+    // Podman 6 renders `.Labels` in a --format template as a string, so read
+    // the label from the JSON output, where it is an object in every version.
+    let containers: Vec<Value> =
+        serde_json::from_slice(&ps.stdout).map_err(|e| format!("parse ps output: {e}"))?;
+    let id = containers
+        .iter()
+        .find_map(|container| container["Labels"]["openshell.ai/sandbox-id"].as_str())
         .ok_or_else(|| format!("no container matches {filter}"))?;
 
     let dir = tempfile::tempdir().map_err(|e| format!("temp dir: {e}"))?;
@@ -222,8 +201,9 @@ async fn supervisor_jsonl_conforms_to_the_native_schema() {
     // every required class appears.
     let mut records = Vec::new();
     let mut last_error = None;
+    let mut last_exec_error = None;
     for _ in 0..12 {
-        let _ = guard.exec(&["python3", "-c", &traffic]).await;
+        last_exec_error = guard.exec(&["python3", "-c", &traffic]).await.err();
         tokio::time::sleep(Duration::from_secs(5)).await;
         match supervisor_records(&engine, &guard.name) {
             Ok(found) => {
@@ -241,34 +221,25 @@ async fn supervisor_jsonl_conforms_to_the_native_schema() {
     let missing = missing_classes(&records);
     assert!(
         missing.is_empty(),
-        "missing OCSF classes {missing:?} in {} records; last copy error: {}",
+        "missing OCSF classes {missing:?} in {} records; last copy error: {}; \
+         last exec error: {}",
         records.len(),
-        last_error.as_deref().unwrap_or("none")
+        last_error.as_deref().unwrap_or("none"),
+        last_exec_error.as_deref().unwrap_or("none")
     );
     let mut failures = Vec::new();
     for record in &records {
-        assert_eq!(
-            record["metadata"]["version"],
-            openshell_ocsf::OCSF_VERSION,
-            "record labelled {}; native validation needs ocsf_schema_version unset \
-             for this sandbox and the gateway",
-            record["metadata"]["version"]
-        );
-        let class_uid = record["class_uid"].as_u64().expect("class_uid");
-        let Some(class) = class_schema_name(class_uid) else {
-            failures.push(format!(
-                "class_uid {class_uid} has no schema mapping in this test"
-            ));
-            continue;
-        };
-        let schema = load_class_schema(class);
-        if let Err(panic) = std::panic::catch_unwind(|| validate_required_fields(record, &schema)) {
-            let reason = panic.downcast_ref::<String>().cloned().unwrap_or_default();
-            failures.push(format!(
+        match openshell_ocsf_validate::validate_event(record) {
+            Ok(()) => {}
+            Err(openshell_ocsf_validate::Error::UnsupportedVersion(version)) => panic!(
+                "record labelled {version}; native validation needs ocsf_schema_version unset \
+                 for this sandbox and the gateway"
+            ),
+            Err(reason) => failures.push(format!(
                 "{} \"{}\": {reason}",
                 record["class_name"],
                 record["message"].as_str().unwrap_or_default()
-            ));
+            )),
         }
     }
     assert!(

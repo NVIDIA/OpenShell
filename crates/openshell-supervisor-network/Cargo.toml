@@ -69,6 +69,7 @@ openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = 
 
 openshell-driver-vm = { path = "../openshell-driver-vm", default-features = false, features = ["allocation-tracking"] }
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
+openshell-ocsf-validate = { path = "../openshell-ocsf-validate" }
 openshell-otel = { path = "../openshell-otel" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

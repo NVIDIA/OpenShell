@@ -68,6 +68,10 @@ namespaces = false
 [tool.setuptools.package-data]
 openshell = ["py.typed", "_proto/*.py", "_proto/*.pyi"]
 
+# Ignore non-release tags such as sdk/go/vX.Y.Z, which share the release commit.
+[tool.setuptools_scm]
+git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "v[0-9]*"]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 88

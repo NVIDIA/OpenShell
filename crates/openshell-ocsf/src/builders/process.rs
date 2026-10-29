@@ -37,19 +37,9 @@ impl<'a> ProcessActivityBuilder<'a, MissingActor> {
     /// A Process Activity must name its acting process before it can be built.
     ///
     /// ```compile_fail
-    /// use openshell_ocsf::{EventContext, EventOrigin, ProcessActivityBuilder};
+    /// use openshell_ocsf::ProcessActivityBuilder;
     ///
-    /// let ctx = EventContext {
-    ///     sandbox_id: String::new(),
-    ///     sandbox_name: String::new(),
-    ///     container_image: String::new(),
-    ///     hostname: String::new(),
-    ///     product_version: String::new(),
-    ///     proxy_ip: "127.0.0.1".parse().unwrap(),
-    ///     proxy_port: 3128,
-    ///     origin: EventOrigin::Supervisor,
-    /// };
-    /// ProcessActivityBuilder::new(&ctx).build();
+    /// ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx()).build();
     /// ```
     #[must_use]
     pub fn new(ctx: impl Into<ContextRef<'a>>) -> Self {
@@ -90,42 +80,11 @@ impl<'a> ProcessActivityBuilder<'a, MissingActor> {
 }
 
 impl<ActorState> ProcessActivityBuilder<'_, ActorState> {
-    /// Set the event activity identifier.
-    #[must_use]
-    pub fn activity(mut self, id: ActivityId) -> Self {
-        self.activity = id;
-        self
-    }
     /// Set the action taken.
-    #[must_use]
-    pub fn action(mut self, id: ActionId) -> Self {
-        self.action = Some(id);
-        self
-    }
     /// Set the disposition of the action.
-    #[must_use]
-    pub fn disposition(mut self, id: DispositionId) -> Self {
-        self.disposition = Some(id);
-        self
-    }
     /// Set the event severity.
-    #[must_use]
-    pub fn severity(mut self, id: SeverityId) -> Self {
-        self.severity = id;
-        self
-    }
     /// Set the overall event status.
-    #[must_use]
-    pub fn status(mut self, id: StatusId) -> Self {
-        self.status = Some(id);
-        self
-    }
     /// Set a human-readable event message.
-    #[must_use]
-    pub fn message(mut self, msg: impl Into<String>) -> Self {
-        self.message = Some(msg.into());
-        self
-    }
     #[must_use]
     pub fn process(mut self, proc: Process) -> Self {
         self.process = Some(proc);
@@ -142,6 +101,10 @@ impl<ActorState> ProcessActivityBuilder<'_, ActorState> {
         self
     }
 }
+
+impl_activity_setter!(ProcessActivityBuilder<ActorState>);
+impl_action_disposition_setters!(ProcessActivityBuilder<ActorState>);
+impl_builder_setters!(ProcessActivityBuilder<ActorState>);
 
 impl ProcessActivityBuilder<'_, HasActor> {
     #[must_use]

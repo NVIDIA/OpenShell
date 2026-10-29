@@ -290,7 +290,7 @@ jobs:
       - vm-e2e
       - build-deb
       - build-rpm
-      - publish-snap
+      - build-snap
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:
