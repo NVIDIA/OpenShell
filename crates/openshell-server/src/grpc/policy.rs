@@ -5437,7 +5437,8 @@ pub(super) async fn handle_push_sandbox_logs(
         )
         .await?;
 
-        let logs: Vec<_> = batch.logs.into_iter().take(100).collect();
+        // A supervisor can replay up to 200 buffered lines after reconnecting.
+        let logs: Vec<_> = batch.logs.into_iter().take(200).collect();
         validate_sandbox_log_timestamps(&logs)?;
 
         for log in logs {
@@ -8263,6 +8264,97 @@ mod tests {
                 },
             }));
         request
+    }
+
+    #[tokio::test]
+    async fn push_sandbox_logs_accepts_a_full_reconnect_buffer_and_caps_larger_batches() {
+        use openshell_core::proto::open_shell_client::OpenShellClient;
+        use openshell_core::proto::open_shell_server::OpenShellServer;
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-log-replay";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "log-replay",
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let principal = crate::auth::principal::test_support::sandbox(sandbox_id);
+        let service = OpenShellServer::with_interceptor(
+            crate::grpc::OpenShellService::new(state.clone()),
+            move |mut request: Request<()>| {
+                request.extensions_mut().insert(principal.clone());
+                Ok(request)
+            },
+        );
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let mut client = OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+
+        for count in [200, 0, 1, 50, 100, 101, 199, 201] {
+            state.tracing_log_bus.remove(sandbox_id);
+            let logs: Vec<_> = (0..count)
+                .map(|index| SandboxLogLine {
+                    sandbox_id: "untrusted-id".to_string(),
+                    event_time: openshell_core::time::timestamp_from_millis(index).ok(),
+                    level: "INFO".to_string(),
+                    target: "reconnect-test".to_string(),
+                    message: format!("line {index}"),
+                    source: "gateway".to_string(),
+                    fields: HashMap::from([("index".to_string(), index.to_string())]),
+                })
+                .collect();
+            let expected: Vec<_> = logs
+                .iter()
+                .take(200)
+                .cloned()
+                .map(|mut log| {
+                    log.sandbox_id = sandbox_id.to_string();
+                    log.source = "sandbox".to_string();
+                    log
+                })
+                .collect();
+            client
+                .push_sandbox_logs(tokio_stream::iter([PushSandboxLogsRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    logs,
+                }]))
+                .await
+                .unwrap();
+
+            let received: Vec<_> = state
+                .tracing_log_bus
+                .tail(sandbox_id, 201)
+                .into_iter()
+                .map(|entry| {
+                    let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
+                        entry.event.payload
+                    else {
+                        panic!("expected a log event");
+                    };
+                    log
+                })
+                .collect();
+            assert_eq!(
+                received.len(),
+                expected.len(),
+                "gateway ingestion of a request containing {count} log lines"
+            );
+            assert_eq!(received, expected, "request containing {count} log lines");
+        }
+        server.abort();
     }
 
     #[test]

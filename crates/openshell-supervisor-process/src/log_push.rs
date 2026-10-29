@@ -180,15 +180,13 @@ pub fn start_log_push(
 const MAX_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 /// Initial backoff delay after a connection failure.
 const INITIAL_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_secs(1);
-/// Lines per regular or reconnect-replay batch, below the gateway's ingest cap.
-const LOG_PUSH_BATCH_LINES: usize = 50;
 
 async fn run_push_loop(
     gateway: GatewayEndpoint,
     sandbox_id: String,
     mut rx: mpsc::Receiver<SandboxLogLine>,
 ) {
-    let mut batch = Vec::with_capacity(LOG_PUSH_BATCH_LINES);
+    let mut batch = Vec::with_capacity(50);
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
 
@@ -238,13 +236,20 @@ async fn run_push_loop(
         });
 
         // --- Flush any lines buffered during reconnect ---
-        if flush_reconnect_buffer(&push_tx, &sandbox_id, &mut batch)
-            .await
-            .is_err()
-        {
-            // RPC died immediately — go back to reconnect.
-            backoff = INITIAL_BACKOFF;
-            continue;
+        if !batch.is_empty() {
+            let lines = std::mem::take(&mut batch);
+            if push_tx
+                .send(PushSandboxLogsRequest {
+                    sandbox_id: sandbox_id.clone(),
+                    logs: lines,
+                })
+                .await
+                .is_err()
+            {
+                // RPC died immediately — go back to reconnect.
+                backoff = INITIAL_BACKOFF;
+                continue;
+            }
         }
 
         // --- Batch and send loop (runs until stream breaks) ---
@@ -269,7 +274,7 @@ async fn run_push_loop(
                         return;
                     };
                     batch.push(line);
-                    if batch.len() >= LOG_PUSH_BATCH_LINES {
+                    if batch.len() >= 50 {
                         let lines = std::mem::take(&mut batch);
                         if push_tx.send(PushSandboxLogsRequest {
                             sandbox_id: sandbox_id.clone(),
@@ -309,24 +314,6 @@ async fn run_push_loop(
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     }
-}
-
-async fn flush_reconnect_buffer(
-    tx: &mpsc::Sender<PushSandboxLogsRequest>,
-    sandbox_id: &str,
-    batch: &mut Vec<SandboxLogLine>,
-) -> Result<(), mpsc::error::SendError<PushSandboxLogsRequest>> {
-    // The reconnect buffer can hold 200 lines, but the gateway only ingests
-    // the first 100 of each request. Replay using the regular batch size.
-    while !batch.is_empty() {
-        let count = batch.len().min(LOG_PUSH_BATCH_LINES);
-        tx.send(PushSandboxLogsRequest {
-            sandbox_id: sandbox_id.to_string(),
-            logs: batch.drain(..count).collect(),
-        })
-        .await?;
-    }
-    Ok(())
 }
 
 /// Drain incoming log lines during a backoff delay so the tracing layer's
@@ -535,87 +522,6 @@ mod tests {
             source: "sandbox".to_string(),
             fields: std::collections::HashMap::new(),
         }
-    }
-
-    #[tokio::test]
-    async fn reconnect_replay_retains_all_buffered_lines_at_the_gateway_ingest_cap() {
-        let expected: Vec<_> = (0..200).map(|i| test_line(&format!("line {i}"))).collect();
-        let (tx, mut rx) = mpsc::channel(LOG_PUSH_QUEUE_LINES);
-        for line in &expected {
-            tx.try_send(line.clone()).unwrap();
-        }
-        drop(tx);
-
-        let mut batch = Vec::new();
-        drain_during_backoff(&mut rx, &mut batch, INITIAL_BACKOFF).await;
-        assert_eq!(batch, expected);
-
-        let (push_tx, mut push_rx) = mpsc::channel(32);
-        flush_reconnect_buffer(&push_tx, "sb-test", &mut batch)
-            .await
-            .unwrap();
-        drop(push_tx);
-
-        let mut received = Vec::new();
-        let mut batch_sizes = Vec::new();
-        while let Some(request) = push_rx.recv().await {
-            assert_eq!(request.sandbox_id, "sb-test");
-            batch_sizes.push(request.logs.len());
-            // Match handle_push_sandbox_logs in openshell-server/src/grpc/policy.rs.
-            received.extend(request.logs.into_iter().take(100));
-        }
-        eprintln!(
-            "reconnect replay: batches={batch_sizes:?}, retained={}/{}",
-            received.len(),
-            expected.len()
-        );
-        assert_eq!(
-            received.len(),
-            expected.len(),
-            "the gateway ingest cap must not truncate reconnect-buffered logs"
-        );
-        assert_eq!(received, expected, "replay must preserve order and fields");
-        assert!(batch.is_empty());
-    }
-
-    #[tokio::test]
-    async fn reconnect_replay_preserves_empty_and_partial_batches() {
-        for count in [0, 1, 49, 50, 51, 100, 101, 199] {
-            let expected: Vec<_> = (0..count)
-                .map(|i| test_line(&format!("line {i}")))
-                .collect();
-            let mut batch = expected.clone();
-            let (tx, mut rx) = mpsc::channel(32);
-            flush_reconnect_buffer(&tx, "sb-test", &mut batch)
-                .await
-                .unwrap();
-            drop(tx);
-
-            let mut received = Vec::new();
-            while let Some(request) = rx.recv().await {
-                assert_eq!(request.sandbox_id, "sb-test");
-                assert!(!request.logs.is_empty());
-                assert!(request.logs.len() <= LOG_PUSH_BATCH_LINES);
-                received.extend(request.logs);
-            }
-            assert_eq!(received, expected, "replay of {count} lines");
-            assert!(batch.is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn reconnect_replay_returns_an_error_if_the_stream_closes() {
-        let mut batch: Vec<_> = (0..200).map(|i| test_line(&format!("line {i}"))).collect();
-        let (tx, rx) = mpsc::channel(1);
-        drop(rx);
-
-        let error = flush_reconnect_buffer(&tx, "sb-test", &mut batch)
-            .await
-            .expect_err("a closed stream must return to the reconnect loop");
-
-        assert_eq!(error.0.logs.len(), LOG_PUSH_BATCH_LINES);
-        assert_eq!(batch.len(), 200 - LOG_PUSH_BATCH_LINES);
-        assert_eq!(batch[0].message, "line 50");
     }
 
     #[tokio::test]
