@@ -337,27 +337,25 @@ pub fn uninspectable_traffic_gate(
     }
 }
 
-/// Sandbox and originating process identity shown to HTTP session hook
-/// middleware. The process is the one the connection's network policy
-/// resolved, without its pid.
+/// Sandbox and originating process identity shown to middleware. The process
+/// is the one the connection's network policy resolved, without its pid.
 pub fn middleware_request_context(
     ctx: &L7EvalContext,
     request_id: &str,
 ) -> openshell_core::proto::RequestContext {
     let sandbox = openshell_ocsf::ctx::ctx();
-    openshell_core::proto::RequestContext {
+    let mut context = openshell_core::proto::RequestContext {
         request_id: request_id.to_string(),
         sandbox_id: sandbox.sandbox_id.clone(),
         sandbox: sandbox.sandbox_name.clone(),
         workspace: ctx.workspace.clone(),
-        originating_process: (!ctx.binary_path.is_empty()).then(|| {
-            openshell_core::proto::Process {
-                binary: ctx.binary_path.clone(),
-                pid: 0,
-                ancestors: ctx.ancestors.clone(),
-            }
-        }),
-    }
+        originating_process: openshell_supervisor_middleware::originating_process(
+            &ctx.binary_path,
+            &ctx.ancestors,
+        ),
+    };
+    openshell_supervisor_middleware::fit_request_context(&mut context);
+    context
 }
 
 /// Emit the detection finding for traffic a matching middleware chain cannot
@@ -1730,6 +1728,10 @@ fn middleware_request_input_with_id(
         sandbox_id: sandbox.sandbox_id.clone(),
         sandbox_name: sandbox.sandbox_name.clone(),
         workspace: ctx.workspace.clone(),
+        originating_process: openshell_supervisor_middleware::originating_process(
+            &ctx.binary_path,
+            &ctx.ancestors,
+        ),
         scheme: scheme.into(),
         host: ctx.host.clone(),
         port: ctx.port,

@@ -1941,6 +1941,10 @@ fn websocket_preflight_input(
         sandbox_id: sandbox.sandbox_id.clone(),
         sandbox_name: sandbox.sandbox_name.clone(),
         workspace: ctx.workspace.clone(),
+        originating_process: openshell_supervisor_middleware::originating_process(
+            &ctx.binary_path,
+            &ctx.ancestors,
+        ),
         scheme: scheme.to_string(),
         host: ctx.host.clone(),
         port: ctx.port,
@@ -4297,6 +4301,8 @@ mod tests {
         assert_eq!(input.sandbox_id, "sbx-123");
         assert_eq!(input.sandbox_name, "nightly-build");
         assert_eq!(input.workspace, "team-a");
+        let process = input.originating_process.expect("originating process");
+        assert_eq!(process.binary, "/usr/bin/curl");
     }
 
     #[test]
@@ -7866,6 +7872,8 @@ network_policies:
         );
 
         assert_eq!(input.scheme, "http");
+        let process = input.originating_process.expect("originating process");
+        assert_eq!(process.binary, "/usr/bin/curl");
     }
 
     #[test]

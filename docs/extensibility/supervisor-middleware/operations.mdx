@@ -28,7 +28,7 @@ When several middleware match the same traffic, OpenShell calls them in ascendin
 
 Every operation includes a request context. The context always includes `sandbox_id`. Use it for authorization, persistence, and correlation. The context also includes `sandbox` and `workspace` names when available. Names can be reused, so use them only for display and logging.
 
-When OpenShell resolves the originating process, `context.originating_process` includes its binary and ancestors, with `pid` set to `0`.
+When OpenShell resolves the process that opened the connection, `context.originating_process` includes its binary and ancestors (nearest parent first), with `pid` set to `0`. Every request on a reused connection carries the process resolved when the connection opened. The field is absent when OpenShell cannot resolve the caller. To keep the context within 4 KiB, OpenShell drops the farthest ancestors of a deep process tree, and omits the process when its binary path alone is too long. Treat a missing process as unknown, not as a denial.
 
 Operations that include headers deliver them in wire order, and repeated headers stay separate. OpenShell removes credential, routing, and hop-by-hop headers before sending them to your service. It also removes framing headers from request input. Response preflight includes `Content-Encoding` and `Content-Range` as read-only metadata. The first stage retains upstream `Content-Length`. For later stages, OpenShell updates it to the known input length and omits it when unknown. Headers named by `Connection` remain omitted. Your service cannot change or remove these fields; OpenShell handles downstream framing.
 

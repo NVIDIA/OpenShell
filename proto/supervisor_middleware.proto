@@ -1044,7 +1044,11 @@ message RequestContext {
   string request_id = 1;
   // Sandbox id that originated the request.
   string sandbox_id = 2;
-  // Workload process that originated the request, when available.
+  // Workload process that opened the connection, when OpenShell resolved it.
+  // The identity is per connection: every request on a reused connection
+  // carries the process resolved when the connection was admitted. When the
+  // context would exceed its size limit, OpenShell drops the farthest
+  // ancestors first, then the whole process.
   Process originating_process = 3;
   // Sandbox name that originated the request. For display and logging only.
   // Names are workspace-scoped and may be reused for different sandbox

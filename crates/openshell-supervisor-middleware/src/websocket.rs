@@ -42,6 +42,8 @@ pub struct WebSocketPreflightInput {
     pub sandbox_id: String,
     pub sandbox_name: String,
     pub workspace: String,
+    /// Workload process that opened the connection, when resolved.
+    pub originating_process: Option<openshell_core::proto::Process>,
     pub scheme: String,
     pub host: String,
     pub port: u16,
@@ -951,16 +953,18 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
     };
     let dispatch = service.service.clone();
     let diagnostic_policy = service.diagnostic_policy;
+    let mut context = RequestContext {
+        request_id: input.request_id,
+        sandbox_id: input.sandbox_id,
+        sandbox: input.sandbox_name,
+        workspace: input.workspace,
+        originating_process: input.originating_process,
+    };
+    super::fit_request_context(&mut context);
     let preflight = WebSocketPreflight {
         session_id: input.session_id,
         phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-        context: Some(RequestContext {
-            request_id: input.request_id,
-            sandbox_id: input.sandbox_id,
-            sandbox: input.sandbox_name,
-            workspace: input.workspace,
-            originating_process: None,
-        }),
+        context: Some(context),
         target: Some(HttpRequestTarget {
             scheme: input.scheme,
             host: input.host,

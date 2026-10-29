@@ -50,7 +50,7 @@ use openshell_core::proto::middleware::v1::supervisor_middleware_server::Supervi
 use openshell_core::proto::{
     Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestSessionEvent,
     HttpRequestTarget, HttpResponseSessionEvent, MiddlewareBinding, MiddlewareDescribeRequest,
-    MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
+    MiddlewareManifest, NetworkMiddlewareConfig, Process, RequestContext, SandboxPolicy,
     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
     ValidateConfigRequest, ValidateConfigResponse,
 };
@@ -599,6 +599,34 @@ impl DescribedChainEntry {
     }
 }
 
+/// The workload process shown to middleware as `RequestContext.originating_process`.
+///
+/// It holds the executable and ancestors (nearest parent first) the
+/// connection's network policy resolved, or is `None` when the caller is
+/// unknown. The pid is 0: the identity is resolved per connection.
+pub fn originating_process(binary: &str, ancestors: &[String]) -> Option<Process> {
+    (!binary.is_empty()).then(|| Process {
+        binary: binary.to_string(),
+        pid: 0,
+        ancestors: ancestors.to_vec(),
+    })
+}
+
+/// Keep a request context within [`MAX_MIDDLEWARE_CONTEXT_BYTES`].
+///
+/// Drops the farthest ancestors of its originating process, then the process
+/// itself, so a deep process tree never becomes an over-capacity failure.
+pub fn fit_request_context(context: &mut RequestContext) {
+    while context.encoded_len() > MAX_MIDDLEWARE_CONTEXT_BYTES {
+        let Some(process) = context.originating_process.as_mut() else {
+            return;
+        };
+        if process.ancestors.pop().is_none() {
+            context.originating_process = None;
+        }
+    }
+}
+
 /// Re-checks a middleware-transformed request body against sandbox policy.
 ///
 /// Returns `Some(reason)` to deny the chain, `None` to proceed. Invoked after
@@ -627,6 +655,8 @@ pub struct HttpRequestInput {
     pub sandbox_id: String,
     pub sandbox_name: String,
     pub workspace: String,
+    /// Workload process that opened the connection, when resolved.
+    pub originating_process: Option<Process>,
     pub scheme: String,
     pub host: String,
     pub port: u16,
@@ -2106,6 +2136,7 @@ impl ChainRunner {
             sandbox_id,
             sandbox_name,
             workspace,
+            originating_process,
             scheme,
             host,
             port,
@@ -2119,13 +2150,14 @@ impl ChainRunner {
         // The request envelope is moved into one stable chain state. Built-ins
         // borrow these values for every stage; only the gRPC adapter clones them
         // when an operator service requires an owned protobuf message.
-        let context = RequestContext {
+        let mut context = RequestContext {
             request_id,
             sandbox_id,
             sandbox: sandbox_name,
             workspace,
-            originating_process: None,
+            originating_process,
         };
+        fit_request_context(&mut context);
         let target = HttpRequestTarget {
             scheme,
             host,
@@ -2560,6 +2592,37 @@ mod tests {
     }
 
     #[test]
+    fn fit_request_context_drops_farthest_ancestors_then_process() {
+        let ancestors: Vec<String> = (0..200)
+            .map(|i| format!("/opt/tools/bin/ancestor-{i:03}"))
+            .collect();
+        let mut context = RequestContext {
+            request_id: "req".into(),
+            originating_process: originating_process("/usr/bin/curl", &ancestors),
+            ..Default::default()
+        };
+        assert!(context.encoded_len() > MAX_MIDDLEWARE_CONTEXT_BYTES);
+        fit_request_context(&mut context);
+        assert!(context.encoded_len() <= MAX_MIDDLEWARE_CONTEXT_BYTES);
+        let process = context.originating_process.expect("process is kept");
+        assert_eq!(process.binary, "/usr/bin/curl");
+        assert!(!process.ancestors.is_empty());
+        assert_eq!(process.ancestors[..], ancestors[..process.ancestors.len()]);
+
+        let mut context = RequestContext {
+            originating_process: originating_process(
+                &format!("/{}", "b".repeat(MAX_MIDDLEWARE_CONTEXT_BYTES)),
+                &ancestors,
+            ),
+            ..Default::default()
+        };
+        fit_request_context(&mut context);
+        assert!(context.originating_process.is_none());
+
+        assert!(originating_process("", &ancestors).is_none());
+    }
+
+    #[test]
     fn advertised_audience_mismatch_fails_registration() {
         let configured = "urn:openshell:extension:middleware:content-guard";
 
@@ -2618,6 +2681,7 @@ mod tests {
             sandbox_id: "sbx-id".into(),
             sandbox_name: "sbx-name".into(),
             workspace: "wrks-default".into(),
+            originating_process: originating_process("/usr/bin/curl", &["/usr/bin/bash".into()]),
             scheme: "https".into(),
             host: "api.example.com".into(),
             port: 443,
@@ -2774,7 +2838,7 @@ mod tests {
         assert_eq!(outcome.body.as_ptr().addr(), expected_body);
         assert_eq!(received.len(), 2);
         assert_eq!(received[0].phase, SupervisorMiddlewarePhase::PreCredentials);
-        assert!(!received[0].originating_process_present);
+        assert!(received[0].originating_process_present);
         assert_eq!(received[0].request_id, expected_request_id);
         assert_eq!(received[0].host, expected_host);
         assert_eq!(received[0].first_header_name, expected_header_name);
@@ -3960,7 +4024,13 @@ mod tests {
         assert_eq!(context.sandbox_id, "sbx-id");
         assert_eq!(context.sandbox, "sbx-name");
         assert_eq!(context.workspace, "wrks-default");
-        assert!(context.originating_process.is_none());
+        let process = context
+            .originating_process
+            .as_ref()
+            .expect("originating process");
+        assert_eq!(process.binary, "/usr/bin/curl");
+        assert_eq!(process.ancestors, vec!["/usr/bin/bash".to_string()]);
+        assert_eq!(process.pid, 0);
         let target = received[0].target.as_ref().expect("request target");
         assert_eq!(target.scheme, "https");
         assert_eq!(target.host, "api.example.com");
@@ -5552,6 +5622,7 @@ mod tests {
             sandbox_id: "sandbox".into(),
             sandbox_name: "sandbox-name".into(),
             workspace: "wrks-default".into(),
+            originating_process: originating_process("/usr/bin/node", &[]),
             scheme: "wss".into(),
             host: "api.openai.com".into(),
             port: 443,
@@ -5996,6 +6067,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -6064,6 +6136,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -6128,6 +6201,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -6201,6 +6275,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: originating_process("/usr/bin/node", &[]),
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -6235,6 +6310,11 @@ mod tests {
         assert_eq!(target.path, "/v1/responses");
         assert!(target.query.is_empty());
         assert_eq!(observed.requested_subprotocols, ["realtime"]);
+        let process = observed
+            .context
+            .and_then(|context| context.originating_process)
+            .expect("preflight originating process");
+        assert_eq!(process.binary, "/usr/bin/node");
         session
             .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
@@ -6287,6 +6367,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: None,
                     scheme: "ws".into(),
                     host: "api.openai.com".into(),
                     port: 80,
@@ -6584,6 +6665,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
