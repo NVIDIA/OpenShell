@@ -1679,6 +1679,7 @@ impl EtwEventProcessor {
             sandbox_id: sandbox_id.to_string(),
             sandbox_name: sandbox_name.to_string(),
             container_image: "mxc/appcontainer".to_string(),
+            container_image_uid: None,
             origin: openshell_ocsf::EventOrigin::Gateway {
                 name: self.gateway_name.clone(),
             },

@@ -724,7 +724,10 @@ fn build_env(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.into(),
         config.ssh_socket_path.clone(),
     );
-    env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
+    env.insert(
+        openshell_core::sandbox_env::CONTAINER_IMAGE.into(),
+        image.to_string(),
+    );
     let main_process = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(spec)
         .map_err(|error| ComputeDriverError::Precondition(error.to_string()))?;
     env.insert(
@@ -1723,6 +1726,10 @@ pub fn build_isolation_specs(
         network_trust_generation(input.network_trust).into(),
     );
     supervisor.image.clone_from(&input.config.supervisor_image);
+    supervisor.env.insert(
+        openshell_core::sandbox_env::CONTAINER_IMAGE_UID.into(),
+        input.image.id.clone(),
+    );
     supervisor.entrypoint = vec!["/openshell-supervisor".into()];
     supervisor.command.extend([
         format!(
@@ -2129,6 +2136,28 @@ mod tests {
             vec!["--bootstrap", crate::isolation::BOOTSTRAP_PATH]
         );
         assert_eq!(specs.supervisor.user, "1000:1001");
+        assert_eq!(
+            specs
+                .supervisor
+                .env
+                .get(openshell_core::sandbox_env::CONTAINER_IMAGE_UID)
+                .map(String::as_str),
+            Some("sha256:image")
+        );
+        assert_eq!(
+            specs
+                .supervisor
+                .env
+                .get(openshell_core::sandbox_env::CONTAINER_IMAGE)
+                .map(String::as_str),
+            Some("image:latest")
+        );
+        assert!(
+            !specs
+                .workload
+                .env
+                .contains_key(openshell_core::sandbox_env::CONTAINER_IMAGE_UID)
+        );
         assert_eq!(specs.supervisor.groups, vec!["2000"]);
         assert!(specs.supervisor.cap_add.is_empty());
         assert_eq!(specs.workload.netns.nsmode, "none");

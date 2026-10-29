@@ -145,7 +145,9 @@ Gateway-produced records use the `OpenShell Gateway` product identity; superviso
 
 For gateway-produced records, `device.os.name` and `device.os.type_id` identify the OS running the gateway process: Linux (200), Windows (100), or macOS (300). Linux supervisor records continue to report Linux, regardless of the gateway's OS. A native macOS gateway therefore reports macOS while its Linux sandboxes report Linux; a gateway running inside a Linux container reports Linux, even on a Mac host.
 
-`metadata.uid` uniquely identifies an event and stays unchanged when that record is serialized again. For supervisor records, use `device.container.uid` to associate the event with its sandbox and `device.container.name` for the sandbox name. These records declare the `container` profile in `metadata.profiles`. Records without a sandbox association omit `device.container`. The emitter omits `device.container.image` because it has an image reference but no resolved image UID, which OCSF requires.
+`metadata.uid` uniquely identifies an event and stays unchanged when that record is serialized again. For supervisor records, use `device.container.uid` to associate the event with its sandbox and `device.container.name` for the sandbox name. These records declare the `container` profile in `metadata.profiles`. Records without a sandbox association omit `device.container`.
+
+Docker and Podman supervisor records include `device.container.image.uid`, the immutable workload image ID resolved at launch, and `device.container.image.name`, the requested image reference. The UID identifies the workload image, even when a mutable tag later changes. Records omit `device.container.image` when the driver has not supplied a resolved image UID, including Kubernetes supervisor records.
 
 <Warning>
 Sandbox identity has moved from top-level `container` to `device.container` for supervisor records, and to `resources` or `unmapped` for gateway records, to conform to OCSF 1.8.0. Update SIEM mappings and parsers, including XSIAM content pack rules that read `container.uid` or `container.name`, to use the paths for the producing component.

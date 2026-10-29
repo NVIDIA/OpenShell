@@ -1381,6 +1381,7 @@ mod ocsf_event_tests {
             sandbox_id: "sbx-1".into(),
             sandbox_name: "sandbox".into(),
             container_image: "img".into(),
+            container_image_uid: None,
             hostname: "host".into(),
             product_version: "0.0.1".into(),
             proxy_ip: "127.0.0.1".parse().unwrap(),

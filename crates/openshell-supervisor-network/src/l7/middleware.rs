@@ -1205,6 +1205,7 @@ mod tests {
             sandbox_id: "sbx-123".into(),
             sandbox_name: "nightly-build".into(),
             container_image: String::new(),
+            container_image_uid: None,
             hostname: "h".into(),
             product_version: "0".into(),
             proxy_ip: [127, 0, 0, 1].into(),

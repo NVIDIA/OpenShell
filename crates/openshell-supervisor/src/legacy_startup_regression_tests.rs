@@ -286,6 +286,7 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         sandbox_id: Some("sb-legacy-restart".into()),
         sandbox: Some("legacy-restart".into()),
         container_image: String::new(),
+        container_image_uid: None,
         openshell_endpoint: Some(endpoint),
         policy_rules: None,
         policy_data: None,

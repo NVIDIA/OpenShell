@@ -120,7 +120,7 @@ use std::sync::Arc;
 use crate::OCSF_VERSION;
 use crate::enums::StatusId;
 use crate::events::base_event::BaseEventData;
-use crate::objects::{Container, Device, Endpoint, Metadata, Product, ResourceDetails};
+use crate::objects::{Container, Device, Endpoint, Image, Metadata, Product, ResourceDetails};
 
 /// Which `OpenShell` component produced an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +146,8 @@ pub struct EventContext {
     pub sandbox_name: String,
     /// Container image reference.
     pub container_image: String,
+    /// Immutable workload image ID resolved by the compute driver at launch.
+    pub container_image_uid: Option<String>,
     /// Device hostname.
     pub hostname: String,
     /// Product version string.
@@ -230,9 +232,14 @@ impl EventContext {
         Some(Container {
             name: self.sandbox_name.clone(),
             uid: Some(self.sandbox_id.clone()),
-            // The context carries an image reference, not a resolved image UID.
-            // OCSF requires image.uid, so omit the object until that is available.
-            image: None,
+            image: self
+                .container_image_uid
+                .as_ref()
+                .filter(|uid| !uid.trim().is_empty())
+                .map(|uid| Image {
+                    uid: uid.clone(),
+                    name: self.container_image.clone(),
+                }),
         })
     }
 
@@ -306,6 +313,7 @@ pub(crate) fn test_sandbox_context() -> EventContext {
         sandbox_id: "sandbox-abc123".to_string(),
         sandbox_name: "my-sandbox".to_string(),
         container_image: "ghcr.io/openshell/sandbox:latest".to_string(),
+        container_image_uid: None,
         hostname: "sandbox-abc123".to_string(),
         product_version: "0.1.0".to_string(),
         proxy_ip: "10.42.0.1".parse().unwrap(),
@@ -428,6 +436,7 @@ pub(crate) fn test_gateway_context() -> EventContext {
         sandbox_id: String::new(),
         sandbox_name: String::new(),
         container_image: String::new(),
+        container_image_uid: None,
         hostname: "openshell-gateway-0".to_string(),
         product_version: "0.1.0".to_string(),
         proxy_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -441,6 +450,27 @@ pub(crate) fn test_gateway_context() -> EventContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_container_image_matches_schema() {
+        let mut ctx = test_sandbox_context();
+        ctx.container_image_uid = Some("sha256:resolved-workload".into());
+        for (class, event) in sample_events(&ctx) {
+            let json = event.to_json().unwrap();
+            openshell_ocsf_validate::validate_event(&json)
+                .unwrap_or_else(|error| panic!("{class}: {error}"));
+            if class != "authentication" {
+                assert_eq!(
+                    json["device"]["container"]["image"]["uid"],
+                    "sha256:resolved-workload"
+                );
+                assert_eq!(
+                    json["device"]["container"]["image"]["name"],
+                    ctx.container_image
+                );
+            }
+        }
+    }
 
     #[test]
     fn sandbox_identity_matches_every_event_class_schema() {

@@ -5339,6 +5339,37 @@ fn docker_network_trust_supervisor_mount(
     })
 }
 
+/// Read the image identity pinned at provisioning, including after a restart.
+/// Re-resolving the template's tag here could identify a different image.
+async fn docker_workload_image_environment(
+    sandbox: &DriverSandbox,
+    directory: &Path,
+) -> Result<Vec<String>, Status> {
+    let bytes = tokio::fs::read(directory.join(BOUNDARY_CONFIG_FILE))
+        .await
+        .map_err(|error| Status::internal(format!("read Docker image launch identity: {error}")))?;
+    let bootstrap: BoundaryConfig = serde_json::from_slice(&bytes)
+        .map_err(|_| Status::internal("decode Docker image launch identity"))?;
+    let mut environment = Vec::new();
+    if let Some(image) = sandbox_image(sandbox) {
+        environment.push(format!(
+            "{}={image}",
+            openshell_core::sandbox_env::CONTAINER_IMAGE
+        ));
+    }
+    if let Some(uid) = bootstrap
+        .resource_claims
+        .get("docker.image_identity")
+        .filter(|uid| !uid.trim().is_empty())
+    {
+        environment.push(format!(
+            "{}={uid}",
+            openshell_core::sandbox_env::CONTAINER_IMAGE_UID
+        ));
+    }
+    Ok(environment)
+}
+
 async fn spawn_docker_control_process(
     docker: &Docker,
     sandbox: &DriverSandbox,
@@ -5365,6 +5396,7 @@ async fn spawn_docker_control_process(
     let workspace_root = tokio::fs::read_to_string(directory.join(WORKSPACE_ROOT_FILE))
         .await
         .map_err(|error| Status::internal(format!("read Docker workspace root: {error}")))?;
+    let image_environment = docker_workload_image_environment(sandbox, &directory).await?;
     let supervisor_name = format!("{}-supervisor", container_name_for_sandbox(sandbox));
     let _ = docker
         .remove_container(
@@ -5415,6 +5447,7 @@ async fn spawn_docker_control_process(
             openshell_core::telemetry::enabled_env_value()
         ),
     ];
+    environment.extend(image_environment);
     environment.extend(supervisor_otlp_environment(config));
     if config.guest_tls.is_some() {
         environment.push(format!(

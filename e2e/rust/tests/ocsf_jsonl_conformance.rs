@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use openshell_e2e::harness::cli::run_cli;
 use openshell_e2e::harness::container::{ContainerEngine, ContainerHttpServer};
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use openshell_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, SandboxGuard};
 use serde_json::Value;
 use tempfile::NamedTempFile;
 
@@ -182,6 +182,21 @@ fn supervisor_records(engine: &ContainerEngine, sandbox: &str) -> Result<Vec<Val
 #[tokio::test]
 async fn supervisor_jsonl_conforms_to_the_native_schema() {
     let engine = ContainerEngine::from_env().expect("container engine");
+    let image = engine
+        .command()
+        .args([
+            "image",
+            "inspect",
+            E2E_WORKLOAD_IMAGE,
+            "--format",
+            "{{.Id}}",
+        ])
+        .output()
+        .expect("inspect workload image");
+    assert!(image.status.success(), "inspect workload image: {image:?}");
+    let image_uid = String::from_utf8(image.stdout).expect("image UID is UTF-8");
+    let image_uid = image_uid.trim().trim_start_matches("sha256:");
+    assert!(!image_uid.is_empty());
     let server = ContainerHttpServer::start_python("ocsf-l7.openshell.test", HTTP_SERVER)
         .await
         .expect("start test server");
@@ -234,7 +249,10 @@ async fn supervisor_jsonl_conforms_to_the_native_schema() {
             "top-level container: {record}"
         );
         assert_eq!(record["device"]["container"]["name"], guard.name);
-        assert!(record["device"]["container"].get("image").is_none());
+        let recorded_image_uid = record["device"]["container"]["image"]["uid"]
+            .as_str()
+            .expect("resolved workload image identity");
+        assert_eq!(recorded_image_uid.trim_start_matches("sha256:"), image_uid);
         match openshell_ocsf_validate::validate_event(record) {
             Ok(()) => {}
             Err(openshell_ocsf_validate::Error::UnsupportedVersion(version)) => panic!(

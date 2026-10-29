@@ -458,6 +458,7 @@ mod tests {
             sandbox_id: sandbox_id.to_string(),
             sandbox_name: "sandbox-name".to_string(),
             container_image: String::new(),
+            container_image_uid: None,
             hostname: "host".to_string(),
             product_version: "0.0.0".to_string(),
             proxy_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),

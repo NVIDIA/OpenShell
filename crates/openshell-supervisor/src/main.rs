@@ -612,7 +612,13 @@ fn main() -> Result<()> {
                     await_main_process_attachment,
                     sandbox_id: args.sandbox_id,
                     sandbox: args.sandbox,
-                    container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
+                    container_image: std::env::var(openshell_core::sandbox_env::CONTAINER_IMAGE)
+                        .unwrap_or_default(),
+                    container_image_uid: std::env::var(
+                        openshell_core::sandbox_env::CONTAINER_IMAGE_UID,
+                    )
+                    .ok()
+                    .filter(|uid| !uid.trim().is_empty()),
                     openshell_endpoint: args.openshell_endpoint,
                     policy_rules: args.policy_rules,
                     policy_data: args.policy_data,

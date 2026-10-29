@@ -14,6 +14,7 @@ fn sandbox_ctx(container_image: &str) -> EventContext {
         sandbox_id: "sb-1".to_string(),
         sandbox_name: "agent-01".to_string(),
         container_image: container_image.to_string(),
+        container_image_uid: None,
         hostname: "openshell-sb-1".to_string(),
         product_version: "0.42.1".to_string(),
         proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -69,6 +70,38 @@ fn image_references_without_a_resolved_uid_are_omitted() {
         assert!(json["device"]["container"].is_object());
         assert!(json["device"]["container"].get("image").is_none());
     }
+}
+
+#[test]
+fn resolved_workload_image_survives_serialization() {
+    let mut ctx = sandbox_ctx("registry.example/agent:latest");
+    for uid in [
+        None,
+        Some(""),
+        Some("   "),
+        Some("sha256:resolved-workload"),
+    ] {
+        ctx.container_image_uid = uid.map(str::to_string);
+        let original = event(&ctx);
+        let json = original.to_json().unwrap();
+        let image = &json["device"]["container"]["image"];
+        if uid == Some("sha256:resolved-workload") {
+            assert_eq!(image["uid"], "sha256:resolved-workload");
+            assert_eq!(image["name"], "registry.example/agent:latest");
+        } else {
+            assert!(image.is_null());
+        }
+        let decoded: OcsfEvent = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(decoded.to_json().unwrap(), json);
+    }
+    ctx.origin = EventOrigin::Gateway {
+        name: "gateway".into(),
+    };
+    assert!(
+        event(&ctx).to_json().unwrap()["device"]
+            .get("container")
+            .is_none()
+    );
 }
 
 #[test]

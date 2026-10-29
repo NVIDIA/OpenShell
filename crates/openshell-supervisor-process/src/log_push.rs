@@ -396,6 +396,7 @@ mod tests {
             sandbox_name: "test-sandbox".to_string(),
             origin: EventOrigin::Supervisor,
             container_image: "openshell/sandbox:test".to_string(),
+            container_image_uid: None,
             hostname: "test-host".to_string(),
             product_version: "0.0.0".to_string(),
             proxy_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
