@@ -401,13 +401,8 @@ fn log_record(
     if let Some(uid) = &base.metadata.uid {
         record.add_attribute("ocsf.metadata.uid", uid.clone());
     }
-    if let Some(sandbox_id) = base
-        .container
-        .as_ref()
-        .and_then(|container| container.uid.clone())
-        .filter(|id| !id.is_empty())
-    {
-        record.add_attribute("openshell.sandbox.id", sandbox_id);
+    if let Some(sandbox_id) = event.sandbox_id() {
+        record.add_attribute("openshell.sandbox.id", sandbox_id.to_string());
     }
 
     let body = match schema_version {
@@ -507,6 +502,7 @@ mod tests {
         let body = body(&record(&event, Some(OcsfSchemaVersion::V1_3)));
         assert_eq!(body["metadata"]["version"], "1.3");
         assert!(body.get("container").is_none());
+        assert!(body["device"].get("container").is_none());
     }
 
     #[test]
@@ -544,7 +540,7 @@ mod tests {
     fn attributes_identify_the_event_and_its_sandbox() {
         let event = event("sandbox-1", SeverityId::Medium);
         let native = native(&event);
-        // The sandbox identity survives a downgrade that strips `container`.
+        // The sandbox identity survives a downgrade that strips `device.container`.
         let record = record(&event, Some(OcsfSchemaVersion::V1_1));
         let int = |key| match attribute(&record, key) {
             Some(AnyValue::Int(value)) => value,
@@ -570,6 +566,27 @@ mod tests {
             attribute(&record, "openshell.sandbox.id"),
             Some(AnyValue::String("sandbox-1".into()))
         );
+    }
+
+    #[test]
+    fn gateway_resource_and_unmapped_attribution_reach_otlp() {
+        use openshell_ocsf::{ApiActivityBuilder, DetectionFindingBuilder, EventOrigin};
+        let mut ctx = event_context("sandbox-1");
+        ctx.origin = EventOrigin::Gateway {
+            name: "gateway".into(),
+        };
+        for event in [
+            ApiActivityBuilder::new(&ctx, "GetSandbox").build(),
+            DetectionFindingBuilder::new(&ctx).build(),
+            ConfigStateChangeBuilder::new(&ctx).build(),
+        ] {
+            let record = record(&event, None);
+            assert_eq!(
+                attribute(&record, "openshell.sandbox.id"),
+                Some(AnyValue::String("sandbox-1".into()))
+            );
+            assert_eq!(body(&record), native(&event));
+        }
     }
 
     #[test]

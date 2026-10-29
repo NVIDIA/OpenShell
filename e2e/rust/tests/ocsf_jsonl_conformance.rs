@@ -229,6 +229,12 @@ async fn supervisor_jsonl_conforms_to_the_native_schema() {
     );
     let mut failures = Vec::new();
     for record in &records {
+        assert!(
+            record.get("container").is_none(),
+            "top-level container: {record}"
+        );
+        assert_eq!(record["device"]["container"]["name"], guard.name);
+        assert!(record["device"]["container"].get("image").is_none());
         match openshell_ocsf_validate::validate_event(record) {
             Ok(()) => {}
             Err(openshell_ocsf_validate::Error::UnsupportedVersion(version)) => panic!(

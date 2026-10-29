@@ -1245,6 +1245,7 @@ mod tests {
                 b
             },
             finding_info: FindingInfo::new("nssh1-replay-abc", "NSSH1 Nonce Replay Attack"),
+            resources: None,
             evidences: None,
             attacks: None,
             remediation: None,
@@ -1270,6 +1271,7 @@ mod tests {
         let event = OcsfEvent::DetectionFinding(DetectionFindingEvent {
             base,
             finding_info: FindingInfo::new("content_guard.match", "configured content matched"),
+            resources: None,
             evidences: Some(vec![Evidence::from_pairs(&[(
                 "matched_content",
                 "must-not-appear",
@@ -1304,6 +1306,7 @@ mod tests {
                 "content_guard\nforged",
                 "matched \"value\"\nFINDING:FORGED",
             ),
+            resources: None,
             evidences: None,
             attacks: None,
             remediation: None,

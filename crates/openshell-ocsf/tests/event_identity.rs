@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `metadata.uid` identifies the event; `container.uid` identifies the sandbox.
+//! `metadata.uid` identifies the event; `device.container.uid` identifies the sandbox.
 
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -56,14 +56,19 @@ fn the_sandbox_id_is_carried_by_the_container() {
         .to_json()
         .expect("serializes");
 
-    assert_eq!(json["container"]["uid"], "sb-1");
-    assert_eq!(json["container"]["name"], "agent-01");
+    assert_eq!(json["device"]["container"]["uid"], "sb-1");
+    assert_eq!(json["device"]["container"]["name"], "agent-01");
 }
 
 #[test]
-fn a_container_without_an_image_omits_the_image() {
-    let json = event(&sandbox_ctx("")).to_json().expect("serializes");
-    assert!(json["container"].get("image").is_none());
+fn image_references_without_a_resolved_uid_are_omitted() {
+    for reference in ["", "image:1", "ghcr.io/nvidia/openshell/sandbox:0.42.1"] {
+        let json = event(&sandbox_ctx(reference))
+            .to_json()
+            .expect("serializes");
+        assert!(json["device"]["container"].is_object());
+        assert!(json["device"]["container"].get("image").is_none());
+    }
 }
 
 #[test]

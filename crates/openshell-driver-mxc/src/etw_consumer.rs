@@ -2106,8 +2106,8 @@ mod tests {
         assert_eq!(json["device"]["name"], "production");
         assert_eq!(json["device"]["uid"], "production");
         assert_eq!(json["device"]["type"], "Server");
-        assert_eq!(json["container"]["name"], "agent-01");
-        assert_eq!(json["container"]["uid"], "sbx-123");
+        assert_eq!(json["unmapped"]["sandbox_name"], "agent-01");
+        assert_eq!(json["unmapped"]["sandbox_id"], "sbx-123");
     }
 
     #[test]

@@ -120,7 +120,7 @@ use std::sync::Arc;
 use crate::OCSF_VERSION;
 use crate::enums::StatusId;
 use crate::events::base_event::BaseEventData;
-use crate::objects::{Container, Device, Endpoint, Image, Metadata, Product};
+use crate::objects::{Container, Device, Endpoint, Metadata, Product, ResourceDetails};
 
 /// Which `OpenShell` component produced an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,28 +206,33 @@ impl EventContext {
             EventOrigin::Supervisor => Product::openshell_sandbox(&self.product_version),
             EventOrigin::Gateway { .. } => Product::openshell_gateway(&self.product_version),
         };
+        let profiles: Vec<String> = profiles
+            .iter()
+            .filter(|p| **p != "container" || matches!(self.origin, EventOrigin::Supervisor))
+            .map(|s| (*s).to_string())
+            .collect();
         Metadata {
             version: OCSF_VERSION.to_string(),
             product,
-            profiles: profiles.iter().map(|s| (*s).to_string()).collect(),
+            profiles,
             uid: Some(uuid::Uuid::new_v4().to_string()),
             log_source: None,
             correlation_uid: None,
         }
     }
 
-    /// Build the OCSF `Container` object when the event concerns a sandbox.
+    /// Build the OCSF `Container` object for an in-sandbox supervisor.
     #[must_use]
     pub fn container(&self) -> Option<Container> {
-        if self.sandbox_id.is_empty() {
+        if self.sandbox_id.is_empty() || matches!(self.origin, EventOrigin::Gateway { .. }) {
             return None;
         }
         Some(Container {
             name: self.sandbox_name.clone(),
             uid: Some(self.sandbox_id.clone()),
-            image: (!self.container_image.is_empty()).then(|| Image {
-                name: self.container_image.clone(),
-            }),
+            // The context carries an image reference, not a resolved image UID.
+            // OCSF requires image.uid, so omit the object until that is available.
+            image: None,
         })
     }
 
@@ -235,10 +240,31 @@ impl EventContext {
     /// on (Linux for the in-sandbox supervisor, Windows for the MXC gateway).
     #[must_use]
     pub fn device(&self) -> Device {
-        match &self.origin {
+        let mut device = match &self.origin {
             EventOrigin::Supervisor => Device::for_current_os(&self.hostname),
             EventOrigin::Gateway { name } => Device::gateway(&self.hostname, name),
+        };
+        device.container = self.container();
+        device
+    }
+
+    /// Identify the affected sandbox without claiming it runs on the gateway device.
+    pub(crate) fn add_sandbox_resource(&self, resources: &mut Vec<ResourceDetails>) {
+        if self.sandbox_id.is_empty() || !matches!(self.origin, EventOrigin::Gateway { .. }) {
+            return;
         }
+        let existing = resources.iter().position(|r| {
+            r.type_label.as_deref() == Some("sandbox") && r.uid.as_deref() == Some(&self.sandbox_id)
+        });
+        let mut resource = existing.map_or_else(
+            || ResourceDetails::new("sandbox", &self.sandbox_id),
+            |index| resources.remove(index),
+        );
+        if resource.name.is_none() && !self.sandbox_name.is_empty() {
+            resource.name = Some(self.sandbox_name.clone());
+        }
+        // Keep the context sandbox first when an event also names other targets.
+        resources.insert(0, resource);
     }
 
     /// Build the `proxy_endpoint` object for the Network Proxy profile.
@@ -262,8 +288,14 @@ impl EventContext {
             base.set_message(m);
         }
         base.set_device(self.device());
-        if let Some(container) = self.container() {
-            base.set_container(container);
+        // These classes have no resources attribute. Keep gateway attribution
+        // in the standard extension object rather than on the gateway device.
+        if matches!(self.origin, EventOrigin::Gateway { .. })
+            && !self.sandbox_id.is_empty()
+            && !matches!(base.class_uid, 6003 | 2004)
+        {
+            base.add_unmapped("sandbox_id", self.sandbox_id.clone());
+            base.add_unmapped("sandbox_name", self.sandbox_name.clone());
         }
     }
 }
@@ -409,6 +441,40 @@ pub(crate) fn test_gateway_context() -> EventContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_identity_matches_every_event_class_schema() {
+        let ctx = test_sandbox_context();
+        for (class_name, event) in sample_events(&ctx) {
+            let json = event.to_json().unwrap();
+            openshell_ocsf_validate::validate_event(&json)
+                .unwrap_or_else(|e| panic!("{class_name}: {e}"));
+            assert!(json.get("container").is_none(), "{class_name}");
+            if class_name == "authentication" {
+                assert!(json["device"].get("container").is_none());
+                assert!(event.sandbox_id().is_none());
+                continue;
+            }
+            assert!(
+                json["metadata"]["profiles"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p == "container"),
+                "{class_name}"
+            );
+            let device = &json["device"];
+            let container = &device["container"];
+            assert_eq!(container["uid"], ctx.sandbox_id, "{class_name}");
+            assert_eq!(container["name"], ctx.sandbox_name, "{class_name}");
+            assert!(
+                container.get("image").is_none(),
+                "image reference alone is insufficient"
+            );
+            let decoded: crate::OcsfEvent = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(decoded.to_json().unwrap(), json, "{class_name}");
+        }
+    }
 
     #[test]
     fn test_sandbox_context_metadata() {
