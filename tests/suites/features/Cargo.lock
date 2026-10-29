@@ -1900,6 +1900,7 @@ dependencies = [
  "futures",
  "http",
  "metrics",
+ "openshell-crypto",
  "openshell-ocsf",
  "opentelemetry",
  "opentelemetry-otlp",
