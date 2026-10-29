@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{Cursor, Read as _};
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -33,6 +33,7 @@ use openshell_core::{
     ExtensionBindingPolicy, GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
     GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig,
 };
+use rustls::pki_types::pem::{PemObject, SectionKind};
 use serde::{Deserialize, Serialize};
 
 /// Gateway configuration schema version supported by this build.
@@ -672,13 +673,13 @@ impl TryFrom<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
 fn sanitize_ca_cert_pem(name: &str, path: &Path, pem: &[u8]) -> Result<Vec<u8>, ConfigFileError> {
     let mut sanitized = Vec::new();
     let mut certificate_count = 0;
-    for item in rustls_pemfile::read_all(&mut Cursor::new(pem)) {
+    for item in <(SectionKind, Vec<u8>)>::pem_slice_iter(pem) {
         let item = item.map_err(|source| ConfigFileError::MiddlewareTlsCaInvalid {
             name: name.to_string(),
             path: path.to_path_buf(),
             message: source.to_string(),
         })?;
-        let rustls_pemfile::Item::X509Certificate(certificate) = item else {
+        let (SectionKind::Certificate, certificate) = item else {
             return Err(ConfigFileError::MiddlewareTlsCaInvalid {
                 name: name.to_string(),
                 path: path.to_path_buf(),
@@ -687,7 +688,7 @@ fn sanitize_ca_cert_pem(name: &str, path: &Path, pem: &[u8]) -> Result<Vec<u8>, 
         };
         certificate_count += 1;
         sanitized.extend_from_slice(b"-----BEGIN CERTIFICATE-----\n");
-        let encoded = base64::engine::general_purpose::STANDARD.encode(certificate.as_ref());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&certificate);
         for line in encoded.as_bytes().chunks(64) {
             sanitized.extend_from_slice(line);
             sanitized.push(b'\n');

@@ -61,7 +61,7 @@ libloading = { version = "0.8", optional = true }
 tar = { version = "0.4", optional = true }
 flate2 = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 
 [features]
 # Portable test instrumentation, independent of the compute runtime.

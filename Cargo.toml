@@ -42,7 +42,6 @@ h2 = "0.4"
 # TLS
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12"] }
-rustls-pemfile = "2"
 rcgen = { version = "0.14.10", default-features = false, features = ["pem"] }
 webpki-roots = "1"
 rustls-native-certs = "0.8"
@@ -117,7 +116,7 @@ jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"
 zeroize = { version = "1", features = ["derive"] }
 getrandom = "0.3"
 aws-lc-rs = "1.16"
-spiffe = { version = "0.15", default-features = false, features = ["workload-api-jwt", "jwt-verify-rust-crypto", "tracing"] }
+spiffe = { version = "0.15", default-features = false, features = ["workload-api-jwt", "jwt-verify-aws-lc-rs", "tracing"] }
 
 # Filesystem embedding
 include_dir = "0.7"
@@ -151,7 +150,7 @@ uuid = { version = "1.10", features = ["v4"] }
 signal-hook = "0.3"
 
 # SMT solver (system libz3 by default; opt into vendored source or a prebuilt release)
-z3 = "0.21"
+z3 = "0.22"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

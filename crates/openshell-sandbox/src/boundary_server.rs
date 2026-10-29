@@ -17,6 +17,7 @@ mod linux {
         BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess, BoundaryTerminal, ExecSession,
     };
 
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::mem::size_of;
@@ -5034,8 +5035,9 @@ mod linux {
     ) -> io::Result<rustls::ServerConfig> {
         openshell_crypto::tls::ensure_default_provider();
         let certificate_bytes = std::fs::read(&tls.certificate_chain_path)?;
-        let certificates = rustls_pemfile::certs(&mut certificate_bytes.as_slice())
-            .collect::<Result<Vec<_>, _>>()?;
+        let certificates = CertificateDer::pem_reader_iter(&mut certificate_bytes.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         if certificates.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -5043,7 +5045,10 @@ mod linux {
             ));
         }
         let private_key_bytes = std::fs::read(&tls.private_key_path)?;
-        let private_key = rustls_pemfile::private_key(&mut private_key_bytes.as_slice())?
+        let private_key = PrivateKeyDer::pem_reader_iter(&mut private_key_bytes.as_slice())
+            .next()
+            .transpose()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -5558,7 +5563,8 @@ mod linux {
 
         fn test_client_config(tls: &SandboxTlsClientConfig) -> rustls::ClientConfig {
             let mut roots = rustls::RootCertStore::empty();
-            for certificate in rustls_pemfile::certs(&mut tls.trust_anchor_pem.as_bytes()) {
+            for certificate in CertificateDer::pem_reader_iter(&mut tls.trust_anchor_pem.as_bytes())
+            {
                 roots
                     .add(certificate.expect("parse test CA"))
                     .expect("add test CA");
