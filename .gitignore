@@ -249,3 +249,4 @@ scripts/lint-mermaid/node_modules/
 
 # Local triage-duty reports, checkpoint, actions, and inbox
 /.agents/triage-duty/
+.opencode-memory.md
