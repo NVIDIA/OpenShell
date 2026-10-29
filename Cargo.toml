@@ -151,7 +151,7 @@ uuid = { version = "1.10", features = ["v4"] }
 signal-hook = "0.3"
 
 # SMT solver (system libz3 by default; opt into vendored source or a prebuilt release)
-z3 = "0.21"
+z3 = "0.22"
 
 [workspace.lints.rust]
 unsafe_code = "warn"
