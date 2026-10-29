@@ -545,6 +545,7 @@ pub use openshell_core::ComputeDriverError as ComputeError;
 pub struct ManagedDriverProcess {
     child: std::sync::Mutex<Option<tokio::process::Child>>,
     socket_path: PathBuf,
+    socket_dir: Option<PathBuf>,
 }
 
 impl ManagedDriverProcess {
@@ -553,7 +554,16 @@ impl ManagedDriverProcess {
         Self {
             child: std::sync::Mutex::new(Some(child)),
             socket_path,
+            socket_dir: None,
         }
+    }
+
+    /// Also remove `dir` on drop. It must be private to this driver.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn with_socket_dir(mut self, dir: PathBuf) -> Self {
+        self.socket_dir = Some(dir);
+        self
     }
 
     #[cfg(unix)]
@@ -602,6 +612,9 @@ impl Drop for ManagedDriverProcess {
             let _ = child.take();
         }
         let _ = std::fs::remove_file(&self.socket_path);
+        if let Some(dir) = &self.socket_dir {
+            let _ = std::fs::remove_dir(dir);
+        }
     }
 }
 
@@ -636,6 +649,26 @@ async fn managed_driver_shutdown_sends_sigterm_before_forcing_exit() {
     process.shutdown().await.unwrap();
 
     assert_eq!(std::fs::read_to_string(terminated).unwrap(), "terminated");
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test]
+async fn managed_driver_drop_removes_socket_and_its_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let socket_dir = root.path().join("driver");
+    std::fs::create_dir(&socket_dir).unwrap();
+    let socket_path = socket_dir.join("driver.sock");
+    std::fs::write(&socket_path, b"").unwrap();
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+
+    drop(ManagedDriverProcess::new(child, socket_path.clone()).with_socket_dir(socket_dir.clone()));
+
+    assert!(!socket_path.exists());
+    assert!(!socket_dir.exists());
 }
 
 #[derive(Debug)]

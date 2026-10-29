@@ -44,7 +44,7 @@ openshell-otel = { path = "../openshell-otel", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
-rustix = { workspace = true }
+rustix = { workspace = true, features = ["fs"] }
 libc = "0.2"
 
 [features]
