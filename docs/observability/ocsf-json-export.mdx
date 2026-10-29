@@ -264,8 +264,7 @@ And a denied connection, produced when `curl https://github.com` runs in a sandb
   "actor": {
     "process": {
       "name": "/usr/bin/curl",
-      "pid": 2187,
-      "cmd_line": "curl https://github.com"
+      "pid": 2187
     }
   },
   "action_id": 2,
@@ -304,6 +303,8 @@ method-only request context and the generated response.
 Connection-error records include the known peer or listening endpoint.
 
 Policy configuration warnings use Device Config State Change.
+
+Process Activity launch records carry the launched command and its arguments in `process.cmd_line`. OpenShell quotes arguments that contain spaces, escapes control characters, and keeps at most 64 arguments and 1024 characters, marking truncation with `…`. It redacts values of options and variables whose names suggest a secret, such as `--token` or `API_KEY=`, well-known credential formats, and URL credentials, queries, and fragments. Redaction is best-effort and cannot catch a secret passed as a plain argument. Network and HTTP Activity records do not include `cmd_line`.
 
 Unix socket relay and relay-control notifications, and proxy or mediation
 failures without an observed network endpoint, use Base Event (`class_uid: 0`).
