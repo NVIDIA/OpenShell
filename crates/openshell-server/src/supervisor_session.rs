@@ -1927,6 +1927,28 @@ fn pool_session_parent(
     Some((parent.clone(), Some(peer_endpoint.clone())))
 }
 
+/// Where to move a live pool sandbox session that this replica serves but
+/// whose owning member's stream is served by another live replica.
+fn pool_relocation(state: &ServerState, sandbox_id: &str) -> Option<SessionRedirect> {
+    if state.store.is_single_replica() || state.gateway_shutting_down.load(Ordering::Acquire) {
+        return None;
+    }
+    let parents = state.pool_session_parents.read().ok()?;
+    let peers = state.gateway_peers.read().ok()?;
+    pool_relocation_target(&parents, &peers, &state.replica_id, sandbox_id)
+}
+
+fn pool_relocation_target(
+    parents: &HashMap<String, String>,
+    peers: &HashMap<String, String>,
+    self_replica_id: &str,
+    sandbox_id: &str,
+) -> Option<SessionRedirect> {
+    let (parent, peer_endpoint) =
+        pool_session_parent(parents, peers, self_replica_id, sandbox_id, false)?;
+    ring_redirect(self_replica_id, &parent, peer_endpoint)
+}
+
 /// Decide whether a preferred replica is worth redirecting to.
 ///
 /// Split out from the lock reads so the rules are testable on their own.
@@ -2788,6 +2810,8 @@ enum SessionLoopExit {
     /// This gateway is shutting down. `redirected` records whether a
     /// `SessionRedirect` was queued for the supervisor.
     GatewayShutdown { redirected: bool },
+    /// The supervisor was redirected to the replica serving its pool member.
+    Relocated,
     /// The session ended for any other reason.
     Other,
 }
@@ -2810,8 +2834,10 @@ async fn finish_supervisor_session(
     // owner and the sandbox stays Ready through the handoff. Without a
     // redirect the supervisor reconnects with backoff through the Service, so
     // waiting would only delay the demotion.
-    if exit == (SessionLoopExit::GatewayShutdown { redirected: true })
-        && terminal_finalized == Some(false)
+    if matches!(
+        exit,
+        SessionLoopExit::GatewayShutdown { redirected: true } | SessionLoopExit::Relocated
+    ) && terminal_finalized == Some(false)
         && sandbox_may_be_ready(state, sandbox_id).await
         && wait_for_replacement_owner(
             &owner_index,
@@ -3024,6 +3050,21 @@ async fn run_session_loop(
                 }
             }
             _ = heartbeat_timer.tick() => {
+                if *supports_session_redirect
+                    && bootstrap_complete
+                    && let Some(redirect) = pool_relocation(state, sandbox_id)
+                {
+                    let owner_replica_id = redirect.owner_replica_id.clone();
+                    if tx
+                        .try_send(GatewayMessage {
+                            payload: Some(gateway_message::Payload::SessionRedirect(redirect)),
+                        })
+                        .is_ok()
+                    {
+                        info!(sandbox_id = %sandbox_id, session_id = %session_id, owner_replica_id, "supervisor session: moving to its supervisor's replica");
+                        return SessionLoopExit::Relocated;
+                    }
+                }
                 let hb = GatewayMessage {
                     payload: Some(gateway_message::Payload::Heartbeat(
                         openshell_core::proto::GatewayHeartbeat {},
@@ -5663,6 +5704,25 @@ mod tests {
             pool_session_parent(&parents, &peers, "gw-0", "sb-a", true),
             None
         );
+    }
+
+    #[test]
+    fn a_live_pool_session_moves_only_to_its_parents_live_peer() {
+        let (parents, peers) = pool_maps();
+        assert_eq!(
+            pool_relocation_target(&parents, &peers, "gw-0", "sb-b"),
+            Some(SessionRedirect {
+                peer_endpoint: "https://gw-1:8443".to_string(),
+                owner_replica_id: "gw-1".to_string(),
+            })
+        );
+        for sandbox_id in ["sb-a", "sb-gone", "sb-dedicated"] {
+            assert_eq!(
+                pool_relocation_target(&parents, &peers, "gw-0", sandbox_id),
+                None,
+                "{sandbox_id}"
+            );
+        }
     }
 
     // ---- ownership terms ----
