@@ -24,10 +24,10 @@ pub use openshell_extension_core::{
     EXTENSION_JWT_TYP, ExtensionAudience, ExtensionCallerKind, ExtensionJwtClaims,
     MAX_EXTENSION_TOKEN_TTL,
 };
+use rustls::pki_types::pem::{PemObject, SectionKind};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use std::{
-    io::Cursor,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -534,9 +534,11 @@ impl ExtensionJwtIssuer {
 
 impl GatewayJwks {
     fn from_public_key_pem(public_key_pem: &[u8], kid: String) -> Result<Self, String> {
-        let item = rustls_pemfile::read_one(&mut Cursor::new(public_key_pem))
+        let item = <(SectionKind, Vec<u8>)>::pem_slice_iter(public_key_pem)
+            .next()
+            .transpose()
             .map_err(|e| format!("failed to parse Ed25519 public key PEM for JWKS: {e}"))?;
-        let Some(rustls_pemfile::Item::SubjectPublicKeyInfo(der)) = item else {
+        let Some((SectionKind::PublicKey, der)) = item else {
             return Err("Ed25519 public key PEM does not contain a PUBLIC KEY block".into());
         };
         let (remainder, spki) = SubjectPublicKeyInfo::from_der(der.as_ref())

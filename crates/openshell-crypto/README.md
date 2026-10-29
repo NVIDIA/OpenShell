@@ -110,7 +110,8 @@ rotation constraints still apply. Authentication failures expose no plaintext or
 distinction between wrong keys, AAD, nonce, ciphertext, or tags.
 
 Coverage excludes dependency-owned SSH/russh primitives, AWS SigV4 signing,
-SPIFFE RustCrypto verification, and non-Rust client runtimes. AWS SDK HTTPS also
+SPIFFE JWT verification, and non-Rust client runtimes. SPIFFE uses its AWS-LC
+backend directly, outside the facade. AWS SDK HTTPS also
 retains its dependency-owned selection. Non-security content hashes and ordinary
 scheduling randomness are not migrated. No SSH or PQC capability is asserted by
 the primitive capability report. OpenSSL, strict policy, module version discovery,

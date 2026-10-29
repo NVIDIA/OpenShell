@@ -55,7 +55,6 @@ nix = { workspace = true, features = ["resource", "socket", "feature", "poll"] }
 
 # TLS crypto provider install (main.rs)
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
 
 # Serialization (serde_json::json! for OCSF unmapped fields)

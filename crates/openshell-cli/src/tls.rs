@@ -9,7 +9,7 @@ use openshell_sdk::{AuthConfig, ClientConfig, ClientIdentity, OpenShellClient};
 use rustls::{
     RootCertStore,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject},
 };
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -185,7 +185,9 @@ pub fn require_tls_materials(server: &str, tls: &TlsOptions) -> Result<TlsMateri
 
 fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
     let mut cursor = Cursor::new(pem);
-    let key = rustls_pemfile::private_key(&mut cursor)
+    let key = PrivateKeyDer::pem_reader_iter(&mut cursor)
+        .next()
+        .transpose()
         .into_diagnostic()?
         .ok_or_else(|| miette::miette!("no private key found in TLS key PEM"))?;
     Ok(key)
@@ -194,7 +196,7 @@ fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
 pub fn build_rustls_config(materials: &TlsMaterials) -> Result<rustls::ClientConfig> {
     let mut roots = RootCertStore::empty();
     let mut ca_cursor = Cursor::new(&materials.ca);
-    let ca_certs = rustls_pemfile::certs(&mut ca_cursor)
+    let ca_certs = CertificateDer::pem_reader_iter(&mut ca_cursor)
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()
         .into_diagnostic()?;
     for cert in ca_certs {
@@ -202,7 +204,7 @@ pub fn build_rustls_config(materials: &TlsMaterials) -> Result<rustls::ClientCon
     }
 
     let mut cert_cursor = Cursor::new(&materials.cert);
-    let cert_chain = rustls_pemfile::certs(&mut cert_cursor)
+    let cert_chain = CertificateDer::pem_reader_iter(&mut cert_cursor)
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()
         .into_diagnostic()?;
     let key = load_private_key(&materials.key)?;

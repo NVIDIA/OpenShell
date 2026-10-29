@@ -14,20 +14,7 @@ yanked = "warn"
 unmaintained = "workspace"
 maximum-db-staleness = "P30D"
 ignore = [
-    # Pre-existing advisories acknowledged at onboarding. Each should be
-    # resolved by upgrading the affected transitive dependency and then
-    # removing the ignore entry.
-    { id = "RUSTSEC-2026-0190", reason = "anyhow unsoundness in downcast_mut — awaiting upstream fix" },
-    { id = "RUSTSEC-2026-0204", reason = "crossbeam-epoch pointer deref — transitive via metrics/quanta" },
-    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin attack — transitive via spiffe, no direct exposure" },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — transitive via older kube/hyper" },
-    # SPIFFE's jsonwebtoken RustCrypto stack still requires crypto-bigint 0.5.
-    # Remove after compatible upstream releases include the dependency upgrade:
-    # https://github.com/Keats/jsonwebtoken/pull/536
-    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 timing variability — transitive via SPIFFE/jsonwebtoken; remove when the dependency chain supports crypto-bigint >=0.7.6" },
-    { id = "RUSTSEC-2026-0391", reason = "zstd context reuse leaks prior stream data — VM driver and zip create fresh contexts; remove when the dependency chain supports zstd >=0.14.3" },
-    { id = "RUSTSEC-2026-0398", reason = "zstd-safe seekable decompression memory corruption — current consumers do not use the seekable API; remove when the dependency chain supports zstd-safe >=8.2.0" },
-    { id = "RUSTSEC-2026-0403", reason = "zstd-safe legacy frame error leaks uninitialized memory through write decoders — VM driver and zip use read decoders; remove when the dependency chain supports zstd-safe >=8.2.0" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin attack — required by russh/ssh-key and RSA test fixtures; no patched release is available" },
 ]
 
 # -- Licenses ------------------------------------------------------------------
