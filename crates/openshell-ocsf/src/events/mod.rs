@@ -140,6 +140,29 @@ impl OcsfEvent {
         }
     }
 
+    /// Sandbox attribution across supervisor and gateway event classes.
+    #[must_use]
+    pub fn sandbox_id(&self) -> Option<&str> {
+        let resources = match self {
+            Self::ApiActivity(event) => event.resources.as_deref(),
+            Self::DetectionFinding(event) => event.resources.as_deref(),
+            _ => None,
+        };
+        self.base()
+            .device
+            .as_ref()
+            .and_then(|device| device.container.as_ref())
+            .and_then(|container| container.uid.as_deref())
+            .or_else(|| {
+                resources?
+                    .iter()
+                    .find(|resource| resource.type_label.as_deref() == Some("sandbox"))
+                    .and_then(|resource| resource.uid.as_deref())
+            })
+            .or_else(|| self.base().unmapped.as_ref()?.get("sandbox_id")?.as_str())
+            .filter(|id| !id.is_empty())
+    }
+
     /// Returns the base event data common to all event classes.
     #[must_use]
     pub fn base(&self) -> &BaseEventData {

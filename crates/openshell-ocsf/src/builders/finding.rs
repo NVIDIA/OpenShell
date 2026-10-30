@@ -7,7 +7,7 @@ use crate::builders::{ContextRef, EventOrigin};
 use crate::enums::{ActionId, ActivityId, ConfidenceId, DispositionId, RiskLevelId, SeverityId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{DetectionFindingEvent, OcsfEvent};
-use crate::objects::{Attack, Evidence, FindingInfo, Remediation};
+use crate::objects::{Attack, Evidence, FindingInfo, Remediation, ResourceDetails};
 
 /// Builder for Detection Finding [2004] events.
 pub struct DetectionFindingBuilder<'a> {
@@ -26,6 +26,7 @@ pub struct DetectionFindingBuilder<'a> {
     message: Option<String>,
     log_source: Option<String>,
     correlation_uid: Option<String>,
+    resources: Vec<ResourceDetails>,
     unmapped: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -48,6 +49,7 @@ impl<'a> DetectionFindingBuilder<'a> {
             message: None,
             log_source: None,
             correlation_uid: None,
+            resources: Vec::new(),
             unmapped: serde_json::Map::new(),
         }
     }
@@ -92,6 +94,13 @@ impl<'a> DetectionFindingBuilder<'a> {
         self
     }
 
+    /// Add a resource affected by the finding.
+    #[must_use]
+    pub fn resource(mut self, resource: ResourceDetails) -> Self {
+        self.resources.push(resource);
+        self
+    }
+
     /// Add a remediation description.
     #[must_use]
     pub fn remediation(mut self, desc: &str) -> Self {
@@ -121,14 +130,12 @@ impl<'a> DetectionFindingBuilder<'a> {
     }
 
     #[must_use]
-    pub fn build(self) -> OcsfEvent {
+    pub fn build(mut self) -> OcsfEvent {
         let activity_name = self.activity.finding_label().to_string();
-        // Gateway events carry a container only when they concern a sandbox.
+        // Only supervisors describe a container on the producing device.
         let profiles: &[&str] = match self.ctx.origin {
-            EventOrigin::Gateway { .. } if self.ctx.container().is_none() => {
-                &["security_control", "host"]
-            }
-            _ => &["security_control", "container", "host"],
+            EventOrigin::Gateway { .. } => &["security_control", "host"],
+            EventOrigin::Supervisor => &["security_control", "container", "host"],
         };
         let mut metadata = self.ctx.metadata(profiles);
         if let Some(source) = self.log_source {
@@ -151,8 +158,11 @@ impl<'a> DetectionFindingBuilder<'a> {
         }
         self.ctx.apply_common_fields(&mut base, None, self.message);
 
+        self.ctx.add_sandbox_resource(&mut self.resources);
+
         OcsfEvent::DetectionFinding(DetectionFindingEvent {
             base,
+            resources: (!self.resources.is_empty()).then_some(self.resources),
             finding_info: self
                 .finding_info
                 .unwrap_or_else(|| FindingInfo::new("unknown", "Unknown Finding")),
@@ -186,15 +196,12 @@ mod tests {
     use crate::builders::{test_gateway_context, test_sandbox_context};
 
     #[test]
-    fn gateway_finding_declares_container_only_with_a_sandbox() {
+    fn gateway_finding_identifies_sandbox_resources() {
         // Gateway-wide findings name no sandbox; MXC findings name the
         // sandbox they concern.
         for (sandbox_id, profiles) in [
             ("", serde_json::json!(["security_control", "host"])),
-            (
-                "sb-1",
-                serde_json::json!(["security_control", "container", "host"]),
-            ),
+            ("sb-1", serde_json::json!(["security_control", "host"])),
         ] {
             let mut ctx = test_gateway_context();
             ctx.sandbox_id = sandbox_id.to_string();
@@ -213,8 +220,9 @@ mod tests {
                 "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f"
             );
             assert_eq!(json["metadata"]["profiles"], profiles, "{sandbox_id:?}");
+            assert!(json["device"].get("container").is_none());
             assert_eq!(
-                json.get("container").is_some(),
+                json.get("resources").is_some(),
                 !sandbox_id.is_empty(),
                 "{sandbox_id:?}"
             );

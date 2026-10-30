@@ -143,6 +143,21 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
 
     let bootstrap: BoundaryConfig =
         serde_json::from_slice(&fs::read(directory.join(BOUNDARY_CONFIG_FILE)).unwrap()).unwrap();
+    // A restart keeps the original image identity even if the mutable
+    // template reference now names another image in the registry.
+    let sandbox = test_sandbox();
+    let image_env = docker_workload_image_environment(&sandbox, &directory)
+        .await
+        .unwrap();
+    assert!(image_env.contains(&format!(
+        "{}=image-test",
+        openshell_core::sandbox_env::CONTAINER_IMAGE_UID
+    )));
+    assert!(image_env.contains(&format!(
+        "{}={}",
+        openshell_core::sandbox_env::CONTAINER_IMAGE,
+        sandbox_image(&sandbox).unwrap()
+    )));
     let descriptor = read_docker_runtime_descriptor(&sandbox_id, &config)
         .await
         .unwrap()

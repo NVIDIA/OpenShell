@@ -37,6 +37,12 @@ policy inputs, auth bundle, backend descriptor, and file locations.
 settings, the log sink, and the denial history served by `policy.local`.
 `SandboxInstanceControls` carries the owner's stop signal, suspension requests,
 and readiness.
+Dedicated Docker and Podman drivers pass the workload image reference and its
+resolved immutable ID through `OPENSHELL_CONTAINER_IMAGE` and
+`OPENSHELL_CONTAINER_IMAGE_UID`. The binary carries these into
+`SandboxInstanceConfig` and the instance's `EventContext`; OCSF builders emit
+`device.container.image` only when the ID is nonempty. Hosted Kubernetes
+instances currently carry only the image reference and omit the image object.
 Everything else, including credential renewal, policy, provider credentials and
 token grants, middleware credentials, the backend connection, and the access
 plane, is created by the instance. Gateway clients receive a `GatewayEndpoint`,

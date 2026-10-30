@@ -76,6 +76,12 @@ pub fn downgrade_event(event: &mut Value, target_version: &str) -> bool {
             }
         }
 
+        if let Some(device) = obj.get_mut("device").and_then(Value::as_object_mut)
+            && device.remove("container").is_some()
+        {
+            modified = true;
+        }
+
         if let Some(profiles) = obj
             .get_mut("metadata")
             .and_then(Value::as_object_mut)
@@ -148,8 +154,7 @@ mod tests {
                 "version": crate::OCSF_VERSION,
                 "profiles": ["security_control", "network_proxy", "container", "host"]
             },
-            "device": {"hostname": "sandbox-1"},
-            "container": {"name": "test-sandbox"},
+            "device": {"hostname": "sandbox-1", "container": {"name": "test-sandbox"}},
             "observation_point_id": 2,
             "unmapped": {"key": "value"}
         })
@@ -162,6 +167,7 @@ mod tests {
 
         assert!(modified);
         assert!(event.get("container").is_none());
+        assert!(event["device"].get("container").is_none());
         assert!(event.get("observation_point_id").is_none());
         assert!(event.get("device").is_some());
         assert!(event.get("unmapped").is_some());
@@ -174,6 +180,7 @@ mod tests {
 
         assert!(modified);
         assert!(event.get("container").is_none());
+        assert!(event["device"].get("container").is_none());
         assert!(event.get("observation_point_id").is_none());
     }
 
@@ -249,7 +256,7 @@ mod tests {
                 "version": crate::OCSF_VERSION,
                 "profiles": ["container"]
             },
-            "container": {"name": "sandbox-1"}
+            "device": {"container": {"name": "sandbox-1"}}
         });
         let modified = downgrade_event(&mut event, "1.1.0");
 

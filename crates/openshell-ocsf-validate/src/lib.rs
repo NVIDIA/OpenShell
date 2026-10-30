@@ -68,12 +68,8 @@ struct Schema {
 
 impl Schema {
     fn validator(&self) -> &jsonschema::Validator {
-        self.validator.get_or_init(|| {
-            let mut json = self.json.clone();
-            // OCSF defines no top-level `container`; OpenShell emits it (NVIDIA/OpenShell#4915).
-            json["properties"]["container"] = Value::Bool(true);
-            jsonschema::draft7::new(&json).expect("vendored schema compiles")
-        })
+        self.validator
+            .get_or_init(|| jsonschema::draft7::new(&self.json).expect("vendored schema compiles"))
     }
 }
 
@@ -319,9 +315,23 @@ mod tests {
     }
 
     #[test]
-    fn accepts_top_level_container() {
+    fn rejects_top_level_container() {
         let mut event = base_event();
         event["container"] = json!({"name": "sandbox", "image": {"name": "example/sandbox:test"}});
+        assert_violation(&event, "", "container");
+    }
+
+    #[test]
+    fn validates_device_container_and_requires_a_resolved_image_uid() {
+        let mut event = base_event();
+        event["device"] = json!({
+            "hostname": "test-host", "type_id": 99, "type": "Sandbox",
+            "container": {"uid": "sandbox-1", "name": "sandbox"}
+        });
+        validate_event(&event).unwrap();
+        event["device"]["container"]["image"] = json!({"name": "example/sandbox:test"});
+        assert_violation(&event, "/device/container/image", "uid");
+        event["device"]["container"]["image"]["uid"] = json!("sha256:1234");
         validate_event(&event).unwrap();
     }
 

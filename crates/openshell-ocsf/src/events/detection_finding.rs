@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::enums::{ActionId, ConfidenceId, DispositionId, RiskLevelId};
 use crate::events::base_event::BaseEventData;
-use crate::objects::{Attack, Evidence, FindingInfo, Remediation};
+use crate::objects::{Attack, Evidence, FindingInfo, Remediation, ResourceDetails};
 
 /// OCSF Detection Finding Event [2004].
 ///
@@ -20,6 +20,10 @@ pub struct DetectionFindingEvent {
 
     /// Finding details (required).
     pub finding_info: FindingInfo,
+
+    /// Resources affected by the finding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<Vec<ResourceDetails>>,
 
     /// Evidence artifacts.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,6 +76,7 @@ impl Serialize for DetectionFindingEvent {
             .ok_or_else(|| serde::ser::Error::custom("expected object"))?;
 
         insert_required!(obj, "finding_info", self.finding_info);
+        insert_optional!(obj, "resources", self.resources);
         insert_optional!(obj, "evidences", self.evidences);
         insert_optional!(obj, "attacks", self.attacks);
         insert_optional!(obj, "remediation", self.remediation);
@@ -113,6 +118,7 @@ mod tests {
             ),
             finding_info: FindingInfo::new("nssh1-replay-abc", "NSSH1 Nonce Replay Attack")
                 .with_desc("A nonce was replayed."),
+            resources: None,
             evidences: Some(vec![Evidence::from_pairs(&[
                 ("nonce", "0xdeadbeef"),
                 ("peer_ip", "10.42.0.1"),
