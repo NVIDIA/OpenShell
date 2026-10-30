@@ -35,3 +35,24 @@ leave partially extracted files; there is no rollback or atomic replacement.
 The CLI requires supervisor support for this subsystem before sending archive
 data. It does not fall back to the previous unpaced exec-stdin upload path.
 Ordinary exec stdin and SFTP retain their existing input-budget behavior.
+
+## Terminal attachments to a TTY main process
+
+The supervisor retains up to 1 MiB of the main process's output and replays it
+to each new `openshell-main` attachment. For a TTY main process, those bytes
+are escape sequences written for whichever terminal was attached when they
+were produced, so a PTY attachment adapts the replay instead of copying it:
+
+- Before the replay, it restores the modes in effect where the retained window
+  starts, such as the alternate screen, cursor visibility, mouse reporting,
+  bracketed paste, keypad, and keyboard protocols. `TerminalState` builds them
+  from evicted output.
+- It drops terminal queries from the replay. The program already received or
+  gave up on those answers; a new terminal would type them into its stdin.
+- After the replay, it resets scroll margins set for an earlier terminal size.
+- It resizes the PTY through an interim size, as `kubectl attach` does, so the
+  program redraws even when the attachment matches the current size.
+- When the attachment detaches, falls behind, or the process exits, it resets
+  the client's terminal modes and leaves the alternate screen.
+
+Clients without a PTY still receive the raw retained bytes.
