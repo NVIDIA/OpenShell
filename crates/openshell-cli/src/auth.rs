@@ -81,6 +81,15 @@ fn generate_confirmation_code() -> String {
     code
 }
 
+/// Build the gateway `/auth/connect` URL carrying the local callback port
+/// and the one-time confirmation code.
+fn auth_connect_url(gateway_endpoint: &str, callback_port: u16, code: &str) -> String {
+    format!(
+        "{}/auth/connect?callback_port={callback_port}&code={code}",
+        gateway_endpoint.trim_end_matches('/')
+    )
+}
+
 /// Run the browser-based CF Access auth flow.
 ///
 /// 1. Generates a one-time confirmation code
@@ -111,16 +120,13 @@ pub async fn browser_auth_flow(gateway_endpoint: &str) -> Result<String> {
         ));
     }
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.into_diagnostic()?;
+    let listener = crate::callback::bind_callback_listener().await?;
     let local_addr = listener.local_addr().into_diagnostic()?;
     let callback_port = local_addr.port();
 
     let code = generate_confirmation_code();
 
-    let auth_url = format!(
-        "{}/auth/connect?callback_port={callback_port}&code={code}",
-        gateway_endpoint.trim_end_matches('/')
-    );
+    let auth_url = auth_connect_url(gateway_endpoint, callback_port, &code);
 
     // Channel to receive the token from the callback handler.
     let (tx, rx) = oneshot::channel::<String>();
@@ -878,5 +884,91 @@ mod tests {
             response.contains("405 Method Not Allowed"),
             "GET should return 405:\n{response}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Browser-flow callback listener binding
+    // ---------------------------------------------------------------
+
+    use crate::callback::{CALLBACK_BIND_ADDRESS_ENV, CALLBACK_PORT_ENV};
+    use crate::test_utils::Environment;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// Bind an ephemeral loopback listener, return its (now freed) port.
+    async fn free_loopback_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("probe bind");
+        listener.local_addr().expect("probe addr").port()
+    }
+
+    /// Read the fixed port under test back from the environment (the
+    /// `Environment` harness re-enters the test in a child process with the
+    /// variables applied).
+    fn expected_fixed_port() -> u16 {
+        std::env::var(CALLBACK_PORT_ENV)
+            .expect("callback port env")
+            .parse()
+            .expect("callback port env parses")
+    }
+
+    #[tokio::test]
+    async fn browser_flow_binds_ephemeral_loopback_by_default() {
+        Environment::new()
+            .remove(CALLBACK_PORT_ENV)
+            .remove(CALLBACK_BIND_ADDRESS_ENV)
+            .run_async(async {
+                let listener = crate::callback::bind_callback_listener()
+                    .await
+                    .expect("default bind");
+                let addr = listener.local_addr().expect("local addr");
+
+                assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+                assert_ne!(addr.port(), 0);
+                let url = auth_connect_url(TEST_GATEWAY, addr.port(), "ABC-1234");
+                assert!(
+                    url.contains(&format!("callback_port={}", addr.port())),
+                    "auth URL: {url}"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn browser_flow_honors_fixed_port_and_wildcard_bind() {
+        let port = free_loopback_port().await;
+        Environment::new()
+            .set(CALLBACK_PORT_ENV, port.to_string())
+            .set(CALLBACK_BIND_ADDRESS_ENV, "0.0.0.0")
+            .run_async(async {
+                let expected = expected_fixed_port();
+                let listener = crate::callback::bind_callback_listener()
+                    .await
+                    .expect("fixed-port bind");
+                let addr = listener.local_addr().expect("local addr");
+
+                assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+                assert_eq!(addr.port(), expected);
+                // The gateway auth URL advertises the fixed port so the wrapper's
+                // published `-p 127.0.0.1:<port>:<port>` mapping reaches the listener.
+                let url = auth_connect_url(TEST_GATEWAY, addr.port(), "ABC-1234");
+                assert!(
+                    url.contains(&format!("callback_port={expected}")),
+                    "auth URL: {url}"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn browser_flow_rejects_invalid_callback_port() {
+        Environment::new()
+            .set(CALLBACK_PORT_ENV, "https")
+            .run_async(async {
+                let err = crate::callback::bind_callback_listener()
+                    .await
+                    .expect_err("invalid port must fail");
+                let msg = format!("{err:#}");
+                assert!(msg.contains(CALLBACK_PORT_ENV), "message: {msg}");
+            })
+            .await;
     }
 }
