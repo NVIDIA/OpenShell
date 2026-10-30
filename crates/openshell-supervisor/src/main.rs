@@ -497,16 +497,15 @@ fn main() -> Result<()> {
         ),
     };
     // The exporters must be created inside the runtime that drives them.
+    let [traces_headers, ocsf_headers] =
+        bundle_otlp_headers(isolation_inputs.as_ref().map(|(_, _, auth, _, _)| auth));
     let (otlp_provider, otlp_setup_error) = runtime.block_on(async {
         start_trace_export(
             args.otlp_endpoint.as_deref().map(export_config),
             args.otlp_protocol,
+            traces_headers,
         )
     });
-    let ocsf_headers = isolation_inputs
-        .as_ref()
-        .and_then(|(_, _, auth, _, _)| auth.ocsf_otlp_headers.as_ref())
-        .map(openshell_core::jwt::SecretOtlpHeaders::expose_secret);
     let (ocsf_export, ocsf_setup_error) = runtime.block_on(async {
         start_ocsf_export(
             args.otlp_ocsf_endpoint.as_deref().map(export_config),
@@ -701,6 +700,24 @@ fn main() -> Result<()> {
     std::process::exit(exit_code?);
 }
 
+/// The headers for the supervisor's own trace and OCSF exports, in that
+/// order, from its launch bundle.
+fn bundle_otlp_headers(
+    auth: Option<&openshell_core::jwt::SupervisorAuthBundle>,
+) -> [Option<&str>; 2] {
+    fn expose(headers: &Option<openshell_core::jwt::SecretOtlpHeaders>) -> Option<&str> {
+        headers
+            .as_ref()
+            .map(openshell_core::jwt::SecretOtlpHeaders::expose_secret)
+    }
+    auth.map_or([None, None], |auth| {
+        [
+            expose(&auth.traces_otlp_headers),
+            expose(&auth.ocsf_otlp_headers),
+        ]
+    })
+}
+
 /// Start OCSF event export to an OTLP collector.
 ///
 /// A setup failure disables export and is returned for the caller to report
@@ -716,9 +733,9 @@ fn start_ocsf_export(
     let Some(config) = config else {
         return (None, None);
     };
-    let started = target(&config, protocol).and_then(|target| {
+    let started = target(&config, protocol, headers).and_then(|target| {
         Ok(openshell_otel::OcsfOtlp::start(
-            target.log_exporter_with_headers(headers)?,
+            target.log_exporter()?,
             target.resource().clone(),
         ))
     });
@@ -734,11 +751,12 @@ fn start_ocsf_export(
 fn start_trace_export(
     config: Option<openshell_otel::OtlpExportConfig<'_>>,
     protocol: OtlpProtocol,
+    headers: Option<&str>,
 ) -> (
     Option<openshell_otel::SdkTracerProvider>,
     Option<openshell_otel::SetupError>,
 ) {
-    match config.map(|config| target(&config, protocol)?.tracer_provider()) {
+    match config.map(|config| target(&config, protocol, headers)?.tracer_provider()) {
         None => (None, None),
         Some(Ok(provider)) => (Some(provider), None),
         Some(Err(error)) => (None, Some(error)),
@@ -748,8 +766,15 @@ fn start_trace_export(
 fn target(
     config: &openshell_otel::OtlpExportConfig<'_>,
     protocol: OtlpProtocol,
+    headers: Option<&str>,
 ) -> Result<openshell_otel::OtlpTarget, openshell_otel::SetupError> {
-    Ok(openshell_otel::OtlpTarget::new(config)?.with_protocol(protocol.into()))
+    Ok(openshell_otel::OtlpTarget::new(config)?
+        .with_protocol(protocol.into())
+        .with_headers(
+            headers
+                .map(openshell_otel::parse_otlp_headers)
+                .unwrap_or_default(),
+        ))
 }
 
 /// Resource attributes identifying this supervisor's sandbox and the gateway
@@ -1017,7 +1042,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn supervisor_signals_export_over_their_configured_protocol() {
+    async fn supervisor_signals_export_with_their_protocol_and_headers() {
         use openshell_ocsf::{ConfigStateChangeBuilder, ocsf_emit};
         use opentelemetry::trace::{Tracer as _, TracerProvider as _};
         use tracing_subscriber::prelude::*;
@@ -1029,10 +1054,18 @@ mod tests {
             service_version: None,
             resource_attributes: Vec::new(),
         };
-        let (provider, error) = start_trace_export(Some(config()), OtlpProtocol::HttpProtobuf);
+        let (provider, error) = start_trace_export(
+            Some(config()),
+            OtlpProtocol::HttpProtobuf,
+            Some("authorization=traces"),
+        );
         assert!(error.is_none(), "unexpected setup error: {error:?}");
         let provider = provider.expect("trace export");
-        let (ocsf, error) = start_ocsf_export(Some(config()), OtlpProtocol::HttpProtobuf, None);
+        let (ocsf, error) = start_ocsf_export(
+            Some(config()),
+            OtlpProtocol::HttpProtobuf,
+            Some("authorization=logs"),
+        );
         assert!(error.is_none(), "unexpected setup error: {error:?}");
         let ocsf = ocsf.expect("OCSF export");
 
@@ -1048,12 +1081,54 @@ mod tests {
             .expect("trace flush");
         ocsf.shutdown().await;
 
-        let mut paths = vec![
-            collector.next_export().await.path,
-            collector.next_export().await.path,
-        ];
-        paths.sort();
-        assert_eq!(paths, ["/v1/logs", "/v1/traces"]);
+        let mut exports =
+            [collector.next_export().await, collector.next_export().await].map(|export| {
+                let authorization = export
+                    .headers
+                    .get("authorization")
+                    .map(|value| value.to_str().unwrap().to_string());
+                (export.path, authorization)
+            });
+        exports.sort();
+        assert_eq!(
+            exports,
+            [
+                ("/v1/logs".to_string(), Some("logs".to_string())),
+                ("/v1/traces".to_string(), Some("traces".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_export_takes_its_own_headers_from_the_launch_bundle() {
+        use openshell_core::jwt::{
+            CredentialEpoch, SecretJwt, SecretOtlpHeaders, SessionRotation, SupervisorAuthBundle,
+        };
+
+        let secret = |value: &str| Some(SecretOtlpHeaders::new(value.to_string()));
+        let bundle = SupervisorAuthBundle {
+            session_id: openshell_core::SandboxSessionId::new(),
+            runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                "generation-1",
+            )
+            .unwrap(),
+            session_rotation: SessionRotation::new(1).unwrap(),
+            auth_epoch: CredentialEpoch::new(1).unwrap(),
+            gateway_token: SecretJwt::parse("test-gateway-token").unwrap(),
+            gateway_expires_at: 0,
+            sandbox_token: SecretJwt::parse("test-sandbox-token").unwrap(),
+            sandbox_expires_at: 0,
+            ssh_host_private_key: None,
+            traces_otlp_headers: secret("lane=traces"),
+            ocsf_otlp_headers: secret("lane=ocsf"),
+            agent_otlp_headers: secret("lane=agent"),
+        };
+
+        assert_eq!(
+            bundle_otlp_headers(Some(&bundle)),
+            [Some("lane=traces"), Some("lane=ocsf")]
+        );
+        assert_eq!(bundle_otlp_headers(None), [None, None]);
     }
 
     #[tokio::test]

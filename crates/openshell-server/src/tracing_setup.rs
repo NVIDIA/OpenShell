@@ -74,12 +74,16 @@ pub fn install(
     let driver_protocol = driver_otlp.map_or(openshell_otel::Protocol::Grpc, |otlp| {
         otlp.traces_protocol().into()
     });
+    let driver_headers = driver_otlp
+        .map(OtlpExport::traces_headers)
+        .unwrap_or_default();
     let (driver_tracer_provider, driver_setup_error) = driver.map_or_else(
         || (None, None),
         |descriptor| {
             descriptor.provider_for(
                 driver_endpoint,
                 driver_protocol,
+                &driver_headers,
                 openshell_core::VERSION,
                 gateway.name(),
                 gateway.compute_driver(),

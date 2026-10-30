@@ -109,6 +109,7 @@ pub async fn assert_compute_driver_tracing(
     let (provider, error) = descriptor.provider_for(
         Some(collector.endpoint()),
         openshell_otel::Protocol::Grpc,
+        &::http::HeaderMap::new(),
         service_version,
         Some("test-gateway"),
         Some(descriptor.compute_driver()),
@@ -142,6 +143,8 @@ pub struct ReceivedTraces {
     pub spans: Vec<Span>,
     /// String bodies of exported log records.
     pub log_bodies: Vec<String>,
+    /// `authorization` metadata of each trace export request.
+    pub trace_authorizations: Vec<String>,
     /// `authorization` metadata of each log export request.
     pub log_authorizations: Vec<String>,
     pub service_names: Vec<String>,
@@ -215,6 +218,15 @@ impl TraceService for Collector {
                 .and_then(|value| value.to_str().ok())
             {
                 received.encodings.push(encoding.to_string());
+            }
+            if let Some(authorization) = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+            {
+                received
+                    .trace_authorizations
+                    .push(authorization.to_string());
             }
             for resource_span in request.into_inner().resource_spans {
                 let attributes = received.record_resource(resource_span.resource);

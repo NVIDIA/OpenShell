@@ -267,12 +267,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn trace_provider_exports_over_http_from_the_batch_thread() {
         let mut collector = OtlpHttpTestServer::start().await;
-        let provider = http_target(collector.endpoint()).tracer_provider().unwrap();
+        let provider = http_target(collector.endpoint())
+            .with_headers(crate::parse_otlp_headers("x-mlflow-experiment-id=7"))
+            .tracer_provider()
+            .unwrap();
         provider.tracer("test").in_span("http-span", |_| {});
         let flush = tokio::task::spawn_blocking(move || provider.force_flush());
 
         let export = collector.next_export().await;
         assert_eq!(export.method, http::Method::POST);
+        assert_eq!(export.headers["x-mlflow-experiment-id"], "7");
         assert_eq!(export.path, "/v1/traces");
         assert_eq!(
             export.headers[http::header::CONTENT_TYPE],
@@ -288,7 +292,8 @@ mod tests {
     async fn log_exporter_sends_headers_over_http_from_a_blocking_thread() {
         let mut collector = OtlpHttpTestServer::start().await;
         let exporter = http_target(collector.endpoint())
-            .log_exporter_with_headers(Some("authorization=Bearer%20token"))
+            .with_headers(crate::parse_otlp_headers("authorization=Bearer%20token"))
+            .log_exporter()
             .unwrap();
         let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
             .with_simple_exporter(exporter)

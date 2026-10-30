@@ -292,6 +292,7 @@ fn spawn_supervisor_token_refresh(
 }
 pub use auth::audit::ConnectionSource;
 pub use multiplex::{MultiplexService, MultiplexedService};
+pub use otel_tracing::{SupervisorOtlpHeaders, supervisor_otlp_headers};
 pub use persistence::Store;
 use sandbox_index::SandboxIndex;
 use sandbox_watch::SandboxWatchBus;
@@ -738,7 +739,7 @@ pub(crate) async fn run_server(
         shutdown_rx.clone(),
     )
     .await?;
-    compute.configure_supervisor_ocsf_headers(otel_tracing::supervisor_ocsf_headers(
+    compute.configure_supervisor_otlp_headers(supervisor_otlp_headers(
         config_file
             .as_ref()
             .and_then(|file| file.openshell.gateway.otlp.as_ref()),
