@@ -125,6 +125,8 @@ const REGISTRY_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 const DEFAULT_ROOTFS_TAR_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const ROOTFS_TAR_STAGING_DIR: &str = "rootfs-tar-staging";
 const VM_CONSOLE_DIAGNOSTIC_BYTES: u64 = 8 * 1024;
+/// Minimum time between `ExportingRootfs` byte-count updates for a local image.
+const EXPORT_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Mirrors the Docker/Podman `type` tag so their bind entries parse
 /// unchanged; virtiofs can only share host directories.
@@ -3399,8 +3401,8 @@ impl VmDriver {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let bootstrap_image_ref = self.bootstrap_image_ref()?;
         // Keep the driver trace continuous across the worker boundary. The
-        // first Pulled event completes bootstrap resolution; later events
-        // belong to the requested workload image.
+        // first Pulled or BootstrapImageReady event completes bootstrap
+        // resolution; later events belong to the requested workload image.
         let mut bootstrap_span = overlay.is_none().then(|| {
             tracing::info_span!(
                 "vm.resolve_bootstrap_image",
@@ -3464,7 +3466,9 @@ impl VmDriver {
                                 Status::internal(format!("decode image preparation event: {error}"))
                             })?;
                         if matches!(event.payload.as_ref(), Some(watch_sandboxes_event::Payload::PlatformEvent(value))
-                            if value.event.as_ref().is_some_and(|event| event.reason == "Pulled")) {
+                            if value.event.as_ref().is_some_and(|event| {
+                                event.reason == "Pulled" || event.reason == "BootstrapImageReady"
+                            })) {
                             bootstrap_span.take();
                         }
                         let _ = self.events.send(event);
@@ -3548,8 +3552,16 @@ impl VmDriver {
     ) -> Result<RuntimeImagePlan, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let bootstrap_image_ref = self.bootstrap_image_ref()?;
+        // The bootstrap image completes the image step only when it is also
+        // the workload image. Otherwise the workload image completes it.
+        let bootstrap_is_workload =
+            rootfs_tar_path.is_none() && image_ref.trim() == bootstrap_image_ref.trim();
         let bootstrap_image_identity = self
-            .ensure_cached_bootstrap_rootfs_image(sandbox_id, &bootstrap_image_ref)
+            .ensure_cached_bootstrap_rootfs_image(
+                sandbox_id,
+                &bootstrap_image_ref,
+                bootstrap_is_workload,
+            )
             .await?;
         let root_disk = image_cache_rootfs_image(&self.config.state_dir, &bootstrap_image_identity);
 
@@ -3565,7 +3577,7 @@ impl VmDriver {
             });
         }
 
-        if image_ref.trim() == bootstrap_image_ref.trim() {
+        if bootstrap_is_workload {
             return span_status.finish(Ok(RuntimeImagePlan {
                 root_disk,
                 image_disk: None,
@@ -3742,31 +3754,39 @@ impl VmDriver {
         &self,
         sandbox_id: &str,
         image_ref: &str,
+        completes_image_step: bool,
     ) -> Result<String, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        if let Some((engine, image_identity)) =
+        let result = if let Some((engine, image_identity)) =
             self.resolve_local_container_image(image_ref).await?
         {
-            let result = self
-                .ensure_cached_local_image_rootfs_image(
-                    sandbox_id,
-                    image_ref,
-                    &engine,
-                    &image_identity,
-                )
-                .await;
-            return span_status.finish(result);
-        }
-
-        span_status.finish(
+            self.ensure_cached_local_image_rootfs_image(
+                sandbox_id,
+                image_ref,
+                &engine,
+                &image_identity,
+            )
+            .await
+        } else {
             self.ensure_cached_registry_rootfs_image(
                 sandbox_id,
                 image_ref,
                 &registry_client(),
                 &registry_auth(image_ref)?,
             )
-            .await,
-        )
+            .await
+        };
+        if let Ok(image_identity) = &result {
+            let image_path = image_cache_rootfs_image(&self.config.state_dir, image_identity);
+            self.publish_bootstrap_image_ready(
+                sandbox_id,
+                image_ref,
+                &image_path,
+                completes_image_step,
+            )
+            .await;
+        }
+        span_status.finish(result)
     }
 
     fn publish_pulling_event(&self, sandbox_id: &str, image_ref: &str) {
@@ -3781,15 +3801,9 @@ impl VmDriver {
         );
     }
 
-    /// A registry-sourced root disk found in the cache: `Pulling`, the
-    /// `CacheHit` progress and `Pulled`, so the image step still advances.
-    async fn publish_registry_cache_hit(
-        &self,
-        sandbox_id: &str,
-        image_ref: &str,
-        image_identity: &str,
-        image_path: &Path,
-    ) {
+    /// A registry-sourced root disk found in the cache: `Pulling` and the
+    /// `CacheHit` progress. The caller reports the image as ready.
+    fn publish_registry_cache_hit(&self, sandbox_id: &str, image_ref: &str, image_identity: &str) {
         self.publish_pulling_event(sandbox_id, image_ref);
         self.publish_vm_progress(
             sandbox_id,
@@ -3802,8 +3816,6 @@ impl VmDriver {
                 ("image_identity".to_string(), image_identity.to_string()),
             ]),
         );
-        self.publish_pulled_event(sandbox_id, image_ref, image_path)
-            .await;
     }
 
     async fn ensure_cached_registry_rootfs_image(
@@ -3831,13 +3843,7 @@ impl VmDriver {
                     image_path = %image_path.display(),
                     "vm driver: root disk image cache hit (digest-pinned, no registry call)"
                 );
-                self.publish_registry_cache_hit(
-                    sandbox_id,
-                    image_ref,
-                    &image_identity,
-                    &image_path,
-                )
-                .await;
+                self.publish_registry_cache_hit(sandbox_id, image_ref, &image_identity);
                 return span_status.finish(Ok(image_identity));
             }
         }
@@ -3891,8 +3897,7 @@ impl VmDriver {
                 image_path = %image_path.display(),
                 "vm driver: root disk image cache hit (no build needed)"
             );
-            self.publish_registry_cache_hit(sandbox_id, image_ref, &image_identity, &image_path)
-                .await;
+            self.publish_registry_cache_hit(sandbox_id, image_ref, &image_identity);
             return span_status.finish(Ok(image_identity));
         }
 
@@ -3944,8 +3949,6 @@ impl VmDriver {
                     ("image_identity".to_string(), image_identity.clone()),
                 ]),
             );
-            self.publish_pulled_event(sandbox_id, image_ref, &image_path)
-                .await;
             return span_status.finish(Ok(image_identity));
         }
 
@@ -3958,8 +3961,6 @@ impl VmDriver {
             &image_identity,
         )
         .await?;
-        self.publish_pulled_event(sandbox_id, image_ref, &image_path)
-            .await;
         span_status.finish(Ok(image_identity))
     }
 
@@ -4068,8 +4069,6 @@ impl VmDriver {
                     ("image_identity".to_string(), cache_identity.clone()),
                 ]),
             );
-            self.publish_pulled_event(sandbox_id, image_ref, &image_path)
-                .await;
             return Ok(cache_identity);
         }
 
@@ -4106,15 +4105,11 @@ impl VmDriver {
                     ("image_identity".to_string(), cache_identity.clone()),
                 ]),
             );
-            self.publish_pulled_event(sandbox_id, image_ref, &image_path)
-                .await;
             return Ok(cache_identity);
         }
 
         self.build_cached_local_image_rootfs_image(sandbox_id, docker, image_ref, &cache_identity)
             .await?;
-        self.publish_pulled_event(sandbox_id, image_ref, &image_path)
-            .await;
         Ok(cache_identity)
     }
 
@@ -4124,6 +4119,7 @@ impl VmDriver {
         image_ref: &str,
         bootstrap_root_disk: &Path,
     ) -> Result<PreparedImageDisk, Status> {
+        self.publish_pulling_event(sandbox_id, image_ref);
         if let Some((docker, image_identity)) =
             self.resolve_local_container_image(image_ref).await?
         {
@@ -4181,22 +4177,29 @@ impl VmDriver {
         let rootfs_archive = staging_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
         self.reset_image_staging_dir(&staging_dir).await?;
 
-        self.publish_vm_progress(
-            sandbox_id,
-            "ExportingRootfs",
-            format!("Exporting rootfs from local image \"{image_ref}\""),
-            HashMap::from([
-                ("image_ref".to_string(), image_ref.to_string()),
-                ("image_source".to_string(), "local_docker".to_string()),
-                ("image_identity".to_string(), cache_identity.clone()),
-            ]),
-        );
-        if let Err(err) =
-            export_local_image_rootfs_to_path(docker, image_ref, &rootfs_archive).await
+        let exported_bytes = match self
+            .export_local_image_rootfs_with_progress(
+                sandbox_id,
+                docker,
+                image_ref,
+                &cache_identity,
+                &rootfs_archive,
+            )
+            .await
         {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Err(err);
-        }
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                return Err(err);
+            }
+        };
+        self.publish_workload_image_ready(
+            sandbox_id,
+            image_ref,
+            "local_docker",
+            false,
+            Some(exported_bytes),
+        );
 
         let payload = GuestImagePayload {
             image_ref: image_ref.to_string(),
@@ -4340,6 +4343,17 @@ impl VmDriver {
             )));
         }
         cleanup_request_staging().await;
+        let staged_bytes = tokio::fs::metadata(&rootfs_archive)
+            .await
+            .ok()
+            .map(|meta| meta.len());
+        self.publish_workload_image_ready(
+            sandbox_id,
+            &tar_display,
+            "rootfs_tar",
+            false,
+            staged_bytes,
+        );
 
         let payload = GuestImagePayload {
             image_ref: tar_display.clone(),
@@ -4489,6 +4503,13 @@ impl VmDriver {
 
         write_oci_layout_for_manifest(&layout_dir, GUEST_IMAGE_OCI_REF, &manifest)
             .map_err(|err| Status::internal(format!("write OCI layout failed: {err}")))?;
+        self.publish_workload_image_ready(
+            sandbox_id,
+            image_ref,
+            "registry",
+            false,
+            u64::try_from(total_bytes).ok().filter(|bytes| *bytes > 0),
+        );
 
         let payload = GuestImagePayload {
             image_ref: image_ref.to_string(),
@@ -4706,6 +4727,46 @@ impl VmDriver {
         )))
     }
 
+    /// Export a local image's rootfs to `tar_path`, reporting the bytes
+    /// written so far as `ExportingRootfs` progress. Returns the archive size.
+    async fn export_local_image_rootfs_with_progress(
+        &self,
+        sandbox_id: &str,
+        docker: &Docker,
+        image_ref: &str,
+        image_identity: &str,
+        tar_path: &Path,
+    ) -> Result<u64, Status> {
+        let metadata = |exported_bytes: Option<u64>| {
+            let mut metadata = HashMap::from([
+                ("image_ref".to_string(), image_ref.to_string()),
+                ("image_source".to_string(), "local_docker".to_string()),
+                ("image_identity".to_string(), image_identity.to_string()),
+            ]);
+            if let Some(bytes) = exported_bytes {
+                metadata.insert("exported_bytes".to_string(), bytes.to_string());
+            }
+            metadata
+        };
+        self.publish_vm_progress(
+            sandbox_id,
+            "ExportingRootfs",
+            format!("Exporting rootfs from local image \"{image_ref}\""),
+            metadata(None),
+        );
+        export_local_image_rootfs_to_path(docker, image_ref, tar_path, |exported_bytes| {
+            self.publish_vm_progress(
+                sandbox_id,
+                "ExportingRootfs",
+                format!(
+                    "Exporting rootfs from local image \"{image_ref}\": {exported_bytes} bytes"
+                ),
+                metadata(Some(exported_bytes)),
+            );
+        })
+        .await
+    }
+
     fn publish_prepared_cache_hit(
         &self,
         sandbox_id: &str,
@@ -4724,6 +4785,7 @@ impl VmDriver {
                 ("image_identity".to_string(), image_identity.to_string()),
             ]),
         );
+        self.publish_workload_image_ready(sandbox_id, image_ref, image_source, true, None);
     }
 
     fn publish_prepared_cache_miss(
@@ -4783,18 +4845,15 @@ impl VmDriver {
                 Status::internal(format!("create image cache staging dir failed: {err}"))
             })?;
 
-        self.publish_vm_progress(
-            sandbox_id,
-            "ExportingRootfs",
-            format!("Exporting rootfs from local image \"{image_ref}\""),
-            HashMap::from([
-                ("image_ref".to_string(), image_ref.to_string()),
-                ("image_source".to_string(), "local_docker".to_string()),
-                ("image_identity".to_string(), image_identity.to_string()),
-            ]),
-        );
-        if let Err(err) =
-            export_local_image_rootfs_to_path(docker, image_ref, &exported_rootfs).await
+        if let Err(err) = self
+            .export_local_image_rootfs_with_progress(
+                sandbox_id,
+                docker,
+                image_ref,
+                image_identity,
+                &exported_rootfs,
+            )
+            .await
         {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
             return Err(err);
@@ -5262,7 +5321,7 @@ pub async fn run_image_preparation_worker(request_path: &Path) -> Result<(), Str
                 .map(preparation::Output::Overlay)
         } else if request.bootstrap_only {
             let identity = driver
-                .ensure_cached_bootstrap_rootfs_image(&request.sandbox_id, &request.image_ref)
+                .ensure_cached_bootstrap_rootfs_image(&request.sandbox_id, &request.image_ref, true)
                 .await?;
             Ok(preparation::Output::Images(RuntimeImagePlan {
                 root_disk: image_cache_rootfs_image(&driver.config.state_dir, &identity),
@@ -5925,11 +5984,15 @@ fn is_docker_not_found_error(err: &BollardError) -> bool {
     )
 }
 
+/// Stream `docker export` of a temporary container into `tar_path` and return
+/// the archive size. `on_progress` receives the bytes written so far, at most
+/// once per [`EXPORT_PROGRESS_INTERVAL`].
 async fn export_local_image_rootfs_to_path(
     docker: &Docker,
     image_ref: &str,
     tar_path: &Path,
-) -> Result<(), Status> {
+    mut on_progress: impl FnMut(u64) + Send,
+) -> Result<u64, Status> {
     let container_name = format!(
         "openshell-vm-rootfs-export-{}",
         std::time::SystemTime::now()
@@ -5969,6 +6032,8 @@ async fn export_local_image_rootfs_to_path(
             Status::internal(format!("create {} failed: {err}", tar_path.display()))
         })?;
         let mut stream = docker.export_container(&container_id);
+        let mut exported_bytes = 0_u64;
+        let mut last_report = std::time::Instant::now();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|err| {
                 Status::failed_precondition(format!(
@@ -5978,10 +6043,16 @@ async fn export_local_image_rootfs_to_path(
             file.write_all(&chunk).await.map_err(|err| {
                 Status::internal(format!("write {} failed: {err}", tar_path.display()))
             })?;
+            exported_bytes = exported_bytes.saturating_add(chunk.len() as u64);
+            if last_report.elapsed() >= EXPORT_PROGRESS_INTERVAL {
+                last_report = std::time::Instant::now();
+                on_progress(exported_bytes);
+            }
         }
-        file.flush()
-            .await
-            .map_err(|err| Status::internal(format!("flush {} failed: {err}", tar_path.display())))
+        file.flush().await.map_err(|err| {
+            Status::internal(format!("flush {} failed: {err}", tar_path.display()))
+        })?;
+        Ok(exported_bytes)
     }
     .await;
 
@@ -5993,9 +6064,9 @@ async fn export_local_image_rootfs_to_path(
         .await;
 
     match (export_result, cleanup_result) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(exported_bytes), Ok(())) => Ok(exported_bytes),
         (Err(err), _) => Err(err),
-        (Ok(()), Err(err)) => Err(Status::internal(format!(
+        (Ok(_), Err(err)) => Err(Status::internal(format!(
             "failed to remove temporary export container for local Docker image '{image_ref}': {err}"
         ))),
     }
@@ -6338,8 +6409,17 @@ impl VmDriver {
         self.publish_platform_event(sandbox_id.to_string(), event);
     }
 
-    /// Emit a `Pulled` platform event with progress metadata for the CLI.
-    async fn publish_pulled_event(&self, sandbox_id: &str, image_ref: &str, image_path: &Path) {
+    /// Report the cached bootstrap root disk. It completes the image step
+    /// (`Pulled`) only when the bootstrap image is also the workload image;
+    /// otherwise `BootstrapImageReady` is a progress detail and the workload
+    /// image completes the step.
+    async fn publish_bootstrap_image_ready(
+        &self,
+        sandbox_id: &str,
+        image_ref: &str,
+        image_path: &Path,
+        completes_image_step: bool,
+    ) {
         let mut metadata = HashMap::from([("image_ref".to_string(), image_ref.to_string())]);
         let size_suffix = tokio::fs::metadata(image_path).await.map_or_else(
             |_| String::new(),
@@ -6348,11 +6428,37 @@ impl VmDriver {
                 format!(" Image size: {} bytes.", meta.len())
             },
         );
+        let (reason, message) = if completes_image_step {
+            (
+                "Pulled",
+                format!("Successfully pulled image \"{image_ref}\".{size_suffix}"),
+            )
+        } else {
+            (
+                "BootstrapImageReady",
+                format!("VM bootstrap image \"{image_ref}\" is ready.{size_suffix}"),
+            )
+        };
+        self.publish_vm_progress(sandbox_id, reason, message, metadata);
+    }
+
+    /// Complete the image step for a workload image that differs from the
+    /// bootstrap image, once its payload is staged and before the root disk
+    /// is formatted. `image_bytes` is the payload size: the exported rootfs
+    /// for a local image, the layer total for a registry image.
+    fn publish_workload_image_ready(
+        &self,
+        sandbox_id: &str,
+        image_ref: &str,
+        image_source: &str,
+        cache_hit: bool,
+        image_bytes: Option<u64>,
+    ) {
         self.publish_vm_progress(
             sandbox_id,
             "Pulled",
-            format!("Successfully pulled image \"{image_ref}\".{size_suffix}"),
-            metadata,
+            workload_image_ready_message(image_ref, image_source, cache_hit, image_bytes),
+            workload_image_ready_metadata(image_ref, image_source, cache_hit, image_bytes),
         );
     }
 }
@@ -7892,15 +7998,15 @@ fn stage_guest_image_payload(
         GuestImagePayloadSource::RegistryOciLayout { layout_dir } => {
             fs::write(image_dir.join("source"), b"oci-layout")
                 .map_err(|err| format!("write guest image source: {err}"))?;
-            copy_dir_recursive(layout_dir, &image_dir.join(GUEST_IMAGE_OCI_LAYOUT_DIR))?;
+            stage_dir_recursive(layout_dir, &image_dir.join(GUEST_IMAGE_OCI_LAYOUT_DIR))?;
         }
         GuestImagePayloadSource::LocalDocker { rootfs_archive } => {
             fs::write(image_dir.join("source"), b"local-docker")
                 .map_err(|err| format!("write guest image source: {err}"))?;
             let dest = image_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
-            fs::copy(rootfs_archive, &dest).map_err(|err| {
+            link_or_copy_file(rootfs_archive, &dest).map_err(|err| {
                 format!(
-                    "copy guest image rootfs archive {} to {}: {err}",
+                    "stage guest image rootfs archive {} at {}: {err}",
                     rootfs_archive.display(),
                     dest.display()
                 )
@@ -7911,7 +8017,26 @@ fn stage_guest_image_payload(
     Ok(())
 }
 
-fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<(), String> {
+/// Stage a driver-owned payload file for `mke2fs -d` without a second full
+/// copy: hard link it when `dest` is on the same filesystem, else copy it.
+/// The payload sources are private staging files that nothing modifies after
+/// staging, and the formatter only reads them, so sharing the inode is safe.
+fn link_or_copy_file(source: &Path, dest: &Path) -> std::io::Result<()> {
+    match fs::hard_link(source, dest) {
+        Ok(()) => Ok(()),
+        Err(link_error) => {
+            tracing::debug!(
+                source = %source.display(),
+                dest = %dest.display(),
+                error = %link_error,
+                "vm driver: hard link failed, copying image payload"
+            );
+            fs::copy(source, dest).map(|_| ())
+        }
+    }
+}
+
+fn stage_dir_recursive(source: &Path, dest: &Path) -> Result<(), String> {
     fs::create_dir_all(dest).map_err(|err| format!("create {}: {err}", dest.display()))?;
     for entry in fs::read_dir(source).map_err(|err| format!("read {}: {err}", source.display()))? {
         let entry = entry.map_err(|err| format!("read {}: {err}", source.display()))?;
@@ -7920,15 +8045,15 @@ fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<(), String> {
         let metadata = fs::symlink_metadata(&source_path)
             .map_err(|err| format!("stat {}: {err}", source_path.display()))?;
         if metadata.file_type().is_dir() {
-            copy_dir_recursive(&source_path, &dest_path)?;
+            stage_dir_recursive(&source_path, &dest_path)?;
         } else if metadata.file_type().is_file() {
             if let Some(parent) = dest_path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|err| format!("create {}: {err}", parent.display()))?;
             }
-            fs::copy(&source_path, &dest_path).map_err(|err| {
+            link_or_copy_file(&source_path, &dest_path).map_err(|err| {
                 format!(
-                    "copy {} to {}: {err}",
+                    "stage {} at {}: {err}",
                     source_path.display(),
                     dest_path.display()
                 )
@@ -8274,8 +8399,19 @@ fn attach_vm_progress_metadata(event: &mut PlatformEvent) {
         "WaitingForImageCacheLock" => {
             mark_progress_detail(&mut event.metadata, "Waiting for image cache lock");
         }
+        "BootstrapImageReady" => {
+            mark_progress_detail(&mut event.metadata, "VM bootstrap image ready");
+        }
         "ExportingRootfs" => {
-            mark_progress_detail(&mut event.metadata, "Exporting local image rootfs");
+            let detail = event
+                .metadata
+                .get("exported_bytes")
+                .and_then(|value| value.parse::<u64>().ok())
+                .map_or_else(
+                    || "Exporting local image rootfs".to_string(),
+                    |bytes| format!("Exporting local image rootfs ({})", format_bytes(bytes)),
+                );
+            mark_progress_detail(&mut event.metadata, detail);
         }
         "PreparingRootfs" => mark_progress_detail(&mut event.metadata, "Preparing rootfs"),
         "CreatingRootDisk" => mark_progress_detail(&mut event.metadata, "Formatting root disk"),
@@ -8294,14 +8430,61 @@ fn pulling_image_from_message(message: &str) -> Option<String> {
 }
 
 fn pulled_label(event: &PlatformEvent) -> String {
-    event
-        .metadata
+    let metadata = &event.metadata;
+    let label = if metadata
+        .get("cache_hit")
+        .is_some_and(|value| value == "true")
+    {
+        "Image ready (cached)"
+    } else {
+        match metadata.get("image_source").map(String::as_str) {
+            Some("local_docker") => "Local image exported",
+            Some("rootfs_tar") => "Rootfs tar staged",
+            _ => "Image pulled",
+        }
+    };
+    metadata
         .get("image_size_bytes")
         .and_then(|value| value.parse::<u64>().ok())
         .map_or_else(
-            || "Image pulled".to_string(),
-            |bytes| format!("Image pulled ({})", format_bytes(bytes)),
+            || label.to_string(),
+            |bytes| format!("{label} ({})", format_bytes(bytes)),
         )
+}
+
+fn workload_image_ready_message(
+    image_ref: &str,
+    image_source: &str,
+    cache_hit: bool,
+    image_bytes: Option<u64>,
+) -> String {
+    let size_suffix = image_bytes.map_or_else(String::new, |bytes| format!(" ({bytes} bytes)"));
+    if cache_hit {
+        format!("Using cached VM image disk for \"{image_ref}\"")
+    } else {
+        match image_source {
+            "local_docker" => format!("Exported local image \"{image_ref}\"{size_suffix}"),
+            "rootfs_tar" => format!("Staged rootfs tar \"{image_ref}\"{size_suffix}"),
+            _ => format!("Successfully pulled image \"{image_ref}\"{size_suffix}"),
+        }
+    }
+}
+
+fn workload_image_ready_metadata(
+    image_ref: &str,
+    image_source: &str,
+    cache_hit: bool,
+    image_bytes: Option<u64>,
+) -> HashMap<String, String> {
+    let mut metadata = HashMap::from([
+        ("image_ref".to_string(), image_ref.to_string()),
+        ("image_source".to_string(), image_source.to_string()),
+        ("cache_hit".to_string(), cache_hit.to_string()),
+    ]);
+    if let Some(bytes) = image_bytes {
+        metadata.insert("image_size_bytes".to_string(), bytes.to_string());
+    }
+    metadata
 }
 
 fn pulling_layer_detail(metadata: &HashMap<String, String>) -> Option<String> {
@@ -8332,6 +8515,7 @@ mod tests {
     use prost_types::{Struct, Value, value::Kind};
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
     use std::fs;
+    use std::os::unix::fs::MetadataExt as _;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -9648,6 +9832,109 @@ mod tests {
                 .get(PROGRESS_ACTIVE_STEP_KEY)
                 .map(String::as_str),
             Some(PROGRESS_STEP_STARTING_SANDBOX)
+        );
+    }
+
+    fn vm_progress_event(reason: &str, metadata: HashMap<String, String>) -> PlatformEvent {
+        let mut event = platform_event("vm", "Normal", reason, String::new());
+        event.metadata = metadata;
+        attach_vm_progress_metadata(&mut event);
+        event
+    }
+
+    fn progress_value<'a>(event: &'a PlatformEvent, key: &str) -> Option<&'a str> {
+        event.metadata.get(key).map(String::as_str)
+    }
+
+    #[test]
+    fn vm_workload_pulled_event_labels_each_image_source() {
+        let cases = [
+            (
+                "local_docker",
+                false,
+                Some(5 * 1024 * 1024 * 1024),
+                "Local image exported (5.0 GB)",
+            ),
+            ("registry", false, Some(44_040_192), "Image pulled (42 MB)"),
+            ("registry", false, None, "Image pulled"),
+            (
+                "rootfs_tar",
+                false,
+                Some(44_040_192),
+                "Rootfs tar staged (42 MB)",
+            ),
+            ("local_docker", true, None, "Image ready (cached)"),
+            ("registry", true, None, "Image ready (cached)"),
+        ];
+        for (source, cache_hit, bytes, label) in cases {
+            let event = vm_progress_event(
+                "Pulled",
+                workload_image_ready_metadata("local-big:1", source, cache_hit, bytes),
+            );
+            assert_eq!(
+                progress_value(&event, PROGRESS_COMPLETE_STEP_KEY),
+                Some(PROGRESS_STEP_PULLING_IMAGE),
+                "{source}"
+            );
+            assert_eq!(
+                progress_value(&event, PROGRESS_COMPLETE_LABEL_KEY),
+                Some(label),
+                "{source} cache_hit={cache_hit}"
+            );
+            assert_eq!(
+                progress_value(&event, PROGRESS_ACTIVE_STEP_KEY),
+                Some(PROGRESS_STEP_STARTING_SANDBOX)
+            );
+        }
+    }
+
+    #[test]
+    fn vm_workload_image_ready_message_names_the_local_export() {
+        assert_eq!(
+            workload_image_ready_message("local-big:1", "local_docker", false, Some(1234)),
+            "Exported local image \"local-big:1\" (1234 bytes)"
+        );
+        assert_eq!(
+            workload_image_ready_message("local-big:1", "local_docker", true, None),
+            "Using cached VM image disk for \"local-big:1\""
+        );
+    }
+
+    #[test]
+    fn vm_bootstrap_image_ready_event_does_not_complete_image_step() {
+        // The bootstrap image of a different workload image is a detail of
+        // the image step, never "Image pulled" for the requested image.
+        let event = vm_progress_event(
+            "BootstrapImageReady",
+            HashMap::from([
+                ("image_ref".to_string(), "bootstrap:latest".to_string()),
+                ("image_size_bytes".to_string(), "536870912".to_string()),
+            ]),
+        );
+        assert_eq!(progress_value(&event, PROGRESS_COMPLETE_STEP_KEY), None);
+        assert_eq!(progress_value(&event, PROGRESS_COMPLETE_LABEL_KEY), None);
+        assert_eq!(progress_value(&event, PROGRESS_ACTIVE_STEP_KEY), None);
+        assert_eq!(
+            progress_value(&event, PROGRESS_ACTIVE_DETAIL_KEY),
+            Some("VM bootstrap image ready")
+        );
+    }
+
+    #[test]
+    fn vm_exporting_rootfs_event_reports_exported_bytes() {
+        let event = vm_progress_event(
+            "ExportingRootfs",
+            HashMap::from([("exported_bytes".to_string(), "44040192".to_string())]),
+        );
+        assert_eq!(
+            progress_value(&event, PROGRESS_ACTIVE_DETAIL_KEY),
+            Some("Exporting local image rootfs (42 MB)")
+        );
+
+        let event = vm_progress_event("ExportingRootfs", HashMap::new());
+        assert_eq!(
+            progress_value(&event, PROGRESS_ACTIVE_DETAIL_KEY),
+            Some("Exporting local image rootfs")
         );
     }
 
@@ -12823,6 +13110,86 @@ mod tests {
             .unwrap(),
             "blob"
         );
+        let blob = blob_dir.join("abc");
+        let staged_blob = image_dir
+            .join(GUEST_IMAGE_OCI_LAYOUT_DIR)
+            .join("blobs")
+            .join("sha256")
+            .join("abc");
+        assert_eq!(
+            fs::metadata(staged_blob).unwrap().ino(),
+            fs::metadata(blob).unwrap().ino()
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn stage_guest_image_payload_links_local_rootfs_archive_without_copy() {
+        let base = unique_temp_dir();
+        let staging_dir = base.join("staging");
+        fs::create_dir_all(&base).unwrap();
+        let rootfs_archive = base.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
+        fs::write(&rootfs_archive, b"exported rootfs").unwrap();
+
+        stage_guest_image_payload(
+            &staging_dir,
+            &GuestImagePayload {
+                image_ref: "local-big:1".to_string(),
+                image_identity: "sha256:local".to_string(),
+                source: GuestImagePayloadSource::LocalDocker {
+                    rootfs_archive: rootfs_archive.clone(),
+                },
+            },
+        )
+        .unwrap();
+
+        let image_dir = staging_dir.join("config").join(GUEST_IMAGE_CONFIG_DIR);
+        let staged = image_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
+        assert_eq!(
+            fs::read_to_string(image_dir.join("source")).unwrap(),
+            "local-docker"
+        );
+        assert_eq!(fs::read(&staged).unwrap(), b"exported rootfs");
+        // Same filesystem: the staged archive is the exported file, not a copy.
+        let source_meta = fs::metadata(&rootfs_archive).unwrap();
+        let staged_meta = fs::metadata(&staged).unwrap();
+        assert_eq!(staged_meta.ino(), source_meta.ino());
+        assert_eq!(staged_meta.nlink(), 2);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn link_or_copy_file_falls_back_to_copy_when_link_fails() {
+        let base = unique_temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        let source = base.join("source.tar");
+        let dest = base.join("dest.tar");
+        fs::write(&source, b"payload").unwrap();
+        // An existing destination makes hard_link fail with EEXIST, which
+        // takes the same fallback as a cross-filesystem EXDEV.
+        fs::write(&dest, b"stale").unwrap();
+
+        link_or_copy_file(&source, &dest).unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), b"payload");
+        let source_meta = fs::metadata(&source).unwrap();
+        let dest_meta = fs::metadata(&dest).unwrap();
+        assert_ne!(dest_meta.ino(), source_meta.ino());
+        assert_eq!(source_meta.nlink(), 1);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn link_or_copy_file_reports_missing_source() {
+        let base = unique_temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        let error = link_or_copy_file(&base.join("missing.tar"), &base.join("dest.tar"))
+            .expect_err("missing source must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!base.join("dest.tar").exists());
 
         let _ = std::fs::remove_dir_all(base);
     }
