@@ -723,6 +723,9 @@ function versionPin(value: string | undefined): bigint {
 
 const FORWARD_CHUNK = 64 * 1024;
 
+// Bound for revoking a forward's SSH session token during cleanup.
+const SSH_CLEANUP_TIMEOUT_MS = 5_000;
+
 function workspaceName(options?: SandboxWorkspaceOptions | null): string {
   const workspace = options?.workspace ?? 'default';
   if (workspace.trim() === '') throw new SdkError('invalid_config', 'workspace must be non-empty');
@@ -1894,7 +1897,11 @@ export class SandboxClient {
       input.end();
       if (token !== undefined) {
         try {
-          await this.grpc.revokeSshSession({ token, allowMissing: true }, { signal });
+          // Not the connection signal: close() aborts it before this runs.
+          await this.grpc.revokeSshSession(
+            { token, allowMissing: true },
+            { signal: AbortSignal.timeout(SSH_CLEANUP_TIMEOUT_MS) },
+          );
         } catch {
           // Best-effort revoke; the token expires on its own regardless.
         }
