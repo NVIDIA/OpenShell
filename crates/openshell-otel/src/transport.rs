@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full, Limited};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -57,15 +58,16 @@ pub fn signal_url(endpoint: &str, signal_path: &str) -> Result<http::Uri, http::
 /// exporters can use it from their own export threads.
 #[derive(Clone, Debug)]
 pub struct OtlpHttpClient {
-    client: Client<HttpConnector, Full<Bytes>>,
+    client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
     runtime: tokio::runtime::Handle,
     timeout: Duration,
 }
 
 impl OtlpHttpClient {
     /// Creates a client bound to the current tokio runtime whose requests
-    /// fail after `timeout`. Fails outside a runtime.
-    pub fn new(timeout: Duration) -> Result<Self, crate::SetupError> {
+    /// fail after `timeout`. It connects to an `https://` collector with
+    /// `tls`; without it, only to `http://` ones. Fails outside a runtime.
+    pub fn new(tls: Option<&crate::OtlpTls>, timeout: Duration) -> Result<Self, crate::SetupError> {
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| crate::SetupError::NoRuntime)?;
         let mut connector = HttpConnector::new();
@@ -74,6 +76,12 @@ impl OtlpHttpClient {
         connector.set_keepalive_interval(Some(TCP_KEEPALIVE_INTERVAL));
         connector.set_keepalive_retries(Some(TCP_KEEPALIVE_RETRIES));
         connector.set_nodelay(true);
+        connector.enforce_http(false);
+        let connector = HttpsConnectorBuilder::new()
+            .with_tls_config(crate::OtlpTls::http_config_for(tls)?)
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(connector);
         Ok(Self {
             client: Client::builder(TokioExecutor::new()).build(connector),
             runtime,
@@ -127,7 +135,7 @@ impl HttpClient for OtlpHttpClient {
 
 #[cfg(test)]
 mod tests {
-    use openshell_otel_test_support::OtlpHttpTestServer;
+    use openshell_otel_test_support::{OtlpHttpTestServer, OtlpTestServer, ServerTls, TestPki};
     use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _};
     use opentelemetry::trace::{Tracer as _, TracerProvider as _};
     use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
@@ -181,7 +189,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn requests_fail_after_the_timeout() {
         let (endpoint, collector) = silent_collector().await;
-        let client = OtlpHttpClient::new(Duration::from_millis(200)).unwrap();
+        let client = OtlpHttpClient::new(None, Duration::from_millis(200)).unwrap();
         let result = tokio::time::timeout(Duration::from_secs(5), client.send(post(&endpoint)))
             .await
             .expect("the client gives up on its own");
@@ -196,7 +204,7 @@ mod tests {
             b"partial".to_vec(),
         )
         .await;
-        let client = OtlpHttpClient::new(Duration::from_secs(5)).unwrap();
+        let client = OtlpHttpClient::new(None, Duration::from_secs(5)).unwrap();
         assert!(client.send(post(&endpoint)).await.is_err());
         collector.abort();
     }
@@ -206,7 +214,7 @@ mod tests {
         let body = vec![b'x'; MAX_RESPONSE_BYTES + 1];
         let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
         let (endpoint, collector) = answering_collector(head.leak(), body).await;
-        let client = OtlpHttpClient::new(Duration::from_secs(5)).unwrap();
+        let client = OtlpHttpClient::new(None, Duration::from_secs(5)).unwrap();
         assert!(client.send(post(&endpoint)).await.is_err());
         collector.abort();
     }
@@ -214,7 +222,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn abandoned_requests_stop() {
         let (endpoint, collector) = silent_collector().await;
-        let client = OtlpHttpClient::new(Duration::from_mins(1)).unwrap();
+        let client = OtlpHttpClient::new(None, Duration::from_mins(1)).unwrap();
         let alive = || {
             tokio::runtime::Handle::current()
                 .metrics()
@@ -245,6 +253,102 @@ mod tests {
         })
         .unwrap()
         .with_protocol(Protocol::HttpProtobuf)
+    }
+
+    fn tls_target(endpoint: &str, protocol: Protocol, tls: crate::OtlpTls) -> OtlpTarget {
+        OtlpTarget::new(&OtlpExportConfig {
+            endpoint,
+            service_name: ServiceName::Fixed("openshell-test"),
+            service_version: None,
+            resource_attributes: Vec::new(),
+        })
+        .unwrap()
+        .with_protocol(protocol)
+        .with_tls(tls)
+    }
+
+    /// Exports one span through `target` and reports whether it was delivered.
+    async fn delivered(target: OtlpTarget) -> bool {
+        let provider = target.tracer_provider().expect("tracer provider");
+        provider.tracer("test").in_span("tls-span", |_| {});
+        tokio::task::spawn_blocking(move || provider.force_flush().is_ok())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exports_verify_the_collector_ca_and_present_a_client_certificate() {
+        let pki = TestPki::generate();
+        let tls = crate::OtlpTls::from_pem(
+            Some(pki.ca_pem.as_bytes()),
+            Some((
+                pki.client.cert_pem.as_bytes(),
+                pki.client.key_pem.as_bytes(),
+            )),
+        )
+        .unwrap();
+
+        let grpc = OtlpTestServer::start_with_tls(&ServerTls::mutual(&pki)).await;
+        assert!(delivered(tls_target(grpc.endpoint(), Protocol::Grpc, tls.clone())).await);
+        assert_eq!(grpc.shutdown().await.spans.len(), 1);
+
+        let mut http = OtlpHttpTestServer::start_with_tls(&ServerTls::mutual(&pki)).await;
+        assert!(delivered(tls_target(http.endpoint(), Protocol::HttpProtobuf, tls)).await);
+        assert_eq!(http.next_export().await.path, "/v1/traces");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exports_fail_without_the_collector_ca_or_a_required_client_certificate() {
+        let pki = TestPki::generate();
+        let ca_only = crate::OtlpTls::from_pem(Some(pki.ca_pem.as_bytes()), None).unwrap();
+        for protocol in [Protocol::Grpc, Protocol::HttpProtobuf] {
+            for (tls, server, case) in [
+                (
+                    crate::OtlpTls::default(),
+                    ServerTls::server_only(&pki),
+                    "platform roots do not trust the collector",
+                ),
+                (
+                    ca_only.clone(),
+                    ServerTls::mutual(&pki),
+                    "the collector requires a client certificate",
+                ),
+            ] {
+                let delivered = match protocol {
+                    Protocol::Grpc => {
+                        let collector = OtlpTestServer::start_with_tls(&server).await;
+                        delivered(tls_target(collector.endpoint(), protocol, tls)).await
+                    }
+                    Protocol::HttpProtobuf => {
+                        let collector = OtlpHttpTestServer::start_with_tls(&server).await;
+                        delivered(tls_target(collector.endpoint(), protocol, tls)).await
+                    }
+                };
+                assert!(!delivered, "{protocol:?}: {case}");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exports_fail_when_the_certificate_does_not_name_the_host() {
+        let pki = TestPki::generate();
+        let tls = crate::OtlpTls::from_pem(Some(pki.ca_pem.as_bytes()), None).unwrap();
+        let by_address = |endpoint: &str| endpoint.replace("localhost", "127.0.0.1");
+
+        let grpc = OtlpTestServer::start_with_tls(&ServerTls::server_only(&pki)).await;
+        assert!(delivered(tls_target(grpc.endpoint(), Protocol::Grpc, tls.clone())).await);
+        assert!(
+            !delivered(tls_target(
+                &by_address(grpc.endpoint()),
+                Protocol::Grpc,
+                tls.clone()
+            ))
+            .await
+        );
+
+        let http = OtlpHttpTestServer::start_with_tls(&ServerTls::server_only(&pki)).await;
+        let endpoint = by_address(http.endpoint());
+        assert!(!delivered(tls_target(&endpoint, Protocol::HttpProtobuf, tls)).await);
     }
 
     #[test]

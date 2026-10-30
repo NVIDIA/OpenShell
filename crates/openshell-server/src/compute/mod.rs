@@ -936,6 +936,7 @@ pub struct ComputeRuntime {
     restart_notify: Arc<Notify>,
     ssh_identities: Arc<OnceLock<crate::ssh_identity::SshIdentityStore>>,
     supervisor_otlp_headers: Arc<OnceLock<crate::otel_tracing::SupervisorOtlpHeaders>>,
+    supervisor_otlp_tls: Arc<OnceLock<crate::otel_tracing::SupervisorOtlpTls>>,
     /// Desired assignments of the shared supervisor host, when the gateway
     /// coordinates one for the in-process driver.
     supervisor_host: Option<openshell_supervisor_control::SupervisorHostController>,
@@ -1052,6 +1053,7 @@ impl ComputeRuntime {
             restart_notify: Arc::new(Notify::new()),
             ssh_identities: Arc::new(OnceLock::new()),
             supervisor_otlp_headers: Arc::new(OnceLock::new()),
+            supervisor_otlp_tls: Arc::new(OnceLock::new()),
             supervisor_host: None,
             service_route_index: Arc::new(OnceLock::new()),
         })
@@ -1103,6 +1105,13 @@ impl ComputeRuntime {
         let _ = self.supervisor_otlp_headers.set(headers);
     }
 
+    pub(crate) fn configure_supervisor_otlp_tls(
+        &self,
+        tls: crate::otel_tracing::SupervisorOtlpTls,
+    ) {
+        let _ = self.supervisor_otlp_tls.set(tls);
+    }
+
     pub(crate) async fn prepare_ssh_identity(
         &self,
         sandbox: &mut Sandbox,
@@ -1131,6 +1140,9 @@ impl ComputeRuntime {
             .await?;
         if let Some(headers) = self.supervisor_otlp_headers.get() {
             headers.apply(&mut authentication.supervisor);
+        }
+        if let Some(tls) = self.supervisor_otlp_tls.get() {
+            tls.apply(&mut authentication.supervisor);
         }
         serialize_launch_authentication(authentication)
     }
@@ -8622,6 +8634,7 @@ pub fn new_test_runtime_with_driver(
         restart_notify: Arc::new(Notify::new()),
         ssh_identities: Arc::new(OnceLock::new()),
         supervisor_otlp_headers: Arc::new(OnceLock::new()),
+        supervisor_otlp_tls: Arc::new(OnceLock::new()),
         supervisor_host: None,
         service_route_index: Arc::new(OnceLock::new()),
     }
@@ -9825,6 +9838,7 @@ mod tests {
             restart_notify: Arc::new(Notify::new()),
             ssh_identities: Arc::new(OnceLock::new()),
             supervisor_otlp_headers: Arc::new(OnceLock::new()),
+            supervisor_otlp_tls: Arc::new(OnceLock::new()),
             supervisor_host: None,
             service_route_index: Arc::new(OnceLock::new()),
         }
@@ -13633,7 +13647,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn launch_bundles_carry_each_supervisor_exports_headers() {
+    async fn launch_bundles_carry_each_supervisor_exports_headers_and_tls() {
         use openshell_core::jwt::SecretOtlpHeaders;
 
         let driver = ControlledDriver::new();
@@ -13643,6 +13657,14 @@ mod tests {
             traces: secret("authorization=traces"),
             ocsf: secret("authorization=Bearer%20secret"),
             agent: secret("x-mlflow-experiment-id=0"),
+        });
+        runtime.configure_supervisor_otlp_tls(crate::otel_tracing::SupervisorOtlpTls {
+            materials: vec![openshell_core::jwt::OtlpTlsMaterial {
+                ca_pem: Some("agent-ca".to_string()),
+                ..Default::default()
+            }],
+            agent: Some(0),
+            ..Default::default()
         });
         let sandbox = sandbox_record(
             "sb-otlp-headers",
@@ -13681,6 +13703,13 @@ mod tests {
                 Some("authorization=Bearer%20secret".to_string()),
                 Some("x-mlflow-experiment-id=0".to_string()),
             ]
+        );
+        assert!(bundle.traces_otlp_tls.is_none() && bundle.ocsf_otlp_tls.is_none());
+        assert_eq!(
+            bundle
+                .otlp_tls_material(bundle.agent_otlp_tls)
+                .and_then(|tls| tls.ca_pem.as_deref()),
+            Some("agent-ca")
         );
     }
 

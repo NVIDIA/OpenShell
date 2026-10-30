@@ -23,7 +23,7 @@
 //! Diagnostic logs and metrics are not exported over OTLP. They have their own
 //! surfaces (the gateway log stream and the Prometheus `/metrics` endpoint).
 
-use openshell_core::jwt::SecretOtlpHeaders;
+use openshell_core::jwt::{OtlpTlsMaterial, SecretOtlpHeaders};
 use openshell_core::sandbox_env::OtlpProtocol;
 use openshell_otel::{OcsfOtlp, OtlpExportConfig, OtlpTarget, ServiceName};
 pub use openshell_otel::{SetupError, TraceContextInterceptor, mark_error};
@@ -122,9 +122,8 @@ pub struct OtlpExport {
     /// Validated collector that supervisors relay workload traces to. The
     /// gateway itself exports nothing for this signal.
     agent: Option<Signal<()>>,
-    /// Headers configured for the trace collector, which in-process compute
-    /// drivers also send.
-    traces_headers: http::HeaderMap,
+    /// How exports reach the trace collector.
+    traces_transport: openshell_otel::CollectorTransport,
 }
 
 /// One signal's exporter and the endpoint it sends to.
@@ -157,12 +156,14 @@ impl OtlpExport {
         cfg: &OtlpConfig,
         gateway: GatewayResourceAttributes<'_>,
     ) -> Result<Self, SetupError> {
+        let transport = |collector: &OtlpCollectorConfig| openshell_otel::CollectorTransport {
+            protocol: collector.protocol.into(),
+            headers: collector.headers.header_map(),
+            tls: collector.tls.clone(),
+        };
         let target = |collector: &OtlpCollectorConfig| {
-            OtlpTarget::new(&export_config(cfg, &collector.endpoint, gateway)).map(|target| {
-                target
-                    .with_protocol(collector.protocol.into())
-                    .with_headers(collector.headers.header_map())
-            })
+            OtlpTarget::new(&export_config(cfg, &collector.endpoint, gateway))
+                .map(|target| target.with_transport(&transport(collector)))
         };
         let traces = cfg
             .traces
@@ -203,10 +204,10 @@ impl OtlpExport {
             traces,
             ocsf,
             agent,
-            traces_headers: cfg
+            traces_transport: cfg
                 .traces
                 .as_ref()
-                .map(|traces| traces.collector.headers.header_map())
+                .map(|traces| transport(&traces.collector))
                 .unwrap_or_default(),
         })
     }
@@ -232,16 +233,10 @@ impl OtlpExport {
         self.traces.as_ref().map(|traces| traces.endpoint.as_str())
     }
 
-    /// The transport to the trace collector.
-    pub fn traces_protocol(&self) -> OtlpProtocol {
-        self.traces
-            .as_ref()
-            .map_or(OtlpProtocol::Grpc, |traces| traces.protocol)
-    }
-
-    /// The headers configured for the trace collector.
-    pub fn traces_headers(&self) -> http::HeaderMap {
-        self.traces_headers.clone()
+    /// How exports reach the trace collector, which in-process compute
+    /// drivers also use.
+    pub fn traces_transport(&self) -> openshell_otel::CollectorTransport {
+        self.traces_transport.clone()
     }
 
     /// The trace provider, when trace export is enabled.
@@ -335,6 +330,70 @@ fn supervisor_otlp_headers_from(
             .agent
             .as_ref()
             .and_then(|agent| secret(agent.collector.headers.header_map())),
+    }
+}
+
+/// TLS material for the supervisor exports, delivered in the launch bundle
+/// like [`SupervisorOtlpHeaders`]. Each export names its collector's
+/// material by position in `materials`.
+#[derive(Clone, Debug, Default)]
+pub struct SupervisorOtlpTls {
+    pub materials: Vec<OtlpTlsMaterial>,
+    pub traces: Option<usize>,
+    pub ocsf: Option<usize>,
+    pub agent: Option<usize>,
+}
+
+impl SupervisorOtlpTls {
+    pub fn apply(&self, bundle: &mut openshell_core::jwt::SupervisorAuthBundle) {
+        bundle.otlp_tls.clone_from(&self.materials);
+        bundle.traces_otlp_tls = self.traces;
+        bundle.ocsf_otlp_tls = self.ocsf;
+        bundle.agent_otlp_tls = self.agent;
+    }
+}
+
+/// The TLS material each enabled supervisor export uses: its collector's,
+/// with each distinct material sent once.
+pub fn supervisor_otlp_tls(otlp: Option<&OtlpConfig>) -> SupervisorOtlpTls {
+    let Some(otlp) = otlp else {
+        return SupervisorOtlpTls::default();
+    };
+    let material = |collector: &OtlpCollectorConfig| {
+        let tls = collector.tls();
+        let pem = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        (!tls.is_default()).then(|| OtlpTlsMaterial {
+            ca_pem: tls.ca_pem().map(pem),
+            client: tls.client_identity().map(|(cert, key)| {
+                openshell_core::jwt::OtlpClientIdentity {
+                    cert_pem: pem(cert),
+                    key_pem: openshell_core::jwt::SecretPrivateKeyPem::new(pem(key)),
+                }
+            }),
+        })
+    };
+    let lanes = [
+        otlp.traces.as_ref().map(|traces| &traces.collector),
+        otlp.ocsf.as_ref().map(|ocsf| &ocsf.collector),
+        otlp.agent.as_ref().map(|agent| &agent.collector),
+    ];
+    let mut materials = Vec::new();
+    let mut seen = Vec::new();
+    let [traces, ocsf, agent] = lanes.map(|collector| {
+        let collector = collector?;
+        let pem = (collector.tls().ca_pem(), collector.tls().client_identity());
+        if let Some(index) = seen.iter().position(|seen| *seen == pem) {
+            return Some(index);
+        }
+        materials.push(material(collector)?);
+        seen.push(pem);
+        Some(materials.len() - 1)
+    });
+    SupervisorOtlpTls {
+        materials,
+        traces,
+        ocsf,
+        agent,
     }
 }
 
@@ -666,8 +725,9 @@ pub mod test_exporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_file::{AgentOtlpConfig, OcsfOtlpConfig, OtlpHeaders, OtlpTracesConfig};
+    use crate::config_file::{AgentOtlpConfig, OcsfOtlpConfig, OtlpTracesConfig};
     use crate::test_environment::Environment;
+    use openshell_core::sandbox_env::OtlpProtocol;
 
     fn config() -> OtlpConfig {
         with_traces_endpoint("http://127.0.0.1:4317")
@@ -677,12 +737,7 @@ mod tests {
         OtlpConfig {
             service_name: None,
             traces: Some(OtlpTracesConfig {
-                collector: OtlpCollectorConfig {
-                    endpoint: endpoint.into(),
-                    protocol: OtlpProtocol::Grpc,
-                    headers: OtlpHeaders::default(),
-                    headers_file: None,
-                },
+                collector: OtlpCollectorConfig::new(endpoint, OtlpProtocol::Grpc),
             }),
             ocsf: None,
             agent: None,
@@ -691,12 +746,7 @@ mod tests {
 
     fn ocsf_config(endpoint: &str) -> OcsfOtlpConfig {
         OcsfOtlpConfig {
-            collector: OtlpCollectorConfig {
-                endpoint: endpoint.into(),
-                protocol: OtlpProtocol::Grpc,
-                headers: OtlpHeaders::default(),
-                headers_file: None,
-            },
+            collector: OtlpCollectorConfig::new(endpoint, OtlpProtocol::Grpc),
             schema_version: None,
         }
     }
@@ -725,10 +775,8 @@ mod tests {
         otlp.ocsf = Some(ocsf);
         otlp.agent = Some(AgentOtlpConfig {
             collector: OtlpCollectorConfig {
-                endpoint: "http://mlflow:5000".into(),
-                protocol: OtlpProtocol::HttpProtobuf,
                 headers: [("x-mlflow-experiment-id", "0")].into(),
-                headers_file: None,
+                ..OtlpCollectorConfig::new("http://mlflow:5000", OtlpProtocol::HttpProtobuf)
             },
         });
 
@@ -776,6 +824,81 @@ mod tests {
                 .traces
                 .is_none()
         );
+    }
+
+    #[test]
+    fn supervisors_receive_each_collectors_tls_material() {
+        let pki = openshell_otel_test_support::TestPki::generate();
+        let mutual = openshell_otel::OtlpTls::from_pem(
+            Some(pki.ca_pem.as_bytes()),
+            Some((
+                pki.client.cert_pem.as_bytes(),
+                pki.client.key_pem.as_bytes(),
+            )),
+        )
+        .unwrap();
+        let ca_only = openshell_otel::OtlpTls::from_pem(Some(pki.ca_pem.as_bytes()), None).unwrap();
+        let mut otlp = with_traces_endpoint("https://traces:4317");
+        otlp.traces.as_mut().unwrap().collector.tls = mutual;
+        otlp.agent = Some(AgentOtlpConfig {
+            collector: OtlpCollectorConfig {
+                tls: ca_only,
+                ..OtlpCollectorConfig::new("https://agents:4318", OtlpProtocol::Grpc)
+            },
+        });
+        otlp.ocsf = Some(ocsf_config("https://siem:4317"));
+
+        let tls = supervisor_otlp_tls(Some(&otlp));
+        let material = |index: Option<usize>| &tls.materials[index.expect("collector TLS")];
+        let traces = material(tls.traces);
+        assert_eq!(traces.ca_pem.as_deref(), Some(pki.ca_pem.as_str()));
+        let client = traces
+            .client
+            .as_ref()
+            .expect("trace collector client certificate");
+        assert_eq!(client.cert_pem, pki.client.cert_pem);
+        assert_eq!(client.key_pem.expose_secret(), pki.client.key_pem);
+        let agent = material(tls.agent);
+        assert_eq!(agent.ca_pem.as_deref(), Some(pki.ca_pem.as_str()));
+        assert!(agent.client.is_none());
+        assert!(tls.ocsf.is_none(), "the platform roots need no material");
+        assert!(supervisor_otlp_tls(None).materials.is_empty());
+    }
+
+    #[test]
+    fn supervisors_receive_each_distinct_tls_material_once() {
+        let pki = openshell_otel_test_support::TestPki::generate();
+        let mutual = || {
+            openshell_otel::OtlpTls::from_pem(
+                Some(pki.ca_pem.as_bytes()),
+                Some((
+                    pki.client.cert_pem.as_bytes(),
+                    pki.client.key_pem.as_bytes(),
+                )),
+            )
+            .unwrap()
+        };
+        let collector = |endpoint: &str| OtlpCollectorConfig {
+            tls: mutual(),
+            ..OtlpCollectorConfig::new(endpoint, OtlpProtocol::Grpc)
+        };
+        let otlp = OtlpConfig {
+            service_name: None,
+            traces: Some(OtlpTracesConfig {
+                collector: collector("https://shared:4317"),
+            }),
+            ocsf: Some(OcsfOtlpConfig {
+                collector: collector("https://shared:4317"),
+                schema_version: None,
+            }),
+            agent: Some(AgentOtlpConfig {
+                collector: collector("https://agents:4318"),
+            }),
+        };
+
+        let tls = supervisor_otlp_tls(Some(&otlp));
+        assert_eq!(tls.materials.len(), 1);
+        assert_eq!([tls.traces, tls.ocsf, tls.agent], [Some(0); 3]);
     }
 
     #[tokio::test]
@@ -849,12 +972,7 @@ mod tests {
         use tracing_subscriber::prelude::*;
 
         let mut collector = openshell_otel_test_support::OtlpHttpTestServer::start().await;
-        let http = |endpoint: &str| OtlpCollectorConfig {
-            endpoint: endpoint.into(),
-            protocol: OtlpProtocol::HttpProtobuf,
-            headers: OtlpHeaders::default(),
-            headers_file: None,
-        };
+        let http = |endpoint: &str| OtlpCollectorConfig::new(endpoint, OtlpProtocol::HttpProtobuf);
         let mut cfg = config();
         cfg.traces = Some(OtlpTracesConfig {
             collector: http(collector.endpoint()),
@@ -866,7 +984,6 @@ mod tests {
         let (export, error) = OtlpExport::start(Some(&cfg), GatewayResourceAttributes::default());
         assert!(error.is_none(), "unexpected setup error: {error:?}");
         let export = export.expect("OTLP export");
-        assert_eq!(export.traces_protocol(), OtlpProtocol::HttpProtobuf);
         assert_eq!(
             export.protocols(),
             [
@@ -874,6 +991,10 @@ mod tests {
                 Some(OtlpProtocol::HttpProtobuf),
                 None
             ]
+        );
+        assert_eq!(
+            export.traces_transport().protocol,
+            openshell_otel::Protocol::HttpProtobuf
         );
 
         let provider = export.tracer_provider().expect("trace export").clone();
@@ -942,6 +1063,62 @@ mod tests {
                 assert_eq!(received.log_authorizations, ["Bearer logs-token"]);
             })
             .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gateway_signals_verify_their_collectors_with_the_configured_tls() {
+        use openshell_ocsf::{ConfigStateChangeBuilder, ocsf_emit};
+        use openshell_otel_test_support::{OtlpTestServer, ServerTls, TestPki};
+        use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+        use tracing_subscriber::prelude::*;
+
+        let pki = TestPki::generate();
+        let collector = OtlpTestServer::start_with_tls(&ServerTls::mutual(&pki)).await;
+        let tls = openshell_otel::OtlpTls::from_pem(
+            Some(pki.ca_pem.as_bytes()),
+            Some((
+                pki.client.cert_pem.as_bytes(),
+                pki.client.key_pem.as_bytes(),
+            )),
+        )
+        .unwrap();
+        let collector_config = OtlpCollectorConfig {
+            tls,
+            ..OtlpCollectorConfig::new(collector.endpoint(), OtlpProtocol::Grpc)
+        };
+        let mut cfg = config();
+        cfg.traces = Some(OtlpTracesConfig {
+            collector: collector_config.clone(),
+        });
+        cfg.ocsf = Some(OcsfOtlpConfig {
+            collector: collector_config,
+            schema_version: None,
+        });
+        let (export, error) = OtlpExport::start(Some(&cfg), GatewayResourceAttributes::default());
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        let export = export.expect("OTLP export");
+
+        export
+            .tracer_provider()
+            .expect("trace export")
+            .tracer("test")
+            .in_span("gateway-span", |_| {});
+        let event =
+            ConfigStateChangeBuilder::new(&crate::gateway_ocsf::context("sandbox-1", "sandbox"))
+                .message("policy approved")
+                .build();
+        let subscriber =
+            tracing_subscriber::registry().with(export.ocsf().expect("OCSF log export").layer());
+        tracing::subscriber::with_default(subscriber, || ocsf_emit!(event));
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(export.shutdown());
+        })
+        .await
+        .unwrap();
+        let received = collector.shutdown().await;
+
+        assert_eq!(received.spans.len(), 1);
+        assert_eq!(received.log_bodies.len(), 1);
     }
 
     #[test]
@@ -1109,12 +1286,7 @@ mod tests {
         bad_ocsf.ocsf = Some(ocsf_config("definitely not a url"));
         let mut bad_agent = config();
         bad_agent.agent = Some(AgentOtlpConfig {
-            collector: OtlpCollectorConfig {
-                endpoint: "definitely not a url".into(),
-                protocol: OtlpProtocol::Grpc,
-                headers: OtlpHeaders::default(),
-                headers_file: None,
-            },
+            collector: OtlpCollectorConfig::new("definitely not a url", OtlpProtocol::Grpc),
         });
         for cfg in [
             with_traces_endpoint("definitely not a url"),

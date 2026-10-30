@@ -8,9 +8,11 @@ local socket that responds to an API ping. An explicitly selected Docker driver
 falls back to `/var/run/docker.sock` when no candidate responds.
 
 When the gateway configures `[openshell.gateway.otlp]`, the in-process driver
-exports spans to the same OTLP/gRPC collector as
+exports spans to the same OTLP collector as
 `openshell-driver-docker`. The standalone driver accepts
-`OPENSHELL_OTLP_ENDPOINT`, continues W3C trace context from gateway RPC
+`OPENSHELL_OTLP_ENDPOINT`, with `OPENSHELL_OTLP_CA_FILE`,
+`OPENSHELL_OTLP_CERT_FILE`, and `OPENSHELL_OTLP_KEY_FILE` for an `https://`
+collector, continues W3C trace context from gateway RPC
 metadata, and flushes spans during graceful shutdown. When
 `[openshell.gateway.otlp.agent]` is enabled, the driver also sets
 `OPENSHELL_OTLP_AGENT_ENDPOINT` on the supervisor container, plus

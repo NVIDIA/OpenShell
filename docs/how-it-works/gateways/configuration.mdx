@@ -615,7 +615,7 @@ endpoint = "http://traces.observability.svc:4318"
 protocol = "http/protobuf"
 ```
 
-Each enabled signal needs an endpoint, either in its own table or from `endpoint`. A table without its own `endpoint` uses the whole `[openshell.gateway.otlp]` collector, including its `protocol` and headers. A table with its own `endpoint` takes nothing else from `[openshell.gateway.otlp]`, so configured settings for one collector, such as its credentials, never reach another, and setting `protocol`, `headers`, or `headers_file` in a table without an `endpoint` is a configuration error. Endpoints must be valid URIs. If one is malformed, the gateway logs the configuration error and continues with all OTLP export disabled. It does not connect at startup: an unreachable collector produces export failures, never a failure to serve.
+Each enabled signal needs an endpoint, either in its own table or from `endpoint`. A table without its own `endpoint` uses the whole `[openshell.gateway.otlp]` collector, including its `protocol`, headers, and TLS files. A table with its own `endpoint` takes nothing else from `[openshell.gateway.otlp]`, so configured settings for one collector, such as its credentials, never reach another, and setting any of them in a table without an `endpoint` is a configuration error. Endpoints must be valid URIs. If one is malformed, the gateway logs the configuration error and continues with all OTLP export disabled. It does not connect at startup: an unreachable collector produces export failures, never a failure to serve.
 
 `protocol` selects the transport to a collector: `grpc`, the default, or `http/protobuf`. With `http/protobuf`, the endpoint is a base URL and each signal is posted to its path under it, `/v1/traces` or `/v1/logs`, as with `OTEL_EXPORTER_OTLP_ENDPOINT`. HTTP/JSON is not supported. Point a `grpc` endpoint at a collector's gRPC receiver, conventionally port `4317`, and an `http/protobuf` endpoint at its HTTP receiver, conventionally port `4318`. A URI alone cannot distinguish the two, so a mismatched endpoint is accepted at startup and then fails on export. Sandbox supervisors and standalone compute drivers must come from the same release as the gateway to use `http/protobuf`: an older supervisor exports over gRPC, and an older driver rejects the protocol setting.
 
@@ -625,7 +625,7 @@ Put credentials in `headers_file` rather than `headers`. It reads a collector's 
 
 Supervisors receive the gateway's headers but export to the endpoints their compute driver gives them. An external compute driver takes those endpoints from its own flags, so give it the same endpoints as the gateway, or supervisors send the gateway's credentials to a different collector. Supervisors from an earlier release than the gateway reject launch credentials that carry headers, so upgrade custom supervisor images with the gateway.
 
-Headers travel in cleartext unless the endpoint uses `https://`, which only `grpc` supports. The agent trace relay and `http/protobuf` collectors always receive them in cleartext, so do not send credentials to them over an untrusted network.
+Headers travel in cleartext unless the endpoint uses `https://`, so use TLS when they carry credentials over an untrusted network.
 
 ```toml
 [openshell.gateway.otlp]
@@ -638,7 +638,17 @@ protocol = "http/protobuf"
 headers  = { x-mlflow-experiment-id = "0" }
 ```
 
-Use an `https://` endpoint for TLS over `grpc`. The gateway verifies the collector certificate against the system trust roots. An `https://` endpoint with `http/protobuf` is a configuration error.
+Use an `https://` endpoint for TLS over either protocol. The gateway verifies the collector certificate against the system trust roots, or only against the PEM certificates in `ca_file` when it is set. Set `cert_file` and `key_file` together to present a PEM client certificate to a collector that requires one. The gateway reads these files at startup and fails to start if one is unreadable, larger than 64 KiB, or holds no usable PEM, if the key does not match the certificate, or if one is set for an `http://` endpoint. Supervisors receive each distinct set of files once, however many tables share it, and the files they receive may total at most 192 KiB. Compute drivers and supervisors use the same CA and client certificate for their own exports, and the agent trace relay uses its collector's. Supervisors receive the file contents with their launch credentials, never through the sandbox environment or file system, so the collector cannot tell a supervisor's exports from the gateway's by certificate. The private key is stored with each sandbox's launch credentials wherever its compute driver keeps them, such as a Kubernetes Secret. The VM driver receives the trace collector's file paths. A standalone compute driver reads its own with `--otlp-ca-file`, `--otlp-cert-file`, and `--otlp-key-file`.
+
+The files are read once. To rotate a certificate, restart the gateway; running sandboxes keep the previous certificate until they restart. Sandbox supervisors from an earlier release than the gateway reject launch credentials that carry collector headers or TLS material, so upgrade custom supervisor images with the gateway. For Helm deployments, mount the files with `server.extraVolumes` and `server.extraVolumeMounts` and point the table's keys at the mounted paths.
+
+```toml
+[openshell.gateway.otlp]
+endpoint  = "https://otel-collector.observability.svc:4317"
+ca_file   = "/etc/openshell/otlp/ca.pem"
+cert_file = "/etc/openshell/otlp/client.pem"
+key_file  = "/etc/openshell/otlp/client-key.pem"
+```
 
 The OpenTelemetry SDK logs export failures after startup. Spans in a failed batch are dropped rather than retried.
 
@@ -730,11 +740,9 @@ Agents must export traces as OTLP/HTTP protobuf with compression disabled. The r
 
 Delivery is best-effort. The relay answers 200 once a batch is buffered and makes one export attempt per batch, so a batch is lost if the collector is unavailable at that moment. The supervisor logs the first failed export and a periodic summary of failures. Before the sandbox reports that its main process exited, and before a suspended sandbox's supervisor exits, the relay flushes buffered batches for up to 5 seconds, and skips that wait when its most recent export failed. It keeps serving `openshell sandbox exec` sessions after the main process exits and flushes once more when the sandbox is torn down.
 
-The relayed hop does not yet support TLS to the collector, so headers, including credentials, travel in cleartext; an `https` endpoint leaves the relay inactive with a logged reason. Protect the hop at the network layer, for example with a collector-side ingress policy.
-
 ### Tuning
 
-`[openshell.gateway.otlp]` decides whether and where to export. How the SDK exports is controlled by the standard OpenTelemetry environment variables, which the gateway reads through the SDK rather than mirroring as TOML keys. They apply to the gateway and its in-process compute drivers. The VM driver also receives the trace headers, and sandbox supervisors receive the trace and OCSF headers, merged as described for [headers](#otlp-export). No other variable reaches supervisors, which receive only the endpoints, protocols, and headers of their collectors.
+`[openshell.gateway.otlp]` decides whether and where to export. How the SDK exports is controlled by the standard OpenTelemetry environment variables, which the gateway reads through the SDK rather than mirroring as TOML keys. They apply to the gateway and its in-process compute drivers. The VM driver also receives the trace headers, and sandbox supervisors receive the trace and OCSF headers, merged as described for [headers](#otlp-export). No other variable reaches supervisors, which receive only the endpoints, protocols, [headers, and TLS material](#otlp-export) of their collectors.
 
 The gateway honors these variables:
 
@@ -749,7 +757,7 @@ The gateway honors these variables:
 | `OTEL_EXPORTER_OTLP_COMPRESSION` | Set to `gzip` to compress exports of every signal. `zstd` is not supported. |
 | `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `OTEL_EXPORTER_OTLP_TRACES_COMPRESSION`, `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` | Exporter transport tuning for spans only. These override the general variables. |
 | `OTEL_EXPORTER_OTLP_LOGS_HEADERS`, `OTEL_EXPORTER_OTLP_LOGS_COMPRESSION`, `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` | Exporter transport tuning for OCSF log records only. These override the general variables. |
-| `SSL_CERT_FILE`, `SSL_CERT_DIR` | Additional trust roots for `https://` endpoints, such as a private CA. |
+| `SSL_CERT_FILE`, `SSL_CERT_DIR` | Replace the system trust roots for `https://` endpoints without a `ca_file`. They affect the gateway and the compute drivers it runs, not supervisors. |
 
 For Helm deployments, set these variables with `server.extraEnv`. Read credentials from a Secret so they stay out of the values file:
 
@@ -773,7 +781,7 @@ These variables have no effect. Only `[openshell.gateway.otlp]` decides which si
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Enablement has one source, `[openshell.gateway.otlp]`, so an environment variable cannot silently turn export on or redirect it. |
 | `OTEL_SDK_DISABLED`, `OTEL_TRACES_EXPORTER`, `OTEL_LOGS_EXPORTER`, `OTEL_METRICS_EXPORTER` | `[openshell.gateway.otlp]` decides which signals are exported. To disable export, omit it. |
 | `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | `protocol` in each table selects the transport, and supervisors follow the same setting. |
-| `OTEL_EXPORTER_OTLP_INSECURE`, `OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_KEY`, and their per-signal forms | The endpoint scheme selects TLS, and collector certificates are verified against the system trust roots. Client certificates are not supported. |
+| `OTEL_EXPORTER_OTLP_INSECURE`, `OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_KEY`, and their per-signal forms | The endpoint scheme selects TLS, and `ca_file`, `cert_file`, and `key_file` in each table set its trust and client certificate, so supervisors follow the same setting. |
 | `OTEL_PROPAGATORS` | The gateway always propagates W3C Trace Context. |
 | `OTEL_BLRP_SCHEDULE_DELAY`, `OTEL_BLRP_MAX_QUEUE_SIZE`, `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BLRP_EXPORT_TIMEOUT` | OCSF log export uses its own queue and batching, described in [OCSF Log Export](#ocsf-log-export). |
 | `OTEL_EXPORTER_OTLP_METRICS_*`, `OTEL_METRIC_EXPORT_INTERVAL` | The gateway serves metrics for Prometheus scraping and does not export them over OTLP. |

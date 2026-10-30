@@ -95,7 +95,9 @@ context. When `[openshell.gateway.otlp.agent]` is enabled, the driver also
 sets `OPENSHELL_OTLP_AGENT_ENDPOINT`, which starts the supervisor's agent trace
 relay. Each endpoint is accompanied by its `_PROTOCOL` variable
 (`OPENSHELL_OTLP_PROTOCOL`, `OPENSHELL_OTLP_AGENT_PROTOCOL`) when the collector
-uses `http/protobuf`. None of these is configurable in driver TOML.
+uses `http/protobuf`. Collector headers and TLS material reach the supervisor
+in its launch credentials, not the Pod environment. None of these is
+configurable in driver TOML.
 
 The driver creates one namespace-wide `NetworkPolicy` before it releases any
 workload Pod. It selects every OpenShell workload, denies all workload egress,

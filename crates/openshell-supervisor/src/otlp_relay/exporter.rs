@@ -76,12 +76,14 @@ impl std::fmt::Display for ExportError {
 
 impl std::error::Error for ExportError {}
 
-/// The collector endpoint could not be turned into an export target.
+/// The collector transport could not be set up.
 #[derive(Debug)]
 pub enum EndpointError {
     Grpc(tonic::transport::Error),
     Http(http::Error),
-    Runtime(openshell_otel::SetupError),
+    /// The HTTP client could not be built, such as without a runtime or
+    /// trust roots.
+    Setup(openshell_otel::SetupError),
 }
 
 impl std::fmt::Display for EndpointError {
@@ -89,7 +91,7 @@ impl std::fmt::Display for EndpointError {
         match self {
             Self::Grpc(error) => error.fmt(f),
             Self::Http(error) => error.fmt(f),
-            Self::Runtime(error) => error.fmt(f),
+            Self::Setup(error) => error.fmt(f),
         }
     }
 }
@@ -119,15 +121,16 @@ impl Exporter {
         endpoint: &str,
         protocol: OtlpProtocol,
         headers: http::HeaderMap,
+        tls: Option<&openshell_otel::OtlpTls>,
     ) -> Result<Self, EndpointError> {
         let transport = match protocol {
             OtlpProtocol::Grpc => Transport::Grpc(Grpc::new(
-                grpc_channel(endpoint).map_err(EndpointError::Grpc)?,
+                grpc_channel(endpoint, tls).map_err(EndpointError::Grpc)?,
             )),
             OtlpProtocol::HttpProtobuf => Transport::Http {
                 client: Box::new(
-                    OtlpHttpClient::new(EXPORT_TIMEOUT + CLIENT_TIMEOUT_MARGIN)
-                        .map_err(EndpointError::Runtime)?,
+                    OtlpHttpClient::new(tls, EXPORT_TIMEOUT + CLIENT_TIMEOUT_MARGIN)
+                        .map_err(EndpointError::Setup)?,
                 ),
                 uri: openshell_otel::signal_url(endpoint, "v1/traces")
                     .map_err(EndpointError::Http)?,
@@ -162,7 +165,10 @@ impl Exporter {
     }
 }
 
-fn grpc_channel(endpoint: &str) -> Result<Channel, tonic::transport::Error> {
+fn grpc_channel(
+    endpoint: &str,
+    tls: Option<&openshell_otel::OtlpTls>,
+) -> Result<Channel, tonic::transport::Error> {
     // Liveness detection for a collector that accepted the TCP connection
     // and then went silent or vanished without a FIN, so the lazy channel
     // redials instead of timing out every batch on a dead connection for
@@ -176,7 +182,11 @@ fn grpc_channel(endpoint: &str) -> Result<Channel, tonic::transport::Error> {
     // that recipe connects eagerly, pings idle connections, and carries a
     // first-party TLS trust policy, none of which fit a third-party
     // collector that must not gate supervisor startup.
-    Ok(Endpoint::from_shared(endpoint.to_string())?
+    let mut channel = Endpoint::from_shared(endpoint.to_string())?;
+    if let Some(tls) = tls {
+        channel = channel.tls_config(tls.grpc_config())?;
+    }
+    Ok(channel
         .connect_timeout(CONNECT_TIMEOUT)
         .tcp_keepalive(Some(TCP_KEEPALIVE_IDLE))
         .tcp_keepalive_interval(Some(TCP_KEEPALIVE_INTERVAL))
@@ -341,12 +351,21 @@ mod tests {
 
     #[test]
     fn new_rejects_an_invalid_uri() {
-        assert!(Exporter::new("not a uri", OtlpProtocol::Grpc, http::HeaderMap::new()).is_err());
+        assert!(
+            Exporter::new(
+                "not a uri",
+                OtlpProtocol::Grpc,
+                http::HeaderMap::new(),
+                None
+            )
+            .is_err()
+        );
         assert!(
             Exporter::new(
                 "not a uri",
                 OtlpProtocol::HttpProtobuf,
-                http::HeaderMap::new()
+                http::HeaderMap::new(),
+                None
             )
             .is_err()
         );
@@ -365,6 +384,7 @@ mod tests {
                 &endpoint,
                 OtlpProtocol::HttpProtobuf,
                 http::HeaderMap::new(),
+                None,
             )
             .unwrap();
             let batch = Bytes::from(encoded_request("over-http", &[]));
@@ -392,6 +412,7 @@ mod tests {
             collector.endpoint(),
             OtlpProtocol::HttpProtobuf,
             http::HeaderMap::new(),
+            None,
         )
         .unwrap();
         let error = exporter
@@ -413,6 +434,7 @@ mod tests {
             &endpoint,
             OtlpProtocol::HttpProtobuf,
             http::HeaderMap::new(),
+            None,
         )
         .unwrap();
 
@@ -431,7 +453,7 @@ mod tests {
         let batch = || Bytes::from(encoded_request("with-headers", &[]));
 
         let grpc = OtlpTestServer::start().await;
-        Exporter::new(grpc.endpoint(), OtlpProtocol::Grpc, headers())
+        Exporter::new(grpc.endpoint(), OtlpProtocol::Grpc, headers(), None)
             .unwrap()
             .export(batch())
             .await
@@ -440,7 +462,7 @@ mod tests {
         assert_eq!(grpc.shutdown().await.trace_authorizations, ["Bearer agent"]);
 
         let mut http = OtlpHttpTestServer::start().await;
-        Exporter::new(http.endpoint(), OtlpProtocol::HttpProtobuf, headers())
+        Exporter::new(http.endpoint(), OtlpProtocol::HttpProtobuf, headers(), None)
             .unwrap()
             .export(batch())
             .await
@@ -451,6 +473,48 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exports_verify_the_collector_and_present_a_client_certificate() {
+        use openshell_otel_test_support::{ServerTls, TestPki};
+
+        let pki = TestPki::generate();
+        let tls = openshell_otel::OtlpTls::from_pem(
+            Some(pki.ca_pem.as_bytes()),
+            Some((
+                pki.client.cert_pem.as_bytes(),
+                pki.client.key_pem.as_bytes(),
+            )),
+        )
+        .unwrap();
+        let batch = || Bytes::from(encoded_request("over-tls", &[]));
+
+        let grpc = OtlpTestServer::start_with_tls(&ServerTls::mutual(&pki)).await;
+        Exporter::new(
+            grpc.endpoint(),
+            OtlpProtocol::Grpc,
+            http::HeaderMap::new(),
+            Some(&tls),
+        )
+        .unwrap()
+        .export(batch())
+        .await
+        .expect("gRPC export over mutual TLS succeeds");
+        assert_eq!(grpc.shutdown().await.spans.len(), 1);
+
+        let mut http = OtlpHttpTestServer::start_with_tls(&ServerTls::mutual(&pki)).await;
+        Exporter::new(
+            http.endpoint(),
+            OtlpProtocol::HttpProtobuf,
+            http::HeaderMap::new(),
+            Some(&tls),
+        )
+        .unwrap()
+        .export(batch())
+        .await
+        .expect("HTTP export over mutual TLS succeeds");
+        assert_eq!(http.next_export().await.path, "/v1/traces");
+    }
+
     #[tokio::test]
     async fn export_reaches_the_collector_with_attributes_intact() {
         let collector = OtlpTestServer::start().await;
@@ -458,6 +522,7 @@ mod tests {
             collector.endpoint(),
             OtlpProtocol::Grpc,
             http::HeaderMap::new(),
+            None,
         )
         .unwrap();
         let batch = Bytes::from(encoded_request(
@@ -490,7 +555,7 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
         let exporter =
-            Exporter::new(&endpoint, OtlpProtocol::Grpc, http::HeaderMap::new()).unwrap();
+            Exporter::new(&endpoint, OtlpProtocol::Grpc, http::HeaderMap::new(), None).unwrap();
 
         let started = Instant::now();
         let error = exporter
@@ -513,6 +578,7 @@ mod tests {
             &collector.endpoint,
             OtlpProtocol::Grpc,
             http::HeaderMap::new(),
+            None,
         )
         .unwrap();
         let started = Instant::now();

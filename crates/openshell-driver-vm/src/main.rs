@@ -105,6 +105,18 @@ struct Args {
     #[arg(long, env = "OPENSHELL_OTLP_PROTOCOL", default_value_t)]
     otlp_protocol: OtlpProtocol,
 
+    /// PEM certificates trusted to verify an `https://` trace collector.
+    #[arg(long, env = "OPENSHELL_OTLP_CA_FILE")]
+    otlp_ca_file: Option<PathBuf>,
+
+    /// PEM client certificate presented to the trace collector.
+    #[arg(long, env = "OPENSHELL_OTLP_CERT_FILE", requires = "otlp_key_file")]
+    otlp_cert_file: Option<PathBuf>,
+
+    /// PEM private key for `--otlp-cert-file`.
+    #[arg(long, env = "OPENSHELL_OTLP_KEY_FILE", requires = "otlp_cert_file")]
+    otlp_key_file: Option<PathBuf>,
+
     /// OTLP collector endpoint for supervisor OCSF event export.
     #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
     otlp_ocsf_endpoint: Option<String>,
@@ -338,6 +350,9 @@ async fn main() -> Result<()> {
         openshell_otel::DriverTracingConfig {
             endpoint: args.otlp_endpoint.as_deref(),
             protocol: args.otlp_protocol.into(),
+            ca_file: args.otlp_ca_file.as_deref(),
+            cert_file: args.otlp_cert_file.as_deref(),
+            key_file: args.otlp_key_file.as_deref(),
             gateway_name: args.gateway_name.as_deref(),
             service_version: VERSION,
             log_level: &args.log_level,
@@ -1012,6 +1027,34 @@ mod tests {
         ])
         .expect_err("legacy --openshell-endpoint must be rejected");
         assert!(error.to_string().contains("--openshell-endpoint"));
+    }
+
+    #[test]
+    fn driver_tracing_reads_the_trace_collectors_tls_files() {
+        let args = Args::try_parse_from([
+            "openshell-driver-vm",
+            "--otlp-endpoint",
+            "https://collector:4317",
+            "--otlp-ca-file",
+            "/etc/otlp/ca.pem",
+            "--otlp-cert-file",
+            "/etc/otlp/client.pem",
+            "--otlp-key-file",
+            "/etc/otlp/client-key.pem",
+        ])
+        .expect("VM driver should accept the trace collector's TLS files");
+        assert_eq!(
+            [
+                args.otlp_ca_file.as_deref(),
+                args.otlp_cert_file.as_deref(),
+                args.otlp_key_file.as_deref()
+            ],
+            [
+                Some(std::path::Path::new("/etc/otlp/ca.pem")),
+                Some(std::path::Path::new("/etc/otlp/client.pem")),
+                Some(std::path::Path::new("/etc/otlp/client-key.pem"))
+            ]
+        );
     }
 
     #[test]
