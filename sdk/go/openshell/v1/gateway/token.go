@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -27,32 +26,6 @@ const (
 	// oidcTokenFile is the OIDC token bundle filename.
 	oidcTokenFile = "oidc_token.json"
 )
-
-// edgeTokenLoader provides lazy, thread-safe loading of the edge token
-// from disk. Successful loads are cached; failures are retried so a token
-// created after client construction can be picked up without a restart.
-type edgeTokenLoader struct {
-	dir   string
-	mu    sync.Mutex
-	token string
-}
-
-// load returns the edge token string, reading it from disk on the first
-// call. It tries edge_token first, falling back to cf_token for legacy
-// compatibility. Only a successful result is cached.
-func (l *edgeTokenLoader) load() (string, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.token != "" {
-		return l.token, nil
-	}
-	token, err := readEdgeToken(l.dir)
-	if err != nil {
-		return "", err
-	}
-	l.token = token
-	return token, nil
-}
 
 // readEdgeToken reads the edge token from the given directory. It tries
 // edge_token first, then cf_token as a legacy fallback. The file content
@@ -158,14 +131,14 @@ func (d *diskTokenSource) Token() (*oauth2.Token, error) {
 // NewClient succeeds even when the token file is missing on disk (FR-007).
 // The error surfaces on the first authentication attempt.
 type lazyEdgeAuth struct {
-	loader *edgeTokenLoader
+	dir string
 }
 
-// GetRequestMetadata loads the edge token lazily and returns it as a
-// Bearer authorization header. The first load is cached by the
-// underlying edgeTokenLoader.
+// GetRequestMetadata reads the edge token from disk on every call and
+// returns it as a Bearer authorization header. Reading each time picks up
+// tokens rewritten by the CLI without a process restart.
 func (a *lazyEdgeAuth) GetRequestMetadata(_ context.Context, _ ...string) (map[string]string, error) {
-	token, err := a.loader.load()
+	token, err := readEdgeToken(a.dir)
 	if err != nil {
 		return nil, err
 	}
