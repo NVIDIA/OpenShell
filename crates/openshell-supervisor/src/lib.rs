@@ -299,6 +299,7 @@ fn prepare_control_readiness_path(path: &std::path::Path) -> Result<()> {
             "supervisor readiness socket path must be absolute"
         ));
     }
+    openshell_core::unix_socket_path::check(path).into_diagnostic()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .into_diagnostic()

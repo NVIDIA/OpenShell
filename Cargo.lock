@@ -4763,6 +4763,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
@@ -4775,6 +4776,9 @@ name = "openshell-gateway"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper",
  "hyper-util",
  "miette",
  "nix 0.29.0",

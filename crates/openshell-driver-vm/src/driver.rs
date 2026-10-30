@@ -1472,7 +1472,9 @@ impl VmDriver {
             .env(openshell_core::sandbox_env::SANDBOX, &sandbox.name)
             .env(
                 openshell_core::sandbox_env::SSH_SOCKET_PATH,
-                sandbox_socket_dir(&self.socket_root, &sandbox.id).join("ssh.sock"),
+                sandbox_socket_dir(&self.socket_root, &sandbox.id)
+                    .map_err(|err| Status::internal(format!("sandbox socket dir: {err}")))?
+                    .join("ssh.sock"),
             )
             .env(
                 openshell_core::sandbox_env::PROXY_TLS_DIR,
@@ -2082,10 +2084,10 @@ impl VmDriver {
         }
 
         let console_output = state_dir.join("rootfs-console.log");
-        create_sandbox_socket_dir(&self.socket_root_fd, &self.socket_root, &sandbox.id)
-            .map_err(|err| Status::internal(format!("create socket dir failed: {err}")))?;
         let control_socket =
-            sandbox_socket_dir(&self.socket_root, &sandbox.id).join(VM_CONTROL_SOCKET);
+            create_sandbox_socket_dir(&self.socket_root_fd, &self.socket_root, &sandbox.id)
+                .map_err(|err| Status::internal(format!("create socket dir failed: {err}")))?
+                .join(VM_CONTROL_SOCKET);
         let session_id = launch_authentication.supervisor.session_id;
         let channel_tls = generate_sandbox_tls_material(session_id)
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -6811,11 +6813,20 @@ async fn restrict_owner_only_dir(_path: &Path) -> Result<(), std::io::Error> {
 }
 
 const SOCKET_ROOT_ALLOC_RETRIES: usize = 16;
-/// macOS `sun_path` is 104 bytes including the NUL terminator.
-const MAX_SUN_PATH_LEN: usize = 103;
 
-fn sandbox_socket_dir(socket_root: &Path, sandbox_id: &str) -> PathBuf {
-    socket_root.join(sandbox_id)
+/// Name of a sandbox's socket directory under the socket root. Sandbox IDs can
+/// be 128 bytes, so a fixed-length digest keeps socket paths short.
+fn sandbox_socket_leaf(sandbox_id: &str) -> Result<String, std::io::Error> {
+    let digest = openshell_crypto::sha256(sandbox_id.as_bytes()).map_err(std::io::Error::other)?;
+    let mut leaf = String::with_capacity(32);
+    for byte in &digest[..16] {
+        write!(&mut leaf, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(leaf)
+}
+
+fn sandbox_socket_dir(socket_root: &Path, sandbox_id: &str) -> Result<PathBuf, std::io::Error> {
+    Ok(socket_root.join(sandbox_socket_leaf(sandbox_id)?))
 }
 
 fn allocate_socket_root() -> Result<(PathBuf, OwnedFd), std::io::Error> {
@@ -6864,34 +6875,34 @@ fn create_sandbox_socket_dir(
     socket_root: &Path,
     sandbox_id: &str,
 ) -> Result<PathBuf, std::io::Error> {
-    let longest = socket_root.join(sandbox_id).join(VM_CONTROL_SOCKET);
-    if longest.as_os_str().len() > MAX_SUN_PATH_LEN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "socket path {} exceeds sun_path limit ({MAX_SUN_PATH_LEN} bytes)",
-                longest.display()
-            ),
-        ));
-    }
-    match rustix::fs::mkdirat(root_fd, sandbox_id, rustix::fs::Mode::from_raw_mode(0o700)) {
+    let leaf = sandbox_socket_leaf(sandbox_id)?;
+    let dir = socket_root.join(&leaf);
+    openshell_core::unix_socket_path::check(&dir.join(VM_CONTROL_SOCKET))?;
+    match rustix::fs::mkdirat(
+        root_fd,
+        leaf.as_str(),
+        rustix::fs::Mode::from_raw_mode(0o700),
+    ) {
         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
         Err(e) => return Err(e.into()),
     }
-    Ok(socket_root.join(sandbox_id))
+    Ok(dir)
 }
 
 fn remove_sandbox_socket_dir(root_fd: &OwnedFd, sandbox_id: &str) {
+    let Ok(leaf) = sandbox_socket_leaf(sandbox_id) else {
+        return;
+    };
     if let Ok(leaf_fd) = rustix::fs::openat(
         root_fd,
-        sandbox_id,
+        leaf.as_str(),
         rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW,
         rustix::fs::Mode::empty(),
     ) {
         let _ = rustix::fs::unlinkat(&leaf_fd, VM_CONTROL_SOCKET, rustix::fs::AtFlags::empty());
         let _ = rustix::fs::unlinkat(&leaf_fd, "ssh.sock", rustix::fs::AtFlags::empty());
     }
-    let _ = rustix::fs::unlinkat(root_fd, sandbox_id, rustix::fs::AtFlags::REMOVEDIR);
+    let _ = rustix::fs::unlinkat(root_fd, leaf.as_str(), rustix::fs::AtFlags::REMOVEDIR);
 }
 
 #[allow(clippy::result_large_err)]
@@ -8341,7 +8352,8 @@ mod tests {
     use tonic::Code;
 
     fn test_socket_root() -> (PathBuf, Arc<OwnedFd>) {
-        let dir = std::env::temp_dir().join(format!(
+        // Production socket roots live under /tmp; macOS TMPDIR is too long.
+        let dir = Path::new("/tmp").join(format!(
             "os-test-{:016x}",
             u64::from_ne_bytes(openshell_crypto::random_bytes::<8>().expect("test entropy"))
         ));
@@ -10572,20 +10584,26 @@ mod tests {
     }
 
     #[test]
-    fn create_sandbox_socket_dir_rejects_over_long_ids() {
+    fn create_sandbox_socket_dir_accepts_longest_sandbox_id() {
         let (root, fd) = test_socket_root();
-        let err = create_sandbox_socket_dir(&fd, &root, &"x".repeat(128)).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(!root.join("x".repeat(128)).exists());
+        let sandbox_id = "x".repeat(128);
+        let dir = create_sandbox_socket_dir(&fd, &root, &sandbox_id).unwrap();
+        assert!(dir.is_dir());
+        assert_eq!(dir, sandbox_socket_dir(&root, &sandbox_id).unwrap());
+        std::os::unix::net::UnixListener::bind(dir.join(VM_CONTROL_SOCKET)).unwrap();
+        remove_sandbox_socket_dir(&fd, &sandbox_id);
+        assert!(!dir.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn sandbox_socket_dir_fits_macos_sun_path() {
-        let sandbox_id = "3eb2ad45-bead-4c2e-bd10-1a4a7f3a2721";
+        let sandbox_id = "x".repeat(128);
         let worst_root = "/tmp/os-4294967295-00000000000000000000000000000000";
-        let control = sandbox_socket_dir(Path::new(worst_root), sandbox_id).join(VM_CONTROL_SOCKET);
-        let ssh = sandbox_socket_dir(Path::new(worst_root), sandbox_id).join("ssh.sock");
+        let dir = sandbox_socket_dir(Path::new(worst_root), &sandbox_id).unwrap();
+        let control = dir.join(VM_CONTROL_SOCKET);
+        let ssh = dir.join("ssh.sock");
+        assert_ne!(dir, sandbox_socket_dir(Path::new(worst_root), "y").unwrap());
         assert!(
             control.as_os_str().len() < 104,
             "control socket path exceeds macOS sun_path: {}",

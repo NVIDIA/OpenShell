@@ -455,6 +455,7 @@ fn compute_driver_listen_mode(args: &Args) -> std::result::Result<ComputeDriverL
                     .to_string(),
             );
         }
+        openshell_core::unix_socket_path::check(&socket_path).map_err(|err| err.to_string())?;
         return Ok(ComputeDriverListenMode::Unix {
             socket_path,
             expected_peer_pid: args.expected_peer_pid,
@@ -1061,6 +1062,20 @@ mod tests {
                 expected_peer_pid: Some(42),
             }
         );
+    }
+
+    #[test]
+    fn listen_mode_rejects_overlong_uds_path() {
+        let socket_path = format!("/tmp/{}/compute-driver.sock", "a".repeat(100));
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--bind-socket",
+            &socket_path,
+            "--expected-peer-pid",
+            "42",
+        ]);
+        let err = compute_driver_listen_mode(&args).expect_err("overlong socket path");
+        assert!(err.contains(&socket_path), "{err}");
     }
 
     #[test]

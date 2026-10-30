@@ -59,7 +59,7 @@ if [ "${E2E_TEST_OVERRIDE}" = "additional_ca" ]; then
 fi
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
 
-# The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
+# This script binds the external VM driver's `compute-driver.sock` under the run state dir.
 # AF_UNIX SUN_LEN is 104 bytes on macOS (108 on Linux), so paths anchored
 # in the workspace's `target/` blow the limit on typical developer
 # machines — e.g. a ~100-char `~/.superset/worktrees/.../target/...`
@@ -169,7 +169,7 @@ print(s.getsockname()[1])
 s.close()')"
 
 # Per-run state dir so concurrent e2e runs don't collide on the UDS or
-# sandbox state. The VM driver creates `<state_dir>/compute-driver.sock`
+# sandbox state. The external VM driver binds `<state_dir>/compute-driver.sock`
 # and `<state_dir>/sandboxes/<id>/overlay.ext4` under here. Keep the
 # basename short — see the SUN_LEN comment above.
 RUN_STATE_DIR="${STATE_DIR_ROOT}/os-vm-e2e-${HOST_PORT}-$$"

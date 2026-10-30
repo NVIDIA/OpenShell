@@ -69,6 +69,7 @@ pub mod time;
 pub mod token_grant_failure;
 pub mod transport_errors;
 pub mod upload;
+pub use openshell_extension_core::unix_socket_path;
 
 pub use config::{
     AppArmorProfile, Config, ExtensionBindingPolicy, GatewayAuthConfig,
