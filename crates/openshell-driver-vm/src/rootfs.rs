@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::driver::DEFAULT_SANDBOX_UID;
+use crate::driver::{DEFAULT_SANDBOX_UID, PREPARED_IMAGE_ROOTFS_DIR};
 
 const SANDBOX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-sandbox.zst"));
 const SUPERVISOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-supervisor.zst"));
@@ -807,8 +807,20 @@ fn debugfs_quote_argument(argument: &str) -> Option<String> {
 /// Persisted VM overlays may outlive the prepared-image cache layout that
 /// created them. Reading the matching old lower disk lets the driver preserve
 /// that overlay's real ownership contract during an upgrade.
+///
+/// A disk prepared in the guest keeps the image rootfs under
+/// `PREPARED_IMAGE_ROOTFS_DIR`, which guest init uses as the overlay lowerdir.
+/// Read the passwd file from that tree, so the driver passes the image's own
+/// account to the guest and does not fall back to the default identity.
 pub fn sandbox_guest_user_ids_from_image(image_path: &Path) -> Result<Option<(u32, u32)>, String> {
-    sandbox_guest_user_ids_from_image_path(image_path, "/etc/passwd")
+    let passwd_path = if image_path.is_file()
+        && ext4_image_has_directory(image_path, PREPARED_IMAGE_ROOTFS_DIR)?
+    {
+        format!("{PREPARED_IMAGE_ROOTFS_DIR}/etc/passwd")
+    } else {
+        "/etc/passwd".to_string()
+    };
+    sandbox_guest_user_ids_from_image_path(image_path, &passwd_path)
 }
 
 /// Read a sandbox account copied into an overlay upper layer.
@@ -1610,6 +1622,47 @@ mod tests {
         assert_eq!(
             sandbox_guest_user_ids(&rootfs).expect("read sandbox user"),
             Some((998, 997))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sandbox_guest_user_ids_from_image_reads_prepared_image_rootfs() {
+        if e2fs_command("debugfs").is_err() {
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let prepared_source = dir.join("prepared-source");
+        fs::create_dir_all(prepared_source.join("image-rootfs/etc")).expect("create image etc");
+        fs::create_dir_all(prepared_source.join("upper")).expect("create upperdir");
+        fs::write(
+            prepared_source.join("image-rootfs/etc/passwd"),
+            "ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\nsandbox:x:998:998::/sandbox:/bin/bash\n",
+        )
+        .expect("write image passwd");
+        let prepared = dir.join("prepared.ext4");
+        create_ext4_image_from_dir_with_size(&prepared_source, &prepared, 64 * 1024 * 1024)
+            .expect("create prepared image");
+        assert_eq!(
+            sandbox_guest_user_ids_from_image(&prepared).expect("read prepared image account"),
+            Some((998, 998))
+        );
+
+        let root_source = dir.join("root-source");
+        fs::create_dir_all(root_source.join("etc")).expect("create root etc");
+        fs::write(
+            root_source.join("etc/passwd"),
+            "sandbox:x:1500:1501:Sandbox:/sandbox:/bin/sh\n",
+        )
+        .expect("write root passwd");
+        let root = dir.join("root.ext4");
+        create_ext4_image_from_dir_with_size(&root_source, &root, 64 * 1024 * 1024)
+            .expect("create root image");
+        assert_eq!(
+            sandbox_guest_user_ids_from_image(&root).expect("read root image account"),
+            Some((1500, 1501))
         );
 
         let _ = fs::remove_dir_all(&dir);
