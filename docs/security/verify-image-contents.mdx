@@ -35,6 +35,12 @@ The same commands work for `ghcr.io/nvidia/openshell/supervisor`.
 
 Every SBOM lists the base-image packages. Release Dev, Release, and Pre-release images also list the Rust crates compiled into their OpenShell binary.
 
+CA trust-store fixes can change a certificate bundle without changing the
+package version reported in the SBOM. Verify the certificate bundle from the
+deployed image as well. Updating a binary does not replace the system trust
+store in gateway, supervisor, or workload images; rebuild and redeploy those
+images to apply trust-store fixes.
+
 <Note>
 OpenShell also publishes minimal SLSA provenance. It records how BuildKit produced the image, including its source revision, build platform, and base-image materials, without the extra build parameters included by full provenance.
 </Note>

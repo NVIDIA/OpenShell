@@ -9,7 +9,7 @@
 # tooling, but keeps the initial agent surface focused on Codex + GitHub tooling
 # for the gator-gate workflow.
 
-FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS system
+FROM nvcr.io/nvidia/base/ubuntu:noble-20260917 AS system
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -50,7 +50,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
         git \
         jq \
         less \
-        nodejs=22.22.1-1nodesource1 \
+        nodejs=22.23.4-1nodesource1 \
         ripgrep \
         vim-tiny \
         nano \

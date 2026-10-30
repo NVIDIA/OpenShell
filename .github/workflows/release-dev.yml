@@ -45,6 +45,11 @@ jobs:
       - name: Fetch tags
         run: git fetch --tags --force
 
+      - name: Install pinned uv
+        env:
+          MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: mise install --locked uv
+
       - name: Compute all versions
         id: v
         run: |
@@ -219,6 +224,9 @@ jobs:
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install pinned uv
+        run: mise install --locked uv
 
       - name: Sync Python dependencies
         run: uv sync

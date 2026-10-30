@@ -14,6 +14,7 @@
   inputs = {
     flake-utils.url = "github:numtide/flake-utils";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs-uv.url = "github:NixOS/nixpkgs/7bfe60fe75d8c7171b95e6ec2d610d4778cc549b";
     # Keep the QEMU and OVMF runtime used by Apple Silicon test guests on a
     # known-good release. Development shells and cross toolchains use nixpkgs.
     nixpkgs-test-guest.url = "github:NixOS/nixpkgs/0954f7ee2f6bb3dc7d4e3d0d8bcb8fd4bde4cfc5";
@@ -32,6 +33,7 @@
     {
       flake-utils,
       nixpkgs,
+      nixpkgs-uv,
       nixpkgs-test-guest,
       treefmt-nix,
       rust-overlay,
@@ -70,7 +72,7 @@
           kubernetes-helm
           syft
           trivy
-          uv
+          nixpkgs-uv.legacyPackages.${system}.uv
           yq-go
           zizmor
           zstd

@@ -316,7 +316,7 @@ stream completion.
 
 ## Prerequisites
 
-- Go 1.25.13 or later
+- Go 1.26.10 or later. On Go 1.27, use at least 1.27.3.
 - [mise](https://mise.jdx.dev) (recommended for reproducible builds)
 
 ## Build and Test

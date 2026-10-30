@@ -46,7 +46,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(inputs.suite-matrix) }}
     container:
-      image: ghcr.io/nvidia/openshell/ci:37072ee81cd7b294c714bfa5ecc829b6927b3d70@sha256:ffa96b8009de6e28bbf157060440c3abb312d3bcda444e9571c539c8c6115615
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -99,6 +99,9 @@ jobs:
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Install pinned uv
+        run: mise install --locked uv
 
       - name: Install Python dependencies and generate protobuf stubs
         if: matrix.python_proto
