@@ -925,6 +925,14 @@ Multi-replica gateways relay session-bound traffic to the replica that owns a sa
 
 The gateway refuses to start when a peer endpoint is configured on a multi-replica backend and peer authentication is unavailable, because the replica could not serve relays from its peers. That happens when the pod identity variables are missing, when the in-cluster Kubernetes client cannot be built, or when the gateway is not running in a cluster. A plaintext `http://` peer endpoint is also rejected when the gateway serves TLS; use it only when the gateway itself serves plaintext.
 
+## Shared Supervisor Pool
+
+`[openshell.gateway.supervisor_pool]` tunes the shared supervisor pool used by the Kubernetes driver with `supervisor_topology = "gateway"`. Omit the table to use the defaults.
+
+| Field | Default | Description |
+|---|---|---|
+| `recovery_timeout_secs` | `60` | Seconds a sandbox stays paused after losing its supervisor, waiting for a pool member to take it over, before it stops. Accepts 30 to 300. |
+
 ## Driver References
 
 ### External Resource Admission

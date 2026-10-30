@@ -44,6 +44,8 @@ navigation:
       path: how-it-works/sandboxes/templates.mdx
     - page: "Runtimes"
       path: how-it-works/sandboxes/runtimes.mdx
+    - page: "Failure and Recovery"
+      path: how-it-works/sandboxes/failure-and-recovery.mdx
   - section: "Providers"
     slug: providers
     contents:
