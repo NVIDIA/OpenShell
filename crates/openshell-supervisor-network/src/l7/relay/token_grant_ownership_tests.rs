@@ -1567,18 +1567,16 @@ impl openshell_core::middleware::InProcessMiddleware for ForwardedHeadStage {
         Err(miette!("HTTP hook test stage"))
     }
 
-    async fn open_http_request_session(
+    async fn open_http_request_hook(
         &self,
-        mut events: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpRequestSessionEvent>,
-    ) -> std::result::Result<
-        openshell_core::middleware::HttpRequestSessionResultStream,
-        tonic::Status,
-    > {
+        mut events: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpRequestHookEvent>,
+    ) -> std::result::Result<openshell_core::middleware::HttpRequestHookResultStream, tonic::Status>
+    {
         use openshell_core::proto::{
             ExistingHeaderAction, HeaderMutation, HttpDuplexMode, HttpFinish, HttpInspect,
-            HttpOutputChunk, HttpOutputStart, HttpPreflightResult, HttpRequestSessionResult,
+            HttpOutputChunk, HttpOutputStart, HttpPreflightResult, HttpRequestHookResult,
             WriteHeader, header_mutation, http_inspect, http_preflight_result,
-            http_request_session_event, http_request_session_result,
+            http_request_hook_event, http_request_hook_result,
         };
         let write = |name: &str, value: &str| HeaderMutation {
             operation: Some(header_mutation::Operation::Write(WriteHeader {
@@ -1596,9 +1594,9 @@ impl openshell_core::middleware::InProcessMiddleware for ForwardedHeadStage {
             let mut declared = None;
             while let Some(event) = events.recv().await {
                 let result = match event.event {
-                    Some(http_request_session_event::Event::Preflight(preflight)) => {
+                    Some(http_request_hook_event::Event::Preflight(preflight)) => {
                         declared = preflight.declared_body_bytes;
-                        http_request_session_result::Result::PreflightResult(HttpPreflightResult {
+                        http_request_hook_result::Result::PreflightResult(HttpPreflightResult {
                             decision: Some(http_preflight_result::Decision::Inspect(HttpInspect {
                                 mode: Some(http_inspect::Mode::Duplex(HttpDuplexMode {})),
                             })),
@@ -1606,24 +1604,24 @@ impl openshell_core::middleware::InProcessMiddleware for ForwardedHeadStage {
                             ..Default::default()
                         })
                     }
-                    Some(http_request_session_event::Event::Begin(_)) => {
-                        http_request_session_result::Result::OutputStart(HttpOutputStart {
+                    Some(http_request_hook_event::Event::Begin(_)) => {
+                        http_request_hook_result::Result::OutputStart(HttpOutputStart {
                             header_mutations: vec![late_mutation.clone()],
                             output_body_bytes: declared,
                         })
                     }
-                    Some(http_request_session_event::Event::InputChunk(chunk)) => {
-                        http_request_session_result::Result::OutputChunk(HttpOutputChunk {
+                    Some(http_request_hook_event::Event::InputChunk(chunk)) => {
+                        http_request_hook_result::Result::OutputChunk(HttpOutputChunk {
                             data: chunk.data,
                         })
                     }
-                    Some(http_request_session_event::Event::InputEnd(_)) => {
-                        http_request_session_result::Result::Finish(HttpFinish::default())
+                    Some(http_request_hook_event::Event::InputEnd(_)) => {
+                        http_request_hook_result::Result::Finish(HttpFinish::default())
                     }
                     _ => break,
                 };
                 if sender
-                    .send(Ok(HttpRequestSessionResult {
+                    .send(Ok(HttpRequestHookResult {
                         result: Some(result),
                     }))
                     .await
@@ -1638,36 +1636,34 @@ impl openshell_core::middleware::InProcessMiddleware for ForwardedHeadStage {
         )))
     }
 
-    async fn open_http_response_session(
+    async fn open_http_response_hook(
         &self,
-        mut events: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpResponseSessionEvent>,
-    ) -> std::result::Result<
-        openshell_core::middleware::HttpResponseSessionResultStream,
-        tonic::Status,
-    > {
+        mut events: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpResponseHookEvent>,
+    ) -> std::result::Result<openshell_core::middleware::HttpResponseHookResultStream, tonic::Status>
+    {
         use openshell_core::proto::{
-            HttpContinue, HttpPreflightResult, HttpResponseSessionResult, http_preflight_result,
-            http_response_session_event, http_response_session_result,
+            HttpContinue, HttpPreflightResult, HttpResponseHookResult, http_preflight_result,
+            http_response_hook_event, http_response_hook_result,
         };
         let captured = Arc::clone(&self.response_request_headers);
         let (sender, receiver) = tokio::sync::mpsc::channel(4);
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                let Some(http_response_session_event::Event::Preflight(preflight)) = event.event
+                let Some(http_response_hook_event::Event::Preflight(preflight)) = event.event
                 else {
                     break;
                 };
                 *captured.lock().expect("response capture lock") =
                     preflight.response.map(|response| response.request_headers);
                 let result =
-                    http_response_session_result::Result::PreflightResult(HttpPreflightResult {
+                    http_response_hook_result::Result::PreflightResult(HttpPreflightResult {
                         decision: Some(http_preflight_result::Decision::ContinueWithoutBody(
                             HttpContinue {},
                         )),
                         ..Default::default()
                     });
                 if sender
-                    .send(Ok(HttpResponseSessionResult {
+                    .send(Ok(HttpResponseHookResult {
                         result: Some(result),
                     }))
                     .await

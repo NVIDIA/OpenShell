@@ -3,15 +3,15 @@
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::middleware::{
-    HttpRequestSessionResultStream, HttpRequestView, HttpResponseResultStream,
-    HttpResponseSessionResultStream, SupervisorMiddlewareEndpoint, WebSocketResponseStream,
+    HttpRequestHookResultStream, HttpRequestView, HttpResponseHookResultStream,
+    HttpResponseResultStream, SupervisorMiddlewareEndpoint, WebSocketResponseStream,
 };
+use openshell_core::proto::middleware::v1::http_hooks_client::HttpHooksClient;
 use openshell_core::proto::middleware::v1::http_response_pre_return_client::HttpResponsePreReturnClient;
-use openshell_core::proto::middleware::v1::http_session_middleware_client::HttpSessionMiddlewareClient;
 use openshell_core::proto::middleware::v1::supervisor_middleware_client::SupervisorMiddlewareClient;
 use openshell_core::proto::{
-    HttpRequestEvaluation, HttpRequestResult, HttpRequestSessionEvent, HttpResponseEvent,
-    HttpResponseSessionEvent, MiddlewareDescribeRequest, MiddlewareManifest, ValidateConfigRequest,
+    HttpRequestEvaluation, HttpRequestHookEvent, HttpRequestResult, HttpResponseEvent,
+    HttpResponseHookEvent, MiddlewareDescribeRequest, MiddlewareManifest, ValidateConfigRequest,
     ValidateConfigResponse, WebSocketSessionEvent,
 };
 use openshell_extension_core::{
@@ -122,20 +122,20 @@ impl GrpcMiddlewareService {
 
     /// Open a remote HTTP hook request exchange through the gRPC
     /// adapter.
-    pub async fn open_http_request_session(
+    pub async fn open_http_request_hook(
         &self,
-        receiver: tokio::sync::mpsc::Receiver<HttpRequestSessionEvent>,
-    ) -> std::result::Result<HttpRequestSessionResultStream, Status> {
-        self.service.open_http_request_session(receiver).await
+        receiver: tokio::sync::mpsc::Receiver<HttpRequestHookEvent>,
+    ) -> std::result::Result<HttpRequestHookResultStream, Status> {
+        self.service.open_http_request_hook(receiver).await
     }
 
     /// Open a remote HTTP hook response exchange through the gRPC
     /// adapter.
-    pub async fn open_http_response_session(
+    pub async fn open_http_response_hook(
         &self,
-        receiver: tokio::sync::mpsc::Receiver<HttpResponseSessionEvent>,
-    ) -> std::result::Result<HttpResponseSessionResultStream, Status> {
-        self.service.open_http_response_session(receiver).await
+        receiver: tokio::sync::mpsc::Receiver<HttpResponseHookEvent>,
+    ) -> std::result::Result<HttpResponseHookResultStream, Status> {
+        self.service.open_http_response_hook(receiver).await
     }
 }
 
@@ -143,7 +143,7 @@ impl GrpcMiddlewareService {
 pub struct RemoteMiddlewareService {
     client: SupervisorMiddlewareClient<ExtensionChannel>,
     response_client: HttpResponsePreReturnClient<ExtensionChannel>,
-    http_session_client: HttpSessionMiddlewareClient<ExtensionChannel>,
+    http_hooks_client: HttpHooksClient<ExtensionChannel>,
 }
 
 impl RemoteMiddlewareService {
@@ -177,7 +177,7 @@ impl RemoteMiddlewareService {
             response_client: HttpResponsePreReturnClient::new(channel.clone())
                 .max_decoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
-            http_session_client: HttpSessionMiddlewareClient::new(channel)
+            http_hooks_client: HttpHooksClient::new(channel)
                 .max_decoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
         })
@@ -242,11 +242,11 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
         Ok(Box::pin(responses))
     }
 
-    async fn open_http_request_session(
+    async fn open_http_request_hook(
         &self,
-        receiver: tokio::sync::mpsc::Receiver<HttpRequestSessionEvent>,
-    ) -> std::result::Result<HttpRequestSessionResultStream, Status> {
-        let mut client = self.http_session_client.clone();
+        receiver: tokio::sync::mpsc::Receiver<HttpRequestHookEvent>,
+    ) -> std::result::Result<HttpRequestHookResultStream, Status> {
+        let mut client = self.http_hooks_client.clone();
         let responses = client
             .evaluate_request(Request::new(tokio_stream::wrappers::ReceiverStream::new(
                 receiver,
@@ -256,11 +256,11 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
         Ok(Box::pin(responses))
     }
 
-    async fn open_http_response_session(
+    async fn open_http_response_hook(
         &self,
-        receiver: tokio::sync::mpsc::Receiver<HttpResponseSessionEvent>,
-    ) -> std::result::Result<HttpResponseSessionResultStream, Status> {
-        let mut client = self.http_session_client.clone();
+        receiver: tokio::sync::mpsc::Receiver<HttpResponseHookEvent>,
+    ) -> std::result::Result<HttpResponseHookResultStream, Status> {
+        let mut client = self.http_hooks_client.clone();
         let responses = client
             .evaluate_response(Request::new(tokio_stream::wrappers::ReceiverStream::new(
                 receiver,
@@ -274,14 +274,12 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
 #[cfg(test)]
 mod tests {
     use futures::StreamExt;
-    use openshell_core::proto::middleware::v1::http_session_middleware_server::{
-        HttpSessionMiddleware, HttpSessionMiddlewareServer,
-    };
+    use openshell_core::proto::middleware::v1::http_hooks_server::{HttpHooks, HttpHooksServer};
     use openshell_core::proto::{
-        HttpContinue, HttpPreflightResult, HttpRequestSessionPreflight, HttpRequestSessionResult,
-        HttpResponseSessionPreflight, HttpResponseSessionResult, SupervisorMiddlewarePhase,
-        http_preflight_result, http_request_session_event, http_request_session_result,
-        http_response_session_event, http_response_session_result,
+        HttpContinue, HttpPreflightResult, HttpRequestHookPreflight, HttpRequestHookResult,
+        HttpResponseHookPreflight, HttpResponseHookResult, SupervisorMiddlewarePhase,
+        http_preflight_result, http_request_hook_event, http_request_hook_result,
+        http_response_hook_event, http_response_hook_result,
     };
     use tokio::net::TcpListener;
     use tokio::sync::{mpsc, oneshot};
@@ -290,7 +288,7 @@ mod tests {
 
     use super::*;
 
-    struct SessionService;
+    struct HttpHooksService;
 
     fn continue_without_body() -> HttpPreflightResult {
         HttpPreflightResult {
@@ -302,20 +300,20 @@ mod tests {
     }
 
     #[tonic::async_trait]
-    impl HttpSessionMiddleware for SessionService {
-        type EvaluateRequestStream = HttpRequestSessionResultStream;
-        type EvaluateResponseStream = HttpResponseSessionResultStream;
+    impl HttpHooks for HttpHooksService {
+        type EvaluateRequestStream = HttpRequestHookResultStream;
+        type EvaluateResponseStream = HttpResponseHookResultStream;
 
         async fn evaluate_request(
             &self,
-            request: Request<tonic::Streaming<HttpRequestSessionEvent>>,
+            request: Request<tonic::Streaming<HttpRequestHookEvent>>,
         ) -> std::result::Result<Response<Self::EvaluateRequestStream>, Status> {
             let event = request
                 .into_inner()
                 .message()
                 .await?
                 .expect("request event");
-            let Some(http_request_session_event::Event::Preflight(preflight)) = event.event else {
+            let Some(http_request_hook_event::Event::Preflight(preflight)) = event.event else {
                 panic!("expected request preflight");
             };
             assert_eq!(
@@ -323,8 +321,8 @@ mod tests {
                 SupervisorMiddlewarePhase::PreCredentials as i32
             );
             Ok(Response::new(Box::pin(futures::stream::iter([Ok(
-                HttpRequestSessionResult {
-                    result: Some(http_request_session_result::Result::PreflightResult(
+                HttpRequestHookResult {
+                    result: Some(http_request_hook_result::Result::PreflightResult(
                         continue_without_body(),
                     )),
                 },
@@ -333,20 +331,20 @@ mod tests {
 
         async fn evaluate_response(
             &self,
-            request: Request<tonic::Streaming<HttpResponseSessionEvent>>,
+            request: Request<tonic::Streaming<HttpResponseHookEvent>>,
         ) -> std::result::Result<Response<Self::EvaluateResponseStream>, Status> {
             let event = request
                 .into_inner()
                 .message()
                 .await?
                 .expect("response event");
-            let Some(http_response_session_event::Event::Preflight(preflight)) = event.event else {
+            let Some(http_response_hook_event::Event::Preflight(preflight)) = event.event else {
                 panic!("expected response preflight");
             };
             assert_eq!(preflight.phase, SupervisorMiddlewarePhase::PreReturn as i32);
             Ok(Response::new(Box::pin(futures::stream::iter([Ok(
-                HttpResponseSessionResult {
-                    result: Some(http_response_session_result::Result::PreflightResult(
+                HttpResponseHookResult {
+                    result: Some(http_response_hook_result::Result::PreflightResult(
                         continue_without_body(),
                     )),
                 },
@@ -355,15 +353,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_session_rpcs_share_channel_and_rotating_bearer() {
+    async fn http_hooks_rpcs_share_channel_and_rotating_bearer() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
         let (authorization_tx, mut authorization_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             Server::builder()
-                .add_service(HttpSessionMiddlewareServer::with_interceptor(
-                    SessionService,
+                .add_service(HttpHooksServer::with_interceptor(
+                    HttpHooksService,
                     move |request: Request<()>| {
                         authorization_tx
                             .send(
@@ -387,7 +385,7 @@ mod tests {
         });
         let bearer = BearerTokenSlot::new("request-token", i64::MAX).expect("bearer");
         let client = RemoteMiddlewareService::connect(
-            "test/http-session",
+            "test/http-hooks",
             &format!("http://{address}"),
             &[],
             Some(bearer.clone()),
@@ -397,9 +395,9 @@ mod tests {
 
         let (request_tx, request_rx) = mpsc::channel(1);
         request_tx
-            .send(HttpRequestSessionEvent {
-                event: Some(http_request_session_event::Event::Preflight(
-                    HttpRequestSessionPreflight {
+            .send(HttpRequestHookEvent {
+                event: Some(http_request_hook_event::Event::Preflight(
+                    HttpRequestHookPreflight {
                         phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                         ..Default::default()
                     },
@@ -409,7 +407,7 @@ mod tests {
             .expect("send request");
         drop(request_tx);
         let mut requests = client
-            .open_http_request_session(request_rx)
+            .open_http_request_hook(request_rx)
             .await
             .expect("request RPC");
         assert_eq!(
@@ -419,7 +417,7 @@ mod tests {
                 .expect("request result")
                 .expect("request status")
                 .result,
-            Some(http_request_session_result::Result::PreflightResult(
+            Some(http_request_hook_result::Result::PreflightResult(
                 continue_without_body()
             ))
         );
@@ -433,9 +431,9 @@ mod tests {
             .expect("rotate bearer");
         let (response_tx, response_rx) = mpsc::channel(1);
         response_tx
-            .send(HttpResponseSessionEvent {
-                event: Some(http_response_session_event::Event::Preflight(
-                    HttpResponseSessionPreflight {
+            .send(HttpResponseHookEvent {
+                event: Some(http_response_hook_event::Event::Preflight(
+                    HttpResponseHookPreflight {
                         phase: SupervisorMiddlewarePhase::PreReturn as i32,
                         ..Default::default()
                     },
@@ -445,7 +443,7 @@ mod tests {
             .expect("send response");
         drop(response_tx);
         let mut responses = client
-            .open_http_response_session(response_rx)
+            .open_http_response_hook(response_rx)
             .await
             .expect("response RPC");
         assert_eq!(
@@ -455,7 +453,7 @@ mod tests {
                 .expect("response result")
                 .expect("response status")
                 .result,
-            Some(http_response_session_result::Result::PreflightResult(
+            Some(http_response_hook_result::Result::PreflightResult(
                 continue_without_body()
             ))
         );

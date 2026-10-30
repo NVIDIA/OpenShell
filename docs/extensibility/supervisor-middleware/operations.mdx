@@ -14,8 +14,8 @@ A middleware service handles one or more operations, such as HTTP requests or We
 
 | Operation | Phase | When OpenShell calls your service | RPC |
 | --- | --- | --- | --- |
-| `HTTP_REQUEST` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `HttpSessionMiddleware.EvaluateRequest`, or legacy `EvaluateHttpRequest` |
-| `HTTP_RESPONSE` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `HttpSessionMiddleware.EvaluateResponse`, or legacy `HttpResponsePreReturn.Evaluate` |
+| `HTTP_REQUEST` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `HttpHooks.EvaluateRequest`, or legacy `EvaluateHttpRequest` |
+| `HTTP_RESPONSE` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `HttpHooks.EvaluateResponse`, or legacy `HttpResponsePreReturn.Evaluate` |
 | `WEBSOCKET_MESSAGE` | `PRE_CREDENTIALS` | When the sandbox opens a WebSocket connection, and for each text message it sends. | `EvaluateWebSocketSession` |
 
 Your service declares each operation it supports as a binding, an operation and its phase, in its `Describe` manifest. OpenShell calls your service only for the operations it declares.
@@ -42,11 +42,11 @@ OpenShell never forwards free-form text from your service to the sandbox or to l
 
 ## HTTP
 
-HTTP middleware inspects requests before OpenShell injects provider credentials and responses before the sandbox receives them. Implement `HttpSessionMiddleware.EvaluateRequest` for `HTTP_REQUEST`, `HttpSessionMiddleware.EvaluateResponse` for `HTTP_RESPONSE`, or both.
+HTTP middleware inspects requests before OpenShell injects provider credentials and responses before the sandbox receives them. Implement `HttpHooks.EvaluateRequest` for `HTTP_REQUEST`, `HttpHooks.EvaluateResponse` for `HTTP_RESPONSE`, or both.
 
-Serve `HttpSessionMiddleware` on the same endpoint as `SupervisorMiddleware`, which handles discovery and configuration. Each RPC invocation serves one binding phase, identified by `phase` in its preflight. Requests currently use `PRE_CREDENTIALS`; responses use `PRE_RETURN`.
+Serve `HttpHooks` on the same endpoint as `SupervisorMiddleware`, which handles discovery and configuration. Each RPC invocation serves one binding phase, identified by `phase` in its preflight. Requests currently use `PRE_CREDENTIALS`; responses use `PRE_RETURN`.
 
-In `Describe`, add `openshell.supervisor-middleware.http-hooks` to both `extension.supported_capabilities` and `extension.required_capabilities`. This selects the session RPCs for all HTTP bindings in your service. Older gateways and supervisors refuse the service because they do not support this capability.
+In `Describe`, add `openshell.supervisor-middleware.http-hooks` to both `extension.supported_capabilities` and `extension.required_capabilities`. This selects the `HttpHooks` RPCs for all HTTP bindings in your service. Older gateways and supervisors refuse the service because they do not support this capability.
 
 ### Requests
 
@@ -151,11 +151,11 @@ No free-form service error text reaches the sandbox. If evaluation capacity rema
 
 <Accordion title="Legacy HTTP Hooks">
 
-Services without the session capability use `EvaluateHttpRequest` and `HttpResponsePreReturn.Evaluate`. These RPCs are deprecated for removal in 0.2.0. Legacy requests use a single buffered evaluation. Legacy responses select `HEADERS_ONLY`, `WHOLE_BODY_BYTES`, or `STREAM_BYTES` and use `block_delivery` to stop delivery.
+Services without the `http-hooks` capability use `EvaluateHttpRequest` and `HttpResponsePreReturn.Evaluate`. These RPCs are deprecated for removal in 0.2.0. Legacy requests use a single buffered evaluation. Legacy responses select `HEADERS_ONLY`, `WHOLE_BODY_BYTES`, or `STREAM_BYTES` and use `block_delivery` to stop delivery.
 
-To migrate, require the session capability, implement the session RPCs, and use `fail_closed`. Replace request evaluation and `WHOLE_BODY_BYTES` with WHOLE_BODY, `STREAM_BYTES` with DUPLEX, and `HEADERS_ONLY` with `continue_without_body`. Keep `block_delivery` for responses. The gateway and each sandbox supervisor read a service's `Describe` manifest when they connect to it, so after changing the service, restart the gateway, re-apply affected policies, and recreate sandboxes that use the service. Separate selectors from services still using legacy hooks, including `openshell/regex`.
+To migrate, require the `http-hooks` capability, implement the `HttpHooks` RPCs, and use `fail_closed`. Replace request evaluation and `WHOLE_BODY_BYTES` with WHOLE_BODY, `STREAM_BYTES` with DUPLEX, and `HEADERS_ONLY` with `continue_without_body`. Keep `block_delivery` for responses. The gateway and each sandbox supervisor read a service's `Describe` manifest when they connect to it, so after changing the service, restart the gateway, re-apply affected policies, and recreate sandboxes that use the service. Separate selectors from services still using legacy hooks, including `openshell/regex`.
 
-Upgrade the gateway before deploying the service. Recreate sandboxes whose supervisors do not support session hooks. To support both contracts during migration, use separate service registrations.
+Upgrade the gateway before deploying the service. Recreate sandboxes whose supervisors do not support HTTP hooks. To support both contracts during migration, use separate service registrations.
 
 </Accordion>
 

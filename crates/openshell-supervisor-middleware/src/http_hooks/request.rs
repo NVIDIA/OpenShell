@@ -4,7 +4,7 @@
 //! HTTP hook request middleware at `PRE_CREDENTIALS`.
 //!
 //! Initial preflight stops at the first inspecting stage. The returned
-//! [`HttpRequestSession`] opens later stages as their input headers become
+//! [`HttpRequestPipeline`] opens later stages as their input headers become
 //! available. A chain whose stages all continue forwards the body untouched.
 
 use std::sync::Arc;
@@ -67,7 +67,7 @@ pub struct HttpRequestPreflightOutcome {
     /// Preflight mutations in chain order, to replay on the raw request head.
     pub header_mutations: Vec<HeaderMutation>,
     /// Present when a stage selected a body mode.
-    pub session: Option<HttpRequestSession>,
+    pub pipeline: Option<HttpRequestPipeline>,
     pub diagnostics: HttpStageDiagnostics,
     /// No HTTP hook slot freed up within the chain deadline. Platform
     /// load shedding, not a stage failure.
@@ -76,13 +76,13 @@ pub struct HttpRequestPreflightOutcome {
 
 /// Request stages, including deferred preflights.
 ///
-/// The session holds its HTTP hook budget slots while its body
+/// The pipeline holds its HTTP hook budget slots while its body
 /// stages run.
-pub struct HttpRequestSession {
+pub struct HttpRequestPipeline {
     pipeline: Pipeline,
 }
 
-impl HttpRequestSession {
+impl HttpRequestPipeline {
     /// Largest body chunk to feed as input.
     #[must_use]
     pub fn input_unit_limit(&self) -> usize {
@@ -183,7 +183,7 @@ impl StageHead for RequestHead {
 
 fn request_spec(input: &HttpRequestPreflightInput) -> PipelineSpec {
     PipelineSpec {
-        head_authority: HeaderAuthority::SessionRequest,
+        head_authority: HeaderAuthority::HookRequest,
         trailer_authority: HeaderAuthority::RequestTrailers,
         connection_nominated: input.connection_nominated_headers.clone(),
         credential_reference_headers: input.credential_reference_headers.clone(),
@@ -218,7 +218,7 @@ impl ChainRunner {
         }
         let chain_deadline = Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
         let slot = if described.iter().any(DescribedChainEntry::is_resolved) {
-            let Some(slot) = self.reserve_http_session(chain_deadline).await else {
+            let Some(slot) = self.reserve_http_hook(chain_deadline).await else {
                 return Ok(capacity_exhausted(input.headers));
             };
             Some(slot)
@@ -236,13 +236,13 @@ impl ChainRunner {
             chain_deadline,
         )
         .await;
-        let session = match preflight.pipeline {
+        let pipeline = match preflight.pipeline {
             Some(pipeline) => {
                 let slot = slot.expect("a selected stage implies a resolved entry");
                 let Some(pipeline) = self.admit_body(pipeline, slot, chain_deadline).await else {
                     return Ok(capacity_exhausted(input.headers));
                 };
-                Some(HttpRequestSession { pipeline })
+                Some(HttpRequestPipeline { pipeline })
             }
             // No stage inspects the body, so the slot is released here.
             None => None,
@@ -254,7 +254,7 @@ impl ChainRunner {
             failure: preflight.failure,
             headers: preflight.headers,
             header_mutations: preflight.header_mutations,
-            session,
+            pipeline,
             diagnostics: preflight.diagnostics,
             session_capacity_exhausted: false,
         })
@@ -282,7 +282,7 @@ fn outcome(
         failure: None,
         headers,
         header_mutations: Vec::new(),
-        session: None,
+        pipeline: None,
         diagnostics,
         session_capacity_exhausted: false,
     }

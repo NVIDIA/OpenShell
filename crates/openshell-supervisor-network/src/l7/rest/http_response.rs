@@ -3,7 +3,7 @@
 
 //! HTTP response relay and pre-return middleware integration.
 
-mod http_session;
+mod http_hooks;
 
 use super::*;
 
@@ -30,7 +30,7 @@ pub struct HttpResponseMiddlewareRelay<'a> {
 }
 
 impl HttpResponseMiddlewareRelay<'_> {
-    /// Whether a session hook stage of this response chain may inspect bodies.
+    /// Whether an HTTP hook stage of this response chain may inspect bodies.
     ///
     /// A chain that cannot be described fails when the response arrives, so
     /// the request is left unchanged.
@@ -377,8 +377,8 @@ where
     };
     match openshell_supervisor_middleware::chain_http_hook_version(&described) {
         openshell_supervisor_middleware::ChainHttpHookVersion::Legacy => {}
-        openshell_supervisor_middleware::ChainHttpHookVersion::Session => {
-            return Box::pin(http_session::relay_response_through_pipeline(
+        openshell_supervisor_middleware::ChainHttpHookVersion::Current => {
+            return Box::pin(http_hooks::relay_response_through_pipeline(
                 request_method,
                 upstream,
                 client,

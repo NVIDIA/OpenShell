@@ -14,7 +14,7 @@ use openshell_ocsf::{
 };
 use openshell_supervisor_middleware::{
     ChainHttpHookVersion, HttpBodyInput, HttpBodyOutput, HttpFailureCode, HttpMiddlewareFailure,
-    HttpPipelineFinish, HttpRequestPreflightInput, HttpRequestSession, HttpStageDiagnostics,
+    HttpPipelineFinish, HttpRequestPipeline, HttpRequestPreflightInput, HttpStageDiagnostics,
     MiddlewareFailureDetail,
 };
 use std::path::PathBuf;
@@ -172,10 +172,10 @@ impl ForwardedRequestHead {
     }
 
     /// Headers shown to response middleware, with the omissions of the HTTP
-    /// session hook request preflight.
+    /// hook request preflight.
     pub(crate) fn visible_headers(&self) -> Result<Vec<openshell_core::proto::HttpHeader>> {
         let head = self.0.committed.get().unwrap_or(&self.0.head);
-        Ok(safe_middleware_headers(head)?.session_visible())
+        Ok(safe_middleware_headers(head)?.hook_visible())
     }
 }
 
@@ -854,7 +854,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery<
                 }),
             })
         }
-        ChainHttpHookVersion::Session => {
+        ChainHttpHookVersion::Current => {
             // A body-aware policy re-checks every replaced body, so the
             // upstream must not see any of it before the last stage's output
             // is checked.
@@ -1052,7 +1052,7 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
             failure: preflight.failure,
         });
     }
-    let Some(session) = preflight.session.take() else {
+    let Some(session) = preflight.pipeline.take() else {
         let rebuilt =
             crate::l7::rest::rebuild_request_headers_only(&req, &preflight.header_mutations)?;
         events.emit(true, "", None, HttpStageDiagnostics::default());
@@ -1174,7 +1174,7 @@ fn request_preflight_input(
             crate::l7::provider::BodyLength::None => Some(0),
             crate::l7::provider::BodyLength::Chunked => None,
         },
-        headers: headers.session_visible(),
+        headers: headers.hook_visible(),
         connection_nominated_headers: headers.connection_nominated,
         credential_reference_headers: headers.credential_references,
         max_output_body_bytes: withheld_limit.map(|limit| limit as u64),
@@ -1206,7 +1206,7 @@ enum BodyRunError {
 /// Feed a request body to `session` while it runs. Dropping the future
 /// cancels every stage.
 async fn run_request_body<C: AsyncRead + Unpin>(
-    session: HttpRequestSession,
+    session: HttpRequestPipeline,
     reader: &mut crate::l7::rest::RequestBodyReader,
     client: &mut C,
     generation_guard: &PolicyGenerationGuard,
@@ -1405,7 +1405,7 @@ impl RequestEvents {
 /// A request body that request middleware streams to the upstream.
 pub struct RequestBodyStream {
     reader: crate::l7::rest::RequestBodyReader,
-    session: Option<HttpRequestSession>,
+    session: Option<HttpRequestPipeline>,
     events: RequestEvents,
     generation_guard: PolicyGenerationGuard,
     injected_headers: crate::l7::token_grant_injection::InjectedHeaders,
@@ -1596,7 +1596,7 @@ pub(super) fn mixed_protocol_events(
 ) -> Vec<openshell_ocsf::OcsfEvent> {
     let mut diagnostics = HttpStageDiagnostics::default();
     if let Some(entry) = chain.iter().find(|entry| {
-        entry.http_hook_version() == Some(openshell_supervisor_middleware::HttpHookVersion::Session)
+        entry.http_hook_version() == Some(openshell_supervisor_middleware::HttpHookVersion::Current)
     }) {
         diagnostics
             .invocations
@@ -1851,7 +1851,7 @@ impl SafeMiddlewareHeaders {
     /// `credential_references` too, as `Authorization` is always omitted, so
     /// whether a stage sees a credential placeholder does not depend on the
     /// header that carries it. Legacy HTTP hooks keep `visible`.
-    fn session_visible(&self) -> Vec<openshell_core::proto::HttpHeader> {
+    fn hook_visible(&self) -> Vec<openshell_core::proto::HttpHeader> {
         self.visible
             .iter()
             .filter(|(name, _)| !self.credential_references.contains(name))
@@ -2082,7 +2082,7 @@ mod tests {
     }
 
     #[test]
-    fn session_request_preflight_omits_headers_that_reference_credentials() {
+    fn hook_request_preflight_omits_headers_that_reference_credentials() {
         let head = "POST /v1/items HTTP/1.1\r\n\
                     Host: api.example.test\r\n\
                     Content-Type: application/json\r\n\

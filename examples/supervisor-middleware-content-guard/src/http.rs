@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP hooks (`HttpSessionMiddleware.EvaluateRequest` and
-//! `HttpSessionMiddleware.EvaluateResponse`) for requests and responses.
+//! HTTP hooks (`HttpHooks.EvaluateRequest` and
+//! `HttpHooks.EvaluateResponse`) for requests and responses.
 //!
 //! The guard selects its configured body mode, `WHOLE_BODY` by default, and falls
 //! back to the other mode when OpenShell offers only that one. A message
@@ -14,16 +14,16 @@
 
 use std::pin::Pin;
 
-use openshell_core::middleware::{HttpRequestSessionResultStream, HttpResponseSessionResultStream};
+use openshell_core::middleware::{HttpRequestHookResultStream, HttpResponseHookResultStream};
 use openshell_core::proto::{
     HeaderMutation, HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable,
     HttpBodyUnavailableReason, HttpContinue, HttpDenial, HttpDuplexMode, HttpFinish,
     HttpInputChunk, HttpInspect, HttpOutputChunk, HttpOutputStart, HttpPreflightResult,
-    HttpRequestPreflightHead, HttpRequestSessionEvent, HttpRequestSessionResult,
-    HttpResponseSessionEvent, HttpResponseSessionResult, HttpUnchanged, HttpWholeBody,
-    HttpWholeBodyMode, HttpWholeBodyResult, MiddlewareDiagnostics, RemoveHeader, header_mutation,
-    http_inspect, http_preflight_result, http_request_session_event, http_request_session_result,
-    http_response_session_event, http_response_session_result, http_whole_body_result,
+    HttpRequestHookEvent, HttpRequestHookResult, HttpRequestPreflightHead, HttpResponseHookEvent,
+    HttpResponseHookResult, HttpUnchanged, HttpWholeBody, HttpWholeBodyMode, HttpWholeBodyResult,
+    MiddlewareDiagnostics, RemoveHeader, header_mutation, http_inspect, http_preflight_result,
+    http_request_hook_event, http_request_hook_result, http_response_hook_event,
+    http_response_hook_result, http_whole_body_result,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -34,22 +34,22 @@ use crate::guard::{
     BodyMode, GuardConfig, GuardOutcome, MAX_PAYLOAD_BYTES, Mode, StreamScanner, inspect, outcome,
 };
 
-/// Run one `HttpSessionMiddleware.EvaluateRequest` exchange.
-pub(crate) fn request_stream<S>(events: S) -> HttpRequestSessionResultStream
+/// Run one `HttpHooks.EvaluateRequest` exchange.
+pub(crate) fn request_stream<S>(events: S) -> HttpRequestHookResultStream
 where
-    S: Stream<Item = Result<HttpRequestSessionEvent, Status>> + Send + Unpin + 'static,
+    S: Stream<Item = Result<HttpRequestHookEvent, Status>> + Send + Unpin + 'static,
 {
-    stage_stream(events, request_event, |reply| HttpRequestSessionResult {
+    stage_stream(events, request_event, |reply| HttpRequestHookResult {
         result: Some(reply.into()),
     })
 }
 
-/// Run one `HttpSessionMiddleware.EvaluateResponse` exchange.
-pub(crate) fn response_stream<S>(events: S) -> HttpResponseSessionResultStream
+/// Run one `HttpHooks.EvaluateResponse` exchange.
+pub(crate) fn response_stream<S>(events: S) -> HttpResponseHookResultStream
 where
-    S: Stream<Item = Result<HttpResponseSessionEvent, Status>> + Send + Unpin + 'static,
+    S: Stream<Item = Result<HttpResponseHookEvent, Status>> + Send + Unpin + 'static,
 {
-    stage_stream(events, response_event, |reply| HttpResponseSessionResult {
+    stage_stream(events, response_event, |reply| HttpResponseHookResult {
         result: Some(reply.into()),
     })
 }
@@ -124,8 +124,8 @@ enum Subject {
     Response,
 }
 
-fn request_event(event: HttpRequestSessionEvent) -> Option<Event> {
-    use http_request_session_event::Event as Wire;
+fn request_event(event: HttpRequestHookEvent) -> Option<Event> {
+    use http_request_hook_event::Event as Wire;
     Some(match event.event? {
         Wire::Preflight(preflight) => Event::Preflight(Box::new(Preflight {
             subject: preflight.request.map_or(Subject::Missing, Subject::Request),
@@ -143,8 +143,8 @@ fn request_event(event: HttpRequestSessionEvent) -> Option<Event> {
     })
 }
 
-fn response_event(event: HttpResponseSessionEvent) -> Option<Event> {
-    use http_response_session_event::Event as Wire;
+fn response_event(event: HttpResponseHookEvent) -> Option<Event> {
+    use http_response_hook_event::Event as Wire;
     Some(match event.event? {
         Wire::Preflight(preflight) => Event::Preflight(Box::new(Preflight {
             subject: if preflight.response.is_some() {
@@ -177,7 +177,7 @@ enum Reply {
     Deny(HttpDenial),
 }
 
-impl From<Reply> for http_request_session_result::Result {
+impl From<Reply> for http_request_hook_result::Result {
     fn from(reply: Reply) -> Self {
         match reply {
             Reply::Preflight(result) => Self::PreflightResult(result),
@@ -190,7 +190,7 @@ impl From<Reply> for http_request_session_result::Result {
     }
 }
 
-impl From<Reply> for http_response_session_result::Result {
+impl From<Reply> for http_response_hook_result::Result {
     fn from(reply: Reply) -> Self {
         match reply {
             Reply::Preflight(result) => Self::PreflightResult(result),
@@ -467,8 +467,7 @@ fn deny(config: &GuardConfig, scanner: &StreamScanner) -> Reply {
 #[cfg(test)]
 mod tests {
     use openshell_core::proto::{
-        HttpBegin, HttpRequestSessionPreflight, HttpResponsePreflightHead,
-        HttpResponseSessionPreflight,
+        HttpBegin, HttpRequestHookPreflight, HttpResponseHookPreflight, HttpResponsePreflightHead,
     };
 
     use super::*;
@@ -789,17 +788,17 @@ mod tests {
         let (permitted, limits, config) = buffered_offer();
         let request = request_stream(tokio_stream::iter(
             [
-                http_request_session_event::Event::Preflight(HttpRequestSessionPreflight {
+                http_request_hook_event::Event::Preflight(HttpRequestHookPreflight {
                     request: Some(HttpRequestPreflightHead::default()),
                     config: config.clone(),
                     permitted_body_modes: permitted.clone(),
                     limits,
                     ..Default::default()
                 }),
-                http_request_session_event::Event::Begin(HttpBegin::default()),
-                http_request_session_event::Event::WholeBody(body()),
+                http_request_hook_event::Event::Begin(HttpBegin::default()),
+                http_request_hook_event::Event::WholeBody(body()),
             ]
-            .map(|event| Ok(HttpRequestSessionEvent { event: Some(event) })),
+            .map(|event| Ok(HttpRequestHookEvent { event: Some(event) })),
         ));
         let request: Vec<_> = request
             .map(|result| result.unwrap().result.unwrap())
@@ -808,24 +807,24 @@ mod tests {
         assert!(matches!(
             request.as_slice(),
             [
-                http_request_session_result::Result::PreflightResult(_),
-                http_request_session_result::Result::WholeBodyResult(_),
+                http_request_hook_result::Result::PreflightResult(_),
+                http_request_hook_result::Result::WholeBodyResult(_),
             ]
         ));
 
         let response = response_stream(tokio_stream::iter(
             [
-                http_response_session_event::Event::Preflight(HttpResponseSessionPreflight {
+                http_response_hook_event::Event::Preflight(HttpResponseHookPreflight {
                     response: Some(HttpResponsePreflightHead::default()),
                     config,
                     permitted_body_modes: permitted,
                     limits,
                     ..Default::default()
                 }),
-                http_response_session_event::Event::Begin(HttpBegin::default()),
-                http_response_session_event::Event::WholeBody(body()),
+                http_response_hook_event::Event::Begin(HttpBegin::default()),
+                http_response_hook_event::Event::WholeBody(body()),
             ]
-            .map(|event| Ok(HttpResponseSessionEvent { event: Some(event) })),
+            .map(|event| Ok(HttpResponseHookEvent { event: Some(event) })),
         ));
         let response: Vec<_> = response
             .map(|result| result.unwrap().result.unwrap())
@@ -834,8 +833,8 @@ mod tests {
         assert!(matches!(
             response.as_slice(),
             [
-                http_response_session_result::Result::PreflightResult(_),
-                http_response_session_result::Result::WholeBodyResult(_),
+                http_response_hook_result::Result::PreflightResult(_),
+                http_response_hook_result::Result::WholeBodyResult(_),
             ]
         ));
     }

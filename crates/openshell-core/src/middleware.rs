@@ -11,25 +11,23 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::proto::{
-    HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestSessionEvent,
-    HttpRequestSessionResult, HttpRequestTarget, HttpResponseEvent, HttpResponseEventResult,
-    HttpResponseSessionEvent, HttpResponseSessionResult, MiddlewareDescribeRequest,
-    MiddlewareManifest, RequestContext, SupervisorMiddlewarePhase, ValidateConfigRequest,
-    ValidateConfigResponse, WebSocketSessionEvent, WebSocketSessionEventResult,
+    HttpHeader, HttpRequestEvaluation, HttpRequestHookEvent, HttpRequestHookResult,
+    HttpRequestResult, HttpRequestTarget, HttpResponseEvent, HttpResponseEventResult,
+    HttpResponseHookEvent, HttpResponseHookResult, MiddlewareDescribeRequest, MiddlewareManifest,
+    RequestContext, SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
+    WebSocketSessionEvent, WebSocketSessionEventResult,
 };
 
-/// Transport-neutral result stream for one `HttpSessionMiddleware.EvaluateRequest`
+/// Transport-neutral result stream for one `HttpHooks.EvaluateRequest`
 /// exchange.
-pub type HttpRequestSessionResultStream = Pin<
-    Box<dyn tokio_stream::Stream<Item = Result<HttpRequestSessionResult, Status>> + Send + 'static>,
+pub type HttpRequestHookResultStream = Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<HttpRequestHookResult, Status>> + Send + 'static>,
 >;
 
-/// Transport-neutral result stream for one `HttpSessionMiddleware.EvaluateResponse`
+/// Transport-neutral result stream for one `HttpHooks.EvaluateResponse`
 /// exchange.
-pub type HttpResponseSessionResultStream = Pin<
-    Box<
-        dyn tokio_stream::Stream<Item = Result<HttpResponseSessionResult, Status>> + Send + 'static,
-    >,
+pub type HttpResponseHookResultStream = Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<HttpResponseHookResult, Status>> + Send + 'static>,
 >;
 
 /// Legacy HTTP hooks. Removed in 0.2.0.
@@ -83,21 +81,21 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         ))
     }
 
-    /// Open one HTTP hook request exchange (`HttpSessionMiddleware.EvaluateRequest`).
-    async fn open_http_request_session(
+    /// Open one HTTP hook request exchange (`HttpHooks.EvaluateRequest`).
+    async fn open_http_request_hook(
         &self,
-        _requests: mpsc::Receiver<HttpRequestSessionEvent>,
-    ) -> Result<HttpRequestSessionResultStream, Status> {
+        _requests: mpsc::Receiver<HttpRequestHookEvent>,
+    ) -> Result<HttpRequestHookResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP hook requests",
         ))
     }
 
-    /// Open one HTTP hook response exchange (`HttpSessionMiddleware.EvaluateResponse`).
-    async fn open_http_response_session(
+    /// Open one HTTP hook response exchange (`HttpHooks.EvaluateResponse`).
+    async fn open_http_response_hook(
         &self,
-        _requests: mpsc::Receiver<HttpResponseSessionEvent>,
-    ) -> Result<HttpResponseSessionResultStream, Status> {
+        _requests: mpsc::Receiver<HttpResponseHookEvent>,
+    ) -> Result<HttpResponseHookResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP hook responses",
         ))
@@ -316,28 +314,28 @@ pub trait InProcessMiddleware: Send + Sync {
         ))
     }
 
-    /// Open one HTTP hook request exchange (`HttpSessionMiddleware.EvaluateRequest`),
+    /// Open one HTTP hook request exchange (`HttpHooks.EvaluateRequest`),
     /// for one HTTP request.
     ///
     /// Implementations that do not require the HTTP hooks capability
     /// may keep the default unsupported response.
-    async fn open_http_request_session(
+    async fn open_http_request_hook(
         &self,
-        _requests: mpsc::Receiver<HttpRequestSessionEvent>,
-    ) -> std::result::Result<HttpRequestSessionResultStream, Status> {
+        _requests: mpsc::Receiver<HttpRequestHookEvent>,
+    ) -> std::result::Result<HttpRequestHookResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP hook requests",
         ))
     }
 
-    /// Open one HTTP hook response exchange (`HttpSessionMiddleware.EvaluateResponse`).
+    /// Open one HTTP hook response exchange (`HttpHooks.EvaluateResponse`).
     ///
     /// Implementations that do not require the HTTP hooks capability
     /// may keep the default unsupported response.
-    async fn open_http_response_session(
+    async fn open_http_response_hook(
         &self,
-        _requests: mpsc::Receiver<HttpResponseSessionEvent>,
-    ) -> std::result::Result<HttpResponseSessionResultStream, Status> {
+        _requests: mpsc::Receiver<HttpResponseHookEvent>,
+    ) -> std::result::Result<HttpResponseHookResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP hook responses",
         ))
@@ -362,7 +360,7 @@ pub const MAX_CONCURRENT_MIDDLEWARE_WORK: usize = 32;
 /// A session consumes one permit regardless of its stage fan-out. These
 /// protocols acquire from this shared budget before opening streams and retain
 /// the permit while any stage remains active. HTTP hooks use
-/// [`MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS`] and
+/// [`MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES`] and
 /// [`MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS`] instead.
 pub const MAX_CONCURRENT_MIDDLEWARE_SESSIONS: usize = 32;
 /// Process-wide bound on HTTP hook messages in preflight or in a
@@ -371,7 +369,7 @@ pub const MAX_CONCURRENT_MIDDLEWARE_SESSIONS: usize = 32;
 /// A request and its response each hold one slot, and only while a stage
 /// inspects them: a message whose stages all continue at preflight releases
 /// its slot then. A message waits for a slot within its chain deadline.
-pub const MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS: usize = 64;
+pub const MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES: usize = 64;
 /// Process-wide bound on HTTP hook messages with a DUPLEX stage.
 ///
 /// A DUPLEX body has no total deadline, so a server-sent events response can

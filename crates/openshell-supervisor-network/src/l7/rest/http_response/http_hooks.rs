@@ -171,7 +171,7 @@ where
     if let Some(guard) = middleware.generation_guard
         && let Err(error) = guard.ensure_current()
     {
-        if let Some(session) = preflight.session.take() {
+        if let Some(session) = preflight.pipeline.take() {
             session.end(MiddlewareSessionEndReason::PolicyReload).await;
         }
         return Err(error);
@@ -212,7 +212,7 @@ where
         return Ok(Some(RelayOutcome::Consumed));
     }
 
-    let Some(session) = preflight.session.take() else {
+    let Some(session) = preflight.pipeline.take() else {
         if preflight.headers == original_headers {
             return Ok(None);
         }
@@ -628,7 +628,7 @@ impl<C: AsyncWrite + Unpin> ResponseWriter<'_, '_, C> {
         // Content-Digest: one that changes the body removes or rewrites them.
         let declared_trailers = &self.parsed.declared_trailers;
         let headers = openshell_supervisor_middleware::headers::apply_accumulated(
-            openshell_supervisor_middleware::headers::HeaderAuthority::SessionResponse,
+            openshell_supervisor_middleware::headers::HeaderAuthority::HookResponse,
             self.headers,
             &self.parsed.connection_nominated,
             late_mutations,

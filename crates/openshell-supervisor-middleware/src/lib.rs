@@ -6,16 +6,16 @@
 mod binding_policy;
 mod diagnostics;
 pub mod headers;
-mod http_session;
+mod http_hooks;
 mod remote;
 mod response;
 mod websocket;
 
-pub use http_session::{
+pub use http_hooks::{
     ChainHttpHookVersion, HTTP_STREAM_IDLE_TIMEOUT, HTTP_WHOLE_BODY_TIMEOUT, HttpBodyInput,
     HttpBodyOutput, HttpFailureCode, HttpMiddlewareFailure, HttpPipelineFinish,
-    HttpRequestPreflightInput, HttpRequestPreflightOutcome, HttpRequestSession,
-    HttpResponseDelivery, HttpResponsePipelinePreflight, HttpResponsePipelineSession,
+    HttpRequestPipeline, HttpRequestPreflightInput, HttpRequestPreflightOutcome,
+    HttpResponseDelivery, HttpResponsePipeline, HttpResponsePipelinePreflight,
     HttpStageDiagnostics, HttpStageInvocation, HttpStageOutcome, MAX_HTTP_REQUEST_WITHHELD_BYTES,
     MAX_HTTP_STREAM_UNIT_BYTES, MIDDLEWARE_CANNOT_INSPECT, MIDDLEWARE_HOOK_VERSIONS_MIXED,
     MiddlewareFailureDetail, chain_http_hook_version, chain_inspects_http_response_bodies,
@@ -49,8 +49,8 @@ use openshell_core::extension_protocol::{
 };
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestSessionEvent,
-    HttpRequestTarget, HttpResponseSessionEvent, MiddlewareBinding, MiddlewareDescribeRequest,
+    Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestHookEvent,
+    HttpRequestTarget, HttpResponseHookEvent, MiddlewareBinding, MiddlewareDescribeRequest,
     MiddlewareManifest, NetworkMiddlewareConfig, Process, RequestContext, SandboxPolicy,
     SupervisorMiddlewareBinding, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
     SupervisorMiddlewareService, ValidateConfigRequest, ValidateConfigResponse,
@@ -60,8 +60,8 @@ use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
 
 use binding_policy::BindingPolicy;
 pub use openshell_core::middleware::{
-    HttpRequestSessionResultStream, HttpRequestView, HttpResponseResultStream,
-    HttpResponseSessionResultStream, InProcessMiddleware, SupervisorMiddlewareEndpoint,
+    HttpRequestHookResultStream, HttpRequestView, HttpResponseHookResultStream,
+    HttpResponseResultStream, InProcessMiddleware, SupervisorMiddlewareEndpoint,
     WebSocketResponseStream,
 };
 
@@ -222,18 +222,18 @@ impl InProcessMiddleware for EndpointInProcessAdapter {
         self.endpoint.open_http_response_pre_return(requests).await
     }
 
-    async fn open_http_request_session(
+    async fn open_http_request_hook(
         &self,
-        requests: tokio::sync::mpsc::Receiver<HttpRequestSessionEvent>,
-    ) -> std::result::Result<HttpRequestSessionResultStream, tonic::Status> {
-        self.endpoint.open_http_request_session(requests).await
+        requests: tokio::sync::mpsc::Receiver<HttpRequestHookEvent>,
+    ) -> std::result::Result<HttpRequestHookResultStream, tonic::Status> {
+        self.endpoint.open_http_request_hook(requests).await
     }
 
-    async fn open_http_response_session(
+    async fn open_http_response_hook(
         &self,
-        requests: tokio::sync::mpsc::Receiver<HttpResponseSessionEvent>,
-    ) -> std::result::Result<HttpResponseSessionResultStream, tonic::Status> {
-        self.endpoint.open_http_response_session(requests).await
+        requests: tokio::sync::mpsc::Receiver<HttpResponseHookEvent>,
+    ) -> std::result::Result<HttpResponseHookResultStream, tonic::Status> {
+        self.endpoint.open_http_response_hook(requests).await
     }
 }
 
@@ -325,7 +325,7 @@ enum MiddlewareSessionAdmission {
 }
 
 pub use openshell_core::middleware::{
-    DEFAULT_MIDDLEWARE_TIMEOUT, MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+    DEFAULT_MIDDLEWARE_TIMEOUT, MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES,
     MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS, MAX_CONCURRENT_MIDDLEWARE_SESSIONS,
     MAX_CONCURRENT_MIDDLEWARE_WORK, MAX_MIDDLEWARE_CHAIN_FINDINGS, MAX_MIDDLEWARE_CHAIN_STAGES,
     MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_CONFIGS, MAX_MIDDLEWARE_FINDINGS_PER_STAGE,
@@ -410,10 +410,10 @@ pub enum HttpHookVersion {
     /// Legacy HTTP hooks (`EvaluateHttpRequest`, `HttpResponsePreReturn`).
     /// Deprecated and removed in 0.2.0.
     Legacy,
-    /// HTTP hooks (`HttpSessionMiddleware.EvaluateRequest`,
-    /// `HttpSessionMiddleware.EvaluateResponse`), selected by requiring
+    /// HTTP hooks (`HttpHooks.EvaluateRequest`,
+    /// `HttpHooks.EvaluateResponse`), selected by requiring
     /// [`SUPERVISOR_MIDDLEWARE_HTTP_HOOKS`]. Always fail-closed.
-    Session,
+    Current,
 }
 
 impl HttpHookVersion {
@@ -422,7 +422,7 @@ impl HttpHookVersion {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Legacy => "legacy_http_hook",
-            Self::Session => "http_hook",
+            Self::Current => "http_hook",
         }
     }
 }
@@ -451,7 +451,7 @@ fn binding_http_hook_version(
             SupervisorMiddlewareOperation::HttpRequest
             | SupervisorMiddlewareOperation::HttpResponse,
         ) => Some(if requires_http_hooks(manifest) {
-            HttpHookVersion::Session
+            HttpHookVersion::Current
         } else {
             HttpHookVersion::Legacy
         }),
@@ -470,7 +470,7 @@ fn manifest_http_hook_version(manifest: &MiddlewareManifest) -> Option<HttpHookV
 
 /// A service that supports the HTTP hooks capability must also
 /// require it. Only a required capability makes peers that predate HTTP
-/// session hooks reject the service; otherwise they would call its HTTP
+/// hooks reject the service; otherwise they would call its HTTP
 /// bindings through the legacy HTTP hooks.
 fn validate_manifest_http_hooks_capability(
     source: &str,
@@ -497,7 +497,7 @@ fn binding_requires_payload_limit(
     manifest: &MiddlewareManifest,
     binding: &MiddlewareBinding,
 ) -> bool {
-    binding_http_hook_version(manifest, binding) != Some(HttpHookVersion::Session)
+    binding_http_hook_version(manifest, binding) != Some(HttpHookVersion::Current)
         || binding.max_payload_bytes > 0
 }
 
@@ -563,7 +563,7 @@ impl DescribedChainEntry {
     /// Effective failure policy. HTTP hook entries always fail closed,
     /// whatever the policy entry says.
     pub fn on_error(&self) -> OnError {
-        if self.http_hook_version == Some(HttpHookVersion::Session) {
+        if self.http_hook_version == Some(HttpHookVersion::Current) {
             OnError::FailClosed
         } else {
             self.entry.on_error
@@ -850,23 +850,23 @@ impl MiddlewareDispatch {
         }
     }
 
-    async fn open_http_request_session(
+    async fn open_http_request_hook(
         &self,
-        receiver: tokio::sync::mpsc::Receiver<HttpRequestSessionEvent>,
-    ) -> std::result::Result<HttpRequestSessionResultStream, tonic::Status> {
+        receiver: tokio::sync::mpsc::Receiver<HttpRequestHookEvent>,
+    ) -> std::result::Result<HttpRequestHookResultStream, tonic::Status> {
         match self {
-            Self::InProcess(service) => service.open_http_request_session(receiver).await,
-            Self::Grpc(service) => service.open_http_request_session(receiver).await,
+            Self::InProcess(service) => service.open_http_request_hook(receiver).await,
+            Self::Grpc(service) => service.open_http_request_hook(receiver).await,
         }
     }
 
-    async fn open_http_response_session(
+    async fn open_http_response_hook(
         &self,
-        receiver: tokio::sync::mpsc::Receiver<HttpResponseSessionEvent>,
-    ) -> std::result::Result<HttpResponseSessionResultStream, tonic::Status> {
+        receiver: tokio::sync::mpsc::Receiver<HttpResponseHookEvent>,
+    ) -> std::result::Result<HttpResponseHookResultStream, tonic::Status> {
         match self {
-            Self::InProcess(service) => service.open_http_response_session(receiver).await,
-            Self::Grpc(service) => service.open_http_response_session(receiver).await,
+            Self::InProcess(service) => service.open_http_response_hook(receiver).await,
+            Self::Grpc(service) => service.open_http_response_hook(receiver).await,
         }
     }
 }
@@ -955,7 +955,7 @@ pub struct MiddlewareRegistry {
     work_admission: Arc<Semaphore>,
     work_admission_waiters: Arc<Semaphore>,
     session_admission: Arc<Semaphore>,
-    http_session_admission: Arc<Semaphore>,
+    http_hooks_admission: Arc<Semaphore>,
     http_stream_admission: Arc<Semaphore>,
 }
 
@@ -975,8 +975,8 @@ impl std::fmt::Debug for MiddlewareRegistry {
                 &self.session_admission.available_permits(),
             )
             .field(
-                "available_http_session_permits",
-                &self.http_session_admission.available_permits(),
+                "available_http_hooks_permits",
+                &self.http_hooks_admission.available_permits(),
             )
             .field(
                 "available_http_stream_permits",
@@ -1002,9 +1002,7 @@ impl Default for MiddlewareRegistry {
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
-            http_session_admission: Arc::new(Semaphore::new(
-                MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
-            )),
+            http_hooks_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES)),
             http_stream_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS)),
         }
     }
@@ -1525,9 +1523,7 @@ impl MiddlewareRegistry {
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
-            http_session_admission: Arc::new(Semaphore::new(
-                MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
-            )),
+            http_hooks_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES)),
             http_stream_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS)),
         })
     }
@@ -1548,7 +1544,7 @@ impl MiddlewareRegistry {
     /// Gateway rules for policies that use HTTP hook middleware.
     ///
     /// - `on_error: fail_open` is rejected on an entry whose service runs HTTP
-    ///   session hooks, including one with WebSocket bindings. HTTP hooks
+    ///   hooks, including one with WebSocket bindings. HTTP hooks
     ///   are always fail-closed, but a supervisor that cannot describe the
     ///   service, including one that predates HTTP hooks, follows
     ///   `on_error` and would skip it under `fail_open`.
@@ -1575,7 +1571,7 @@ impl MiddlewareRegistry {
                 continue;
             };
             if OnError::parse(&config.on_error)? == OnError::FailOpen
-                && manifest_http_hook_version(manifest) == Some(HttpHookVersion::Session)
+                && manifest_http_hook_version(manifest) == Some(HttpHookVersion::Current)
             {
                 return Err(miette!(
                     "middleware config '{name}' cannot use on_error: fail_open with '{}': HTTP hook middleware is always fail-closed, and a supervisor that cannot describe it would skip it under fail_open; use fail_closed",
@@ -1613,7 +1609,7 @@ impl MiddlewareRegistry {
                         continue;
                     }
                     let describe = |protocol: Option<HttpHookVersion>| match protocol {
-                        Some(HttpHookVersion::Session) => "HTTP hooks",
+                        Some(HttpHookVersion::Current) => "HTTP hooks",
                         _ => "legacy HTTP hooks",
                     };
                     let operation_name = match operation {
@@ -1731,8 +1727,8 @@ impl ChainRunner {
                 work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
                 work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
                 session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
-                http_session_admission: Arc::new(Semaphore::new(
-                    MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+                http_hooks_admission: Arc::new(Semaphore::new(
+                    MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES,
                 )),
                 http_stream_admission: Arc::new(Semaphore::new(
                     MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS,
@@ -1763,7 +1759,7 @@ impl ChainRunner {
         registry.work_admission = Arc::clone(&self.registry.work_admission);
         registry.work_admission_waiters = Arc::clone(&self.registry.work_admission_waiters);
         registry.session_admission = Arc::clone(&self.registry.session_admission);
-        registry.http_session_admission = Arc::clone(&self.registry.http_session_admission);
+        registry.http_hooks_admission = Arc::clone(&self.registry.http_hooks_admission);
         registry.http_stream_admission = Arc::clone(&self.registry.http_stream_admission);
         Self::from_registry(registry)
     }
@@ -1821,11 +1817,11 @@ impl ChainRunner {
 
     /// Wait until `deadline` for one HTTP hook slot, held through
     /// preflight and `WHOLE_BODY` stages. `None` when none freed up in time.
-    async fn reserve_http_session(
+    async fn reserve_http_hook(
         &self,
         deadline: tokio::time::Instant,
     ) -> Option<MiddlewareSessionPermit> {
-        reserve_until(&self.registry.http_session_admission, deadline).await
+        reserve_until(&self.registry.http_hooks_admission, deadline).await
     }
 
     /// Take one HTTP hook DUPLEX slot if one is free now.
@@ -1962,7 +1958,7 @@ impl ChainRunner {
                 continue;
             };
             let http_hook_version = binding_http_hook_version(manifest, &binding);
-            if http_hook_version == Some(HttpHookVersion::Session)
+            if http_hook_version == Some(HttpHookVersion::Current)
                 && entry.on_error == OnError::FailOpen
             {
                 self.warn_fail_open_not_applied(&entry);
@@ -2120,7 +2116,7 @@ impl ChainRunner {
         // hook versions and fails closed.
         if let Some(entry) = entries
             .iter()
-            .find(|entry| entry.http_hook_version() == Some(HttpHookVersion::Session))
+            .find(|entry| entry.http_hook_version() == Some(HttpHookVersion::Current))
         {
             return Ok(ChainOutcome {
                 allowed: false,
@@ -4134,9 +4130,7 @@ mod tests {
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
-            http_session_admission: Arc::new(Semaphore::new(
-                MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
-            )),
+            http_hooks_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES)),
             http_stream_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS)),
         }
     }

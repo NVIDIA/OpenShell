@@ -4,7 +4,7 @@
 //! HTTP hook response middleware at `PRE_RETURN`.
 //!
 //! Initial preflight stops at the first inspecting stage. The returned
-//! [`HttpResponsePipelineSession`] opens later stages on the preceding
+//! [`HttpResponsePipeline`] opens later stages on the preceding
 //! stage's output headers. The relay commits the response head on the final
 //! output `Start`. A chain whose stages all continue delivers the body untouched.
 //!
@@ -75,7 +75,7 @@ pub struct HttpResponsePipelinePreflight {
     /// Head after the initial preflight prefix.
     pub headers: Vec<HttpHeader>,
     /// Present when a stage selected a body mode.
-    pub session: Option<HttpResponsePipelineSession>,
+    pub pipeline: Option<HttpResponsePipeline>,
     pub diagnostics: HttpStageDiagnostics,
     /// No HTTP hook slot freed up within the chain deadline, so the
     /// response failed closed.
@@ -84,13 +84,13 @@ pub struct HttpResponsePipelinePreflight {
 
 /// Response body stages selected at preflight.
 ///
-/// The session holds its HTTP hook budget slots while its body
+/// The pipeline holds its HTTP hook budget slots while its body
 /// stages run.
-pub struct HttpResponsePipelineSession {
+pub struct HttpResponsePipeline {
     pipeline: Pipeline,
 }
 
-impl HttpResponsePipelineSession {
+impl HttpResponsePipeline {
     /// Largest body chunk to feed as input.
     #[must_use]
     pub fn input_unit_limit(&self) -> usize {
@@ -338,7 +338,7 @@ impl ChainRunner {
         }
         let chain_deadline = Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
         let slot = if described.iter().any(DescribedChainEntry::is_resolved) {
-            let Some(slot) = self.reserve_http_session(chain_deadline).await else {
+            let Some(slot) = self.reserve_http_hook(chain_deadline).await else {
                 return Ok(capacity_exhausted(&described, input.headers));
             };
             Some(slot)
@@ -346,7 +346,7 @@ impl ChainRunner {
             None
         };
         let spec = PipelineSpec {
-            head_authority: HeaderAuthority::SessionResponse,
+            head_authority: HeaderAuthority::HookResponse,
             trailer_authority: HeaderAuthority::ResponseTrailers,
             connection_nominated: input.connection_nominated_headers.clone(),
             // Only request heads omit credential-bearing headers.
@@ -367,13 +367,13 @@ impl ChainRunner {
             chain_deadline,
         )
         .await;
-        let session = match preflight.pipeline {
+        let pipeline = match preflight.pipeline {
             Some(pipeline) => {
                 let slot = slot.expect("a selected stage implies a resolved entry");
                 let Some(pipeline) = self.admit_body(pipeline, slot, chain_deadline).await else {
                     return Ok(capacity_exhausted(&described, input.headers));
                 };
-                Some(HttpResponsePipelineSession { pipeline })
+                Some(HttpResponsePipeline { pipeline })
             }
             // No stage inspects the body, so the slot is released here.
             None => None,
@@ -384,7 +384,7 @@ impl ChainRunner {
             denial: preflight.denial,
             failure: preflight.failure,
             headers: preflight.headers,
-            session,
+            pipeline,
             diagnostics: preflight.diagnostics,
             session_capacity_exhausted: false,
         })
@@ -411,7 +411,7 @@ fn outcome(
         denial: None,
         failure: None,
         headers,
-        session: None,
+        pipeline: None,
         diagnostics,
         session_capacity_exhausted: false,
     }
@@ -464,7 +464,7 @@ mod tests {
     };
 
     use super::ResponseHead;
-    use crate::http_session::pipeline::StageHead;
+    use crate::http_hooks::pipeline::StageHead;
     use crate::{
         ChainEntry, DescribedChainEntry, HttpHookVersion, HttpResponsePreflightInput, OnError,
     };
@@ -487,7 +487,7 @@ mod tests {
             }),
             max_payload_bytes: limit,
             timeout: std::time::Duration::from_millis(500),
-            http_hook_version: Some(HttpHookVersion::Session),
+            http_hook_version: Some(HttpHookVersion::Current),
         }
     }
 

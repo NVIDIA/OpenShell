@@ -20,7 +20,7 @@ service SupervisorMiddleware {
   rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
 
   // Deprecated: legacy HTTP hooks, removed in 0.2.0. Use
-  // HttpSessionMiddleware.EvaluateRequest.
+  // HttpHooks.EvaluateRequest.
   // EvaluateHttpRequest returns an allow, deny, or mutation decision for one
   // buffered HTTP request. OpenShell calls it for the HTTP_REQUEST bindings of
   // a service that does not require the HTTP hooks capability.
@@ -39,25 +39,25 @@ service SupervisorMiddleware {
       returns (stream WebSocketSessionEventResult);
 }
 
-// HttpSessionMiddleware evaluates HTTP messages for one operator-run middleware.
+// HttpHooks evaluates HTTP messages for one operator-run middleware.
 // It shares SupervisorMiddleware's registration, discovery, configuration, and
 // endpoint. Each invocation serves one binding phase, carried in its preflight.
-service HttpSessionMiddleware {
+service HttpHooks {
   // HTTP hooks for requests. OpenShell calls it for the HTTP_REQUEST
   // bindings of a service whose manifest lists
   // openshell.supervisor-middleware.http-hooks in
   // extension.required_capabilities. Peers that predate HTTP hooks
   // reject such a service at Describe. One stream per request and middleware
   // stage. The first event is a request preflight.
-  rpc EvaluateRequest(stream HttpRequestSessionEvent)
-      returns (stream HttpRequestSessionResult);
+  rpc EvaluateRequest(stream HttpRequestHookEvent)
+      returns (stream HttpRequestHookResult);
 
   // HTTP hooks for responses, for the HTTP_RESPONSE bindings of a
   // service that requires the HTTP hooks capability. One stream per
   // response and middleware stage. The first event is a preflight of the
   // response head.
-  rpc EvaluateResponse(stream HttpResponseSessionEvent)
-      returns (stream HttpResponseSessionResult);
+  rpc EvaluateResponse(stream HttpResponseHookEvent)
+      returns (stream HttpResponseHookResult);
 }
 
 message MiddlewareDescribeRequest {
@@ -67,7 +67,7 @@ message MiddlewareDescribeRequest {
 }
 
 // Deprecated: legacy HTTP hooks, removed in 0.2.0. Use
-// HttpSessionMiddleware.EvaluateResponse.
+// HttpHooks.EvaluateResponse.
 // HttpResponsePreReturn evaluates one response for one middleware stage before
 // OpenShell returns it to the sandbox. OpenShell calls it for the HTTP_RESPONSE
 // bindings of a service that does not require the HTTP hooks
@@ -144,15 +144,15 @@ message ValidateConfigResponse {
   string reason = 2;
 }
 
-// HTTP hooks. One ordered event in a HttpSessionMiddleware.EvaluateRequest
+// HTTP hooks. One ordered event in a HttpHooks.EvaluateRequest
 // stream. Preflight is always first and sees the preceding stage's completed
 // output headers. An inspect result is followed by begin
 // and exactly one body lifecycle: whole_body for WHOLE_BODY, or input_chunk
 // events ending with input_end for DUPLEX. session_end is best effort and has
 // no result.
-message HttpRequestSessionEvent {
+message HttpRequestHookEvent {
   oneof event {
-    HttpRequestSessionPreflight preflight = 1;
+    HttpRequestHookPreflight preflight = 1;
     HttpBegin begin = 2;
     HttpWholeBody whole_body = 3;
     HttpInputChunk input_chunk = 4;
@@ -161,11 +161,11 @@ message HttpRequestSessionEvent {
   }
 }
 
-// HTTP hooks. One ordered event in a HttpSessionMiddleware.EvaluateResponse
-// stream, in the order HttpRequestSessionEvent describes.
-message HttpResponseSessionEvent {
+// HTTP hooks. One ordered event in a HttpHooks.EvaluateResponse
+// stream, in the order HttpRequestHookEvent describes.
+message HttpResponseHookEvent {
   oneof event {
-    HttpResponseSessionPreflight preflight = 1;
+    HttpResponseHookPreflight preflight = 1;
     HttpBegin begin = 2;
     HttpWholeBody whole_body = 3;
     HttpInputChunk input_chunk = 4;
@@ -174,7 +174,7 @@ message HttpResponseSessionEvent {
   }
 }
 
-// HTTP hooks. One ordered result in a HttpSessionMiddleware.EvaluateRequest
+// HTTP hooks. One ordered result in a HttpHooks.EvaluateRequest
 // stream. Preflight requires preflight_result or deny. WHOLE_BODY ends with
 // whole_body_result or deny. DUPLEX sends output_start before any
 // output_chunk, even for an empty output, and ends with finish or deny. An
@@ -183,7 +183,7 @@ message HttpResponseSessionEvent {
 // A service may close its result stream right after the result that ends its
 // part in the exchange (continue_without_body, whole_body_result, finish, or
 // deny), or keep it open until session_end. OpenShell accepts both.
-message HttpRequestSessionResult {
+message HttpRequestHookResult {
   oneof result {
     HttpPreflightResult preflight_result = 1;
     HttpWholeBodyResult whole_body_result = 2;
@@ -194,11 +194,11 @@ message HttpRequestSessionResult {
   }
 }
 
-// HTTP hooks. One ordered result in a HttpSessionMiddleware.EvaluateResponse
-// stream, under the rules HttpRequestSessionResult describes, with
+// HTTP hooks. One ordered result in a HttpHooks.EvaluateResponse
+// stream, under the rules HttpRequestHookResult describes, with
 // block_delivery instead of deny. Blocking delivery does not undo the
 // request already handled by the external service.
-message HttpResponseSessionResult {
+message HttpResponseHookResult {
   oneof result {
     HttpPreflightResult preflight_result = 1;
     HttpWholeBodyResult whole_body_result = 2;
@@ -260,7 +260,7 @@ message HttpBodyModeUnavailable {
 
 // HTTP hook preflight for one request stage: what is evaluated, the
 // body modes offered, and limits.
-message HttpRequestSessionPreflight {
+message HttpRequestHookPreflight {
   // A request after network-policy admission and before credentials.
   HttpRequestPreflightHead request = 1;
   // Phase of the HTTP_REQUEST binding this stream serves: PRE_CREDENTIALS.
@@ -288,7 +288,7 @@ message HttpRequestSessionPreflight {
 
 // HTTP hook preflight for one response stage: what is evaluated, the
 // body modes offered, and limits.
-message HttpResponseSessionPreflight {
+message HttpResponseHookPreflight {
   // A final upstream response before it reaches the sandbox.
   HttpResponsePreflightHead response = 1;
   // Phase of the HTTP_RESPONSE binding this stream serves: PRE_RETURN.
@@ -546,7 +546,7 @@ message HttpRequestEvaluation {
 // UTF-8 before any middleware runs. When a response head is not valid UTF-8,
 // an HTTP hook response chain fails closed with failure_code
 // middleware_cannot_inspect, and legacy response hooks follow on_error. HTTP
-// session hooks also fail a message whose trailers are not valid UTF-8.
+// hooks also fail a message whose trailers are not valid UTF-8.
 message HttpHeader {
   // Lowercased header name.
   string name = 1;
@@ -906,13 +906,13 @@ message MiddlewareExchangeProtocolError {}
 enum SupervisorMiddlewareOperation {
   SUPERVISOR_MIDDLEWARE_OPERATION_UNSPECIFIED = 0;
   // An HTTP request at PRE_CREDENTIALS. OpenShell calls
-  // HttpSessionMiddleware.EvaluateRequest when the service requires the
+  // HttpHooks.EvaluateRequest when the service requires the
   // openshell.supervisor-middleware.http-hooks capability, and the
   // deprecated EvaluateHttpRequest otherwise.
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST = 1;
   SUPERVISOR_MIDDLEWARE_OPERATION_WEBSOCKET_MESSAGE = 2;
   // A final HTTP response at PRE_RETURN. OpenShell calls
-  // HttpSessionMiddleware.EvaluateResponse when the service requires the HTTP
+  // HttpHooks.EvaluateResponse when the service requires the HTTP
   // hooks capability, and the deprecated HttpResponsePreReturn.Evaluate
   // otherwise.
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_RESPONSE = 3;

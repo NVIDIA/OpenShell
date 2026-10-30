@@ -31,12 +31,12 @@ use tokio::time::Instant;
 use openshell_core::proto::{
     Decision, HeaderMutation, HttpBegin, HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable,
     HttpBodyUnavailableReason, HttpDenial, HttpFinish, HttpHeader, HttpInputChunk, HttpInputEnd,
-    HttpOutputChunk, HttpOutputStart, HttpPreflightResult, HttpRequestPreflightHead,
-    HttpRequestSessionEvent, HttpRequestSessionPreflight, HttpResponsePreflightHead,
-    HttpResponseSessionEvent, HttpResponseSessionPreflight, HttpWholeBody, HttpWholeBodyResult,
+    HttpOutputChunk, HttpOutputStart, HttpPreflightResult, HttpRequestHookEvent,
+    HttpRequestHookPreflight, HttpRequestPreflightHead, HttpResponseHookEvent,
+    HttpResponseHookPreflight, HttpResponsePreflightHead, HttpWholeBody, HttpWholeBodyResult,
     MiddlewareDiagnostics, MiddlewareSessionEnd, MiddlewareSessionEndReason, RequestContext,
-    SupervisorMiddlewarePhase, http_inspect, http_preflight_result, http_request_session_event,
-    http_response_session_event, http_whole_body_result,
+    SupervisorMiddlewarePhase, http_inspect, http_preflight_result, http_request_hook_event,
+    http_response_hook_event, http_whole_body_result,
 };
 
 use crate::headers::{self, HeaderAuthority};
@@ -447,9 +447,9 @@ pub struct PreflightFields {
 }
 
 impl PreflightFields {
-    /// An `HttpSessionMiddleware.EvaluateRequest` preflight at `PRE_CREDENTIALS`.
+    /// An `HttpHooks.EvaluateRequest` preflight at `PRE_CREDENTIALS`.
     pub fn request(self, request: HttpRequestPreflightHead) -> StagePreflight {
-        StagePreflight::Request(HttpRequestSessionPreflight {
+        StagePreflight::Request(HttpRequestHookPreflight {
             request: Some(request),
             phase: SupervisorMiddlewarePhase::PreCredentials as i32,
             context: Some(self.context),
@@ -462,9 +462,9 @@ impl PreflightFields {
         })
     }
 
-    /// An `HttpSessionMiddleware.EvaluateResponse` preflight at `PRE_RETURN`.
+    /// An `HttpHooks.EvaluateResponse` preflight at `PRE_RETURN`.
     pub fn response(self, head: HttpResponsePreflightHead) -> StagePreflight {
-        StagePreflight::Response(HttpResponseSessionPreflight {
+        StagePreflight::Response(HttpResponseHookPreflight {
             response: Some(head),
             phase: SupervisorMiddlewarePhase::PreReturn as i32,
             context: Some(self.context),
@@ -480,8 +480,8 @@ impl PreflightFields {
 
 /// The preflight that opens one stage exchange. It selects the RPC.
 pub enum StagePreflight {
-    Request(HttpRequestSessionPreflight),
-    Response(HttpResponseSessionPreflight),
+    Request(HttpRequestHookPreflight),
+    Response(HttpResponseHookPreflight),
 }
 
 /// One event after the preflight. Both RPCs carry the same body events.
@@ -511,7 +511,7 @@ type StageResults =
 
 /// Conversions between the stage events and results and one RPC's messages,
 /// which differ in their preflight and denial variant.
-macro_rules! session_messages {
+macro_rules! hook_messages {
     ($event:ident, $result:ident, $denial:ident) => {
         impl From<StageEvent> for openshell_core::proto::$event::Event {
             fn from(event: StageEvent) -> Self {
@@ -541,22 +541,18 @@ macro_rules! session_messages {
     };
 }
 
-session_messages!(
-    http_request_session_event,
-    http_request_session_result,
-    Deny
-);
-session_messages!(
-    http_response_session_event,
-    http_response_session_result,
+hook_messages!(http_request_hook_event, http_request_hook_result, Deny);
+hook_messages!(
+    http_response_hook_event,
+    http_response_hook_result,
     BlockDelivery
 );
 
 /// Event sender of one open stage exchange, typed by its RPC.
 #[derive(Clone)]
 enum EventSender {
-    Request(mpsc::Sender<HttpRequestSessionEvent>),
-    Response(mpsc::Sender<HttpResponseSessionEvent>),
+    Request(mpsc::Sender<HttpRequestHookEvent>),
+    Response(mpsc::Sender<HttpResponseHookEvent>),
 }
 
 impl EventSender {
@@ -564,13 +560,13 @@ impl EventSender {
     async fn send(&self, event: StageEvent) -> Result<(), ()> {
         match self {
             Self::Request(sender) => sender
-                .send(HttpRequestSessionEvent {
+                .send(HttpRequestHookEvent {
                     event: Some(event.into()),
                 })
                 .await
                 .map_err(drop),
             Self::Response(sender) => sender
-                .send(HttpResponseSessionEvent {
+                .send(HttpResponseHookEvent {
                     event: Some(event.into()),
                 })
                 .await
@@ -719,12 +715,12 @@ pub(super) async fn open_stage(
             StagePreflight::Request(preflight) => {
                 let (sender, receiver) = mpsc::channel(STAGE_QUEUE_MESSAGES);
                 sender
-                    .send(HttpRequestSessionEvent {
-                        event: Some(http_request_session_event::Event::Preflight(preflight)),
+                    .send(HttpRequestHookEvent {
+                        event: Some(http_request_hook_event::Event::Preflight(preflight)),
                     })
                     .await
                     .map_err(|_| closed())?;
-                let results = service.service.open_http_request_session(receiver).await?;
+                let results = service.service.open_http_request_hook(receiver).await?;
                 (
                     EventSender::Request(sender),
                     stage_results(results, |result| result.result.map(StageResult::from)),
@@ -733,12 +729,12 @@ pub(super) async fn open_stage(
             StagePreflight::Response(preflight) => {
                 let (sender, receiver) = mpsc::channel(STAGE_QUEUE_MESSAGES);
                 sender
-                    .send(HttpResponseSessionEvent {
-                        event: Some(http_response_session_event::Event::Preflight(preflight)),
+                    .send(HttpResponseHookEvent {
+                        event: Some(http_response_hook_event::Event::Preflight(preflight)),
                     })
                     .await
                     .map_err(|_| closed())?;
-                let results = service.service.open_http_response_session(receiver).await?;
+                let results = service.service.open_http_response_hook(receiver).await?;
                 (
                     EventSender::Response(sender),
                     stage_results(results, |result| result.result.map(StageResult::from)),
@@ -831,7 +827,7 @@ async fn prepare_stage(
         }
         return Err(entry_failure(entry, "binding_not_described"));
     }
-    if entry.http_hook_version() != Some(HttpHookVersion::Session) {
+    if entry.http_hook_version() != Some(HttpHookVersion::Current) {
         return Err(entry_failure(entry, MIDDLEWARE_HOOK_VERSIONS_MIXED));
     }
     let offer = head.body_modes(entry, input_headers, declared_body_bytes);
@@ -1020,7 +1016,7 @@ pub struct Pipeline {
     admission: BodyAdmission,
 }
 
-/// Session budget slots one message holds while its body stages run.
+/// HTTP hook budget slots one message holds while its body stages run.
 #[derive(Default)]
 struct BodyAdmission {
     /// The first stage retains its preflight slot while it buffers.
@@ -1070,7 +1066,7 @@ impl ChainRunner {
             let slot = if slot.is_some() {
                 slot
             } else {
-                self.reserve_http_session(deadline).await
+                self.reserve_http_hook(deadline).await
             };
             let Some(slot) = slot else {
                 pipeline.end(MiddlewareSessionEndReason::Cancellation).await;
@@ -1370,7 +1366,7 @@ impl BufferAdmission {
         if let Some(permit) = active.upgrade() {
             return Some(permit);
         }
-        let permit = Arc::new(self.runner.reserve_http_session(deadline).await?);
+        let permit = Arc::new(self.runner.reserve_http_hook(deadline).await?);
         *active = Arc::downgrade(&permit);
         Some(permit)
     }

@@ -18,14 +18,14 @@ pub enum HeaderAuthority {
     /// An HTTP hook request head. Body-mode offers come from the
     /// original head, so `Content-Encoding` is read-only too: a stage must
     /// not relabel a body it replaced.
-    SessionRequest,
+    HookRequest,
     RequestTrailers,
     Response,
     /// An HTTP hook response head. Unlike legacy response hooks,
     /// a stage may write integrity headers such as `ETag` and
     /// `Content-Digest`. They are not stripped when a body changes: the stage
     /// that changes the body owns them.
-    SessionResponse,
+    HookResponse,
     ResponseTrailers,
 }
 
@@ -316,14 +316,14 @@ fn validate_authority(
         HeaderAuthority::Request | HeaderAuthority::RequestTrailers => {
             is_request_protected(normalized_name)
         }
-        HeaderAuthority::SessionRequest => {
+        HeaderAuthority::HookRequest => {
             is_request_protected(normalized_name) || normalized_name == "content-encoding"
         }
         HeaderAuthority::Response => {
             is_response_protected(normalized_name)
                 || (kind == MutationKind::Write && is_response_remove_only(normalized_name))
         }
-        HeaderAuthority::SessionResponse | HeaderAuthority::ResponseTrailers => {
+        HeaderAuthority::HookResponse | HeaderAuthority::ResponseTrailers => {
             is_response_protected(normalized_name)
         }
     };
@@ -734,13 +734,13 @@ mod tests {
     }
 
     #[test]
-    fn session_response_authority_lets_stages_own_integrity_headers() {
+    fn hook_response_authority_lets_stages_own_integrity_headers() {
         let existing = [
             header("etag", "\"upstream\""),
             header("content-length", "5"),
         ];
         let updated = apply(
-            HeaderAuthority::SessionResponse,
+            HeaderAuthority::HookResponse,
             &existing,
             &[],
             &[
@@ -766,13 +766,8 @@ mod tests {
             remove("Content-Length"),
             write("Content-Encoding", "gzip", ExistingHeaderAction::Overwrite),
         ] {
-            let error = apply(
-                HeaderAuthority::SessionResponse,
-                &existing,
-                &[],
-                &[mutation],
-            )
-            .expect_err("protected session response mutation");
+            let error = apply(HeaderAuthority::HookResponse, &existing, &[], &[mutation])
+                .expect_err("protected session response mutation");
             assert!(matches!(error, HeaderMutationError::Protected { .. }));
         }
     }
@@ -824,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn session_request_authority_keeps_content_encoding_read_only() {
+    fn hook_request_authority_keeps_content_encoding_read_only() {
         let existing = [header("content-encoding", "gzip")];
         for mutation in [
             write(
@@ -835,7 +830,7 @@ mod tests {
             remove("Content-Encoding"),
         ] {
             let error = apply(
-                HeaderAuthority::SessionRequest,
+                HeaderAuthority::HookRequest,
                 &existing,
                 &[],
                 std::slice::from_ref(&mutation),
@@ -847,7 +842,7 @@ mod tests {
                 .expect("legacy request coding mutation");
         }
         let error = apply(
-            HeaderAuthority::SessionRequest,
+            HeaderAuthority::HookRequest,
             &[],
             &[],
             &[write(

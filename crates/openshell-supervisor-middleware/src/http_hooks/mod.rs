@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP hooks (`HttpSessionMiddleware.EvaluateRequest` and `HttpSessionMiddleware.EvaluateResponse`).
+//! HTTP hooks (`HttpHooks.EvaluateRequest` and `HttpHooks.EvaluateResponse`).
 //!
 //! Legacy HTTP hooks keep their own engines. A chain runs on exactly one hook
 //! version: every selected entry for one HTTP message must use the same
@@ -24,12 +24,10 @@ pub use pipeline::{
     MIDDLEWARE_HOOK_VERSIONS_MIXED, MiddlewareFailureDetail,
 };
 pub use request::{
-    HttpRequestPreflightInput, HttpRequestPreflightOutcome, HttpRequestSession,
+    HttpRequestPipeline, HttpRequestPreflightInput, HttpRequestPreflightOutcome,
     MAX_HTTP_REQUEST_WITHHELD_BYTES,
 };
-pub use response::{
-    HttpResponseDelivery, HttpResponsePipelinePreflight, HttpResponsePipelineSession,
-};
+pub use response::{HttpResponseDelivery, HttpResponsePipeline, HttpResponsePipelinePreflight};
 
 use crate::{
     DescribedChainEntry, HttpHookVersion, MAX_MIDDLEWARE_CONTEXT_BYTES,
@@ -44,7 +42,7 @@ pub enum ChainHttpHookVersion {
     Legacy,
     /// At least one entry uses HTTP hooks and none uses legacy HTTP
     /// hooks.
-    Session,
+    Current,
     /// Resolved entries of both HTTP hook versions select the same
     /// message. The message fails closed with [`MIDDLEWARE_HOOK_VERSIONS_MIXED`].
     Mixed,
@@ -54,27 +52,27 @@ pub enum ChainHttpHookVersion {
 /// entries. An unresolved entry follows its `on_error` on either path.
 #[must_use]
 pub fn chain_http_hook_version(entries: &[DescribedChainEntry]) -> ChainHttpHookVersion {
-    let session = entries
+    let current = entries
         .iter()
-        .any(|entry| entry.http_hook_version() == Some(HttpHookVersion::Session));
+        .any(|entry| entry.http_hook_version() == Some(HttpHookVersion::Current));
     let legacy = entries
         .iter()
         .any(|entry| entry.http_hook_version() == Some(HttpHookVersion::Legacy));
-    match (legacy, session) {
+    match (legacy, current) {
         (true, true) => ChainHttpHookVersion::Mixed,
-        (false, true) => ChainHttpHookVersion::Session,
+        (false, true) => ChainHttpHookVersion::Current,
         _ => ChainHttpHookVersion::Legacy,
     }
 }
 
-/// True when a session hook stage of a described response chain may inspect bodies.
+/// True when an HTTP hook stage of a described response chain may inspect bodies.
 ///
 /// No body mode is offered for an encoded response, so the relay then asks the
 /// upstream for an identity-coded one.
 #[must_use]
 pub fn chain_inspects_http_response_bodies(entries: &[DescribedChainEntry]) -> bool {
     entries.iter().any(|entry| {
-        entry.http_hook_version() == Some(HttpHookVersion::Session) && entry.max_payload_bytes() > 0
+        entry.http_hook_version() == Some(HttpHookVersion::Current) && entry.max_payload_bytes() > 0
     })
 }
 

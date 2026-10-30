@@ -12,12 +12,12 @@ use openshell_core::extension_protocol::{
 use openshell_core::proto::{
     ExistingHeaderAction, HeaderMutation, HttpBodyMode, HttpContinue, HttpDenial, HttpDuplexMode,
     HttpFinish, HttpHeader, HttpInspect, HttpOutputChunk, HttpOutputStart, HttpPreflightResult,
-    HttpRequestResult, HttpRequestSessionEvent, HttpRequestSessionPreflight,
-    HttpRequestSessionResult, HttpRequestTarget, HttpWholeBodyMode, HttpWholeBodyResult,
-    MiddlewareBinding, MiddlewareDiagnostics, MiddlewareManifest, RequestContext,
-    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
-    WriteHeader, header_mutation, http_inspect, http_preflight_result, http_request_session_event,
-    http_request_session_result, http_whole_body_result,
+    HttpRequestHookEvent, HttpRequestHookPreflight, HttpRequestHookResult, HttpRequestResult,
+    HttpRequestTarget, HttpWholeBodyMode, HttpWholeBodyResult, MiddlewareBinding,
+    MiddlewareDiagnostics, MiddlewareManifest, RequestContext, SupervisorMiddlewareOperation,
+    SupervisorMiddlewarePhase, SupervisorMiddlewareService, WriteHeader, header_mutation,
+    http_inspect, http_preflight_result, http_request_hook_event, http_request_hook_result,
+    http_whole_body_result,
 };
 use tokio::sync::mpsc;
 
@@ -25,8 +25,8 @@ use super::pipeline::entry_failure;
 use crate::binding_policy::BindingPolicy;
 use crate::{
     ChainEntry, ChainRunner, DescribedChainEntry, HttpBodyInput, HttpBodyOutput, HttpFailureCode,
-    HttpRequestPreflightInput, HttpRequestSessionResultStream, HttpRequestView, HttpStageOutcome,
-    InProcessMiddleware, MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+    HttpRequestHookResultStream, HttpRequestPreflightInput, HttpRequestView, HttpStageOutcome,
+    InProcessMiddleware, MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES,
     MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS, MAX_MIDDLEWARE_CHAIN_TIMEOUT, MiddlewareFailureDetail,
     MiddlewareRegistry, OnError, TransformedBodyPolicy, authorize_external_manifest,
     validate_manifest_bindings,
@@ -61,7 +61,7 @@ fn manifest(bindings: Vec<MiddlewareBinding>) -> MiddlewareManifest {
 }
 
 /// Manifest of a service that requires the HTTP hooks capability.
-fn session_manifest(bindings: Vec<MiddlewareBinding>) -> MiddlewareManifest {
+fn hooks_manifest(bindings: Vec<MiddlewareBinding>) -> MiddlewareManifest {
     MiddlewareManifest {
         extension: Some(http_hooks_middleware_metadata("example/guard", "test")),
         ..manifest(bindings)
@@ -78,11 +78,11 @@ fn registration_requires_the_http_hooks_capability_it_supports() {
         ),
         (
             "HTTP hooks in both directions",
-            session_manifest(vec![binding(HttpRequest), binding(HttpResponse)]),
+            hooks_manifest(vec![binding(HttpRequest), binding(HttpResponse)]),
         ),
         (
             "HTTP hooks with a WebSocket binding",
-            session_manifest(vec![binding(HttpRequest), binding(WebsocketMessage)]),
+            hooks_manifest(vec![binding(HttpRequest), binding(WebsocketMessage)]),
         ),
     ] {
         validate_manifest_bindings("test service", &manifest)
@@ -106,7 +106,7 @@ fn registration_requires_the_http_hooks_capability_it_supports() {
 
     let error = validate_manifest_bindings(
         "test service",
-        &session_manifest(vec![MiddlewareBinding {
+        &hooks_manifest(vec![MiddlewareBinding {
             phase: SupervisorMiddlewarePhase::PreReturn as i32,
             ..binding(HttpRequest)
         }]),
@@ -128,7 +128,7 @@ fn registration_requires_the_http_hooks_capability_it_supports() {
     };
     authorize_external_manifest(
         &registration,
-        &session_manifest(vec![preflight_only]),
+        &hooks_manifest(vec![preflight_only]),
         false,
         &BindingPolicy::Dynamic,
     )
@@ -137,7 +137,7 @@ fn registration_requires_the_http_hooks_capability_it_supports() {
         .expect_err("a legacy HTTP hook binding needs a payload limit");
     authorize_external_manifest(
         &registration,
-        &session_manifest(vec![binding(HttpRequest)]),
+        &hooks_manifest(vec![binding(HttpRequest)]),
         false,
         &BindingPolicy::Dynamic,
     )
@@ -177,7 +177,7 @@ struct ScriptedStage {
     /// Heads this stage received in `Begin`.
     begun: Arc<Mutex<Vec<Vec<HttpHeader>>>>,
     /// Preflights this stage received.
-    preflights: Arc<Mutex<Vec<HttpRequestSessionPreflight>>>,
+    preflights: Arc<Mutex<Vec<HttpRequestHookPreflight>>>,
     /// Request headers each response preflight carried.
     response_request_headers: Arc<Mutex<Vec<Vec<HttpHeader>>>>,
 }
@@ -213,9 +213,9 @@ impl ScriptedStage {
 
 #[allow(clippy::unnecessary_wraps)] // Matches the stream item type.
 fn result(
-    result: http_request_session_result::Result,
-) -> Result<HttpRequestSessionResult, tonic::Status> {
-    Ok(HttpRequestSessionResult {
+    result: http_request_hook_result::Result,
+) -> Result<HttpRequestHookResult, tonic::Status> {
+    Ok(HttpRequestHookResult {
         result: Some(result),
     })
 }
@@ -225,7 +225,7 @@ impl InProcessMiddleware for ScriptedStage {
     async fn describe(&self) -> MiddlewareManifest {
         MiddlewareManifest {
             name: self.name.into(),
-            ..session_manifest(vec![
+            ..hooks_manifest(vec![
                 binding(SupervisorMiddlewareOperation::HttpRequest),
                 binding(SupervisorMiddlewareOperation::HttpResponse),
             ])
@@ -247,10 +247,10 @@ impl InProcessMiddleware for ScriptedStage {
         Err(miette::miette!("HTTP hook test stage"))
     }
 
-    async fn open_http_request_session(
+    async fn open_http_request_hook(
         &self,
-        mut events: mpsc::Receiver<HttpRequestSessionEvent>,
-    ) -> Result<HttpRequestSessionResultStream, tonic::Status> {
+        mut events: mpsc::Receiver<HttpRequestHookEvent>,
+    ) -> Result<HttpRequestHookResultStream, tonic::Status> {
         let (sender, receiver) = mpsc::channel(4);
         let preflight = self.preflight.clone();
         let body = self.body;
@@ -282,7 +282,7 @@ impl InProcessMiddleware for ScriptedStage {
             let mut output_started = false;
             while let Some(event) = events.recv().await {
                 let reply = match event.event {
-                    Some(http_request_session_event::Event::Preflight(preflight_event)) => {
+                    Some(http_request_hook_event::Event::Preflight(preflight_event)) => {
                         preflights.lock().unwrap().push(preflight_event.clone());
                         assert!(preflight_event.request.is_some());
                         let buffered_limit = preflight_event
@@ -306,7 +306,7 @@ impl InProcessMiddleware for ScriptedStage {
                             &Preflight::Continue
                         } {
                             Preflight::Continue => {
-                                result(http_request_session_result::Result::PreflightResult(
+                                result(http_request_hook_result::Result::PreflightResult(
                                     HttpPreflightResult {
                                         decision: Some(
                                             http_preflight_result::Decision::ContinueWithoutBody(
@@ -327,7 +327,7 @@ impl InProcessMiddleware for ScriptedStage {
                                     }
                                     _ => http_inspect::Mode::Duplex(HttpDuplexMode {}),
                                 };
-                                result(http_request_session_result::Result::PreflightResult(
+                                result(http_request_hook_result::Result::PreflightResult(
                                     HttpPreflightResult {
                                         decision: Some(http_preflight_result::Decision::Inspect(
                                             HttpInspect { mode: Some(mode) },
@@ -338,7 +338,7 @@ impl InProcessMiddleware for ScriptedStage {
                                 ))
                             }
                             Preflight::Deny(code) => {
-                                result(http_request_session_result::Result::Deny(HttpDenial {
+                                result(http_request_hook_result::Result::Deny(HttpDenial {
                                     diagnostics: Some(MiddlewareDiagnostics {
                                         reason_code: (*code).to_string(),
                                         ..Default::default()
@@ -348,11 +348,11 @@ impl InProcessMiddleware for ScriptedStage {
                             Preflight::Fail(code) => Err(tonic::Status::new(*code, "scripted")),
                         }
                     }
-                    Some(http_request_session_event::Event::Begin(started)) => {
+                    Some(http_request_hook_event::Event::Begin(started)) => {
                         begun.lock().unwrap().push(started.headers);
                         if matches!(body, Body::Uppercase) && !output_after_input {
                             output_started = true;
-                            result(http_request_session_result::Result::OutputStart(
+                            result(http_request_hook_result::Result::OutputStart(
                                 HttpOutputStart {
                                     header_mutations: late_mutations.clone(),
                                     output_body_bytes: None,
@@ -362,8 +362,8 @@ impl InProcessMiddleware for ScriptedStage {
                             continue;
                         }
                     }
-                    Some(http_request_session_event::Event::WholeBody(buffered)) => result(
-                        http_request_session_result::Result::WholeBodyResult(HttpWholeBodyResult {
+                    Some(http_request_hook_event::Event::WholeBody(buffered)) => result(
+                        http_request_hook_result::Result::WholeBodyResult(HttpWholeBodyResult {
                             body: Some(match body {
                                 Body::Replace(replacement) => {
                                     http_whole_body_result::Body::Replacement(replacement.to_vec())
@@ -379,10 +379,10 @@ impl InProcessMiddleware for ScriptedStage {
                             ..Default::default()
                         }),
                     ),
-                    Some(http_request_session_event::Event::InputChunk(chunk)) => {
+                    Some(http_request_hook_event::Event::InputChunk(chunk)) => {
                         if !output_started {
                             sender
-                                .send(result(http_request_session_result::Result::OutputStart(
+                                .send(result(http_request_hook_result::Result::OutputStart(
                                     HttpOutputStart {
                                         header_mutations: late_mutations.clone(),
                                         output_body_bytes: None,
@@ -392,16 +392,16 @@ impl InProcessMiddleware for ScriptedStage {
                                 .unwrap();
                             output_started = true;
                         }
-                        result(http_request_session_result::Result::OutputChunk(
+                        result(http_request_hook_result::Result::OutputChunk(
                             HttpOutputChunk {
                                 data: chunk.data.to_ascii_uppercase(),
                             },
                         ))
                     }
-                    Some(http_request_session_event::Event::InputEnd(_)) => {
+                    Some(http_request_hook_event::Event::InputEnd(_)) => {
                         if !output_started {
                             sender
-                                .send(result(http_request_session_result::Result::OutputStart(
+                                .send(result(http_request_hook_result::Result::OutputStart(
                                     HttpOutputStart {
                                         header_mutations: late_mutations.clone(),
                                         output_body_bytes: None,
@@ -410,11 +410,11 @@ impl InProcessMiddleware for ScriptedStage {
                                 .await
                                 .unwrap();
                         }
-                        result(http_request_session_result::Result::Finish(
+                        result(http_request_hook_result::Result::Finish(
                             HttpFinish::default(),
                         ))
                     }
-                    Some(http_request_session_event::Event::SessionEnd(end)) => {
+                    Some(http_request_hook_event::Event::SessionEnd(end)) => {
                         ended.lock().unwrap().push(end.reason);
                         break;
                     }
@@ -430,14 +430,14 @@ impl InProcessMiddleware for ScriptedStage {
             receiver,
         )))
     }
-    async fn open_http_response_session(
+    async fn open_http_response_hook(
         &self,
-        mut events: mpsc::Receiver<openshell_core::proto::HttpResponseSessionEvent>,
-    ) -> Result<crate::HttpResponseSessionResultStream, tonic::Status> {
+        mut events: mpsc::Receiver<openshell_core::proto::HttpResponseHookEvent>,
+    ) -> Result<crate::HttpResponseHookResultStream, tonic::Status> {
         use futures::StreamExt as _;
         use openshell_core::proto::{
-            HttpResponseSessionResult, http_response_session_event::Event as E,
-            http_response_session_result::Result as R,
+            HttpResponseHookResult, http_response_hook_event::Event as E,
+            http_response_hook_result::Result as R,
         };
         let response_request_headers = Arc::clone(&self.response_request_headers);
         let (sender, receiver) = mpsc::channel(4);
@@ -450,7 +450,7 @@ impl InProcessMiddleware for ScriptedStage {
                             .lock()
                             .unwrap()
                             .push(response.request_headers.clone());
-                        http_request_session_event::Event::Preflight(HttpRequestSessionPreflight {
+                        http_request_hook_event::Event::Preflight(HttpRequestHookPreflight {
                             request: Some(openshell_core::proto::HttpRequestPreflightHead {
                                 target: response.target,
                                 headers: response.headers,
@@ -465,35 +465,27 @@ impl InProcessMiddleware for ScriptedStage {
                             declared_body_bytes: p.declared_body_bytes,
                         })
                     }
-                    E::Begin(v) => http_request_session_event::Event::Begin(v),
-                    E::WholeBody(v) => http_request_session_event::Event::WholeBody(v),
-                    E::InputChunk(v) => http_request_session_event::Event::InputChunk(v),
-                    E::InputEnd(v) => http_request_session_event::Event::InputEnd(v),
-                    E::SessionEnd(v) => http_request_session_event::Event::SessionEnd(v),
+                    E::Begin(v) => http_request_hook_event::Event::Begin(v),
+                    E::WholeBody(v) => http_request_hook_event::Event::WholeBody(v),
+                    E::InputChunk(v) => http_request_hook_event::Event::InputChunk(v),
+                    E::InputEnd(v) => http_request_hook_event::Event::InputEnd(v),
+                    E::SessionEnd(v) => http_request_hook_event::Event::SessionEnd(v),
                 });
-                if sender
-                    .send(HttpRequestSessionEvent { event })
-                    .await
-                    .is_err()
-                {
+                if sender.send(HttpRequestHookEvent { event }).await.is_err() {
                     break;
                 }
             }
         });
-        let results = self.open_http_request_session(receiver).await?;
+        let results = self.open_http_request_hook(receiver).await?;
         Ok(Box::pin(results.map(|result| {
-            result.map(|result| HttpResponseSessionResult {
+            result.map(|result| HttpResponseHookResult {
                 result: result.result.map(|result| match result {
-                    http_request_session_result::Result::PreflightResult(v) => {
-                        R::PreflightResult(v)
-                    }
-                    http_request_session_result::Result::WholeBodyResult(v) => {
-                        R::WholeBodyResult(v)
-                    }
-                    http_request_session_result::Result::OutputStart(v) => R::OutputStart(v),
-                    http_request_session_result::Result::OutputChunk(v) => R::OutputChunk(v),
-                    http_request_session_result::Result::Finish(v) => R::Finish(v),
-                    http_request_session_result::Result::Deny(v) => R::BlockDelivery(v),
+                    http_request_hook_result::Result::PreflightResult(v) => R::PreflightResult(v),
+                    http_request_hook_result::Result::WholeBodyResult(v) => R::WholeBodyResult(v),
+                    http_request_hook_result::Result::OutputStart(v) => R::OutputStart(v),
+                    http_request_hook_result::Result::OutputChunk(v) => R::OutputChunk(v),
+                    http_request_hook_result::Result::Finish(v) => R::Finish(v),
+                    http_request_hook_result::Result::Deny(v) => R::BlockDelivery(v),
                 }),
             })
         })))
@@ -598,7 +590,7 @@ async fn run_input(
         .map(|invocation| invocation.outcome)
         .collect();
     let preflight_mutations = mutation_values(&preflight.header_mutations);
-    let Some(session) = preflight.session.filter(|_| preflight.allowed) else {
+    let Some(session) = preflight.pipeline.filter(|_| preflight.allowed) else {
         return Run {
             allowed: preflight.allowed,
             reason: preflight.reason,
@@ -824,16 +816,16 @@ fn scripted(name: &'static str, preflight: Preflight, body: Body) -> Arc<Scripte
 /// Free HTTP hook slots, then free DUPLEX slots.
 fn free_slots(runner: &ChainRunner) -> (usize, usize) {
     (
-        runner.registry.http_session_admission.available_permits(),
+        runner.registry.http_hooks_admission.available_permits(),
         runner.registry.http_stream_admission.available_permits(),
     )
 }
 
 #[tokio::test]
-async fn a_message_holds_session_slots_only_while_a_stage_inspects_it() {
+async fn a_message_holds_hook_slots_only_while_a_stage_inspects_it() {
     use HttpBodyMode::{Duplex, WholeBody};
     let full = (
-        MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+        MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES,
         MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS,
     );
     for (case, stages, held) in [
@@ -876,7 +868,7 @@ async fn a_message_holds_session_slots_only_while_a_stage_inspects_it() {
             .expect("preflight");
         assert!(preflight.allowed, "{case}: {}", preflight.reason);
         assert_eq!(free_slots(&runner), held, "{case}");
-        let Some(session) = preflight.session else {
+        let Some(session) = preflight.pipeline else {
             continue;
         };
         let buffers = held.0 < full.0;
@@ -917,16 +909,16 @@ async fn a_message_holds_session_slots_only_while_a_stage_inspects_it() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn preflight_waits_for_a_session_slot_within_the_chain_deadline() {
+async fn preflight_waits_for_a_hook_slot_within_the_chain_deadline() {
     let (runner, described) = scripted_chain(vec![scripted(
         "example/a",
         Preflight::Continue,
         Body::Unchanged,
     )])
     .await;
-    let mut held = Arc::clone(&runner.registry.http_session_admission)
+    let mut held = Arc::clone(&runner.registry.http_hooks_admission)
         .acquire_many_owned(
-            u32::try_from(MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS).expect("slot count"),
+            u32::try_from(MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES).expect("slot count"),
         )
         .await
         .expect("hold every slot");
@@ -984,7 +976,7 @@ async fn waiting_for_a_stream_slot_does_not_hold_a_preflight_slot() {
                 .await
         })
     };
-    let waiting: Vec<_> = (0..MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS)
+    let waiting: Vec<_> = (0..MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES)
         .map(|_| spawn(streaming.clone()))
         .collect();
     let mixed = spawn(described.clone());
@@ -993,7 +985,7 @@ async fn waiting_for_a_stream_slot_does_not_hold_a_preflight_slot() {
     assert!(!mixed.is_finished());
     assert_eq!(
         free_slots(&runner),
-        (MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS, 0),
+        (MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES, 0),
         "waiting messages hold no preflight slot",
     );
 
@@ -1017,10 +1009,10 @@ async fn waiting_for_a_stream_slot_does_not_hold_a_preflight_slot() {
     drop(held.split(1));
     let mixed = mixed.await.expect("task").expect("preflight");
     assert!(mixed.allowed, "{}", mixed.reason);
-    assert!(mixed.session.is_some());
+    assert!(mixed.pipeline.is_some());
     assert_eq!(
         free_slots(&runner),
-        (MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS, 0),
+        (MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES, 0),
     );
 }
 
@@ -1272,7 +1264,7 @@ async fn run_response(
         .await
         .unwrap();
     assert!(preflight.allowed, "{}", preflight.reason);
-    let session = preflight.session.unwrap();
+    let session = preflight.pipeline.unwrap();
     let (input, inputs) = mpsc::channel(4);
     let (output, mut outputs) = mpsc::channel(4);
     let feed = async {
@@ -1449,7 +1441,7 @@ async fn downstream_preflight_waits_for_output_headers_without_spending_its_time
     assert!(second.preflights.lock().unwrap().is_empty());
     let (input, inputs) = mpsc::channel(4);
     let (output, mut outputs) = mpsc::channel(4);
-    let task = tokio::spawn(preflight.session.unwrap().run_with_body_policy(
+    let task = tokio::spawn(preflight.pipeline.unwrap().run_with_body_policy(
         inputs,
         output,
         TransformedBodyPolicy::NotPolicyRelevant,
@@ -1498,8 +1490,8 @@ async fn adjacent_buffered_stages_share_capacity_instead_of_deadlocking() {
         .preflight_described_http_request(described, request_input(b"hello"))
         .await
         .unwrap();
-    let held = Arc::clone(&runner.registry.http_session_admission)
-        .acquire_many_owned(u32::try_from(MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS - 1).unwrap())
+    let held = Arc::clone(&runner.registry.http_hooks_admission)
+        .acquire_many_owned(u32::try_from(MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES - 1).unwrap())
         .await
         .unwrap();
     let (input, inputs) = mpsc::channel(4);
@@ -1517,7 +1509,7 @@ async fn adjacent_buffered_stages_share_capacity_instead_of_deadlocking() {
     let collect = async { while outputs.recv().await.is_some() {} };
     let execute = async {
         let (finish, ()) = tokio::join!(
-            preflight.session.unwrap().run_with_body_policy(
+            preflight.pipeline.unwrap().run_with_body_policy(
                 inputs,
                 output,
                 TransformedBodyPolicy::NotPolicyRelevant
@@ -1533,7 +1525,7 @@ async fn adjacent_buffered_stages_share_capacity_instead_of_deadlocking() {
     assert_eq!(
         free_slots(&runner),
         (
-            MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+            MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES,
             MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS
         )
     );
@@ -1556,8 +1548,8 @@ async fn deferred_preflight_capacity_wait_is_bounded_and_releases_the_stream_slo
         .preflight_described_http_request(described, request_input(b"hello"))
         .await
         .unwrap();
-    let held = Arc::clone(&runner.registry.http_session_admission)
-        .acquire_many_owned(u32::try_from(MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS).unwrap())
+    let held = Arc::clone(&runner.registry.http_hooks_admission)
+        .acquire_many_owned(u32::try_from(MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES).unwrap())
         .await
         .unwrap();
     let (input, inputs) = mpsc::channel(4);
@@ -1574,7 +1566,7 @@ async fn deferred_preflight_capacity_wait_is_bounded_and_releases_the_stream_slo
     let (output, mut outputs) = mpsc::channel(4);
     let collect = async { while outputs.recv().await.is_some() {} };
     let (finish, ()) = tokio::join!(
-        preflight.session.unwrap().run_with_body_policy(
+        preflight.pipeline.unwrap().run_with_body_policy(
             inputs,
             output,
             TransformedBodyPolicy::NotPolicyRelevant
@@ -1588,7 +1580,7 @@ async fn deferred_preflight_capacity_wait_is_bounded_and_releases_the_stream_slo
     assert_eq!(
         free_slots(&runner),
         (
-            MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+            MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES,
             MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS
         )
     );
@@ -1613,7 +1605,7 @@ async fn cancellation_closes_only_opened_stages_and_releases_capacity() {
         .unwrap();
     let (_input, inputs) = mpsc::channel(4);
     let (output, _outputs) = mpsc::channel(4);
-    let task = tokio::spawn(preflight.session.unwrap().run_with_body_policy(
+    let task = tokio::spawn(preflight.pipeline.unwrap().run_with_body_policy(
         inputs,
         output,
         TransformedBodyPolicy::NotPolicyRelevant,
@@ -1631,7 +1623,7 @@ async fn cancellation_closes_only_opened_stages_and_releases_capacity() {
     assert_eq!(
         free_slots(&runner),
         (
-            MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
+            MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES,
             MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS
         )
     );

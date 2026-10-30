@@ -4,8 +4,8 @@
 //! Example OpenShell supervisor middleware service.
 //!
 //! The content guard redacts or denies configured terms in HTTP request and
-//! response bodies through HTTP hooks (`HttpSessionMiddleware.EvaluateRequest`
-//! and `HttpSessionMiddleware.EvaluateResponse`), and in WebSocket text messages. Its
+//! response bodies through HTTP hooks (`HttpHooks.EvaluateRequest`
+//! and `HttpHooks.EvaluateResponse`), and in WebSocket text messages. Its
 //! manifest requires the `openshell.supervisor-middleware.http-hooks`
 //! capability, which gateways and supervisors that predate HTTP hooks
 //! do not support, so they refuse it at Describe.
@@ -21,16 +21,14 @@ use openshell_core::extension_protocol::{
     ExtensionFamily, http_hooks_middleware_metadata, validate_gateway_metadata,
 };
 use openshell_core::middleware::{
-    HttpRequestSessionResultStream, HttpResponseSessionResultStream, WebSocketResponseStream,
+    HttpRequestHookResultStream, HttpResponseHookResultStream, WebSocketResponseStream,
 };
-use openshell_core::proto::middleware::v1::http_session_middleware_server::{
-    HttpSessionMiddleware, HttpSessionMiddlewareServer,
-};
+use openshell_core::proto::middleware::v1::http_hooks_server::{HttpHooks, HttpHooksServer};
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
     SupervisorMiddleware, SupervisorMiddlewareServer,
 };
 use openshell_core::proto::{
-    HttpRequestEvaluation, HttpRequestResult, HttpRequestSessionEvent, HttpResponseSessionEvent,
+    HttpRequestEvaluation, HttpRequestHookEvent, HttpRequestResult, HttpResponseHookEvent,
     MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest,
     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, ValidateConfigRequest,
     ValidateConfigResponse, WebSocketSessionEvent,
@@ -152,20 +150,20 @@ impl SupervisorMiddleware for ContentGuard {
 }
 
 #[tonic::async_trait]
-impl HttpSessionMiddleware for ContentGuard {
-    type EvaluateRequestStream = HttpRequestSessionResultStream;
-    type EvaluateResponseStream = HttpResponseSessionResultStream;
+impl HttpHooks for ContentGuard {
+    type EvaluateRequestStream = HttpRequestHookResultStream;
+    type EvaluateResponseStream = HttpResponseHookResultStream;
 
     async fn evaluate_request(
         &self,
-        request: Request<tonic::Streaming<HttpRequestSessionEvent>>,
+        request: Request<tonic::Streaming<HttpRequestHookEvent>>,
     ) -> Result<Response<Self::EvaluateRequestStream>, Status> {
         Ok(Response::new(http::request_stream(request.into_inner())))
     }
 
     async fn evaluate_response(
         &self,
-        request: Request<tonic::Streaming<HttpResponseSessionEvent>>,
+        request: Request<tonic::Streaming<HttpResponseHookEvent>>,
     ) -> Result<Response<Self::EvaluateResponseStream>, Status> {
         Ok(Response::new(http::response_stream(request.into_inner())))
     }
@@ -182,7 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
         )
         .add_service(
-            HttpSessionMiddlewareServer::new(ContentGuard)
+            HttpHooksServer::new(ContentGuard)
                 .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
         )

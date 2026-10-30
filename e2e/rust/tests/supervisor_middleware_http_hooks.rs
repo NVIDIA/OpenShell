@@ -7,7 +7,7 @@
 //!
 //! Runs the `supervisor-middleware-content-guard` example from this checkout
 //! as an operator-registered middleware service for the current gateway and
-//! Docker sandbox supervisor. `mise run e2e:middleware-http-session` builds the
+//! Docker sandbox supervisor. `mise run e2e:middleware-http-hooks` builds the
 //! example and exports `OPENSHELL_E2E_CONTENT_GUARD_BIN`; without it the test
 //! skips, unless `OPENSHELL_E2E_REQUIRE_MIDDLEWARE=1` makes the binary
 //! mandatory.
@@ -651,7 +651,7 @@ fn should_run() -> Option<String> {
     match std::env::var(BIN_ENV) {
         Ok(binary) if !binary.is_empty() => Some(binary),
         _ => skip(&format!(
-            "{BIN_ENV} is not set; run `mise run e2e:middleware-http-session`"
+            "{BIN_ENV} is not set; run `mise run e2e:middleware-http-hooks`"
         )),
     }
 }

@@ -926,7 +926,7 @@ where
 }
 
 /// Relay one request and its response. `live_body` carries a body that HTTP
-/// session hook request middleware streams; `req` then holds only its head.
+/// hook request middleware streams; `req` then holds only its head.
 pub(crate) async fn relay_http_request_with_body_guarded_observed<C, U>(
     req: &L7Request,
     client: &mut C,
@@ -2927,7 +2927,7 @@ pub(crate) async fn send_middleware_deny_response<C: AsyncWrite + Unpin>(
 /// Unlike an L7 policy denial, a middleware failure does not indicate a
 /// missing policy rule. The response therefore omits policy-advisor guidance
 /// and does not include the middleware runtime's diagnostic text. An HTTP
-/// session hook failure carries its platform-owned code and stage.
+/// hook failure carries its platform-owned code and stage.
 pub(crate) async fn send_middleware_failure_response<C: AsyncWrite + Unpin>(
     req: &L7Request,
     policy_name: &str,
@@ -7335,7 +7335,7 @@ mod tests {
     /// carries `late_mutations`. With `captured_request_headers`, it records
     /// the request headers its preflight carries.
     #[derive(Default)]
-    struct SessionEchoStage {
+    struct HookEchoStage {
         declared: Option<u64>,
         reject: bool,
         gate: Option<ResponseBodyGate>,
@@ -7343,14 +7343,14 @@ mod tests {
         captured_request_headers: Option<Arc<std::sync::Mutex<Option<Vec<HttpHeader>>>>>,
     }
 
-    async fn emit_session_result(
+    async fn emit_hook_result(
         sender: &mpsc::Sender<
-            std::result::Result<openshell_core::proto::HttpResponseSessionResult, tonic::Status>,
+            std::result::Result<openshell_core::proto::HttpResponseHookResult, tonic::Status>,
         >,
-        result: openshell_core::proto::http_response_session_result::Result,
+        result: openshell_core::proto::http_response_hook_result::Result,
     ) -> bool {
         sender
-            .send(Ok(openshell_core::proto::HttpResponseSessionResult {
+            .send(Ok(openshell_core::proto::HttpResponseHookResult {
                 result: Some(result),
             }))
             .await
@@ -7358,7 +7358,7 @@ mod tests {
     }
 
     #[tonic::async_trait]
-    impl openshell_supervisor_middleware::InProcessMiddleware for SessionEchoStage {
+    impl openshell_supervisor_middleware::InProcessMiddleware for HookEchoStage {
         async fn describe(&self) -> MiddlewareManifest {
             MiddlewareManifest {
                 name: "test/session-echo".into(),
@@ -7394,17 +7394,17 @@ mod tests {
             Err(miette!("HTTP hook test stage"))
         }
 
-        async fn open_http_response_session(
+        async fn open_http_response_hook(
             &self,
-            mut events: mpsc::Receiver<openshell_core::proto::HttpResponseSessionEvent>,
+            mut events: mpsc::Receiver<openshell_core::proto::HttpResponseHookEvent>,
         ) -> std::result::Result<
-            openshell_supervisor_middleware::HttpResponseSessionResultStream,
+            openshell_supervisor_middleware::HttpResponseHookResultStream,
             tonic::Status,
         > {
             use openshell_core::proto::{
                 HttpDenial, HttpDuplexMode, HttpFinish, HttpInspect, HttpOutputChunk,
                 HttpOutputStart, HttpPreflightResult, MiddlewareDiagnostics, http_inspect,
-                http_preflight_result, http_response_session_event, http_response_session_result,
+                http_preflight_result, http_response_hook_event, http_response_hook_result,
             };
             let (declared, reject, gate) = (self.declared, self.reject, self.gate.clone());
             let late_mutations = self.late_mutations.clone();
@@ -7413,14 +7413,14 @@ mod tests {
             tokio::spawn(async move {
                 while let Some(event) = events.recv().await {
                     let sent = match event.event {
-                        Some(http_response_session_event::Event::Preflight(preflight)) => {
+                        Some(http_response_hook_event::Event::Preflight(preflight)) => {
                             if let Some(captured) = &captured_request_headers {
                                 *captured.lock().expect("preflight capture lock") =
                                     preflight.response.map(|response| response.request_headers);
                             }
-                            emit_session_result(
+                            emit_hook_result(
                                 &sender,
-                                http_response_session_result::Result::PreflightResult(
+                                http_response_hook_result::Result::PreflightResult(
                                     HttpPreflightResult {
                                         decision: Some(http_preflight_result::Decision::Inspect(
                                             HttpInspect {
@@ -7435,32 +7435,28 @@ mod tests {
                             )
                             .await
                         }
-                        Some(http_response_session_event::Event::Begin(_)) => {
-                            emit_session_result(
+                        Some(http_response_hook_event::Event::Begin(_)) => {
+                            emit_hook_result(
                                 &sender,
-                                http_response_session_result::Result::OutputStart(
-                                    HttpOutputStart {
-                                        header_mutations: late_mutations.clone(),
-                                        output_body_bytes: declared,
-                                    },
-                                ),
+                                http_response_hook_result::Result::OutputStart(HttpOutputStart {
+                                    header_mutations: late_mutations.clone(),
+                                    output_body_bytes: declared,
+                                }),
                             )
                             .await
                         }
-                        Some(http_response_session_event::Event::InputChunk(_))
+                        Some(http_response_hook_event::Event::InputChunk(_))
                             if declared == Some(0) =>
                         {
                             true
                         }
-                        Some(http_response_session_event::Event::InputChunk(chunk)) => {
+                        Some(http_response_hook_event::Event::InputChunk(chunk)) => {
                             let (first, rest) = chunk.data.split_at(1);
-                            let mut sent = emit_session_result(
+                            let mut sent = emit_hook_result(
                                 &sender,
-                                http_response_session_result::Result::OutputChunk(
-                                    HttpOutputChunk {
-                                        data: first.to_vec(),
-                                    },
-                                ),
+                                http_response_hook_result::Result::OutputChunk(HttpOutputChunk {
+                                    data: first.to_vec(),
+                                }),
                             )
                             .await;
                             if let Some(gate) = &gate {
@@ -7468,9 +7464,9 @@ mod tests {
                                 gate.release.notified().await;
                             }
                             if sent && !rest.is_empty() {
-                                sent = emit_session_result(
+                                sent = emit_hook_result(
                                     &sender,
-                                    http_response_session_result::Result::OutputChunk(
+                                    http_response_hook_result::Result::OutputChunk(
                                         HttpOutputChunk {
                                             data: rest.to_vec(),
                                         },
@@ -7480,10 +7476,10 @@ mod tests {
                             }
                             sent
                         }
-                        Some(http_response_session_event::Event::InputEnd(_)) if reject => {
-                            emit_session_result(
+                        Some(http_response_hook_event::Event::InputEnd(_)) if reject => {
+                            emit_hook_result(
                                 &sender,
-                                http_response_session_result::Result::BlockDelivery(HttpDenial {
+                                http_response_hook_result::Result::BlockDelivery(HttpDenial {
                                     diagnostics: Some(MiddlewareDiagnostics {
                                         reason_code: "late_match".into(),
                                         ..Default::default()
@@ -7492,10 +7488,10 @@ mod tests {
                             )
                             .await
                         }
-                        Some(http_response_session_event::Event::InputEnd(_)) => {
-                            emit_session_result(
+                        Some(http_response_hook_event::Event::InputEnd(_)) => {
+                            emit_hook_result(
                                 &sender,
-                                http_response_session_result::Result::Finish(HttpFinish::default()),
+                                http_response_hook_result::Result::Finish(HttpFinish::default()),
                             )
                             .await
                         }
@@ -7510,8 +7506,8 @@ mod tests {
         }
     }
 
-    fn session_echo_fixture(
-        stage: SessionEchoStage,
+    fn hook_echo_fixture(
+        stage: HookEchoStage,
     ) -> (
         openshell_supervisor_middleware::ChainRunner,
         Vec<openshell_supervisor_middleware::ChainEntry>,
@@ -7528,7 +7524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_response_holds_back_completion_until_the_stage_finishes() {
+    async fn hook_response_holds_back_completion_until_the_stage_finishes() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         for (name, declared, reject, expected_end) in [
             ("declared length, finished", Some(5), false, "\r\n\r\nhello"),
@@ -7538,7 +7534,7 @@ mod tests {
             // No terminating chunk follows a rejection.
             ("chunked, rejected", None, true, "1\r\nh\r\n4\r\nello\r\n"),
         ] {
-            let (runner, chain) = session_echo_fixture(SessionEchoStage {
+            let (runner, chain) = hook_echo_fixture(HookEchoStage {
                 declared,
                 reject,
                 ..Default::default()
@@ -7564,9 +7560,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_response_preflight_carries_forwarded_request_headers() {
+    async fn hook_response_preflight_carries_forwarded_request_headers() {
         let captured = Arc::new(std::sync::Mutex::new(None));
-        let (runner, chain) = session_echo_fixture(SessionEchoStage {
+        let (runner, chain) = hook_echo_fixture(HookEchoStage {
             declared: Some(5),
             captured_request_headers: Some(Arc::clone(&captured)),
             ..Default::default()
@@ -7620,9 +7616,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_response_without_forwarded_request_head_fails_closed() {
+    async fn hook_response_without_forwarded_request_head_fails_closed() {
         let captured = Arc::new(std::sync::Mutex::new(None));
-        let (runner, chain) = session_echo_fixture(SessionEchoStage {
+        let (runner, chain) = hook_echo_fixture(HookEchoStage {
             captured_request_headers: Some(Arc::clone(&captured)),
             ..Default::default()
         });
@@ -7655,7 +7651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_response_stages_own_integrity_headers() {
+    async fn hook_response_stages_own_integrity_headers() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"v1\"\r\nContent-MD5: md5\r\n\r\nhello";
         for (name, late_mutations, kept, absent) in [
             // A DUPLEX stage that passes the body through keeps the
@@ -7677,7 +7673,7 @@ mod tests {
                 vec!["content-md5", "\"v1\""],
             ),
         ] {
-            let (runner, chain) = session_echo_fixture(SessionEchoStage {
+            let (runner, chain) = hook_echo_fixture(HookEchoStage {
                 declared: Some(5),
                 late_mutations,
                 ..Default::default()
@@ -7705,10 +7701,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_response_holds_the_head_of_an_empty_declared_body() {
+    async fn hook_response_holds_the_head_of_an_empty_declared_body() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         for reject in [false, true] {
-            let (runner, chain) = session_echo_fixture(SessionEchoStage {
+            let (runner, chain) = hook_echo_fixture(HookEchoStage {
                 declared: Some(0),
                 reject,
                 ..Default::default()
@@ -7742,10 +7738,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_response_checks_the_policy_generation_before_every_write() {
+    async fn hook_response_checks_the_policy_generation_before_every_write() {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let (runner, chain) = session_echo_fixture(SessionEchoStage {
+        let (runner, chain) = hook_echo_fixture(HookEchoStage {
             declared: None,
             reject: false,
             gate: Some(ResponseBodyGate {
