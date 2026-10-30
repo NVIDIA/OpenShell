@@ -28,6 +28,9 @@ mod otlp_relay;
 mod provider_readiness;
 pub mod sandbox_instance_host;
 pub mod shared_host;
+#[cfg(test)]
+#[path = "../../../tests/support/environment.rs"]
+mod test_environment;
 
 use config_runtime::{agent_proposals_enabled_from_settings, run_policy_poll_loop};
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -1304,7 +1307,8 @@ pub async fn run_sandbox_instance(
     let (mut otlp_relay, otlp_reserved_destination) = otlp_relay::activate(
         otlp_agent_endpoint,
         otlp_agent_protocol,
-        auth_bundle.agent_otlp_headers.clone(),
+        auth_bundle.agent_otlp().headers.cloned(),
+        auth_bundle.agent_otlp().tls.cloned(),
         sandbox_id.clone(),
     );
 
@@ -4653,6 +4657,10 @@ mod tests {
             traces_otlp_headers: None,
             ocsf_otlp_headers: None,
             agent_otlp_headers: None,
+            otlp_tls: Vec::new(),
+            traces_otlp_tls: None,
+            ocsf_otlp_tls: None,
+            agent_otlp_tls: None,
         };
         let config = SandboxInstanceConfig {
             app_router: None,
