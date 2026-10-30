@@ -539,11 +539,7 @@ pub async fn spawn(
     let guest_tls_paths = compute_driver_guest_tls_paths(vm_config)?;
     prepare_compute_driver_socket_path(vm_config, &socket_path)?;
 
-    let mut command = Command::new(&driver_bin);
-    command.kill_on_drop(true);
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::inherit());
-    command.stderr(Stdio::inherit());
+    let mut command = compute_driver_command(&driver_bin);
     command.arg("--bind-socket").arg(&socket_path);
     command.arg("--admission-config-json").arg(
         serde_json::to_string(&openshell_core::resource_admission::DriverAdmissionConfig {
@@ -597,6 +593,27 @@ pub async fn spawn(
     Ok(AcquiredRemoteDriverEndpoint::managed(
         "vm", channel, process,
     ))
+}
+
+/// Base command for the VM compute-driver subprocess.
+///
+/// The driver gets its own process group. Ctrl+C on a foreground gateway
+/// sends SIGINT to the terminal's foreground process group; if the driver
+/// shared the gateway's group it would exit on that signal before the
+/// gateway's shutdown sweep could stop its sandboxes. In its own group the
+/// driver keeps serving until the gateway stops it through
+/// `ManagedDriverProcess::shutdown` after the sweep. A gateway that dies
+/// without that shutdown still takes the driver with it: the driver arms a
+/// parent-death signal at startup, which does not depend on the group.
+#[cfg(unix)]
+fn compute_driver_command(driver_bin: &Path) -> Command {
+    let mut command = Command::new(driver_bin);
+    command.kill_on_drop(true);
+    command.process_group(0);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::inherit());
+    command.stderr(Stdio::inherit());
+    command
 }
 
 fn validate_vm_sandbox_identity(config: &VmComputeConfig) -> Result<()> {
@@ -797,10 +814,10 @@ async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
 mod tests {
     use super::{
         VmComputeConfig, append_otlp_args, append_vm_identity_args, append_vm_network_trust_args,
-        append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args, compute_driver_guest_tls_paths,
-        compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
-        prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
-        validate_vm_sandbox_identity,
+        append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args, compute_driver_command,
+        compute_driver_guest_tls_paths, compute_driver_socket_path, current_euid,
+        prepare_compute_driver_socket_path, prepare_vm_state_dir, resolve_compute_driver_bin,
+        resolve_driver_search_dirs, validate_vm_sandbox_identity,
     };
     use openshell_core::{NetworkSupervisorTrustBundle, UpstreamProxyConfig};
     use openshell_server::config_file::{OcsfOtlpConfig, OtlpConfig, OtlpTracesConfig};
@@ -843,6 +860,30 @@ mod tests {
         }
         .validate_configuration()
         .expect("an explicit bootstrap image is valid");
+    }
+
+    #[tokio::test]
+    async fn vm_driver_command_runs_driver_in_its_own_process_group() {
+        use rustix::process::{Pid, getpgid};
+
+        let mut child = compute_driver_command(std::path::Path::new("sleep"))
+            .arg("30")
+            .spawn()
+            .expect("spawn stand-in driver");
+        let pid = Pid::from_raw(i32::try_from(child.id().expect("child pid")).unwrap())
+            .expect("child pid is non-zero");
+        let child_group = getpgid(Some(pid)).expect("read child process group");
+        let gateway_group = getpgid(None).expect("read own process group");
+        child.kill().await.expect("stop stand-in driver");
+
+        assert_eq!(
+            child_group, pid,
+            "the driver must lead its own process group"
+        );
+        assert_ne!(
+            child_group, gateway_group,
+            "terminal SIGINT to the gateway's group must not reach the driver"
+        );
     }
 
     #[test]
