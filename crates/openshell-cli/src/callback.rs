@@ -20,15 +20,17 @@
 //!   runtimes with user-mode networking (pasta, slirp4netns) can only reach
 //!   listeners bound to `0.0.0.0`, so a wrapper sets this to `0.0.0.0`
 //!   inside the container while publishing the port to host loopback only.
-//!   The browser-facing redirect URL stays `http://127.0.0.1:<port>/...`
-//!   either way, so no identity-provider allowlist change is needed.
+//!   IPv6 addresses work too (for example `::1` or `::`): the browser-facing
+//!   callback URL derives from the bound address (see [`callback_host`]), so
+//!   an IPv6-bound listener directs the browser to `http://[::1]:<port>/...`
+//!   instead of the unreachable `127.0.0.1`.
 //!
 //! Both variables default to unset, preserving the historical
 //! `127.0.0.1:<ephemeral>` behavior. Binding `0.0.0.0` on a host machine
 //! would expose the callback server to the local network, so it is never the
 //! default and always requires the explicit variable.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use miette::Result;
 use tokio::net::TcpListener;
@@ -65,6 +67,33 @@ pub(crate) async fn bind_callback_listener() -> Result<TcpListener> {
     TcpListener::bind(addr)
         .await
         .map_err(|e| bind_error(addr, e))
+}
+
+/// The IP address a browser uses to reach a bound callback listener.
+///
+/// Callback URLs target the bound address, except that wildcard binds are
+/// reached through the matching loopback address: a listener on `0.0.0.0`
+/// accepts `127.0.0.1` connections and a listener on `::` accepts `::1`
+/// connections, so the browser is sent to the loopback literal of that
+/// family (the container wrapper publishes the port to host loopback).
+pub(crate) fn callback_target(local_addr: SocketAddr) -> IpAddr {
+    match local_addr.ip() {
+        IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    }
+}
+
+/// The host a browser uses to reach a bound callback listener, in URL form.
+///
+/// IPv4 addresses render bare (`127.0.0.1`); IPv6 addresses are bracketed
+/// (`[::1]`) as required by RFC 3986/RFC 8252. Use
+/// [`callback_target`] for the unbracketed literal.
+pub(crate) fn callback_host(local_addr: SocketAddr) -> String {
+    match callback_target(local_addr) {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    }
 }
 
 /// Parse and validate [`CALLBACK_PORT_ENV`].
@@ -108,7 +137,6 @@ fn bind_error(addr: SocketAddr, source: std::io::Error) -> miette::Report {
 mod tests {
     use super::*;
     use crate::test_utils::Environment;
-    use std::net::Ipv6Addr;
 
     /// Bind an ephemeral loopback listener, return its (now freed) port.
     async fn free_loopback_port() -> u16 {
@@ -157,6 +185,67 @@ mod tests {
             );
             assert!(msg.contains("IP address"), "value {raw:?}: {msg}");
         }
+    }
+
+    #[test]
+    fn callback_host_maps_bindings_to_reachable_url_hosts() {
+        let parse = |s: &str| -> SocketAddr { s.parse().expect("addr") };
+        // Wildcard binds are reached through the matching loopback literal.
+        assert_eq!(callback_host(parse("0.0.0.0:8080")), "127.0.0.1");
+        assert_eq!(callback_host(parse("[::]:8080")), "[::1]");
+        // Loopback binds keep their address; IPv6 renders bracketed.
+        assert_eq!(callback_host(parse("127.0.0.1:8080")), "127.0.0.1");
+        assert_eq!(callback_host(parse("[::1]:8080")), "[::1]");
+        // Explicit specific addresses are addressed literally.
+        assert_eq!(callback_host(parse("192.168.1.5:8080")), "192.168.1.5");
+        assert_eq!(callback_host(parse("[2001:db8::5]:8080")), "[2001:db8::5]");
+    }
+
+    #[test]
+    fn callback_target_maps_bindings_to_reachable_ips() {
+        let parse = |s: &str| -> SocketAddr { s.parse().expect("addr") };
+        assert_eq!(
+            callback_target(parse("0.0.0.0:8080")),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            callback_target(parse("[::]:8080")),
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
+        assert_eq!(
+            callback_target(parse("[2001:db8::5]:8080")),
+            IpAddr::V6("2001:db8::5".parse::<Ipv6Addr>().expect("v6"))
+        );
+    }
+
+    #[tokio::test]
+    async fn ipv6_callback_is_reachable_at_advertised_host() {
+        // Callback reachability: an IPv6-bound listener must be reachable at
+        // exactly the host the browser flows advertise, and (on a host
+        // without the address) must NOT be reachable via IPv4 loopback.
+        Environment::new()
+            .remove(CALLBACK_PORT_ENV)
+            .set(CALLBACK_BIND_ADDRESS_ENV, "::1")
+            .run_async(async {
+                let listener = bind_callback_listener().await.expect("ipv6 bind");
+                let addr = listener.local_addr().expect("local addr");
+                let host = callback_host(addr);
+                assert_eq!(host, "[::1]");
+
+                let v6 = SocketAddr::new(
+                    IpAddr::V6("::1".parse::<Ipv6Addr>().expect("v6")),
+                    addr.port(),
+                );
+                let stream = tokio::net::TcpStream::connect(v6)
+                    .await
+                    .expect("[::1] callback must be reachable");
+                drop(stream);
+
+                let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port());
+                let refused = tokio::net::TcpStream::connect(v4).await;
+                assert!(refused.is_err(), "IPv4 loopback must not reach a ::1 bind");
+            })
+            .await;
     }
 
     #[test]

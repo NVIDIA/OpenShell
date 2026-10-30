@@ -173,13 +173,16 @@ fn device_token_form(
 
 /// Build the OIDC redirect URI for a bound callback listener.
 ///
-/// The URI always points at IPv4 loopback, even when the listener binds
-/// `0.0.0.0` inside a container: the host-published port and the identity
-/// provider allowlist (`http://127.0.0.1:*`) both target host loopback. See
-/// the `callback` module docs for the environment-variable controls.
+/// The URI derives from the listener's bound address (see
+/// [`crate::callback::callback_host`]): IPv4 binds and the default bind use
+/// `http://127.0.0.1:<port>/callback`, while IPv6 binds use the bracketed
+/// literal (`http://[::1]:<port>/callback`), matching RFC 8252 loopback
+/// redirects. Identity providers that allowlist `http://127.0.0.1:*` for
+/// native apps should also allowlist `http://[::1]:*`.
 fn callback_redirect_uri(listener: &TcpListener) -> Result<String> {
-    let port = listener.local_addr().into_diagnostic()?.port();
-    Ok(format!("http://127.0.0.1:{port}/callback"))
+    let local_addr = listener.local_addr().into_diagnostic()?;
+    let host = crate::callback::callback_host(local_addr);
+    Ok(format!("http://{host}:{}/callback", local_addr.port()))
 }
 
 /// Run the OIDC Authorization Code + PKCE browser flow.
@@ -1051,7 +1054,7 @@ mod tests {
 
     use crate::callback::{CALLBACK_BIND_ADDRESS_ENV, CALLBACK_PORT_ENV};
     use crate::test_utils::Environment;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     /// Bind an ephemeral loopback listener, return its (now freed) port.
     async fn free_loopback_port() -> u16 {
@@ -1103,10 +1106,48 @@ mod tests {
 
                 assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
                 assert_eq!(addr.port(), expected);
-                // The redirect URI stays on 127.0.0.1 even for a wildcard bind so the
-                // identity-provider allowlist keeps matching.
+                // The redirect URI stays on 127.0.0.1 for an IPv4 wildcard
+                // bind so the identity-provider allowlist keeps matching.
                 let uri = callback_redirect_uri(&listener).expect("redirect uri");
                 assert_eq!(uri, format!("http://127.0.0.1:{expected}/callback"));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn browser_flow_redirect_uri_follows_ipv6_bind() {
+        Environment::new()
+            .remove(CALLBACK_PORT_ENV)
+            .set(CALLBACK_BIND_ADDRESS_ENV, "::1")
+            .run_async(async {
+                let listener = crate::callback::bind_callback_listener()
+                    .await
+                    .expect("ipv6 bind");
+                let addr = listener.local_addr().expect("local addr");
+
+                assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+                // RFC 8252 loopback redirect with the bracketed IPv6 literal,
+                // so the browser actually reaches the ::1-bound listener.
+                let uri = callback_redirect_uri(&listener).expect("redirect uri");
+                assert_eq!(uri, format!("http://[::1]:{}/callback", addr.port()));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn browser_flow_redirect_uri_uses_ipv6_loopback_for_wildcard_v6_bind() {
+        Environment::new()
+            .remove(CALLBACK_PORT_ENV)
+            .set(CALLBACK_BIND_ADDRESS_ENV, "::")
+            .run_async(async {
+                let listener = crate::callback::bind_callback_listener()
+                    .await
+                    .expect("wildcard ipv6 bind");
+                let addr = listener.local_addr().expect("local addr");
+
+                assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+                let uri = callback_redirect_uri(&listener).expect("redirect uri");
+                assert_eq!(uri, format!("http://[::1]:{}/callback", addr.port()));
             })
             .await;
     }

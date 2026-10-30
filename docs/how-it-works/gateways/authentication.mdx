@@ -335,7 +335,7 @@ When the CLI runs inside a container, the wrapper cannot know a randomly chosen 
 | Environment variable | Purpose | Default |
 |---|---|---|
 | `OPENSHELL_CALLBACK_PORT` | Pin the callback listener to a fixed TCP port (an integer from 1 to 65535) so a container wrapper can publish `-p 127.0.0.1:<port>:<port>` before login starts. | Unset (ephemeral port) |
-| `OPENSHELL_CALLBACK_BIND_ADDRESS` | Override the listener bind address (an IP address). Container runtimes with user-mode networking (pasta, slirp4netns) can only reach listeners bound to `0.0.0.0`, so a wrapper sets this to `0.0.0.0` inside the container. | `127.0.0.1` |
+| `OPENSHELL_CALLBACK_BIND_ADDRESS` | Override the listener bind address (an IP address). Container runtimes with user-mode networking (pasta, slirp4netns) can only reach listeners bound to `0.0.0.0`, so a wrapper sets this to `0.0.0.0` inside the container. IPv6 addresses such as `::1` or `::` are also accepted. | `127.0.0.1` |
 
 For example, a wrapper running the CLI in a container sets both variables and publishes the fixed port to host loopback only:
 
@@ -343,7 +343,7 @@ For example, a wrapper running the CLI in a container sets both variables and pu
 OPENSHELL_CALLBACK_PORT=18080 OPENSHELL_CALLBACK_BIND_ADDRESS=0.0.0.0 openshell gateway login
 ```
 
-The browser-facing redirect URL stays `http://127.0.0.1:<port>/callback` (or the edge flow's `callback_port`) even when the listener binds `0.0.0.0`, so no identity-provider redirect allowlist change is needed.
+The browser-facing callback URL derives from the bound address, so the listener is always reachable: IPv4 binds (including the default and `0.0.0.0`) use `http://127.0.0.1:<port>/callback`, and IPv6 binds use the bracketed RFC 8252 loopback form `http://[::1]:<port>/callback`. The bundled Keycloak realm allows `http://127.0.0.1:*`, `http://localhost:*`, and `http://[::1]:*` redirects for the CLI client; other identity providers that allowlist loopback redirects for native apps should include the `[::1]` form as well. In the edge flow the CLI passes the callback host to the gateway's connect page, which accepts loopback IP literals only, so an IPv6-bound CLI is reached at `[::1]` there too.
 
 Binding `0.0.0.0` on a host machine would expose the callback server to the local network, so the CLI never does it by default: the bind address only changes when `OPENSHELL_CALLBACK_BIND_ADDRESS` is set explicitly. With both variables unset, the listener binds `127.0.0.1` on an ephemeral port exactly as before. An invalid port or address value, or a fixed port that is already in use, fails the login command with a clear error instead of falling back silently.
 

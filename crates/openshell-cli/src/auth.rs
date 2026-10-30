@@ -81,11 +81,21 @@ fn generate_confirmation_code() -> String {
     code
 }
 
-/// Build the gateway `/auth/connect` URL carrying the local callback port
-/// and the one-time confirmation code.
-fn auth_connect_url(gateway_endpoint: &str, callback_port: u16, code: &str) -> String {
+/// Build the gateway `/auth/connect` URL carrying the local callback host
+/// and port plus the one-time confirmation code.
+///
+/// `callback_host` is the unbracketed IP literal the browser should use to
+/// reach the CLI callback server (for example `127.0.0.1` or `::1`). The
+/// gateway page brackets IPv6 literals when building the fetch URL and only
+/// accepts loopback addresses.
+fn auth_connect_url(
+    gateway_endpoint: &str,
+    callback_host: &str,
+    callback_port: u16,
+    code: &str,
+) -> String {
     format!(
-        "{}/auth/connect?callback_port={callback_port}&code={code}",
+        "{}/auth/connect?callback_port={callback_port}&callback_host={callback_host}&code={code}",
         gateway_endpoint.trim_end_matches('/')
     )
 }
@@ -123,10 +133,11 @@ pub async fn browser_auth_flow(gateway_endpoint: &str) -> Result<String> {
     let listener = crate::callback::bind_callback_listener().await?;
     let local_addr = listener.local_addr().into_diagnostic()?;
     let callback_port = local_addr.port();
+    let callback_host = crate::callback::callback_target(local_addr).to_string();
 
     let code = generate_confirmation_code();
 
-    let auth_url = auth_connect_url(gateway_endpoint, callback_port, &code);
+    let auth_url = auth_connect_url(gateway_endpoint, &callback_host, callback_port, &code);
 
     // Channel to receive the token from the callback handler.
     let (tx, rx) = oneshot::channel::<String>();
@@ -892,7 +903,7 @@ mod tests {
 
     use crate::callback::{CALLBACK_BIND_ADDRESS_ENV, CALLBACK_PORT_ENV};
     use crate::test_utils::Environment;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     /// Bind an ephemeral loopback listener, return its (now freed) port.
     async fn free_loopback_port() -> u16 {
@@ -923,11 +934,12 @@ mod tests {
 
                 assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
                 assert_ne!(addr.port(), 0);
-                let url = auth_connect_url(TEST_GATEWAY, addr.port(), "ABC-1234");
+                let url = auth_connect_url(TEST_GATEWAY, "127.0.0.1", addr.port(), "ABC-1234");
                 assert!(
                     url.contains(&format!("callback_port={}", addr.port())),
                     "auth URL: {url}"
                 );
+                assert!(url.contains("callback_host=127.0.0.1"), "auth URL: {url}");
             })
             .await;
     }
@@ -947,13 +959,37 @@ mod tests {
 
                 assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
                 assert_eq!(addr.port(), expected);
-                // The gateway auth URL advertises the fixed port so the wrapper's
-                // published `-p 127.0.0.1:<port>:<port>` mapping reaches the listener.
-                let url = auth_connect_url(TEST_GATEWAY, addr.port(), "ABC-1234");
+                // The gateway auth URL advertises the fixed port and the
+                // IPv4 loopback target so the wrapper's published
+                // `-p 127.0.0.1:<port>:<port>` mapping reaches the listener.
+                let url = auth_connect_url(TEST_GATEWAY, "127.0.0.1", addr.port(), "ABC-1234");
                 assert!(
                     url.contains(&format!("callback_port={expected}")),
                     "auth URL: {url}"
                 );
+                assert!(url.contains("callback_host=127.0.0.1"), "auth URL: {url}");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn browser_flow_advertises_ipv6_loopback_callback_host() {
+        Environment::new()
+            .remove(CALLBACK_PORT_ENV)
+            .set(CALLBACK_BIND_ADDRESS_ENV, "::1")
+            .run_async(async {
+                let listener = crate::callback::bind_callback_listener()
+                    .await
+                    .expect("ipv6 bind");
+                let addr = listener.local_addr().expect("local addr");
+
+                assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+                // The auth URL carries the unbracketed IPv6 literal; the
+                // gateway page brackets it when building the fetch URL.
+                let host = crate::callback::callback_target(addr).to_string();
+                assert_eq!(host, "::1");
+                let url = auth_connect_url(TEST_GATEWAY, &host, addr.port(), "ABC-1234");
+                assert!(url.contains("callback_host=::1"), "auth URL: {url}");
             })
             .await;
     }
