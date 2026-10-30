@@ -458,6 +458,21 @@ allow_unauthenticated_users = true
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
+For a gateway behind Cloudflare Access, `[openshell.gateway.edge_auth]` verifies the Access token on every request instead:
+
+```toml
+[openshell.gateway.edge_auth]
+provider      = "cloudflare_access"
+issuer        = "https://example-team.cloudflareaccess.com"
+audience      = "<application-aud-tag>"
+jwks_ttl_secs = 3600 # Must be greater than zero.
+roles_claim   = "custom.groups" # Optional.
+admin_role    = "openshell-admin" # Optional; set together with user_role.
+user_role     = "openshell-user"
+```
+
+The issuer must use HTTPS and the audience must not be empty. Leave `roles_claim`, `admin_role`, and `user_role` empty for authentication-only mode, where every verified caller is a platform admin and workspace membership is not enforced. Setting a role requires `roles_claim`, and `admin_role` and `user_role` must be set together. The gateway refuses to start when `edge_auth` is combined with `[openshell.gateway.oidc]` or `allow_unauthenticated_users`. See [Verify Cloudflare Access Tokens](/kubernetes/access-control#verify-cloudflare-access-tokens).
+
 ## Service Routing
 
 Sandbox service URLs default to a readable composite hostname:

@@ -48,6 +48,7 @@ use crate::{
     auth::audit::{self, AuthzDenial, ConnectionSource, RequestOrigin},
     auth::authenticator::{AuthFailureReason, AuthMechanism, Authentication, AuthenticatorChain},
     auth::authz::AuthzPolicy,
+    auth::edge::EdgeAuthenticator,
     auth::identity::Identity,
     auth::oidc::{self, OidcAuthenticator},
     auth::principal::{OperatorPrincipal, Principal, UserPrincipal},
@@ -313,11 +314,7 @@ impl MultiplexService {
             self.state.gateway_interceptors.clone(),
             Some(self.state.clone()),
         );
-        let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
-            admin_role: oidc.admin_role.clone(),
-            user_role: oidc.user_role.clone(),
-            scopes_enabled: !oidc.scopes_claim.is_empty(),
-        });
+        let authz_policy = AuthzPolicy::from_config(&self.state.config);
         let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
             GrpcRouter::new(openshell, reflection).with_sandbox_updates(sandbox_updates),
@@ -1084,6 +1081,8 @@ where
 /// 5. `OidcAuthenticator` — validates user Bearer tokens against the
 ///    configured OIDC issuer. Returns `Unauthenticated` for missing
 ///    Bearer headers so non-OIDC clients can't sneak through.
+/// 6. `EdgeAuthenticator`: validates the edge proxy's signed token against
+///    the configured issuer and audience. Never configured with OIDC.
 ///
 /// Once sandbox authentication is configured, callers must present an
 /// explicit credential for authenticated gRPC methods. Missing bearer auth
@@ -1094,7 +1093,7 @@ where
 ///
 /// When no bearer authenticators are configured, the chain is left as `None`.
 /// The router still requires an mTLS principal or the explicit development opt-in.
-fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
+pub fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
     if let Some(peer) = state.peer_authenticator.clone() {
         authenticators.push(peer);
@@ -1115,6 +1114,9 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
     }
     if let Some(cache) = state.oidc_cache.clone() {
         authenticators.push(Arc::new(OidcAuthenticator::new(cache)));
+    }
+    if let Some(cache) = state.edge_auth_cache.clone() {
+        authenticators.push(Arc::new(EdgeAuthenticator::new(cache)));
     }
     if authenticators.is_empty() {
         return None;
@@ -1160,7 +1162,7 @@ impl<S> AuthGrpcRouter<S> {
         Self::with_peer_identity(inner, authenticator_chain, authz_policy, None, false, false)
     }
 
-    fn with_peer_identity(
+    pub(crate) fn with_peer_identity(
         inner: S,
         authenticator_chain: Option<AuthenticatorChain>,
         authz_policy: Option<AuthzPolicy>,
@@ -4701,6 +4703,31 @@ mod tests {
             assert_eq!(events[0]["auth_protocol"], "OpenID");
             assert_redacted(&events[0], "canary-secret-token");
             assert_redacted(&events[0], "ExpiredSignature");
+        }
+
+        #[tokio::test]
+        async fn rejected_edge_credential_emits_classified_authentication_failure() {
+            let path = "/openshell.v1.OpenShell/ListSandboxes";
+            let (status, events) = call_with_rejection(
+                AuthRejection::new(
+                    AuthMechanism::CloudflareAccess,
+                    AuthFailureReason::AudienceOrIssuerMismatch,
+                    tonic::Status::unauthenticated("invalid token: InvalidAudience"),
+                ),
+                path,
+            )
+            .await;
+
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_router_authentication_failure(
+                &events[0],
+                path,
+                "audience_or_issuer_mismatch",
+                3,
+            );
+            assert_eq!(events[0]["auth_protocol_id"], 99);
+            assert_eq!(events[0]["auth_protocol"], "cloudflare_access");
         }
 
         #[tokio::test]

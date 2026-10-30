@@ -326,6 +326,8 @@ This is transparent to the user. All CLI commands work the same regardless of wh
 
 **Re-authentication**: If the token expires, run `openshell gateway login` to open the browser flow again and update the stored token.
 
+By default the gateway trusts the proxy and does not check the token. Configure `[openshell.gateway.edge_auth]` to have the gateway verify the Cloudflare Access token on every request. See [Verify Cloudflare Access Tokens](/kubernetes/access-control#verify-cloudflare-access-tokens).
+
 ### Plaintext
 
 When a gateway is deployed with `disable_tls = true` (set through Helm as

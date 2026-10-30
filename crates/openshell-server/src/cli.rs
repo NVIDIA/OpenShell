@@ -675,6 +675,13 @@ fn prepare_server_config_with_drivers(
         });
     }
 
+    if let Some(edge_auth) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.edge_auth.clone())
+    {
+        config = config.with_edge_auth(edge_auth);
+    }
+
     // `gateway_jwt` is configured through TOML in cluster deployments. Local
     // package-managed starts also auto-detect the JWT bundle written next to
     // the generated TLS bundle so upgrades pick up sandbox auth without a
@@ -732,14 +739,16 @@ fn validate_user_auth(config: &openshell_core::Config) -> Result<()> {
         && !config.mtls_auth.enabled
         && !config.mtls_auth.operator_enabled
         && config.oidc.is_none()
+        && config.edge_auth.is_none()
         && config.gateway_jwt.is_none()
     {
         return Err(miette::miette!(
             "gateway has no user authentication configured\n\n\
-             No OIDC issuer, mTLS user auth, operator auth, or gateway_jwt is set. \
+             No OIDC issuer, mTLS user auth, operator auth, edge_auth, or gateway_jwt is set. \
              Authenticated RPCs require credentials unless unauthenticated users are explicitly allowed.\n\n\
-             Configure [openshell.gateway.oidc], [openshell.gateway.mtls_auth], or \
-             [openshell.gateway.gateway_jwt], or explicitly opt in for trusted local development:\n\n\
+             Configure [openshell.gateway.oidc], [openshell.gateway.mtls_auth], \
+             [openshell.gateway.edge_auth], or [openshell.gateway.gateway_jwt], \
+             or explicitly opt in for trusted local development:\n\n\
              [openshell.gateway.auth]\n\
              allow_unauthenticated_users = true"
         ));
@@ -822,6 +831,7 @@ async fn run_from_args(
         .and_then(|tls| tls.client_ca_path.as_ref())
         .is_some();
     let has_oidc = prepared.config.oidc.is_some();
+    let has_edge_auth = prepared.config.edge_auth.is_some();
 
     if prepared.config.tls.is_none() {
         warn!("TLS disabled — listening on plaintext HTTP");
@@ -842,6 +852,19 @@ async fn run_from_args(
     }
     if has_oidc {
         info!("OIDC authentication enabled");
+    }
+    if has_edge_auth {
+        info!("Edge JWT authentication enabled");
+    }
+    if prepared
+        .config
+        .edge_auth
+        .as_ref()
+        .is_some_and(|edge| edge.admin_role.is_empty())
+    {
+        warn!(
+            "edge_auth has no admin_role or user_role: every caller the proxy admits is a platform admin and workspace membership is not enforced"
+        );
     }
     if let Some(err) = otlp_error.as_ref().or(driver_otlp_error.as_ref()) {
         error!(
@@ -1561,7 +1584,7 @@ mod tests {
     fn user_auth_requires_a_mechanism_or_explicit_opt_in() {
         // Cover each mechanism on its own and in combination, with and without
         // the development opt-in. Only the entirely unconfigured case fails.
-        for mechanisms in 0..32 {
+        for mechanisms in 0..64 {
             let mut config = openshell_core::Config::new(None);
             config.auth.allow_unauthenticated_users = mechanisms & 1 != 0;
             config.mtls_auth.enabled = mechanisms & 2 != 0;
@@ -1570,6 +1593,14 @@ mod tests {
                 config.oidc = Some(
                     toml::from_str("issuer = 'https://idp.example.com'\naudience = 'openshell'")
                         .unwrap(),
+                );
+            }
+            if mechanisms & 32 != 0 {
+                config.edge_auth = Some(
+                    toml::from_str(
+                        "provider = 'cloudflare_access'\nissuer = 'https://team.cloudflareaccess.com'\naudience = 'aud'",
+                    )
+                    .unwrap(),
                 );
             }
             if mechanisms & 16 != 0 {
@@ -4414,6 +4445,44 @@ mem_mib = "not-a-number"
                     .contains("image_preparation_timeout_seconds must be between 1 and 86400")
             );
         }
+            });
+    }
+
+    #[test]
+    fn server_config_loads_edge_auth_from_file() {
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .run(|| {
+                let state = std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                std::fs::write(
+                    &config_path,
+                    r#"
+[openshell]
+version = 2
+[openshell.gateway.edge_auth]
+provider = "cloudflare_access"
+issuer = "https://team.cloudflareaccess.com"
+audience = "aud-tag"
+"#,
+                )
+                .unwrap();
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--config",
+                    config_path.to_str().unwrap(),
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--compute-driver",
+                    "docker",
+                    "--disable-tls",
+                ]);
+                let prepared = super::prepare_server_config(&mut args, &matches).unwrap();
+                let edge = prepared.config.edge_auth.expect("edge_auth is set");
+                assert_eq!(edge.audience, "aud-tag");
             });
     }
 

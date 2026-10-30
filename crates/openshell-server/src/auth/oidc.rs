@@ -16,7 +16,7 @@ use super::identity::{Identity, IdentityProvider};
 use super::principal::{Principal, UserPrincipal};
 use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
-use openshell_core::OidcConfig;
+use openshell_core::{EdgeAuthConfig, EdgeAuthProvider, OidcConfig};
 use openshell_crypto::jwt::decode;
 use reqwest::Client;
 use serde::Deserialize;
@@ -61,6 +61,61 @@ const KID_MISS_REFRESH_COOLDOWN: Duration = Duration::from_secs(1);
 const OIDC_DISCOVERY_MAX_BYTES: usize = 64 * 1024;
 const JWKS_MAX_BYTES: usize = 1024 * 1024;
 
+/// Where Cloudflare Access publishes its signing keys, relative to the team
+/// origin. Access issues no OIDC discovery document for edge tokens.
+const CLOUDFLARE_ACCESS_JWKS_PATH: &str = "/cdn-cgi/access/certs";
+
+/// The kind of credential a [`JwksCache`] verifies. It selects the audit
+/// mechanism, the identity provider, and the claims that name the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenKind {
+    Oidc,
+    CloudflareAccess,
+}
+
+impl TokenKind {
+    fn mechanism(self) -> AuthMechanism {
+        match self {
+            Self::Oidc => AuthMechanism::Oidc,
+            Self::CloudflareAccess => AuthMechanism::CloudflareAccess,
+        }
+    }
+
+    fn provider(self) -> IdentityProvider {
+        match self {
+            Self::Oidc => IdentityProvider::Oidc,
+            Self::CloudflareAccess => IdentityProvider::CloudflareAccess,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Oidc => "OIDC",
+            Self::CloudflareAccess => "edge token",
+        }
+    }
+
+    /// Edge tokens may carry `nbf`; OIDC validation has never enforced it.
+    fn validates_nbf(self) -> bool {
+        self == Self::CloudflareAccess
+    }
+
+    /// Cloudflare service tokens carry an empty `sub`, which would merge
+    /// every such caller into one identity. OIDC has always accepted it.
+    fn rejects_empty_subject(self) -> bool {
+        self == Self::CloudflareAccess
+    }
+
+    /// The human-readable name for the caller: `preferred_username` for
+    /// OIDC, `email` for edge tokens.
+    fn display_name(self, claims: &mut OidcClaims) -> Option<String> {
+        match self {
+            Self::Oidc => claims.preferred_username.take(),
+            Self::CloudflareAccess => claims.email.take(),
+        }
+    }
+}
+
 /// Cached JWKS key set fetched from the OIDC issuer.
 ///
 /// A `refresh_mutex` ensures that only one refresh runs at a time,
@@ -83,6 +138,7 @@ pub struct JwksCache {
     refresh_mutex: tokio::sync::Mutex<()>,
     http: Client,
     config: OidcConfig,
+    kind: TokenKind,
 }
 
 impl std::fmt::Debug for JwksCache {
@@ -146,6 +202,81 @@ fn validate_oidc_url(
             "{description} must use HTTPS, not the '{scheme}' scheme"
         )),
     }
+}
+
+/// Validate a token issuer URL: it must pass [`validate_oidc_url`] and carry
+/// no query or fragment.
+fn validate_issuer_url(
+    value: &str,
+    description: &str,
+    dangerously_allow_insecure_http: bool,
+) -> Result<url::Url, String> {
+    let issuer = validate_oidc_url(value, description, dangerously_allow_insecure_http)?;
+    if issuer.query().is_some() || issuer.fragment().is_some() {
+        return Err(format!(
+            "{description} must not include a query or fragment"
+        ));
+    }
+    Ok(issuer)
+}
+
+fn validate_jwks_ttl(jwks_ttl_secs: u64) -> Result<(), String> {
+    if jwks_ttl_secs == 0 {
+        return Err(
+            "jwks_ttl_secs must be greater than zero (0 would refresh on every request and \
+             collapse the stale-key grace period to zero)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn jwks_http_client() -> Result<Client, String> {
+    openshell_crypto::tls::ensure_default_provider();
+    Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("failed to create HTTP client: {e}"))
+}
+
+/// Validate edge auth settings and derive what a [`JwksCache`] needs: the
+/// token validation settings, the provider's JWKS URL, and the token kind.
+fn edge_auth_parts(config: &EdgeAuthConfig) -> Result<(OidcConfig, url::Url, TokenKind), String> {
+    validate_jwks_ttl(config.jwks_ttl_secs)?;
+    if config.audience.is_empty() {
+        return Err("edge auth audience must not be empty".to_string());
+    }
+    if config.roles_claim.is_empty()
+        && !(config.admin_role.is_empty() && config.user_role.is_empty())
+    {
+        return Err("edge auth admin_role and user_role require roles_claim".to_string());
+    }
+    let issuer_url = validate_issuer_url(&config.issuer, "edge auth issuer", false)?;
+    if !matches!(issuer_url.path(), "" | "/") {
+        return Err("edge auth issuer must be the team origin without a path".to_string());
+    }
+    let (kind, jwks_path) = match config.provider {
+        EdgeAuthProvider::CloudflareAccess => {
+            (TokenKind::CloudflareAccess, CLOUDFLARE_ACCESS_JWKS_PATH)
+        }
+    };
+    let jwks_uri = issuer_url
+        .join(jwks_path)
+        .map_err(|error| format!("failed to construct edge auth JWKS URL: {error}"))?;
+    let jwt_config = OidcConfig {
+        // Tokens carry the lowercase origin without a trailing slash.
+        issuer: issuer_url.origin().ascii_serialization(),
+        dangerously_allow_insecure_http: false,
+        jwks_allowed_origins: Vec::new(),
+        audience: config.audience.clone(),
+        jwks_ttl_secs: config.jwks_ttl_secs,
+        roles_claim: config.roles_claim.clone(),
+        admin_role: config.admin_role.clone(),
+        user_role: config.user_role.clone(),
+        scopes_claim: String::new(),
+    };
+    Ok((jwt_config, jwks_uri, kind))
 }
 
 fn validate_jwks_origin(
@@ -507,7 +638,6 @@ pub struct OidcClaims {
     #[serde(default)]
     pub preferred_username: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub email: Option<String>,
     /// Roles extracted from the configurable claim path.
     #[serde(skip)]
@@ -578,33 +708,24 @@ impl JwksCache {
     /// Create a new JWKS cache, discovering the JWKS URI and fetching the
     /// initial key set.
     pub async fn new(config: &OidcConfig) -> Result<Self, String> {
-        openshell_crypto::tls::ensure_default_provider();
-        let http = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| format!("failed to create HTTP client: {e}"))?;
+        Self::new_with_client(config, jwks_http_client()?).await
+    }
 
-        Self::new_with_client(config, http).await
+    /// Create a cache that verifies the edge proxy's tokens, loading the
+    /// provider's published signing keys.
+    pub async fn for_edge_auth(config: &EdgeAuthConfig) -> Result<Self, String> {
+        let (jwt_config, jwks_uri, kind) = edge_auth_parts(config)?;
+        Self::from_jwks_uri(&jwt_config, jwks_uri, jwks_http_client()?, kind).await
     }
 
     async fn new_with_client(config: &OidcConfig, http: Client) -> Result<Self, String> {
-        if config.jwks_ttl_secs == 0 {
-            return Err(
-                "jwks_ttl_secs must be greater than zero (0 would refresh on every request and \
-                 collapse the stale-key grace period to zero)"
-                    .to_string(),
-            );
-        }
+        validate_jwks_ttl(config.jwks_ttl_secs)?;
 
-        let issuer_url = validate_oidc_url(
+        let issuer_url = validate_issuer_url(
             &config.issuer,
             "OIDC issuer",
             config.dangerously_allow_insecure_http,
         )?;
-        if issuer_url.query().is_some() || issuer_url.fragment().is_some() {
-            return Err("OIDC issuer must not include a query or fragment".to_string());
-        }
         // Validate every configured exception at startup, even when the
         // discovery document ultimately uses the issuer origin.
         for allowed in &config.jwks_allowed_origins {
@@ -640,6 +761,16 @@ impl JwksCache {
 
         info!(jwks_uri = %jwks_uri, "OIDC JWKS URI discovered");
 
+        Self::from_jwks_uri(config, jwks_uri, http, TokenKind::Oidc).await
+    }
+
+    /// Build a cache for a known JWKS URI and load its initial key set.
+    async fn from_jwks_uri(
+        config: &OidcConfig,
+        jwks_uri: url::Url,
+        http: Client,
+        kind: TokenKind,
+    ) -> Result<Self, String> {
         let cache = Self {
             keys: Arc::new(RwLock::new(HashMap::new())),
             jwks_uri: jwks_uri.to_string(),
@@ -664,6 +795,7 @@ impl JwksCache {
             refresh_mutex: tokio::sync::Mutex::new(()),
             http,
             config: config.clone(),
+            kind,
         };
 
         cache.refresh_keys().await?;
@@ -799,16 +931,16 @@ impl JwksCache {
 
         self.refresh_if_stale().await.map_err(|e| {
             warn!(error = %e, "JWKS refresh failed");
-            reject(
+            self.reject(
                 AuthFailureReason::IdentityProviderUnavailable,
-                Status::internal("OIDC key refresh failed"),
+                Status::internal(format!("{} key refresh failed", self.kind.label())),
             )
         })?;
 
         // Decode the header to find the key ID.
         let header = decode_header(token).map_err(|e| {
             debug!(error = %e, "Failed to decode JWT header");
-            reject(
+            self.reject(
                 AuthFailureReason::MalformedCredential,
                 Status::unauthenticated("invalid token"),
             )
@@ -816,7 +948,7 @@ impl JwksCache {
 
         let kid = header.kid.ok_or_else(|| {
             debug!("JWT has no kid in header");
-            reject(
+            self.reject(
                 AuthFailureReason::MalformedCredential,
                 Status::unauthenticated("invalid token: missing kid"),
             )
@@ -828,9 +960,9 @@ impl JwksCache {
             drop(keys_guard);
             self.refresh_keys_coalesced().await.map_err(|e| {
                 warn!(error = %e, "JWKS refresh on kid miss failed");
-                reject(
+                self.reject(
                     AuthFailureReason::IdentityProviderUnavailable,
-                    Status::internal("OIDC key refresh failed"),
+                    Status::internal(format!("{} key refresh failed", self.kind.label())),
                 )
             })?;
             keys_guard = self.keys.read().await;
@@ -841,7 +973,7 @@ impl JwksCache {
             .map(|(dk, alg)| (dk.clone(), *alg))
             .ok_or_else(|| {
                 debug!(kid = %kid, "JWT kid not found in JWKS");
-                reject(
+                self.reject(
                     AuthFailureReason::InvalidCredential,
                     Status::unauthenticated("invalid token: unknown signing key"),
                 )
@@ -854,7 +986,7 @@ impl JwksCache {
                 expected = ?cached_algorithm,
                 "JWT algorithm mismatch for cached signing key"
             );
-            return Err(reject(
+            return Err(self.reject(
                 AuthFailureReason::InvalidCredential,
                 Status::unauthenticated("invalid token"),
             ));
@@ -864,16 +996,23 @@ impl JwksCache {
         validation.set_issuer(&[&self.config.issuer]);
         validation.set_audience(&[&self.config.audience]);
         validation.set_required_spec_claims(&["iss", "aud", "exp", "sub"]);
+        validation.validate_nbf = self.kind.validates_nbf();
 
         let token_data = decode::<OidcClaims>(token, &decoding_key, &validation).map_err(|e| {
             debug!(error = %e, "JWT validation failed");
-            reject(
+            self.reject(
                 decode_failure_reason(e.kind()),
                 Status::unauthenticated(format!("invalid token: {e}")),
             )
         })?;
 
         let mut claims = token_data.claims;
+        if self.kind.rejects_empty_subject() && claims.sub.is_empty() {
+            return Err(self.reject(
+                AuthFailureReason::InvalidCredential,
+                Status::unauthenticated("invalid token: empty subject"),
+            ));
+        }
         claims.extract_roles(&self.config.roles_claim);
 
         let scopes = if self.config.scopes_claim.is_empty() {
@@ -882,18 +1021,27 @@ impl JwksCache {
             claims.extract_scopes(&self.config.scopes_claim)
         };
 
+        let display_name = self.kind.display_name(&mut claims);
         Ok(Identity {
             subject: claims.sub,
-            display_name: claims.preferred_username,
+            display_name,
             roles: claims.roles,
             scopes,
-            provider: IdentityProvider::Oidc,
+            provider: self.kind.provider(),
         })
     }
-}
 
-fn reject(reason: AuthFailureReason, status: Status) -> AuthRejection {
-    AuthRejection::new(AuthMechanism::Oidc, reason, status)
+    /// Verify `token` and accept the caller as a user principal.
+    pub(super) async fn accept_user(&self, token: &str) -> Result<Authentication, AuthRejection> {
+        let identity = self.validate_token(token).await?;
+        Ok(Authentication::Accepted(Principal::User(UserPrincipal {
+            identity,
+        })))
+    }
+
+    fn reject(&self, reason: AuthFailureReason, status: Status) -> AuthRejection {
+        AuthRejection::new(self.kind.mechanism(), reason, status)
+    }
 }
 
 fn decode_failure_reason(kind: &jsonwebtoken::errors::ErrorKind) -> AuthFailureReason {
@@ -940,10 +1088,7 @@ impl Authenticator for OidcAuthenticator {
             return Ok(Authentication::NotApplicable);
         };
 
-        let identity = self.cache.validate_token(token).await?;
-        Ok(Authentication::Accepted(Principal::User(UserPrincipal {
-            identity,
-        })))
+        self.cache.accept_user(token).await
     }
 }
 
@@ -1502,6 +1647,21 @@ mod tests {
         assert_eq!(identity.roles, vec!["openshell-user".to_owned()]);
         assert_eq!(identity.scopes, vec!["sandbox:write".to_owned()]);
         assert_eq!(identity.provider, IdentityProvider::Oidc);
+    }
+
+    #[tokio::test]
+    async fn oidc_token_with_empty_subject_is_still_accepted() {
+        let server = wiremock::MockServer::start().await;
+        let cache = cache_with_mock_issuer(&server).await;
+
+        let mut claims = claims_for(&server.uri(), TEST_AUDIENCE, now_secs() + 3600);
+        claims["sub"] = serde_json::json!("");
+        let identity = cache
+            .validate_token(&mint_rs256(&claims, TEST_KID))
+            .await
+            .expect("only edge tokens reject an empty subject");
+
+        assert_eq!(identity.subject, "");
     }
 
     #[tokio::test]
@@ -2392,6 +2552,364 @@ mod tests {
             let eddsa_token = sign_token(&eddsa, &issuer, &config.audience, "eddsa-user");
             let err = cache.validate_token(&eddsa_token).await.unwrap_err();
             assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
+        }
+    }
+
+    /// Edge tokens: Cloudflare Access shaped claims (`aud` is an array, the
+    /// caller is named by `email`) verified against a mock key endpoint.
+    mod edge_auth {
+        use super::*;
+        use crate::auth::edge::EdgeAuthenticator;
+        use http::{HeaderMap, HeaderValue};
+        use openshell_core::{EdgeAuthConfig, EdgeAuthProvider};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const TEAM: &str = "https://team.cloudflareaccess.com";
+        const AUD_TAG: &str = "4714c1358e65fe4b";
+
+        fn edge_config() -> EdgeAuthConfig {
+            EdgeAuthConfig {
+                provider: EdgeAuthProvider::CloudflareAccess,
+                issuer: TEAM.to_owned(),
+                audience: AUD_TAG.to_owned(),
+                jwks_ttl_secs: 3600,
+                roles_claim: "custom.groups".to_owned(),
+                admin_role: String::new(),
+                user_role: String::new(),
+            }
+        }
+
+        fn access_claims(exp: i64) -> serde_json::Value {
+            serde_json::json!({
+                "sub": "user-1",
+                "email": "ada@example.com",
+                "iss": TEAM,
+                "aud": [AUD_TAG],
+                "exp": exp,
+                "type": "app",
+                "custom": { "groups": ["eng", "openshell-admin"] },
+            })
+        }
+
+        /// Serve the Access key endpoint locally; only the key fetch is
+        /// redirected, so tokens still carry the real team issuer.
+        async fn edge_cache(server: &MockServer) -> JwksCache {
+            Mock::given(method("GET"))
+                .and(path(CLOUDFLARE_ACCESS_JWKS_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "keys": [{
+                        "kid": TEST_KID,
+                        "kty": "RSA",
+                        "alg": "RS256",
+                        "use": "sig",
+                        "n": TEST_RSA_KEY.modulus_b64,
+                        "e": TEST_RSA_KEY.exponent_b64,
+                    }],
+                })))
+                .mount(server)
+                .await;
+            let (jwt_config, _, kind) = edge_auth_parts(&edge_config()).unwrap();
+            let jwks_uri =
+                url::Url::parse(&format!("{}{CLOUDFLARE_ACCESS_JWKS_PATH}", server.uri())).unwrap();
+            JwksCache::from_jwks_uri(&jwt_config, jwks_uri, jwks_http_client().unwrap(), kind)
+                .await
+                .expect("cache builds from the mock key endpoint")
+        }
+
+        fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+            let mut map = HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(*name, HeaderValue::from_str(value).unwrap());
+            }
+            map
+        }
+
+        #[tokio::test]
+        async fn valid_token_becomes_a_cloudflare_access_user() {
+            let server = MockServer::start().await;
+            let cache = edge_cache(&server).await;
+            let token = mint_rs256(&access_claims(now_secs() + 3600), TEST_KID);
+
+            let identity = cache.validate_token(&token).await.expect("accepted");
+
+            assert_eq!(identity.subject, "user-1");
+            assert_eq!(identity.display_name.as_deref(), Some("ada@example.com"));
+            assert_eq!(identity.provider, IdentityProvider::CloudflareAccess);
+            assert_eq!(identity.roles, ["eng", "openshell-admin"]);
+        }
+
+        #[tokio::test]
+        async fn token_in_the_past_nbf_window_is_accepted_and_future_nbf_is_rejected() {
+            let server = MockServer::start().await;
+            let cache = edge_cache(&server).await;
+
+            let mut claims = access_claims(now_secs() + 3600);
+            claims["nbf"] = serde_json::json!(now_secs() - 60);
+            cache
+                .validate_token(&mint_rs256(&claims, TEST_KID))
+                .await
+                .expect("nbf in the past is valid");
+
+            claims["nbf"] = serde_json::json!(now_secs() + 3600);
+            let rejection = cache
+                .validate_token(&mint_rs256(&claims, TEST_KID))
+                .await
+                .expect_err("nbf in the future must be rejected");
+            assert_eq!(rejection.mechanism, AuthMechanism::CloudflareAccess);
+        }
+
+        #[tokio::test]
+        async fn bad_tokens_are_rejected_with_the_edge_mechanism() {
+            let server = MockServer::start().await;
+            let cache = edge_cache(&server).await;
+            let live = now_secs() + 3600;
+
+            let mut wrong_aud = access_claims(live);
+            wrong_aud["aud"] = serde_json::json!(["other-app"]);
+            let mut empty_sub = access_claims(live);
+            empty_sub["sub"] = serde_json::json!("");
+            let mut wrong_iss = access_claims(live);
+            wrong_iss["iss"] = serde_json::json!("https://other.cloudflareaccess.com");
+            let cases = [
+                (
+                    mint_rs256(&wrong_aud, TEST_KID),
+                    AuthFailureReason::AudienceOrIssuerMismatch,
+                ),
+                (
+                    mint_rs256(&wrong_iss, TEST_KID),
+                    AuthFailureReason::AudienceOrIssuerMismatch,
+                ),
+                (
+                    mint_rs256(&empty_sub, TEST_KID),
+                    AuthFailureReason::InvalidCredential,
+                ),
+                (
+                    mint_rs256(&access_claims(now_secs() - 3600), TEST_KID),
+                    AuthFailureReason::ExpiredCredential,
+                ),
+                (
+                    mint_rs256(&access_claims(live), "unknown-kid"),
+                    AuthFailureReason::InvalidCredential,
+                ),
+                (
+                    "not-a-jwt".to_owned(),
+                    AuthFailureReason::MalformedCredential,
+                ),
+            ];
+            for (token, reason) in cases {
+                let rejection = cache.validate_token(&token).await.expect_err("rejected");
+                assert_eq!(rejection.mechanism, AuthMechanism::CloudflareAccess);
+                assert_eq!(rejection.reason, reason);
+                assert_eq!(rejection.status.code(), tonic::Code::Unauthenticated);
+            }
+        }
+
+        /// Through the real chain construction, a request without a valid
+        /// edge token is rejected rather than treated as local development.
+        #[tokio::test]
+        async fn router_requires_an_edge_token_on_every_request() {
+            use crate::compute::new_test_runtime;
+            use crate::multiplex::{AuthGrpcRouter, build_authenticator_chain};
+            use crate::persistence::Store;
+            use crate::sandbox_index::SandboxIndex;
+            use crate::sandbox_watch::SandboxWatchBus;
+            use crate::supervisor_session::SupervisorSessionRegistry;
+            use crate::tracing_bus::TracingLogBus;
+            use std::sync::Mutex;
+            use tower::Service;
+
+            let server = MockServer::start().await;
+            let config = openshell_core::Config::new(None).with_edge_auth(edge_config());
+            crate::auth::edge::validate_config(&config).expect("edge-only config is valid");
+            let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+            let compute = new_test_runtime(store.clone()).await;
+            let mut state = crate::ServerState::new(
+                config,
+                store,
+                compute,
+                SandboxIndex::new(),
+                SandboxWatchBus::new(),
+                TracingLogBus::new(),
+                Arc::new(SupervisorSessionRegistry::new()),
+                None,
+            );
+            state.edge_auth_cache = Some(Arc::new(edge_cache(&server).await));
+
+            let reached = Arc::new(Mutex::new(Vec::new()));
+            let recorded = reached.clone();
+            let inner = tower::service_fn(move |req: http::Request<()>| {
+                let principal = req.extensions().get::<Principal>().cloned();
+                recorded.lock().unwrap().push(principal);
+                async {
+                    Ok::<_, std::convert::Infallible>(http::Response::new(
+                        tonic::body::Body::empty(),
+                    ))
+                }
+            });
+            let mut router = AuthGrpcRouter::with_peer_identity(
+                inner,
+                build_authenticator_chain(&state),
+                crate::auth::authz::AuthzPolicy::from_config(&state.config),
+                None,
+                state.config.mtls_auth.enabled,
+                state.config.auth.allow_unauthenticated_users,
+            );
+            let call = |header: Option<&str>| {
+                let mut request =
+                    http::Request::builder().uri("/openshell.v1.OpenShell/ListSandboxes");
+                if let Some(token) = header {
+                    request = request.header(crate::auth::edge::EDGE_TOKEN_HEADER, token);
+                }
+                request.body(()).unwrap()
+            };
+            let status = |response: &http::Response<tonic::body::Body>| {
+                response
+                    .headers()
+                    .get("grpc-status")
+                    .map(|value| value.to_str().unwrap().to_owned())
+            };
+
+            let unauthenticated = tonic::Code::Unauthenticated as i32;
+            for header in [None, Some("garbage")] {
+                let response = router.call(call(header)).await.unwrap();
+                assert_eq!(
+                    status(&response).as_deref(),
+                    Some(unauthenticated.to_string().as_str()),
+                    "token {header:?}"
+                );
+            }
+            assert!(reached.lock().unwrap().is_empty(), "handler was reached");
+
+            let token = mint_rs256(&access_claims(now_secs() + 3600), TEST_KID);
+            let response = router.call(call(Some(&token))).await.unwrap();
+            assert_eq!(status(&response), None);
+            let reached = reached.lock().unwrap();
+            let Some(Some(Principal::User(user))) = reached.first() else {
+                panic!("expected a user principal, got {reached:?}");
+            };
+            assert_eq!(user.identity.subject, "user-1");
+            assert_eq!(user.identity.provider, IdentityProvider::CloudflareAccess);
+        }
+
+        #[tokio::test]
+        async fn token_signed_by_another_key_is_rejected() {
+            let server = MockServer::start().await;
+            let cache = edge_cache(&server).await;
+            crate::install_jsonwebtoken_crypto_provider();
+            let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+            header.kid = Some(TEST_KID.to_owned());
+            let other = TestRsaKey::generate();
+            let token = openshell_crypto::jwt::encode(
+                &header,
+                &access_claims(now_secs() + 3600),
+                &jsonwebtoken::EncodingKey::from_rsa_pem(other.private_pem.as_bytes()).unwrap(),
+            )
+            .unwrap();
+
+            let rejection = cache.validate_token(&token).await.expect_err("rejected");
+            assert_eq!(rejection.reason, AuthFailureReason::InvalidCredential);
+        }
+
+        #[tokio::test]
+        async fn authenticator_reads_header_or_cookie_and_ignores_bearer() {
+            let server = MockServer::start().await;
+            let authenticator = EdgeAuthenticator::new(Arc::new(edge_cache(&server).await));
+            let token = mint_rs256(&access_claims(now_secs() + 3600), TEST_KID);
+            let cookie = format!("theme=dark; CF_Authorization={token}");
+
+            for map in [
+                headers(&[("cf-access-jwt-assertion", &token)]),
+                headers(&[("cookie", &cookie)]),
+            ] {
+                match authenticator.authenticate(&map, "/x").await {
+                    Ok(Authentication::Accepted(Principal::User(user))) => {
+                        assert_eq!(user.identity.subject, "user-1");
+                    }
+                    other => panic!("expected an accepted user, got {other:?}"),
+                }
+            }
+
+            for map in [
+                HeaderMap::new(),
+                headers(&[("authorization", "Bearer something")]),
+            ] {
+                let outcome = authenticator.authenticate(&map, "/x").await;
+                assert!(matches!(outcome, Ok(Authentication::NotApplicable)));
+            }
+
+            let bad = headers(&[("cf-access-jwt-assertion", "garbage")]);
+            let rejection = authenticator
+                .authenticate(&bad, "/x")
+                .await
+                .expect_err("an invalid edge token ends the chain");
+            assert_eq!(rejection.status.code(), tonic::Code::Unauthenticated);
+        }
+
+        #[test]
+        fn config_is_validated_and_the_jwks_url_derived() {
+            let (jwt_config, jwks_uri, kind) = edge_auth_parts(&EdgeAuthConfig {
+                issuer: "https://Team.CloudflareAccess.com/".to_owned(),
+                ..edge_config()
+            })
+            .expect("valid config");
+            assert_eq!(kind, TokenKind::CloudflareAccess);
+            assert_eq!(jwt_config.issuer, TEAM);
+            assert_eq!(
+                jwks_uri.as_str(),
+                "https://team.cloudflareaccess.com/cdn-cgi/access/certs"
+            );
+
+            let invalid = [
+                (
+                    EdgeAuthConfig {
+                        issuer: "http://team.cloudflareaccess.com".to_owned(),
+                        ..edge_config()
+                    },
+                    "must use HTTPS",
+                ),
+                (
+                    EdgeAuthConfig {
+                        issuer: format!("{TEAM}?x=1"),
+                        ..edge_config()
+                    },
+                    "query or fragment",
+                ),
+                (
+                    EdgeAuthConfig {
+                        issuer: format!("{TEAM}/tenant"),
+                        ..edge_config()
+                    },
+                    "without a path",
+                ),
+                (
+                    EdgeAuthConfig {
+                        audience: String::new(),
+                        ..edge_config()
+                    },
+                    "audience must not be empty",
+                ),
+                (
+                    EdgeAuthConfig {
+                        jwks_ttl_secs: 0,
+                        ..edge_config()
+                    },
+                    "greater than zero",
+                ),
+                (
+                    EdgeAuthConfig {
+                        roles_claim: String::new(),
+                        admin_role: "admin".to_owned(),
+                        user_role: "user".to_owned(),
+                        ..edge_config()
+                    },
+                    "require roles_claim",
+                ),
+            ];
+            for (config, expected) in invalid {
+                let error = edge_auth_parts(&config).expect_err("rejected");
+                assert!(error.contains(expected), "{error}");
+            }
         }
     }
 }

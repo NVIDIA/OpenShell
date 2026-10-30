@@ -193,10 +193,7 @@ async fn auth_connect(
         .into_response();
     }
 
-    let cf_token = headers
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| extract_cookie(cookies, "CF_Authorization"));
+    let cf_token = cookie_value(&headers, super::edge::EDGE_TOKEN_COOKIE);
 
     // Prefer the Host header (set by Cloudflare Tunnel / reverse proxies)
     // so the page shows the external URL the user actually connected through
@@ -233,6 +230,16 @@ async fn auth_connect(
         )
             .into_response()
     }
+}
+
+/// Find a named cookie across every `Cookie` header. HTTP/2 clients may send
+/// cookies split over several header fields.
+pub(super) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|cookies| extract_cookie(cookies, name))
 }
 
 /// Extract a named cookie value from a `Cookie` header string.
