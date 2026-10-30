@@ -119,8 +119,15 @@ async fn revoked_refresh_grant_requires_user_reauthorization(cx: &mut Context) -
     // testkit cleans up sandboxes, not providers or profiles, so remove them
     // here whether or not the test passed. A panic or a killed test process
     // skips this; the names are unique to the run, so leftovers don't collide.
-    let _ = kc.cli(["provider", "delete", &provider]).await;
-    let _ = kc.cli(["profile", "delete", &profile_id]).await;
+    // A failed cleanup doesn't fail the test, but it is reported.
+    for args in [
+        ["provider", "delete", provider.as_str()],
+        ["profile", "delete", profile_id.as_str()],
+    ] {
+        if let Err(error) = kc.cli(args).await.and_then(CliOutput::success) {
+            eprintln!("cleanup failed: {error}");
+        }
+    }
     result
 }
 
