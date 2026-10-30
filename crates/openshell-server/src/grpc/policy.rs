@@ -4026,6 +4026,18 @@ pub async fn build_provider_environment_snapshot_from_inputs(
             .clear();
     }
 
+    // Add request metadata only after token-grant owner composition and all
+    // static value filtering, so it describes this exact atomic snapshot.
+    let static_request_metadata = super::provider::static_credential_request_metadata(
+        &sandbox_id,
+        provider_profile_catalog,
+        provider_records,
+        &provider_environment,
+    )?;
+    provider_environment
+        .dynamic_credentials
+        .extend(static_request_metadata);
+
     info!(
         sandbox_id = %sandbox_id,
         provider_count = provider_names.len(),
@@ -12340,13 +12352,27 @@ mod tests {
             environment.provider_env_revision,
             second.provider_env_revision
         );
-        assert_eq!(environment.dynamic_credentials.len(), 2);
-        assert!(environment.dynamic_credentials.values().all(|credential| {
-            credential
-                .token_grant
-                .as_ref()
-                .is_some_and(|grant| grant.token_endpoint.contains("revision-b"))
-        }));
+        let grants = environment
+            .dynamic_credentials
+            .values()
+            .filter_map(|credential| credential.token_grant.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(grants.len(), 2);
+        assert!(
+            grants
+                .iter()
+                .all(|grant| grant.token_endpoint.contains("revision-b"))
+        );
+        assert!(
+            environment
+                .dynamic_credentials
+                .iter()
+                .filter(|(key, _)| key.starts_with(
+                    openshell_core::provider_credentials::STATIC_CREDENTIAL_METADATA_PREFIX
+                ))
+                .all(|(_, credential)| credential.token_grant.is_none()
+                    && credential.token_grant_owners.is_empty())
+        );
 
         handle_submit_policy_analysis(
             &state,

@@ -58,6 +58,21 @@ router agree on provider defaults. Profiles define:
 Do not duplicate provider-specific inference behavior in callers. Add shared
 behavior here, then consume it from the gateway, sandbox, and router.
 
+## Static Credential Resolution
+
+Static credential bindings retain endpoint authorization. The gateway includes
+static `ProviderProfileCredential` auth metadata in the existing runtime
+credential map under `static-env:<ENV_KEY>`. Provider state extracts those entries
+before storing dynamic token grants and compiles placement locally alongside the
+matching static binding. Missing metadata preserves legacy endpoint-scoped
+substitution; malformed reserved metadata fails closed atomically.
+
+Request rewriting supplies the actual header name, query key, or path slot.
+Header authorization is independent of authentication scheme, including Basic.
+Explicit body/WebSocket rewrite policies and trusted signing retain their
+existing permissions. Existing placeholder and stable-handle derivation remain
+unchanged. Protobuf message shapes and service interfaces remain unchanged.
+
 ## Middleware Contracts
 
 Built-in supervisor middleware identifiers, host-selector matching, and pure

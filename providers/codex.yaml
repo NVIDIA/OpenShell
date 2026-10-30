@@ -33,6 +33,8 @@ credentials:
     description: Codex OAuth access token
     env_vars: [CODEX_AUTH_ACCESS_TOKEN]
     required: true
+    auth_style: bearer
+    header_name: authorization
   - name: refresh_token
     description: Codex OAuth refresh token
     env_vars: [CODEX_AUTH_REFRESH_TOKEN]
@@ -41,6 +43,8 @@ credentials:
     description: Codex account identifier
     env_vars: [CODEX_AUTH_ACCOUNT_ID]
     required: true
+    auth_style: header
+    header_name: chatgpt-account-id
   - name: id_token
     description: Codex OAuth ID token
     env_vars: [CODEX_AUTH_ID_TOKEN]

@@ -167,6 +167,21 @@ A provisioning timeout can be repaired by Stop after its original driver work
 settles and cleanup completes. Stop exposes Stopped without discarding the timeout
 diagnosis or storage. This lifecycle behavior also applies when updates are disabled.
 
+## Static credential delivery
+
+Existing polling and configuration-push environments keep their original wire
+shape, delivery behavior, identities, and stable-handle derivation. The gateway
+adds placement-only `ProviderProfileCredential` entries to the existing runtime
+credential map under `static-env:<ENV_KEY>`, for actually delivered static keys.
+Entries are matched to their owning provider binding and contain no token grant,
+refresh configuration, or credential values. The supervisor infers enforcement
+from the auth metadata; the gateway does not enforce placement.
+
+Older supervisors ignore entries without token grants. An older gateway omits
+these entries, so newer supervisors retain legacy behavior. Metadata travels in
+the same captured environment snapshot; no separate service, capability gate,
+or additional lookup is needed.
+
 ## Operator credential export
 
 `GetProviderCredentials` exports selected profile-declared runtime environment
