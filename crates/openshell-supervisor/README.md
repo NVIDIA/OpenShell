@@ -257,3 +257,36 @@ cannot export each instance's records with that instance's collector headers and
 identity. Its console logs and each instance's gateway log push remain, and the
 Kubernetes driver warns at startup when the gateway configures supervisor
 export.
+
+## Application listener
+
+The opt-in application TLS listener serves declared HTTP/1.1 and WebSocket
+services through each sandbox instance's `BoundaryLoopbackConnector`. The host
+binds one listener and dispatches accepted TLS streams by SNI to a bounded queue
+on the owning instance's runtime. That runtime owns request handling, credentials,
+policy state, limits, and OCSF context. Stopping an instance unregisters only its
+routes and closes its streams; it does not stop another instance's ingress.
+
+Gateway configuration snapshots carry the declared-service allowlist. Successful
+poll and push application installs that allowlist; rejected configuration
+suspends it. Polling renews a 30-second freshness lease. In push mode, an accepted
+live supervisor session renews already installed, unexpired routes even when no
+configuration changes. Rejection or a lease lapse cannot revive an old stream.
+Ending the configuration loop suspends routes.
+
+`OPENSHELL_APP_LISTENER_ENABLED=true` explicitly enables the process listener.
+`OPENSHELL_APP_LISTEN_ADDRESS`, `OPENSHELL_APP_SERVICE_DOMAIN`,
+`OPENSHELL_APP_TLS_CERT`, and `OPENSHELL_APP_TLS_KEY` are then required. Hosted
+instances receive the process router explicitly and never read another
+instance's configuration from process environment. TLS configuration uses
+`openshell-crypto`; certificates are read at process startup. Restart the
+supervisor to reload application certificates.
+
+This path uses application or trusted-edge authentication independently from
+gateway authentication. It validates Host against SNI, preserves public
+Host/Origin and application cookies, strips gateway/edge identity material, and
+retains service-specific bearer passthrough. It has no discovery API or public
+URL selection. Dedicated and shared supervisors expose the app listener on their
+Pod IPs without app Services. Clients must select the member owning their
+sandbox. HA takeover may preserve the workload generation; existing ingress streams
+are not migrated. Runtime ownership fencing must reject stale connectors.

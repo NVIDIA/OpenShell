@@ -1622,3 +1622,27 @@ probes. Arguments after `--` validate the effective daemon invocation,
 including its command-line overrides. Preflight preserves every failed file. Do
 not advise users to delete or rewrite it automatically; back it up and follow the
 manual schema-v2 migration in the Gateway Configuration reference.
+
+## Supervisor application ingress
+
+When `[openshell.supervisor.app_listener]` is explicitly enabled, check its
+`port` and `domain` separately from the gateway API and supervisor runtime ports.
+The Kubernetes TLS Secret is configured with `tls_secret_name` under
+`[openshell.drivers.kubernetes.sandbox_runtime.app_listener]`. Disabled listeners
+create no app TLS mount or app port. TLS material is mounted only in supervisors
+and reloads on supervisor restart.
+
+Inspect supervisor Pods with `kubectl`. In both dedicated and shared topologies,
+connect to the current sandbox owner's Pod IP and configured app port. The driver
+creates no app Services. Preserve service SNI and Host when using curl's
+`--connect-to`, and verify the application certificate. A port-forward bypasses
+NetworkPolicy forwarding; also test from a permitted in-cluster client. Operators
+provide ingress network rules. Running supervisors retain their startup listener
+configuration until restarted.
+
+Service changes arrive through polling or push configuration. Only admitted
+service declarations are installed. Polling and accepted live push sessions
+renew a 30-second lease; rejected configuration or expired freshness closes
+routes. App traffic uses application/edge authentication independently of gateway
+user authentication. This listener stage does not add service discovery or
+change the public URLs printed by the CLI.

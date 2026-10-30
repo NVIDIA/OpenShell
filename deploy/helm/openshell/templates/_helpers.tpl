@@ -269,6 +269,11 @@ shared workspace mode.
 {{- $kubernetesConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
 {{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}
 {{- $names := list -}}
+{{- $app := include "openshell.appListenerConfig" . | fromYaml -}}
+{{- $appDeployment := include "openshell.appListenerDeployment" . | fromYaml -}}
+{{- if and (get $app "enabled") (get $appDeployment "tls_secret_name") (not (include "openshell.supervisorEnabled" .)) -}}
+{{- $names = append $names (get $appDeployment "tls_secret_name") -}}
+{{- end -}}
 {{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) -}}
 {{- $names = append $names .Values.server.tls.clientTlsSecretName -}}
 {{- end -}}
@@ -631,6 +636,13 @@ absent fields so every chart consumer observes the same configuration.
 {{- end -}}
 {{- $legacyRuntime := .Values.supervisor.sandboxRuntime | default dict -}}
 {{- $runtimeConfig := get $kubernetes "sandbox_runtime" | default dict -}}
+{{- if hasKey $gatewayConfig "openshell.drivers.kubernetes.sandbox_runtime" -}}
+{{- $runtimeConfig = deepCopy (get $gatewayConfig "openshell.drivers.kubernetes.sandbox_runtime") -}}
+{{- end -}}
+{{- $appDeployment := include "openshell.appListenerDeployment" . | fromYaml -}}
+{{- if $appDeployment -}}
+{{- $_ := set $runtimeConfig "app_listener" $appDeployment -}}
+{{- end -}}
 {{- if and (ne (int (get $legacyRuntime "boundaryPort" | default 5500)) 5500) (not (hasKey $runtimeConfig "boundary_port")) -}}
 {{- $_ := set $runtimeConfig "boundary_port" (int (get $legacyRuntime "boundaryPort")) -}}
 {{- end -}}
@@ -807,3 +819,28 @@ Validate chart values that Helm would otherwise accept silently.
 {{- fail "server.dataStorageSize must be a Kubernetes quantity with a unit, such as 20Gi" -}}
 {{- end -}}
 {{- end }}
+
+{{/* Common app settings are separate from driver-owned TLS/Service details. */}}
+{{- define "openshell.appListenerConfig" -}}
+{{- $config := .Values.gatewayConfig | default dict -}}
+{{- $supervisor := get $config "openshell.supervisor" | default dict -}}
+{{- $app := get $supervisor "app_listener" | default dict -}}
+{{- if hasKey $config "openshell.supervisor.app_listener" -}}
+{{- $app = get $config "openshell.supervisor.app_listener" -}}
+{{- end -}}
+{{- toYaml $app -}}
+{{- end -}}
+
+{{- define "openshell.appListenerDeployment" -}}
+{{- $config := .Values.gatewayConfig | default dict -}}
+{{- $kube := get $config "openshell.drivers.kubernetes" | default dict -}}
+{{- $runtime := get $kube "sandbox_runtime" | default dict -}}
+{{- if hasKey $config "openshell.drivers.kubernetes.sandbox_runtime" -}}
+{{- $runtime = get $config "openshell.drivers.kubernetes.sandbox_runtime" -}}
+{{- end -}}
+{{- $app := get $runtime "app_listener" | default dict -}}
+{{- if hasKey $config "openshell.drivers.kubernetes.sandbox_runtime.app_listener" -}}
+{{- $app = get $config "openshell.drivers.kubernetes.sandbox_runtime.app_listener" -}}
+{{- end -}}
+{{- toYaml $app -}}
+{{- end -}}

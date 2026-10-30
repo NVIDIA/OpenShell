@@ -597,7 +597,14 @@ fn main() -> Result<()> {
                         "isolation-backend role started without validated runtime inputs"
                     ));
                 };
+                let app_host = openshell_supervisor::app_listener::Config::from_env()?
+                    .map(openshell_supervisor::app_listener::Config::bind)
+                    .transpose()?
+                    .map(openshell_supervisor::app_listener::BoundListener::start);
                 let config = openshell_supervisor::SandboxInstanceConfig {
+                    app_router: app_host
+                        .as_ref()
+                        .map(openshell_supervisor::app_listener::HostHandle::router),
                     command,
                     workdir,
                     timeout_secs: args.timeout,

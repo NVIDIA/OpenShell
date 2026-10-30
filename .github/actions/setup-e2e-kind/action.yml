@@ -29,6 +29,10 @@ inputs:
     description: mise release to install
     required: false
     default: v2026.9.9
+  enforce-network-policy:
+    description: Replace kindnet with pinned Calico for NetworkPolicy assertions
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -45,11 +49,62 @@ runs:
         REGISTRY_PASSWORD: ${{ inputs.registry-password }}
       run: echo "$REGISTRY_PASSWORD" | docker login "${REGISTRY%%/*}" -u "$REGISTRY_USERNAME" --password-stdin
 
+    - name: Configure policy-enforcing kind network
+      id: kind-config
+      if: inputs.enforce-network-policy == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        config="$RUNNER_TEMP/kind-network-policy.yaml"
+        cat > "$config" <<'YAML'
+        kind: Cluster
+        apiVersion: kind.x-k8s.io/v1alpha4
+        networking:
+          disableDefaultCNI: true
+          podSubnet: 10.244.0.0/16
+        YAML
+        echo "path=$config" >> "$GITHUB_OUTPUT"
+
     - name: Create kind cluster
       uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
       with:
         cluster_name: ${{ inputs.cluster-name }}
-        wait: 120s
+        # Nodes cannot become Ready until the following CNI installation.
+        wait: ${{ inputs.enforce-network-policy == 'true' && '0s' || '120s' }}
+        config: ${{ steps.kind-config.outputs.path }}
+
+    - name: Install policy-enforcing CNI
+      if: inputs.enforce-network-policy == 'true'
+      shell: bash
+      env:
+        CLUSTER_NAME: ${{ inputs.cluster-name }}
+      run: |
+        set -euo pipefail
+        collect_cni_diagnostics() {
+          failure_status=$?
+          set +e
+          diagnostics="$GITHUB_WORKSPACE/results/app-listener/cni-setup"
+          mkdir -p "$diagnostics"
+          kubectl --context "kind-$CLUSTER_NAME" get nodes -o wide > "$diagnostics/nodes.txt" 2>&1
+          kubectl --context "kind-$CLUSTER_NAME" describe nodes > "$diagnostics/node-details.txt" 2>&1
+          kubectl --context "kind-$CLUSTER_NAME" -n kube-system get pods -o wide > "$diagnostics/pods.txt" 2>&1
+          kubectl --context "kind-$CLUSTER_NAME" -n kube-system get events --sort-by=.lastTimestamp > "$diagnostics/events.txt" 2>&1
+          for component in calico-node calico-kube-controllers; do
+            kubectl --context "kind-$CLUSTER_NAME" -n kube-system describe pods -l "k8s-app=$component" > "$diagnostics/$component-details.txt" 2>&1
+            kubectl --context "kind-$CLUSTER_NAME" -n kube-system logs -l "k8s-app=$component" --all-containers --prefix --tail=200 > "$diagnostics/$component.log" 2>&1
+            kubectl --context "kind-$CLUSTER_NAME" -n kube-system logs -l "k8s-app=$component" --all-containers --prefix --tail=200 --previous > "$diagnostics/$component-previous.log" 2>&1
+          done
+          cat "$diagnostics/pods.txt" "$diagnostics/events.txt"
+          exit "$failure_status"
+        }
+        trap collect_cni_diagnostics ERR
+        curl -fsSL https://raw.githubusercontent.com/projectcalico/calico/v3.30.3/manifests/calico.yaml \
+          -o "$RUNNER_TEMP/calico.yaml"
+        sed 's@192.168.0.0/16@10.244.0.0/16@g' "$RUNNER_TEMP/calico.yaml" > "$RUNNER_TEMP/calico-kind.yaml"
+        kubectl --context "kind-$CLUSTER_NAME" apply -f "$RUNNER_TEMP/calico-kind.yaml"
+        kubectl --context "kind-$CLUSTER_NAME" -n kube-system rollout status daemonset/calico-node --timeout=300s
+        kubectl --context "kind-$CLUSTER_NAME" -n kube-system rollout status deployment/calico-kube-controllers --timeout=300s
+        kubectl --context "kind-$CLUSTER_NAME" wait nodes --all --for=condition=Ready --timeout=120s
 
     - name: Export kind kubeconfig to mise path
       shell: bash

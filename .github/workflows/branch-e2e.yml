@@ -463,6 +463,43 @@ jobs:
       agent-sandbox-version: ${{ matrix.agent_sandbox_version }}
       test-name: ${{ matrix.test_name }}
 
+  kubernetes-app-listener-e2e:
+    needs: [pr_metadata, build-binaries, build-images]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - topology: dedicated
+            delivery: push
+            takeover: graceful
+            name: dedicated push
+          - topology: dedicated
+            delivery: poll
+            takeover: graceful
+            name: dedicated poll
+          - topology: shared
+            delivery: push
+            takeover: graceful
+            name: shared graceful takeover
+          - topology: shared
+            delivery: push
+            takeover: abrupt
+            name: shared abrupt takeover
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      job-name: Kubernetes app listener (${{ matrix.name }})
+      e2e-task: e2e:kubernetes:app-listener
+      enforce-network-policy: true
+      listener-topology: ${{ matrix.topology }}
+      listener-delivery: ${{ matrix.delivery }}
+      listener-takeover: ${{ matrix.takeover }}
+
   kubernetes-workspace-managed-e2e:
     needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
@@ -552,6 +589,7 @@ jobs:
       - podman-external-driver-e2e
       - vm-external-driver-e2e
       - kubernetes-e2e
+      - kubernetes-app-listener-e2e
       - kubernetes-external-driver-e2e
       - kubernetes-workspace-managed-e2e
       - kubernetes-workspace-operator-e2e
