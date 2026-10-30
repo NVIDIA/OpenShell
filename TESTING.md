@@ -355,23 +355,23 @@ HTTP `Host`, TLS SNI, and mTLS handling.
 Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
-- CLI conformance (`tests/suites/conformance`) - portable Cargo tests for
-  lifecycle, mechanistic drafts, file transfer, and the sandbox-local API,
-  including agent-authored permission requests. Driver E2E runs the complete
-  Cargo test package. The installed-artifact conformance lanes run the `sandbox`
-  package through `openshell-test-runner` (see below).
+- Conformance (`tests/suites/conformance`) - the testkit `sandbox` package:
+  lifecycle, the CLI, persistent workspaces, file transfer, and the policy
+  advisor. Driver E2E runs it with nextest against the lane's gateway. The
+  installed-artifact conformance lanes run the same package through
+  `openshell-test-runner` (see above).
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
-  `e2e-vm`) - CLI conformance plus the common and driver-specific coverage for
+  `e2e-vm`) - conformance plus the common and driver-specific coverage for
   the selected deployment.
 - Docker suite (`--features e2e-docker`) - includes Docker-only coverage such as Dockerfile image builds, Docker preflight checks, and managed Docker gateway start.
 - Docker GPU suite (`--features e2e-docker-gpu`) - Docker suite plus GPU sandbox smoke coverage.
-- Configuration push suite (`--features e2e-config-push`) - CLI conformance and the policy tests against a Docker gateway with `config_delivery_mode = "push"`. Run it with `mise run e2e:rust:push`.
+- Configuration push suite (`--features e2e-config-push`) - conformance and the policy tests against a Docker gateway with `config_delivery_mode = "push"`. Run it with `mise run e2e:rust:push`.
 - VM suite (`--features e2e-vm`) - runs e2e tests on a VM.
 - Kubernetes credential-driver suite (`--features e2e-kubernetes-credential-drivers`) - targeted Kubernetes Secrets and Vault provider credential storage coverage.
 
-The Docker, Podman, Kubernetes, and VM runners execute CLI
-conformance before their Rust tests. Set the driver's feature variable
-(`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURES`,
+The Docker, Podman, Kubernetes, and VM runners execute conformance before
+their Rust tests; a run with no conformance tests fails. Set the driver's
+feature variable (`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURES`,
 `OPENSHELL_E2E_KUBERNETES_FEATURES`, or `OPENSHELL_E2E_VM_FEATURES`) to
 `e2e-conformance-only` to skip the Rust tests; the runner logs a notice when
 it skips them. Unset or empty values select the driver's default Rust
