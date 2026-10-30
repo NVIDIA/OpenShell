@@ -104,13 +104,14 @@ struct Args {
     #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
     otlp_ocsf_endpoint: Option<String>,
 
-    /// OCSF schema version that supervisors downgrade exported events to.
-    #[arg(
-        long,
-        env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION",
-        requires = "otlp_ocsf_endpoint"
-    )]
+    /// Deprecated and ignored: `OpenShell` emits OCSF 1.8.0 only.
+    #[arg(long, env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION", hide = true)]
     otlp_ocsf_schema_version: Option<String>,
+
+    /// OTLP/gRPC collector endpoint that supervisors relay workload traces
+    /// to. Absent keeps the agent trace relay off.
+    #[arg(long, env = "OPENSHELL_OTLP_AGENT_ENDPOINT")]
+    otlp_agent_endpoint: Option<String>,
 
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
@@ -313,6 +314,11 @@ async fn main() -> Result<()> {
             log_level: &args.log_level,
         },
     );
+    if args.otlp_ocsf_schema_version.is_some() {
+        tracing::warn!(
+            "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION is deprecated and ignored; OpenShell emits OCSF 1.8.0"
+        );
+    }
 
     let listen_mode = compute_driver_listen_mode(&args).map_err(|err| miette::miette!("{err}"))?;
 
@@ -335,13 +341,12 @@ async fn main() -> Result<()> {
             .grpc_endpoint
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
         supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
+        supervisor_otlp_agent_endpoint: args.otlp_agent_endpoint.clone(),
         supervisor_gateway_name: args.gateway_name.clone(),
-        supervisor_ocsf_export: args.otlp_ocsf_endpoint.clone().map(|endpoint| {
-            openshell_core::sandbox_env::OcsfOtlpExport {
-                endpoint,
-                schema_version: args.otlp_ocsf_schema_version.clone(),
-            }
-        }),
+        supervisor_ocsf_export: args
+            .otlp_ocsf_endpoint
+            .clone()
+            .map(|endpoint| openshell_core::sandbox_env::OcsfOtlpExport { endpoint }),
         state_dir: args.state_dir.clone(),
         launcher_bin: None,
         default_image: args.default_image.clone(),

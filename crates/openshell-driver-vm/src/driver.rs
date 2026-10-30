@@ -356,6 +356,10 @@ pub struct VmDriverConfig {
     /// export; driver TOML cannot set it.
     #[serde(skip)]
     pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+    /// OTLP/gRPC collector that supervisors relay workload traces to. The
+    /// gateway supplies it from `[otlp.agent]`; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_otlp_agent_endpoint: Option<String>,
     /// Gateway name passed to supervisors for their telemetry.
     pub supervisor_gateway_name: Option<String>,
     pub state_dir: PathBuf,
@@ -431,6 +435,10 @@ impl std::fmt::Debug for VmDriverConfig {
             .field("grpc_endpoint", &self.grpc_endpoint)
             .field("supervisor_otlp_endpoint", &self.supervisor_otlp_endpoint)
             .field("supervisor_ocsf_export", &self.supervisor_ocsf_export)
+            .field(
+                "supervisor_otlp_agent_endpoint",
+                &self.supervisor_otlp_agent_endpoint,
+            )
             .field("supervisor_gateway_name", &self.supervisor_gateway_name)
             .field("state_dir", &self.state_dir)
             .field("launcher_bin", &self.launcher_bin)
@@ -502,6 +510,7 @@ impl Default for VmDriverConfig {
             grpc_endpoint: String::new(),
             supervisor_otlp_endpoint: None,
             supervisor_ocsf_export: None,
+            supervisor_otlp_agent_endpoint: None,
             supervisor_gateway_name: None,
             allow_driver_config: false,
             resource_admission:
@@ -1493,6 +1502,9 @@ impl VmDriver {
         }
         if let Some(export) = &self.config.supervisor_ocsf_export {
             command.envs(export.environment());
+        }
+        if let Some(endpoint) = &self.config.supervisor_otlp_agent_endpoint {
+            command.env(openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT, endpoint);
         }
         if let Some(name) = &self.config.supervisor_gateway_name {
             command.env(openshell_core::sandbox_env::GATEWAY_NAME, name);
@@ -5310,6 +5322,9 @@ fn configure_main_exit_marker(command: &mut Command, state_dir: &Path) {
         .arg("--main-exit-marker")
         .arg(state_dir.join(MAIN_PROCESS_EXITED_FILE));
 }
+
+#[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for VmDriver {}
 
 #[tonic::async_trait]
 impl ComputeDriver for VmDriver {
@@ -12329,6 +12344,28 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn extracts_zstd_compressed_oci_layer() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = tar_bytes_with_file("bin/tool", b"tool contents");
+        let compressed = zstd::encode_all(archive.as_slice(), 0).unwrap();
+        let blob = temp.path().join("layer.tar.zst");
+        let extracted = temp.path().join("extracted");
+        fs::write(&blob, compressed).unwrap();
+
+        extract_layer_blob_to_dir(
+            &blob,
+            "application/vnd.oci.image.layer.v1.tar+zstd",
+            &extracted,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(extracted.join("bin/tool")).unwrap(),
+            b"tool contents"
+        );
     }
 
     #[test]

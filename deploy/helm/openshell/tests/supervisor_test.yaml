@@ -714,17 +714,17 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: supervisor.replicas must be an integer of at least 1
-  - it: rejects a recovery timeout below 10 seconds
+  - it: rejects a recovery timeout below 30 seconds
     template: templates/supervisor.yaml
     set:
       supervisor:
-        recoveryTimeoutSeconds: 9
+        recoveryTimeoutSeconds: 29
       gatewayConfig:
         openshell.drivers.kubernetes:
           supervisor_topology: gateway
     asserts:
       - failedTemplate:
-          errorMessage: supervisor.recoveryTimeoutSeconds must be an integer between 10 and 300, or null for the default
+          errorMessage: supervisor.recoveryTimeoutSeconds must be an integer between 30 and 300, or null for the default
   - it: rejects a recovery timeout above 300 seconds
     template: templates/supervisor.yaml
     set:
@@ -736,7 +736,7 @@ tests:
           supervisor_topology: gateway
     asserts:
       - failedTemplate:
-          errorMessage: supervisor.recoveryTimeoutSeconds must be an integer between 10 and 300, or null for the default
+          errorMessage: supervisor.recoveryTimeoutSeconds must be an integer between 30 and 300, or null for the default
   - it: rejects a fractional recovery timeout
     template: templates/supervisor.yaml
     set:
@@ -747,7 +747,7 @@ tests:
           supervisor_topology: gateway
     asserts:
       - failedTemplate:
-          errorMessage: supervisor.recoveryTimeoutSeconds must be an integer between 10 and 300, or null for the default
+          errorMessage: supervisor.recoveryTimeoutSeconds must be an integer between 30 and 300, or null for the default
   - it: ignores supervisor pool values without the gateway topology
     template: templates/supervisor.yaml
     set:

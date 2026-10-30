@@ -51,6 +51,10 @@ use crate::proto::{
 /// startup fit with room to spare.
 pub const POOL_RECOVERY_TIMEOUT_SECS: u32 = 60;
 
+/// Recovery deadlines, in seconds, a gateway may configure for its pool. The
+/// minimum outlasts detecting a failed member.
+pub const POOL_RECOVERY_TIMEOUT_RANGE: std::ops::RangeInclusive<u32> = 30..=300;
+
 /// Heartbeat interval of pool members, whose liveness drives failover.
 pub const POOL_HEARTBEAT_INTERVAL: Duration = crate::pool_timing::HEARTBEAT_INTERVAL;
 /// Silence after which the gateway closes a pool member's stream.

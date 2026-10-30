@@ -1865,6 +1865,9 @@ impl SupervisorPool {
                 .await
                 .map_err(|error| format!("read supervisor pool capacity: {error}"))?,
         );
+        if members.is_empty() {
+            return Err("no shared supervisor replica is attached to the gateway".to_string());
+        }
         let ring = ring_of(&members);
         let targets = candidates(
             &ring,
@@ -3267,12 +3270,14 @@ mod tests {
         assert_eq!(view.members.len(), 3);
         // With no live member a launch is refused before its workload runs.
         let empty = Fixture::new().await;
+        let refused = empty
+            .replica("gw-b")
+            .place_launch(launch("rt-route-none", "sandbox-x", "generation-1"))
+            .await
+            .unwrap_err();
         assert!(
-            empty
-                .replica("gw-b")
-                .place_launch(launch("rt-route-none", "sandbox-x", "generation-1"))
-                .await
-                .is_err()
+            refused.contains("no shared supervisor replica is attached"),
+            "{refused}"
         );
     }
 
@@ -4805,7 +4810,11 @@ mod tests {
         let launching = fixture.replica("gw-b");
         let (pass, launched) = tokio::join!(
             pool.reconcile_once(),
-            launching.place_launch(launch("rt-route-new0", "sandbox-new", "generation-1")),
+            Box::pin(launching.place_launch(launch(
+                "rt-route-new0",
+                "sandbox-new",
+                "generation-1"
+            ))),
         );
         pass.unwrap();
         // Every route is re-adopted by the new process at the next term,

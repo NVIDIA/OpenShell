@@ -437,8 +437,8 @@ default.
 {{- $value := get $supervisor "recoveryTimeoutSeconds" -}}
 {{- if and (hasKey $supervisor "recoveryTimeoutSeconds") (not (kindIs "invalid" $value)) (ne (toString $value) "") -}}
 {{- $timeout := include "openshell.wholeNumber" $value -}}
-{{- if or (eq $timeout "") (lt (int64 $timeout) 10) (gt (int64 $timeout) 300) -}}
-{{- fail "supervisor.recoveryTimeoutSeconds must be an integer between 10 and 300, or null for the default" -}}
+{{- if or (eq $timeout "") (lt (int64 $timeout) 30) (gt (int64 $timeout) 300) -}}
+{{- fail "supervisor.recoveryTimeoutSeconds must be an integer between 30 and 300, or null for the default" -}}
 {{- end -}}
 {{- $timeout -}}
 {{- end -}}

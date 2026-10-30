@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{Cursor, Read as _};
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -33,6 +33,7 @@ use openshell_core::{
     EdgeAuthConfig, ExtensionBindingPolicy, GatewayAuthConfig, GatewayInterceptorConfig,
     GatewayJwtConfig, GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig,
 };
+use rustls::pki_types::pem::{PemObject, SectionKind};
 use serde::{Deserialize, Serialize};
 
 /// Gateway configuration schema version supported by this build.
@@ -142,6 +143,9 @@ pub struct GatewayFileSection {
     /// Absolute preparation budget for new attempts; existing deadlines persist.
     #[serde(default)]
     pub image_preparation_timeout_seconds: Option<u32>,
+    /// Explicit activation only after the compatible deployment rollout ends.
+    #[serde(default)]
+    pub enable_sandbox_updates: Option<bool>,
     #[serde(default)]
     pub grpc_rate_limit_requests: Option<u64>,
     #[serde(default)]
@@ -226,7 +230,7 @@ pub struct GatewayFileSection {
 #[serde(deny_unknown_fields)]
 pub struct SupervisorPoolConfig {
     /// Seconds a sandbox runtime keeps its workload frozen after losing its
-    /// supervisor before terminating it, from 10 to 300. The pool's
+    /// supervisor before terminating it, from 30 to 300. The pool's
     /// supervisors offer it to each runtime; unset offers
     /// [`openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -262,14 +266,13 @@ pub enum OcsfLogRotation {
     Daily,
 }
 
-pub use openshell_ocsf::OcsfSchemaVersion;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "RawOcsfLogConfig")]
 pub struct OcsfLogConfig {
     pub path: PathBuf,
+    /// Deprecated and ignored: `OpenShell` emits OCSF 1.8.0 only.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub schema_version: Option<OcsfSchemaVersion>,
+    pub schema_version: Option<String>,
     pub rotation: OcsfLogRotation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_files: Option<std::num::NonZeroUsize>,
@@ -281,7 +284,7 @@ pub struct OcsfLogConfig {
 #[serde(deny_unknown_fields)]
 struct RawOcsfLogConfig {
     path: PathBuf,
-    schema_version: Option<OcsfSchemaVersion>,
+    schema_version: Option<String>,
     #[serde(default)]
     rotation: OcsfLogRotation,
     max_files: Option<std::num::NonZeroUsize>,
@@ -319,8 +322,9 @@ impl TryFrom<RawOcsfLogConfig> for OcsfLogConfig {
 /// `[openshell.gateway.otlp]` section and its per-signal tables.
 ///
 /// `endpoint` is the collector for every enabled signal, and on its own
-/// enables trace export. `[otlp.traces]` overrides the trace endpoint, and
-/// `[otlp.ocsf]` with `enabled = true` exports OCSF events as log records,
+/// enables trace export. `[otlp.traces]` overrides the trace endpoint,
+/// `[otlp.ocsf]` with `enabled = true` exports OCSF events as log records, and
+/// `[otlp.agent]` with `enabled = true` relays workload traces, each
 /// optionally to a different endpoint. SDK tuning knobs are deliberately absent — see
 /// [`crate::otel_tracing`] for what this table owns and what the `OTEL_*`
 /// environment variables own.
@@ -341,27 +345,36 @@ pub struct OtlpConfig {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_enabled_ocsf"
+        serialize_with = "serialize_enabled"
     )]
     pub ocsf: Option<OcsfOtlpConfig>,
+
+    /// Relay of workload traces from sandboxes, when enabled.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_enabled"
+    )]
+    pub agent: Option<AgentOtlpConfig>,
 }
 
 /// Writes `enabled = true` so that a serialized config parses back to the
 /// same export.
-fn serialize_enabled_ocsf<S: serde::Serializer>(
-    ocsf: &Option<OcsfOtlpConfig>,
+fn serialize_enabled<T: Serialize, S: serde::Serializer>(
+    table: &Option<T>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     #[derive(Serialize)]
-    struct Enabled<'a> {
+    struct Enabled<'a, T> {
         enabled: bool,
         #[serde(flatten)]
-        ocsf: &'a OcsfOtlpConfig,
+        table: &'a T,
     }
-    ocsf.as_ref()
-        .map(|ocsf| Enabled {
+    table
+        .as_ref()
+        .map(|table| Enabled {
             enabled: true,
-            ocsf,
+            table,
         })
         .serialize(serializer)
 }
@@ -370,6 +383,12 @@ impl OtlpConfig {
     /// The collector that receives traces, when trace export is enabled.
     pub fn traces_endpoint(&self) -> Option<&str> {
         self.traces.as_ref().map(|traces| traces.endpoint.as_str())
+    }
+
+    /// The collector that receives relayed workload traces, when the agent
+    /// trace relay is enabled.
+    pub fn agent_endpoint(&self) -> Option<&str> {
+        self.agent.as_ref().map(|agent| agent.endpoint.as_str())
     }
 }
 
@@ -387,9 +406,17 @@ pub struct OcsfOtlpConfig {
     /// OTLP/gRPC collector endpoint for OCSF log records.
     pub endpoint: String,
 
-    /// Optional OCSF downgrade target for exported log records.
+    /// Deprecated and ignored: `OpenShell` emits OCSF 1.8.0 only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub schema_version: Option<OcsfSchemaVersion>,
+    pub schema_version: Option<String>,
+}
+
+/// `[openshell.gateway.otlp.agent]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOtlpConfig {
+    /// OTLP/gRPC collector endpoint that sandbox supervisors forward
+    /// workload traces to.
+    pub endpoint: String,
 }
 
 #[derive(Deserialize)]
@@ -403,6 +430,17 @@ struct RawOtlpConfig {
     traces: Option<RawOtlpTraces>,
     #[serde(default)]
     ocsf: Option<RawOcsfOtlp>,
+    #[serde(default)]
+    agent: Option<RawAgentOtlp>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAgentOtlp {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    endpoint: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -420,7 +458,7 @@ struct RawOcsfOtlp {
     #[serde(default)]
     endpoint: Option<String>,
     #[serde(default)]
-    schema_version: Option<OcsfSchemaVersion>,
+    schema_version: Option<String>,
 }
 
 impl TryFrom<RawOtlpConfig> for OtlpConfig {
@@ -447,13 +485,26 @@ impl TryFrom<RawOtlpConfig> for OtlpConfig {
                 })
             })
             .transpose()?;
-        if traces.is_none() && ocsf.is_none() {
-            return Err("otlp needs an endpoint, or otlp.ocsf with enabled = true".to_string());
+        let agent = raw
+            .agent
+            .filter(|agent| agent.enabled)
+            .map(|agent| {
+                Ok::<_, String>(AgentOtlpConfig {
+                    endpoint: endpoint_for("agent", agent.endpoint)?,
+                })
+            })
+            .transpose()?;
+        if traces.is_none() && ocsf.is_none() && agent.is_none() {
+            return Err(
+                "otlp needs an endpoint, or otlp.ocsf or otlp.agent with enabled = true"
+                    .to_string(),
+            );
         }
         Ok(Self {
             service_name: raw.service_name,
             traces,
             ocsf,
+            agent,
         })
     }
 }
@@ -488,6 +539,28 @@ pub struct SupervisorNetworkFileSection {
 }
 
 impl ConfigFile {
+    /// Deprecated `schema_version` fields that are set; they are ignored.
+    pub fn deprecated_ocsf_schema_versions(&self) -> Vec<&'static str> {
+        let gateway = &self.openshell.gateway;
+        let mut set = Vec::new();
+        if gateway
+            .ocsf_log
+            .as_ref()
+            .is_some_and(|ocsf| ocsf.schema_version.is_some())
+        {
+            set.push("openshell.gateway.ocsf_log.schema_version");
+        }
+        if gateway
+            .otlp
+            .as_ref()
+            .and_then(|otlp| otlp.ocsf.as_ref())
+            .is_some_and(|ocsf| ocsf.schema_version.is_some())
+        {
+            set.push("openshell.gateway.otlp.ocsf.schema_version");
+        }
+        set
+    }
+
     /// Resolve the selected driver's exact backend name without sandbox input.
     pub(crate) fn isolation_backend(
         &self,
@@ -626,13 +699,13 @@ impl TryFrom<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
 fn sanitize_ca_cert_pem(name: &str, path: &Path, pem: &[u8]) -> Result<Vec<u8>, ConfigFileError> {
     let mut sanitized = Vec::new();
     let mut certificate_count = 0;
-    for item in rustls_pemfile::read_all(&mut Cursor::new(pem)) {
+    for item in <(SectionKind, Vec<u8>)>::pem_slice_iter(pem) {
         let item = item.map_err(|source| ConfigFileError::MiddlewareTlsCaInvalid {
             name: name.to_string(),
             path: path.to_path_buf(),
             message: source.to_string(),
         })?;
-        let rustls_pemfile::Item::X509Certificate(certificate) = item else {
+        let (SectionKind::Certificate, certificate) = item else {
             return Err(ConfigFileError::MiddlewareTlsCaInvalid {
                 name: name.to_string(),
                 path: path.to_path_buf(),
@@ -641,7 +714,7 @@ fn sanitize_ca_cert_pem(name: &str, path: &Path, pem: &[u8]) -> Result<Vec<u8>, 
         };
         certificate_count += 1;
         sanitized.extend_from_slice(b"-----BEGIN CERTIFICATE-----\n");
-        let encoded = base64::engine::general_purpose::STANDARD.encode(certificate.as_ref());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&certificate);
         for line in encoded.as_bytes().chunks(64) {
             sanitized.extend_from_slice(line);
             sanitized.push(b'\n');
@@ -866,12 +939,12 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
         .supervisor_pool
         .and_then(|pool| pool.recovery_timeout_secs)
         .is_some_and(|timeout| {
-            !openshell_supervisor_control::SUPERVISOR_RECOVERY_TIMEOUT_RANGE.contains(&timeout)
+            !openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_RANGE.contains(&timeout)
         })
     {
         return Err(ConfigFileError::InvalidValue {
             field: "openshell.gateway.supervisor_pool.recovery_timeout_secs",
-            message: "must be between 10 and 300 seconds",
+            message: "must be between 30 and 300 seconds",
         });
     }
     if let Some((name, _)) = file
@@ -1386,20 +1459,40 @@ service_name = "openshell-gateway-dev"
         assert_eq!(config.queue_capacity.get(), 10_000);
         assert_eq!(config.queue_max_bytes.get(), 16 * 1024 * 1024);
         assert!(ConfigFile::default().openshell.gateway.ocsf_log.is_none());
+    }
 
+    #[test]
+    fn names_the_deprecated_schema_versions_that_are_set() {
+        assert!(
+            ConfigFile::default()
+                .deprecated_ocsf_schema_versions()
+                .is_empty()
+        );
+        let tmp = write_tmp(
+            "[openshell.gateway.ocsf_log]\npath = 'events.jsonl'\nschema_version = '1.3'\n\n\
+             [openshell.gateway.otlp.ocsf]\nenabled = true\nendpoint = 'http://siem:4317'\nschema_version = '1.3'\n",
+        );
+        assert_eq!(
+            load(tmp.path()).unwrap().deprecated_ocsf_schema_versions(),
+            [
+                "openshell.gateway.ocsf_log.schema_version",
+                "openshell.gateway.otlp.ocsf.schema_version"
+            ]
+        );
+    }
+
+    #[test]
+    fn ocsf_log_accepts_the_deprecated_schema_version() {
         let tmp = write_tmp(
             "[openshell.gateway.ocsf_log]\npath = 'events.jsonl'\nschema_version = '1.3'\n",
         );
-        assert_eq!(
-            load(tmp.path())
-                .unwrap()
-                .openshell
-                .gateway
-                .ocsf_log
-                .unwrap()
-                .schema_version,
-            Some(OcsfSchemaVersion::V1_3)
-        );
+        let config = load(tmp.path())
+            .unwrap()
+            .openshell
+            .gateway
+            .ocsf_log
+            .unwrap();
+        assert_eq!(config.schema_version.as_deref(), Some("1.3"));
     }
 
     #[test]
@@ -1411,8 +1504,6 @@ service_name = "openshell-gateway-dev"
             "path = 'log'\nqueue_max_bytes = 0",
             "path = 'log'\nmax_files = 0",
             "path = 'log'\nrotation = 'hourly'",
-            "path = 'log'\nschema_version = ''",
-            "path = 'log'\nschema_version = '1.8'",
             "path = 'log'\nkind = 'jsonl'",
             "path = 'log'\nrotation = 'never'\nmax_files = 7",
         ] {
@@ -1464,15 +1555,26 @@ service_name = "openshell-gateway-dev"
         let otlp = otlp(
             "[openshell.gateway.otlp]\nendpoint = 'http://shared:4317'\n\n\
              [openshell.gateway.otlp.traces]\nendpoint = 'http://traces:4317'\n\n\
-             [openshell.gateway.otlp.ocsf]\nenabled = true\nendpoint = 'http://siem:4317'\nschema_version = '1.1'\n",
+             [openshell.gateway.otlp.ocsf]\nenabled = true\nendpoint = 'http://siem:4317'\n",
         );
         assert_eq!(otlp.traces_endpoint(), Some("http://traces:4317"));
         assert_eq!(
             otlp.ocsf,
             Some(OcsfOtlpConfig {
                 endpoint: "http://siem:4317".into(),
-                schema_version: Some(OcsfSchemaVersion::V1_1),
+                schema_version: None,
             })
+        );
+    }
+
+    #[test]
+    fn otlp_ocsf_accepts_the_deprecated_schema_version() {
+        let otlp = otlp(
+            "[openshell.gateway.otlp.ocsf]\nenabled = true\nendpoint = 'http://siem:4317'\nschema_version = '1.3'\n",
+        );
+        assert_eq!(
+            otlp.ocsf.and_then(|ocsf| ocsf.schema_version).as_deref(),
+            Some("1.3")
         );
     }
 
@@ -1499,10 +1601,52 @@ service_name = "openshell-gateway-dev"
     }
 
     #[test]
+    fn otlp_agent_relay_is_off_unless_enabled() {
+        for agent in ["", "enabled = false\n", "endpoint = 'http://agents:4317'\n"] {
+            let otlp = otlp(&format!(
+                "[openshell.gateway.otlp]\nendpoint = 'http://127.0.0.1:4317'\n\n\
+                 [openshell.gateway.otlp.agent]\n{agent}"
+            ));
+            assert_eq!(
+                otlp.agent_endpoint(),
+                None,
+                "enabled the relay with {agent:?}"
+            );
+        }
+        let otlp = otlp("[openshell.gateway.otlp]\nendpoint = 'http://127.0.0.1:4317'\n");
+        assert_eq!(otlp.agent_endpoint(), None);
+    }
+
+    #[test]
+    fn otlp_agent_relay_defaults_to_the_shared_endpoint() {
+        let otlp = otlp(
+            "[openshell.gateway.otlp]\nendpoint = 'http://shared:4317'\n\n\
+             [openshell.gateway.otlp.traces]\nendpoint = 'http://traces:4317'\n\n\
+             [openshell.gateway.otlp.agent]\nenabled = true\n",
+        );
+        assert_eq!(otlp.traces_endpoint(), Some("http://traces:4317"));
+        assert_eq!(otlp.agent_endpoint(), Some("http://shared:4317"));
+    }
+
+    #[test]
+    fn otlp_agent_relay_uses_its_own_endpoint() {
+        let otlp = otlp(
+            "[openshell.gateway.otlp.agent]\nenabled = true\nendpoint = 'http://agents:4317'\n",
+        );
+        assert_eq!(otlp.traces_endpoint(), None);
+        assert_eq!(otlp.agent_endpoint(), Some("http://agents:4317"));
+
+        let tmp = write_tmp("[openshell.gateway.otlp.agent]\nenabled = true\n");
+        let error = load(tmp.path()).expect_err("an enabled relay needs an endpoint");
+        assert!(format!("{error:#}").contains("otlp.agent needs an endpoint"));
+    }
+
+    #[test]
     fn otlp_config_round_trips() {
         let tmp = write_tmp(
             "[openshell.gateway.otlp]\nendpoint = 'http://shared:4317'\nservice_name = 'gw'\n\n\
-             [openshell.gateway.otlp.ocsf]\nenabled = true\nschema_version = '1.3'\n",
+             [openshell.gateway.otlp.ocsf]\nenabled = true\n\n\
+             [openshell.gateway.otlp.agent]\nenabled = true\nendpoint = 'http://agents:4317'\n",
         );
         let file = load(tmp.path()).unwrap();
         let encoded = toml::to_string(&file).unwrap();
@@ -1517,7 +1661,6 @@ service_name = "openshell-gateway-dev"
             "[openshell.gateway.otlp.traces]\n",
             "[openshell.gateway.otlp.ocsf]\n",
             "[openshell.gateway.otlp.ocsf]\nenabled = true\n",
-            "[openshell.gateway.otlp.ocsf]\nenabled = true\nendpoint = 'http://siem:4317'\nschema_version = '1.8'\n",
             "[openshell.gateway.otlp.ocsf]\nenabled = 'yes'\nendpoint = 'http://siem:4317'\n",
             "[openshell.gateway.otlp.metrics]\nendpoint = 'http://metrics:4317'\n",
             "[openshell.gateway.otlp]\nendpoint = 'http://127.0.0.1:4317'\nocsf_logs = true\n",
@@ -2016,7 +2159,14 @@ database_lock_max_connections = 0
         );
         // Recovery stays bounded, and unknown keys, including the removed
         // `enabled` switch, are refused.
-        for out_of_range in ["9", "301"] {
+        assert_eq!(
+            pool("recovery_timeout_secs = 30\n")
+                .unwrap()
+                .unwrap()
+                .recovery_timeout_secs,
+            Some(30)
+        );
+        for out_of_range in ["10", "29", "301"] {
             assert!(matches!(
                 pool(&format!("recovery_timeout_secs = {out_of_range}\n")),
                 Err(ConfigFileError::InvalidValue {

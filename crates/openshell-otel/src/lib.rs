@@ -189,7 +189,10 @@ pub fn resource_for(config: &OtlpExportConfig<'_>) -> Resource {
 }
 
 /// Trim and validate an OTLP endpoint before handing it to an exporter.
-fn validated_endpoint(endpoint: &str) -> Result<(&str, http::Uri), SetupError> {
+///
+/// Every exporter that reads an operator-supplied endpoint uses this, so a
+/// value accepted for one signal is accepted for all of them.
+pub fn validated_endpoint(endpoint: &str) -> Result<(&str, http::Uri), SetupError> {
     let endpoint = endpoint.trim();
     if endpoint.is_empty() {
         return Err(SetupError::EmptyEndpoint);

@@ -255,6 +255,9 @@ metrics_bind_address  = "0.0.0.0:9090"
 
 log_level             = "info"
 
+# Activate only after retiring incompatible gateways and outstanding driver work.
+enable_sandbox_updates = false
+
 # Connection ceiling for the gateway's database pool. Omit to use the backend
 # default: 10 for Postgres, 5 for on-disk SQLite.
 database_max_connections = 10
@@ -514,6 +517,46 @@ Changing the installation name, the hostname format, or both changes every
 hash URL issued before the change; previously issued URLs stop resolving
 until callers request a fresh URL.
 
+## Sandbox Updates
+
+`[openshell.gateway] enable_sandbox_updates` defaults to `false`. It gates
+the separate `openshell.v1.SandboxUpdates/UpdateSandbox` RPC on the existing
+gateway listener. It gates image, command, environment, label, and annotation
+updates for stopped sandboxes. Upgrade every gateway before activation.
+Disabling the flag stops new updates; accepted updates still recover automatically.
+The equivalent gateway process flag and environment variable
+are `--enable-sandbox-updates true` and
+`OPENSHELL_ENABLE_SANDBOX_UPDATES=true`.
+
+Enable it only after completing the
+[activation checklist](/kubernetes/high-availability#activate-sandbox-updates).
+Setting it to `true` attests that every gateway that can write the database is
+compatible and incompatible gateways cannot return. Keep it false throughout a
+rolling upgrade, including while outstanding operations from retired gateways
+settle. Gateway membership checks fail closed but do not prove retirement. PostgreSQL
+administrative and monitoring sessions do not block updates; connection
+`application_name` settings are preserved.
+
+For a schema-v2 file, set:
+
+```toml
+[openshell.gateway]
+enable_sandbox_updates = true
+```
+
+The canonical Helm values form uses a dotted table key:
+
+```yaml
+gatewayConfig:
+  "openshell.gateway":
+    enable_sandbox_updates: true
+```
+
+This is not an automatic mixed-version migration switch. Do not downgrade while
+an image update is pending or retained sandboxes require the private image
+revision protocol. SQLite supports one gateway process only; activation attests
+that the previous process has stopped, not that sharing a SQLite file enables HA.
+
 ## Database Pool
 
 `[openshell.gateway] database_max_connections` sets the connection ceiling for the gateway's database pool. One pool is shared by every database-backed RPC, so this value is also the gateway's ceiling on concurrent database work. When the pool is saturated, callers queue on connection acquisition and sqlx logs that the time to acquire a connection exceeded its slow threshold. The background readiness monitor draws from the same pool, so sustained saturation can push its database ping past the check timeout and flip `/readyz` to not-ready while the gateway is otherwise serving.
@@ -543,7 +586,6 @@ Gateway records use `[openshell.gateway] name` as `device.uid` and `device.name`
 ```toml
 [openshell.gateway.ocsf_log]
 path = "/var/log/openshell/gateway-ocsf.jsonl"
-schema_version = "1.3"
 rotation = "daily"
 max_files = 7
 queue_capacity = 10000
@@ -553,7 +595,7 @@ queue_max_bytes = 16777216
 | Field | Default | Behavior |
 |---|---|---|
 | `path` | Required | Nonempty file path; relative paths use the gateway's working directory. |
-| `schema_version` | Native OCSF 1.8.0 | Optional downgrade target. Accepted values are `1.1` and `1.3`. The configured version applies to every record in the file. |
+| `schema_version` | None | Deprecated and ignored; records are native OCSF 1.8.0. The gateway logs a warning at startup when it is set. |
 | `rotation` | `daily` | Rotate on the first write of a new UTC day. `never` allows unbounded file growth. |
 | `max_files` | `7` | Positive number of rotated segments to retain, in addition to the active file. Rejects explicit use with `rotation = "never"`. |
 | `queue_capacity` | `10000` | Positive queued-record limit. Overflow discards incoming records. |
@@ -561,7 +603,7 @@ queue_max_bytes = 16777216
 
 Unknown fields are rejected. This is one file destination, not an exporter registry. To send the same events to a collector, use [OCSF log export](#ocsf-log-export). The existing `ocsf_json_enabled` sandbox setting remains independent.
 
-For Helm installations, set `server.ocsfLog.enabled` to render this table and optionally set `server.ocsfLog.schemaVersion`. The default `server.ocsfLog.path`, `/tmp/gateway-ocsf.jsonl`, is writable in the gateway container with either the StatefulSet or Deployment workload but does not persist across pod restarts. To keep records, mount a volume with `server.extraVolumes` and `server.extraVolumeMounts` and set the path on it. When replicas share a volume, add `subPathExpr: $(OPENSHELL_POD_NAME)` to the mount so each replica writes its own file.
+For Helm installations, set `server.ocsfLog.enabled` to render this table. The default `server.ocsfLog.path`, `/tmp/gateway-ocsf.jsonl`, is writable in the gateway container with either the StatefulSet or Deployment workload but does not persist across pod restarts. To keep records, mount a volume with `server.extraVolumes` and `server.extraVolumeMounts` and set the path on it. When replicas share a volume, add `subPathExpr: $(OPENSHELL_POD_NAME)` to the mount so each replica writes its own file.
 
 Give each gateway replica its own writable file and an external shipper read access to the containing directory. New files use owner-only permissions on Unix; arrange shipper access deliberately. Rotation renames the active file to a date- and UUID-suffixed sibling. The shipper must follow rotated files and checkpoint its progress. Do not use multiple writers or external copy-truncate rotation on this path.
 
@@ -573,7 +615,7 @@ Allow enough retention and disk space for shipper outages. Graceful shutdown all
 
 ## OTLP Export
 
-`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP/gRPC. Omit the table to disable export. Its `endpoint` is the collector for every signal the gateway exports and, on its own, enables trace export. `[openshell.gateway.otlp.traces]` sends spans to a different collector. [OCSF log export](#ocsf-log-export) is off until `[openshell.gateway.otlp.ocsf]` sets `enabled = true`, and can use its own collector.
+`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP/gRPC. Omit the table to disable export. Its `endpoint` is the collector for every signal the gateway exports and, on its own, enables trace export. `[openshell.gateway.otlp.traces]` sends spans to a different collector. [OCSF log export](#ocsf-log-export) is off until `[openshell.gateway.otlp.ocsf]` sets `enabled = true`, and the [agent trace relay](#agent-trace-relay) is off until `[openshell.gateway.otlp.agent]` sets `enabled = true`. Each can use its own collector.
 
 The gateway already uses the Rust `tracing` framework for structured logs sent to stdout and the sandbox log stream. Enabling this section adds an OpenTelemetry layer to the same tracing subscriber. It exports span trees to an OTLP collector without exporting, replacing, or redirecting the existing diagnostic log events.
 
@@ -601,14 +643,16 @@ The gateway passes the trace endpoint to compute drivers and sandbox supervisors
 
 For Helm deployments, set `server.otlp.endpoint` to render this table. The
 optional `server.otlp.serviceName` value overrides the gateway service name;
-driver service names remain fixed. Set the `traces` and `ocsf` tables through
-`gatewayConfig`, which renders each key as a TOML table:
+driver service names remain fixed. Set the `traces`, `ocsf`, and `agent` tables
+through `gatewayConfig`, which renders each key as a TOML table:
 
 ```yaml
 gatewayConfig:
   openshell.gateway.otlp.traces:
     endpoint: https://traces-backend:4317
   openshell.gateway.otlp.ocsf:
+    enabled: true
+  openshell.gateway.otlp.agent:
     enabled: true
 ```
 
@@ -634,23 +678,24 @@ In-process compute drivers read their backend-specific settings from `[openshell
 
 ### OCSF Log Export
 
-Set `enabled = true` in `[openshell.gateway.otlp.ocsf]` to export gateway OCSF events as OTLP log records. It defaults to `false`, so trace export alone never sends OCSF events. Records go to the table's `endpoint`, or to `[openshell.gateway.otlp]` `endpoint` when it is omitted, with the same resource attributes as spans, under the `openshell.ocsf` instrumentation scope. Use a separate endpoint to send OCSF events to a collector that feeds a SIEM while spans go elsewhere. Sandbox supervisors receive the same endpoint and schema version and export their own OCSF events there directly, so the endpoint must also be reachable from sandboxes. Supervisor records carry the supervisor's resource attributes, including `openshell.sandbox.id` and `openshell.gateway.name`. Supervisors also send the collector headers that the gateway uses for OCSF export, from `OTEL_EXPORTER_OTLP_LOGS_HEADERS` or else `OTEL_EXPORTER_OTLP_HEADERS`, so a collector that requires authentication accepts their records too. The gateway delivers the headers with each sandbox's launch credentials, never through the sandbox environment. Other `OTEL_*` variables do not reach supervisors.
+Set `enabled = true` in `[openshell.gateway.otlp.ocsf]` to export gateway OCSF events as OTLP log records. It defaults to `false`, so trace export alone never sends OCSF events. Records go to the table's `endpoint`, or to `[openshell.gateway.otlp]` `endpoint` when it is omitted, with the same resource attributes as spans, under the `openshell.ocsf` instrumentation scope. Use a separate endpoint to send OCSF events to a collector that feeds a SIEM while spans go elsewhere. Sandbox supervisors receive the same endpoint and export their own OCSF events there directly, so the endpoint must also be reachable from sandboxes. Supervisor records carry the supervisor's resource attributes, including `openshell.sandbox.id` and `openshell.gateway.name`. Supervisors also send the collector headers that the gateway uses for OCSF export, from `OTEL_EXPORTER_OTLP_LOGS_HEADERS` or else `OTEL_EXPORTER_OTLP_HEADERS`, so a collector that requires authentication accepts their records too. The gateway delivers the headers with each sandbox's launch credentials, never through the sandbox environment. Other `OTEL_*` variables do not reach supervisors.
 
 ```toml
 [openshell.gateway.otlp.ocsf]
 enabled        = true
-endpoint       = "http://siem-collector.security.svc:4317" # optional
-schema_version = "1.3"                                     # optional
+endpoint = "http://siem-collector.security.svc:4317" # optional
 ```
 
 Each OCSF event becomes one log record:
 
 | Field | Value |
 |---|---|
-| Body | The OCSF event as a JSON string. With `schema_version` set to `1.1` or `1.3`, the record is downgraded as for [OCSF JSONL output](#ocsf-jsonl-output). |
+| Body | The OCSF event as a JSON string. |
 | Timestamp | The OCSF `time`. The observed timestamp is when the gateway received the event. |
 | Severity | Unknown, Informational, and Other are INFO, Low is WARN, Medium is WARN2, High is ERROR, Critical is ERROR2, and Fatal is FATAL. The severity text is the OCSF severity name. |
-| Attributes | `ocsf.class_uid`, `ocsf.activity_id`, `ocsf.severity_id`, `ocsf.metadata.uid`, and, for events associated with a sandbox, `openshell.sandbox.id`. These come from the event before any downgrade, so they remain when a downgrade removes the fields from the body. |
+| Attributes | `ocsf.class_uid`, `ocsf.activity_id`, `ocsf.severity_id`, `ocsf.metadata.uid`, and, for events associated with a sandbox, `openshell.sandbox.id`. |
+
+`schema_version` in this table is deprecated and ignored; the gateway logs a warning at startup when it is set.
 
 Log export is independent of `RUST_LOG` and of `[openshell.gateway.ocsf_log]`; you can enable both. The gateway queues up to 10,000 records, and up to 16 MiB of records including the batch being exported, without blocking event producers. It exports a batch as soon as 100 records or 1 MiB are queued, or 500 ms after the first record of a batch arrives. A record larger than 1 MiB, such as an event for a request with a very long path, is dropped rather than exported.
 
@@ -660,9 +705,29 @@ A collector can accept a batch while rejecting some of its records, an OTLP part
 
 Metrics include `openshell_ocsf_otlp_queued_total`, `openshell_ocsf_otlp_exported_total`, `openshell_ocsf_otlp_dropped_total` (with a `reason` label of `queue_capacity`, `queue_bytes`, `oversized`, `export_failed`, `serialization`, or `closed`), `openshell_ocsf_otlp_export_errors_total`, and `openshell_ocsf_otlp_retries_total`.
 
+### Agent trace relay
+
+Set `enabled = true` in `[openshell.gateway.otlp.agent]` to have each sandbox forward the workload's own traces. It defaults to `false`, so trace export alone never changes the workload environment. Traces go to the table's `endpoint`, or to `[openshell.gateway.otlp]` `endpoint` when it is omitted, and that endpoint must be reachable from sandboxes.
+
+```toml
+[openshell.gateway.otlp.agent]
+enabled  = true
+endpoint = "http://agent-collector.observability.svc:4317" # optional
+```
+
+While the relay is active, the sandbox runtime sets `OTEL_EXPORTER_OTLP_ENDPOINT=http://192.0.0.8:4318` and `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` in every workload process, and sets `OTEL_EXPORTER_OTLP_COMPRESSION` and `OTEL_EXPORTER_OTLP_TRACES_COMPRESSION` to `none`, so a standard OpenTelemetry SDK exports without configuration. These are lowest-precedence defaults. They are not set when the sandbox creation request or an environment passed to `openshell sandbox exec` names `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or when the image `ENV` names one for the main process, since `openshell sandbox exec` sessions do not inherit the image environment, and an endpoint the workload sets itself, for example with a shell `export`, takes precedence over them. A workload that exports elsewhere does so subject to the sandbox's network policy, and its traces carry no relay attribution. Provider credentials cannot redirect traces. While the relay is off, nothing is injected. Because the generic endpoint is set, an SDK that also exports metrics or logs sends them to the relay, which answers with an empty OTLP success and discards them. To keep metrics and logs, point those exporters elsewhere with `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` and `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`. The address is a reserved label rather than a network destination: the supervisor serves it inside the sandbox boundary and forwards accepted batches to the collector over OTLP/gRPC. The collector's address is never visible inside the sandbox.
+
+Every forwarded resource carries `openshell.sandbox.id`, with the same value as the supervisor's own spans, and `openshell.telemetry.source=agent`. Values the agent supplies for those two keys are replaced at the resource level; span and scope attributes pass through unchanged, so filter and join on the resource attributes. Filter on `openshell.telemetry.source` to separate agent traces from infrastructure traces, and join on `openshell.sandbox.id` to correlate them.
+
+Agents must export traces as OTLP/HTTP protobuf with compression disabled. The relay answers 415 to JSON bodies and to any `Content-Encoding` other than `identity`, 413 to bodies larger than 2 MiB, to requests with more than 512 `ResourceSpans` entries, and to requests whose resource attributes exceed 8192 in number or 256 KiB in total, 408 to requests whose body does not arrive within 30 seconds, and 503 with `Retry-After` while its buffer of 32 batches is full, which standard SDKs retry with backoff. Error responses carry a protobuf `google.rpc.Status` whose message states the reason. While the relay is off, connections to the relay address are refused immediately.
+
+Delivery is best-effort. The relay answers 200 once a batch is buffered and makes one export attempt per batch, so a batch is lost if the collector is unavailable at that moment. The supervisor logs the first failed export and a periodic summary of failures. Before the sandbox reports that its main process exited, and before a suspended sandbox's supervisor exits, the relay flushes buffered batches for up to 5 seconds, and skips that wait when its most recent export failed. It keeps serving `openshell sandbox exec` sessions after the main process exits and flushes once more when the sandbox is torn down.
+
+The relayed hop does not yet support TLS or authentication to the collector; an `https` endpoint leaves the relay inactive with a logged reason. Protect the hop at the network layer, for example with a collector-side ingress policy.
+
 ### Tuning
 
-`[openshell.gateway.otlp]` decides whether and where to export. How the SDK exports is controlled by the standard OpenTelemetry environment variables, which the gateway reads through the SDK rather than mirroring as TOML keys. They apply to the gateway and its in-process compute drivers. The gateway does not pass them to sandbox supervisors, which receive only the endpoints, the OCSF schema version, and the [OCSF collector headers](#ocsf-log-export).
+`[openshell.gateway.otlp]` decides whether and where to export. How the SDK exports is controlled by the standard OpenTelemetry environment variables, which the gateway reads through the SDK rather than mirroring as TOML keys. They apply to the gateway and its in-process compute drivers. The gateway does not pass them to sandbox supervisors, which receive only the endpoints and the [OCSF collector headers](#ocsf-log-export).
 
 The gateway honors these variables:
 

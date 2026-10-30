@@ -118,6 +118,20 @@ mod tests {
             MEMBER_TTL * 2
                 < Duration::from_secs(u64::from(crate::controller::POOL_RECOVERY_TIMEOUT_SECS))
         );
+        assert!(
+            GATEWAY_SILENCE_TIMEOUT
+                + MEMBER_REFRESH_INTERVAL
+                + MEMBER_TTL
+                + MEMBER_REFRESH_INTERVAL
+                + Duration::from_secs(5)
+                <= Duration::from_secs(u64::from(
+                    *crate::controller::POOL_RECOVERY_TIMEOUT_RANGE.start()
+                ))
+        );
+        assert!(
+            crate::controller::POOL_RECOVERY_TIMEOUT_RANGE
+                .contains(&crate::controller::POOL_RECOVERY_TIMEOUT_SECS)
+        );
         assert_eq!(host_backoff_bound(1), Duration::from_millis(150));
         assert_eq!(host_backoff_bound(10), Duration::from_millis(600));
     }

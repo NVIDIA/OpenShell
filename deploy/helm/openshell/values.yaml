@@ -111,7 +111,7 @@ supervisor:
   # -- Seconds a sandbox workload stays frozen after losing its pool member's
   # supervision before the sandbox runtime terminates it, rendered as
   # [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an
-  # integer from 10 to 300. Null leaves the gateway's pool default of 60
+  # integer from 30 to 300. Null leaves the gateway's pool default of 60
   # seconds.
   recoveryTimeoutSeconds: 60
   # Pod security context for the shared supervisor Deployment, rendered only
@@ -406,8 +406,8 @@ server:
     # When replicas share the volume, set subPathExpr: $(OPENSHELL_POD_NAME)
     # on the mount so each replica writes its own file.
     path: /tmp/gateway-ocsf.jsonl
-    # -- Optional OCSF downgrade target. Empty emits native OCSF 1.8.0.
-    # Supported values: "1.1", "1.3".
+    # -- Deprecated and ignored: the gateway emits native OCSF 1.8.0 and logs
+    # a warning at startup when this is set.
     schemaVersion: ""
     # -- Rotate the active file daily in UTC, or never.
     rotation: daily

@@ -504,6 +504,45 @@ during the upgrade, the older replicas serialize every mutation across the
 fleet. Mutations can be slower and can briefly fail under load until the
 rollout finishes.
 
+### Activate Sandbox Updates
+
+Sandbox configuration updates default to disabled. Setting
+`[openshell.gateway] enable_sandbox_updates = true` is an operator
+attestation that the deployment uniformly supports the image-update protocol.
+Use this sequence before activating the
+[separate update service](/how-it-works/sandboxes/overview#update-the-image-of-a-stopped-sandbox).
+
+1. Keep the setting false throughout the rolling upgrade. Drain and retire
+   every incompatible gateway, including unregistered processes and Jobs, and
+   settle all outstanding driver operations they started. A completed
+   Kubernetes rollout alone does not establish this.
+2. Prevent incompatible gateways from returning. Pin compatible images and
+   retire old rollback targets, Jobs, and other launch configurations that could
+   reconnect to the database.
+3. Confirm live gateway membership records advertise sandbox-update protocol 1.
+   Missing or incompatible capabilities, malformed records, and truncated
+   membership reads reject updates. These observations are not durable proof
+   of fleet compatibility. Expiry or absence of a membership record does not
+   prove that its process and driver work have stopped.
+4. Activate the flag only after completing retirement and preventing old
+   gateways from returning. See the exact
+   [TOML, environment, process flag, and Helm forms](/how-it-works/gateways/configuration#sandbox-updates).
+
+A pending image update atomically sets the existing
+`provisioning.driver_operation_pending` and `provisioning.driver_operation_id`
+fields alongside private image intent. Start, stop, and provisioning-retry paths honor this per-sandbox barrier, including after a
+legacy public record round-trip. Successful reconciliation preserves current
+provisioning diagnostics and clocks, clears the pending flag, and retains the
+new operation ID to fence delayed callbacks. Previously absent provisioning
+remains absent unless concurrent writes added diagnostics or clocks. This
+barrier does not replace the deployment activation checklist.
+Image intent and revision are not new public `SandboxStatus` fields.
+
+Do not downgrade while updates are pending or retained sandboxes require the
+private revision protocol. SQLite supports one gateway process only. For a
+SQLite gateway, activation attests that the old process has stopped; a shared
+SQLite file is not an HA deployment.
+
 ## (Experimental) Multi-tenant supervisor
 
 By default, the Kubernetes driver runs a supervisor Pod for each sandbox. With
@@ -563,7 +602,7 @@ lost.
 
 If no supervisor takes over within `supervisor.recoveryTimeoutSeconds`, the
 sandbox terminates its workload. The timeout defaults to `60` seconds and
-accepts values from `10` to `300`.
+accepts values from `30` to `300`.
 
 ### Scale Supervisors Manually
 

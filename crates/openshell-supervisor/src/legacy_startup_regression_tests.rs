@@ -306,6 +306,7 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
         takeover: None,
         supervisor_recovery_timeout_secs: None,
+        otlp_agent_endpoint: None,
     };
     let bindings = SandboxInstanceBindings::dedicated(
         &config,

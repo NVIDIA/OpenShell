@@ -48,14 +48,6 @@ remains in Actions. This checks
 protobuf compatibility; SDK/configuration compatibility and migration review
 remain separate qualification work.
 
-The release qualification workflow has a release-captain-approved exception
-for all `v0.1.6-pre.N` candidates, including replacement candidates after a failed
-run. It still runs Buf and fails on compilation or tooling
-errors, but accepts detected protobuf breaking changes for that tag. The run
-summary and qualification JSON's `exceptions` array record the scope and reason.
-Other versions retain the normal version policy. Remove the workflow exception
-after promotion; release notes must describe the accepted changes and migration.
-
 Fetch the target and tags to check committed branch changes locally, replacing
 `origin/main` for another target:
 
@@ -74,23 +66,6 @@ nix run .#check-protobuf-compatibility -- refs/tags/v0.2.0-pre.1
 For an intentional minor-train incompatibility, record the Buf finding,
 linked issue, consumer impact, and migration plan in the PR. Keep the finding
 visible; do not disable the job or add a broad Buf ignore rule.
-
-### Remove the v0.1.6 exception
-
-Squash-merge [PR #4976](https://github.com/NVIDIA/OpenShell/pull/4976) so the
-exception, checker support, qualification metadata, tests, and temporary guidance
-can be removed together with one revert. After verifying stable v0.1.6 publication,
-open a cleanup PR from current `main` and revert that PR's squash-merge commit:
-
-```shell
-git revert --no-commit <PR-4976-squash-merge-sha>
-git commit --signoff -m "revert(ci): remove temporary v0.1.6 protobuf exception"
-```
-
-Use the final squash-merge SHA shown on the merged PR, not a branch commit SHA.
-Validate the reverted workflow with Actionlint and run the normal protobuf check
-before merging the cleanup. Reverting the whole PR restores normal enforcement
-and removes the exception mechanism; do not leave the bypass support behind.
 
 ### Windows validation
 
@@ -718,7 +693,10 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by prerelease previews, notes-only previews, and stable publication when no preview is reused. |
 | `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev, Release, and Pre-release without Store credentials or publication. |
-| `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts directly to a Store channel without rebuilding. Release Dev uses `latest/edge`, Pre-release uses `latest/beta`, and Release uses `latest/stable` for the stable rebuild. Uploads queue per channel and architecture, so tagged beta and stable jobs recheck repository tags after earlier publication finishes and before updating their floating channels. |
+| `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts directly to a Store channel without rebuilding. Release Dev uses `latest/edge`, Pre-release uses `latest/beta`, and Release uses `latest/stable` for the stable rebuild. Uploads queue per channel and architecture, so tagged beta and stable jobs recheck repository tags after earlier publication finishes and before updating their floating channels. Manual dispatch uploads the `snap-linux-*` artifacts from `artifact-run-id`. |
+| `.github/workflows/sdk-typescript-publish.yml` | Publishes the TypeScript SDK to GitHub Packages. Called by stable Release; manual dispatch publishes a given tag and npm version. |
+| `.github/workflows/sdk-go-tag.yml` | Creates the `sdk/go/vX.Y.Z` tag and asks the Go module proxy to fetch it. Called by stable Release; manual dispatch tags a given version and commit. |
+| `.github/workflows/wheel-publish.yml` | Triggers the GitLab pipeline that publishes wheels from a GitHub Release to PyPI. Called by stable Release; manual dispatch republishes a given tag. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts

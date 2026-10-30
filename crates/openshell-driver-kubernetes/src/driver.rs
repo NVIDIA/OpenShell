@@ -90,6 +90,9 @@ use tokio::sync::{OnceCell, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
 
+#[path = "image_update.rs"]
+mod image_update;
+
 pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, KubernetesDriverError>> + Send>>;
 
@@ -1106,7 +1109,8 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 
 impl KubernetesComputeDriver {
     /// Environment that lets a supervisor export spans, joining the current
-    /// trace, and OCSF events, identifying the gateway that launched it.
+    /// trace, OCSF events, and relayed workload traces, identifying the
+    /// gateway that launched it.
     fn supervisor_otlp_environment(&self) -> Vec<(&'static str, String)> {
         let mut environment = Vec::new();
         if let Some(endpoint) = self.config.supervisor_otlp_endpoint.as_deref() {
@@ -1118,6 +1122,12 @@ impl KubernetesComputeDriver {
         }
         if let Some(export) = &self.config.supervisor_ocsf_export {
             environment.extend(export.environment());
+        }
+        if let Some(endpoint) = &self.config.supervisor_otlp_agent_endpoint {
+            environment.push((
+                openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT,
+                endpoint.clone(),
+            ));
         }
         if let Some(name) = &self.config.supervisor_gateway_name {
             environment.push((openshell_core::sandbox_env::GATEWAY_NAME, name.clone()));
@@ -1278,10 +1288,11 @@ impl KubernetesComputeDriver {
         }
         if shared_supervisor.is_some()
             && (config.supervisor_otlp_endpoint.is_some()
-                || config.supervisor_ocsf_export.is_some())
+                || config.supervisor_ocsf_export.is_some()
+                || config.supervisor_otlp_agent_endpoint.is_some())
         {
             warn!(
-                "the gateway supervisor topology does not export supervisor OTLP traces or OCSF events; shared sandbox instances keep console logs and gateway log push"
+                "the gateway supervisor topology does not export supervisor OTLP traces or OCSF events or relay workload traces; shared sandbox instances keep console logs and gateway log push"
             );
         }
         let driver = Self {
@@ -1333,7 +1344,10 @@ impl KubernetesComputeDriver {
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/kubernetes",
                 openshell_core::VERSION,
-                [],
+                [
+                    openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION
+                        .to_string(),
+                ],
             )),
         })
     }
@@ -3863,10 +3877,14 @@ impl KubernetesComputeDriver {
                     .await
                     .map_err(|error| match error {
                         LaunchError::Persist(error) => error,
-                        // The host is at capacity; the create fails before
-                        // its workload runs.
+                        // The host is at capacity, or the pool could not
+                        // place the instance; the create fails before its
+                        // workload runs.
                         LaunchError::Refused(error) => {
                             KubernetesDriverError::Precondition(error.to_string())
+                        }
+                        LaunchError::Unplaced(reason) => {
+                            KubernetesDriverError::Precondition(reason)
                         }
                         LaunchError::Invalid(error) => {
                             KubernetesDriverError::Message(error.to_string())
@@ -8966,9 +8984,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_otlp_environment_carries_only_configured_signals() {
-        use openshell_core::sandbox_env::{
-            OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OTLP_OCSF_SCHEMA_VERSION, OcsfOtlpExport,
-        };
+        use openshell_core::sandbox_env::{OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OcsfOtlpExport};
 
         let names = |config: KubernetesComputeConfig| {
             KubernetesComputeDriver::new_for_test(config)
@@ -8990,16 +9006,24 @@ mod tests {
         let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
             supervisor_ocsf_export: Some(OcsfOtlpExport {
                 endpoint: "http://siem:4317".into(),
-                schema_version: Some("1.1".into()),
             }),
             ..Default::default()
         });
         assert_eq!(
             driver.supervisor_otlp_environment(),
-            [
-                (OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string()),
-                (OTLP_OCSF_SCHEMA_VERSION, "1.1".to_string()),
-            ]
+            [(OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string())]
+        );
+
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+            supervisor_otlp_agent_endpoint: Some("http://agents:4317".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            driver.supervisor_otlp_environment(),
+            [(
+                openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT,
+                "http://agents:4317".to_string()
+            )]
         );
 
         let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {

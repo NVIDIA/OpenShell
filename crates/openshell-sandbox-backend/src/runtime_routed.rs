@@ -582,6 +582,7 @@ async fn send_reply(
 mod tests {
     use super::*;
     use crate::boundary_protocol::{SandboxTlsMaterial, generate_sandbox_tls_material};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
     /// A runtime: dial the router, name `route`, and serve `identity`'s TLS.
     async fn runtime_dial(
@@ -614,10 +615,12 @@ mod tests {
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(
-            rustls_pemfile::certs(&mut identity.certificate_chain_pem.as_bytes())
+            CertificateDer::pem_reader_iter(&mut identity.certificate_chain_pem.as_bytes())
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
-            rustls_pemfile::private_key(&mut identity.private_key_pem.as_bytes())
+            PrivateKeyDer::pem_reader_iter(&mut identity.private_key_pem.as_bytes())
+                .next()
+                .transpose()
                 .unwrap()
                 .unwrap(),
         )

@@ -487,6 +487,7 @@ impl ServerState {
         credentials: credentials::CredentialRuntime,
     ) -> Self {
         let replica_id = compute::lease::replica_id();
+        let compute = compute.with_sandbox_updates(config.enable_sandbox_updates);
         compute.configure_ssh_identities(credentials.clone());
         let service_route_index = Arc::new(service_routing::ServiceRouteIndex::new(
             config.service_routing_discriminator().map(str::to_string),
@@ -1399,6 +1400,7 @@ async fn terminate_signal() {
 
 pub use compute::{
     AcquiredRemoteDriverEndpoint, DriverWatchStream, ManagedDriverProcess, SharedComputeDriver,
+    SharedComputeDriverConfigurationUpdates,
 };
 
 /// Driver instance returned by a compiled compute-driver factory.
@@ -1467,7 +1469,30 @@ pub trait ComputeDriverFactory: Send + Sync {
         false
     }
 
+    /// Whether this configuration hosts sandboxes on the gateway's shared
+    /// supervisor pool. Same constraints as [`Self::validate_config`].
+    fn uses_shared_supervision(&self, _context: ComputeDriverConfigContext<'_>) -> Result<bool> {
+        Ok(false)
+    }
+
     async fn build(&self, context: ComputeDriverBuildContext<'_>) -> Result<ComputeDriverInstance>;
+
+    /// Build with a separately registered, optional in-process image updater.
+    ///
+    /// Existing factories only implement `build`; their baseline driver object
+    /// remains sufficient and this hook defaults to no configuration-update support.
+    /// Supporting factories return the same driver instance in both slots and
+    /// advertise the negotiated configuration-update capability. Remote drivers expose
+    /// their extension over the existing endpoint instead of using this hook.
+    async fn build_with_configuration_updates(
+        &self,
+        context: ComputeDriverBuildContext<'_>,
+    ) -> Result<(
+        ComputeDriverInstance,
+        Option<SharedComputeDriverConfigurationUpdates>,
+    )> {
+        self.build(context).await.map(|instance| (instance, None))
+    }
 }
 
 /// One named compiled-driver registration.
@@ -1876,6 +1901,13 @@ async fn build_compute_runtime(
         driver_startup,
         false,
     )?;
+    validate_supervisor_pool_consumer(
+        &driver,
+        &config.name,
+        config.bind_address,
+        &config.log_level,
+        driver_startup,
+    )?;
     let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
     let admission = match &driver {
         ConfiguredComputeDriver::Registered(registration) => registration
@@ -1911,16 +1943,15 @@ async fn build_compute_runtime(
                 supervisor_recovery_timeout_secs: supervisor_pool
                     .and_then(|pool| pool.recovery_timeout_secs),
             };
-            let instance = registration.factory.build(build_context).await?;
+            let (instance, image_updates) = registration
+                .factory
+                .build_with_configuration_updates(build_context)
+                .await?;
             let supervisor_host = shared_supervision
                 .into_inner()
                 .map(|supervision| supervision.controller().clone());
             if supervisor_pool.is_some() && supervisor_host.is_none() {
-                return Err(Error::config(
-                    "openshell.gateway.supervisor_pool tunes the shared supervisor pool, but no \
-                     compute driver hosts sandboxes on it; set the Kubernetes driver's \
-                     supervisor_topology = \"gateway\" or remove the table",
-                ));
+                return Err(Error::config(SUPERVISOR_POOL_WITHOUT_HOST));
             }
             match instance {
                 ComputeDriverInstance::InProcess(driver) => ComputeRuntime::from_driver(
@@ -1937,7 +1968,8 @@ async fn build_compute_runtime(
                 .map_err(|error| {
                     Error::execution(format!("failed to create compute runtime: {error}"))
                 })?
-                .with_supervisor_host(supervisor_host),
+                .with_supervisor_host(supervisor_host)
+                .with_image_update_driver(image_updates),
                 ComputeDriverInstance::ManagedRemote(_) if supervisor_host.is_some() => {
                     return Err(Error::config(
                         "only an in-process compute driver can use the gateway's shared supervision",
@@ -1959,12 +1991,6 @@ async fn build_compute_runtime(
                     })?
                 }
             }
-        }
-        ConfiguredComputeDriver::Remote { .. } if supervisor_pool.is_some() => {
-            return Err(Error::config(
-                "openshell.gateway.supervisor_pool tunes the shared supervisor pool, which \
-                 only an in-process compute driver can use; remove the table",
-            ));
         }
         ConfiguredComputeDriver::Remote { name } => {
             let remote_config =
@@ -2072,6 +2098,49 @@ fn validate_compute_driver_config(
     Ok(driver)
 }
 
+const SUPERVISOR_POOL_WITHOUT_HOST: &str = "openshell.gateway.supervisor_pool tunes the shared \
+     supervisor pool, but no compute driver hosts sandboxes on it; set the Kubernetes driver's \
+     supervisor_topology = \"gateway\" or remove the table";
+
+/// Refuse `[openshell.gateway.supervisor_pool]` unless the selected driver
+/// hosts sandboxes on the shared supervisor pool.
+fn validate_supervisor_pool_consumer(
+    driver: &ConfiguredComputeDriver,
+    gateway_name: &str,
+    gateway_bind_address: SocketAddr,
+    gateway_log_level: &str,
+    driver_startup: compute::driver_config::DriverStartupContext<'_>,
+) -> Result<()> {
+    if driver_startup
+        .file
+        .is_none_or(|file| file.openshell.gateway.supervisor_pool.is_none())
+    {
+        return Ok(());
+    }
+    match driver {
+        ConfiguredComputeDriver::Registered(registration) => {
+            if registration
+                .factory
+                .uses_shared_supervision(ComputeDriverConfigContext {
+                    driver_name: &registration.name,
+                    gateway_name,
+                    gateway_bind_address,
+                    gateway_log_level,
+                    driver_startup,
+                })?
+            {
+                Ok(())
+            } else {
+                Err(Error::config(SUPERVISOR_POOL_WITHOUT_HOST))
+            }
+        }
+        ConfiguredComputeDriver::Remote { .. } => Err(Error::config(
+            "openshell.gateway.supervisor_pool tunes the shared supervisor pool, which only an \
+             in-process compute driver can use; remove the table",
+        )),
+    }
+}
+
 fn resolve_configured_compute_driver(
     registry: &ComputeDriverRegistry,
     driver_name: &str,
@@ -2174,6 +2243,9 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
         ))),
     }
 }
+
+#[cfg(test)]
+mod compute_factory_compatibility;
 
 #[cfg(test)]
 mod tests {
@@ -2666,7 +2738,7 @@ mod tests {
                 .iter()
                 .map(|service| service.name.as_str())
                 .collect::<Vec<_>>(),
-            ["openshell.v1.OpenShell"]
+            ["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"]
         );
 
         stop_listener(shutdown, handle).await;

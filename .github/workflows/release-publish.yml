@@ -509,161 +509,70 @@ jobs:
     name: Publish Snap
     needs: release
     if: ${{ !inputs.is-prerelease && inputs.make-latest }}
+    permissions:
+      actions: read
+      contents: read
     uses: ./.github/workflows/snap-publish.yml
     with:
       upload-channel: latest/stable
       github-environment: latest/stable
       release-tag: ${{ inputs.release-tag }}
     secrets:
-      publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+      SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   publish-prerelease-snap:
     name: Publish Prerelease Snap
     needs: release
     if: inputs.is-prerelease
+    permissions:
+      actions: read
+      contents: read
     uses: ./.github/workflows/snap-publish.yml
     with:
       upload-channel: latest/beta
       release-tag: ${{ inputs.release-tag }}
       github-environment: latest/beta
     secrets:
-      publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+      SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   publish-sdk-typescript:
     name: Publish TypeScript SDK
     needs: release
     if: ${{ !inputs.is-prerelease }}
-    runs-on: linux-amd64-cpu8
-    timeout-minutes: 15
     permissions:
       contents: read
       packages: write
-    defaults:
-      run:
-        shell: nix shell --inputs-from . nixpkgs#nodejs_24 -c bash -euo pipefail {0}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ inputs.source-sha }}
+    uses: ./.github/workflows/sdk-typescript-publish.yml
+    with:
+      release-tag: ${{ inputs.release-tag }}
+      source-ref: ${{ inputs.source-sha }}
+      npm-version: ${{ inputs.npm-version }}
+      make-latest: ${{ inputs.make-latest }}
 
-      - uses: ./.github/actions/setup-nix
-
-      - name: Install TypeScript dependencies
-        working-directory: ./sdk/typescript
-        run: npm ci
-
-      - name: Configure npm auth for GitHub Packages
-        working-directory: ./sdk/typescript
-        run: |
-          {
-            echo "@nvidia:registry=https://npm.pkg.github.com"
-            # Keep the token reference literal for npm to expand at publish time.
-            # shellcheck disable=SC2016
-            echo '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}'
-          } > .npmrc
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: inputs.make-latest
-        with:
-          persist-credentials: false
-          ref: ${{ github.workflow_sha }}
-          path: release-workflow
-          sparse-checkout: .github/actions/check-latest-release
-
-      - name: Check current latest release
-        id: latest
-        if: inputs.make-latest
-        uses: ./release-workflow/.github/actions/check-latest-release
-        with:
-          release-tag: ${{ inputs.release-tag }}
-
-      - name: Publish
-        working-directory: ./sdk/typescript
-        env:
-          OPENSHELL_NPM_VERSION: ${{ inputs.npm-version }}
-          MAKE_LATEST: ${{ steps.latest.outputs.make-latest }}
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          npm pkg set version="${OPENSHELL_NPM_VERSION}"
-          dist_tag=latest
-          if [[ "${MAKE_LATEST}" != "true" ]]; then
-            dist_tag="release-${OPENSHELL_NPM_VERSION%.*}"
-          fi
-          npm publish --tag "${dist_tag}"
-
-  # Go resolves submodule versions from directory-prefixed tags, so the SDK at
-  # sdk/go needs its own sdk/go/vX.Y.Z tag to show up as a release on pkg.go.dev.
   tag-sdk-go:
     name: Tag Go SDK
     needs: release
     if: ${{ !inputs.is-prerelease }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
     permissions:
       contents: write
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      VERSION: ${{ inputs.semver }}
-      SOURCE_SHA: ${{ inputs.source-sha }}
-    steps:
-      - name: Create Go SDK tag
-        run: |
-          set -euo pipefail
-          tag="sdk/go/v${VERSION}"
-          # Lightweight tag, so the ref points at the commit directly.
-          if ! existing=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq .object.sha 2>/dev/null); then
-            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${tag}" -f sha="${SOURCE_SHA}"
-          elif [[ "${existing}" != "${SOURCE_SHA}" ]]; then
-            echo "${tag} already exists at ${existing}, expected ${SOURCE_SHA}" >&2
-            exit 1
-          fi
-
-      # pkg.go.dev picks up versions the Go module proxy has fetched.
-      - name: Request version from Go module proxy
-        continue-on-error: true
-        run: curl --fail --silent --show-error --max-time 60 "https://proxy.golang.org/github.com/!n!v!i!d!i!a/!open!shell/sdk/go/@v/v${VERSION}.info"
+    uses: ./.github/workflows/sdk-go-tag.yml
+    with:
+      version: ${{ inputs.semver }}
+      source-sha: ${{ inputs.source-sha }}
 
   trigger-wheel-publish:
     name: Trigger Wheel Publish
     needs: release
     if: ${{ !inputs.is-prerelease }}
-    runs-on: [self-hosted, nv]
-    timeout-minutes: 10
-    steps:
-      - name: Trigger GitLab CI
-        env:
-          GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
-          GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
-          COMMIT_SHA: ${{ inputs.source-sha }}
-          RELEASE_VERSION: ${{ inputs.python-version }}
-          RELEASE_TAG: ${{ env.RELEASE_TAG }}
-          WHEEL_FILENAMES: ${{ needs.release.outputs.wheel_filenames }}
-        run: |
-          set -euo pipefail
-          if [ -z "${WHEEL_FILENAMES}" ]; then
-            echo "No wheel filenames provided by build job" >&2
-            exit 1
-          fi
-
-          response=$(curl -X POST \
-            --fail \
-            --silent \
-            --show-error \
-            -F "token=${GITLAB_CI_TRIGGER_TOKEN}" \
-            -F "ref=main" \
-            -F "variables[PIPELINE_ACTION]=publish_wheels" \
-            -F "variables[GITHUB_REPOSITORY]=${GITHUB_REPOSITORY}" \
-            -F "variables[COMMIT_SHA]=${COMMIT_SHA}" \
-            -F "variables[RELEASE_TAG]=${RELEASE_TAG}" \
-            -F "variables[RELEASE_VERSION]=${RELEASE_VERSION}" \
-            -F "variables[RELEASE_KIND]=stable" \
-            -F "variables[WHEEL_FILENAMES]=${WHEEL_FILENAMES}" \
-            "${GITLAB_CI_TRIGGER_URL}")
-          pipeline_id=$(printf '%s' "$response" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-          pipeline_status=$(printf '%s' "$response" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
-          echo "Triggered GitLab pipeline ${pipeline_id:-unknown} with status=${pipeline_status:-unknown}"
+    uses: ./.github/workflows/wheel-publish.yml
+    with:
+      release-tag: ${{ inputs.release-tag }}
+      source-sha: ${{ inputs.source-sha }}
+      python-version: ${{ inputs.python-version }}
+      wheel-filenames: ${{ needs.release.outputs.wheel_filenames }}
+    secrets:
+      GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
+      GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
 
   publish-fern-docs:
     name: Sync and Publish Fern Docs

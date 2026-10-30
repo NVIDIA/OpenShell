@@ -142,9 +142,10 @@ struct Args {
     #[arg(long, env = openshell_core::sandbox_env::OTLP_OCSF_ENDPOINT)]
     otlp_ocsf_endpoint: Option<String>,
 
-    /// OCSF schema version that exported events are downgraded to.
-    #[arg(long, env = openshell_core::sandbox_env::OTLP_OCSF_SCHEMA_VERSION)]
-    otlp_ocsf_schema_version: Option<openshell_ocsf::OcsfSchemaVersion>,
+    /// OTLP/gRPC collector endpoint that workload traces are relayed to.
+    /// Absent keeps the relay inactive.
+    #[arg(long, env = openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT)]
+    otlp_agent_endpoint: Option<String>,
 
     /// Name of the gateway that launched this sandbox, for telemetry.
     #[arg(long, env = openshell_core::sandbox_env::GATEWAY_NAME)]
@@ -491,7 +492,6 @@ fn main() -> Result<()> {
         start_ocsf_export(
             args.otlp_ocsf_endpoint.as_deref().map(export_config),
             ocsf_headers,
-            args.otlp_ocsf_schema_version,
         )
     });
     let otlp_layer_provider = otlp_provider.clone();
@@ -522,14 +522,12 @@ fn main() -> Result<()> {
         let push_layer = log_push_state.as_ref().map(|(layer, _)| layer.clone());
         let _log_push_handle = log_push_state.map(|(_, handle)| handle);
         let ocsf_enabled = Arc::new(AtomicBool::new(false));
-        let ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
 
         let (logging_layers, _logging_guards, file_available) = logging::layers(
             std::io::stderr(),
             Path::new("/var/log"),
             console_filter,
             ocsf_enabled.clone(),
-            ocsf_schema_version.clone(),
         );
         tracing_subscriber::registry()
             .with(logging_layers)
@@ -628,6 +626,7 @@ fn main() -> Result<()> {
                     proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
                     takeover: None,
                     supervisor_recovery_timeout_secs: None,
+                    otlp_agent_endpoint: args.otlp_agent_endpoint.clone(),
                 };
                 // Log push already shares these credentials and the logging
                 // layers these OCSF JSON settings.
@@ -636,7 +635,6 @@ fn main() -> Result<()> {
                     gateway_credentials,
                     openshell_ocsf::OcsfJsonSettings {
                         enabled: ocsf_enabled,
-                        target_version: ocsf_schema_version,
                     },
                 );
                 let result = Box::pin(openshell_supervisor::run_sandbox_with_backend(
@@ -689,7 +687,6 @@ fn main() -> Result<()> {
 fn start_ocsf_export(
     config: Option<openshell_otel::OtlpExportConfig<'_>>,
     headers: Option<&str>,
-    schema_version: Option<openshell_ocsf::OcsfSchemaVersion>,
 ) -> (
     Option<openshell_otel::OcsfOtlp>,
     Option<openshell_otel::SetupError>,
@@ -701,7 +698,6 @@ fn start_ocsf_export(
         Ok(openshell_otel::OcsfOtlp::start(
             target.log_exporter_with_headers(headers)?,
             target.resource().clone(),
-            schema_version,
         ))
     });
     match started {
@@ -916,24 +912,28 @@ mod tests {
     }
 
     #[test]
-    fn ocsf_export_takes_a_supported_schema_version() {
+    fn agent_relay_endpoint_is_separate_from_trace_export() {
         let args = Args::try_parse_from([
             "openshell-supervisor",
-            "--otlp-ocsf-endpoint",
-            "http://siem:4317",
-            "--otlp-ocsf-schema-version",
-            "1.3",
+            "--otlp-endpoint",
+            "http://traces:4317",
         ])
-        .expect("parse OCSF export");
-        assert_eq!(args.otlp_ocsf_endpoint.as_deref(), Some("http://siem:4317"));
+        .expect("parse trace export");
         assert_eq!(
-            args.otlp_ocsf_schema_version,
-            Some(openshell_ocsf::OcsfSchemaVersion::V1_3)
+            args.otlp_agent_endpoint, None,
+            "trace export alone leaves the relay inactive"
         );
-        assert!(
-            Args::try_parse_from(["openshell-supervisor", "--otlp-ocsf-schema-version", "1.8"])
-                .is_err()
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--otlp-agent-endpoint",
+            "http://agents:4317",
+        ])
+        .expect("parse agent relay");
+        assert_eq!(
+            args.otlp_agent_endpoint.as_deref(),
+            Some("http://agents:4317")
         );
+        assert_eq!(args.otlp_endpoint, None);
     }
 
     #[tokio::test]
@@ -944,17 +944,16 @@ mod tests {
             service_version: None,
             resource_attributes: Vec::new(),
         };
-        let (export, error) = start_ocsf_export(None, None, None);
+        let (export, error) = start_ocsf_export(None, None);
         assert!(export.is_none() && error.is_none());
 
-        let (export, error) = start_ocsf_export(Some(config("not a url")), None, None);
+        let (export, error) = start_ocsf_export(Some(config("not a url")), None);
         assert!(export.is_none());
         assert!(error.is_some());
 
         let (export, error) = start_ocsf_export(
             Some(config("http://127.0.0.1:4317")),
             Some("authorization=Bearer%20t"),
-            None,
         );
         assert!(error.is_none(), "unexpected setup error: {error:?}");
         export.expect("OCSF export").shutdown().await;
