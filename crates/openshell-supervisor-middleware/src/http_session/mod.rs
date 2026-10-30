@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP session hooks (`HttpSessionMiddleware.EvaluateRequest` and `HttpSessionMiddleware.EvaluateResponse`).
+//! HTTP hooks (`HttpSessionMiddleware.EvaluateRequest` and `HttpSessionMiddleware.EvaluateResponse`).
 //!
-//! v1 HTTP hooks keep their own engines. A chain runs on exactly one hook
+//! Legacy HTTP hooks keep their own engines. A chain runs on exactly one hook
 //! version: every selected entry for one HTTP message must use the same
 //! version, and a chain that mixes them fails closed with
 //! [`MIDDLEWARE_HOOK_VERSIONS_MIXED`].
@@ -39,13 +39,13 @@ use crate::{
 /// HTTP hook version a described chain runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainHttpHookVersion {
-    /// Every resolved entry uses v1 HTTP hooks, or the chain is empty. The
-    /// chain runs on the v1 HTTP hook engines, unchanged.
-    V1,
-    /// At least one entry uses HTTP session hooks and none uses v1 HTTP
+    /// Every resolved entry uses legacy HTTP hooks, or the chain is empty. The
+    /// chain runs on the legacy HTTP hook engines, unchanged.
+    Legacy,
+    /// At least one entry uses HTTP hooks and none uses legacy HTTP
     /// hooks.
     Session,
-    /// Resolved v1 HTTP hook and HTTP session hook entries select the same
+    /// Resolved entries of both HTTP hook versions select the same
     /// message. The message fails closed with [`MIDDLEWARE_HOOK_VERSIONS_MIXED`].
     Mixed,
 }
@@ -57,13 +57,13 @@ pub fn chain_http_hook_version(entries: &[DescribedChainEntry]) -> ChainHttpHook
     let session = entries
         .iter()
         .any(|entry| entry.http_hook_version() == Some(HttpHookVersion::Session));
-    let v1 = entries
+    let legacy = entries
         .iter()
-        .any(|entry| entry.http_hook_version() == Some(HttpHookVersion::V1));
-    match (v1, session) {
+        .any(|entry| entry.http_hook_version() == Some(HttpHookVersion::Legacy));
+    match (legacy, session) {
         (true, true) => ChainHttpHookVersion::Mixed,
         (false, true) => ChainHttpHookVersion::Session,
-        _ => ChainHttpHookVersion::V1,
+        _ => ChainHttpHookVersion::Legacy,
     }
 }
 

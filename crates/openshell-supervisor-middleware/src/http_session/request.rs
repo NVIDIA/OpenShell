@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP session hook request middleware at `PRE_CREDENTIALS`.
+//! HTTP hook request middleware at `PRE_CREDENTIALS`.
 //!
 //! Initial preflight stops at the first inspecting stage. The returned
 //! [`HttpRequestSession`] opens later stages as their input headers become
@@ -69,14 +69,14 @@ pub struct HttpRequestPreflightOutcome {
     /// Present when a stage selected a body mode.
     pub session: Option<HttpRequestSession>,
     pub diagnostics: HttpStageDiagnostics,
-    /// No HTTP session hook slot freed up within the chain deadline. Platform
+    /// No HTTP hook slot freed up within the chain deadline. Platform
     /// load shedding, not a stage failure.
     pub session_capacity_exhausted: bool,
 }
 
 /// Request stages, including deferred preflights.
 ///
-/// The session holds its HTTP session hook budget slots while its body
+/// The session holds its HTTP hook budget slots while its body
 /// stages run.
 pub struct HttpRequestSession {
     pipeline: Pipeline,
@@ -196,7 +196,7 @@ impl ChainRunner {
     /// Prepare a described chain through its first inspecting stage. Returns
     /// an error only for a chain over platform capacity.
     ///
-    /// Preflight waits for an HTTP session hook slot within the chain
+    /// Preflight waits for an HTTP hook slot within the chain
     /// deadline, and the slot is released once no stage inspects the body.
     pub async fn preflight_described_http_request(
         &self,
@@ -261,7 +261,7 @@ impl ChainRunner {
     }
 }
 
-/// No HTTP session hook slot freed up within the chain deadline.
+/// No HTTP hook slot freed up within the chain deadline.
 fn capacity_exhausted(headers: Vec<HttpHeader>) -> HttpRequestPreflightOutcome {
     HttpRequestPreflightOutcome {
         allowed: false,

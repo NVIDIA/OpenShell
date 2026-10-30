@@ -44,7 +44,7 @@ use miette::{Result, miette};
 use prost::Message;
 
 use openshell_core::extension_protocol::{
-    ExtensionFamily, NegotiatedExtension, SUPERVISOR_MIDDLEWARE_HTTP_SESSION, gateway_metadata,
+    ExtensionFamily, NegotiatedExtension, SUPERVISOR_MIDDLEWARE_HTTP_HOOKS, gateway_metadata,
     negotiate,
 };
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
@@ -407,12 +407,12 @@ impl OnError {
 /// HTTP hook version of a service's HTTP bindings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HttpHookVersion {
-    /// v1 HTTP hooks (`EvaluateHttpRequest`, `HttpResponsePreReturn`).
+    /// Legacy HTTP hooks (`EvaluateHttpRequest`, `HttpResponsePreReturn`).
     /// Deprecated and removed in 0.2.0.
-    V1,
-    /// HTTP session hooks (`HttpSessionMiddleware.EvaluateRequest`,
+    Legacy,
+    /// HTTP hooks (`HttpSessionMiddleware.EvaluateRequest`,
     /// `HttpSessionMiddleware.EvaluateResponse`), selected by requiring
-    /// [`SUPERVISOR_MIDDLEWARE_HTTP_SESSION`]. Always fail-closed.
+    /// [`SUPERVISOR_MIDDLEWARE_HTTP_HOOKS`]. Always fail-closed.
     Session,
 }
 
@@ -421,21 +421,21 @@ impl HttpHookVersion {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::V1 => "http_hook_v1",
-            Self::Session => "http_session_hook",
+            Self::Legacy => "legacy_http_hook",
+            Self::Session => "http_hook",
         }
     }
 }
 
-/// True when the service requires the HTTP session hooks capability. Peers
-/// that predate HTTP session hooks do not support it, so they reject the
-/// service at Describe instead of calling the v1 HTTP hooks.
-fn requires_http_session(manifest: &MiddlewareManifest) -> bool {
+/// True when the service requires the HTTP hooks capability. Peers
+/// that predate HTTP hooks do not support it, so they reject the
+/// service at Describe instead of calling the legacy HTTP hooks.
+fn requires_http_hooks(manifest: &MiddlewareManifest) -> bool {
     manifest.extension.as_ref().is_some_and(|extension| {
         extension
             .required_capabilities
             .iter()
-            .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_SESSION)
+            .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_HOOKS)
     })
 }
 
@@ -450,10 +450,10 @@ fn binding_http_hook_version(
         Ok(
             SupervisorMiddlewareOperation::HttpRequest
             | SupervisorMiddlewareOperation::HttpResponse,
-        ) => Some(if requires_http_session(manifest) {
+        ) => Some(if requires_http_hooks(manifest) {
             HttpHookVersion::Session
         } else {
-            HttpHookVersion::V1
+            HttpHookVersion::Legacy
         }),
         _ => None,
     }
@@ -468,11 +468,11 @@ fn manifest_http_hook_version(manifest: &MiddlewareManifest) -> Option<HttpHookV
         .find_map(|binding| binding_http_hook_version(manifest, binding))
 }
 
-/// A service that supports the HTTP session hooks capability must also
+/// A service that supports the HTTP hooks capability must also
 /// require it. Only a required capability makes peers that predate HTTP
 /// session hooks reject the service; otherwise they would call its HTTP
-/// bindings through the v1 HTTP hooks.
-fn validate_manifest_http_session_capability(
+/// bindings through the legacy HTTP hooks.
+fn validate_manifest_http_hooks_capability(
     source: &str,
     manifest: &MiddlewareManifest,
 ) -> Result<()> {
@@ -480,17 +480,17 @@ fn validate_manifest_http_session_capability(
         extension
             .supported_capabilities
             .iter()
-            .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_SESSION)
+            .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_HOOKS)
     });
-    if supported && !requires_http_session(manifest) {
+    if supported && !requires_http_hooks(manifest) {
         return Err(miette!(
-            "{source} supports {SUPERVISOR_MIDDLEWARE_HTTP_SESSION} without requiring it; list it in required_capabilities so that peers without HTTP session hooks reject the service instead of calling v1 HTTP hooks"
+            "{source} supports {SUPERVISOR_MIDDLEWARE_HTTP_HOOKS} without requiring it; list it in required_capabilities so that peers without HTTP hooks reject the service instead of calling legacy HTTP hooks"
         ));
     }
     Ok(())
 }
 
-/// v1 HTTP hooks and WebSocket bindings carry payloads. An HTTP session hook
+/// Legacy HTTP hooks and WebSocket bindings carry payloads. An HTTP hook
 /// binding that advertises no payload limit is offered no body modes, so it
 /// can only continue or deny at preflight.
 fn binding_requires_payload_limit(
@@ -560,7 +560,7 @@ impl DescribedChainEntry {
         self.max_payload_bytes
     }
 
-    /// Effective failure policy. HTTP session hook entries always fail closed,
+    /// Effective failure policy. HTTP hook entries always fail closed,
     /// whatever the policy entry says.
     pub fn on_error(&self) -> OnError {
         if self.http_hook_version == Some(HttpHookVersion::Session) {
@@ -948,7 +948,7 @@ pub struct MiddlewareRegistry {
     services: Arc<Vec<Arc<MiddlewareServiceState>>>,
     registered_services: Arc<Vec<RegisteredMiddlewareService>>,
     /// Policy configs already warned that `fail_open` does not apply to their
-    /// HTTP session hook service.
+    /// HTTP hook service.
     fail_open_warnings: Arc<std::sync::Mutex<HashSet<String>>>,
     middleware_names: Arc<HashSet<String>>,
     negotiated_extensions: Arc<Vec<NegotiatedExtension>>,
@@ -1141,7 +1141,7 @@ fn validate_manifest_bindings(
         return Err(miette!("{source} describes no bindings"));
     }
 
-    validate_manifest_http_session_capability(source, manifest)?;
+    validate_manifest_http_hooks_capability(source, manifest)?;
     let mut bindings = BTreeMap::new();
     for binding in &manifest.bindings {
         let selector = supported_binding(source, binding)?;
@@ -1545,19 +1545,19 @@ impl MiddlewareRegistry {
         })
     }
 
-    /// Gateway rules for policies that use HTTP session hook middleware.
+    /// Gateway rules for policies that use HTTP hook middleware.
     ///
     /// - `on_error: fail_open` is rejected on an entry whose service runs HTTP
-    ///   session hooks, including one with WebSocket bindings. HTTP session hooks
+    ///   session hooks, including one with WebSocket bindings. HTTP hooks
     ///   are always fail-closed, but a supervisor that cannot describe the
-    ///   service, including one that predates HTTP session hooks, follows
+    ///   service, including one that predates HTTP hooks, follows
     ///   `on_error` and would skip it under `fail_open`.
     /// - Two entries whose endpoint selectors may overlap must use the same
     ///   HTTP hook version for every HTTP operation both serve: one HTTP message
     ///   never runs both hook versions.
     ///
     /// Supervisors do not apply these rules to stored policies; they run an
-    /// HTTP session hook entry fail-closed and refuse a mixed chain at runtime.
+    /// HTTP hook entry fail-closed and refuse a mixed chain at runtime.
     pub async fn validate_http_hook_rules(&self, policy: &SandboxPolicy) -> Result<()> {
         let manifests = ChainRunner::from_registry(self.clone()).manifests().await?;
         let mut configs: Vec<_> = policy.network_middlewares.iter().collect();
@@ -1578,7 +1578,7 @@ impl MiddlewareRegistry {
                 && manifest_http_hook_version(manifest) == Some(HttpHookVersion::Session)
             {
                 return Err(miette!(
-                    "middleware config '{name}' cannot use on_error: fail_open with '{}': HTTP session hook middleware is always fail-closed, and a supervisor that cannot describe it would skip it under fail_open; use fail_closed",
+                    "middleware config '{name}' cannot use on_error: fail_open with '{}': HTTP hook middleware is always fail-closed, and a supervisor that cannot describe it would skip it under fail_open; use fail_closed",
                     config.middleware
                 ));
             }
@@ -1613,8 +1613,8 @@ impl MiddlewareRegistry {
                         continue;
                     }
                     let describe = |protocol: Option<HttpHookVersion>| match protocol {
-                        Some(HttpHookVersion::Session) => "HTTP session hooks",
-                        _ => "v1 HTTP hooks",
+                        Some(HttpHookVersion::Session) => "HTTP hooks",
+                        _ => "legacy HTTP hooks",
                     };
                     let operation_name = match operation {
                         SupervisorMiddlewareOperation::HttpResponse => "HTTP responses",
@@ -1819,7 +1819,7 @@ impl ChainRunner {
             })
     }
 
-    /// Wait until `deadline` for one HTTP session hook slot, held through
+    /// Wait until `deadline` for one HTTP hook slot, held through
     /// preflight and `WHOLE_BODY` stages. `None` when none freed up in time.
     async fn reserve_http_session(
         &self,
@@ -1828,7 +1828,7 @@ impl ChainRunner {
         reserve_until(&self.registry.http_session_admission, deadline).await
     }
 
-    /// Take one HTTP session hook DUPLEX slot if one is free now.
+    /// Take one HTTP hook DUPLEX slot if one is free now.
     fn try_reserve_http_stream(&self) -> Option<MiddlewareSessionPermit> {
         Arc::clone(&self.registry.http_stream_admission)
             .try_acquire_owned()
@@ -1836,7 +1836,7 @@ impl ChainRunner {
             .map(|permit| MiddlewareSessionPermit { _session: permit })
     }
 
-    /// Wait until `deadline` for one HTTP session hook DUPLEX slot.
+    /// Wait until `deadline` for one HTTP hook DUPLEX slot.
     async fn reserve_http_stream(
         &self,
         deadline: tokio::time::Instant,
@@ -1944,7 +1944,7 @@ impl ChainRunner {
                 Self::attachment_name(state, manifest) == entry.implementation
             }) else {
                 // An undescribed service follows its on_error. The gateway
-                // rejects fail_open for HTTP session hook services.
+                // rejects fail_open for HTTP hook services.
                 described_entries.push(DescribedChainEntry {
                     entry,
                     service: None,
@@ -2000,8 +2000,8 @@ impl ChainRunner {
     }
 
     /// Warn once per policy config that its `fail_open` does not apply to an
-    /// HTTP session hook service. The gateway rejects such policies, but one
-    /// stored before the service moved to HTTP session hooks still loads.
+    /// HTTP hook service. The gateway rejects such policies, but one
+    /// stored before the service moved to HTTP hooks still loads.
     fn warn_fail_open_not_applied(&self, entry: &ChainEntry) {
         let key = format!("{}\0{}", entry.name, entry.implementation);
         let first = self
@@ -2014,7 +2014,7 @@ impl ChainRunner {
             tracing::warn!(
                 config = %entry.name,
                 middleware = %entry.implementation,
-                "middleware config sets on_error: fail_open, but its service runs HTTP session hooks, which always fail closed; HTTP traffic fails closed"
+                "middleware config sets on_error: fail_open, but its service runs HTTP hooks, which always fail closed; HTTP traffic fails closed"
             );
         }
     }
@@ -2115,8 +2115,8 @@ impl ChainRunner {
         admission: Option<MiddlewareWorkAdmission>,
     ) -> Result<ChainOutcome> {
         ensure_chain_capacity(entries.len())?;
-        // This engine runs v1 HTTP hooks only. A chain with an HTTP session hook
-        // entry runs on the HTTP session hook pipeline; one that reaches here mixes both
+        // This engine runs legacy HTTP hooks only. A chain with an HTTP hook
+        // entry runs on the HTTP hook pipeline; one that reaches here mixes both
         // hook versions and fails closed.
         if let Some(entry) = entries
             .iter()

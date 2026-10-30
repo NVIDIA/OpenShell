@@ -10,7 +10,7 @@ SPDX-License-Identifier: Apache-2.0
 
 This configured-literal guard applies the same case-sensitive terms to HTTP request bodies, HTTP response bodies, and client WebSocket text messages. It is not a general PII detector.
 
-The guard implements [HTTP session hooks](../../docs/extensibility/supervisor-middleware/operations.mdx) (`HttpSessionMiddleware.EvaluateRequest` and `HttpSessionMiddleware.EvaluateResponse`) only. Its manifest requires the `openshell.supervisor-middleware.http-session` capability. Gateways and supervisors that predate HTTP session hooks do not support it, so they refuse the service at startup. The example released with v0.1.2 is the v1 HTTP hook reference.
+The guard implements [HTTP hooks](../../docs/extensibility/supervisor-middleware/operations.mdx) (`HttpSessionMiddleware.EvaluateRequest` and `HttpSessionMiddleware.EvaluateResponse`) only. Its manifest requires the `openshell.supervisor-middleware.http-hooks` capability. Gateways and supervisors that predate HTTP hooks do not support it, so they refuse the service at startup. The example released with v0.1.2 is the legacy HTTP hook reference.
 
 The guard serves `HttpSessionMiddleware` and `SupervisorMiddleware` on the same endpoint. `SupervisorMiddleware` handles discovery, configuration, and WebSocket sessions.
 
@@ -128,7 +128,7 @@ clean and matching responses through the external gRPC service.
 
 Bodyless responses, such as `HEAD`, `204`, and `304`, continue. Clean bodies
 pass unchanged, and transport chunk boundaries do not affect matching.
-Trailers pass without mutation. HTTP session hook middleware always fails
+Trailers pass without mutation. HTTP hook middleware always fails
 closed, so the example policy's `on_error: fail_closed` is the only accepted
 value. The guard does not decode compressed bodies, normalize Unicode, scan
 headers, or spool bodies.
@@ -157,4 +157,4 @@ config:
     - prototype-secret
 ```
 
-The implementation supports `HTTP_REQUEST/PRE_CREDENTIALS` and `HTTP_RESPONSE/PRE_RETURN` through HTTP session hooks, and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. It advertises a 256 KiB limit for each operation and inherits the service-wide RPC timeout. The gateway registration's `max_payload_bytes` may set a smaller shared limit. A binding can advertise a shorter timeout, but it cannot extend the operator-configured timeout. The server raises its gRPC message limits to 4.5 MiB, which a payload limit at the 4 MiB platform maximum needs.
+The implementation supports `HTTP_REQUEST/PRE_CREDENTIALS` and `HTTP_RESPONSE/PRE_RETURN` through HTTP hooks, and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. It advertises a 256 KiB limit for each operation and inherits the service-wide RPC timeout. The gateway registration's `max_payload_bytes` may set a smaller shared limit. A binding can advertise a shorter timeout, but it cannot extend the operator-configured timeout. The server raises its gRPC message limits to 4.5 MiB, which a payload limit at the 4 MiB platform maximum needs.

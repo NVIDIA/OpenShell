@@ -1512,7 +1512,7 @@ async fn route_selected_authorityless_body_refresh_cannot_forward_superseded_gra
     authorityless_body_refresh(true).await;
 }
 
-/// HTTP session hook stage bound to both HTTP operations. It streams a request
+/// HTTP hook stage bound to both HTTP operations. It streams a request
 /// body through with a preflight mutation and a late one, and records the
 /// request headers its response preflight carries.
 struct ForwardedHeadStage {
@@ -1544,7 +1544,7 @@ impl openshell_core::middleware::InProcessMiddleware for ForwardedHeadStage {
             ],
             expected_audience: String::new(),
             extension: Some(
-                openshell_core::extension_protocol::http_session_middleware_metadata(
+                openshell_core::extension_protocol::http_hooks_middleware_metadata(
                     "openshell/test-forwarded-head",
                     "test",
                 ),
@@ -1564,7 +1564,7 @@ impl openshell_core::middleware::InProcessMiddleware for ForwardedHeadStage {
         &self,
         _request: openshell_core::middleware::HttpRequestView<'_>,
     ) -> Result<openshell_core::proto::HttpRequestResult> {
-        Err(miette!("HTTP session hook test stage"))
+        Err(miette!("HTTP hook test stage"))
     }
 
     async fn open_http_request_session(

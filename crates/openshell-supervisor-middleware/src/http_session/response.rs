@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP session hook response middleware at `PRE_RETURN`.
+//! HTTP hook response middleware at `PRE_RETURN`.
 //!
 //! Initial preflight stops at the first inspecting stage. The returned
 //! [`HttpResponsePipelineSession`] opens later stages on the preceding
@@ -65,7 +65,7 @@ impl HttpResponseDelivery {
     }
 }
 
-/// Outcome of HTTP session hook response preflight.
+/// Outcome of HTTP hook response preflight.
 pub struct HttpResponsePipelinePreflight {
     pub allowed: bool,
     pub reason: String,
@@ -77,14 +77,14 @@ pub struct HttpResponsePipelinePreflight {
     /// Present when a stage selected a body mode.
     pub session: Option<HttpResponsePipelineSession>,
     pub diagnostics: HttpStageDiagnostics,
-    /// No HTTP session hook slot freed up within the chain deadline, so the
+    /// No HTTP hook slot freed up within the chain deadline, so the
     /// response failed closed.
     pub session_capacity_exhausted: bool,
 }
 
 /// Response body stages selected at preflight.
 ///
-/// The session holds its HTTP session hook budget slots while its body
+/// The session holds its HTTP hook budget slots while its body
 /// stages run.
 pub struct HttpResponsePipelineSession {
     pipeline: Pipeline,
@@ -319,7 +319,7 @@ impl ChainRunner {
     /// Prepare a described response chain through its first inspecting stage.
     /// Returns an error only for a chain over platform capacity.
     ///
-    /// Preflight waits for an HTTP session hook slot within the chain
+    /// Preflight waits for an HTTP hook slot within the chain
     /// deadline, and the slot is released once no stage inspects the body.
     pub async fn preflight_http_response_pipeline(
         &self,
@@ -390,7 +390,7 @@ impl ChainRunner {
         })
     }
 
-    /// Fail an HTTP session hook response chain whose head valid HTTP allows
+    /// Fail an HTTP hook response chain whose head valid HTTP allows
     /// but the middleware protocol cannot encode.
     #[must_use]
     pub fn http_response_pipeline_input_unrepresentable(
@@ -439,7 +439,7 @@ fn chain_failure(
     }
 }
 
-/// No HTTP session hook slot freed up within the chain deadline. No stage
+/// No HTTP hook slot freed up within the chain deadline. No stage
 /// owns this failure.
 fn capacity_exhausted(
     entries: &[DescribedChainEntry],

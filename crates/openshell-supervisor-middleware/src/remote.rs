@@ -120,7 +120,7 @@ impl GrpcMiddlewareService {
         self.service.open_http_response_pre_return(receiver).await
     }
 
-    /// Open a remote HTTP session hook request exchange through the gRPC
+    /// Open a remote HTTP hook request exchange through the gRPC
     /// adapter.
     pub async fn open_http_request_session(
         &self,
@@ -129,7 +129,7 @@ impl GrpcMiddlewareService {
         self.service.open_http_request_session(receiver).await
     }
 
-    /// Open a remote HTTP session hook response exchange through the gRPC
+    /// Open a remote HTTP hook response exchange through the gRPC
     /// adapter.
     pub async fn open_http_response_session(
         &self,
@@ -207,7 +207,7 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
         request: Request<HttpRequestEvaluation>,
     ) -> std::result::Result<Response<HttpRequestResult>, Status> {
         let mut client = self.client.clone();
-        // v1 HTTP hooks stay callable until their removal in 0.2.0.
+        // Legacy HTTP hooks stay callable until their removal in 0.2.0.
         #[allow(deprecated)]
         client.evaluate_http_request(request).await
     }
@@ -231,7 +231,7 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
         receiver: tokio::sync::mpsc::Receiver<HttpResponseEvent>,
     ) -> std::result::Result<HttpResponseResultStream, Status> {
         let mut client = self.response_client.clone();
-        // v1 HTTP hooks stay callable until their removal in 0.2.0.
+        // Legacy HTTP hooks stay callable until their removal in 0.2.0.
         #[allow(deprecated)]
         let responses = client
             .evaluate(Request::new(tokio_stream::wrappers::ReceiverStream::new(

@@ -65,7 +65,7 @@ pub async fn close_after_early_response<C: AsyncRead + AsyncWrite + Unpin>(
 
 pub enum MiddlewareApplyResult {
     Allowed(crate::l7::provider::L7Request),
-    /// HTTP session hook request middleware streams the body. `request` holds
+    /// HTTP hook request middleware streams the body. `request` holds
     /// only the head; the relay commits it on the middleware's final `Start`.
     Streamed {
         request: crate::l7::provider::L7Request,
@@ -73,7 +73,7 @@ pub enum MiddlewareApplyResult {
     },
     Denied {
         denial: Option<openshell_supervisor_middleware::MiddlewareDenial>,
-        /// Why an HTTP session hook chain failed closed, when it did.
+        /// Why an HTTP hook chain failed closed, when it did.
         failure: Option<MiddlewareFailureDetail>,
     },
     /// The platform's shared active-work and waiter capacities were both full.
@@ -86,7 +86,7 @@ pub enum MiddlewareApplyResult {
     RequestTimeout,
 }
 
-/// Whether HTTP session hook request middleware output may stream to the
+/// Whether HTTP hook request middleware output may stream to the
 /// upstream while the client uploads.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RequestBodyDelivery {
@@ -124,7 +124,7 @@ impl RequestBodyDelivery {
 }
 
 /// Request head as the request middleware chain forwarded it, before
-/// credentials are injected. HTTP session hook response stages receive its
+/// credentials are injected. HTTP hook response stages receive its
 /// visible headers.
 ///
 /// Record it from a request that does not carry credentials yet. A live body
@@ -808,7 +808,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
 }
 
 /// Describe the request chain and run it on the engine of its HTTP hook version.
-/// A chain that mixes v1 HTTP hook and HTTP session hook entries fails
+/// A chain that mixes entries of both HTTP hook versions fails
 /// closed.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery<
@@ -830,7 +830,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery<
     }
     let chain = runner.describe_chain(&chain).await?;
     match openshell_supervisor_middleware::chain_http_hook_version(&chain) {
-        ChainHttpHookVersion::V1 => {
+        ChainHttpHookVersion::Legacy => {
             Box::pin(apply_protocol1_middleware_chain(
                 req,
                 client,
@@ -883,7 +883,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery<
     }
 }
 
-/// v1 HTTP hook request chain, unchanged from 0.1.x.
+/// Legacy HTTP hook request chain, unchanged from 0.1.x.
 #[allow(clippy::too_many_arguments)]
 async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: crate::l7::provider::L7Request,
@@ -1001,7 +1001,7 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
     Ok(MiddlewareApplyResult::Allowed(rebuilt))
 }
 
-/// Run an HTTP session hook request chain on the stage pipeline.
+/// Run an HTTP hook request chain on the stage pipeline.
 #[allow(clippy::too_many_arguments)]
 async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: crate::l7::provider::L7Request,
@@ -1576,7 +1576,7 @@ pub(super) fn request_client_timeout_event(
         .build()
 }
 
-/// A request chain selected v1 HTTP hook and HTTP session hook entries for
+/// A request chain selected entries of both HTTP hook versions for
 /// the same message, so it failed closed.
 fn emit_mixed_protocol_denial(
     ctx: &L7EvalContext,
@@ -1847,10 +1847,10 @@ struct SafeMiddlewareHeaders {
 }
 
 impl SafeMiddlewareHeaders {
-    /// Headers HTTP session hooks see. They omit every header named in
+    /// Headers HTTP hooks see. They omit every header named in
     /// `credential_references` too, as `Authorization` is always omitted, so
     /// whether a stage sees a credential placeholder does not depend on the
-    /// header that carries it. v1 HTTP hooks keep `visible`.
+    /// header that carries it. Legacy HTTP hooks keep `visible`.
     fn session_visible(&self) -> Vec<openshell_core::proto::HttpHeader> {
         self.visible
             .iter()
@@ -2109,7 +2109,7 @@ mod tests {
             input.credential_reference_headers,
             ["x-api-key", "x-upstream-auth"]
         );
-        // v1 HTTP hooks keep their released view.
+        // Legacy HTTP hooks keep their released view.
         let v1 = safe_middleware_headers(head.as_bytes()).unwrap().visible;
         assert!(
             v1.iter().any(

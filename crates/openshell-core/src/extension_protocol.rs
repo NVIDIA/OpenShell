@@ -29,13 +29,13 @@ pub const COMPUTE_SUSPEND_RESUME: &str = "openshell.compute.suspend-resume";
 pub const COMPUTE_UPDATE_SANDBOX_CONFIGURATION: &str =
     "openshell.compute.update-sandbox-configuration";
 
-/// Capability for supervisor middleware that implements HTTP session hooks.
+/// Capability for supervisor middleware that implements HTTP hooks.
 ///
-/// A service selects HTTP session hooks for all of its HTTP bindings by
+/// A service selects HTTP hooks for all of its HTTP bindings by
 /// listing this capability in `required_capabilities`. Peers that predate
-/// HTTP session hooks do not support it, so they reject the service at
-/// `Describe` instead of calling the deprecated v1 HTTP hooks.
-pub const SUPERVISOR_MIDDLEWARE_HTTP_SESSION: &str = "openshell.supervisor-middleware.http-session";
+/// HTTP hooks do not support it, so they reject the service at
+/// `Describe` instead of calling the deprecated legacy HTTP hooks.
+pub const SUPERVISOR_MIDDLEWARE_HTTP_HOOKS: &str = "openshell.supervisor-middleware.http-hooks";
 
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
@@ -144,7 +144,7 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
             supported_capabilities.push(COMPUTE_UPDATE_SANDBOX_CONFIGURATION.to_string());
         }
         ExtensionFamily::SupervisorMiddleware => {
-            supported_capabilities.push(SUPERVISOR_MIDDLEWARE_HTTP_SESSION.to_string());
+            supported_capabilities.push(SUPERVISOR_MIDDLEWARE_HTTP_HOOKS.to_string());
         }
         ExtensionFamily::Credentials | ExtensionFamily::GatewayInterceptor => {}
     }
@@ -190,12 +190,12 @@ fn expected_contract(gateway: &PeerMetadata) -> String {
     )
 }
 
-/// Extension metadata for supervisor middleware that implements HTTP session hooks.
+/// Extension metadata for supervisor middleware that implements HTTP hooks.
 ///
-/// It supports and requires [`SUPERVISOR_MIDDLEWARE_HTTP_SESSION`], so peers
-/// without HTTP session hooks reject the service at `Describe`.
+/// It supports and requires [`SUPERVISOR_MIDDLEWARE_HTTP_HOOKS`], so peers
+/// without HTTP hooks reject the service at `Describe`.
 #[must_use]
-pub fn http_session_middleware_metadata(
+pub fn http_hooks_middleware_metadata(
     implementation_name: impl Into<String>,
     implementation_version: impl Into<String>,
 ) -> PeerMetadata {
@@ -203,11 +203,11 @@ pub fn http_session_middleware_metadata(
         ExtensionFamily::SupervisorMiddleware,
         implementation_name,
         implementation_version,
-        [SUPERVISOR_MIDDLEWARE_HTTP_SESSION.to_string()],
+        [SUPERVISOR_MIDDLEWARE_HTTP_HOOKS.to_string()],
     );
     metadata
         .required_capabilities
-        .push(SUPERVISOR_MIDDLEWARE_HTTP_SESSION.to_string());
+        .push(SUPERVISOR_MIDDLEWARE_HTTP_HOOKS.to_string());
     metadata
 }
 
@@ -548,8 +548,8 @@ mod tests {
     }
 
     #[test]
-    fn http_session_middleware_requires_a_peer_with_http_session_hooks() {
-        let middleware = http_session_middleware_metadata("example/guard", "test");
+    fn http_hooks_middleware_requires_a_peer_with_http_hooks() {
+        let middleware = http_hooks_middleware_metadata("example/guard", "test");
         let gateway = gateway_metadata(ExtensionFamily::SupervisorMiddleware);
         let negotiated = negotiate(
             ExtensionFamily::SupervisorMiddleware,
@@ -557,35 +557,33 @@ mod tests {
             &gateway,
             Some(middleware.clone()),
         )
-        .expect("a peer with HTTP session hooks accepts the service");
+        .expect("a peer with HTTP hooks accepts the service");
         assert!(
             negotiated
                 .required_capabilities
                 .iter()
-                .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_SESSION)
+                .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_HOOKS)
         );
 
-        // A peer that predates HTTP session hooks advertises only the
+        // A peer that predates HTTP hooks advertises only the
         // contract capability.
         let mut older = gateway;
         older
             .supported_capabilities
-            .retain(|capability| capability != SUPERVISOR_MIDDLEWARE_HTTP_SESSION);
+            .retain(|capability| capability != SUPERVISOR_MIDDLEWARE_HTTP_HOOKS);
         let error = negotiate(
             ExtensionFamily::SupervisorMiddleware,
             "example/guard",
             &older,
             Some(middleware),
         )
-        .expect_err("a peer without HTTP session hooks rejects the service");
+        .expect_err("a peer without HTTP hooks rejects the service");
         assert!(matches!(
             error,
             NegotiationError::MissingGatewayCapabilities { .. }
         ));
         assert!(
-            error
-                .to_string()
-                .contains(SUPERVISOR_MIDDLEWARE_HTTP_SESSION),
+            error.to_string().contains(SUPERVISOR_MIDDLEWARE_HTTP_HOOKS),
             "{error}"
         );
     }

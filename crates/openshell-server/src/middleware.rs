@@ -24,7 +24,7 @@ pub async fn validate_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::extension_protocol::http_session_middleware_metadata;
+    use openshell_core::extension_protocol::http_hooks_middleware_metadata;
     use openshell_core::proto::{
         HttpRequestResult, MiddlewareBinding, MiddlewareEndpointSelector, MiddlewareManifest,
         NetworkMiddlewareConfig, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
@@ -67,7 +67,7 @@ mod tests {
             MiddlewareManifest {
                 name: self.name.into(),
                 bindings,
-                extension: Some(http_session_middleware_metadata(self.name, "test")),
+                extension: Some(http_hooks_middleware_metadata(self.name, "test")),
                 ..Default::default()
             }
         }
@@ -84,7 +84,7 @@ mod tests {
             &self,
             _request: HttpRequestView<'_>,
         ) -> miette::Result<HttpRequestResult> {
-            Err(miette::miette!("HTTP session hook test middleware"))
+            Err(miette::miette!("HTTP hook test middleware"))
         }
     }
 
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fail_open_is_rejected_on_http_session_hook_middleware() {
+    async fn fail_open_is_rejected_on_http_hook_middleware() {
         let registry = registry().await;
         for middleware in ["example/guard", "example/guard-with-websocket"] {
             let error = validate_policy(
@@ -153,7 +153,7 @@ mod tests {
                 )]),
             )
             .await
-            .expect_err("HTTP session hook middleware is always fail-closed");
+            .expect_err("HTTP hook middleware is always fail-closed");
             assert_eq!(error.code(), tonic::Code::InvalidArgument);
             assert!(
                 error.message().contains("cannot use on_error: fail_open"),
@@ -174,7 +174,7 @@ mod tests {
             )]),
         )
         .await
-        .expect("v1 HTTP hook middleware keeps fail_open");
+        .expect("legacy HTTP hook middleware keeps fail_open");
     }
 
     #[tokio::test]
@@ -210,7 +210,7 @@ mod tests {
         .expect("disjoint selectors may use different hook versions");
 
         // The regex middleware has no response binding, so a response-only
-        // HTTP session hook service may share its selector.
+        // HTTP hook service may share its selector.
         validate_policy(
             &registry,
             &policy(vec![

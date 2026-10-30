@@ -76,7 +76,7 @@ pub struct HttpResponsePreflightInput {
     /// fields. Their values are not exposed to middleware.
     pub connection_nominated_headers: Vec<String>,
     /// Sanitized headers of the request this response answers, as request
-    /// middleware forwarded them before credentials. Only HTTP session hook
+    /// middleware forwarded them before credentials. Only HTTP hook
     /// stages receive them.
     pub request_headers: Vec<HttpHeader>,
 }

@@ -4,10 +4,10 @@
 //! Example OpenShell supervisor middleware service.
 //!
 //! The content guard redacts or denies configured terms in HTTP request and
-//! response bodies through HTTP session hooks (`HttpSessionMiddleware.EvaluateRequest`
+//! response bodies through HTTP hooks (`HttpSessionMiddleware.EvaluateRequest`
 //! and `HttpSessionMiddleware.EvaluateResponse`), and in WebSocket text messages. Its
-//! manifest requires the `openshell.supervisor-middleware.http-session`
-//! capability, which gateways and supervisors that predate HTTP session hooks
+//! manifest requires the `openshell.supervisor-middleware.http-hooks`
+//! capability, which gateways and supervisors that predate HTTP hooks
 //! do not support, so they refuse it at Describe.
 
 mod guard;
@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 use openshell_core::extension_protocol::{
-    ExtensionFamily, http_session_middleware_metadata, validate_gateway_metadata,
+    ExtensionFamily, http_hooks_middleware_metadata, validate_gateway_metadata,
 };
 use openshell_core::middleware::{
     HttpRequestSessionResultStream, HttpResponseSessionResultStream, WebSocketResponseStream,
@@ -97,7 +97,7 @@ impl SupervisorMiddleware for ContentGuard {
                 },
             ],
             expected_audience: String::new(),
-            extension: Some(http_session_middleware_metadata(
+            extension: Some(http_hooks_middleware_metadata(
                 MANIFEST_NAME,
                 openshell_core::VERSION,
             )),
@@ -135,9 +135,9 @@ impl SupervisorMiddleware for ContentGuard {
         &self,
         _request: Request<HttpRequestEvaluation>,
     ) -> Result<Response<HttpRequestResult>, Status> {
-        // v1 HTTP hooks. This service implements HTTP session hooks only.
+        // Legacy HTTP hooks. This service implements HTTP hooks only.
         Err(Status::unimplemented(
-            "content guard implements HTTP session hooks only",
+            "content guard implements HTTP hooks only",
         ))
     }
 
@@ -193,14 +193,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use openshell_core::extension_protocol::{
-        SUPERVISOR_MIDDLEWARE_HTTP_SESSION, gateway_metadata,
-    };
+    use openshell_core::extension_protocol::{SUPERVISOR_MIDDLEWARE_HTTP_HOOKS, gateway_metadata};
 
     use super::*;
 
     #[tokio::test]
-    async fn manifest_advertises_http_session_hook_and_websocket_bindings() {
+    async fn manifest_advertises_http_hook_and_websocket_bindings() {
         let manifest = SupervisorMiddleware::describe(
             &ContentGuard,
             Request::new(MiddlewareDescribeRequest {
@@ -229,7 +227,7 @@ mod tests {
             extension
                 .required_capabilities
                 .iter()
-                .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_SESSION)
+                .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_HOOKS)
         );
     }
 

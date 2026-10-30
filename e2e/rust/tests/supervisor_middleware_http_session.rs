@@ -3,7 +3,7 @@
 
 #![cfg(feature = "e2e-docker")]
 
-//! HTTP session hooks end to end.
+//! HTTP hooks end to end.
 //!
 //! Runs the `supervisor-middleware-content-guard` example from this checkout
 //! as an operator-registered middleware service for the current gateway and
@@ -418,7 +418,7 @@ struct PolicyCase<'a> {
     /// Port of a `tls: skip` endpoint the attachment also selects, which the
     /// gateway rejects.
     tls_skip_port: Option<u16>,
-    /// Also attach `openshell/regex` (v1 HTTP hooks) to the same host.
+    /// Also attach `openshell/regex` (legacy HTTP hooks) to the same host.
     mixed: bool,
 }
 
@@ -634,7 +634,7 @@ fn should_run() -> Option<String> {
     let required = std::env::var(REQUIRE_ENV).as_deref() == Ok("1");
     let skip = |reason: &str| {
         assert!(!required, "{REQUIRE_ENV}=1 but {reason}");
-        eprintln!("Skipping HTTP session hook middleware e2e: {reason}");
+        eprintln!("Skipping HTTP hook middleware e2e: {reason}");
         None
     };
     if std::env::var("OPENSHELL_E2E_DRIVER").as_deref() != Ok("docker") {
@@ -658,7 +658,7 @@ fn should_run() -> Option<String> {
 
 #[tokio::test]
 #[serial(supervisor_middleware)]
-async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor() {
+async fn http_hook_content_guard_runs_against_the_gateway_and_supervisor() {
     let Some(binary) = should_run() else {
         return;
     };

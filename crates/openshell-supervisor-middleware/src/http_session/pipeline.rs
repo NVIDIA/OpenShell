@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP session hook stage pipeline, shared by request and response evaluation.
+//! HTTP hook stage pipeline, shared by request and response evaluation.
 //!
 //! Each stage opens when the preceding stage establishes its output headers.
 //! Header-only stages continue immediately; inspecting stages emit `Start`
@@ -61,14 +61,14 @@ pub const HTTP_WHOLE_BODY_TIMEOUT: Duration = Duration::from_mins(2);
 /// Messages each link and stage queue holds.
 pub const STAGE_QUEUE_MESSAGES: usize = 4;
 const SESSION_END_TIMEOUT: Duration = Duration::from_millis(10);
-/// Failure reason when a message cannot be shown to an HTTP session hook
+/// Failure reason when a message cannot be shown to an HTTP hook
 /// stage, such as a head over capacity.
 pub const MIDDLEWARE_CANNOT_INSPECT: &str = "middleware_cannot_inspect";
-/// Failure reason for a chain that selects v1 and HTTP session hook stages for the
+/// Failure reason for a chain that selects legacy and current HTTP hook stages for the
 /// same HTTP message.
 pub const MIDDLEWARE_HOOK_VERSIONS_MIXED: &str = "middleware_hook_versions_mixed";
 
-/// Why an HTTP session hook exchange failed closed, in terms the sandbox can
+/// Why an HTTP hook exchange failed closed, in terms the sandbox can
 /// act on: retry when the middleware is unavailable or slow, but not when it
 /// cannot inspect the message.
 ///
@@ -95,7 +95,7 @@ pub enum HttpFailureCode {
     /// A header or trailer mutation broke a header change rule; carries the
     /// rule's code, such as `header_mutation_protected_header`.
     HeaderMutation(&'static str),
-    /// The chain selects v1 HTTP hook and HTTP session hook entries.
+    /// The chain selects entries of both HTTP hook versions.
     HookVersionsMixed,
 }
 
@@ -190,7 +190,7 @@ pub enum HttpStageOutcome {
     FailClosed,
     /// The entry did not resolve to a registered binding, and its
     /// `on_error: fail_open` let the message continue without it. Never an
-    /// HTTP session hook entry.
+    /// HTTP hook entry.
     FailOpen,
 }
 
@@ -1514,7 +1514,7 @@ struct Checkpoint<'p> {
 /// Holds one stage's output until the stage ends, re-checks it with the body
 /// policy when it differs from the stage's input, and then releases it. A
 /// policy denial fails the exchange before the next stage or the output sees
-/// the body, as v1 HTTP hooks re-checks every replacement before the next stage.
+/// the body, as legacy HTTP hooks re-checks every replacement before the next stage.
 async fn run_checkpoint(
     checkpoint: Checkpoint<'_>,
     mut link: mpsc::Receiver<Frame>,
@@ -2272,7 +2272,7 @@ pub(super) fn classify_result(
 fn status_failure(entry: &DescribedChainEntry, status: &tonic::Status) -> HttpMiddlewareFailure {
     match status.code() {
         tonic::Code::DeadlineExceeded => entry_failure(entry, "middleware_timeout"),
-        // The service does not implement the HTTP session hook RPC its binding
+        // The service does not implement the HTTP hook RPC its binding
         // selected.
         tonic::Code::Unimplemented => entry_failure(entry, "middleware_unimplemented"),
         // The reason may carry an in-process service's status text, so the
@@ -2369,7 +2369,7 @@ fn validate_diagnostics(
 }
 
 /// Namespace one stage's findings and metadata. External services get the
-/// same normalization as v1 HTTP hook results: no metadata and no service-chosen
+/// same normalization as legacy HTTP hook results: no metadata and no service-chosen
 /// finding text.
 fn collect_diagnostics(
     entry: &DescribedChainEntry,

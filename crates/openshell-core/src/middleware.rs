@@ -32,7 +32,7 @@ pub type HttpResponseSessionResultStream = Pin<
     >,
 >;
 
-/// v1 HTTP hooks. Removed in 0.2.0.
+/// Legacy HTTP hooks. Removed in 0.2.0.
 ///
 /// Transport-neutral result stream for one HTTP response middleware stage.
 pub type HttpResponseResultStream = Pin<
@@ -83,23 +83,23 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         ))
     }
 
-    /// Open one HTTP session hook request exchange (`HttpSessionMiddleware.EvaluateRequest`).
+    /// Open one HTTP hook request exchange (`HttpSessionMiddleware.EvaluateRequest`).
     async fn open_http_request_session(
         &self,
         _requests: mpsc::Receiver<HttpRequestSessionEvent>,
     ) -> Result<HttpRequestSessionResultStream, Status> {
         Err(Status::unimplemented(
-            "middleware does not implement HTTP session hook requests",
+            "middleware does not implement HTTP hook requests",
         ))
     }
 
-    /// Open one HTTP session hook response exchange (`HttpSessionMiddleware.EvaluateResponse`).
+    /// Open one HTTP hook response exchange (`HttpSessionMiddleware.EvaluateResponse`).
     async fn open_http_response_session(
         &self,
         _requests: mpsc::Receiver<HttpResponseSessionEvent>,
     ) -> Result<HttpResponseSessionResultStream, Status> {
         Err(Status::unimplemented(
-            "middleware does not implement HTTP session hook responses",
+            "middleware does not implement HTTP hook responses",
         ))
     }
 }
@@ -316,30 +316,30 @@ pub trait InProcessMiddleware: Send + Sync {
         ))
     }
 
-    /// Open one HTTP session hook request exchange (`HttpSessionMiddleware.EvaluateRequest`),
+    /// Open one HTTP hook request exchange (`HttpSessionMiddleware.EvaluateRequest`),
     /// for one HTTP request.
     ///
-    /// Implementations that do not require the HTTP session hooks capability
+    /// Implementations that do not require the HTTP hooks capability
     /// may keep the default unsupported response.
     async fn open_http_request_session(
         &self,
         _requests: mpsc::Receiver<HttpRequestSessionEvent>,
     ) -> std::result::Result<HttpRequestSessionResultStream, Status> {
         Err(Status::unimplemented(
-            "middleware does not implement HTTP session hook requests",
+            "middleware does not implement HTTP hook requests",
         ))
     }
 
-    /// Open one HTTP session hook response exchange (`HttpSessionMiddleware.EvaluateResponse`).
+    /// Open one HTTP hook response exchange (`HttpSessionMiddleware.EvaluateResponse`).
     ///
-    /// Implementations that do not require the HTTP session hooks capability
+    /// Implementations that do not require the HTTP hooks capability
     /// may keep the default unsupported response.
     async fn open_http_response_session(
         &self,
         _requests: mpsc::Receiver<HttpResponseSessionEvent>,
     ) -> std::result::Result<HttpResponseSessionResultStream, Status> {
         Err(Status::unimplemented(
-            "middleware does not implement HTTP session hook responses",
+            "middleware does not implement HTTP hook responses",
         ))
     }
 }
@@ -356,23 +356,23 @@ pub const MAX_MIDDLEWARE_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Process-wide safety valve for concurrently buffered middleware work.
 pub const MAX_CONCURRENT_MIDDLEWARE_WORK: usize = 32;
-/// Process-wide safety valve for retained WebSocket and v1 HTTP response
+/// Process-wide safety valve for retained WebSocket and legacy HTTP response
 /// middleware sessions.
 ///
 /// A session consumes one permit regardless of its stage fan-out. These
 /// protocols acquire from this shared budget before opening streams and retain
-/// the permit while any stage remains active. HTTP session hooks use
+/// the permit while any stage remains active. HTTP hooks use
 /// [`MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS`] and
 /// [`MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS`] instead.
 pub const MAX_CONCURRENT_MIDDLEWARE_SESSIONS: usize = 32;
-/// Process-wide bound on HTTP session hook messages in preflight or in a
+/// Process-wide bound on HTTP hook messages in preflight or in a
 /// `WHOLE_BODY` stage.
 ///
 /// A request and its response each hold one slot, and only while a stage
 /// inspects them: a message whose stages all continue at preflight releases
 /// its slot then. A message waits for a slot within its chain deadline.
 pub const MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS: usize = 64;
-/// Process-wide bound on HTTP session hook messages with a DUPLEX stage.
+/// Process-wide bound on HTTP hook messages with a DUPLEX stage.
 ///
 /// A DUPLEX body has no total deadline, so a server-sent events response can
 /// hold its slot indefinitely. This separate budget keeps such streams from

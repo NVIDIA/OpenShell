@@ -182,7 +182,7 @@ description = "Build the Docker E2E workload fixture"
 run = "CONTAINER_ENGINE=docker bash tasks/scripts/e2e-build-workload.sh"
 
 ["e2e:middleware-http-session"]
-description = "Run the HTTP session hooks content-guard middleware example against the current gateway and Docker supervisor"
+description = "Run the HTTP hooks content-guard middleware example against the current gateway and Docker supervisor"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail

@@ -228,8 +228,8 @@ Add `network_middlewares` only when the user asks to inspect, transform, redact,
 - To require request inspection, ask the operator to include `http_request_pre_credentials` in `bindings` with `binding_policy = "allowlist"` or `"exact"`. The default `dynamic` policy follows what the service advertises; sandbox policy alone cannot require a missing binding. Confirm the gateway and all supervisors support binding policies before relying on them.
 - WebSocket middleware inspects client text messages only, over both `ws://` and `wss://`. Binary and upstream-to-client messages pass without inspection, even with `fail_closed`.
 - `on_error` controls selected-stage failures. Explicit denials always block traffic. A failed WebSocket stage with `fail_open` can remain bypassed for the rest of the connection.
-- Default `on_error` to `fail_closed`. Use `fail_open` only when bypassing the stage preserves the user's stated security requirement. Never use `fail_open` for a service that implements HTTP session hooks; the gateway rejects it.
-- Entries whose endpoint selectors may overlap must use the same HTTP hook version for the operations both handle. The built-in `openshell/regex` uses v1 HTTP hooks, so do not let its selector overlap an HTTP session hook service that inspects requests.
+- Default `on_error` to `fail_closed`. Use `fail_open` only when bypassing the stage preserves the user's stated security requirement. Never use `fail_open` for a service that implements HTTP hooks; the gateway rejects it.
+- Entries whose endpoint selectors may overlap must use the same HTTP hook version for the operations both handle. The built-in `openshell/regex` uses legacy HTTP hooks, so do not let its selector overlap an HTTP hook service that inspects requests.
 - Assign unique `order` values across the complete policy. Lower values run first, and at most 10 configs may be selected.
 - Match the narrowest destination hosts possible with `endpoints.include`; use `exclude` when a broad selector has trusted exceptions.
 - Do not select fail-closed middleware for `tls: skip` endpoints because the supervisor cannot inspect that traffic.
@@ -405,7 +405,7 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 - [ ] Every middleware config has a non-empty `middleware` name and non-empty `endpoints.include`
 - [ ] Middleware `order` values are unique and no selected chain exceeds 10 stages
 - [ ] No fail-closed middleware selector can cover a `tls: skip` endpoint
-- [ ] No HTTP session hook middleware entry uses `on_error: fail_open`
+- [ ] No HTTP hook middleware entry uses `on_error: fail_open`
 - [ ] Middleware entries with overlapping selectors use the same HTTP hook version for each HTTP operation they share
 - [ ] If inspection by an operator-run service is mandatory, the registration requires the binding (`http_request_pre_credentials`, `http_response_pre_return`, or `websocket_message_pre_credentials`), the service advertises it, and the attachment uses `on_error: fail_closed`
 - [ ] The user understands that V1 WebSocket middleware inspects client text messages only

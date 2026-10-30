@@ -15,13 +15,13 @@ pub const MAX_HEADER_MUTATION_BYTES: usize = 32 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderAuthority {
     Request,
-    /// An HTTP session hook request head. Body-mode offers come from the
+    /// An HTTP hook request head. Body-mode offers come from the
     /// original head, so `Content-Encoding` is read-only too: a stage must
     /// not relabel a body it replaced.
     SessionRequest,
     RequestTrailers,
     Response,
-    /// An HTTP session hook response head. Unlike legacy response hooks,
+    /// An HTTP hook response head. Unlike legacy response hooks,
     /// a stage may write integrity headers such as `ETag` and
     /// `Content-Digest`. They are not stripped when a body changes: the stage
     /// that changes the body owns them.
@@ -169,7 +169,7 @@ pub fn apply_accumulated(
     )
 }
 
-/// Reject mutations of the headers an HTTP session hook request head omits
+/// Reject mutations of the headers an HTTP hook request head omits
 /// because their values carry a credential placeholder. A stage cannot see
 /// them, so it cannot write or remove them either.
 pub fn reject_credential_reference_mutations(

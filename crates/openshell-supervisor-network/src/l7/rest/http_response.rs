@@ -20,11 +20,11 @@ pub struct HttpResponseMiddlewareRelay<'a> {
     pub(crate) policy_name: &'a str,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) whole_body_timeout: std::time::Duration,
-    /// The client request used HTTP/1.1, so an HTTP session hook response may
+    /// The client request used HTTP/1.1, so an HTTP hook response may
     /// be re-framed chunked. An HTTP/1.0 client cannot decode chunked framing.
     pub(crate) client_accepts_chunked: bool,
     /// The request head as request middleware forwarded it, before
-    /// credentials. HTTP session hook response stages receive its headers, and
+    /// credentials. HTTP hook response stages receive its headers, and
     /// fail closed without it.
     pub(crate) request_head: Option<crate::l7::middleware::ForwardedRequestHead>,
 }
@@ -376,7 +376,7 @@ where
         }
     };
     match openshell_supervisor_middleware::chain_http_hook_version(&described) {
-        openshell_supervisor_middleware::ChainHttpHookVersion::V1 => {}
+        openshell_supervisor_middleware::ChainHttpHookVersion::Legacy => {}
         openshell_supervisor_middleware::ChainHttpHookVersion::Session => {
             return Box::pin(http_session::relay_response_through_pipeline(
                 request_method,
@@ -430,7 +430,7 @@ where
         },
         headers: parsed.headers,
         connection_nominated_headers: parsed.connection_nominated,
-        // v1 response hooks do not receive request headers.
+        // Legacy response hooks do not receive request headers.
         request_headers: Vec::new(),
     };
     let preflight_result = if parsed.representable {
@@ -2058,7 +2058,7 @@ async fn send_response_middleware_denial<C: AsyncWrite + Unpin>(
 }
 
 /// Answer a response that middleware failed before its head was committed.
-/// An HTTP session hook failure carries its platform-owned code and stage.
+/// An HTTP hook failure carries its platform-owned code and stage.
 async fn send_response_delivery_failure<C: AsyncWrite + Unpin>(
     client: &mut C,
     request_method: &str,

@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP session hook registration rules and stage state machine.
+//! HTTP hook registration rules and stage state machine.
 
 use std::sync::{Arc, Mutex};
 
 use openshell_core::extension_protocol::{
-    ExtensionFamily, SUPERVISOR_MIDDLEWARE_HTTP_SESSION, extension_metadata,
-    http_session_middleware_metadata,
+    ExtensionFamily, SUPERVISOR_MIDDLEWARE_HTTP_HOOKS, extension_metadata,
+    http_hooks_middleware_metadata,
 };
 use openshell_core::proto::{
     ExistingHeaderAction, HeaderMutation, HttpBodyMode, HttpContinue, HttpDenial, HttpDuplexMode,
@@ -45,7 +45,7 @@ fn binding(operation: SupervisorMiddlewareOperation) -> MiddlewareBinding {
     }
 }
 
-/// Manifest of a v1 HTTP hook service.
+/// Manifest of a legacy HTTP hook service.
 fn manifest(bindings: Vec<MiddlewareBinding>) -> MiddlewareManifest {
     MiddlewareManifest {
         name: "example/guard".into(),
@@ -60,28 +60,28 @@ fn manifest(bindings: Vec<MiddlewareBinding>) -> MiddlewareManifest {
     }
 }
 
-/// Manifest of a service that requires the HTTP session hooks capability.
+/// Manifest of a service that requires the HTTP hooks capability.
 fn session_manifest(bindings: Vec<MiddlewareBinding>) -> MiddlewareManifest {
     MiddlewareManifest {
-        extension: Some(http_session_middleware_metadata("example/guard", "test")),
+        extension: Some(http_hooks_middleware_metadata("example/guard", "test")),
         ..manifest(bindings)
     }
 }
 
 #[test]
-fn registration_requires_the_http_session_capability_it_supports() {
+fn registration_requires_the_http_hooks_capability_it_supports() {
     use SupervisorMiddlewareOperation::{HttpRequest, HttpResponse, WebsocketMessage};
     for (case, manifest) in [
         (
-            "v1 HTTP hooks",
+            "legacy HTTP hooks",
             manifest(vec![binding(HttpRequest), binding(HttpResponse)]),
         ),
         (
-            "HTTP session hooks in both directions",
+            "HTTP hooks in both directions",
             session_manifest(vec![binding(HttpRequest), binding(HttpResponse)]),
         ),
         (
-            "HTTP session hooks with a WebSocket binding",
+            "HTTP hooks with a WebSocket binding",
             session_manifest(vec![binding(HttpRequest), binding(WebsocketMessage)]),
         ),
     ] {
@@ -89,16 +89,16 @@ fn registration_requires_the_http_session_capability_it_supports() {
             .unwrap_or_else(|error| panic!("{case}: {error}"));
     }
 
-    // Peers that predate HTTP session hooks accept a service that only
+    // Peers that predate HTTP hooks accept a service that only
     // supports the capability, and would call its HTTP bindings through the
-    // v1 HTTP hooks.
+    // Legacy HTTP hooks.
     let mut supported_only = manifest(vec![binding(HttpRequest)]);
     supported_only
         .extension
         .as_mut()
         .expect("test manifest carries extension metadata")
         .supported_capabilities
-        .push(SUPERVISOR_MIDDLEWARE_HTTP_SESSION.into());
+        .push(SUPERVISOR_MIDDLEWARE_HTTP_HOOKS.into());
     let error = validate_manifest_bindings("test service", &supported_only)
         .expect_err("a supported but not required capability is rejected")
         .to_string();
@@ -118,7 +118,7 @@ fn registration_requires_the_http_session_capability_it_supports() {
         "{error}"
     );
 
-    // An HTTP session hook binding without a payload limit is preflight-only.
+    // An HTTP hook binding without a payload limit is preflight-only.
     let mut preflight_only = binding(HttpRequest);
     preflight_only.max_payload_bytes = 0;
     // The registration leaves the operator payload limit unset.
@@ -134,14 +134,14 @@ fn registration_requires_the_http_session_capability_it_supports() {
     )
     .expect("a preflight-only binding carries no payload");
     validate_manifest_bindings("test service", &manifest(vec![preflight_only]))
-        .expect_err("a v1 HTTP hook binding needs a payload limit");
+        .expect_err("a legacy HTTP hook binding needs a payload limit");
     authorize_external_manifest(
         &registration,
         &session_manifest(vec![binding(HttpRequest)]),
         false,
         &BindingPolicy::Dynamic,
     )
-    .expect_err("an HTTP session hook binding with a payload limit needs an operator limit");
+    .expect_err("an HTTP hook binding with a payload limit needs an operator limit");
 }
 
 /// What a scripted stage does at preflight.
@@ -161,7 +161,7 @@ enum Body {
     Uppercase,
 }
 
-/// In-memory HTTP session hook stage with a fixed script.
+/// In-memory HTTP hook stage with a fixed script.
 struct ScriptedStage {
     name: &'static str,
     preflight: Preflight,
@@ -244,7 +244,7 @@ impl InProcessMiddleware for ScriptedStage {
         &self,
         _request: HttpRequestView<'_>,
     ) -> miette::Result<HttpRequestResult> {
-        Err(miette::miette!("HTTP session hook test stage"))
+        Err(miette::miette!("HTTP hook test stage"))
     }
 
     async fn open_http_request_session(
@@ -821,7 +821,7 @@ fn scripted(name: &'static str, preflight: Preflight, body: Body) -> Arc<Scripte
     Arc::new(ScriptedStage::new(name, preflight, body))
 }
 
-/// Free HTTP session hook slots, then free DUPLEX slots.
+/// Free HTTP hook slots, then free DUPLEX slots.
 fn free_slots(runner: &ChainRunner) -> (usize, usize) {
     (
         runner.registry.http_session_admission.available_permits(),

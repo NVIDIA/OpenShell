@@ -11972,7 +11972,7 @@ network_policies:
         }
     }
 
-    /// HTTP session hook request stage that streams the body through and
+    /// HTTP hook request stage that streams the body through and
     /// declares its original length, or with `drop_body` declares and emits
     /// an empty body. It rejects at `input_end` when `reject` is set, and
     /// records every preflight it receives.
@@ -11997,7 +11997,7 @@ network_policies:
                 }],
                 expected_audience: String::new(),
                 extension: Some(
-                    openshell_core::extension_protocol::http_session_middleware_metadata(
+                    openshell_core::extension_protocol::http_hooks_middleware_metadata(
                         "openshell/test-session-echo",
                         "test",
                     ),
@@ -12017,7 +12017,7 @@ network_policies:
             &self,
             _request: openshell_core::middleware::HttpRequestView<'_>,
         ) -> Result<openshell_core::proto::HttpRequestResult> {
-            Err(miette!("HTTP session hook test stage"))
+            Err(miette!("HTTP hook test stage"))
         }
 
         async fn open_http_request_session(
@@ -12507,7 +12507,7 @@ network_policies:
                 bindings,
                 expected_audience: String::new(),
                 extension: Some(
-                    openshell_core::extension_protocol::http_session_middleware_metadata(
+                    openshell_core::extension_protocol::http_hooks_middleware_metadata(
                         "openshell/test-session-echo",
                         "test",
                     ),
@@ -12527,7 +12527,7 @@ network_policies:
             &self,
             _request: openshell_core::middleware::HttpRequestView<'_>,
         ) -> Result<openshell_core::proto::HttpRequestResult> {
-            Err(miette!("HTTP session hook test stage"))
+            Err(miette!("HTTP hook test stage"))
         }
 
         async fn open_http_request_session(
@@ -12727,7 +12727,7 @@ network_policies:
         Missing,
     }
 
-    /// HTTP session hook counterpart of [`McpToolReplacingService`]: a `WHOLE_BODY` stage
+    /// HTTP hook counterpart of [`McpToolReplacingService`]: a `WHOLE_BODY` stage
     /// that replaces the tool call and writes the sessionless `Mcp-Name`
     /// mirror as a late mutation in its body result, at preflight, or not at
     /// all.
@@ -12747,7 +12747,7 @@ network_policies:
                 })
                 .await;
             manifest.extension = Some(
-                openshell_core::extension_protocol::http_session_middleware_metadata(
+                openshell_core::extension_protocol::http_hooks_middleware_metadata(
                     manifest.name.clone(),
                     "test",
                 ),

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP session hooks (`HttpSessionMiddleware.EvaluateRequest` and
+//! HTTP hooks (`HttpSessionMiddleware.EvaluateRequest` and
 //! `HttpSessionMiddleware.EvaluateResponse`) for requests and responses.
 //!
 //! The guard selects its configured body mode, `WHOLE_BODY` by default, and falls

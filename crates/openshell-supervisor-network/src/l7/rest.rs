@@ -792,7 +792,7 @@ pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) deny_uninspected_credentials: bool,
     /// Ask the upstream for an identity-coded response.
     ///
-    /// The relay sets it when an HTTP session hook response stage may inspect
+    /// The relay sets it when an HTTP hook response stage may inspect
     /// the body.
     pub(crate) identity_response_coding: bool,
     pub(crate) credential_signing: crate::l7::CredentialSigning,
@@ -7328,7 +7328,7 @@ mod tests {
         assert!(delivered.is_empty());
     }
 
-    /// HTTP session hook response stage that streams its input back and
+    /// HTTP hook response stage that streams its input back and
     /// declares `declared` output bytes. A stage that declares an empty output
     /// emits nothing. With `gate`, it waits after the first byte of each input
     /// chunk. It rejects at `input_end` when `reject` is set. `output_start`
@@ -7371,7 +7371,7 @@ mod tests {
                 }],
                 expected_audience: String::new(),
                 extension: Some(
-                    openshell_core::extension_protocol::http_session_middleware_metadata(
+                    openshell_core::extension_protocol::http_hooks_middleware_metadata(
                         "openshell/test-session-echo",
                         "test",
                     ),
@@ -7391,7 +7391,7 @@ mod tests {
             &self,
             _request: openshell_supervisor_middleware::HttpRequestView<'_>,
         ) -> Result<HttpRequestResult> {
-            Err(miette!("HTTP session hook test stage"))
+            Err(miette!("HTTP hook test stage"))
         }
 
         async fn open_http_response_session(
