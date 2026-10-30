@@ -13003,6 +13003,17 @@ mod tests {
             }],
         )
         .expect("a hostless layer does not compete with a pinned endpoint");
+
+        let mut outside = pinned();
+        outside.endpoints[0].allowed_ips = vec!["10.0.0.5".to_string()];
+        validate_candidate_effective_policy(
+            &hostless_base,
+            &[ProviderPolicyLayer {
+                rule_name: "_provider_example".to_string(),
+                rule: outside,
+            }],
+        )
+        .expect_err("a pinned address outside the hostless allowed_ips is looser");
     }
 
     #[tokio::test]

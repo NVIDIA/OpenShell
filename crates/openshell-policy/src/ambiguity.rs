@@ -3,11 +3,14 @@
 
 //! Validation for endpoint selectors whose policy-derived behavior conflicts.
 
+use ipnet::IpNet;
 use openshell_core::proto::{
     NetworkEndpoint, NetworkEnforcementMode, NetworkTlsMode, SandboxPolicy,
 };
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fmt;
+use std::net::IpAddr;
 
 /// One pair of endpoints that can authorize the same request but disagree on
 /// policy-derived behavior that must have a single deterministic value.
@@ -56,7 +59,9 @@ struct EndpointRef<'a> {
 /// contributed by multiple compatible endpoints. Metadata used to establish
 /// or parse a connection must agree whenever equally specific endpoint host,
 /// port, and (for request-specific metadata) path selectors can match the
-/// same request.
+/// same request. When a host-naming endpoint overlaps a hostless one, the
+/// host-naming endpoint supplies that metadata and must be at least as
+/// restrictive.
 #[must_use]
 pub fn find_endpoint_ambiguities(policy: &SandboxPolicy) -> Vec<EndpointAmbiguity> {
     let endpoints = policy
@@ -87,21 +92,28 @@ pub fn find_endpoint_ambiguities(policy: &SandboxPolicy) -> Vec<EndpointAmbiguit
             let overlapping_ports = overlapping_ports(left.endpoint, right.endpoint);
             if overlapping_ports.is_empty()
                 || !host_patterns_overlap(&left.endpoint.host, &right.endpoint.host)
-                || host_selector_specificity(&left.endpoint.host)
-                    != host_selector_specificity(&right.endpoint.host)
             {
                 continue;
             }
 
-            let mut conflicts = connection_conflicts(left.endpoint, right.endpoint);
-            if endpoint_contributes_request_pipeline_metadata(left.endpoint)
-                && endpoint_contributes_request_pipeline_metadata(right.endpoint)
-                && path_patterns_overlap(&left.endpoint.path, &right.endpoint.path)
-                && path_selector_specificity(&left.endpoint.path)
-                    == path_selector_specificity(&right.endpoint.path)
+            let conflicts = match host_selector_specificity(&left.endpoint.host)
+                .cmp(&host_selector_specificity(&right.endpoint.host))
             {
-                conflicts.extend(request_pipeline_conflicts(left.endpoint, right.endpoint));
-            }
+                Ordering::Equal => {
+                    let mut conflicts = connection_conflicts(left.endpoint, right.endpoint);
+                    if endpoint_contributes_request_pipeline_metadata(left.endpoint)
+                        && endpoint_contributes_request_pipeline_metadata(right.endpoint)
+                        && path_patterns_overlap(&left.endpoint.path, &right.endpoint.path)
+                        && path_selector_specificity(&left.endpoint.path)
+                            == path_selector_specificity(&right.endpoint.path)
+                    {
+                        conflicts.extend(request_pipeline_conflicts(left.endpoint, right.endpoint));
+                    }
+                    conflicts
+                }
+                Ordering::Greater => looser_than_hostless_conflicts(left.endpoint, right.endpoint),
+                Ordering::Less => looser_than_hostless_conflicts(right.endpoint, left.endpoint),
+            };
             if conflicts.is_empty() {
                 continue;
             }
@@ -191,6 +203,144 @@ fn connection_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<
 
 fn is_explicit_tcp(protocol: &str) -> bool {
     protocol.eq_ignore_ascii_case("tcp")
+}
+
+fn is_l7_protocol(protocol: &str) -> bool {
+    !protocol.is_empty() && !is_explicit_tcp(protocol)
+}
+
+/// A host-naming endpoint replaces an overlapping hostless `allowed_ips`
+/// endpoint's connection and request-pipeline metadata for every request both
+/// can match, so it must be at least as restrictive on each setting that has
+/// a stricter direction. Settings without one (which L7 parser, credentials,
+/// signing) come from the host-naming endpoint. Allow and deny rules still
+/// combine across both endpoints at request time.
+fn looser_than_hostless_conflicts(
+    hosted: &NetworkEndpoint,
+    hostless: &NetworkEndpoint,
+) -> Vec<String> {
+    let mut conflicts = Vec::new();
+    if is_explicit_tcp(&hosted.protocol) && !is_explicit_tcp(&hostless.protocol) {
+        push_looser(
+            &mut conflicts,
+            "protocol",
+            &hosted.protocol,
+            &hostless.protocol,
+        );
+    }
+    if normalized_tls(hosted.tls) == NetworkTlsMode::Skip as i32
+        && normalized_tls(hostless.tls) != NetworkTlsMode::Skip as i32
+    {
+        push_looser(&mut conflicts, "tls", &"skip", &"terminate");
+    }
+    if !allowed_ips_within(&hosted.allowed_ips, &hostless.allowed_ips) {
+        push_looser(
+            &mut conflicts,
+            "allowed_ips",
+            &normalized_strings(&hosted.allowed_ips),
+            &normalized_strings(&hostless.allowed_ips),
+        );
+    }
+
+    if !is_l7_protocol(&hostless.protocol) {
+        return conflicts;
+    }
+    if !is_l7_protocol(&hosted.protocol) {
+        push_looser(
+            &mut conflicts,
+            "protocol",
+            &hosted.protocol,
+            &hostless.protocol,
+        );
+        return conflicts;
+    }
+    if normalized_enforcement(hostless.enforcement) == NetworkEnforcementMode::Enforce as i32
+        && normalized_enforcement(hosted.enforcement) != NetworkEnforcementMode::Enforce as i32
+    {
+        push_looser(&mut conflicts, "enforcement", &"audit", &"enforce");
+    }
+    if hosted.allow_encoded_slash && !hostless.allow_encoded_slash {
+        push_looser(
+            &mut conflicts,
+            "allow_encoded_slash",
+            &hosted.allow_encoded_slash,
+            &hostless.allow_encoded_slash,
+        );
+    }
+    if !hosted.protocol.eq_ignore_ascii_case(&hostless.protocol) {
+        return conflicts;
+    }
+    if hosted.protocol.eq_ignore_ascii_case("graphql")
+        && normalized_body_limit(hosted.graphql_max_body_bytes)
+            > normalized_body_limit(hostless.graphql_max_body_bytes)
+    {
+        push_looser(
+            &mut conflicts,
+            "graphql_max_body_bytes",
+            &normalized_body_limit(hosted.graphql_max_body_bytes),
+            &normalized_body_limit(hostless.graphql_max_body_bytes),
+        );
+    }
+    if is_json_rpc_family(&hosted.protocol)
+        && normalized_body_limit(hosted.json_rpc_max_body_bytes)
+            > normalized_body_limit(hostless.json_rpc_max_body_bytes)
+    {
+        push_looser(
+            &mut conflicts,
+            "json_rpc_max_body_bytes",
+            &normalized_body_limit(hosted.json_rpc_max_body_bytes),
+            &normalized_body_limit(hostless.json_rpc_max_body_bytes),
+        );
+    }
+    if hosted.protocol.eq_ignore_ascii_case("mcp")
+        && normalized_mcp_strict_tool_names(hostless)
+        && !normalized_mcp_strict_tool_names(hosted)
+    {
+        push_looser(&mut conflicts, "mcp.strict_tool_names", &false, &true);
+    }
+    conflicts
+}
+
+fn push_looser<T: fmt::Debug + ?Sized>(
+    conflicts: &mut Vec<String>,
+    field: &str,
+    hosted: &T,
+    hostless: &T,
+) {
+    conflicts.push(format!(
+        "{field}={hosted:?} on the host endpoint is less restrictive than {hostless:?} on the hostless endpoint"
+    ));
+}
+
+/// True when every address `inner` permits is also permitted by `outer`.
+///
+/// An empty list permits any public address, and runtime validation rejects
+/// `allowed_ips` broad enough to cover all of them, so an empty `inner` is
+/// never within a non-empty `outer`. Each `inner` network must sit inside a
+/// single `outer` network; a network split across adjacent `outer` entries
+/// is conservatively treated as not contained.
+fn allowed_ips_within(inner: &[String], outer: &[String]) -> bool {
+    if inner.is_empty() {
+        return outer.is_empty();
+    }
+    let Some(outer) = outer
+        .iter()
+        .map(|entry| parse_allowed_ip(entry))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    inner.iter().all(|entry| {
+        parse_allowed_ip(entry).is_some_and(|net| outer.iter().any(|outer| outer.contains(&net)))
+    })
+}
+
+fn parse_allowed_ip(entry: &str) -> Option<IpNet> {
+    let entry = entry.trim();
+    entry
+        .parse::<IpNet>()
+        .ok()
+        .or_else(|| entry.parse::<IpAddr>().ok().map(IpNet::from))
 }
 
 /// Keep request-pipeline ambiguity checks aligned with Rego's
@@ -410,8 +560,8 @@ fn host_patterns_overlap(left: &str, right: &str) -> bool {
 ///
 /// An endpoint that names a host (exactly or by glob) takes precedence over a
 /// hostless `allowed_ips` endpoint for every request both can match, so the
-/// two never compete for connection or request metadata. Endpoints of equal
-/// rank must agree.
+/// two never compete for connection or request metadata; see
+/// `looser_than_hostless_conflicts`. Endpoints of equal rank must agree.
 fn host_selector_specificity(host: &str) -> usize {
     usize::from(!host.is_empty())
 }
@@ -1090,30 +1240,110 @@ mod tests {
         assert!(find_endpoint_ambiguities(&policy_with(pinned, open_web)).is_empty());
     }
 
-    #[test]
-    fn plain_and_wildcard_hosts_take_precedence_over_hostless_endpoints() {
-        let open_web = hostless(443, &["0.0.0.0/0"]);
-
-        assert!(
-            find_endpoint_ambiguities(&policy_with(open_web.clone(), endpoint("github.com", 443)))
-                .is_empty()
-        );
-        let mut wildcard = endpoint("*.example.com", 443);
-        wildcard.tls = NetworkTlsMode::Skip as i32;
-        assert!(find_endpoint_ambiguities(&policy_with(open_web, wildcard)).is_empty());
+    fn assert_looser_than_hostless(
+        hosted: NetworkEndpoint,
+        hostless: NetworkEndpoint,
+        field: &str,
+    ) {
+        for policy in [
+            policy_with(hosted.clone(), hostless.clone()),
+            policy_with(hostless, hosted),
+        ] {
+            let ambiguities = find_endpoint_ambiguities(&policy);
+            assert_eq!(ambiguities.len(), 1, "{ambiguities:?}");
+            assert!(
+                ambiguities[0]
+                    .conflicts
+                    .iter()
+                    .any(|conflict| conflict.starts_with(&format!("{field}="))
+                        && conflict.contains("less restrictive")),
+                "{ambiguities:?}"
+            );
+        }
     }
 
     #[test]
-    fn hosted_endpoint_takes_precedence_over_hostless_request_metadata() {
-        let mut open_web = hostless(443, &["0.0.0.0/0"]);
+    fn hosted_endpoint_without_allowed_ips_is_looser_than_hostless_endpoint() {
+        assert_looser_than_hostless(
+            endpoint("github.com", 443),
+            hostless(443, &["172.0.0.0/6", "192.0.0.0/2"]),
+            "allowed_ips",
+        );
+    }
+
+    #[test]
+    fn hosted_allowed_ips_must_sit_within_hostless_allowed_ips() {
+        let mut hosted = endpoint("example.com", 443);
+        hosted.allowed_ips = vec!["10.0.0.5".to_string()];
+        assert_looser_than_hostless(
+            hosted,
+            hostless(443, &["172.0.0.0/6", "192.0.0.0/2"]),
+            "allowed_ips",
+        );
+
+        let mut broader = endpoint("example.com", 443);
+        broader.allowed_ips = vec!["172.0.0.0/5".to_string()];
+        assert_looser_than_hostless(broader, hostless(443, &["172.0.0.0/6"]), "allowed_ips");
+    }
+
+    #[test]
+    fn hosted_endpoint_must_inspect_when_hostless_endpoint_inspects() {
+        let mut open_web = hostless(443, &["172.0.0.0/6", "192.0.0.0/2"]);
         open_web.protocol = "rest".to_string();
+        let mut github = endpoint("github.com", 443);
+        github.allowed_ips = vec!["192.0.2.0/24".to_string()];
+
+        assert_looser_than_hostless(github, open_web, "protocol");
+    }
+
+    #[test]
+    fn hosted_tls_skip_is_looser_than_hostless_tls_termination() {
+        let mut wildcard = endpoint("*.example.com", 443);
+        wildcard.allowed_ips = vec!["8.8.8.0/24".to_string()];
+        wildcard.tls = NetworkTlsMode::Skip as i32;
+
+        assert_looser_than_hostless(wildcard, hostless(443, &["8.0.0.0/8"]), "tls");
+    }
+
+    #[test]
+    fn hosted_raw_tcp_is_looser_than_hostless_endpoint() {
+        let mut database = endpoint("db.example.com", 443);
+        database.allowed_ips = vec!["8.8.8.8".to_string()];
+        database.protocol = "tcp".to_string();
+
+        assert_looser_than_hostless(database, hostless(443, &["8.0.0.0/8"]), "protocol");
+    }
+
+    #[test]
+    fn hosted_audit_is_looser_than_hostless_enforcement() {
+        let mut open_web = hostless(443, &["8.0.0.0/8"]);
+        open_web.protocol = "rest".to_string();
+        open_web.enforcement = NetworkEnforcementMode::Enforce as i32;
         let mut provider = endpoint("example.com", 443);
+        provider.allowed_ips = vec!["8.8.8.8".to_string()];
+        provider.protocol = "rest".to_string();
+        provider.enforcement = NetworkEnforcementMode::Audit as i32;
+
+        assert_looser_than_hostless(provider, open_web, "enforcement");
+    }
+
+    #[test]
+    fn stricter_hosted_endpoint_may_choose_its_own_request_metadata() {
+        let mut open_web = hostless(443, &["8.0.0.0/8"]);
+        open_web.protocol = "rest".to_string();
+        open_web.tls = NetworkTlsMode::Skip as i32;
+        let mut provider = endpoint("example.com", 443);
+        provider.allowed_ips = vec!["8.8.8.8".to_string()];
         provider.protocol = "graphql".to_string();
+        provider.enforcement = NetworkEnforcementMode::Enforce as i32;
         provider.credential_binding = Some(openshell_core::proto::NetworkCredentialBinding {
             provider: "example".to_string(),
         });
 
-        assert!(find_endpoint_ambiguities(&policy_with(open_web, provider)).is_empty());
+        assert!(
+            find_endpoint_ambiguities(&policy_with(open_web.clone(), provider.clone())).is_empty()
+        );
+        assert!(find_endpoint_ambiguities(&policy_with(provider, open_web)).is_empty());
     }
 
     #[test]
