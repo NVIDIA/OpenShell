@@ -589,6 +589,12 @@ impl super::ComputeRuntime {
         };
         let mut deadline = ProvisioningDeadline::from_record(record)?;
         let preparation_expired = deadline.is_preparing();
+        // A supervisor that never registered may be waiting on a launch bound
+        // to another isolation backend; report that instead of a timeout.
+        let backend_mismatch = preparation_expired
+            .then(|| self.validate_isolation_backend_binding(current).err())
+            .flatten()
+            .map(|error| error.message().to_string());
         if !deadline.expire(&record.attempt_id, &record.configuration_change_id, now_ms) {
             return Ok(None);
         }
@@ -610,22 +616,26 @@ impl super::ComputeRuntime {
                         .configuration_admission
                         .as_ref()
                         .map_or("", |admission| admission.error.as_str());
-                    let message = if preparation_expired {
-                        "Image preparation or initial supervisor startup exceeded its absolute deadline".to_string()
-                    } else if diagnostic.is_empty() {
-                        "Provisioning repair window expired after 300 seconds".to_string()
-                    } else {
-                        format!(
-                            "Provisioning repair window expired after 300 seconds: {diagnostic}"
-                        )
-                    };
+                    let message = backend_mismatch.clone().unwrap_or_else(|| {
+                        if preparation_expired {
+                            "Image preparation or initial supervisor startup exceeded its absolute deadline".to_string()
+                        } else if diagnostic.is_empty() {
+                            "Provisioning repair window expired after 300 seconds".to_string()
+                        } else {
+                            format!(
+                                "Provisioning repair window expired after 300 seconds: {diagnostic}"
+                            )
+                        }
+                    });
                     status
                         .conditions
                         .retain(|condition| condition.r#type != "Ready");
                     status.conditions.push(SandboxCondition {
                         r#type: "Ready".into(),
                         status: "False".into(),
-                        reason: if preparation_expired {
+                        reason: if backend_mismatch.is_some() {
+                            "IsolationBackendMismatch"
+                        } else if preparation_expired {
                             "ImagePreparationTimedOut"
                         } else {
                             "ProvisioningTimedOut"
