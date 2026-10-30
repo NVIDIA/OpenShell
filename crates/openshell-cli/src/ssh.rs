@@ -1865,9 +1865,7 @@ async fn sandbox_sync_down_file(
             )
         })?;
 
-    let staging = tempfile::TempDir::new_in(staging_parent)
-        .into_diagnostic()
-        .wrap_err("failed to create download staging directory")?;
+    let staging = new_download_staging(staging_parent)?;
 
     let tar_cmd = build_single_file_tar_cmd(parent, basename);
     stream_sandbox_tar(session, tar_cmd, staging.path()).await?;
@@ -1942,8 +1940,45 @@ async fn sandbox_sync_down_directory(
             )
         })?;
 
+    // Extract into a fresh directory inside `dest` (same filesystem), so a
+    // failed attempt leaves `dest` untouched and a retry starts clean.
+    let staging = new_download_staging(dest_path)?;
     let tar_cmd = format!("tar cf - -C {path} .", path = shell_escape(sandbox_path));
-    stream_sandbox_tar(session, tar_cmd, dest_path).await
+    stream_sandbox_tar(session, tar_cmd, staging.path()).await?;
+    merge_staged_dir(staging.path(), dest_path).wrap_err_with(|| {
+        format!(
+            "failed to place downloaded directory at '{}'",
+            dest_path.display()
+        )
+    })
+}
+
+fn new_download_staging(dest: &Path) -> Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix(".openshell-download-")
+        .tempdir_in(dest)
+        .into_diagnostic()
+        .wrap_err("failed to create download staging directory")
+}
+
+/// Move the entries of `staged` into `dest`, merging directories that exist on
+/// both sides and replacing files. Refuses to replace a directory with a file
+/// or the reverse, and never follows a symlink in `dest`.
+fn merge_staged_dir(staged: &Path, dest: &Path) -> Result<()> {
+    for entry in fs::read_dir(staged).into_diagnostic()? {
+        let entry = entry.into_diagnostic()?;
+        let target = dest.join(entry.file_name());
+        let staged_is_dir = entry.file_type().into_diagnostic()?.is_dir();
+        let target_is_dir = fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir());
+        if staged_is_dir && target_is_dir {
+            merge_staged_dir(&entry.path(), &target)?;
+        } else {
+            fs::rename(entry.path(), &target)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to rename into '{}'", target.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Run the SSH proxy, connecting stdin/stdout to the gateway.
@@ -3329,6 +3364,74 @@ mod tests {
         let meta = fs::symlink_metadata(&final_path).expect("stat final");
         assert!(meta.is_file());
         assert_eq!(fs::read(&final_path).expect("read final"), b"trust me");
+    }
+
+    #[test]
+    fn merge_staged_dir_merges_into_existing_destination() {
+        let workdir = tempfile::tempdir().expect("create workdir");
+        let dest = workdir.path().join("dest");
+        fs::create_dir_all(dest.join("sub")).expect("create dest");
+        fs::write(dest.join("keep.txt"), "keep").expect("write keep");
+        fs::write(dest.join("over.txt"), "old").expect("write over");
+        fs::write(dest.join("sub/old.txt"), "old").expect("write old");
+
+        let staged = workdir.path().join("staged");
+        fs::create_dir_all(staged.join("sub")).expect("create staged");
+        fs::create_dir_all(staged.join("fresh")).expect("create fresh");
+        fs::write(staged.join("over.txt"), "new").expect("write over");
+        fs::write(staged.join("sub/new.txt"), "new").expect("write new");
+        fs::write(staged.join("fresh/a.txt"), "a").expect("write a");
+
+        merge_staged_dir(&staged, &dest).expect("merge");
+
+        let read = |path: &str| fs::read_to_string(dest.join(path)).expect(path);
+        assert_eq!(read("keep.txt"), "keep");
+        assert_eq!(read("over.txt"), "new");
+        assert_eq!(read("sub/old.txt"), "old");
+        assert_eq!(read("sub/new.txt"), "new");
+        assert_eq!(read("fresh/a.txt"), "a");
+    }
+
+    #[test]
+    fn merge_staged_dir_refuses_to_replace_a_directory_with_a_file() {
+        let workdir = tempfile::tempdir().expect("create workdir");
+        let dest = workdir.path().join("dest");
+        fs::create_dir_all(dest.join("entry")).expect("create dest");
+        fs::write(dest.join("entry/keep.txt"), "keep").expect("write keep");
+
+        let staged = workdir.path().join("staged");
+        fs::create_dir_all(&staged).expect("create staged");
+        fs::write(staged.join("entry"), "file").expect("write file");
+
+        merge_staged_dir(&staged, &dest).expect_err("directory must not be replaced");
+        assert_eq!(
+            fs::read_to_string(dest.join("entry/keep.txt")).expect("read keep"),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn failed_download_attempt_leaves_destination_untouched() {
+        let workdir = tempfile::tempdir().expect("create workdir");
+        let dest = workdir.path().join("dest");
+        fs::create_dir(&dest).expect("create dest");
+        fs::write(dest.join("keep.txt"), "keep").expect("write keep");
+
+        // A truncated archive fails to extract after writing its first entry.
+        let archive = build_single_file_archive("partial.txt", &[7u8; 4096]);
+        let staging = new_download_staging(&dest).expect("staging dir");
+        let mut truncated = tar::Archive::new(std::io::Cursor::new(&archive[..700]));
+        truncated
+            .unpack(staging.path())
+            .expect_err("truncated archive must fail");
+        assert!(staging.path().join("partial.txt").exists());
+        drop(staging);
+
+        let names: Vec<_> = fs::read_dir(&dest)
+            .expect("read dest")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["keep.txt"]);
     }
 
     #[cfg(unix)]
