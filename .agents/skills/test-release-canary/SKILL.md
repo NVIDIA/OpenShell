@@ -36,12 +36,18 @@ RPM package installation also has tmachine conformance coverage in
 `Branch E2E Checks` (with `test:e2e`), `Release Dev`, `Release`, and `Pre-release`. Those
 lanes use the `rpm` installer on `fedora-podman-rootful` and
 `fedora-podman-rootless` with candidate CLI and
-gateway RPMs and matching runtime images. Branch RPM package builds run on
-every approved branch run, independently of optional E2E labels.
+gateway RPMs and matching runtime images. Branch RPM package builds run when
+either `test:e2e` or `test:upgrade` selects integration qualification.
 
-The host-package jobs exercise fresh installs, not upgrades from a persisted
-schema-v1 gateway config. Validate Homebrew and RPM exact-default migration with
-the release-tooling and package lifecycle tests before relying on the canary.
+The host-package jobs exercise fresh installs, not upgrades from persisted
+gateway state. Release Dev and Pre-release additionally run a tmachine Ubuntu DEB
+upgrade lane: it installs the latest published release package and matching
+runtime images, upgrades to the candidate package, verifies
+an existing sandbox survives, and creates a new sandbox. That lane is part of
+the release conformance matrix, not this canary. Release promotes a qualified
+prerelease without rerunning qualification. Validate Homebrew and RPM
+exact-default migration with the release-tooling and package lifecycle tests
+before relying on the canary.
 
 The canary does not install or import `@nvidia/openshell-sdk`. TypeScript SDK
 validation lives in the `TypeScript SDK` branch check, including a publish
