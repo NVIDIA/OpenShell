@@ -127,7 +127,8 @@ defer client.Close()
 ```
 
 Concurrent callers share a single refresh call. If the token source fails, the
-SDK falls back to the cached token with a logged warning. See the
+SDK falls back to the cached token with a logged warning until that token
+expires; after that, RPCs fail with the refresh error. See the
 [Auth](https://ro14nd.de/openshell-sdk-go/api/auth.html) docs for details.
 
 ### With edge proxy headers

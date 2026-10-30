@@ -17,7 +17,7 @@ var (
 	ErrConfigParse = errors.New("gateway: config parse error")
 
 	// ErrTokenLoad is returned when a token file (edge_token,
-	// oidc_token.json) is missing, unreadable, or malformed.
+	// oidc_token.json) is missing, unreadable, malformed, or expired.
 	ErrTokenLoad = errors.New("gateway: token load error")
 
 	// ErrUnsupportedAuthMode is returned when the auth_mode value in
