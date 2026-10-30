@@ -960,8 +960,8 @@ fn build_staged_transparent_denial_event(
     reason: &str,
     status_detail: &'static str,
 ) -> openshell_ocsf::OcsfEvent {
-    let (binary, ancestors, cmdline) = identity.as_ref().map_or_else(
-        |_| ("-".to_string(), "-".to_string(), "-".to_string()),
+    let (binary, ancestors) = identity.as_ref().map_or_else(
+        |_| ("-".to_string(), "-".to_string()),
         |identity| {
             (
                 identity.executable.path.display().to_string(),
@@ -971,12 +971,6 @@ fn build_staged_transparent_denial_event(
                     .map(|ancestor| ancestor.path.display().to_string())
                     .collect::<Vec<_>>()
                     .join(" -> "),
-                identity
-                    .cmdline_paths
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
             )
         },
     );
@@ -987,7 +981,7 @@ fn build_staged_transparent_denial_event(
         .severity(SeverityId::Medium)
         .status(StatusId::Failure)
         .dst_endpoint(transparent_destination_endpoint(destination, mapped_host))
-        .actor_process(Process::from_bypass(&binary, "-", &ancestors).with_cmd_line(&cmdline))
+        .actor_process(Process::from_bypass(&binary, "-", &ancestors))
         .message(format!("Transparent TCP denied before relay: {reason}"))
         .status_detail(status_detail)
         .build()
@@ -2010,7 +2004,6 @@ fn build_connect_allow_ocsf_event(
     binary: &str,
     pid: &str,
     ancestors: &str,
-    cmdline: &str,
     policy: &str,
     l7_inspection: bool,
 ) -> openshell_ocsf::OcsfEvent {
@@ -2027,7 +2020,7 @@ fn build_connect_allow_ocsf_event(
         .status(StatusId::Success)
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .actor_process(Process::from_bypass(binary, pid, ancestors))
         .firewall_rule(policy, "opa")
         .message(format!("{connect_msg} allowed {host}:{port}"))
         .build()
@@ -2043,7 +2036,6 @@ fn build_forward_allow_ocsf_event(
     binary: &str,
     pid: &str,
     ancestors: &str,
-    cmdline: &str,
     policy: &str,
 ) -> openshell_ocsf::OcsfEvent {
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -2058,7 +2050,7 @@ fn build_forward_allow_ocsf_event(
         ))
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .actor_process(Process::from_bypass(binary, pid, ancestors))
         .firewall_rule(policy, "opa")
         .message(format!("FORWARD allowed {method} {host}:{port}{path}"))
         .build()
@@ -2129,7 +2121,6 @@ fn build_forward_l7_parse_rejection_ocsf_event(
     binary: &str,
     pid: &str,
     ancestors: &str,
-    cmdline: &str,
     policy: &str,
     detail: &str,
 ) -> openshell_ocsf::OcsfEvent {
@@ -2145,7 +2136,7 @@ fn build_forward_l7_parse_rejection_ocsf_event(
         ))
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .actor_process(Process::from_bypass(binary, pid, ancestors))
         .firewall_rule(policy, "l7")
         .message(format!(
             "FORWARD_L7 denied non-canonical request-target for {method} {host}:{port}{path}"
@@ -2164,7 +2155,6 @@ fn build_forward_policy_deny_ocsf_event(
     binary: &str,
     pid: &str,
     ancestors: &str,
-    cmdline: &str,
     reason: &str,
 ) -> openshell_ocsf::OcsfEvent {
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -2179,7 +2169,7 @@ fn build_forward_policy_deny_ocsf_event(
         ))
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .actor_process(Process::from_bypass(binary, pid, ancestors))
         .firewall_rule("-", "opa")
         .message(format!("FORWARD denied {method} {host}:{port}{path}"))
         .status_detail(reason)
@@ -2230,7 +2220,6 @@ impl std::fmt::Display for DestinationCheckError {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_connect_destination_deny_ocsf_event(
     denial: &DestinationDenial,
     peer_addr: SocketAddr,
@@ -2239,7 +2228,6 @@ fn build_connect_destination_deny_ocsf_event(
     binary: &str,
     pid: &str,
     ancestors: &str,
-    cmdline: &str,
 ) -> openshell_ocsf::OcsfEvent {
     let detail = destination_denial_detail(denial.kind);
     let message = if denial.kind == DestinationDenialKind::InternalAddress {
@@ -2256,7 +2244,7 @@ fn build_connect_destination_deny_ocsf_event(
         .status(StatusId::Failure)
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .actor_process(Process::from_bypass(binary, pid, ancestors))
         .firewall_rule("-", "ssrf")
         .message(message)
         .status_detail(&denial.reason)
@@ -2274,7 +2262,6 @@ fn build_forward_destination_deny_ocsf_event(
     binary: &str,
     pid: &str,
     ancestors: &str,
-    cmdline: &str,
     policy: &str,
 ) -> openshell_ocsf::OcsfEvent {
     let detail = destination_denial_detail(denial.kind);
@@ -2296,7 +2283,7 @@ fn build_forward_destination_deny_ocsf_event(
         ))
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .actor_process(Process::from_bypass(binary, pid, ancestors))
         .firewall_rule(policy, "ssrf")
         .message(format!("FORWARD blocked: {log_detail} for {host}:{port}"))
         .status_detail(&denial.reason)
@@ -2313,7 +2300,6 @@ async fn deny_connect_destination<C>(
     binary: &str,
     pid: &str,
     ancestors: &str,
-    cmdline: &str,
     decision: &EgressDecision,
     denial_tx: &Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: &Option<ActivitySender>,
@@ -2323,7 +2309,7 @@ where
 {
     let detail = destination_denial_detail(denial.kind);
     ocsf_emit!(build_connect_destination_deny_ocsf_event(
-        denial, peer_addr, host, port, binary, pid, ancestors, cmdline,
+        denial, peer_addr, host, port, binary, pid, ancestors,
     ));
 
     emit_denial(
@@ -2364,7 +2350,6 @@ async fn deny_forward_destination<C>(
     binary: &str,
     pid: &str,
     ancestors: &str,
-    cmdline: &str,
     policy: &str,
     decision: &EgressDecision,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
@@ -2375,7 +2360,7 @@ where
 {
     let detail = destination_denial_detail(denial.kind);
     ocsf_emit!(build_forward_destination_deny_ocsf_event(
-        denial, peer_addr, method, host, port, path, binary, pid, ancestors, cmdline, policy,
+        denial, peer_addr, method, host, port, path, binary, pid, ancestors, policy,
     ));
 
     emit_denial_simple(
@@ -2801,16 +2786,6 @@ async fn handle_mediated_connection(
             .collect::<Vec<_>>()
             .join(" -> ")
     };
-    let cmdline_str = if decision.cmdline_paths.is_empty() {
-        "-".to_string()
-    } else {
-        decision
-            .cmdline_paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
     let policy_str = matched_policy.as_deref().unwrap_or("-");
 
     // Log denied connections immediately — they never reach L7.
@@ -2825,10 +2800,7 @@ async fn handle_mediated_connection(
             .status(StatusId::Failure)
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
             .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
+            .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
             .firewall_rule("-", "opa")
             .message(format!("CONNECT denied {host_lc}:{port}"))
             .status_detail(&deny_reason)
@@ -2913,7 +2885,6 @@ async fn handle_mediated_connection(
                     &binary_str,
                     &pid_str,
                     &ancestors_str,
-                    &cmdline_str,
                     &decision,
                     &denial_tx,
                     &activity_tx,
@@ -2956,7 +2927,6 @@ async fn handle_mediated_connection(
                     &binary_str,
                     &pid_str,
                     &ancestors_str,
-                    &cmdline_str,
                     &decision,
                     &denial_tx,
                     &activity_tx,
@@ -2988,10 +2958,7 @@ async fn handle_mediated_connection(
             .status(StatusId::Failure)
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
             .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
+            .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
             .firewall_rule(policy_str, "tls")
             .message(format!(
                 "CONNECT refused for {host_lc}:{port}: {TLS_TERMINATION_UNAVAILABLE_DETAIL}"
@@ -3026,10 +2993,7 @@ async fn handle_mediated_connection(
             .status(StatusId::Failure)
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
             .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
+            .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
             .firewall_rule(policy_str, "credentials")
             .message(format!(
                 "CONNECT refused for {host_lc}:{port}: uninspected credential traffic"
@@ -3125,7 +3089,6 @@ async fn handle_mediated_connection(
         &binary_str,
         &pid_str,
         &ancestors_str,
-        &cmdline_str,
         policy_str,
         should_inspect_l7,
     ));
@@ -3282,10 +3245,7 @@ async fn handle_mediated_connection(
                 .status(StatusId::Failure)
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-                .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
-                )
+                .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
                 .firewall_rule(policy_str, "tls")
                 .message(format!("CONNECT refused for {host_lc}:{port}: {DETAIL}"))
                 .status_detail(DETAIL)
@@ -3353,10 +3313,7 @@ async fn handle_mediated_connection(
                 .status(StatusId::Failure)
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-                .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
-                )
+                .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
                 .firewall_rule(policy_str, "l7")
                 .message(format!(
                     "CONNECT_L7 blocked unsupported tunnel protocol for {host_lc}:{port}"
@@ -5626,16 +5583,6 @@ async fn handle_forward_proxy(
             .collect::<Vec<_>>()
             .join(" -> ")
     };
-    let cmdline_str = if decision.cmdline_paths.is_empty() {
-        "-".to_string()
-    } else {
-        decision
-            .cmdline_paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
 
     // 4. Only proceed on explicit Allow — reject Deny
     let matched_policy = match &decision.action {
@@ -5650,7 +5597,6 @@ async fn handle_forward_proxy(
                 &binary_str,
                 &pid_str,
                 &ancestors_str,
-                &cmdline_str,
                 reason,
             ));
             emit_denial_simple(
@@ -5923,7 +5869,6 @@ async fn handle_forward_proxy(
                 &binary_str,
                 &pid_str,
                 &ancestors_str,
-                &cmdline_str,
                 policy_str,
                 FORWARD_ENCODED_SLASH_REJECTION_DETAIL,
             ));
@@ -5961,10 +5906,7 @@ async fn handle_forward_proxy(
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
-                .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
-                )
+                .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
                 .firewall_rule(policy_str, "l7")
                 .message(format!(
                     "FORWARD_L7 denied unsupported upgrade for {method} {host_lc}:{port}{telemetry_path}"
@@ -6221,10 +6163,7 @@ async fn handle_forward_proxy(
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
-                .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
-                )
+                .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
                 .firewall_rule(policy_str, engine_type)
                 .message(log_message)
                 .build();
@@ -6288,7 +6227,6 @@ async fn handle_forward_proxy(
                 &binary_str,
                 &pid_str,
                 &ancestors_str,
-                &cmdline_str,
                 policy_str,
                 &decision,
                 denial_tx,
@@ -6326,7 +6264,6 @@ async fn handle_forward_proxy(
                 &binary_str,
                 &pid_str,
                 &ancestors_str,
-                &cmdline_str,
                 policy_str,
                 &decision,
                 denial_tx,
@@ -6729,10 +6666,7 @@ async fn handle_forward_proxy(
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
-                .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
-                )
+                .actor_process(Process::from_bypass(&binary_str, &pid_str, &ancestors_str))
                 .message(format!(
                     "FORWARD upstream connect failed for {host_lc}:{port}: {e}"
                 ))
@@ -6876,7 +6810,6 @@ async fn handle_forward_proxy(
         &binary_str,
         &pid_str,
         &ancestors_str,
-        &cmdline_str,
         policy_str,
     ));
     emit_forward_success_activity(activity_tx, l7_activity_pending);
@@ -8339,6 +8272,40 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
             serde_json::to_value(unmapped).unwrap()["dst_endpoint"],
             serde_json::json!({"ip": "203.0.113.7", "port": 443})
         );
+    }
+
+    #[test]
+    fn network_events_do_not_present_cmdline_paths_as_cmd_line() {
+        let identity = Ok(ContractBinaryIdentity {
+            executable: ContractExecutableIdentity {
+                path: executable_path("/usr/bin/python3"),
+                digest: Some("44".repeat(32).parse().unwrap()),
+            },
+            ancestors: Vec::new(),
+            cmdline_paths: vec![PathBuf::from("/app/main.py")],
+        });
+        let denied = build_staged_transparent_denial_event(
+            "203.0.113.7:443".parse().unwrap(),
+            None,
+            &identity,
+            "endpoint 203.0.113.7:443 is not allowed by any policy",
+            "transparent_tcp_policy_denied",
+        );
+        let allowed = build_connect_allow_ocsf_event(
+            "127.0.0.1:45123".parse().unwrap(),
+            "example.com",
+            443,
+            "/usr/bin/python3",
+            "42",
+            "/usr/bin/bash",
+            "allow_example",
+            false,
+        );
+        for event in [denied, allowed] {
+            let json = serde_json::to_value(event).unwrap();
+            assert!(json["actor"]["process"].get("cmd_line").is_none(), "{json}");
+            assert!(!json.to_string().contains("/app/main.py"), "{json}");
+        }
     }
 
     #[tokio::test]
@@ -10497,7 +10464,6 @@ network_policies:
             "/usr/bin/curl",
             "42",
             "/usr/bin/bash",
-            "curl http://api.example.com/v1/models",
             reason,
         );
         let json = event.to_json().unwrap();
@@ -10518,7 +10484,6 @@ network_policies:
             "/usr/bin/curl",
             "42",
             "/usr/bin/bash",
-            "curl http://api.example.com/admin/x%2Fy",
             "allow_api",
             FORWARD_ENCODED_SLASH_REJECTION_DETAIL,
         );
@@ -10692,7 +10657,6 @@ network_policies:
             "/usr/bin/curl",
             "42",
             "/usr/bin/bash",
-            "curl",
             "allow_api",
         )
         .to_json()
@@ -10706,7 +10670,6 @@ network_policies:
             "/usr/bin/curl",
             "42",
             "/usr/bin/bash",
-            "curl",
             "policy denied",
         )
         .to_json()
@@ -10732,7 +10695,6 @@ network_policies:
             "/usr/bin/curl",
             "42",
             "/usr/bin/bash",
-            "curl",
             "allow_api",
         )
         .to_json()
