@@ -510,13 +510,11 @@ pub fn compute_driver_guest_tls_paths(
             "guest_tls_ca is required when VM guest TLS materials are configured",
         ));
     };
-    for path in [&ca] {
-        if !path.is_file() {
-            return Err(Error::config(format!(
-                "vm guest TLS material '{}' does not exist or is not a file",
-                path.display()
-            )));
-        }
+    if !ca.is_file() {
+        return Err(Error::config(format!(
+            "vm guest TLS material '{}' does not exist or is not a file",
+            ca.display()
+        )));
     }
 
     Ok(Some(VmGuestTlsPaths { ca }))

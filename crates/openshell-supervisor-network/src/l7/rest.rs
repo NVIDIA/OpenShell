@@ -2329,7 +2329,7 @@ fn append_header(headers: &[u8], name: &str, value: &str) -> Vec<u8> {
     let split = headers
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .map_or(headers.len(), |pos| pos);
+        .unwrap_or(headers.len());
     let mut out = Vec::with_capacity(headers.len() + name.len() + value.len() + 4);
     out.extend_from_slice(&headers[..split]);
     out.extend_from_slice(b"\r\n");
@@ -4128,7 +4128,7 @@ mod tests {
     #[tokio::test]
     async fn relay_chunked_rejects_oversized_trailer_block() {
         let mut wire = b"0\r\n".to_vec();
-        for name in [b'a', b'b'] {
+        for name in *b"ab" {
             wire.extend_from_slice(&[name, b':']);
             wire.resize(wire.len() + MAX_HEADER_BYTES / 2, b'x');
             wire.extend_from_slice(b"\r\n");
