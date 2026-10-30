@@ -5,6 +5,7 @@
 
 mod driver;
 mod grpc;
+mod headers;
 mod logs;
 mod ocsf;
 mod propagation;
@@ -20,6 +21,7 @@ pub use grpc::{
     RecordGrpcStatus, TracedGrpcStream, compute_driver_rpc_layer, compute_driver_rpc_operation,
     grpc_status_code_name, record_grpc_status, rpc,
 };
+pub use headers::{encode_otlp_headers, merge_otlp_headers, parse_otlp_headers};
 pub use ocsf::{OcsfOtlp, OcsfOtlpLayer};
 pub use propagation::{
     HeaderMapExtractor, MetadataMapInjector, TRACEPARENT_ENV, TRACESTATE_ENV,
@@ -31,6 +33,7 @@ pub use transport::{OtlpHttpClient, signal_url};
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 pub use opentelemetry_otlp::LogExporter;
+use opentelemetry_otlp::tonic_types::metadata::MetadataMap;
 use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig, WithTonicConfig};
 use opentelemetry_sdk::Resource;
@@ -230,12 +233,26 @@ pub fn validated_endpoint(endpoint: &str) -> Result<(&str, http::Uri), SetupErro
 
 /// A validated OTLP collector endpoint and the resource that every signal
 /// exported to it describes.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OtlpTarget {
     endpoint: String,
     tls: bool,
     protocol: Protocol,
+    headers: http::HeaderMap,
     resource: Resource,
+}
+
+impl std::fmt::Debug for OtlpTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OtlpTarget")
+            .field("endpoint", &self.endpoint)
+            .field("tls", &self.tls)
+            .field("protocol", &self.protocol)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("resource", &self.resource)
+            .finish()
+    }
 }
 
 impl OtlpTarget {
@@ -246,6 +263,7 @@ impl OtlpTarget {
             endpoint: endpoint.to_string(),
             tls: uri.scheme() == Some(&http::uri::Scheme::HTTPS),
             protocol: Protocol::Grpc,
+            headers: http::HeaderMap::new(),
             resource: resource_for(config),
         })
     }
@@ -254,6 +272,15 @@ impl OtlpTarget {
     #[must_use]
     pub fn with_protocol(mut self, protocol: Protocol) -> Self {
         self.protocol = protocol;
+        self
+    }
+
+    /// Send `headers` with every export request. Headers from the process
+    /// environment (`OTEL_EXPORTER_OTLP_*HEADERS`) still apply and replace
+    /// any of the same name.
+    #[must_use]
+    pub fn with_headers(mut self, headers: http::HeaderMap) -> Self {
+        self.headers = headers;
         self
     }
 
@@ -275,13 +302,38 @@ impl OtlpTarget {
     where
         B: WithExportConfig + WithTonicConfig,
     {
-        let builder = builder.with_endpoint(self.endpoint.clone());
+        let builder = builder
+            .with_endpoint(self.endpoint.clone())
+            .with_metadata(MetadataMap::from_headers(self.headers.clone()));
         if self.tls {
             // Tonic trusts nothing by default, so enable the platform roots.
             builder.with_tls_config(ClientTlsConfig::new().with_enabled_roots())
         } else {
             builder
         }
+    }
+
+    /// Point an OTLP/HTTP exporter builder at `signal_path` under this
+    /// target.
+    pub(crate) fn configure_http<B>(
+        &self,
+        builder: B,
+        signal_path: &str,
+        timeout_var: &str,
+    ) -> Result<B, SetupError>
+    where
+        B: WithExportConfig + WithHttpConfig,
+    {
+        let headers = self
+            .headers
+            .iter()
+            .filter_map(|(name, value)| Some((name.to_string(), value.to_str().ok()?.to_string())))
+            .collect();
+        Ok(builder
+            .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+            .with_endpoint(self.http_signal_url(signal_path)?)
+            .with_http_client(OtlpHttpClient::new(transport::export_timeout(timeout_var))?)
+            .with_headers(headers))
     }
 
     #[must_use]
@@ -300,13 +352,12 @@ impl OtlpTarget {
             Protocol::Grpc => self
                 .configure(SpanExporter::builder().with_tonic())
                 .build()?,
-            Protocol::HttpProtobuf => SpanExporter::builder()
-                .with_http()
-                .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
-                .with_endpoint(self.http_signal_url("v1/traces")?)
-                .with_http_client(OtlpHttpClient::new(transport::export_timeout(
+            Protocol::HttpProtobuf => self
+                .configure_http(
+                    SpanExporter::builder().with_http(),
+                    "v1/traces",
                     "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
-                ))?)
+                )?
                 .build()?,
         };
         Ok(SdkTracerProvider::builder()
@@ -608,6 +659,45 @@ mod tests {
                 .map(|value| value.to_string()),
             Some("vm-dev".to_string())
         );
+    }
+
+    #[test]
+    fn debug_output_names_headers_without_their_values() {
+        let target = OtlpTarget::new(&OtlpExportConfig {
+            endpoint: "http://collector:4317",
+            service_name: ServiceName::Fixed("test-service"),
+            service_version: None,
+            resource_attributes: Vec::new(),
+        })
+        .unwrap()
+        .with_headers(parse_otlp_headers("authorization=Bearer%20secret-token"));
+
+        let debug = format!("{target:?}");
+        assert!(debug.contains("authorization"), "{debug}");
+        assert!(!debug.contains("secret-token"), "{debug}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trace_provider_sends_headers_as_grpc_metadata() {
+        use opentelemetry::trace::Tracer as _;
+
+        let collector = openshell_otel_test_support::OtlpTestServer::start().await;
+        let provider = OtlpTarget::new(&OtlpExportConfig {
+            endpoint: collector.endpoint(),
+            service_name: ServiceName::Fixed("test-service"),
+            service_version: None,
+            resource_attributes: Vec::new(),
+        })
+        .unwrap()
+        .with_headers(parse_otlp_headers("authorization=Bearer%20token"))
+        .tracer_provider()
+        .unwrap();
+        provider.tracer("test").in_span("grpc-span", |_| {});
+        let flush = tokio::task::spawn_blocking(move || provider.force_flush());
+
+        collector.wait_for_export().await;
+        flush.await.unwrap().expect("flush succeeds");
+        assert_eq!(collector.received().trace_authorizations, ["Bearer token"]);
     }
 
     #[tokio::test]

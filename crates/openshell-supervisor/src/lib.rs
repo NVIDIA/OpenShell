@@ -1298,8 +1298,12 @@ pub async fn run_sandbox_instance(
     // handler is installed when the first staged connection arrives, and
     // before attach so the agent spec can tell the boundary whether to point
     // workload SDKs at it.
-    let (mut otlp_relay, otlp_reserved_destination) =
-        otlp_relay::activate(otlp_agent_endpoint, otlp_agent_protocol, sandbox_id.clone());
+    let (mut otlp_relay, otlp_reserved_destination) = otlp_relay::activate(
+        otlp_agent_endpoint,
+        otlp_agent_protocol,
+        auth_bundle.agent_otlp_headers.clone(),
+        sandbox_id.clone(),
+    );
 
     // Construct the selected client only after shared policy and credential
     // setup has completed. Keep live credentials and later CA publication in
@@ -4619,7 +4623,9 @@ mod tests {
                 .expect("token"),
             sandbox_expires_at: 0,
             ssh_host_private_key: None,
+            traces_otlp_headers: None,
             ocsf_otlp_headers: None,
+            agent_otlp_headers: None,
         };
         let config = SandboxInstanceConfig {
             command: vec!["true".to_string()],

@@ -271,7 +271,9 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         sandbox_token: openshell_core::jwt::SecretJwt::parse("test-sandbox-token").unwrap(),
         sandbox_expires_at: 0,
         ssh_host_private_key: None,
+        traces_otlp_headers: None,
         ocsf_otlp_headers: None,
+        agent_otlp_headers: None,
     };
     let setup = HeldBackendSetup {
         session_id,

@@ -108,41 +108,36 @@ enum Transport {
 pub struct Exporter {
     transport: Transport,
     endpoint: String,
+    headers: http::HeaderMap,
 }
 
 impl Exporter {
-    /// Prepares a lazy connection to `endpoint` over `protocol`. Fails only
-    /// when the endpoint is not a valid URI; no I/O happens here.
-    pub fn new(endpoint: &str, protocol: OtlpProtocol) -> Result<Self, EndpointError> {
-        match protocol {
-            OtlpProtocol::Grpc => Ok(Self::with_channel(
+    /// Prepares a lazy connection to `endpoint` over `protocol` that sends
+    /// `headers` with every export. Fails only when the endpoint is not a
+    /// valid URI; no I/O happens here.
+    pub fn new(
+        endpoint: &str,
+        protocol: OtlpProtocol,
+        headers: http::HeaderMap,
+    ) -> Result<Self, EndpointError> {
+        let transport = match protocol {
+            OtlpProtocol::Grpc => Transport::Grpc(Grpc::new(
                 grpc_channel(endpoint).map_err(EndpointError::Grpc)?,
-                endpoint,
             )),
-            OtlpProtocol::HttpProtobuf => Ok(Self {
-                transport: Transport::Http {
-                    client: Box::new(
-                        OtlpHttpClient::new(EXPORT_TIMEOUT + CLIENT_TIMEOUT_MARGIN)
-                            .map_err(EndpointError::Runtime)?,
-                    ),
-                    uri: openshell_otel::signal_url(endpoint, "v1/traces")
-                        .map_err(EndpointError::Http)?,
-                },
-                endpoint: endpoint.to_string(),
-            }),
-        }
-    }
-
-    /// Forwards over a channel prepared elsewhere. This is the seam for a
-    /// shared collector transport (TLS, compression, headers) built once in
-    /// `openshell-otel` for the gateway, the supervisor's own spans, and this
-    /// relay; `endpoint` is only used for log messages.
-    #[must_use]
-    pub fn with_channel(channel: Channel, endpoint: &str) -> Self {
-        Self {
-            transport: Transport::Grpc(Grpc::new(channel)),
+            OtlpProtocol::HttpProtobuf => Transport::Http {
+                client: Box::new(
+                    OtlpHttpClient::new(EXPORT_TIMEOUT + CLIENT_TIMEOUT_MARGIN)
+                        .map_err(EndpointError::Runtime)?,
+                ),
+                uri: openshell_otel::signal_url(endpoint, "v1/traces")
+                    .map_err(EndpointError::Http)?,
+            },
+        };
+        Ok(Self {
+            transport,
             endpoint: endpoint.to_string(),
-        }
+            headers,
+        })
     }
 
     /// The collector URI this exporter targets.
@@ -155,8 +150,10 @@ impl Exporter {
     pub async fn export(&self, batch: Bytes) -> Result<(), ExportError> {
         let send = async {
             match &self.transport {
-                Transport::Grpc(client) => export_grpc(client.clone(), batch).await,
-                Transport::Http { client, uri } => export_http(client, uri, batch).await,
+                Transport::Grpc(client) => export_grpc(client.clone(), &self.headers, batch).await,
+                Transport::Http { client, uri } => {
+                    export_http(client, uri, &self.headers, batch).await
+                }
             }
         };
         tokio::time::timeout(EXPORT_TIMEOUT, send)
@@ -189,13 +186,18 @@ fn grpc_channel(endpoint: &str) -> Result<Channel, tonic::transport::Error> {
         .connect_lazy())
 }
 
-async fn export_grpc(mut client: Grpc<Channel>, batch: Bytes) -> Result<(), ExportError> {
+async fn export_grpc(
+    mut client: Grpc<Channel>,
+    headers: &http::HeaderMap,
+    batch: Bytes,
+) -> Result<(), ExportError> {
     client.ready().await.map_err(|error| {
         ExportError::Status(Status::unavailable(format!(
             "collector channel not ready: {error}"
         )))
     })?;
     let mut request = tonic::Request::new(batch);
+    *request.metadata_mut() = tonic::metadata::MetadataMap::from_headers(headers.clone());
     request
         .extensions_mut()
         .insert(GrpcMethod::new(SERVICE, METHOD));
@@ -209,12 +211,17 @@ async fn export_grpc(mut client: Grpc<Channel>, batch: Bytes) -> Result<(), Expo
 async fn export_http(
     client: &OtlpHttpClient,
     uri: &http::Uri,
+    headers: &http::HeaderMap,
     batch: Bytes,
 ) -> Result<(), ExportError> {
-    let request = http::Request::post(uri.clone())
-        .header(http::header::CONTENT_TYPE, "application/x-protobuf")
+    let mut request = http::Request::post(uri.clone())
         .body(batch)
         .map_err(|error| ExportError::Http(error.to_string()))?;
+    request.headers_mut().clone_from(headers);
+    request.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/x-protobuf"),
+    );
     let response = client
         .send(request)
         .await
@@ -334,8 +341,15 @@ mod tests {
 
     #[test]
     fn new_rejects_an_invalid_uri() {
-        assert!(Exporter::new("not a uri", OtlpProtocol::Grpc).is_err());
-        assert!(Exporter::new("not a uri", OtlpProtocol::HttpProtobuf).is_err());
+        assert!(Exporter::new("not a uri", OtlpProtocol::Grpc, http::HeaderMap::new()).is_err());
+        assert!(
+            Exporter::new(
+                "not a uri",
+                OtlpProtocol::HttpProtobuf,
+                http::HeaderMap::new()
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -347,7 +361,12 @@ mod tests {
         ] {
             let mut collector = OtlpHttpTestServer::start().await;
             let endpoint = format!("{}{suffix}", collector.endpoint());
-            let exporter = Exporter::new(&endpoint, OtlpProtocol::HttpProtobuf).unwrap();
+            let exporter = Exporter::new(
+                &endpoint,
+                OtlpProtocol::HttpProtobuf,
+                http::HeaderMap::new(),
+            )
+            .unwrap();
             let batch = Bytes::from(encoded_request("over-http", &[]));
 
             exporter
@@ -369,7 +388,12 @@ mod tests {
     #[tokio::test]
     async fn http_export_fails_on_a_non_success_status() {
         let collector = OtlpHttpTestServer::start_with_status(http::StatusCode::FORBIDDEN).await;
-        let exporter = Exporter::new(collector.endpoint(), OtlpProtocol::HttpProtobuf).unwrap();
+        let exporter = Exporter::new(
+            collector.endpoint(),
+            OtlpProtocol::HttpProtobuf,
+            http::HeaderMap::new(),
+        )
+        .unwrap();
         let error = exporter
             .export(Bytes::from(encoded_request("s", &[])))
             .await
@@ -385,7 +409,12 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
-        let exporter = Exporter::new(&endpoint, OtlpProtocol::HttpProtobuf).unwrap();
+        let exporter = Exporter::new(
+            &endpoint,
+            OtlpProtocol::HttpProtobuf,
+            http::HeaderMap::new(),
+        )
+        .unwrap();
 
         let started = Instant::now();
         let error = exporter
@@ -397,25 +426,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exports_over_a_channel_prepared_by_the_caller() {
-        let collector = OtlpTestServer::start().await;
-        let channel = Endpoint::from_shared(collector.endpoint().to_string())
+    async fn exports_send_the_configured_headers_over_either_protocol() {
+        let headers = || openshell_otel::parse_otlp_headers("authorization=Bearer%20agent");
+        let batch = || Bytes::from(encoded_request("with-headers", &[]));
+
+        let grpc = OtlpTestServer::start().await;
+        Exporter::new(grpc.endpoint(), OtlpProtocol::Grpc, headers())
             .unwrap()
-            .connect_lazy();
-        let exporter = Exporter::with_channel(channel, collector.endpoint());
-        exporter
-            .export(Bytes::from(encoded_request("via-channel", &[])))
+            .export(batch())
             .await
-            .expect("export over the supplied channel");
-        collector.wait_for_export().await;
-        let received = collector.shutdown().await;
-        assert!(received.spans.iter().any(|span| span.name == "via-channel"));
+            .expect("gRPC export succeeds");
+        grpc.wait_for_export().await;
+        assert_eq!(grpc.shutdown().await.trace_authorizations, ["Bearer agent"]);
+
+        let mut http = OtlpHttpTestServer::start().await;
+        Exporter::new(http.endpoint(), OtlpProtocol::HttpProtobuf, headers())
+            .unwrap()
+            .export(batch())
+            .await
+            .expect("HTTP export succeeds");
+        assert_eq!(
+            http.next_export().await.headers["authorization"],
+            "Bearer agent"
+        );
     }
 
     #[tokio::test]
     async fn export_reaches_the_collector_with_attributes_intact() {
         let collector = OtlpTestServer::start().await;
-        let exporter = Exporter::new(collector.endpoint(), OtlpProtocol::Grpc).unwrap();
+        let exporter = Exporter::new(
+            collector.endpoint(),
+            OtlpProtocol::Grpc,
+            http::HeaderMap::new(),
+        )
+        .unwrap();
         let batch = Bytes::from(encoded_request(
             "exported-span",
             &[("service.name", "unit-agent"), ("custom", "kept")],
@@ -445,7 +489,8 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
-        let exporter = Exporter::new(&endpoint, OtlpProtocol::Grpc).unwrap();
+        let exporter =
+            Exporter::new(&endpoint, OtlpProtocol::Grpc, http::HeaderMap::new()).unwrap();
 
         let started = Instant::now();
         let error = exporter
@@ -464,7 +509,12 @@ mod tests {
         // error inside the export deadline rather than a 5 s timeout, and
         // the lazy channel is left closed for the next export to redial.
         let collector = SilentCollector::start().await;
-        let exporter = Exporter::new(&collector.endpoint, OtlpProtocol::Grpc).unwrap();
+        let exporter = Exporter::new(
+            &collector.endpoint,
+            OtlpProtocol::Grpc,
+            http::HeaderMap::new(),
+        )
+        .unwrap();
         let started = Instant::now();
         let error = exporter
             .export(Bytes::from(encoded_request("s", &[])))
