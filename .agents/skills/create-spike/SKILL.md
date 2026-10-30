@@ -7,7 +7,7 @@ metadata:
 
 # Create Spike
 
-Investigate a specific OpenShell need and record the findings in a GitHub issue. Use `create-github-issue` for the issue structure and `triage-issue` for the distinction between technical validation and human acceptance. A spike does not authorize implementation or a roadmap decision.
+Investigate a specific OpenShell need and record the findings in a GitHub issue. Use `create-github-issue` for the issue structure and `triage-validate-issue` for the distinction between technical validation and human acceptance. A spike does not authorize implementation or a roadmap decision.
 
 ## Before investigating
 
