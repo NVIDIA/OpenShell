@@ -1243,7 +1243,7 @@ impl VmDriver {
             None
         };
 
-        let (socket_root, socket_root_fd) = allocate_socket_root()
+        let (socket_root, socket_root_fd) = openshell_core::socket_root::allocate()
             .map_err(|err| format!("failed to allocate socket root in /tmp: {err}"))?;
 
         let (events, _) = broadcast::channel(WATCH_BUFFER);
@@ -6810,53 +6810,8 @@ async fn restrict_owner_only_dir(_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-const SOCKET_ROOT_ALLOC_RETRIES: usize = 16;
-/// macOS `sun_path` is 104 bytes including the NUL terminator.
-const MAX_SUN_PATH_LEN: usize = 103;
-
 fn sandbox_socket_dir(socket_root: &Path, sandbox_id: &str) -> PathBuf {
     socket_root.join(sandbox_id)
-}
-
-fn allocate_socket_root() -> Result<(PathBuf, OwnedFd), std::io::Error> {
-    let uid = rustix::process::geteuid().as_raw();
-    allocate_socket_root_with(Path::new("/tmp"), || {
-        let random = u128::from_ne_bytes(
-            openshell_crypto::random_bytes::<16>().map_err(std::io::Error::other)?,
-        );
-        Ok(format!("os-{uid}-{random:032x}"))
-    })
-}
-
-fn allocate_socket_root_with(
-    base: &Path,
-    mut gen_name: impl FnMut() -> Result<String, std::io::Error>,
-) -> Result<(PathBuf, OwnedFd), std::io::Error> {
-    for _ in 0..SOCKET_ROOT_ALLOC_RETRIES {
-        let root = base.join(gen_name()?);
-        match rustix::fs::mkdir(&root, rustix::fs::Mode::from_raw_mode(0o700)) {
-            Ok(()) => {
-                let fd = rustix::fs::open(
-                    &root,
-                    rustix::fs::OFlags::RDONLY
-                        | rustix::fs::OFlags::DIRECTORY
-                        | rustix::fs::OFlags::NOFOLLOW,
-                    rustix::fs::Mode::empty(),
-                )
-                .map_err(std::io::Error::from)?;
-                return Ok((root, fd));
-            }
-            Err(rustix::io::Errno::EXIST) => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        format!(
-            "failed to allocate socket root under {} after {SOCKET_ROOT_ALLOC_RETRIES} attempts",
-            base.display()
-        ),
-    ))
 }
 
 fn create_sandbox_socket_dir(
@@ -6864,16 +6819,9 @@ fn create_sandbox_socket_dir(
     socket_root: &Path,
     sandbox_id: &str,
 ) -> Result<PathBuf, std::io::Error> {
-    let longest = socket_root.join(sandbox_id).join(VM_CONTROL_SOCKET);
-    if longest.as_os_str().len() > MAX_SUN_PATH_LEN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "socket path {} exceeds sun_path limit ({MAX_SUN_PATH_LEN} bytes)",
-                longest.display()
-            ),
-        ));
-    }
+    openshell_core::socket_root::check_path_len(
+        &socket_root.join(sandbox_id).join(VM_CONTROL_SOCKET),
+    )?;
     match rustix::fs::mkdirat(root_fd, sandbox_id, rustix::fs::Mode::from_raw_mode(0o700)) {
         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
         Err(e) => return Err(e.into()),
@@ -10596,89 +10544,6 @@ mod tests {
             "ssh socket path exceeds macOS sun_path: {}",
             ssh.display()
         );
-    }
-
-    #[test]
-    fn allocate_socket_root_returns_distinct_roots() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut counter = 0u64;
-        let (root_a, _fd_a) = allocate_socket_root_with(tmp.path(), || {
-            counter += 1;
-            Ok(format!("root-{counter}"))
-        })
-        .unwrap();
-        let (root_b, _fd_b) = allocate_socket_root_with(tmp.path(), || {
-            counter += 1;
-            Ok(format!("root-{counter}"))
-        })
-        .unwrap();
-        assert_ne!(
-            root_a, root_b,
-            "two allocations must produce distinct roots"
-        );
-    }
-
-    #[test]
-    fn allocate_socket_root_retries_on_occupied_name() {
-        let tmp = tempfile::tempdir().unwrap();
-        let victim = tmp.path().join("victim");
-        std::fs::create_dir(&victim).unwrap();
-        let original_mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
-
-        // attempt-0: symlink to victim directory
-        std::os::unix::fs::symlink(&victim, tmp.path().join("attempt-0")).unwrap();
-        // attempt-1: existing directory (simulates foreign-owned pre-creation)
-        std::fs::create_dir(tmp.path().join("attempt-1")).unwrap();
-
-        let call_count = AtomicUsize::new(0);
-        let (root, _fd) = allocate_socket_root_with(tmp.path(), || {
-            let n = call_count.fetch_add(1, Ordering::SeqCst);
-            Ok(format!("attempt-{n}"))
-        })
-        .expect("should succeed after retries");
-
-        assert_eq!(root, tmp.path().join("attempt-2"));
-        assert_eq!(call_count.load(Ordering::SeqCst), 3);
-        assert!(
-            tmp.path()
-                .join("attempt-0")
-                .symlink_metadata()
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-            "pre-created symlink must not be removed"
-        );
-        assert!(
-            tmp.path().join("attempt-1").exists(),
-            "pre-created directory must not be removed"
-        );
-        let after_mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            original_mode, after_mode,
-            "victim directory permissions must not change"
-        );
-    }
-
-    #[test]
-    fn allocate_socket_root_propagates_name_generation_failure() {
-        let tmp = tempfile::tempdir().unwrap();
-        let err = allocate_socket_root_with(tmp.path(), || {
-            Err(std::io::Error::other(openshell_crypto::CryptoError::Random))
-        })
-        .expect_err("entropy failure must stop allocation");
-        assert_eq!(err.kind(), std::io::ErrorKind::Other);
-        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn allocate_socket_root_exhaustion_returns_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let blocked = tmp.path().join("blocked");
-        std::fs::create_dir(&blocked).unwrap();
-
-        let err = allocate_socket_root_with(tmp.path(), || Ok("blocked".to_string()))
-            .expect_err("should fail when all names are occupied");
-        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
     #[test]
