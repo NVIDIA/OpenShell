@@ -1203,6 +1203,13 @@ After a gateway restart, an existing sandbox can return to `Provisioning`
 temporarily while its supervisor reconnects. Wait for the phase to return to
 `Ready` before you connect to the sandbox or execute commands.
 
+On the Kubernetes driver, a sandbox pod that the scheduler cannot place keeps
+the sandbox in `Provisioning` with a `PodScheduled=False` condition. Its reason
+is `Unschedulable` and its message is the scheduler's explanation, such as
+`0/3 nodes are available: 3 Insufficient memory`. `openshell sandbox create`
+shows the same message while it waits, and `openshell sandbox get` reports the
+condition. The condition clears once the pod is scheduled.
+
 The gateway records a successful canonical main-process exit as `Ready=False`
 with reason `MainProcessCompleted`. Nonzero and signal-normalized results use
 `MainProcessFailed` and the `Error` phase. It also sets `status.exit_code`;
