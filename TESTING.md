@@ -355,23 +355,23 @@ HTTP `Host`, TLS SNI, and mTLS handling.
 Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
-- CLI conformance (`tests/suites/conformance`) - portable Cargo tests for
-  lifecycle, mechanistic drafts, file transfer, and the sandbox-local API,
-  including agent-authored permission requests. Driver E2E runs the complete
-  Cargo test package. The installed-artifact conformance lanes run the `sandbox`
-  package through `openshell-test-runner` (see below).
+- Conformance (`tests/suites/conformance`) - the testkit `sandbox` package:
+  lifecycle, the CLI, persistent workspaces, file transfer, and the policy
+  advisor. Driver E2E runs it with nextest against the lane's gateway. The
+  installed-artifact conformance lanes run the same package through
+  `openshell-test-runner` (see above).
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
-  `e2e-vm`) - CLI conformance plus the common and driver-specific coverage for
+  `e2e-vm`) - conformance plus the common and driver-specific coverage for
   the selected deployment.
 - Docker suite (`--features e2e-docker`) - includes Docker-only coverage such as Dockerfile image builds, Docker preflight checks, and managed Docker gateway start.
 - Docker GPU suite (`--features e2e-docker-gpu`) - Docker suite plus GPU sandbox smoke coverage.
-- Configuration push suite (`--features e2e-config-push`) - CLI conformance and the policy tests against a Docker gateway with `config_delivery_mode = "push"`. Run it with `mise run e2e:rust:push`.
+- Configuration push suite (`--features e2e-config-push`) - conformance and the policy tests against a Docker gateway with `config_delivery_mode = "push"`. Run it with `mise run e2e:rust:push`.
 - VM suite (`--features e2e-vm`) - runs e2e tests on a VM.
 - Kubernetes credential-driver suite (`--features e2e-kubernetes-credential-drivers`) - targeted Kubernetes Secrets and Vault provider credential storage coverage.
 
-The Docker, Podman, Kubernetes, and VM runners execute CLI
-conformance before their Rust tests. Set the driver's feature variable
-(`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURES`,
+The Docker, Podman, Kubernetes, and VM runners execute conformance before
+their Rust tests; a run with no conformance tests fails. Set the driver's
+feature variable (`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURES`,
 `OPENSHELL_E2E_KUBERNETES_FEATURES`, or `OPENSHELL_E2E_VM_FEATURES`) to
 `e2e-conformance-only` to skip the Rust tests; the runner logs a notice when
 it skips them. Unset or empty values select the driver's default Rust
@@ -397,52 +397,28 @@ Run the Docker-backed Rust CLI e2e suite:
 mise run e2e:docker
 ```
 
-Run the portable CLI conformance suite against the gateway selected in your
-OpenShell CLI configuration:
+Run the conformance suite against the gateway selected in your OpenShell CLI
+configuration:
 
 ```shell
 cargo build --package openshell-cli
 OPENSHELL_BIN="$PWD/target/debug/openshell" \
-  cargo test \
+  cargo nextest run \
     --locked \
     --manifest-path tests/suites/conformance/Cargo.toml \
-    --package openshell-test-conformance-cli \
-    --no-fail-fast \
-    -- \
-    --test-threads=1 \
-    --nocapture
+    --package sandbox \
+    --test-threads 1 \
+    --no-fail-fast
 ```
 
 The gateway must already be installed, reachable, and selected before the tests
 start. The test suite does not provision a gateway or select a compute driver.
 Set `OPENSHELL_BIN` to another executable to test a different prebuilt CLI.
+[tests/testkit/README.md](tests/testkit/README.md) covers gateway selection and
+cleanup.
 
-The phase-1 scenario verifies the complete CLI-to-gateway-to-driver path without
-depending on how the gateway was installed or which driver is configured. It
-requires machine-readable gRPC status, creates a uniquely named detached
-sandbox with the configured default image, verifies the sandbox is `Ready` by finding its
-unique name in paginated JSON list output, executes `echo` with a run-specific
-marker, deletes the sandbox, and verifies that its name no longer appears.
-Driver suites enable the same profile
-instead of maintaining a separate smoke implementation. Sandbox lifecycle,
-label matrices, VM overlay, and TLS-key permission assertions remain regular
-E2E coverage.
-
-Each invocation prints a ten-character run ID before creating resources.
-Conformance sandboxes use names such as `ct-<run-id>-01`. The runner tracks the
-exact name and uses it for cleanup; phase 1 does not add ownership labels.
-
-The runner deletes owned resources after both success and failure. If the test
-process is interrupted before cleanup, locate leftovers without touching
-unrelated gateway state:
-
-```shell
-openshell sandbox list --output json
-openshell sandbox delete <sandbox-name>
-```
-
-Gateway-backed Rust E2E tasks run the CLI conformance Cargo tests against the
-configured gateway, then run any lane-specific Rust tests that still apply.
+Gateway-backed Rust E2E tasks run the conformance suite against the configured
+gateway, then run any lane-specific Rust tests that still apply.
 Run the Podman-backed Rust CLI e2e suite:
 
 ```shell

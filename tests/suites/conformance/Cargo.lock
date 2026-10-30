@@ -1880,17 +1880,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "openshell-conformance"
-version = "0.0.0"
-dependencies = [
- "rand 0.9.4",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
@@ -1990,14 +1979,6 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
-]
-
-[[package]]
-name = "openshell-test-conformance-cli"
-version = "0.0.0"
-dependencies = [
- "openshell-conformance",
- "tokio",
 ]
 
 [[package]]
