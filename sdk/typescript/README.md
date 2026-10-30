@@ -310,6 +310,21 @@ const status = await client.raw.getSandboxPolicyStatus({
 
 The raw layer returns the generated wire messages verbatim, preserving proto distinctions (an omitted optional versus an explicitly empty map) that the curated types may smooth over. As curated sub-clients land, prefer them; `raw` stays as the always-available floor.
 
+### Raw configuration message migration
+
+`SandboxConfigSnapshot` and `GetSandboxConfigResponse` now include a
+`serviceRoutes` array. The protobuf wire change is additive, and ordinary RPC
+callers continue to receive decoded messages. This field is the supervisor's
+declared application ingress allowlist, not service discovery; an empty array
+installs no application routes.
+
+Complete object literals typed as either generated message must add
+`serviceRoutes: []`. Alternatively, use `create(SandboxConfigSnapshotSchema, init)`
+or `create(GetSandboxConfigResponseSchema, init)` from `@bufbuild/protobuf`, with
+the corresponding schema imported from `@nvidia/openshell-sdk/raw`. Schema-based
+initialization supplies the empty array when omitted. The curated SDK API is
+unchanged.
+
 ## Boundaries
 
 The SDK ships primitives, not the CLI's terminal experience. Some things are intentionally out of scope:

@@ -15,6 +15,19 @@ gateway-name resolution.
   surface doesn't yet cover (providers, policy, logs, settings, SSH,
   forwarding).
 
+## Raw configuration message migration
+
+`SandboxConfigSnapshot` and `GetSandboxConfigResponse` now include the repeated
+`service_routes` field. This is an additive protobuf wire change; ordinary RPC
+callers can continue reading responses. It describes the supervisor's declared
+application ingress allowlist, not service discovery. An empty list installs no
+application routes.
+
+Code constructing complete raw Rust message literals must add
+`service_routes: Vec::new()` or use `..Default::default()` for unspecified fields.
+Exhaustive destructuring patterns must include `service_routes` or end with `..`.
+The curated SDK API is unchanged.
+
 ## Auth and refresh
 
 The curated surface drives OIDC refresh automatically: proactively before a

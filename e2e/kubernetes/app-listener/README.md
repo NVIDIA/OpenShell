@@ -99,6 +99,13 @@ The lower-level runner leaves the Helm release and TLS Secret in place. Use
 check an already disabled release. Configuration rejection and the additional
 deployment cleanup scenarios remain in the manual checklist below.
 
+The supervisor Rust test
+`rejected_configuration_closes_streams_without_affecting_another_sandbox`
+automates rejection at the listener configuration boundary with real TLS
+WebSockets on a shared listener. It checks stream closure, isolation from another
+sandbox, and recovery without reviving old streams. Injecting a rejection through
+the deployed gateway remains a manual Kubernetes scenario.
+
 ## Manual deployment and additional scenarios
 
 Before deployment, provide an operator-owned `openshell-app-tls` Secret in the
@@ -122,6 +129,11 @@ actually owning the sandbox and use its configured app port. Do not select an
 arbitrary member when more than one is present. Check ownership through
 supervisor admission/release logs in this stage; automated owner selection
 belongs to the later discovery API.
+
+This manual selection validates the listener independently of the later RFC 0017
+discovery and routing integrations. A Service balancing across all shared
+supervisors cannot select the owner. After takeover, repeat owner selection and
+update the test destination; discovery consumers will automate that step.
 
 From a permitted client Pod, mount only the public app certificate/CA and run:
 

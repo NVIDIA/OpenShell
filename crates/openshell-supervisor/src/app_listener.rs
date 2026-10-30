@@ -1400,7 +1400,11 @@ mod tests {
         tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
 
     async fn websocket(f: &Fixture, service: &str) -> TestWebSocket {
-        let host = format!("default--sandbox-a--{service}.svc.openshell.internal");
+        sandbox_websocket(f, "sandbox-a", service).await
+    }
+
+    async fn sandbox_websocket(f: &Fixture, sandbox: &str, service: &str) -> TestWebSocket {
+        let host = format!("default--{sandbox}--{service}.svc.openshell.internal");
         let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[f.address])
             .await
             .unwrap();
@@ -1432,6 +1436,42 @@ mod tests {
             .await
             .expect("revoked WebSocket must close");
         assert!(next.is_none() || next.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_configuration_closes_streams_without_affecting_another_sandbox() {
+        let f = fixture();
+        let second = f.host.router().instance("sandbox-b").unwrap();
+        second.routes.install(&installed(vec![SandboxServiceRoute {
+            endpoint_id: "endpoint-b".into(),
+            ..f.route.clone()
+        }]));
+        let second_connector = Arc::new(Connector {
+            calls: AtomicUsize::new(0),
+        });
+        let _second_handle = second.start(rpc_test::loopback(second_connector));
+        let mut rejected_ws = websocket(&f, "web").await;
+        let mut unaffected_ws = sandbox_websocket(&f, "sandbox-b", "web").await;
+        echo(&mut rejected_ws, "before rejection").await;
+        echo(&mut unaffected_ws, "peer before rejection").await;
+
+        let mut rejected = installed(vec![f.route.clone()]);
+        rejected.configuration_admitted = false;
+        rejected.configuration_error = "candidate configuration rejected".into();
+        f.routes.install(&rejected);
+        // A live push session must not renew rejected configuration.
+        f.routes.renew();
+        assert!(request(&f, HOST, HOST, "").await.is_empty());
+        echo(&mut unaffected_ws, "peer survives rejection").await;
+
+        // Restore before reading the old stream: even coalesced updates must
+        // revoke its original token, while new connections can recover.
+        f.routes.install(&installed(vec![f.route.clone()]));
+        closed(&mut rejected_ws).await;
+        let mut recovered_ws = websocket(&f, "web").await;
+        echo(&mut recovered_ws, "after accepted configuration").await;
+        echo(&mut unaffected_ws, "peer survives recovery").await;
+        assert_eq!(f.connector.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
