@@ -137,16 +137,29 @@ func validateGatewayName(name string) error {
 	return nil
 }
 
-// resolveActiveGateway reads the active_gateway file from the user
-// config directory and returns the validated gateway name. Returns
-// ErrNoActiveGateway if the file is missing or empty.
+// resolveActiveGateway returns the validated active gateway name. It reads
+// the user active_gateway file and falls back to the system one when the user
+// file is missing, empty, or invalid, matching the CLI. Returns
+// ErrNoActiveGateway describing the user file when neither yields a name.
 func resolveActiveGateway() (string, error) {
 	userBase, err := userConfigDir()
 	if err != nil {
-		return "", fmt.Errorf("%w: cannot determine config directory: %v", ErrNoActiveGateway, err)
+		err = fmt.Errorf("%w: cannot determine config directory: %v", ErrNoActiveGateway, err)
+	} else {
+		var name string
+		if name, err = readActiveGatewayFile(filepath.Join(userBase, activeGatewayFile)); err == nil {
+			return name, nil
+		}
 	}
 
-	path := filepath.Join(userBase, activeGatewayFile)
+	if name, sysErr := readActiveGatewayFile(filepath.Join(systemConfigDir(), activeGatewayFile)); sysErr == nil {
+		return name, nil
+	}
+	return "", err
+}
+
+// readActiveGatewayFile reads and validates the gateway name stored at path.
+func readActiveGatewayFile(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("%w", ErrNoActiveGateway)

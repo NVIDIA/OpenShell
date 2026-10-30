@@ -13,7 +13,7 @@ import (
 
 // NewClient creates a fully wired SDK client from an on-disk gateway
 // configuration. If name is empty, the active gateway (set via
-// `openshell gateway use`) is used.
+// `openshell gateway use`, or the system default) is used.
 //
 // The function resolves the gateway directory, parses metadata.json,
 // loads tokens lazily, maps the auth mode to an SDK auth provider, and
@@ -66,8 +66,8 @@ func NewClient(name string, opts ...ClientOption) (*v1.Client, error) {
 }
 
 // LoadConfig reads and parses a gateway's on-disk configuration without
-// creating a client connection. If name is empty, the active gateway is
-// used.
+// creating a client connection. If name is empty, the active gateway (user
+// selection, then system default) is used.
 //
 // The returned [Config] is an immutable snapshot; changes to the on-disk
 // files after this call are not reflected.
