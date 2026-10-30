@@ -388,6 +388,94 @@ mod session {
         }
     }
 
+    /// A PEM private key. Redacted from diagnostics and cleared on drop.
+    #[derive(Clone)]
+    pub struct SecretPrivateKeyPem(Zeroizing<String>);
+
+    impl SecretPrivateKeyPem {
+        #[must_use]
+        pub fn new(value: String) -> Self {
+            Self(Zeroizing::new(value))
+        }
+
+        #[must_use]
+        pub fn expose_secret(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl fmt::Debug for SecretPrivateKeyPem {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("SecretPrivateKeyPem([REDACTED])")
+        }
+    }
+
+    impl Serialize for SecretPrivateKeyPem {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_str(self.expose_secret())
+        }
+    }
+
+    impl<'de> Deserialize<'de> for SecretPrivateKeyPem {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            String::deserialize(deserializer).map(Self::new)
+        }
+    }
+
+    /// TLS material for one OTLP collector connection, as PEM. The private
+    /// key is redacted from diagnostics and cleared on drop.
+    #[derive(Clone, Default, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct OtlpTlsMaterial {
+        /// Certificates trusted to verify the collector instead of the
+        /// platform roots.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ca_pem: Option<String>,
+        /// Client certificate presented to the collector.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub client: Option<OtlpClientIdentity>,
+    }
+
+    /// A PEM client certificate chain and its private key.
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct OtlpClientIdentity {
+        pub cert_pem: String,
+        pub key_pem: SecretPrivateKeyPem,
+    }
+
+    #[cfg(feature = "otel")]
+    impl OtlpTlsMaterial {
+        /// The material as exporter TLS settings.
+        pub fn otlp_tls(&self) -> Result<openshell_otel::OtlpTls, openshell_otel::TlsError> {
+            openshell_otel::OtlpTls::from_pem(
+                self.ca_pem.as_deref().map(str::as_bytes),
+                self.client.as_ref().map(|client| {
+                    (
+                        client.cert_pem.as_bytes(),
+                        client.key_pem.expose_secret().as_bytes(),
+                    )
+                }),
+            )
+        }
+    }
+
+    impl fmt::Debug for OtlpTlsMaterial {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("OtlpTlsMaterial")
+                .field("ca_pem", &self.ca_pem.is_some())
+                .field("client", &self.client)
+                .finish()
+        }
+    }
+
     /// Trusted launch input delivered only to `openshell-supervisor`.
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -418,6 +506,18 @@ mod session {
         /// the gateway configures them. Never delivered to the workload.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent_otlp_headers: Option<SecretOtlpHeaders>,
+        /// TLS material for the supervisor's collectors, each distinct
+        /// material once, present only when the gateway configures it.
+        /// Never delivered to the workload.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub otlp_tls: Vec<OtlpTlsMaterial>,
+        /// Position in `otlp_tls` of each collector's material.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub traces_otlp_tls: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ocsf_otlp_tls: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent_otlp_tls: Option<usize>,
     }
 
     /// Gateway-created authentication input trusted by a compute driver.
@@ -479,7 +579,25 @@ mod session {
             SandboxGenerationId::parse(self.runtime_generation.to_string())
                 .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?;
             SessionRotation::new(self.session_rotation.get())?;
+            let references = [
+                self.traces_otlp_tls,
+                self.ocsf_otlp_tls,
+                self.agent_otlp_tls,
+            ];
+            if references
+                .into_iter()
+                .flatten()
+                .any(|index| index >= self.otlp_tls.len())
+            {
+                return Err(SessionJwtError::InvalidOtlpTlsReference);
+            }
             Ok(())
+        }
+
+        /// The material that `index`, one of the `*_otlp_tls` fields, names.
+        /// [`Self::validate`] rejects an index outside `otlp_tls`.
+        pub fn otlp_tls_material(&self, index: Option<usize>) -> Option<&OtlpTlsMaterial> {
+            index.and_then(|index| self.otlp_tls.get(index))
         }
 
         pub fn sandbox_bearer_slot(&self) -> Result<SessionBearerTokenSlot, SessionJwtError> {
@@ -507,6 +625,10 @@ mod session {
                 .field("traces_otlp_headers", &self.traces_otlp_headers)
                 .field("ocsf_otlp_headers", &self.ocsf_otlp_headers)
                 .field("agent_otlp_headers", &self.agent_otlp_headers)
+                .field("otlp_tls", &self.otlp_tls)
+                .field("traces_otlp_tls", &self.traces_otlp_tls)
+                .field("ocsf_otlp_tls", &self.ocsf_otlp_tls)
+                .field("agent_otlp_tls", &self.agent_otlp_tls)
                 .finish()
         }
     }
@@ -1174,6 +1296,8 @@ mod session {
         MissingRuntimeIdentity,
         #[error("sandbox runtime identity is invalid")]
         InvalidRuntimeIdentity,
+        #[error("OTLP TLS reference is outside the bundle's TLS material")]
+        InvalidOtlpTlsReference,
         #[error("key ID is invalid")]
         InvalidKeyId,
         #[error("verification key IDs must be unique")]
@@ -1638,6 +1762,10 @@ mod tests {
                 traces_otlp_headers: None,
                 ocsf_otlp_headers: None,
                 agent_otlp_headers: None,
+                otlp_tls: Vec::new(),
+                traces_otlp_tls: None,
+                ocsf_otlp_tls: None,
+                agent_otlp_tls: None,
             };
             bundle.validate().expect("non-expiring auth bundle");
         }
@@ -1785,6 +1913,16 @@ mod tests {
                 agent_otlp_headers: Some(SecretOtlpHeaders::new(
                     "authorization=agent-token".to_string(),
                 )),
+                otlp_tls: vec![OtlpTlsMaterial {
+                    ca_pem: Some("agent-ca".to_string()),
+                    client: Some(OtlpClientIdentity {
+                        cert_pem: "agent-cert".to_string(),
+                        key_pem: SecretPrivateKeyPem::new("agent-private-key".to_string()),
+                    }),
+                }],
+                traces_otlp_tls: None,
+                ocsf_otlp_tls: None,
+                agent_otlp_tls: Some(0),
             };
 
             let encoded = serde_json::to_vec(&bundle).expect("serialize auth bundle");
@@ -1807,34 +1945,63 @@ mod tests {
             assert!(!debug.contains("collector-token"));
             assert!(!debug.contains("agent-token"));
             assert!(!debug.contains("traces-token"));
-            assert_eq!(debug.matches("[REDACTED]").count(), 6);
+            assert!(!debug.contains("agent-private-key"));
+            assert_eq!(debug.matches("[REDACTED]").count(), 7);
             assert_eq!(
-                decoded.ssh_host_private_key.unwrap().expose_secret(),
+                decoded
+                    .ssh_host_private_key
+                    .as_ref()
+                    .unwrap()
+                    .expose_secret(),
                 "private-ssh-host-key"
             );
             assert_eq!(
-                decoded.traces_otlp_headers.unwrap().expose_secret(),
+                decoded
+                    .traces_otlp_headers
+                    .as_ref()
+                    .unwrap()
+                    .expose_secret(),
                 "authorization=traces-token"
             );
             assert_eq!(
-                decoded.ocsf_otlp_headers.unwrap().expose_secret(),
+                decoded.ocsf_otlp_headers.as_ref().unwrap().expose_secret(),
                 "authorization=collector-token"
             );
             assert_eq!(
-                decoded.agent_otlp_headers.unwrap().expose_secret(),
+                decoded.agent_otlp_headers.as_ref().unwrap().expose_secret(),
                 "authorization=agent-token"
             );
+            let agent_tls = decoded
+                .otlp_tls_material(decoded.agent_otlp_tls)
+                .expect("agent collector TLS");
+            assert_eq!(agent_tls.ca_pem.as_deref(), Some("agent-ca"));
+            let client = agent_tls.client.as_ref().unwrap();
+            assert_eq!(client.cert_pem, "agent-cert");
+            assert_eq!(client.key_pem.expose_secret(), "agent-private-key");
             let mut legacy = serde_json::to_value(&bundle).unwrap();
             let fields = legacy.as_object_mut().unwrap();
             fields.remove("ssh_host_private_key");
             fields.remove("traces_otlp_headers");
             fields.remove("ocsf_otlp_headers");
             fields.remove("agent_otlp_headers");
+            fields.remove("otlp_tls");
+            fields.remove("agent_otlp_tls");
             let legacy: SupervisorAuthBundle = serde_json::from_value(legacy).unwrap();
             assert!(legacy.ssh_host_private_key.is_none());
             assert!(legacy.traces_otlp_headers.is_none());
             assert!(legacy.ocsf_otlp_headers.is_none());
             assert!(legacy.agent_otlp_headers.is_none());
+            assert!(legacy.otlp_tls.is_empty() && legacy.agent_otlp_tls.is_none());
+
+            decoded
+                .validate()
+                .expect("references within the TLS material");
+            let mut dangling = decoded.clone();
+            dangling.traces_otlp_tls = Some(1);
+            assert!(matches!(
+                dangling.validate(),
+                Err(SessionJwtError::InvalidOtlpTlsReference)
+            ));
         }
 
         #[derive(Serialize)]

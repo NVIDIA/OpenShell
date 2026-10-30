@@ -744,6 +744,11 @@ pub(crate) async fn run_server(
             .as_ref()
             .and_then(|file| file.openshell.gateway.otlp.as_ref()),
     ));
+    compute.configure_supervisor_otlp_tls(otel_tracing::supervisor_otlp_tls(
+        config_file
+            .as_ref()
+            .and_then(|file| file.openshell.gateway.otlp.as_ref()),
+    ));
     let gateway_interceptors = if let Some(issuer) = extension_jwt_issuer.as_ref() {
         let mut slots = BTreeMap::new();
         for interceptor in &config.gateway_interceptors {

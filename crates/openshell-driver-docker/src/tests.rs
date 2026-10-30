@@ -67,6 +67,10 @@ fn test_launch_authentication() -> Vec<u8> {
             traces_otlp_headers: None,
             ocsf_otlp_headers: None,
             agent_otlp_headers: None,
+            otlp_tls: Vec::new(),
+            traces_otlp_tls: None,
+            ocsf_otlp_tls: None,
+            agent_otlp_tls: None,
         },
         gateway_id: "gateway-test".to_string(),
         verification_keys: vec![SessionVerificationKey {

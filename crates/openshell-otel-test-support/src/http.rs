@@ -33,10 +33,25 @@ impl OtlpHttpTestServer {
 
     /// Starts the collector, answering every request with `status`.
     pub async fn start_with_status(status: http::StatusCode) -> Self {
+        Self::start_with(status, None).await
+    }
+
+    /// Serve over TLS at `https://localhost:<port>` with `tls`, answering 200.
+    pub async fn start_with_tls(tls: &crate::ServerTls) -> Self {
+        Self::start_with(http::StatusCode::OK, Some(tls)).await
+    }
+
+    async fn start_with(status: http::StatusCode, tls: Option<&crate::ServerTls>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("OTLP/HTTP test collector should bind a loopback listener");
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let port = listener.local_addr().unwrap().port();
+        let endpoint = if tls.is_some() {
+            format!("https://localhost:{port}")
+        } else {
+            format!("http://127.0.0.1:{port}")
+        };
+        let acceptor = tls.map(|tls| tokio_rustls::TlsAcceptor::from(tls.rustls_config()));
         let (tx, exports) = tokio::sync::mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
             loop {
@@ -44,6 +59,7 @@ impl OtlpHttpTestServer {
                     continue;
                 };
                 let tx = tx.clone();
+                let acceptor = acceptor.clone();
                 tokio::spawn(async move {
                     let service = hyper::service::service_fn(
                         move |request: http::Request<hyper::body::Incoming>| {
@@ -64,9 +80,22 @@ impl OtlpHttpTestServer {
                             }
                         },
                     );
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
-                        .await;
+                    let http = hyper::server::conn::http1::Builder::new();
+                    match acceptor {
+                        Some(acceptor) => {
+                            // A refused handshake is the outcome some tests expect.
+                            if let Ok(stream) = acceptor.accept(stream).await {
+                                let _ = http
+                                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                                    .await;
+                            }
+                        }
+                        None => {
+                            let _ = http
+                                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                                .await;
+                        }
+                    }
                 });
             }
         });

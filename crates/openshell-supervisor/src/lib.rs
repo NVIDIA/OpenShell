@@ -1302,6 +1302,9 @@ pub async fn run_sandbox_instance(
         otlp_agent_endpoint,
         otlp_agent_protocol,
         auth_bundle.agent_otlp_headers.clone(),
+        auth_bundle
+            .otlp_tls_material(auth_bundle.agent_otlp_tls)
+            .cloned(),
         sandbox_id.clone(),
     );
 
@@ -4626,6 +4629,10 @@ mod tests {
             traces_otlp_headers: None,
             ocsf_otlp_headers: None,
             agent_otlp_headers: None,
+            otlp_tls: Vec::new(),
+            traces_otlp_tls: None,
+            ocsf_otlp_tls: None,
+            agent_otlp_tls: None,
         };
         let config = SandboxInstanceConfig {
             command: vec!["true".to_string()],

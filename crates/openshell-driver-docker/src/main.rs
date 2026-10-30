@@ -52,6 +52,18 @@ struct Args {
     #[arg(long, env = "OPENSHELL_OTLP_PROTOCOL", default_value_t)]
     otlp_protocol: OtlpProtocol,
 
+    /// PEM certificates trusted to verify an `https://` trace collector.
+    #[arg(long, env = "OPENSHELL_OTLP_CA_FILE")]
+    otlp_ca_file: Option<PathBuf>,
+
+    /// PEM client certificate presented to the trace collector.
+    #[arg(long, env = "OPENSHELL_OTLP_CERT_FILE", requires = "otlp_key_file")]
+    otlp_cert_file: Option<PathBuf>,
+
+    /// PEM private key for `--otlp-cert-file`.
+    #[arg(long, env = "OPENSHELL_OTLP_KEY_FILE", requires = "otlp_cert_file")]
+    otlp_key_file: Option<PathBuf>,
+
     /// OTLP collector endpoint for supervisor OCSF event export.
     #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
     otlp_ocsf_endpoint: Option<String>,
@@ -100,6 +112,9 @@ async fn main() -> Result<()> {
         openshell_otel::DriverTracingConfig {
             endpoint: args.otlp_endpoint.as_deref(),
             protocol: args.otlp_protocol.into(),
+            ca_file: args.otlp_ca_file.as_deref(),
+            cert_file: args.otlp_cert_file.as_deref(),
+            key_file: args.otlp_key_file.as_deref(),
             gateway_name: args.gateway_name.as_deref(),
             service_version: VERSION,
             log_level: &args.log_level,

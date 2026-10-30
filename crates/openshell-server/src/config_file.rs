@@ -394,6 +394,29 @@ impl OtlpConfig {
             .map(|agent| agent.collector.endpoint.as_str())
     }
 
+    /// Bytes of TLS files sent to supervisors, counting files shared by
+    /// several exports once.
+    fn supervisor_tls_bytes(&self) -> usize {
+        let mut seen = Vec::new();
+        [
+            self.traces.as_ref().map(|traces| &traces.collector),
+            self.ocsf.as_ref().map(|ocsf| &ocsf.collector),
+            self.agent.as_ref().map(|agent| &agent.collector),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|collector| (collector.tls.ca_pem(), collector.tls.client_identity()))
+        .filter(|pem| {
+            let new = !seen.contains(pem);
+            seen.push(*pem);
+            new
+        })
+        .map(|(ca, client)| {
+            ca.map_or(0, <[u8]>::len) + client.map_or(0, |(cert, key)| cert.len() + key.len())
+        })
+        .sum()
+    }
+
     /// The exports that compute drivers pass to supervisors.
     pub fn supervisor_otlp(&self) -> openshell_core::sandbox_env::SupervisorOtlp {
         openshell_core::sandbox_env::SupervisorOtlp {
@@ -407,7 +430,7 @@ impl OtlpConfig {
 /// One OTLP collector. A lane table with its own `endpoint` describes its
 /// own collector; one without inherits the whole `[openshell.gateway.otlp]`
 /// collector.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OtlpCollectorConfig {
     /// Collector endpoint, e.g.
     /// `http://otel-collector.observability.svc:4317`.
@@ -425,6 +448,23 @@ pub struct OtlpCollectorConfig {
     /// File the headers are read from, one `name=value` per line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers_file: Option<PathBuf>,
+
+    /// PEM certificates trusted to verify an `https://` collector instead of
+    /// the platform roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_file: Option<PathBuf>,
+
+    /// PEM client certificate chain presented to an `https://` collector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_file: Option<PathBuf>,
+
+    /// PEM private key for `cert_file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_file: Option<PathBuf>,
+
+    /// TLS settings read from the files above when the config is loaded.
+    #[serde(skip)]
+    pub(crate) tls: openshell_otel::OtlpTls,
 }
 
 /// Headers the exporters set themselves, or that HTTP/2 forbids.
@@ -611,19 +651,23 @@ impl std::fmt::Debug for OtlpHeaders {
 }
 
 impl OtlpCollectorConfig {
-    /// Rejects an `https://` endpoint for `http/protobuf`, which has no TLS.
-    fn checked(self, table: &str) -> Result<Self, String> {
-        let https = self
-            .endpoint
-            .trim()
-            .get(..8)
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"));
-        if https && self.protocol == OtlpProtocol::HttpProtobuf {
-            return Err(format!(
-                "{table} uses an https:// endpoint, which http/protobuf does not support"
-            ));
+    /// The TLS settings read from `ca_file`, `cert_file`, and `key_file`.
+    pub fn tls(&self) -> &openshell_otel::OtlpTls {
+        &self.tls
+    }
+
+    /// A collector at `endpoint` with no headers or TLS files.
+    pub fn new(endpoint: impl Into<String>, protocol: OtlpProtocol) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            protocol,
+            headers: OtlpHeaders::default(),
+            headers_file: None,
+            ca_file: None,
+            cert_file: None,
+            key_file: None,
+            tls: openshell_otel::OtlpTls::default(),
         }
-        Ok(self)
     }
 
     fn export(&self) -> openshell_core::sandbox_env::OtlpExport {
@@ -641,14 +685,14 @@ fn is_grpc(protocol: &OtlpProtocol) -> bool {
 }
 
 /// `[openshell.gateway.otlp.traces]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OtlpTracesConfig {
     #[serde(flatten)]
     pub collector: OtlpCollectorConfig,
 }
 
 /// `[openshell.gateway.otlp.ocsf]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OcsfOtlpConfig {
     #[serde(flatten)]
     pub collector: OtlpCollectorConfig,
@@ -659,7 +703,7 @@ pub struct OcsfOtlpConfig {
 }
 
 /// `[openshell.gateway.otlp.agent]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentOtlpConfig {
     /// The collector that sandbox supervisors forward workload traces to.
     #[serde(flatten)]
@@ -677,6 +721,12 @@ struct RawOtlpConfig {
     headers: Option<BTreeMap<String, String>>,
     #[serde(default)]
     headers_file: Option<PathBuf>,
+    #[serde(default)]
+    ca_file: Option<PathBuf>,
+    #[serde(default)]
+    cert_file: Option<PathBuf>,
+    #[serde(default)]
+    key_file: Option<PathBuf>,
     #[serde(default)]
     service_name: Option<String>,
     #[serde(default)]
@@ -700,6 +750,12 @@ struct RawAgentOtlp {
     headers: Option<BTreeMap<String, String>>,
     #[serde(default)]
     headers_file: Option<PathBuf>,
+    #[serde(default)]
+    ca_file: Option<PathBuf>,
+    #[serde(default)]
+    cert_file: Option<PathBuf>,
+    #[serde(default)]
+    key_file: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -713,6 +769,12 @@ struct RawOtlpTraces {
     headers: Option<BTreeMap<String, String>>,
     #[serde(default)]
     headers_file: Option<PathBuf>,
+    #[serde(default)]
+    ca_file: Option<PathBuf>,
+    #[serde(default)]
+    cert_file: Option<PathBuf>,
+    #[serde(default)]
+    key_file: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -729,8 +791,20 @@ struct RawOcsfOtlp {
     #[serde(default)]
     headers_file: Option<PathBuf>,
     #[serde(default)]
+    ca_file: Option<PathBuf>,
+    #[serde(default)]
+    cert_file: Option<PathBuf>,
+    #[serde(default)]
+    key_file: Option<PathBuf>,
+    #[serde(default)]
     schema_version: Option<String>,
 }
+
+/// Most bytes of TLS files that sandbox launch credentials carry, counting
+/// each distinct collector's files once: what one collector's three files
+/// may hold, which keeps the credentials within a shared supervisor's 256
+/// KiB launch material.
+const MAX_SUPERVISOR_TLS_BYTES: usize = 192 * 1024;
 
 /// The collector keys every OTLP table accepts.
 struct RawCollector {
@@ -738,6 +812,9 @@ struct RawCollector {
     protocol: Option<OtlpProtocol>,
     headers: Option<BTreeMap<String, String>>,
     headers_file: Option<PathBuf>,
+    ca_file: Option<PathBuf>,
+    cert_file: Option<PathBuf>,
+    key_file: Option<PathBuf>,
 }
 
 macro_rules! raw_collector {
@@ -747,6 +824,9 @@ macro_rules! raw_collector {
             protocol: $raw.protocol,
             headers: $raw.headers,
             headers_file: $raw.headers_file,
+            ca_file: $raw.ca_file,
+            cert_file: $raw.cert_file,
+            key_file: $raw.key_file,
         }
     };
 }
@@ -764,6 +844,9 @@ impl RawCollector {
                 ("protocol", self.protocol.is_some()),
                 ("headers", self.headers.is_some()),
                 ("headers_file", self.headers_file.is_some()),
+                ("ca_file", self.ca_file.is_some()),
+                ("cert_file", self.cert_file.is_some()),
+                ("key_file", self.key_file.is_some()),
             ]
             .into_iter()
             .find_map(|(key, set)| set.then_some(key));
@@ -777,13 +860,46 @@ impl RawCollector {
                 format!("{table} needs an endpoint, or otlp.endpoint to default to")
             });
         };
-        OtlpCollectorConfig {
+        let tls = Self::tls(
+            table,
+            &endpoint,
+            self.ca_file.as_deref(),
+            self.cert_file.as_deref(),
+            self.key_file.as_deref(),
+        )?;
+        Ok(OtlpCollectorConfig {
             endpoint,
             protocol: self.protocol.unwrap_or_default(),
             headers: OtlpHeaders::resolve(table, self.headers, self.headers_file.as_deref())?,
             headers_file: self.headers_file,
+            ca_file: self.ca_file,
+            cert_file: self.cert_file,
+            key_file: self.key_file,
+            tls,
+        })
+    }
+
+    fn tls(
+        table: &str,
+        endpoint: &str,
+        ca_file: Option<&Path>,
+        cert_file: Option<&Path>,
+        key_file: Option<&Path>,
+    ) -> Result<openshell_otel::OtlpTls, String> {
+        if ca_file.is_none() && cert_file.is_none() && key_file.is_none() {
+            return Ok(openshell_otel::OtlpTls::default());
         }
-        .checked(table)
+        if !endpoint
+            .trim()
+            .get(..8)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        {
+            return Err(format!(
+                "{table} sets TLS files, which need an https:// endpoint"
+            ));
+        }
+        openshell_otel::OtlpTls::from_files(ca_file, cert_file, key_file)
+            .map_err(|error| format!("{table}: {error}"))
     }
 }
 
@@ -796,6 +912,9 @@ impl TryFrom<RawOtlpConfig> for OtlpConfig {
                 ("protocol", raw.protocol.is_some()),
                 ("headers", raw.headers.is_some()),
                 ("headers_file", raw.headers_file.is_some()),
+                ("ca_file", raw.ca_file.is_some()),
+                ("cert_file", raw.cert_file.is_some()),
+                ("key_file", raw.key_file.is_some()),
             ]
             .into_iter()
             .find_map(|(key, set)| set.then_some(key));
@@ -812,6 +931,9 @@ impl TryFrom<RawOtlpConfig> for OtlpConfig {
                 protocol: raw.protocol,
                 headers: raw.headers,
                 headers_file: raw.headers_file,
+                ca_file: raw.ca_file,
+                cert_file: raw.cert_file,
+                key_file: raw.key_file,
             }
             .resolve("otlp", None)
         });
@@ -846,12 +968,21 @@ impl TryFrom<RawOtlpConfig> for OtlpConfig {
                     .to_string(),
             );
         }
-        Ok(Self {
+        let config = Self {
             service_name: raw.service_name,
             traces,
             ocsf,
             agent,
-        })
+        };
+        let supervisor_tls = config.supervisor_tls_bytes();
+        if supervisor_tls > MAX_SUPERVISOR_TLS_BYTES {
+            return Err(format!(
+                "otlp TLS files sent to supervisors total {supervisor_tls} bytes across their \
+                 distinct collectors, more than {MAX_SUPERVISOR_TLS_BYTES}; share TLS files \
+                 between tables or use smaller files"
+            ));
+        }
+        Ok(config)
     }
 }
 
@@ -1856,12 +1987,7 @@ service_name = "openshell-gateway-dev"
         assert_eq!(
             otlp.ocsf,
             Some(OcsfOtlpConfig {
-                collector: OtlpCollectorConfig {
-                    endpoint: "http://127.0.0.1:4317".into(),
-                    protocol: OtlpProtocol::Grpc,
-                    headers: OtlpHeaders::default(),
-                    headers_file: None,
-                },
+                collector: OtlpCollectorConfig::new("http://127.0.0.1:4317", OtlpProtocol::Grpc),
                 schema_version: None,
             })
         );
@@ -1878,12 +2004,7 @@ service_name = "openshell-gateway-dev"
         assert_eq!(
             otlp.ocsf,
             Some(OcsfOtlpConfig {
-                collector: OtlpCollectorConfig {
-                    endpoint: "http://siem:4317".into(),
-                    protocol: OtlpProtocol::Grpc,
-                    headers: OtlpHeaders::default(),
-                    headers_file: None,
-                },
+                collector: OtlpCollectorConfig::new("http://siem:4317", OtlpProtocol::Grpc),
                 schema_version: None,
             })
         );
@@ -2037,19 +2158,6 @@ service_name = "openshell-gateway-dev"
         );
         let error = load(tmp.path()).expect_err("http/json is not supported");
         assert!(format!("{error:#}").contains("http/json"), "{error:#}");
-
-        for table in [
-            "[openshell.gateway.otlp]\nendpoint = 'https://shared:4318'\nprotocol = 'http/protobuf'\n",
-            "[openshell.gateway.otlp.agent]\nenabled = true\nendpoint = 'HTTPS://agents:4318'\n\
-             protocol = 'http/protobuf'\n",
-        ] {
-            let tmp = write_tmp(table);
-            let error = load(tmp.path()).expect_err("https is not supported over http/protobuf");
-            assert!(
-                format!("{error:#}").contains("which http/protobuf does not support"),
-                "{table}: {error:#}"
-            );
-        }
     }
 
     #[test]
@@ -2275,14 +2383,178 @@ service_name = "openshell-gateway-dev"
         assert!(!debug.contains("secret-token"), "{debug}");
     }
 
+    /// A directory holding a test PKI's `ca.pem`, `client.pem`, and
+    /// `client-key.pem`.
+    fn pki_files() -> (openshell_otel_test_support::TestPki, tempfile::TempDir) {
+        let pki = openshell_otel_test_support::TestPki::generate();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ca.pem"), &pki.ca_pem).unwrap();
+        std::fs::write(dir.path().join("client.pem"), &pki.client.cert_pem).unwrap();
+        std::fs::write(dir.path().join("client-key.pem"), &pki.client.key_pem).unwrap();
+        (pki, dir)
+    }
+
+    #[test]
+    fn otlp_tls_files_sent_to_supervisors_fit_their_launch_bundle() {
+        let pki = openshell_otel_test_support::TestPki::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let repeated = |pem: &str, bytes: usize| pem.repeat(bytes / pem.len());
+        let write = |name: &str, contents: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, contents).unwrap();
+            path.display().to_string()
+        };
+        let key = write("client-key.pem", &pki.client.key_pem);
+        let files = |lane: usize| {
+            let ca = write(
+                &format!("ca-{lane}.pem"),
+                &repeated(&pki.ca_pem, 60 * 1024 - lane * pki.ca_pem.len()),
+            );
+            let cert = write(
+                &format!("client-{lane}.pem"),
+                &repeated(&pki.client.cert_pem, 60 * 1024),
+            );
+            format!("ca_file = '{ca}'\ncert_file = '{cert}'\nkey_file = '{key}'\n")
+        };
+
+        otlp(&format!(
+            "[openshell.gateway.otlp]\nendpoint = 'https://shared:4317'\n{}\n\
+             [openshell.gateway.otlp.ocsf]\nenabled = true\n\n\
+             [openshell.gateway.otlp.agent]\nenabled = true\n",
+            files(0)
+        ));
+
+        let tmp = write_tmp(&format!(
+            "[openshell.gateway.otlp.traces]\nendpoint = 'https://traces:4317'\n{}\n\
+             [openshell.gateway.otlp.ocsf]\nenabled = true\nendpoint = 'https://siem:4317'\n{}\n\
+             [openshell.gateway.otlp.agent]\nenabled = true\nendpoint = 'https://agents:4317'\n{}",
+            files(1),
+            files(2),
+            files(3)
+        ));
+        let error = format!("{:#}", load(tmp.path()).expect_err("TLS files too large"));
+        assert!(
+            error.contains("TLS files sent to supervisors total"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn otlp_tls_files_are_read_for_the_collector_they_belong_to() {
+        let (pki, dir) = pki_files();
+        let path = |name: &str| dir.path().join(name).display().to_string();
+        let otlp = otlp(&format!(
+            "[openshell.gateway.otlp]\nendpoint = 'https://shared:4317'\n\
+             ca_file = '{ca}'\ncert_file = '{cert}'\nkey_file = '{key}'\n\n\
+             [openshell.gateway.otlp.ocsf]\nenabled = true\n\n\
+             [openshell.gateway.otlp.agent]\nenabled = true\nendpoint = 'https://agents:4318'\n\
+             ca_file = '{ca}'\n",
+            ca = path("ca.pem"),
+            cert = path("client.pem"),
+            key = path("client-key.pem"),
+        ));
+        let mutual = openshell_otel::OtlpTls::from_pem(
+            Some(pki.ca_pem.as_bytes()),
+            Some((
+                pki.client.cert_pem.as_bytes(),
+                pki.client.key_pem.as_bytes(),
+            )),
+        )
+        .unwrap();
+        let ca_only = openshell_otel::OtlpTls::from_pem(Some(pki.ca_pem.as_bytes()), None).unwrap();
+        assert_eq!(otlp.traces.unwrap().collector.tls, mutual);
+        assert_eq!(
+            otlp.ocsf.unwrap().collector.tls,
+            mutual,
+            "inherits the shared collector"
+        );
+        assert_eq!(
+            otlp.agent.unwrap().collector.tls,
+            ca_only,
+            "inherits nothing"
+        );
+    }
+
+    #[test]
+    fn otlp_tls_files_are_rejected_when_unusable() {
+        let (_pki, dir) = pki_files();
+        let path = |name: &str| dir.path().join(name).display().to_string();
+        for (table, problem) in [
+            (
+                format!(
+                    "endpoint = 'http://shared:4317'\nca_file = '{}'",
+                    path("ca.pem")
+                ),
+                "need an https:// endpoint".to_string(),
+            ),
+            (
+                format!(
+                    "endpoint = 'https://shared:4317'\ncert_file = '{}'",
+                    path("client.pem")
+                ),
+                "otlp: cert_file is set without key_file".to_string(),
+            ),
+            (
+                format!(
+                    "endpoint = 'https://shared:4317'\nkey_file = '{}'",
+                    path("client-key.pem")
+                ),
+                "otlp: key_file is set without cert_file".to_string(),
+            ),
+            (
+                format!(
+                    "endpoint = 'https://shared:4317'\nca_file = '{}'",
+                    path("missing.pem")
+                ),
+                format!("otlp: ca_file {}", path("missing.pem")),
+            ),
+            (
+                format!(
+                    "endpoint = 'https://shared:4317'\nca_file = '{}'",
+                    path("client-key.pem")
+                ),
+                "no PEM certificate".to_string(),
+            ),
+        ] {
+            let tmp = write_tmp(&format!("[openshell.gateway.otlp]\n{table}\n"));
+            let error = format!("{:#}", load(tmp.path()).expect_err(&table));
+            assert!(error.contains(&problem), "{table}: {error}");
+        }
+
+        let tmp = write_tmp(&format!(
+            "[openshell.gateway.otlp]\nendpoint = 'https://shared:4317'\n\n\
+             [openshell.gateway.otlp.traces]\nca_file = '{}'\n",
+            path("ca.pem")
+        ));
+        let error = format!("{:#}", load(tmp.path()).unwrap_err());
+        assert!(
+            error.contains("sets ca_file without its own endpoint"),
+            "{error}"
+        );
+
+        let tmp = write_tmp(&format!(
+            "[openshell.gateway.otlp]\nca_file = '{}'\n\n\
+             [openshell.gateway.otlp.traces]\nendpoint = 'https://traces:4317'\n",
+            path("ca.pem")
+        ));
+        let error = format!("{:#}", load(tmp.path()).unwrap_err());
+        assert!(
+            error.contains("otlp sets ca_file without its own endpoint"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn otlp_config_round_trips() {
-        let tmp = write_tmp(
+        let (_pki, pki_dir) = pki_files();
+        let tmp = write_tmp(&format!(
             "[openshell.gateway.otlp]\nendpoint = 'http://shared:4317'\nservice_name = 'gw'\n\n\
              [openshell.gateway.otlp.ocsf]\nenabled = true\n\n\
              [openshell.gateway.otlp.agent]\nenabled = true\nendpoint = 'http://agents:4318'\n\
-             protocol = 'http/protobuf'\nheaders = { x-mlflow-experiment-id = '0' }\n",
-        );
+             protocol = 'http/protobuf'\nheaders = {{ x-mlflow-experiment-id = '0' }}\n\n\
+             [openshell.gateway.otlp.traces]\nendpoint = 'https://traces:4317'\nca_file = '{ca}'\n",
+            ca = pki_dir.path().join("ca.pem").display(),
+        ));
         let file = load(tmp.path()).unwrap();
         let encoded = toml::to_string(&file).unwrap();
         let decoded = toml::from_str::<ConfigFile>(&encoded).unwrap();

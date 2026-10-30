@@ -11,6 +11,7 @@ impl OtlpTarget {
     /// Build a log exporter for this target. Callers attach
     /// [`Self::resource`] to it.
     pub fn log_exporter(&self) -> Result<LogExporter, SetupError> {
+        self.check_tls()?;
         match self.protocol {
             Protocol::Grpc => Ok(self
                 .configure(LogExporter::builder().with_tonic())
