@@ -219,7 +219,7 @@ git worktree remove --force "$wt"
 | Transient infrastructure failure in a pre-release, including a registry push | After approval, `gh run rerun <run-id> --failed`. `Release` won't select the run until all of it passes. |
 | Pre-release run ends in `startup_failure` | The workflow file is invalid at that commit. Fix it in a new `-pre.N` (Monday step 3). |
 | Code defect or `Cargo Deny` advisory | Rerunning won't help. Fix it in a new `-pre.N` (Monday step 3). |
-| `Release` fails after selection | After approval, rerun only the failed jobs that haven't published. |
+| `Release` fails after selection | After approval, rerun only the failed jobs that haven't published. If the run's artifacts expired or its jobs were skipped, dispatch `Release` again with `-f tag=vX.Y.Z`; it publishes only what is missing. |
 
 ## Related
 

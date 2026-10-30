@@ -19,11 +19,6 @@ on:
         required: false
         default: false
         type: boolean
-      release-notes-reused:
-        description: Whether the calling run already uploaded release-notes from the promoted prerelease's preview
-        required: false
-        default: false
-        type: boolean
       source-sha:
         description: Source commit of the built artifacts in the calling run
         required: true
@@ -48,9 +43,6 @@ on:
       GITLAB_CI_TRIGGER_TOKEN:
         required: false
       GITLAB_CI_TRIGGER_URL:
-        required: false
-      LLM_INFERENCE_API_KEY:
-        description: NVIDIA Inference Hub API key for stable release notes
         required: false
 
 permissions:
@@ -264,11 +256,23 @@ jobs:
           set -euo pipefail
           for component in gateway sandbox supervisor; do
             image="ghcr.io/nvidia/openshell/${component}:${VERSION}"
-            # Archives are build artifacts from this run, not externally signed images.
-            nix shell --inputs-from . nixpkgs#skopeo -c \
-              skopeo --insecure-policy copy --all --preserve-digests \
-              --authfile "${HOME}/.docker/config.json" \
-              "oci-archive:artifacts/images/${component}.tar" "docker://${image}"
+            # Never replace a published stable image; a rerun keeps the original.
+            # Only a missing manifest means unpublished; any other lookup error
+            # fails rather than risk overwriting.
+            if lookup_error=$(nix shell --inputs-from . nixpkgs#skopeo -c \
+              skopeo inspect --raw --authfile "${HOME}/.docker/config.json" \
+              "docker://${image}" 2>&1 >/dev/null); then
+              echo "${image} is already published; keeping it."
+            elif [[ "${lookup_error}" != *"manifest unknown"* ]]; then
+              echo "::error::Could not check whether ${image} is published: ${lookup_error}"
+              exit 1
+            else
+              # Archives are build artifacts from this run, not externally signed images.
+              nix shell --inputs-from . nixpkgs#skopeo -c \
+                skopeo --insecure-policy copy --all --preserve-digests \
+                --authfile "${HOME}/.docker/config.json" \
+                "oci-archive:artifacts/images/${component}.tar" "docker://${image}"
+            fi
             tasks/scripts/verify-image-sbom.sh "${image}" --require-cargo
           done
 
@@ -326,28 +330,24 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.source-sha }}
 
-      - uses: ./.github/actions/release-helm-oci
+      # Charts come from the release source; the publish logic comes from this
+      # workflow so retrying an older tag uses the current duplicate handling.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.workflow_sha }}
+          path: release-workflow
+          sparse-checkout: .github/actions/release-helm-oci
+
+      - uses: ./release-workflow/.github/actions/release-helm-oci
         with:
           chart-version: ${{ inputs.semver }}
           app-version: ${{ inputs.semver }}
           release-kind: public
 
-  release-notes:
-    name: Write Release Notes
-    if: ${{ !inputs.is-prerelease && !inputs.release-notes-reused }}
-    permissions:
-      contents: read
-      pull-requests: read
-    uses: ./.github/workflows/release-notes.yml
-    with:
-      release-tag: ${{ inputs.release-tag }}
-    secrets:
-      LLM_INFERENCE_API_KEY: ${{ secrets.LLM_INFERENCE_API_KEY }}
-
   release:
     name: Publish Release Assets
-    needs: [assemble, release-helm, release-notes]
-    if: ${{ !cancelled() && needs.assemble.result == 'success' && needs.release-helm.result == 'success' && (inputs.is-prerelease || inputs.release-notes-reused || needs.release-notes.result == 'success') }}
+    needs: [assemble, release-helm]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:
@@ -393,6 +393,7 @@ jobs:
               }
             }
 
+      # Stable callers upload release-notes in the same run before calling Publish.
       - name: Download release notes
         if: ${{ !inputs.is-prerelease }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -416,6 +417,8 @@ jobs:
           make_latest: ${{ steps.latest.outputs.make-latest == 'true' && 'true' || 'false' }}
           tag_name: ${{ env.RELEASE_TAG }}
           body_path: release/release-notes.md
+          # A rerun uploads only missing assets and keeps published ones.
+          overwrite_files: false
           files: |
             release/openshell-x86_64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-unknown-linux-musl.tar.gz
@@ -591,3 +594,49 @@ jobs:
       publish: true
     secrets:
       FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+
+  # GitHub treats skipped jobs as passing, so a publisher that never ran would
+  # leave the run green. Fail when any publisher expected for this release kind
+  # did not succeed, so callers' failure notifications fire.
+  check-publication:
+    name: Check Publication
+    needs:
+      - assemble
+      - tag-ghcr-release
+      - release-helm
+      - release
+      - publish-snap
+      - publish-prerelease-snap
+      - publish-sdk-typescript
+      - tag-sdk-go
+      - trigger-wheel-publish
+      - publish-fern-docs
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every expected publisher to succeed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          IS_PRERELEASE: ${{ inputs.is-prerelease }}
+          MAKE_LATEST: ${{ inputs.make-latest }}
+        run: |
+          set -euo pipefail
+          expected=(assemble tag-ghcr-release release-helm release)
+          if [[ "${IS_PRERELEASE}" == "true" ]]; then
+            expected+=(publish-prerelease-snap)
+          else
+            expected+=(publish-sdk-typescript tag-sdk-go trigger-wheel-publish publish-fern-docs)
+            if [[ "${MAKE_LATEST}" == "true" ]]; then
+              expected+=(publish-snap)
+            fi
+          fi
+          failed=0
+          for job in "${expected[@]}"; do
+            result=$(jq -r --arg job "${job}" '.[$job].result' <<<"${NEEDS}")
+            if [[ "${result}" != "success" ]]; then
+              echo "::error::${job} did not publish (result: ${result})"
+              failed=1
+            fi
+          done
+          exit "${failed}"

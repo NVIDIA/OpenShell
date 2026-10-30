@@ -197,7 +197,7 @@ qualification; stable publication is blocked, while published pre-release
 artifacts remain available. The Pre-release failure notification includes the
 run link. Both callers share `release-build.yml` and `release-publish.yml`.
 Qualification evidence remains in Actions; publishing a copy to OCI storage is best effort.
-Snap Store uploads happen only for stable releases after qualification passes.
+Pre-release uploads snaps to `latest/beta`; stable releases upload to `latest/stable`.
 
 For a release notes preview, dispatch `release.yml` with `notes-only=true` and
 `tag=<stable-tag>`. The generator resolves the previous reachable stable tag;
@@ -214,8 +214,8 @@ and qualification, and keeps the notes only in the `release-notes` artifact.
 This job is advisory: a notes failure emits a warning without failing the
 prerelease run or blocking promotion. Stable publication reuses the promoted
 prerelease's `release-notes` artifact, retagged, and generates notes only when
-that preview is unavailable. The `Select Qualified Prerelease` summary says
-which happened.
+that preview is unavailable. The Release workflow's `Release Notes` job summary
+says which happened, and Publish waits for that job.
 
 For `Codex Compatibility Review`, inspect its job summary and the
 `compatibility-review-run-<run-id>-attempt-<attempt>` artifact. Confirm the

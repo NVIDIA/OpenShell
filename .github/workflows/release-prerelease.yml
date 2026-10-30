@@ -99,6 +99,7 @@ jobs:
     name: Preview Release Notes
     needs: [resolve, build]
     permissions:
+      actions: read
       contents: read
       pull-requests: read
     uses: ./.github/workflows/release-notes.yml
@@ -114,7 +115,6 @@ jobs:
     permissions:
       actions: read
       contents: write
-      pull-requests: read
       packages: write
       id-token: write
       attestations: write

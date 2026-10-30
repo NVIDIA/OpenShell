@@ -3,8 +3,8 @@
 
 name: Release Helm OCI
 description: >
-  Patch chart version/appVersion, refuse duplicate OCI versions on public
-  releases, package the gateway and workspace charts, and push them to GHCR OCI.
+  Patch chart version/appVersion, package the gateway and workspace charts, and
+  push them to GHCR OCI. Public releases never overwrite published versions.
 
 inputs:
   chart-version:
@@ -63,22 +63,38 @@ runs:
         echo "workspace_chart_dir=${WORKSPACE_CHART_DIR}" >> "$GITHUB_OUTPUT"
         echo "chart_version=${CHART_VERSION}" >> "$GITHUB_OUTPUT"
 
-    - name: Refuse duplicate chart version
+    # Public chart versions are never overwritten. A rerun keeps both published
+    # charts; a partial publication still fails for manual repair.
+    - name: Check for published chart version
+      id: published
       if: inputs.release-kind == 'public'
       env:
         CHART_VERSION: ${{ steps.prep.outputs.chart_version }}
       shell: bash
       run: |
         set -euo pipefail
+        found=0
         for chart in helm-chart openshell-workspace; do
           OCI_CHART="oci://ghcr.io/nvidia/openshell/${chart}"
-          if helm show chart "${OCI_CHART}" --version "${CHART_VERSION}" >/dev/null 2>&1; then
-            echo "::error::Chart ${chart}:${CHART_VERSION} is already published. Use a new tag or delete the existing package first."
+          # Only "not found" means unpublished; any other lookup error fails
+          # rather than risk overwriting.
+          if lookup_error=$(helm show chart "${OCI_CHART}" --version "${CHART_VERSION}" 2>&1 >/dev/null); then
+            found=$((found + 1))
+          elif [[ "${lookup_error}" != *"ghcr.io/nvidia/openshell/${chart}:${CHART_VERSION}: not found"* ]]; then
+            echo "::error::Could not check whether ${chart}:${CHART_VERSION} is published: ${lookup_error}"
             exit 1
           fi
         done
+        if [ "${found}" -eq 2 ]; then
+          echo "Charts ${CHART_VERSION} are already published; keeping them."
+          echo "published=true" >> "$GITHUB_OUTPUT"
+        elif [ "${found}" -ne 0 ]; then
+          echo "::error::Only one chart is published at ${CHART_VERSION}. Delete it or publish the other chart manually."
+          exit 1
+        fi
 
     - name: Package Helm chart
+      if: steps.published.outputs.published != 'true'
       env:
         GATEWAY_CHART_DIR: ${{ steps.prep.outputs.gateway_chart_dir }}
         WORKSPACE_CHART_DIR: ${{ steps.prep.outputs.workspace_chart_dir }}
@@ -91,6 +107,7 @@ runs:
         ls /tmp/helm-charts/*.tgz
 
     - name: Push Helm chart to GHCR OCI
+      if: steps.published.outputs.published != 'true'
       shell: bash
       run: |
         set -euo pipefail

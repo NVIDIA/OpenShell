@@ -95,6 +95,11 @@ jobs:
         run: |
           set -euo pipefail
           npm pkg set version="${OPENSHELL_NPM_VERSION}"
+          package="$(npm pkg get name | tr -d '"')@${OPENSHELL_NPM_VERSION}"
+          if npm view "${package}" version >/dev/null 2>&1; then
+            echo "${package} is already published."
+            exit 0
+          fi
           dist_tag=latest
           if [[ "${MAKE_LATEST}" != "true" ]]; then
             dist_tag="release-${OPENSHELL_NPM_VERSION%.*}"

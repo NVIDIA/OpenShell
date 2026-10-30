@@ -100,6 +100,10 @@ jobs:
             echo "No wheel filenames provided by build job" >&2
             exit 1
           fi
+          if curl --fail --silent --output /dev/null "https://pypi.org/pypi/openshell/${RELEASE_VERSION}/json"; then
+            echo "openshell ${RELEASE_VERSION} is already on PyPI."
+            exit 0
+          fi
 
           response=$(curl -X POST \
             --fail \
