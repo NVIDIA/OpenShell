@@ -103,6 +103,7 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Contributing    | `create-github-issue`     | Create well-structured GitHub issues                                                                |
 | Contributing    | `create-security-advisory` | Prepare structured vulnerability reports and authorized private GitHub advisory drafts             |
 | Contributing    | `create-github-pr`        | Create pull requests with proper conventions                                                        |
+| Contributing    | `test-audit`              | Gate new tests and audit existing ones for junk patterns and mock-only coverage of real dependencies |
 | Reviewing       | `review-github-pr`        | Summarize PR diffs and key design decisions                                                         |
 | Reviewing       | `review-security-issue`   | Assess security issues and private advisories for severity and remediation                           |
 | Reviewing       | `fix-security-issue`      | Implement an approved security remediation plan                                                     |
