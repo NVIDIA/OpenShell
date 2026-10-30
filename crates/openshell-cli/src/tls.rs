@@ -5,6 +5,7 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 pub use openshell_core::replica_routing::{
     owner_replica, retry_unrouted, routed_to, with_owner_hint,
 };
+use openshell_otel::EnvTraceContextInterceptor;
 use openshell_sdk::{AuthConfig, ClientConfig, ClientIdentity, OpenShellClient};
 use rustls::{
     RootCertStore,
@@ -16,7 +17,32 @@ use std::path::PathBuf;
 use tonic::transport::Channel;
 
 /// Concrete gRPC client type used by all commands.
-pub type GrpcClient = openshell_sdk::raw::AuthedGrpcClient;
+pub type GrpcClient = openshell_sdk::raw::GrpcClient<
+    tonic::service::interceptor::InterceptedService<Channel, GatewayInterceptor>,
+>;
+
+/// Interceptor stack applied to gateway requests from clients built by
+/// [`grpc_client`].
+///
+/// Runs authentication header injection first, then passive W3C trace-context
+/// forwarding so a CI pipeline's `TRACEPARENT` extends into the gateway's
+/// spans. tonic allows a single interceptor per channel, so the two concerns
+/// are composed here.
+#[derive(Clone)]
+pub struct GatewayInterceptor {
+    auth: openshell_sdk::EdgeAuthInterceptor,
+    trace: EnvTraceContextInterceptor,
+}
+
+impl tonic::service::Interceptor for GatewayInterceptor {
+    fn call(
+        &mut self,
+        request: tonic::Request<()>,
+    ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
+        let request = self.auth.call(request)?;
+        self.trace.call(request)
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct TlsOptions {
@@ -313,9 +339,10 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
 
 /// Build the SDK client and return its raw gRPC escape hatch.
 ///
-/// When `tls.edge_token` is set, the returned client is wrapped with an
-/// interceptor that injects authentication headers on every request.
-/// Otherwise, standard mTLS is used (interceptor is a no-op).
+/// The returned client carries a [`GatewayInterceptor`] that injects
+/// authentication headers (when a token is set) and passively forwards the
+/// `TRACEPARENT`/`TRACESTATE` trace context from the environment on every
+/// request. With no token and no trace context, the interceptor is a no-op.
 pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
     let config = sdk_client_config(server, tls)?;
     // Keep the SDK's transport state machine out of every command future.
@@ -323,14 +350,71 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
     let client = Box::pin(OpenShellClient::connect(config))
         .await
         .into_diagnostic()?;
-    Ok(client.raw_grpc())
+    // tonic allows a single interceptor per channel: compose the SDK's auth
+    // interceptor (sharing its live bearer slot) with the CLI's passive
+    // trace-context forwarding.
+    let interceptor = GatewayInterceptor {
+        auth: client.auth_interceptor(),
+        trace: EnvTraceContextInterceptor::from_env(),
+    };
+    Ok(openshell_sdk::raw::GrpcClient::with_interceptor(
+        client.channel(),
+        interceptor,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TlsOptions, sdk_client_config};
-    use openshell_sdk::AuthConfig;
+    use super::{GatewayInterceptor, TlsOptions, sdk_client_config};
+    use crate::TEST_ENV_LOCK;
+    use openshell_otel::EnvTraceContextInterceptor;
+    use openshell_sdk::{AuthConfig, EdgeAuthInterceptor};
     use std::io::Write;
+    use tonic::service::Interceptor as _;
+
+    #[test]
+    fn gateway_interceptor_composes_auth_and_trace_forwarding() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        temp_env::with_vars(
+            [
+                ("TRACEPARENT", Some(traceparent)),
+                ("TRACESTATE", Some("vendor=value")),
+            ],
+            || {
+                let mut interceptor = GatewayInterceptor {
+                    auth: EdgeAuthInterceptor::new(Some("test-token"), None).unwrap(),
+                    trace: EnvTraceContextInterceptor::from_env(),
+                };
+
+                let request = interceptor.call(tonic::Request::new(())).unwrap();
+
+                assert_eq!(
+                    request
+                        .metadata()
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("Bearer test-token")
+                );
+                assert_eq!(
+                    request
+                        .metadata()
+                        .get("traceparent")
+                        .and_then(|value| value.to_str().ok()),
+                    Some(traceparent)
+                );
+                assert_eq!(
+                    request
+                        .metadata()
+                        .get("tracestate")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("vendor=value")
+                );
+            },
+        );
+    }
 
     #[test]
     fn sdk_config_carries_cli_mtls_materials() {
