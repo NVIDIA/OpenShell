@@ -35,7 +35,12 @@ set -eu
 echo "docker $*" >> "$CALLS"
 case "$1" in
     --version) echo 'Docker test stub' ;;
-    push) exit "${TEST_PUSH_STATUS:-0}" ;;
+    push)
+        if [[ "${2:-}" == --digestfile && "${TEST_SKIP_DIGEST:-0}" != 1 ]]; then
+            printf '%s\n' "${TEST_PUSH_DIGEST:-sha256:$TEST_DIGEST}" > "$3"
+        fi
+        exit "${TEST_PUSH_STATUS:-0}"
+        ;;
     image) printf '["%s@sha256:%s"]\n' "${TEST_INSPECT_REPOSITORY:-registry.test/team/gator}" "$TEST_DIGEST" ;;
 esac
 SH
@@ -84,6 +89,23 @@ TEST_PUBLISH=docker.io/team/gator:tooling TEST_INSPECT_REPOSITORY=team/gator \
     run_transport > "$tmp/out"
 grep -Fxq "docker.io/team/gator@sha256:$TEST_DIGEST" "$tmp/out"
 echo 'ok - Docker Hub digest normalization preserves the explicit registry'
+
+: > "$CALLS"
+pushed_digest="sha256:$(printf 'b%.0s' {1..64})"
+TEST_ENGINE=podman TEST_PUBLISH=registry.test/team/gator:tooling \
+    TEST_PUSH_DIGEST="$pushed_digest" run_transport > "$tmp/out"
+grep -Fxq "registry.test/team/gator@$pushed_digest" "$tmp/out"
+grep -Fq 'push --digestfile ' "$CALLS"
+if grep -Fq 'image inspect' "$CALLS"; then
+    fail 'Podman registry delivery used the local image digest'
+fi
+TEST_ENGINE=podman TEST_PUBLISH=registry.test/team/gator:tooling \
+    TEST_PUSH_DIGEST=malformed expect_failure run_transport
+TEST_ENGINE=podman TEST_PUBLISH=registry.test/team/gator:tooling \
+    TEST_SKIP_DIGEST=1 expect_failure run_transport
+TEST_ENGINE=podman TEST_PUBLISH=registry.test/team/gator:tooling \
+    TEST_PUSH_STATUS=1 expect_failure run_transport
+echo 'ok - Podman uses the pushed manifest digest and rejects missing or invalid digests'
 
 : > "$CALLS"
 TEST_IMAGE="registry.test/team/gator@sha256:$TEST_DIGEST" run_transport > "$tmp/out"

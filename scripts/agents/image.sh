@@ -81,8 +81,23 @@ deliver_agent_image() {
             ;;
         registry)
             log "Publishing '$image_tag'."
-            ce push "$image_tag" || fail "image push failed"
             local repository="${image_tag%:*}"
+            if [[ "$CONTAINER_ENGINE" == podman ]]; then
+                # Podman may convert the manifest on push. RepoDigests describes
+                # the local image, not necessarily the manifest in the registry.
+                local digest_dir digest
+                digest_dir="$(mktemp -d)" || fail "cannot create push digest directory"
+                if ! ce push --digestfile "$digest_dir/digest" "$image_tag"; then
+                    rm -rf "$digest_dir"
+                    fail "image push failed"
+                fi
+                digest="$(cat "$digest_dir/digest" 2>/dev/null)" || digest=""
+                rm -rf "$digest_dir"
+                [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || fail "cannot resolve published image digest; refusing mutable-tag launch"
+                SANDBOX_FROM="$repository@$digest"
+                return
+            fi
+            ce push "$image_tag" || fail "image push failed"
             SANDBOX_FROM="$(ce image inspect "$image_tag" --format '{{json .RepoDigests}}' | ruby -rjson -e '
               digests = JSON.parse(STDIN.read) || []
               normalize = lambda do |repository|
