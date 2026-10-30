@@ -243,7 +243,10 @@ suite, with a name that says what the suite tests.
 3. Re-lock the workspace: `cargo metadata --manifest-path
    tests/suites/features/Cargo.toml`, then
    `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`.
-4. Add a row for the suite to the matrix in `.github/workflows/e2e-suites.yml`.
+4. Add `cargo fmt` and `cargo clippy` lines for the package (`-p <name>`) to
+   `tasks/rust.toml` and to the Format and Lint steps in
+   `.github/workflows/branch-checks.yml`.
+5. Add a row for the suite to the matrix in `.github/workflows/e2e-suites.yml`.
 
 If the feature only needs the gateway, run the suite in an existing
 environment such as `ubuntu-docker-rootful`, and skip the rest of this
@@ -268,7 +271,8 @@ service.
   `tests/support/<service>`, so any suite can depend on it, or reuse the
   existing one. It defines the variable names as constants and a
   `<Service>Context::new(cx)` that reads them, waits for the service, and
-  wraps the testkit `Context`. Each test calls it on its first line. Nextest runs each test in its own process, so the fixture builds its
+  wraps the testkit `Context`. Each test calls it on its first line.
+  Nextest runs each test in its own process, so the fixture builds its
   clients there from the variables. A missing variable fails the test; it
   never skips it.
 - **Documentation.** Document the variables in the fixture's module docs, so

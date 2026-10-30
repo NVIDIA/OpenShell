@@ -10,9 +10,10 @@
 //! on tmachine: anyone running a suite against their own deployment sets the
 //! same variables.
 //!
-//! The values can be credentials, so they stay in the guest. The runner
-//! [`check`]s the files but never puts a value in a command it runs over
-//! SSH; the test command exports the files itself with [`export_script`].
+//! The values can be credentials, so they never appear in a command line or
+//! an error. The runner [`check`]s the names but never puts a value in a
+//! command it runs over SSH; the test command exports the files itself with
+//! [`export_script`].
 
 use anyhow::{Context, Result, bail, ensure};
 use tmachine::Session;
