@@ -397,52 +397,28 @@ Run the Docker-backed Rust CLI e2e suite:
 mise run e2e:docker
 ```
 
-Run the portable CLI conformance suite against the gateway selected in your
-OpenShell CLI configuration:
+Run the conformance suite against the gateway selected in your OpenShell CLI
+configuration:
 
 ```shell
 cargo build --package openshell-cli
 OPENSHELL_BIN="$PWD/target/debug/openshell" \
-  cargo test \
+  cargo nextest run \
     --locked \
     --manifest-path tests/suites/conformance/Cargo.toml \
-    --package openshell-test-conformance-cli \
-    --no-fail-fast \
-    -- \
-    --test-threads=1 \
-    --nocapture
+    --package sandbox \
+    --test-threads 1 \
+    --no-fail-fast
 ```
 
 The gateway must already be installed, reachable, and selected before the tests
 start. The test suite does not provision a gateway or select a compute driver.
 Set `OPENSHELL_BIN` to another executable to test a different prebuilt CLI.
+[tests/testkit/README.md](tests/testkit/README.md) covers gateway selection and
+cleanup.
 
-The phase-1 scenario verifies the complete CLI-to-gateway-to-driver path without
-depending on how the gateway was installed or which driver is configured. It
-requires machine-readable gRPC status, creates a uniquely named detached
-sandbox with the configured default image, verifies the sandbox is `Ready` by finding its
-unique name in paginated JSON list output, executes `echo` with a run-specific
-marker, deletes the sandbox, and verifies that its name no longer appears.
-Driver suites enable the same profile
-instead of maintaining a separate smoke implementation. Sandbox lifecycle,
-label matrices, VM overlay, and TLS-key permission assertions remain regular
-E2E coverage.
-
-Each invocation prints a ten-character run ID before creating resources.
-Conformance sandboxes use names such as `ct-<run-id>-01`. The runner tracks the
-exact name and uses it for cleanup; phase 1 does not add ownership labels.
-
-The runner deletes owned resources after both success and failure. If the test
-process is interrupted before cleanup, locate leftovers without touching
-unrelated gateway state:
-
-```shell
-openshell sandbox list --output json
-openshell sandbox delete <sandbox-name>
-```
-
-Gateway-backed Rust E2E tasks run the CLI conformance Cargo tests against the
-configured gateway, then run any lane-specific Rust tests that still apply.
+Gateway-backed Rust E2E tasks run the conformance suite against the configured
+gateway, then run any lane-specific Rust tests that still apply.
 Run the Podman-backed Rust CLI e2e suite:
 
 ```shell
