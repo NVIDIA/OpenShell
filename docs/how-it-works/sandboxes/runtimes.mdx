@@ -121,7 +121,7 @@ Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint
 
 `supervisor_network_mode` defaults to `host`. Set `bridge` to use Docker bridge networking; `auto` also selects host. The workload always retains `network=none`.
 
-Host mode on Docker Desktop requires host networking enabled. Bridge mode automatically uses `host.docker.internal` for a gateway on the Desktop host. On native Linux, the gateway and host services must listen on bridge-reachable addresses. Set `grpc_endpoint` for remote gateways, remapped published ports, or other custom layouts. Endpoint selection preserves TLS verification and does not change the gateway's listener. See [Docker configuration](/how-it-works/gateways/configuration#docker).
+Host mode on Docker Desktop requires host networking enabled. When the gateway runs inside WSL 2 with Docker Desktop, host mode connects sandboxes to the gateway through `host.docker.internal` automatically. Bridge mode automatically uses `host.docker.internal` for a gateway on the Desktop host. On native Linux, the gateway and host services must listen on bridge-reachable addresses. Set `grpc_endpoint` for remote gateways, remapped published ports, or other custom layouts. Endpoint selection preserves TLS verification and does not change the gateway's listener. See [Docker configuration](/how-it-works/gateways/configuration#docker).
 
 OpenShell discovers Docker's host address automatically in bridge mode. Set `host_gateway_ip` only to override discovery.
 
