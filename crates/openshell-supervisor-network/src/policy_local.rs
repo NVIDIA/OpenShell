@@ -8,7 +8,7 @@ use miette::{IntoDiagnostic, Result};
 use openshell_core::grpc_client::GatewayEndpoint;
 use openshell_core::proposals::AgentProposals;
 use openshell_core::proto::{
-    L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
+    L7Rule, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
     SandboxPolicy as ProtoSandboxPolicy,
 };
 use openshell_ocsf::{
@@ -1227,11 +1227,18 @@ fn network_rule_from_json(
         .map(|binary| NetworkBinary { path: binary.path })
         .collect();
 
-    Ok(NetworkPolicyRule {
+    let rule = NetworkPolicyRule {
         name: rule.name.unwrap_or_default(),
         endpoints,
         binaries,
-    })
+    };
+    // Reject a rule the supervisor would refuse to load after approval.
+    let policy = ProtoSandboxPolicy {
+        network_policies: HashMap::from([("proposal".to_string(), rule.clone())]),
+        ..Default::default()
+    };
+    crate::opa::validated_proto_data(&policy, 0, true).map_err(|invalid| invalid.to_string())?;
+    Ok(rule)
 }
 
 fn network_endpoint_from_json(
@@ -1261,6 +1268,27 @@ fn network_endpoint_from_json(
     if ports.is_empty() {
         return Err("endpoint.port or endpoint.ports is required".to_string());
     }
+    // A more specific endpoint path can replace the protocol and enforcement
+    // of an operator endpoint on the same host, so only operators set it.
+    if !endpoint.path.is_empty() {
+        return Err(
+            "endpoint.path is not supported in proposals; ask an administrator to add it"
+                .to_string(),
+        );
+    }
+    // `tool` is shorthand for `params.name`; when both are set the policy
+    // conversion keeps `params.name` and drops `tool`.
+    if endpoint
+        .rules
+        .iter()
+        .any(|rule| rule.allow.tool.is_some() && rule.allow.params.contains_key("name"))
+        || endpoint
+            .deny_rules
+            .iter()
+            .any(|rule| rule.tool.is_some() && rule.params.contains_key("name"))
+    {
+        return Err("set either `tool` or `params.name` on a rule, not both".to_string());
+    }
     if endpoint
         .rules
         .iter()
@@ -1274,34 +1302,13 @@ fn network_endpoint_from_json(
         .rules
         .into_iter()
         .map(|rule| L7Rule {
-            allow: Some(L7Allow {
-                method: rule.allow.method,
-                path: rule.allow.path,
-                command: rule.allow.command,
-                query: HashMap::new(),
-                // GraphQL fields default empty — agent-authored proposals from
-                // policy.local target REST/SQL/L4 endpoints; GraphQL operation
-                // matching is set on the policy server side or via direct YAML.
-                operation_type: String::new(),
-                operation_name: String::new(),
-                fields: Vec::new(),
-                params: HashMap::new(),
-            }),
+            allow: Some(openshell_policy::allow_def_to_proto(rule.allow)),
         })
         .collect();
     let deny_rules = endpoint
         .deny_rules
         .into_iter()
-        .map(|rule| L7DenyRule {
-            method: rule.method,
-            path: rule.path,
-            command: rule.command,
-            query: HashMap::new(),
-            operation_type: String::new(),
-            operation_name: String::new(),
-            fields: Vec::new(),
-            params: HashMap::new(),
-        })
+        .map(openshell_policy::deny_def_to_proto)
         .collect();
 
     Ok(NetworkEndpoint {
@@ -1327,13 +1334,16 @@ fn network_endpoint_from_json(
         allow_uninspected_credentials: false,
         provider_credentialed: false,
         advisor_proposed: false,
-        // GraphQL persisted-query knobs and path scoping default empty —
-        // agent proposals don't author them today.
+        // GraphQL persisted-query knobs default empty — agent proposals
+        // don't author them today.
         persisted_queries: String::new(),
         graphql_persisted_queries: HashMap::new(),
         graphql_max_body_bytes: 0,
         json_rpc_max_body_bytes: 0,
-        mcp: None,
+        mcp: endpoint.mcp.map(|mcp| McpOptions {
+            versions: mcp.versions,
+            ..Default::default()
+        }),
         path: String::new(),
         credential_signing: String::new(),
         signing_service: String::new(),
@@ -1457,7 +1467,10 @@ struct ProposalRequest {
     operations: Vec<serde_json::Value>,
 }
 
+// Proposal rule structs reject unknown keys: a dropped field could widen the
+// rule the reviewer approves.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddNetworkRuleJson {
     #[serde(default, rename = "ruleName")]
     rule_name: Option<String>,
@@ -1465,6 +1478,7 @@ struct AddNetworkRuleJson {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NetworkPolicyRuleJson {
     #[serde(default)]
     name: Option<String>,
@@ -1475,8 +1489,11 @@ struct NetworkPolicyRuleJson {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NetworkEndpointJson {
     host: String,
+    #[serde(default)]
+    path: String,
     #[serde(default)]
     port: u32,
     #[serde(default)]
@@ -1494,45 +1511,36 @@ struct NetworkEndpointJson {
     #[serde(default)]
     allowed_ips: Vec<String>,
     #[serde(default)]
-    deny_rules: Vec<L7DenyRuleJson>,
+    deny_rules: Vec<openshell_policy_schema::L7DenyRule>,
     #[serde(default)]
     allow_encoded_slash: bool,
+    #[serde(default)]
+    mcp: Option<McpJson>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpJson {
+    versions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NetworkBinaryJson {
     path: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct L7RuleJson {
-    allow: L7AllowJson,
-}
-
-#[derive(Debug, Deserialize)]
-struct L7AllowJson {
-    #[serde(default)]
-    method: String,
-    #[serde(default)]
-    path: String,
-    #[serde(default)]
-    command: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct L7DenyRuleJson {
-    #[serde(default)]
-    method: String,
-    #[serde(default)]
-    path: String,
-    #[serde(default)]
-    command: String,
+    allow: openshell_policy_schema::L7Allow,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use openshell_core::proposals::AgentProposals;
+    use openshell_core::proto::L7Allow;
 
     fn test_workspace_rx() -> tokio::sync::watch::Receiver<String> {
         tokio::sync::watch::channel(String::new()).1
@@ -1691,6 +1699,83 @@ mod tests {
             endpoint.tls,
             openshell_core::proto::NetworkTlsMode::Unspecified as i32
         );
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_keeps_mcp_tool() {
+        let body = br#"{
+            "operations": [{"addRule": {"ruleName": "wiki_mcp", "rule": {
+                "endpoints": [{"host": "mcp.example.org", "port": 443,
+                    "protocol": "mcp", "enforcement": "enforce",
+                    "mcp": {"versions": ["2025-11-25"]},
+                    "rules": [{"allow": {"method": "initialize"}},
+                              {"allow": {"method": "tools/call", "tool": "read_wiki_structure"}}],
+                    "deny_rules": [{"method": "tools/call", "tool": "delete_*"}]}],
+                "binaries": [{"path": "/usr/bin/curl"}]}}}]
+        }"#;
+
+        let chunks = proposal_chunks_from_body(body).unwrap();
+        let endpoint = &chunks[0].proposed_rule.as_ref().unwrap().endpoints[0];
+        assert_eq!(
+            endpoint.mcp.as_ref().unwrap().versions,
+            vec!["2025-11-25".to_string()]
+        );
+        let tool_call = endpoint.rules[1].allow.as_ref().unwrap();
+        assert_eq!(tool_call.method, "tools/call");
+        assert_eq!(tool_call.params["name"].glob, "read_wiki_structure");
+        assert_eq!(endpoint.deny_rules[0].params["name"].glob, "delete_*");
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_rejects_rules_the_supervisor_cannot_load() {
+        for (endpoint, reason) in [
+            (
+                r#"{"host":"mcp.example.org","port":443,"path":"/mcp","protocol":"mcp"}"#,
+                "endpoint.path",
+            ),
+            (
+                r#"{"host":"mcp.example.org","port":443,"protocol":"mcp","rules":[{"allow":{"method":"tools/call","tool":"read_x","params":{"name":"*"}}}]}"#,
+                "not both",
+            ),
+            (
+                r#"{"host":"api.example.com","port":443,"protocol":"rest","rules":[{"allow":{"method":"POST","path":"/x","tool":"read_x"}}]}"#,
+                "params matching is only valid for protocol mcp",
+            ),
+            (
+                r#"{"host":"mcp.example.org","port":443,"protocol":"mcp","rules":[{"allow":{"method":"tools/call","params":{"arguments":"*"}}}]}"#,
+                "MCP tool argument matching is not supported yet",
+            ),
+            (
+                r#"{"host":"api.example.com","port":443,"protocol":"rest","mcp":{"versions":["2025-11-25"]}}"#,
+                "cannot configure mcp options",
+            ),
+        ] {
+            let body = format!(
+                r#"{{"operations": [{{"addRule": {{"ruleName": "bad", "rule": {{"endpoints": [{endpoint}]}}}}}}]}}"#
+            );
+
+            let error = proposal_chunks_from_body(body.as_bytes()).unwrap_err();
+            assert!(
+                error.contains(reason),
+                "{endpoint}: unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_rejects_unknown_rule_fields() {
+        for endpoint in [
+            r#"{"host":"api.example.com","port":443,"credential_signing":"aws_sigv4"}"#,
+            r#"{"host":"api.example.com","port":443,"rules":[{"allow":{"method":"GET","unknown":"x"}}]}"#,
+            r#"{"host":"mcp.example.org","port":443,"protocol":"mcp","mcp":{"allow_all_known_mcp_methods":true}}"#,
+        ] {
+            let body = format!(
+                r#"{{"operations": [{{"addRule": {{"ruleName": "extra", "rule": {{"endpoints": [{endpoint}]}}}}}}]}}"#
+            );
+
+            let error = proposal_chunks_from_body(body.as_bytes()).unwrap_err();
+            assert!(error.contains("unknown field"), "unexpected error: {error}");
+        }
     }
 
     #[test]

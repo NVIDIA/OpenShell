@@ -213,6 +213,8 @@ The new submission wins by structural overlap.
   TCP or a raw TLS tunnel, ask an administrator to add that access explicitly.
 - Do not include query strings, tokens, credentials, or secret values in
   paths.
+- For an MCP server, name the tool with `tool` on the `tools/call` allow
+  rule. A `tools/call` allow without `tool` permits every tool.
 - Explain uncertainty in `intent_summary` instead of widening the rule.
 - If pushing with `git` fails, that is a separate L4 or protocol-specific
   path from GitHub REST API access. Propose it separately.
