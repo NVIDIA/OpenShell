@@ -196,6 +196,25 @@ verifies this, and `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix
 re-locks a workspace from the root lockfile. Add new testkit workspaces to
 `ALIGNED_WORKSPACES` in that script.
 
+#### What a conformance test may assert
+
+Conformance tests run on every compute driver, so they check the public
+contract and nothing a driver is free to change.
+
+- Assert only what the public contract promises: the comments in `proto/` and
+  the published docs.
+- Assert on `phase` and `exit_code`. Don't assert on condition reasons or
+  messages.
+- To check that something did not happen, read the state that shows it. Don't
+  sleep and hope.
+- If a behavior isn't documented, open an issue to document it. Don't write a
+  test for it. A behavior that only some drivers have belongs in
+  `tests/suites/features` or `tests/suites/drivers`.
+- The only way to skip a test is `#[ignore = "<issue link>"]`, for a broken or
+  flaky test.
+
+Adapted from the handover notes in NVIDIA/OpenShell#4629 by Evan Lezar.
+
 ### Running suites in a tmachine environment (`tests/runner/`)
 
 `openshell-test-runner` runs a test family inside a tmachine VM, against the
@@ -339,9 +358,8 @@ Suites:
 - CLI conformance (`tests/suites/conformance`) - portable Cargo tests for
   lifecycle, mechanistic drafts, file transfer, and the sandbox-local API,
   including agent-authored permission requests. Driver E2E runs the complete
-  Cargo test package. The installed-artifact conformance suite runs the same
-  tests from a nextest archive and offers a focused `policy-advisor` testsuite
-  for manual integration runs.
+  Cargo test package. The installed-artifact conformance lanes run the `sandbox`
+  package through `openshell-test-runner` (see below).
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
   `e2e-vm`) - CLI conformance plus the common and driver-specific coverage for
   the selected deployment.
@@ -451,7 +469,9 @@ rebuilds only the RPMs. Run conformance against the installed RPMs:
 
 ```shell
 nix run .#build-artifacts
-nix run .#tmachine -- test fedora-podman-rootful rpm conformance
+nix run .#openshell-test-runner -- \
+  --environment fedora-podman-rootful --installer rpm \
+  --family conformance --package sandbox
 ```
 
 Run the portable subset in a disposable rootless Podman guest:
