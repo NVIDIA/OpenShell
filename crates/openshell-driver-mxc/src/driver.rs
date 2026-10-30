@@ -44,6 +44,9 @@ const HOST_RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
 const BOUNDARY_CONFIG_FILE: &str = "boundary.json";
 const BOUNDARY_TLS_CERT_FILE: &str = "sandbox.crt";
 const BOUNDARY_TLS_KEY_FILE: &str = "sandbox.key";
+/// Directory under the workload `cwd` that holds each generation's boundary
+/// staging directory.
+const BOUNDARY_STAGING_DIR: &str = ".openshell-runtime";
 const DIRECT_PROXY_USERNAME: &str = "openshell";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -157,6 +160,10 @@ struct MxcSandboxConfig {
     command: Vec<String>,
     #[serde(default)]
     cwd: String,
+    /// Files and directories the workload cannot open, including inside
+    /// filesystem grants. Sent to MXC as `filesystem.deniedPaths`.
+    #[serde(default)]
+    denied_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,11 +363,33 @@ impl MxcComputeBackend {
             ));
         }
         let policy = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref());
-        self.map_sandbox_policy(
+        let mapped = self.map_sandbox_policy(
             &sandbox.id,
             policy,
             "127.0.0.1:3128".parse().expect("fixed proxy address"),
         )?;
+        // Denied paths are checked against every grant MXC receives: the
+        // policy grants, the generation staging directory under `cwd`
+        // (read-write, checked as `cwd\.openshell-runtime` because the
+        // generation is not known yet), and the sandbox executable
+        // (read-only).
+        let staging_root = Path::new(&config.cwd)
+            .join(BOUNDARY_STAGING_DIR)
+            .display()
+            .to_string();
+        let read_write: Vec<&str> = mapped
+            .readwrite_paths
+            .iter()
+            .chain([&staging_root])
+            .map(String::as_str)
+            .collect();
+        let read_only: Vec<&str> = mapped
+            .readonly_paths
+            .iter()
+            .chain([&self.config.sandbox_binary_path])
+            .map(String::as_str)
+            .collect();
+        check_denied_paths(&config.denied_paths, &read_write, &read_only)?;
         Ok(())
     }
 
@@ -420,7 +449,7 @@ impl MxcComputeBackend {
             .join(safe_component(&sandbox_id)?)
             .join(&generation);
         let boundary_state_dir = PathBuf::from(&sandbox_config.cwd)
-            .join(".openshell-runtime")
+            .join(BOUNDARY_STAGING_DIR)
             .join(&generation);
         let gate = Arc::new(Mutex::new(()));
         let startup_guard = gate.clone().lock_owned().await;
@@ -734,18 +763,11 @@ async fn run_lifecycle_inner(
         "--log-level".to_string(),
         openshell_core::driver_utils::sandbox_log_level(&context.sandbox, "info"),
     ]);
-    let mut filesystem = MxcFilesystem {
-        readwrite_paths: mapped.readwrite_paths,
-        readonly_paths: mapped.readonly_paths,
-        denied_paths: Vec::new(),
-    };
-    push_unique_path(
-        &mut filesystem.readwrite_paths,
-        context.boundary_state_dir.display().to_string(),
-    );
-    push_unique_path(
-        &mut filesystem.readonly_paths,
-        context.config.sandbox_binary_path.clone(),
+    let filesystem = boundary_filesystem(
+        &mapped,
+        &context.sandbox_config,
+        &context.boundary_state_dir,
+        &context.config.sandbox_binary_path,
     );
     let process = MxcProcess {
         command_line: sandbox_command,
@@ -984,7 +1006,331 @@ fn sandbox_config(sandbox: &DriverSandbox) -> Result<MxcSandboxConfig, tonic::St
             "mxc driver_config.command must contain an executable",
         ));
     }
-    Ok(config)
+    let mut denied_paths = Vec::with_capacity(config.denied_paths.len());
+    for entry in &config.denied_paths {
+        let path = normalize_denied_path(entry).map_err(|reason| {
+            tonic::Status::invalid_argument(format!(
+                "mxc driver_config.denied_paths entry '{entry}' {reason}"
+            ))
+        })?;
+        push_unique_path(&mut denied_paths, path);
+    }
+    Ok(MxcSandboxConfig {
+        denied_paths,
+        ..config
+    })
+}
+
+/// Normalize a `driver_config.mxc.denied_paths` entry to the form sent to
+/// MXC: a path that starts with a drive letter, with backslash separators and
+/// no repeated or trailing separator. Rejects `.` and `..` components,
+/// components that end in a dot or space (Windows strips those), and
+/// characters Windows does not allow in file names. Aliases such as 8.3 short
+/// names and junctions are resolved when the entry is compared with the
+/// grants (`check_denied_paths`).
+fn normalize_denied_path(path: &str) -> Result<String, &'static str> {
+    let normalized = crate::policy::normalize_path(path);
+    if !has_drive_root(&normalized) {
+        return Err("is not an absolute path on a local drive, such as C:\\work\\.env");
+    }
+    let components: Vec<&str> = normalized[3..]
+        .split('\\')
+        .filter(|component| !component.is_empty())
+        .collect();
+    if components
+        .iter()
+        .any(|component| component.ends_with(['.', ' ']))
+    {
+        // Covers `.` and `..`; Windows also drops a trailing dot or space.
+        return Err("has a '.' or '..' component or one ending in a dot or space");
+    }
+    if components.iter().any(|component| {
+        component
+            .chars()
+            .any(|character| character.is_control() || "<>:\"|?*".contains(character))
+    }) {
+        return Err("contains a character Windows does not allow in file names");
+    }
+    Ok(format!("{}{}", &normalized[..3], components.join("\\")))
+}
+
+/// Whether a backslash-separated path starts with a drive letter and a root,
+/// as in `C:\`.
+fn has_drive_root(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+}
+
+/// Access a grant or a denied path gives the workload. For rules that name
+/// the same path, a denied path removes the grant, and a read-write grant is
+/// taken to win over a read-only one, which can only make the rename check
+/// below stricter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Access {
+    ReadOnly,
+    ReadWrite,
+    Denied,
+}
+
+/// A filesystem grant or denied path as written, with its resolved key.
+struct FilesystemRule<'a> {
+    path: &'a str,
+    key: Vec<String>,
+    access: Access,
+}
+
+/// Check denied paths against the grants MXC receives and the host file
+/// system before any sandbox state is created.
+///
+/// MXC resolves overlapping rules by the file system object each path names:
+/// a denied path equal to a grant removes the whole grant, while a grant
+/// nested in a denied directory keeps its access. Neither matches a request
+/// to hide part of a grant, so a denied path must not equal or contain a
+/// grant, compared after resolving 8.3 short names, junctions and symbolic
+/// links, and ignoring letter case. MXC also refuses to start a
+/// `ProcessContainer` that denies a path whose parent directory does not
+/// exist; the denied path itself may be absent.
+///
+/// MXC enforces denied paths and grants by path. The workload can rename a
+/// directory when the directory and its parent are both writable to it, and
+/// everything below the directory then sits at a path that no denied path or
+/// read-only grant names. A denied path below such a directory is rejected.
+fn check_denied_paths(
+    denied_paths: &[String],
+    read_write: &[&str],
+    read_only: &[&str],
+) -> Result<(), tonic::Status> {
+    if denied_paths.is_empty() {
+        return Ok(());
+    }
+    let mut rules = Vec::new();
+    for (grants, access) in [
+        (read_write, Access::ReadWrite),
+        (read_only, Access::ReadOnly),
+    ] {
+        for grant in grants {
+            let resolved = resolve_grant(grant).map_err(|reason| {
+                tonic::Status::invalid_argument(format!(
+                    "mxc driver_config.denied_paths cannot be checked against the filesystem grant '{grant}': {reason}"
+                ))
+            })?;
+            rules.push(FilesystemRule {
+                path: grant,
+                key: path_key(&resolved),
+                access,
+            });
+        }
+    }
+    let denied: Vec<(&str, String)> = denied_paths
+        .iter()
+        .map(|path| (path.as_str(), resolve_path(path)))
+        .collect();
+    rules.extend(denied.iter().map(|(path, resolved)| FilesystemRule {
+        path,
+        key: path_key(resolved),
+        access: Access::Denied,
+    }));
+    for (denied, resolved) in &denied {
+        let denied_key = path_key(resolved);
+        if let Some(grant) = grant_within(&rules, &denied_key) {
+            return Err(tonic::Status::invalid_argument(format!(
+                "mxc driver_config.denied_paths entry '{denied}' equals or contains the filesystem grant '{grant}'; deny paths below the grant instead"
+            )));
+        }
+        let path = Path::new(denied);
+        if !path.parent().is_some_and(Path::is_dir) {
+            // Denying the outermost missing directory covers the entry, and
+            // MXC accepts it because that directory's own parent exists.
+            let remedy = path
+                .ancestors()
+                .skip(1)
+                .take_while(|ancestor| !ancestor.exists())
+                .last()
+                .filter(|missing| missing.parent().is_some_and(Path::is_dir))
+                .map_or_else(String::new, |missing| {
+                    format!(
+                        "; deny the missing directory '{}' instead",
+                        missing.display()
+                    )
+                });
+            return Err(tonic::Status::failed_precondition(format!(
+                "mxc driver_config.denied_paths entry '{denied}' has no existing parent directory, which MXC requires{remedy}"
+            )));
+        }
+        if let Some(depth) = renamable_ancestor(&rules, &denied_key) {
+            let components: Vec<&str> = path_components(resolved).collect();
+            let directory = join_components(&components[..depth]);
+            let parent = join_components(&components[..depth - 1]);
+            // Denying the directory is only possible when no grant lies
+            // within it.
+            let remedy = if grant_within(&rules, &denied_key[..depth]).is_some() {
+                format!("Move the entry directly into '{parent}'")
+            } else {
+                format!("Deny '{directory}' instead, or move the entry directly into '{parent}'")
+            };
+            return Err(tonic::Status::invalid_argument(format!(
+                "mxc driver_config.denied_paths entry '{denied}' is inside '{directory}', which the workload can rename because both it and its parent are writable; the entry is then readable under a new path. {remedy}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The first grant, as written, that equals `key` or lies within it.
+fn grant_within<'a>(rules: &[FilesystemRule<'a>], key: &[String]) -> Option<&'a str> {
+    rules
+        .iter()
+        .find(|rule| rule.access != Access::Denied && rule.key.starts_with(key))
+        .map(|rule| rule.path)
+}
+
+/// Access the most specific rule that names `key` or a directory above it
+/// gives the workload; `None` outside every rule.
+fn access_at(rules: &[FilesystemRule<'_>], key: &[String]) -> Option<Access> {
+    rules
+        .iter()
+        .filter(|rule| key.starts_with(&rule.key))
+        .max_by_key(|rule| (rule.key.len(), rule.access))
+        .map(|rule| rule.access)
+}
+
+/// The outermost directory above `denied` that the workload can rename, as
+/// its number of components: one that is writable and whose parent is
+/// writable. A drive root has no parent and cannot be renamed.
+fn renamable_ancestor(rules: &[FilesystemRule<'_>], denied: &[String]) -> Option<usize> {
+    let writable = |key: &[String]| access_at(rules, key) == Some(Access::ReadWrite);
+    (2..denied.len()).find(|&depth| writable(&denied[..depth]) && writable(&denied[..depth - 1]))
+}
+
+/// Prefix of the verbatim paths `std::fs::canonicalize` returns on Windows.
+const VERBATIM_PREFIX: &str = r"\\?\";
+
+/// Prefixes of the Win32 file, Win32 device, and NT object namespaces.
+const NAMESPACE_PREFIXES: [&str; 3] = [VERBATIM_PREFIX, r"\\.\", r"\??\"];
+
+/// Resolve a filesystem grant to the path that starts with a drive letter
+/// and names the same file system object, for comparison with denied paths.
+/// MXC also accepts grants in the device and object namespaces, such as
+/// `\\.\C:\work`, `\??\C:\work`, `\\?\GLOBALROOT\Device\HarddiskVolume3\work`
+/// and `\\?\Volume{...}\work`, and follows junctions in them, so those are
+/// resolved through the file system as well. MXC grants nothing through a UNC
+/// path, and a path without a drive depends on the current drive; both are
+/// rejected, as is a spelling the file system does not resolve to a drive.
+fn resolve_grant(grant: &str) -> Result<String, &'static str> {
+    let normalized = crate::policy::normalize_path(grant);
+    let path = strip_drive_namespace(&normalized);
+    if has_drive_root(path) {
+        return Ok(resolve_path(path));
+    }
+    if is_unc_path(path) {
+        return Err("MXC grants no access through a UNC path; grant the local path instead");
+    }
+    if NAMESPACE_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+        && let Some(resolved) = resolve_existing_prefix(Path::new(path))
+    {
+        let resolved = resolved.display().to_string();
+        let resolved = resolved.strip_prefix(VERBATIM_PREFIX).unwrap_or(&resolved);
+        if has_drive_root(resolved) {
+            return Ok(resolved.to_string());
+        }
+    }
+    Err(
+        "it does not resolve to a path on a local drive; write the grant as a path such as C:\\work",
+    )
+}
+
+/// The drive path inside a `\\?\C:\`, `\\.\C:\` or `\??\C:\` spelling, or
+/// the path unchanged.
+fn strip_drive_namespace(path: &str) -> &str {
+    NAMESPACE_PREFIXES
+        .iter()
+        .find_map(|prefix| {
+            path.strip_prefix(prefix)
+                .filter(|rest| has_drive_root(rest))
+        })
+        .unwrap_or(path)
+}
+
+/// Whether a backslash-separated path is a UNC path, in any namespace.
+fn is_unc_path(path: &str) -> bool {
+    NAMESPACE_PREFIXES
+        .iter()
+        .find_map(|prefix| path.strip_prefix(prefix))
+        .map_or_else(
+            || path.starts_with(r"\\"),
+            |rest| {
+                rest.get(..4)
+                    .is_some_and(|unc| unc.eq_ignore_ascii_case(r"UNC\"))
+            },
+        )
+}
+
+/// The path that names the same file system object as `path`, for comparing
+/// denied paths with grants. A path that starts with a drive letter, also
+/// after a `\\?\`, `\\.\` or `\??\` prefix, is resolved with
+/// `std::fs::canonicalize`, which follows junctions and symbolic links and
+/// returns the long name and on-disk letter case of every component. When the
+/// path does not exist, its deepest existing ancestor is resolved and the
+/// remaining components are appended as written. Components that cannot be
+/// resolved this way, and other paths, are returned as written.
+fn resolve_path(path: &str) -> String {
+    let normalized = crate::policy::normalize_path(path);
+    let path = strip_drive_namespace(&normalized);
+    if has_drive_root(path)
+        && let Some(resolved) = resolve_existing_prefix(Path::new(path))
+    {
+        let resolved = resolved.display().to_string();
+        return resolved
+            .strip_prefix(VERBATIM_PREFIX)
+            .unwrap_or(&resolved)
+            .to_string();
+    }
+    path.to_string()
+}
+
+/// Canonicalize the deepest existing ancestor of `path` and append the
+/// remaining components as written.
+fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
+    let mut missing = Vec::new();
+    for ancestor in path.ancestors() {
+        if let Ok(resolved) = std::fs::canonicalize(ancestor) {
+            return Some(
+                missing
+                    .iter()
+                    .rev()
+                    .fold(resolved, |resolved, component| resolved.join(component)),
+            );
+        }
+        missing.push(ancestor.file_name()?);
+    }
+    None
+}
+
+/// The components of a backslash-separated path, without empty and `.`
+/// components.
+fn path_components(path: &str) -> impl Iterator<Item = &str> {
+    path.split('\\')
+        .filter(|component| !component.is_empty() && *component != ".")
+}
+
+/// Join path components with backslashes; a drive alone becomes its root.
+fn join_components(components: &[&str]) -> String {
+    let joined = components.join("\\");
+    if components.len() == 1 {
+        joined + "\\"
+    } else {
+        joined
+    }
+}
+
+/// Case-insensitive path components for comparing Windows paths. Letter case
+/// is ignored for all Unicode letters, not only ASCII.
+fn path_key(path: &str) -> Vec<String> {
+    path_components(&crate::policy::normalize_path(path))
+        .map(str::to_lowercase)
+        .collect()
 }
 
 fn launch_authentication(
@@ -1080,6 +1426,31 @@ fn push_unique_path(paths: &mut Vec<String>, path: String) {
     {
         paths.push(path);
     }
+}
+
+/// MXC filesystem rules for the boundary `ProcessContainer`: the policy
+/// grants, the generation staging directory, the sandbox executable, and the
+/// caller's denied paths.
+fn boundary_filesystem(
+    mapped: &MappedConfig,
+    sandbox_config: &MxcSandboxConfig,
+    boundary_state_dir: &Path,
+    sandbox_binary_path: &str,
+) -> MxcFilesystem {
+    let mut filesystem = MxcFilesystem {
+        readwrite_paths: mapped.readwrite_paths.clone(),
+        readonly_paths: mapped.readonly_paths.clone(),
+        denied_paths: sandbox_config.denied_paths.clone(),
+    };
+    push_unique_path(
+        &mut filesystem.readwrite_paths,
+        boundary_state_dir.display().to_string(),
+    );
+    push_unique_path(
+        &mut filesystem.readonly_paths,
+        sandbox_binary_path.to_string(),
+    );
+    filesystem
 }
 
 fn cleanup_runtime_directory(path: &Path) {
@@ -1552,6 +1923,742 @@ mod tests {
             assert_eq!(error.code(), tonic::Code::InvalidArgument);
             assert!(!backend.config.state_dir.exists());
         }
+    }
+
+    fn with_denied_paths(mut sandbox: DriverSandbox, denied_paths: &[String]) -> DriverSandbox {
+        let template = sandbox.spec.as_mut().unwrap().template.as_mut().unwrap();
+        let mut config = struct_to_json_value(template.driver_config.as_ref().unwrap());
+        config["denied_paths"] = serde_json::json!(denied_paths);
+        let serde_json::Value::Object(config) = config else {
+            unreachable!()
+        };
+        template.driver_config =
+            Some(openshell_core::proto_struct::json_object_to_struct(config).expect("config"));
+        sandbox
+    }
+
+    fn with_filesystem_grants(
+        mut sandbox: DriverSandbox,
+        read_write: &[&Path],
+        read_only: &[&Path],
+    ) -> DriverSandbox {
+        let strings = |paths: &[&Path]| -> Vec<String> {
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect()
+        };
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .policy
+            .as_mut()
+            .unwrap()
+            .filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            read_write: strings(read_write),
+            read_only: strings(read_only),
+            ..Default::default()
+        });
+        sandbox
+    }
+
+    fn display(path: &Path) -> String {
+        path.display().to_string()
+    }
+
+    #[test]
+    fn driver_config_denied_paths_inside_a_grant_pass_preflight() {
+        let (backend, sandbox, dir) = preflight_fixture();
+        let profile = dir.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        std::fs::write(profile.join(".env"), "fixture").unwrap();
+        let sandbox = with_filesystem_grants(sandbox, &[&profile], &[]);
+        // A denied path may be absent while its parent directory exists.
+        let sandbox = with_denied_paths(
+            sandbox,
+            &[
+                display(&profile.join(".env")),
+                display(&profile.join("auth.json")),
+            ],
+        );
+        backend
+            .validate_sandbox_create(&sandbox)
+            .expect("denied paths inside a grant pass preflight");
+        assert!(!backend.config.state_dir.exists());
+    }
+
+    #[test]
+    fn driver_config_denied_paths_reach_the_mxc_request() {
+        let (backend, sandbox, dir) = preflight_fixture();
+        let profile = dir.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let env = display(&profile.join(".env"));
+        let auth = display(&profile.join("auth.json"));
+        let sandbox = with_filesystem_grants(sandbox, &[&profile], &[]);
+        let process = MxcProcess {
+            command_line: "cmd /c exit 0".into(),
+            cwd: display(dir.path()),
+            env: Vec::new(),
+            timeout: 0,
+        };
+        let staging = dir.path().join(BOUNDARY_STAGING_DIR).join("generation");
+        let mxc_request = |sandbox: &DriverSandbox| {
+            backend
+                .validate_sandbox_create(sandbox)
+                .expect("valid preflight");
+            let config = sandbox_config(sandbox).unwrap();
+            let mapped = backend
+                .map_sandbox_policy(
+                    &sandbox.id,
+                    sandbox.spec.as_ref().unwrap().policy.as_ref(),
+                    "127.0.0.1:3128".parse().unwrap(),
+                )
+                .unwrap();
+            let filesystem = boundary_filesystem(
+                &mapped,
+                &config,
+                &staging,
+                &backend.config.sandbox_binary_path,
+            );
+            crate::mxc::oneshot_config_json(
+                &sandbox.id,
+                &filesystem,
+                &MxcProcessContainer::default(),
+                &process,
+                None,
+                None,
+            )
+        };
+
+        // Without denied paths the request carries no deniedPaths or fallback
+        // field.
+        let request = mxc_request(&sandbox);
+        assert!(request["filesystem"].get("deniedPaths").is_none());
+        assert!(request.get("fallback").is_none());
+
+        // Forward slashes, a trailing separator, and a case-only duplicate
+        // normalize to one backslash path per entry.
+        let sandbox = with_denied_paths(
+            sandbox,
+            &[
+                env.replace('\\', "/"),
+                format!("{env}\\"),
+                env.to_ascii_uppercase(),
+                auth.clone(),
+            ],
+        );
+        let request = mxc_request(&sandbox);
+        assert_eq!(
+            request["filesystem"]["deniedPaths"],
+            serde_json::json!([env, auth])
+        );
+        assert_eq!(
+            request["filesystem"]["readwritePaths"],
+            serde_json::json!([display(&profile), display(&staging)])
+        );
+        // MXC must not fall back to changing host ACLs to enforce the denies.
+        assert_eq!(
+            request["fallback"],
+            serde_json::json!({ "allowDaclMutation": false })
+        );
+    }
+
+    #[test]
+    fn driver_config_denied_paths_must_be_absolute_local_paths() {
+        let (backend, sandbox, dir) = preflight_fixture();
+        let base = display(dir.path());
+        for path in [
+            String::new(),
+            "relative\\.env".into(),
+            "\\work\\.env".into(),
+            "C:work\\.env".into(),
+            "\\\\server\\share\\.env".into(),
+            "\\\\?\\C:\\work\\.env".into(),
+            "\\\\.\\C:\\work\\.env".into(),
+            "\\??\\C:\\work\\.env".into(),
+            "\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\work\\.env".into(),
+            "\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\work\\.env".into(),
+            format!(" {base}\\.env"),
+            format!("{base}\\.env "),
+            format!("{base}\\.env."),
+            format!("{base}\\.\\.env"),
+            format!("{base}\\profile\\..\\.env"),
+            format!("{base}\\.env:stream"),
+            format!("{base}\\*.env"),
+        ] {
+            let error = backend
+                .validate_sandbox_create(&with_denied_paths(
+                    sandbox.clone(),
+                    std::slice::from_ref(&path),
+                ))
+                .expect_err("ambiguous denied path must be rejected");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument, "{path:?}");
+            assert!(
+                error
+                    .message()
+                    .starts_with("mxc driver_config.denied_paths entry"),
+                "{path:?}: {}",
+                error.message()
+            );
+        }
+        assert!(!backend.config.state_dir.exists());
+    }
+
+    #[test]
+    fn driver_config_denied_paths_must_not_cover_a_grant() {
+        let (backend, sandbox, dir) = preflight_fixture();
+        let work = dir.path().join("work");
+        let tools = dir.path().join("tools");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::create_dir(&tools).unwrap();
+        let sandbox = with_filesystem_grants(sandbox, &[&work], &[&tools]);
+        let staging = display(&dir.path().join(BOUNDARY_STAGING_DIR));
+        let binary = backend.config.sandbox_binary_path.clone();
+        for (denied, grant) in [
+            (display(&work), display(&work)),
+            (
+                display(&work).to_ascii_uppercase().replace('\\', "/"),
+                display(&work),
+            ),
+            (display(dir.path()), display(&work)),
+            (display(&tools), display(&tools)),
+            (staging.clone(), staging),
+            (binary.clone(), binary),
+        ] {
+            let error = backend
+                .validate_sandbox_create(&with_denied_paths(
+                    sandbox.clone(),
+                    std::slice::from_ref(&denied),
+                ))
+                .expect_err("a denied path must not cover a grant");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument, "{denied}");
+            assert!(
+                error.message().contains(&format!(
+                    "equals or contains the filesystem grant '{grant}'"
+                )),
+                "{denied}: {}",
+                error.message()
+            );
+        }
+        // A grant written as a verbatim path names the same directory.
+        let verbatim = PathBuf::from(format!(r"\\?\{}", display(&work)));
+        let sandbox = with_filesystem_grants(sandbox, &[&verbatim], &[]);
+        assert_denied_path_covers_grant(&backend, &sandbox, &display(&work), &verbatim);
+        assert!(!backend.config.state_dir.exists());
+    }
+
+    #[test]
+    fn driver_config_denied_path_parent_must_exist() {
+        let (backend, sandbox, dir) = preflight_fixture();
+        std::fs::write(dir.path().join("file.txt"), "fixture").unwrap();
+        let missing = dir.path().join("missing");
+        // No directory to suggest when the parent is a file or the drive is
+        // missing.
+        let no_volume = PathBuf::from(format!("{}:\\missing\\.env", unused_drive_letter()));
+        for (denied, remedy) in [
+            (missing.join(".env"), Some(&missing)),
+            (missing.join("nested").join(".env"), Some(&missing)),
+            (dir.path().join("file.txt").join(".env"), None),
+            (no_volume, None),
+        ] {
+            let sandbox = with_denied_paths(sandbox.clone(), &[display(&denied)]);
+            let error = backend.validate_sandbox_create(&sandbox).unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(
+                error.message().contains("has no existing parent directory"),
+                "{}",
+                error.message()
+            );
+            // The error names the missing directory to deny instead.
+            let suggestion = remedy.map(|directory| {
+                format!(
+                    "; deny the missing directory '{}' instead",
+                    display(directory)
+                )
+            });
+            assert_eq!(
+                error.message().split_once("which MXC requires").unwrap().1,
+                suggestion.as_deref().unwrap_or_default(),
+                "{}",
+                error.message()
+            );
+        }
+        // Denying the missing directory itself passes preflight.
+        let sandbox = with_denied_paths(sandbox, &[display(&missing)]);
+        backend
+            .validate_sandbox_create(&sandbox)
+            .expect("a missing directory under an existing one can be denied");
+        assert!(!backend.config.state_dir.exists());
+    }
+
+    /// A drive letter with no volume behind it.
+    fn unused_drive_letter() -> char {
+        (b'D'..=b'Z')
+            .rev()
+            .map(char::from)
+            .find(|letter| !Path::new(&format!("{letter}:\\")).exists())
+            .expect("an unused drive letter")
+    }
+
+    /// Run `cmd.exe /d /c <command>` and return its trimmed output.
+    fn run_cmd(command: &str) -> (bool, String) {
+        use std::os::windows::process::CommandExt as _;
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c"])
+            .raw_arg(command)
+            .output()
+            .expect("run cmd.exe");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        )
+    }
+
+    /// The 8.3 short spelling of an existing path, or `None` when the volume
+    /// has no short name for it (8.3 name creation disabled).
+    fn short_path(path: &Path) -> Option<String> {
+        let (_, short) = run_cmd(&format!("for %I in (\"{}\") do @echo %~sI", path.display()));
+        let same_object =
+            std::fs::canonicalize(&short).ok()? == std::fs::canonicalize(path).ok()?;
+        (same_object && !short.eq_ignore_ascii_case(&display(path))).then_some(short)
+    }
+
+    fn assert_denied_path_covers_grant(
+        backend: &MxcComputeBackend,
+        sandbox: &DriverSandbox,
+        denied: &str,
+        grant: &Path,
+    ) {
+        let error = backend
+            .validate_sandbox_create(&with_denied_paths(sandbox.clone(), &[denied.to_string()]))
+            .expect_err("a denied path must not cover a grant");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument, "{denied}");
+        assert!(
+            error.message().contains(&format!(
+                "equals or contains the filesystem grant '{}'",
+                display(grant)
+            )),
+            "{denied}: {}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn driver_config_denied_paths_resolve_short_names() {
+        let (backend, sandbox, dir) = preflight_fixture();
+        let long_dir = dir.path().join("denied paths long name");
+        let work = long_dir.join("work");
+        let pending = long_dir.join("pending").join("nested");
+        std::fs::create_dir_all(work.join("profile")).unwrap();
+        let Some(short_dir) = short_path(&long_dir) else {
+            eprintln!(
+                "SKIP: no 8.3 short name for {}; enable 8.3 name creation on its volume to run this test",
+                long_dir.display()
+            );
+            return;
+        };
+        // `pending\nested` is a grant that does not exist yet, nor does its
+        // parent.
+        let sandbox = with_filesystem_grants(sandbox, &[&work, &pending], &[]);
+        // The same directories through the 8.3 name of their parent: equal to
+        // a grant, containing a grant, and equal to the grant that does not
+        // exist.
+        for (denied, grant) in [
+            (format!("{short_dir}\\work"), &work),
+            (short_dir.clone(), &work),
+            (format!("{short_dir}\\pending\\nested"), &pending),
+        ] {
+            assert_denied_path_covers_grant(&backend, &sandbox, &denied, grant);
+        }
+        // The reverse: a grant spelled with the 8.3 name, denied by its long
+        // name.
+        let short_grant = PathBuf::from(format!("{short_dir}\\work"));
+        let reversed = with_filesystem_grants(sandbox.clone(), &[&short_grant], &[]);
+        assert_denied_path_covers_grant(&backend, &reversed, &display(&work), &short_grant);
+        // A file directly inside the grant can be denied through the 8.3 name.
+        backend
+            .validate_sandbox_create(&with_denied_paths(
+                sandbox,
+                &[format!("{short_dir}\\work\\.env")],
+            ))
+            .expect("a short spelling of a path inside a grant passes preflight");
+        assert!(!backend.config.state_dir.exists());
+    }
+
+    #[test]
+    fn driver_config_denied_paths_resolve_junctions() {
+        let (backend, sandbox, dir) = preflight_fixture();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join("profile")).unwrap();
+        let link = dir.path().join("link");
+        let (created, output) = run_cmd(&format!(
+            "mklink /J \"{}\" \"{}\"",
+            link.display(),
+            work.display()
+        ));
+        assert!(created, "mklink /J failed: {output}");
+        let sandbox = with_filesystem_grants(sandbox, &[&work], &[]);
+        // A junction whose target is the grant names the grant.
+        assert_denied_path_covers_grant(&backend, &sandbox, &display(&link), &work);
+        // A grant spelled through the junction is the same directory.
+        let through_link = with_filesystem_grants(sandbox.clone(), &[&link], &[]);
+        assert_denied_path_covers_grant(&backend, &through_link, &display(&work), &link);
+        // A file directly inside the grant can be denied through the junction.
+        backend
+            .validate_sandbox_create(&with_denied_paths(sandbox, &[display(&link.join(".env"))]))
+            .expect("a path below the grant through a junction passes preflight");
+        assert!(!backend.config.state_dir.exists());
+    }
+
+    #[test]
+    fn driver_config_denied_paths_ignore_unicode_case() {
+        let (backend, sandbox, dir) = preflight_fixture();
+        let existing = dir.path().join("\u{e4}rger");
+        std::fs::create_dir(&existing).unwrap();
+        // A grant that does not exist yet keeps the letter case as written.
+        let pending = dir.path().join("\u{f6}l");
+        let sandbox = with_filesystem_grants(sandbox, &[&existing, &pending], &[]);
+        for (denied, grant) in [
+            (dir.path().join("\u{c4}RGER"), &existing),
+            (dir.path().join("\u{d6}L"), &pending),
+        ] {
+            assert_denied_path_covers_grant(&backend, &sandbox, &display(&denied), grant);
+        }
+        assert!(!backend.config.state_dir.exists());
+    }
+
+    #[test]
+    fn driver_config_denied_paths_compare_unresolvable_paths_as_written() {
+        let (backend, sandbox, _dir) = preflight_fixture();
+        // Nothing on a drive letter without a volume can be resolved.
+        let drive = unused_drive_letter();
+        let grant = PathBuf::from(format!("{drive}:\\Work"));
+        let sandbox = with_filesystem_grants(sandbox, &[&grant], &[]);
+        let denied = format!("{}:/WORK/", drive.to_ascii_lowercase());
+        assert_denied_path_covers_grant(&backend, &sandbox, &denied, &grant);
+        // The same grant in the device and object namespaces.
+        for grant in [format!(r"\\.\{drive}:\Work"), format!(r"\??\{drive}:\Work")] {
+            let grant = PathBuf::from(grant);
+            let sandbox = with_filesystem_grants(sandbox.clone(), &[&grant], &[]);
+            assert_denied_path_covers_grant(&backend, &sandbox, &denied, &grant);
+        }
+        // A resolved path drops the `\\?\` prefix `canonicalize` adds, so it
+        // compares in the same form as a path compared as written.
+        assert_eq!(resolve_path(r"C:\"), r"C:\");
+        assert!(!backend.config.state_dir.exists());
+    }
+
+    /// The resolved drive form of an existing path, as `canonicalize` returns
+    /// it without the `\\?\` prefix.
+    fn canonical(path: &Path) -> String {
+        let resolved = display(&std::fs::canonicalize(path).expect("canonicalize"));
+        resolved
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&resolved)
+            .to_string()
+    }
+
+    /// Create a host junction at `link` that points to `target`.
+    fn junction(link: &Path, target: &Path) {
+        let (created, output) = run_cmd(&format!(
+            "mklink /J \"{}\" \"{}\"",
+            link.display(),
+            target.display()
+        ));
+        assert!(created, "mklink /J failed: {output}");
+    }
+
+    /// Assert that preflight rejects `denied` because the workload can rename
+    /// `directory`, and that the error says what to deny or move instead.
+    fn assert_renamable_directory(
+        backend: &MxcComputeBackend,
+        sandbox: &DriverSandbox,
+        denied: &str,
+        directory: &Path,
+        can_deny_directory: bool,
+    ) {
+        let error = backend
+            .validate_sandbox_create(&with_denied_paths(sandbox.clone(), &[denied.to_string()]))
+            .expect_err("a denied path below a renamable directory must be rejected");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument, "{denied}");
+        let message = error.message();
+        let parent = canonical(directory.parent().unwrap());
+        let directory = canonical(directory);
+        assert!(
+            message.contains(&format!(
+                "entry '{denied}' is inside '{directory}', which the workload can rename"
+            )),
+            "{message}"
+        );
+        let remedy = if can_deny_directory {
+            format!("Deny '{directory}' instead, or move the entry directly into '{parent}'")
+        } else {
+            format!("Move the entry directly into '{parent}'")
+        };
+        assert!(message.ends_with(&remedy), "{message}");
+        assert!(!backend.config.state_dir.exists());
+    }
+
+    #[test]
+    fn driver_config_denied_paths_below_a_renamable_directory_are_rejected() {
+        let (backend, sandbox, dir) = preflight_fixture();
+        let work = dir.path().join("work");
+        let profile = work.join("profile");
+        let tools = work.join("tools");
+        let bin = tools.join("bin");
+        std::fs::create_dir_all(profile.join("sub")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(profile.join(".env"), "fixture").unwrap();
+        std::fs::write(profile.join("sub").join(".env"), "fixture").unwrap();
+        let read_write = with_filesystem_grants(sandbox.clone(), &[&work], &[]);
+        // Two and three levels below a read-write grant root, present or
+        // absent: the outermost directory below the root can be renamed.
+        for denied in [
+            profile.join(".env"),
+            profile.join("sub").join(".env"),
+            profile.join("auth.json"),
+        ] {
+            assert_renamable_directory(&backend, &read_write, &display(&denied), &profile, true);
+        }
+        // The root of a read-write grant nested in another one can be
+        // renamed; denying it would remove that grant.
+        let nested = with_filesystem_grants(sandbox.clone(), &[&work, &profile], &[]);
+        let denied = display(&profile.join(".env"));
+        assert_renamable_directory(&backend, &nested, &denied, &profile, false);
+        // A read-only grant two levels inside a read-write grant: the
+        // read-write directory above the read-only grant root can be renamed.
+        let read_only = with_filesystem_grants(sandbox.clone(), &[&work], &[&bin]);
+        let denied = display(&bin.join("key.pem"));
+        assert_renamable_directory(&backend, &read_only, &denied, &tools, false);
+        // A path granted both read-write and read-only counts as read-write.
+        let both = with_filesystem_grants(sandbox.clone(), &[&work, &profile], &[&profile]);
+        let denied = display(&profile.join(".env"));
+        assert_renamable_directory(&backend, &both, &denied, &profile, false);
+        // The generation staging directory under `cwd` is read-write, checked
+        // from `cwd\.openshell-runtime` because the generation is not known yet.
+        let generation = dir.path().join(BOUNDARY_STAGING_DIR).join("generation");
+        std::fs::create_dir_all(&generation).unwrap();
+        let denied = display(&generation.join("x.env"));
+        assert_renamable_directory(&backend, &sandbox, &denied, &generation, true);
+        // A read-write grant on the drive root: the outermost directory
+        // below the root can be renamed.
+        let resolved = canonical(dir.path());
+        let root = PathBuf::from(&resolved[..3]);
+        let outermost = root.join(resolved[3..].split('\\').next().unwrap());
+        let drive = with_filesystem_grants(sandbox, &[&root], &[]);
+        let denied = display(&work.join(".env"));
+        assert_renamable_directory(&backend, &drive, &denied, &outermost, false);
+    }
+
+    #[test]
+    fn driver_config_denied_paths_out_of_rename_reach_pass_preflight() {
+        let (backend, sandbox, dir) = preflight_fixture();
+        let work = dir.path().join("work");
+        let profile = work.join("profile");
+        let secrets = work.join("secrets");
+        let inner = secrets.join("inner");
+        std::fs::create_dir_all(profile.join("sub")).unwrap();
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(work.join(".env"), "fixture").unwrap();
+        std::fs::write(profile.join(".env"), "fixture").unwrap();
+        let env = work.join(".env");
+        let auth = work.join("auth.json");
+        let profile_env = profile.join(".env");
+        let nested_env = profile.join("sub").join(".env");
+        let cases: [(&[&Path], &[&Path], &[&Path]); 4] = [
+            // Directly inside a read-write grant root whose parent the
+            // workload cannot write: a file, an absent file, directories,
+            // and a path inside a denied directory.
+            (&[&work], &[], &[&env, &auth, &profile, &secrets, &inner]),
+            // Below a read-only grant root.
+            (&[], &[&work], &[&nested_env]),
+            // Below a read-only grant directly inside a read-write grant.
+            (&[&work], &[&profile], &[&profile_env, &nested_env]),
+            // Directly inside a read-write grant within a read-only grant.
+            (&[&profile], &[&work], &[&profile_env]),
+        ];
+        for (read_write, read_only, denied) in cases {
+            let denied: Vec<String> = denied.iter().map(|path| display(path)).collect();
+            let sandbox = with_denied_paths(
+                with_filesystem_grants(sandbox.clone(), read_write, read_only),
+                &denied,
+            );
+            backend
+                .validate_sandbox_create(&sandbox)
+                .unwrap_or_else(|error| panic!("{denied:?}: {}", error.message()));
+        }
+        assert!(!backend.config.state_dir.exists());
+    }
+
+    #[test]
+    fn driver_config_denied_paths_rename_check_resolves_aliases() {
+        let (backend, sandbox, dir) = preflight_fixture();
+        let work = dir.path().join("work area");
+        let profile = work.join("profile directory");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join(".env"), "fixture").unwrap();
+        let env = display(&profile.join(".env"));
+        let read_write = with_filesystem_grants(sandbox.clone(), &[&work], &[]);
+        // The denied path through a host junction to its directory, and in
+        // other letter case.
+        let profile_link = dir.path().join("profile link");
+        junction(&profile_link, &profile);
+        for denied in [display(&profile_link.join(".env")), env.to_uppercase()] {
+            assert_renamable_directory(&backend, &read_write, &denied, &profile, true);
+        }
+        // The read-write grant through a host junction.
+        let work_link = dir.path().join("work link");
+        junction(&work_link, &work);
+        let through_link = with_filesystem_grants(sandbox.clone(), &[&work_link], &[]);
+        assert_renamable_directory(&backend, &through_link, &env, &profile, true);
+        // The denied path's directory and the grant through 8.3 short names.
+        let (Some(short_profile), Some(short_work)) = (short_path(&profile), short_path(&work))
+        else {
+            eprintln!(
+                "SKIP: no 8.3 short names under {}; enable 8.3 name creation on its volume to run this part",
+                dir.path().display()
+            );
+            return;
+        };
+        let denied = format!("{short_profile}\\.env");
+        assert_renamable_directory(&backend, &read_write, &denied, &profile, true);
+        let short_work = PathBuf::from(short_work);
+        let short_grant = with_filesystem_grants(sandbox, &[&short_work], &[]);
+        assert_renamable_directory(&backend, &short_grant, &env, &profile, true);
+    }
+
+    /// `\\?\Volume{...}\` for the volume that holds `path`, from `mountvol`.
+    fn volume_guid_path(path: &str) -> Option<String> {
+        let (_, output) = run_cmd(&format!("mountvol {}\\ /L", &path[..2]));
+        let guid = output.trim();
+        guid.starts_with(r"\\?\Volume{").then(|| guid.to_string())
+    }
+
+    /// `\Device\HarddiskVolumeN` for the volume that holds `path`.
+    fn volume_device(path: &str) -> Option<String> {
+        let root = std::fs::canonicalize(format!("{}\\", &path[..2])).ok()?;
+        (1..=64)
+            .map(|number| format!(r"\Device\HarddiskVolume{number}"))
+            .find(|device| {
+                std::fs::canonicalize(format!(r"\\?\GLOBALROOT{device}\"))
+                    .is_ok_and(|resolved| resolved == root)
+            })
+    }
+
+    /// Spellings of an existing path in the Win32 file and device namespaces
+    /// and the NT object namespace, all of which MXC accepts as grants.
+    fn namespace_spellings(path: &Path) -> Vec<String> {
+        let path = canonical(path);
+        let rest = &path[2..];
+        let mut spellings = vec![
+            format!(r"\\.\{path}"),
+            format!(r"\\?\{path}"),
+            format!(r"\??\{path}"),
+        ];
+        match volume_device(&path) {
+            Some(device) => spellings.extend([
+                format!(r"\\?\GLOBALROOT{device}{rest}"),
+                format!(r"\\.\GLOBALROOT{device}{rest}"),
+            ]),
+            None => eprintln!("SKIP: no \\Device\\HarddiskVolumeN name found for {path}"),
+        }
+        match volume_guid_path(&path) {
+            Some(guid) => spellings.extend([
+                format!("{guid}{}", &rest[1..]),
+                format!(r"\\.\{}{}", &guid[4..], &rest[1..]),
+            ]),
+            None => eprintln!("SKIP: no volume GUID path found for {path}"),
+        }
+        spellings
+    }
+
+    #[test]
+    fn driver_config_denied_paths_resolve_namespace_grants() {
+        let (backend, sandbox, dir) = preflight_fixture();
+        let secret = dir.path().join("secret");
+        let nested = secret.join("nested");
+        let work = dir.path().join("work");
+        let profile = work.join("profile");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        let link = dir.path().join("link");
+        junction(&link, &nested);
+        // A read-only grant through a host junction, written in another
+        // namespace, names a directory inside the denied directory.
+        for grant in namespace_spellings(&link) {
+            let grant = PathBuf::from(grant);
+            let sandbox = with_filesystem_grants(sandbox.clone(), &[], &[&grant]);
+            assert_denied_path_covers_grant(&backend, &sandbox, &display(&secret), &grant);
+        }
+        // A read-write grant written in another namespace counts for the
+        // rename check, and a path directly inside it can be denied.
+        for grant in namespace_spellings(&work) {
+            let grant = PathBuf::from(grant);
+            let sandbox = with_filesystem_grants(sandbox.clone(), &[&grant], &[]);
+            let denied = display(&profile.join(".env"));
+            assert_renamable_directory(&backend, &sandbox, &denied, &profile, true);
+            backend
+                .validate_sandbox_create(&with_denied_paths(
+                    sandbox,
+                    &[display(&work.join(".env"))],
+                ))
+                .unwrap_or_else(|error| panic!("{}: {}", grant.display(), error.message()));
+        }
+    }
+
+    #[test]
+    fn driver_config_denied_paths_reject_grants_that_do_not_resolve() {
+        let (backend, sandbox, dir) = preflight_fixture();
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let path = canonical(&work);
+        let (drive, rest) = path.split_at(2);
+        let share = format!("{}$", &drive[..1]);
+        let denied = display(&work.join(".env"));
+        let unc = "MXC grants no access through a UNC path; grant the local path instead";
+        let unresolved = "it does not resolve to a path on a local drive";
+        for (grant, reason) in [
+            (format!(r"\\localhost\{share}{rest}"), unc),
+            (format!(r"\\?\UNC\localhost\{share}{rest}"), unc),
+            (format!(r"\\.\UNC\localhost\{share}{rest}"), unc),
+            // No drive: the path depends on the current drive.
+            (rest.to_string(), unresolved),
+            (
+                r"\\?\Volume{00000000-0000-0000-0000-000000000000}\work".to_string(),
+                unresolved,
+            ),
+            (
+                r"\\?\GLOBALROOT\Device\NoSuchVolume\work".to_string(),
+                unresolved,
+            ),
+            // A UNC path through the multiple UNC provider device.
+            (
+                format!(r"\\?\GLOBALROOT\Device\Mup\localhost\{share}{rest}"),
+                unresolved,
+            ),
+            (r"\\.\pipe\openshell-no-such-pipe".to_string(), unresolved),
+        ] {
+            let grant = PathBuf::from(grant);
+            let sandbox = with_filesystem_grants(sandbox.clone(), &[&grant], &[]);
+            // Without denied paths the grant reaches MXC unchanged.
+            backend
+                .validate_sandbox_create(&sandbox)
+                .expect("nothing to check without denied paths");
+            let error = backend
+                .validate_sandbox_create(&with_denied_paths(sandbox, std::slice::from_ref(&denied)))
+                .expect_err("a grant that does not resolve must be rejected");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(
+                error.message().starts_with(&format!(
+                    "mxc driver_config.denied_paths cannot be checked against the filesystem grant '{}': {reason}",
+                    grant.display()
+                )),
+                "{}",
+                error.message()
+            );
+        }
+        assert!(!backend.config.state_dir.exists());
     }
 
     #[test]

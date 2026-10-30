@@ -165,7 +165,7 @@ fn network_json(network: &MxcNetwork) -> serde_json::Value {
     value
 }
 
-fn oneshot_config_json(
+pub fn oneshot_config_json(
     container_id: &str,
     filesystem: &MxcFilesystem,
     pc: &MxcProcessContainer,
@@ -209,6 +209,13 @@ fn oneshot_config_json(
         "processContainer": serde_json::Value::Object(pc_json),
         "filesystem": serde_json::Value::Object(filesystem_json),
     });
+    // MXC 1.0 defaults `fallback.allowDaclMutation` to true, so on a host whose
+    // base container cannot enforce `deniedPaths` it would add deny entries to
+    // the ACLs of host files instead. Withhold that consent whenever paths are
+    // denied; such a host then fails the launch.
+    if !filesystem.denied_paths.is_empty() {
+        config["fallback"] = serde_json::json!({ "allowDaclMutation": false });
+    }
     if let Some(network) = network {
         config["network"] = network_json(network);
     }
