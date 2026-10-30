@@ -82,6 +82,7 @@ tracing-opentelemetry = { workspace = true }
 # Metrics
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+metrics-util = { workspace = true }
 
 # Utilities
 base64 = { workspace = true }

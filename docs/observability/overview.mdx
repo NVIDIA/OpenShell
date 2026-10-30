@@ -13,7 +13,7 @@ OpenShell produces three kinds of observability signals: traces, metrics, and OC
 | Signal | Produced by | Destination |
 |---|---|---|
 | Traces | Gateway, compute drivers, sandbox supervisors | OTLP collector |
-| Metrics | Gateway | Prometheus scrape |
+| Metrics | Gateway | Prometheus scrape, optionally an OTLP collector |
 | OCSF events, shorthand | Gateway, sandbox supervisors | Gateway console, `openshell logs`, supervisor log file |
 | OCSF events, JSONL | Gateway, sandbox supervisors | Local file |
 | OCSF events, OTLP | Gateway, sandbox supervisors | OTLP collector |
