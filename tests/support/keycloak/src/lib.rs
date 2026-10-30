@@ -56,6 +56,10 @@ pub const PASSWORD_ENV: &str = "OPENSHELL_TEST_KEYCLOAK_PASSWORD";
 // tests/runner/src/bundle.rs). Otherwise a slow Keycloak gets the test killed
 // instead of failing with a readiness error.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long one request to Keycloak may take, in seconds. `poll_until` checks
+/// its deadline only between attempts, so a request to a Keycloak that
+/// accepts connections but stalls must give up on its own.
+const CURL_MAX_TIME: &str = "10";
 
 /// How to reach the environment's Keycloak realm, and a user in it.
 #[derive(Clone)]
@@ -142,10 +146,13 @@ impl Keycloak {
                         "--fail",
                         "--silent",
                         "--show-error",
+                        "--max-time",
+                        CURL_MAX_TIME,
                         "--output",
                         "/dev/null",
                         &url,
                     ])
+                    .kill_on_drop(true)
                     .output()
                     .await
                     .map_err(|error| Error::from_error(&error))
@@ -227,6 +234,8 @@ async fn post_form(url: &str, fields: &[&str], secret: (&str, &str)) -> Result<V
         "--fail-with-body",
         "--silent",
         "--show-error",
+        "--max-time",
+        CURL_MAX_TIME,
         "--request",
         "POST",
         url,
