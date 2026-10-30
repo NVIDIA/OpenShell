@@ -257,6 +257,25 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
             .await?,
     )?;
 
+    // A booted guest also restarts k3s and the Agent Sandbox controller, and
+    // a gateway that is healthy doesn't show the controller is reconciling.
+    if session
+        .exec(&["test", "-x", K3S_BINARY])
+        .await?
+        .status
+        .success()
+    {
+        checked(
+            "wait for the Agent Sandbox controller",
+            session
+                .exec_timeout(
+                    &["sudo", "-n", "bash", "-c", WAIT_K3S_CONTROLLER],
+                    WAIT_K3S_CONTROLLER_TIMEOUT,
+                )
+                .await?,
+        )?;
+    }
+
     let archive = format!("{guest}/tests.tar.zst");
     let extract = format!("{guest}/extract");
     let config = format!("{guest}/nextest.toml");
@@ -351,6 +370,12 @@ fn print_log_tail(log: &Path) {
 const COLLECT_K3S: &str = include_str!("collect-k3s.sh");
 /// Where the k3s installers put the k3s binary; its presence marks a k3s guest.
 const K3S_BINARY: &str = "/usr/local/bin/k3s";
+/// The check that the Agent Sandbox controller reconciles Sandboxes, run on a
+/// k3s guest after it boots.
+const WAIT_K3S_CONTROLLER: &str = include_str!("wait-k3s-controller.sh");
+/// The script retries for up to ten minutes; this catches one that stalls.
+const WAIT_K3S_CONTROLLER_TIMEOUT: Duration = Duration::from_mins(12);
+
 /// Where the guest keeps the script's output until it is copied out.
 const COLLECT_K3S_OUTPUT: &str = "/var/tmp/openshell-k3s-diagnostics.txt";
 /// How long the guest lets the script run before stopping it. The script
