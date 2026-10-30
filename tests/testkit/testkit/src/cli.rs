@@ -86,7 +86,8 @@ impl Cli {
 
     /// Like [`Cli::run_in`], with extra environment variables for the CLI,
     /// such as a credential it reads by name. Values are not included in
-    /// [`CliOutput::command`] or in errors, so they can hold secrets.
+    /// [`CliOutput::command`] or in errors, so they can hold secrets. They
+    /// can't change which gateway or workspace the CLI uses.
     pub async fn run_with_env<I, S>(
         &self,
         dir: Option<&Path>,
@@ -108,8 +109,11 @@ impl Cli {
             .join(" ");
 
         let mut process = tokio::process::Command::new(&self.binary);
+        // Set first, so the gateway and workspace selection below wins over
+        // anything the caller passes.
         process
             .args(&args)
+            .envs(env.iter().copied())
             .env("NO_COLOR", "1")
             .env(WORKSPACE_ENV, &self.gateway.workspace)
             .stdin(Stdio::null())
@@ -127,7 +131,6 @@ impl Cli {
         if let Some(dir) = dir {
             process.current_dir(dir);
         }
-        process.envs(env.iter().copied());
 
         let output = tokio::time::timeout(CLI_TIMEOUT, process.output())
             .await
