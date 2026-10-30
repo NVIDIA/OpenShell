@@ -46,6 +46,7 @@ def _required_files() -> set[str]:
         files.add(f"openshell/_proto/{stem}_pb2.py")
         files.add(f"openshell/_proto/{stem}_pb2.pyi")
         files.add(f"openshell/_proto/{stem}_pb2_grpc.py")
+        files.add(f"openshell/_proto/{stem}_pb2_grpc.pyi")
     return files
 
 

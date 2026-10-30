@@ -196,8 +196,17 @@ jobs:
           prepare-shell: "true"
           shell-installable: .#devShells.x86_64-linux.default
 
+      - name: Install pinned cargo-deny
+        run: mise install --locked github:EmbarkStudios/cargo-deny
+
+      # Enter mise inside the Nix shell so Nix's cargo-deny cannot shadow the pin.
+      # mise sets RUSTC_WRAPPER=sccache, but this metadata-only job does not
+      # install sccache. Clear wrappers after mise applies its environment.
+      - name: Verify crypto dependency guardrail
+        run: mise exec github:EmbarkStudios/cargo-deny -- env RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= uv run --no-project python tasks/scripts/test-crypto-dependency-policy.py
+
       - name: Check dependencies
-        run: cargo deny check licenses bans sources
+        run: mise exec github:EmbarkStudios/cargo-deny -- env RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= cargo deny check licenses bans sources
 
   rust-format:
     name: Rust format
@@ -221,6 +230,10 @@ jobs:
           cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all -- --check
           cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check
           cargo fmt --manifest-path examples/isolation-backend-v8/Cargo.toml --all -- --check
+          cargo fmt --manifest-path tests/testkit/Cargo.toml --all -- --check
+          cargo fmt --manifest-path tests/tmachine/Cargo.toml --all -- --check
+          cargo fmt --manifest-path tests/runner/Cargo.toml --all -- --check
+          cargo fmt --manifest-path tests/suites/conformance/Cargo.toml -p sandbox -- --check
 
   cargo-lockfiles:
     name: Cargo lockfiles
@@ -238,7 +251,9 @@ jobs:
 
       - name: Verify Cargo lockfiles
         shell: nix develop -c bash -euo pipefail {0}
-        run: tasks/scripts/check-cargo-lockfiles.sh
+        run: |
+          tasks/scripts/check-cargo-lockfiles.sh
+          uv run tasks/scripts/check_cargo_lockfile_alignment.py
 
   rust-lint:
     name: Rust lint (${{ matrix.system }})
@@ -277,6 +292,10 @@ jobs:
           cargo clippy --locked --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path examples/isolation-backend-v8/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path tests/testkit/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path tests/tmachine/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path tests/runner/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path tests/suites/conformance/Cargo.toml -p sandbox --all-targets -- -D warnings
 
   rust-test:
     name: Rust test (${{ matrix.system }})
@@ -310,13 +329,51 @@ jobs:
       - name: Verify crypto backend independence
         shell: nix develop -c bash -euo pipefail {0}
         run: |
-          cargo tree --locked -p openshell-crypto --no-default-features --edges normal,build,dev --prefix none > /tmp/openshell-crypto-dependencies.txt
+          cargo tree --locked -p openshell-crypto --no-default-features --edges normal,build,dev --target all --prefix none > /tmp/openshell-crypto-dependencies.txt
           if grep -Eq '^(ring|aws-lc-rs|aws-lc-sys|aws-lc-fips-sys) v' /tmp/openshell-crypto-dependencies.txt; then
             echo "ERROR: backend-free crypto build includes Ring or AWS-LC" >&2
             cat /tmp/openshell-crypto-dependencies.txt >&2
             exit 1
           fi
           cargo test --locked -p openshell-crypto --no-default-features --test independent_backend
+
+      - name: Verify OpenSSL backend
+        shell: nix develop .#crypto -c bash -euo pipefail {0}
+        env:
+          OPENSSL_NO_VENDOR: "1"
+          OPENSSL_STATIC: "0"
+        run: |
+          cargo tree --locked -p openshell-crypto --no-default-features --features openssl --edges normal,build,dev --target all --prefix none > /tmp/openshell-openssl-dependencies.txt
+          if grep -Eq '^(ring|aws-lc-rs|aws-lc-sys|aws-lc-fips-sys|openssl-src) v' /tmp/openshell-openssl-dependencies.txt; then
+            echo "ERROR: OpenSSL-only crypto build includes another backend or vendored OpenSSL" >&2
+            cat /tmp/openshell-openssl-dependencies.txt >&2
+            exit 1
+          fi
+          cargo clippy --locked -p openshell-crypto --no-default-features --features openssl --all-targets -- -D warnings
+          cargo test --locked -p openshell-crypto --no-default-features --features openssl
+          for feature in tls-tonic tls-kube tls-sqlx; do
+            cargo check --locked -p openshell-crypto --no-default-features --features "openssl,$feature"
+          done
+          cargo clippy --locked -p openshell-crypto --features openssl --all-targets -- -D warnings
+          cargo test --locked -p openshell-crypto --features openssl
+
+      - name: Verify dynamic OpenSSL linkage on Linux
+        if: runner.os == 'Linux'
+        shell: nix develop .#crypto -c bash -euo pipefail {0}
+        env:
+          OPENSSL_NO_VENDOR: "1"
+          OPENSSL_STATIC: "0"
+        run: |
+          cargo test --locked -p openshell-crypto --no-default-features --features openssl --test openssl_tls --no-run --message-format=json > "$RUNNER_TEMP/openssl-artifacts.jsonl"
+          executable=$(uv run --no-project python -c 'import json, sys; artifacts = [json.loads(line) for line in sys.stdin]; paths = [a["executable"] for a in artifacts if a.get("reason") == "compiler-artifact" and a.get("target", {}).get("name") == "openssl_tls" and a.get("executable")]; assert len(paths) == 1, paths; print(paths[0])' < "$RUNNER_TEMP/openssl-artifacts.jsonl")
+          ldd "$executable" > "$RUNNER_TEMP/openssl-linkage.txt"
+          cat "$RUNNER_TEMP/openssl-linkage.txt"
+          for library in libssl libcrypto; do
+            if ! grep -Eq "^[[:space:]]*$library\\.so[^[:space:]]* => /" "$RUNNER_TEMP/openssl-linkage.txt"; then
+              echo "ERROR: $library did not resolve to a dynamic library" >&2
+              exit 1
+            fi
+          done
 
       - name: Test
         shell: nix develop -c bash -euo pipefail {0}
@@ -325,6 +382,9 @@ jobs:
         run: |
           cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
+          cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/testkit/Cargo.toml
+          cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/tmachine/Cargo.toml
+          cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/runner/Cargo.toml
 
   rust-postgres-test:
     name: Rust PostgreSQL tests

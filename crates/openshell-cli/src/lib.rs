@@ -16,7 +16,6 @@ pub mod auth;
 pub mod color;
 pub(crate) mod commands;
 pub mod completers;
-pub mod edge_tunnel;
 pub mod oidc_auth;
 pub mod output;
 pub(crate) mod policy_update;

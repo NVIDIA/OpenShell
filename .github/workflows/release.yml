@@ -7,8 +7,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Stable version to promote from its latest passing prerelease (e.g. v0.0.4)"
-        required: true
+        description: "Stable version (e.g. v0.0.4); omit to detect the highest prerelease version on this branch"
+        required: false
         type: string
       notes-only:
         description: "Generate a release notes artifact without promoting or publishing"
@@ -87,7 +87,7 @@ jobs:
       - name: Retain promotion record
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: stable-promotion-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: stable-promotion-${{ steps.candidate.outputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: promotion.json
           retention-days: 90
           if-no-files-found: error

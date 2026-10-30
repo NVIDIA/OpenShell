@@ -110,6 +110,11 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- range $legacyKey, $runtimeKey := dict "logLevel" "log_level" "enableLoopbackServiceHttp" "enable_loopback_service_http" "enableWebsocketTunnel" "enable_websocket_tunnel" "policyValidationFailureMode" "policy_validation_failure_mode" -}}
 {{- if not (hasKey $gateway $runtimeKey) -}}{{- $_ := set $gateway $runtimeKey (get $legacyServer $legacyKey) -}}{{- end -}}
 {{- end -}}
+{{/* An empty hostname format means "unset"; only translate it when set. The
+     discriminator is the gateway installation name, rendered above. */}}
+{{- if and (get $legacyServer "serviceHostnameFormat") (not (hasKey $gateway "service_hostname_format")) -}}
+{{- $_ := set $gateway "service_hostname_format" (get $legacyServer "serviceHostnameFormat") -}}
+{{- end -}}
 {{- if not (hasKey $gateway "compute_driver") -}}{{- $_ := set $gateway "compute_driver" "kubernetes" -}}{{- end -}}
 {{- $serverDnsNames := .Values.pkiInitJob.serverDnsNames | default list -}}
 {{- if .Values.certManager.enabled -}}{{- $serverDnsNames = .Values.certManager.serverDnsNames | default list -}}{{- end -}}
@@ -178,7 +183,7 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- if not (hasKey $ocsfConfig "rotation") -}}{{- $rotation := get $legacyOcsf "rotation" | default "daily" -}}{{- if not (has $rotation (list "daily" "never")) -}}{{- fail "server.ocsfLog.rotation must be daily or never" -}}{{- end -}}{{- $_ := set $ocsfConfig "rotation" $rotation -}}{{- end -}}
 {{- if not (hasKey $ocsfConfig "queue_capacity") -}}{{- $queueCapacity := 10000 -}}{{- if and (hasKey $legacyOcsf "queueCapacity") (ne (get $legacyOcsf "queueCapacity") nil) -}}{{- $queueCapacity = get $legacyOcsf "queueCapacity" -}}{{- end -}}{{- if lt (int $queueCapacity) 1 -}}{{- fail "server.ocsfLog.queueCapacity and queueMaxBytes must be positive" -}}{{- end -}}{{- $_ := set $ocsfConfig "queue_capacity" (int $queueCapacity) -}}{{- end -}}
 {{- if not (hasKey $ocsfConfig "queue_max_bytes") -}}{{- $queueMaxBytes := 16777216 -}}{{- if and (hasKey $legacyOcsf "queueMaxBytes") (ne (get $legacyOcsf "queueMaxBytes") nil) -}}{{- $queueMaxBytes = get $legacyOcsf "queueMaxBytes" -}}{{- end -}}{{- if lt (int $queueMaxBytes) 1 -}}{{- fail "server.ocsfLog.queueCapacity and queueMaxBytes must be positive" -}}{{- end -}}{{- $_ := set $ocsfConfig "queue_max_bytes" (int $queueMaxBytes) -}}{{- end -}}
-{{- if not (hasKey $ocsfConfig "schema_version") -}}{{- $schemaVersion := get $legacyOcsf "schemaVersion" | default "" -}}{{- if not (has $schemaVersion (list "" "1.1" "1.3")) -}}{{- fail "server.ocsfLog.schemaVersion must be empty, 1.1, or 1.3" -}}{{- end -}}{{- if $schemaVersion -}}{{- $_ := set $ocsfConfig "schema_version" $schemaVersion -}}{{- end -}}{{- end -}}
+{{- if not (hasKey $ocsfConfig "schema_version") -}}{{- $schemaVersion := get $legacyOcsf "schemaVersion" | default "" -}}{{- if $schemaVersion -}}{{- $_ := set $ocsfConfig "schema_version" (toString $schemaVersion) -}}{{- end -}}{{- end -}}
 {{- if and (eq (get $ocsfConfig "rotation") "daily") (not (hasKey $ocsfConfig "max_files")) -}}{{- $maxFiles := 7 -}}{{- if and (hasKey $legacyOcsf "maxFiles") (ne (get $legacyOcsf "maxFiles") nil) -}}{{- $maxFiles = get $legacyOcsf "maxFiles" -}}{{- end -}}{{- if lt (int $maxFiles) 1 -}}{{- fail "server.ocsfLog.maxFiles must be positive when rotation is daily" -}}{{- end -}}{{- $_ := set $ocsfConfig "max_files" (int $maxFiles) -}}{{- end -}}
 {{- end -}}
 {{- $_ := set $config "openshell.gateway.ocsf_log" $ocsfConfig -}}
@@ -303,6 +308,22 @@ owner: server.*. Override any gatewayConfig copies before serializing TOML. */}}
 {{- $_ := unset $gatewayTls "external_server_names" -}}
 {{- end -}}
 {{- $_ := set $config "openshell.gateway.tls" $gatewayTls -}}
+{{- end -}}
+{{/* The chart owns the shared supervisor pool; see
+openshell.supervisorPoolConfig. */}}
+{{- $supervisorPool := include "openshell.supervisorPoolConfig" . | fromYaml -}}
+{{- if $supervisorPool -}}
+{{- $_ := set $config "openshell.gateway.supervisor_pool" $supervisorPool -}}
+{{- end -}}
+{{/* Additional destination CA trust is chart plumbing: the runtime table is
+owned by the chart, not gatewayConfig. Derive it only from the chart-owned
+operator ConfigMap reference. */}}
+{{- $supervisorNetwork := .Values.supervisor.network | default dict -}}
+{{- if get $supervisorNetwork "additionalCaConfigMapName" -}}
+{{- if hasKey $config "openshell.supervisor.network" -}}
+{{- fail "gatewayConfig must not define openshell.supervisor.network; the chart derives it from supervisor.network.additionalCaConfigMapName" -}}
+{{- end -}}
+{{- $_ := set $config "openshell.supervisor.network" (dict "additional_ca_bundle" "/etc/openshell-tls/additional-ca-source/ca.crt") -}}
 {{- end -}}
 {{/* A nested YAML map and its dotted top-level table would serialize to
 conflicting TOML definitions. Fail before rendering an invalid ConfigMap. */}}

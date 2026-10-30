@@ -83,5 +83,17 @@ e2e_write_podman_gateway_config() {
         e2e_write_gateway_oidc_config "${oidc_issuer}"
       fi
     fi
+    # Opt-in OTLP export so the otlp_relay e2e can bind a collector stub on
+    # the referenced port. Supervisors connect lazily, so the gateway may
+    # start before the stub exists.
+    if [ -n "${OPENSHELL_E2E_OTLP_ENDPOINT:-}" ]; then
+      printf '\n[openshell.gateway.otlp]\n'
+      printf 'endpoint = %s\n' "$(e2e_podman_toml_string "${OPENSHELL_E2E_OTLP_ENDPOINT}")"
+      # The agent trace relay is opt-in; OPENSHELL_E2E_OTLP_AGENT=0 runs the
+      # relay's inert case with trace export still on.
+      if [ "${OPENSHELL_E2E_OTLP_AGENT:-1}" != "0" ]; then
+        printf '\n[openshell.gateway.otlp.agent]\nenabled = true\n'
+      fi
+    fi
   } >>"${output}"
 }

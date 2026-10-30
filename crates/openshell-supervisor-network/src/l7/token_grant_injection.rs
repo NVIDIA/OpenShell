@@ -53,9 +53,17 @@ pub trait TokenGrantResolver: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<String, TokenGrantFailure>> + Send + 'a>>;
 }
 
-/// Resolves provider tokens using the supervisor's authenticated grant flow.
-#[derive(Default)]
-pub struct SpiffeTokenGrantResolver;
+/// Resolves provider tokens through one sandbox instance's authenticated grant flow.
+pub struct SpiffeTokenGrantResolver {
+    grants: crate::token_grant::SandboxInstanceTokenGrants,
+}
+
+impl SpiffeTokenGrantResolver {
+    #[must_use]
+    pub fn new(grants: crate::token_grant::SandboxInstanceTokenGrants) -> Self {
+        Self { grants }
+    }
+}
 
 impl TokenGrantResolver for SpiffeTokenGrantResolver {
     fn obtain<'a>(
@@ -63,8 +71,8 @@ impl TokenGrantResolver for SpiffeTokenGrantResolver {
         request: TokenGrantRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<String, TokenGrantFailure>> + Send + 'a>> {
         Box::pin(async move {
-            crate::token_grant::obtain_provider_token(
-                crate::token_grant::ObtainProviderTokenRequest {
+            self.grants
+                .obtain_provider_token(crate::token_grant::ObtainProviderTokenRequest {
                     provider_name: request.provider_key,
                     token_endpoint: request.token_endpoint,
                     jwt_svid_audience: request.jwt_svid_audience,
@@ -75,16 +83,10 @@ impl TokenGrantResolver for SpiffeTokenGrantResolver {
                     grant_type: request.grant_type,
                     requested_token_type: request.requested_token_type,
                     request_id: request.request_id,
-                },
-            )
-            .await
+                })
+                .await
         })
     }
-}
-
-/// Construct the production SPIFFE-backed resolver.
-pub fn default_resolver() -> Arc<dyn TokenGrantResolver> {
-    Arc::new(SpiffeTokenGrantResolver)
 }
 
 /// A refused request: the grant failure and the credential whose grant failed.

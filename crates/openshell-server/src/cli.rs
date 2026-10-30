@@ -6,7 +6,10 @@
 use clap::parser::ValueSource;
 use clap::{ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
-use openshell_core::config::{ConfigDeliveryMode, DEFAULT_GATEWAY_NAME, DEFAULT_SERVER_PORT};
+use openshell_core::config::{
+    ConfigDeliveryMode, DEFAULT_GATEWAY_NAME, DEFAULT_SERVER_PORT, ServiceHostnameFormat,
+    ServiceRoutingConfig,
+};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::net::{IpAddr, SocketAddr};
@@ -286,6 +289,13 @@ struct RunArgs {
     )]
     server_sans: Vec<String>,
 
+    /// Hostname format for exposed sandbox services: `readable` (default)
+    /// keeps `<workspace>--<sandbox>[--<service>]` hostnames; `hashed` mints
+    /// opaque one-label hostnames discriminated by the gateway installation
+    /// name.
+    #[arg(long, env = "OPENSHELL_SERVICE_HOSTNAME_FORMAT")]
+    service_hostname_format: Option<ServiceHostnameFormat>,
+
     /// Enable plaintext HTTP routing for loopback sandbox service URLs.
     #[arg(
         long,
@@ -303,6 +313,11 @@ struct RunArgs {
         action = ArgAction::Set
     )]
     enable_websocket_tunnel: bool,
+
+    /// Activate stopped-sandbox configuration updates only after retiring every incompatible gateway
+    /// and settling its outstanding driver operations. See HA upgrade guidance.
+    #[arg(long, env = "OPENSHELL_ENABLE_SANDBOX_UPDATES", default_value_t = false, action = ArgAction::Set)]
+    enable_sandbox_updates: bool,
 }
 
 pub fn command() -> Command {
@@ -391,6 +406,15 @@ fn prepare_server_config_with_drivers(
     } else {
         None
     };
+    // Normalize sources now, but defer artifact staging until the selected
+    // driver has been proven able to propagate the bundle. This keeps a
+    // rejected startup/preflight from leaving gateway state behind.
+    let normalized_network_trust = file
+        .as_ref()
+        .map(|file| crate::network_trust::normalize_from_config(&file.openshell.supervisor.network))
+        .transpose()
+        .map_err(|error| miette::miette!("{error}"))?
+        .flatten();
     if let Some(file) = file.as_ref() {
         merge_file_into_args(args, &file.openshell.gateway, matches);
     }
@@ -568,8 +592,15 @@ fn prepare_server_config_with_drivers(
                 .unwrap_or_default(),
         )
         .with_server_sans(args.server_sans.clone())
+        .with_service_hostname_format(args.service_hostname_format.unwrap_or_default())
         .with_loopback_service_http(args.enable_loopback_service_http)
         .with_websocket_tunnel(args.enable_websocket_tunnel);
+    config
+        .service_routing
+        .validate(&config.name)
+        .map_err(|error| miette::miette!("invalid service routing configuration: {error}"))?;
+
+    config.enable_sandbox_updates = args.enable_sandbox_updates;
     if let Some(sources) = file
         .as_ref()
         .and_then(|file| file.openshell.gateway.provider_profile_sources.clone())
@@ -650,13 +681,70 @@ fn prepare_server_config_with_drivers(
     // user-authored config file.
     config.gateway_jwt = gateway_jwt;
 
+    if let Some(normalized) = normalized_network_trust.as_ref() {
+        // Use the same resolver as runtime construction, with the explicit
+        // configuration marker but no synthetic/staged artifact. This rejects
+        // remote endpoints and factories that have not opted into trust
+        // propagation before any state is written.
+        let driver_startup = crate::compute::driver_config::DriverStartupContext {
+            file: file.as_ref(),
+            guest_tls: guest_tls.as_ref(),
+            network_trust: None,
+            network_trust_configured: true,
+            gateway_port: config.bind_address.port(),
+            gateway_tls_enabled: config.tls.is_some(),
+            endpoint_overrides: &config.compute_driver_endpoints,
+        };
+        crate::validate_compute_driver_config(
+            compute_drivers,
+            compute_driver.name(),
+            &config.name,
+            config.bind_address,
+            &config.log_level,
+            driver_startup,
+            false,
+        )
+        .map_err(|error| {
+            miette::miette!(
+                "Network supervisor additional destination trust configured: certificate_count={} digest={}: {error}",
+                normalized.certificate_count(),
+                normalized.digest()
+            )
+        })?;
+    }
+    let network_trust = normalized_network_trust
+        .map(crate::network_trust::stage_normalized)
+        .transpose()?;
+
     Ok(ServerStartupConfig {
         config,
         config_file: file,
         guest_tls,
+        network_trust,
         compute_driver,
         legacy_compute_driver_env_seen,
     })
+}
+
+/// Reject an implicit development gateway before starting any listeners or services.
+fn validate_user_auth(config: &openshell_core::Config) -> Result<()> {
+    if !config.auth.allow_unauthenticated_users
+        && !config.mtls_auth.enabled
+        && !config.mtls_auth.operator_enabled
+        && config.oidc.is_none()
+        && config.gateway_jwt.is_none()
+    {
+        return Err(miette::miette!(
+            "gateway has no user authentication configured\n\n\
+             No OIDC issuer, mTLS user auth, operator auth, or gateway_jwt is set. \
+             Authenticated RPCs require credentials unless unauthenticated users are explicitly allowed.\n\n\
+             Configure [openshell.gateway.oidc], [openshell.gateway.mtls_auth], or \
+             [openshell.gateway.gateway_jwt], or explicitly opt in for trusted local development:\n\n\
+             [openshell.gateway.auth]\n\
+             allow_unauthenticated_users = true"
+        ));
+    }
+    Ok(())
 }
 
 async fn run_from_args(
@@ -665,6 +753,7 @@ async fn run_from_args(
     compute_drivers: ComputeDriverRegistry,
 ) -> Result<()> {
     let prepared = prepare_server_config_with_drivers(&mut args, &matches, &compute_drivers)?;
+    validate_user_auth(&prepared.config)?;
 
     // Initialize OCSF identity before tracing can emit gateway events.
     let gateway_identity = crate::gateway_ocsf::GatewayIdentity {
@@ -711,6 +800,20 @@ async fn run_from_args(
     if prepared.legacy_compute_driver_env_seen {
         warn!("OPENSHELL_DRIVERS is deprecated; migrate to OPENSHELL_COMPUTE_DRIVER");
     }
+    for field in prepared
+        .config_file
+        .iter()
+        .flat_map(ConfigFile::deprecated_ocsf_schema_versions)
+    {
+        warn!("{field} is deprecated and ignored; OpenShell emits OCSF 1.8.0");
+    }
+    if let Some(bundle) = prepared.network_trust.as_ref() {
+        info!(
+            certificate_count = bundle.certificate_count(),
+            digest = bundle.digest(),
+            "Network supervisor additional destination trust configured"
+        );
+    }
 
     let has_client_ca = prepared
         .config
@@ -749,24 +852,13 @@ async fn run_from_args(
         info!(
             traces_endpoint = otlp.traces_endpoint().map(tracing::field::display),
             ocsf_endpoint = otlp.ocsf_endpoint().map(tracing::field::display),
+            agent_endpoint = otlp.agent_endpoint().map(tracing::field::display),
             "OTLP exporting enabled"
         );
     }
     if prepared.config.auth.allow_unauthenticated_users {
         warn!(
             "Unauthenticated user access enabled — only use this for trusted local development or a fully trusted fronting proxy"
-        );
-    }
-
-    if !prepared.config.auth.allow_unauthenticated_users
-        && !prepared.config.mtls_auth.enabled
-        && !prepared.config.mtls_auth.operator_enabled
-        && !has_oidc
-        && prepared.config.gateway_jwt.is_none()
-    {
-        warn!(
-            "Neither mTLS user auth nor OIDC nor sandbox JWT auth is configured — \
-             the gateway has no authentication mechanism"
         );
     }
 
@@ -805,6 +897,10 @@ impl crate::ComputeDriverFactory for PreflightTestFactory {
     }
 
     fn supports_config_preflight(&self) -> bool {
+        true
+    }
+
+    fn supports_network_supervisor_trust(&self) -> bool {
         true
     }
 
@@ -907,6 +1003,12 @@ fn run_effective_config_preflight(
         let empty_file = ConfigFile::default();
         let semantic_file = file.as_ref().unwrap_or(&empty_file);
         validate_preflight_semantics(&run, matches, semantic_file)?;
+        // Preflight must exercise the same full source parsing as startup,
+        // while deliberately leaving state artifacts untouched.
+        let network_trust_configured = crate::network_trust::normalize_from_config(
+            &semantic_file.openshell.supervisor.network,
+        )?
+        .is_some();
 
         let mut endpoint_overrides = BTreeMap::new();
         if let Some(selection) = selection.as_ref()
@@ -917,6 +1019,8 @@ fn run_effective_config_preflight(
         let driver_startup = crate::compute::driver_config::DriverStartupContext {
             file: file.as_ref(),
             guest_tls: None,
+            network_trust: None,
+            network_trust_configured,
             gateway_port: run.port,
             gateway_tls_enabled: !run.disable_tls,
             endpoint_overrides: &endpoint_overrides,
@@ -924,7 +1028,7 @@ fn run_effective_config_preflight(
         let mut selected_driver = None;
         if let Some(selection) = selection.as_ref() {
             validate_preflight_isolation_backend(semantic_file, selection.name())?;
-            selected_driver = Some(crate::validate_compute_driver_config(
+            let driver = crate::validate_compute_driver_config(
                 compute_drivers,
                 selection.name(),
                 run.name.trim(),
@@ -932,8 +1036,24 @@ fn run_effective_config_preflight(
                 &run.log_level,
                 driver_startup,
                 true,
-            )?);
+            )?;
+            crate::validate_supervisor_pool_consumer(
+                &driver,
+                run.name.trim(),
+                SocketAddr::new(run.bind_address, run.port),
+                &run.log_level,
+                driver_startup,
+            )?;
+            selected_driver = Some(driver);
         } else if file.is_some() {
+            // Preflight cannot run driver detection probes. A pool table must
+            // name its consumer so this check cannot silently pass for a
+            // driver that will reject the table at startup.
+            if semantic_file.openshell.gateway.supervisor_pool.is_some() {
+                return Err(miette::miette!(
+                    "openshell.gateway.supervisor_pool requires an explicit compute driver for config preflight"
+                ));
+            }
             // Runtime auto-detection may connect local API sockets or launch a
             // bounded discovery command. Preflight must not perform those
             // side effects, so validate every configured table that could be
@@ -1044,6 +1164,11 @@ fn validate_preflight_semantics(
         args.grpc_rate_limit_requests,
         args.grpc_rate_limit_window_seconds,
     )?;
+    if args.service_hostname_format == Some(ServiceHostnameFormat::Hashed) {
+        ServiceRoutingConfig::default()
+            .validate(args.name.trim())
+            .map_err(|error| miette::miette!("invalid service routing configuration: {error}"))?;
+    }
     GuestTlsPaths::validate_configuration(Some(gateway), args.disable_tls)
         .map_err(|error| miette::miette!("invalid gateway guest TLS configuration: {error}"))?;
 
@@ -1252,6 +1377,12 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.server_sans.clone_from(sans);
     }
+    if let Some(format) = &file.service_hostname_format
+        && args.service_hostname_format.is_none()
+        && arg_defaulted(matches, "service_hostname_format")
+    {
+        args.service_hostname_format = Some(*format);
+    }
     if let Some(enabled) = file.enable_loopback_service_http
         && arg_defaulted(matches, "enable_loopback_service_http")
     {
@@ -1261,6 +1392,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         && arg_defaulted(matches, "enable_websocket_tunnel")
     {
         args.enable_websocket_tunnel = enabled;
+    }
+    if let Some(enabled) = file.enable_sandbox_updates
+        && arg_defaulted(matches, "enable_sandbox_updates")
+    {
+        args.enable_sandbox_updates = enabled;
     }
     if let Some(mtls_auth) = &file.mtls_auth
         && arg_defaulted(matches, "enable_mtls_auth")
@@ -1417,8 +1553,128 @@ mod tests {
     use super::{Cli, command};
     use crate::test_environment::Environment;
     use clap::Parser;
+    use openshell_core::config::ServiceHostnameFormat;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn user_auth_requires_a_mechanism_or_explicit_opt_in() {
+        // Cover each mechanism on its own and in combination, with and without
+        // the development opt-in. Only the entirely unconfigured case fails.
+        for mechanisms in 0..32 {
+            let mut config = openshell_core::Config::new(None);
+            config.auth.allow_unauthenticated_users = mechanisms & 1 != 0;
+            config.mtls_auth.enabled = mechanisms & 2 != 0;
+            config.mtls_auth.operator_enabled = mechanisms & 4 != 0;
+            if mechanisms & 8 != 0 {
+                config.oidc = Some(
+                    toml::from_str("issuer = 'https://idp.example.com'\naudience = 'openshell'")
+                        .unwrap(),
+                );
+            }
+            if mechanisms & 16 != 0 {
+                config.gateway_jwt = Some(toml::from_str(
+                    "signing_key_path = 'key.pem'\npublic_key_path = 'public.pem'\nkid_path = 'kid'"
+                ).unwrap());
+            }
+            assert_eq!(
+                super::validate_user_auth(&config).is_ok(),
+                mechanisms != 0,
+                "authentication combination {mechanisms}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_rejects_missing_user_auth_before_starting_services() {
+        for auth in [
+            "",
+            "[openshell.gateway.auth]\nallow_unauthenticated_users = false\n",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let config_path = home.path().join("gateway.toml");
+            std::fs::write(&config_path, format!("[openshell]\nversion = 2\n{auth}")).unwrap();
+            Environment::new()
+                .set("XDG_CONFIG_HOME", home.path().to_str().unwrap())
+                .set("XDG_STATE_HOME", home.path().to_str().unwrap())
+                .set("OPENSHELL_LOCAL_TLS_DIR", home.path().join("tls"))
+                .remove("OPENSHELL_GATEWAY_CONFIG")
+                .remove("OPENSHELL_DRIVERS")
+                .run(|| {
+                    let (args, matches) = parse_with_args(&[
+                        "openshell-gateway",
+                        "--config",
+                        config_path.to_str().unwrap(),
+                        "--disable-tls",
+                        "--db-url",
+                        "sqlite::memory:",
+                        "--compute-driver",
+                        "test",
+                    ]);
+                    // The factory panics if startup reaches driver construction.
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let error = runtime
+                        .block_on(super::run_from_args(
+                            args,
+                            matches,
+                            test_registry("test", true),
+                        ))
+                        .unwrap_err()
+                        .to_string();
+                    for expected in [
+                        "gateway has no user authentication configured",
+                        "OIDC",
+                        "mTLS",
+                        "operator auth",
+                        "gateway_jwt",
+                        "[openshell.gateway.auth]",
+                        "allow_unauthenticated_users = true",
+                    ] {
+                        assert!(error.contains(expected), "missing {expected:?} in {error}");
+                    }
+                });
+        }
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: tests serialize environment mutation with ENV_LOCK.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+
+        #[allow(unsafe_code)]
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: tests serialize environment mutation with ENV_LOCK.
+            unsafe { std::env::remove_var(key) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            match self.original.as_deref() {
+                // SAFETY: tests serialize environment mutation with ENV_LOCK.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: tests serialize environment mutation with ENV_LOCK.
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     static REGISTRY_DETECTION_CALLS: AtomicUsize = AtomicUsize::new(0);
     static REJECTING_VALIDATION_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -1444,11 +1700,39 @@ mod tests {
             true
         }
 
+        fn supports_network_supervisor_trust(&self) -> bool {
+            true
+        }
+
         async fn build(
             &self,
             _context: crate::ComputeDriverBuildContext<'_>,
         ) -> openshell_core::Result<crate::ComputeDriverInstance> {
             unreachable!("CLI metadata tests do not build drivers")
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct SharedSupervisionFactory;
+
+    #[async_trait::async_trait]
+    impl crate::ComputeDriverFactory for SharedSupervisionFactory {
+        fn supports_config_preflight(&self) -> bool {
+            true
+        }
+
+        fn uses_shared_supervision(
+            &self,
+            _context: crate::ComputeDriverConfigContext<'_>,
+        ) -> openshell_core::Result<bool> {
+            Ok(true)
+        }
+
+        async fn build(
+            &self,
+            _context: crate::ComputeDriverBuildContext<'_>,
+        ) -> openshell_core::Result<crate::ComputeDriverInstance> {
+            unreachable!("preflight must not build the selected driver")
         }
     }
 
@@ -2193,6 +2477,69 @@ mod tests {
     }
 
     #[test]
+    fn config_preflight_rejects_supervisor_pool_without_a_shared_supervision_driver() {
+        let config_home = tempfile::tempdir().unwrap();
+        let config = config_home.path().join("gateway.toml");
+        std::fs::write(
+            &config,
+            "[openshell]\nversion = 2\n\n[openshell.gateway.supervisor_pool]\nrecovery_timeout_secs = 60\n",
+        )
+        .unwrap();
+        let preflight = |registry: &crate::ComputeDriverRegistry| {
+            let (run, matches) = parse_with_args(&[
+                "openshell-gateway",
+                "--compute-driver",
+                "local",
+                "--disable-tls",
+            ]);
+            super::run_config_preflight_with_drivers(
+                super::ConfigPreflightArgs {
+                    path: Some(config.clone()),
+                    ..Default::default()
+                },
+                run,
+                &matches,
+                registry,
+            )
+        };
+
+        Environment::new()
+            .remove("OPENSHELL_GATEWAY_CONFIG")
+            .remove("OPENSHELL_COMPUTE_DRIVER")
+            .remove("OPENSHELL_DRIVERS")
+            .run(|| {
+                preflight(&test_registry("local", false))
+                    .expect_err("a pool table without a shared supervision driver must fail");
+
+                let mut registry = crate::ComputeDriverRegistry::new();
+                registry
+                    .install(
+                        crate::ComputeDriverRegistration::new(
+                            "local",
+                            100,
+                            None,
+                            SharedSupervisionFactory,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                preflight(&registry).expect("a shared supervision driver consumes the pool table");
+
+                let (run, matches) = parse_with_args(&["openshell-gateway", "--disable-tls"]);
+                super::run_config_preflight_with_drivers(
+                    super::ConfigPreflightArgs {
+                        path: Some(config.clone()),
+                        ..Default::default()
+                    },
+                    run,
+                    &matches,
+                    &detected_local_registry(),
+                )
+                .expect_err("a pool table without an explicit driver cannot be preflighted");
+            });
+    }
+
+    #[test]
     fn config_preflight_rejects_factory_without_side_effect_free_validation() {
         let config_home = tempfile::tempdir().unwrap();
 
@@ -2428,6 +2775,53 @@ mod tests {
     }
 
     #[test]
+    fn config_preflight_normalizes_network_trust_without_creating_an_artifact() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let source_home = tempfile::tempdir().unwrap();
+        let state_parent = tempfile::tempdir().unwrap();
+        let state_home = state_parent.path().join("not-created");
+        let source = source_home.path().join("destination-ca.pem");
+        let certificate = rcgen::generate_simple_self_signed(vec!["destination.example".into()])
+            .expect("test certificate");
+        std::fs::write(&source, certificate.cert.pem()).unwrap();
+        let config = config_home.path().join("gateway.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[openshell]\nversion = 2\n\n[openshell.supervisor.network]\nadditional_ca_bundle = \"{}\"\n",
+                source.display()
+            ),
+        )
+        .unwrap();
+        let _config_env = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", state_home.to_str().unwrap());
+        let (run, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--compute-driver",
+            "test",
+            "--disable-tls",
+        ]);
+
+        super::run_config_preflight(
+            super::ConfigPreflightArgs {
+                path: Some(config),
+                ..Default::default()
+            },
+            run,
+            &matches,
+        )
+        .expect("valid trust source and capable selected driver pass preflight");
+
+        assert!(
+            !state_home.exists(),
+            "preflight must not create a normalized trust artifact"
+        );
+    }
+
+    #[test]
     fn config_preflight_explicit_path_overrides_environment_selection() {
         let dir = tempfile::tempdir().unwrap();
         let legacy = dir.path().join("legacy.toml");
@@ -2508,6 +2902,10 @@ mod tests {
             (
                 "rate-limit",
                 "[openshell]\nversion = 2\n[openshell.gateway]\nname = 'secret-semantic-marker'\ngrpc_rate_limit_requests = 10\n",
+            ),
+            (
+                "service-routing",
+                "[openshell]\nversion = 2\n[openshell.gateway]\nservice_routing_gateway_name = 'Not A Label'\n",
             ),
             (
                 "guest-tls",
@@ -2717,6 +3115,40 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_update_activation_defaults_off_and_file_requires_explicit_opt_in() {
+        Environment::new().remove("OPENSHELL_ENABLE_SANDBOX_UPDATES").run(|| {
+            let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+            assert!(!args.enable_sandbox_updates);
+            assert!(!openshell_core::Config::new(None).enable_sandbox_updates);
+            let file = config_file_from_toml("[openshell]\nversion = 2\n[openshell.gateway]\nenable_sandbox_updates = true\n");
+            merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+            assert!(args.enable_sandbox_updates);
+        });
+    }
+
+    #[test]
+    fn explicit_cli_or_environment_disable_overrides_file_activation() {
+        let file = config_file_from_toml(
+            "[openshell]\nversion = 2\n[openshell.gateway]\nenable_sandbox_updates = true\n",
+        );
+        Environment::new()
+            .remove("OPENSHELL_ENABLE_SANDBOX_UPDATES")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--enable-sandbox-updates", "false"]);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(!args.enable_sandbox_updates);
+            });
+        Environment::new()
+            .set("OPENSHELL_ENABLE_SANDBOX_UPDATES", "false")
+            .run(|| {
+                let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(!args.enable_sandbox_updates);
+            });
+    }
+
+    #[test]
     fn rejects_legacy_drivers_flag() {
         let error = command()
             .try_get_matches_from(["openshell-gateway", "--drivers", "docker"])
@@ -2892,6 +3324,107 @@ mod tests {
 
                 assert!(super::resolve_mtls_auth_enabled(&args, &matches, None));
             });
+    }
+
+    #[test]
+    fn prepare_server_config_normalizes_global_network_trust_before_driver_startup() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = tempfile::tempdir().unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path().to_str().unwrap());
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", config_dir.path().to_str().unwrap());
+
+        let certificate = rcgen::generate_simple_self_signed(vec!["destination.example".into()])
+            .expect("test certificate");
+        let source = source_dir.path().join("destination-ca.pem");
+        std::fs::write(&source, certificate.cert.pem()).unwrap();
+        let config_path = config_dir.path().join("gateway.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[openshell]\nversion = 2\n\n[openshell.supervisor.network]\nadditional_ca_bundle = \"{}\"\n",
+                source.display()
+            ),
+        )
+        .unwrap();
+
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--db-url",
+            "sqlite::memory:",
+            "--disable-tls",
+            "--compute-driver",
+            "local",
+        ]);
+        let prepared = super::prepare_server_config_with_drivers(
+            &mut args,
+            &matches,
+            &detected_local_registry(),
+        )
+        .expect("global network trust should normalize during startup preparation");
+        let bundle = prepared.network_trust.expect("normalized trust bundle");
+        assert_eq!(bundle.certificate_count(), 1);
+        assert!(bundle.artifact_path().is_file());
+        assert_eq!(std::fs::read(bundle.artifact_path()).unwrap(), bundle.pem());
+    }
+
+    #[test]
+    fn prepare_server_config_rejects_network_trust_endpoint_override_without_artifact() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = tempfile::tempdir().unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path().to_str().unwrap());
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", config_dir.path().to_str().unwrap());
+
+        let certificate = rcgen::generate_simple_self_signed(vec!["destination.example".into()])
+            .expect("test certificate");
+        let source = source_dir.path().join("destination-ca.pem");
+        std::fs::write(&source, certificate.cert.pem()).unwrap();
+        let config_path = config_dir.path().join("gateway.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[openshell]\nversion = 2\n\n[openshell.supervisor.network]\nadditional_ca_bundle = \"{}\"\n",
+                source.display()
+            ),
+        )
+        .unwrap();
+
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--db-url",
+            "sqlite::memory:",
+            "--disable-tls",
+            "--compute-driver",
+            "local",
+            "--compute-driver-socket",
+            "/tmp/local.sock",
+        ]);
+        let result = super::prepare_server_config_with_drivers(
+            &mut args,
+            &matches,
+            &detected_local_registry(),
+        );
+        let Err(error) = result else {
+            panic!("network trust cannot be silently discarded by a remote endpoint");
+        };
+
+        assert!(error.to_string().contains("additional_ca_bundle"));
+        assert!(error.to_string().contains("unsupported remote endpoint"));
+        assert!(
+            !state.path().join("network-supervisor").exists(),
+            "rejected endpoint override must not stage a trust artifact"
+        );
     }
 
     #[test]
@@ -3653,6 +4186,126 @@ enable_loopback_service_http = false
                 assert!(
                     args.enable_loopback_service_http,
                     "env var must win over file"
+                );
+            });
+    }
+
+    #[test]
+    fn file_populates_service_hostname_format() {
+        Environment::new()
+            .remove("OPENSHELL_SERVICE_HOSTNAME_FORMAT")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+                let file = config_file_from_toml(
+                    "[openshell.gateway]\nservice_hostname_format = \"hashed\"\n",
+                );
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+                assert_eq!(
+                    args.service_hostname_format,
+                    Some(ServiceHostnameFormat::Hashed)
+                );
+            });
+    }
+
+    #[test]
+    fn service_hostname_format_cli_and_env_override_file_value() {
+        // CLI flag wins over the file value.
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--service-hostname-format",
+            "readable",
+        ]);
+        let file =
+            config_file_from_toml("[openshell.gateway]\nservice_hostname_format = \"hashed\"\n");
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+        assert_eq!(
+            args.service_hostname_format,
+            Some(ServiceHostnameFormat::Readable),
+            "CLI flag must win over file value"
+        );
+
+        // Env var wins over the file value.
+        Environment::new()
+            .set("OPENSHELL_SERVICE_HOSTNAME_FORMAT", "readable")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+                let file = config_file_from_toml(
+                    "[openshell.gateway]\nservice_hostname_format = \"hashed\"\n",
+                );
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert_eq!(
+                    args.service_hostname_format,
+                    Some(ServiceHostnameFormat::Readable),
+                    "env var must win over file value"
+                );
+            });
+    }
+
+    #[test]
+    fn server_config_preparation_applies_and_validates_hashed_hostnames() {
+        let state = tempfile::tempdir().unwrap();
+        let local_tls = tempfile::tempdir().unwrap();
+
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set(
+                "OPENSHELL_LOCAL_TLS_DIR",
+                local_tls.path().to_str().unwrap(),
+            )
+            .remove("OPENSHELL_SERVICE_HOSTNAME_FORMAT")
+            .run(|| {
+                let config_path = state.path().join("gateway.toml");
+                std::fs::write(
+                    &config_path,
+                    "[openshell]\nversion = 2\n\n[openshell.gateway]\nname = \"gateway-west\"\nservice_hostname_format = \"hashed\"\n",
+                )
+                .unwrap();
+
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--config",
+                    config_path.to_str().unwrap(),
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--compute-driver",
+                    "local",
+                    "--disable-tls",
+                ]);
+
+                let prepared = super::prepare_server_config(&mut args, &matches)
+                    .expect("server config is prepared");
+                assert_eq!(
+                    prepared.config.service_routing_discriminator(),
+                    Some("gateway-west")
+                );
+
+                let invalid_path = state.path().join("invalid-gateway-name.toml");
+                std::fs::write(
+                    &invalid_path,
+                    "[openshell]\nversion = 2\n\n[openshell.gateway]\nname = \"Gateway West\"\nservice_hostname_format = \"hashed\"\n",
+                )
+                .unwrap();
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--config",
+                    invalid_path.to_str().unwrap(),
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--compute-driver",
+                    "local",
+                    "--disable-tls",
+                ]);
+                let error = super::prepare_server_config(&mut args, &matches)
+                    .err()
+                    .expect("invalid installation name must fail preparation");
+                assert!(
+                    error.to_string().contains("hashed service hostnames require"),
+                    "unexpected error: {error}"
                 );
             });
     }
