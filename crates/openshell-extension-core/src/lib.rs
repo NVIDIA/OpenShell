@@ -10,6 +10,7 @@ mod identity;
 mod jwt;
 mod store;
 mod transport;
+pub mod unix_socket_path;
 
 pub use auth::{BearerTokenInterceptor, BearerTokenSlot, TokenSlotError};
 pub use identity::{ExtensionAudience, ExtensionIdentity, ExtensionKind, IdentityError};

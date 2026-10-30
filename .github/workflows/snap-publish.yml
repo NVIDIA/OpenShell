@@ -1,0 +1,139 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Publish Snap
+
+on:
+  workflow_call:
+    inputs:
+      upload-channel:
+        required: true
+        type: string
+      github-environment:
+        required: true
+        type: string
+      release-tag:
+        description: Stable tag to recheck before updating the stable channel
+        required: false
+        type: string
+        default: ""
+      artifact-run-id:
+        description: Run whose snap-linux-* artifacts are uploaded; defaults to the current run
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SNAPCRAFT_STORE_CREDENTIALS:
+        required: true
+  workflow_dispatch:
+    inputs:
+      upload-channel:
+        description: Snap Store channel, also used as the GitHub environment
+        required: true
+        type: choice
+        options:
+          - latest/stable
+          - latest/beta
+          - latest/edge
+      release-tag:
+        description: Stable tag to recheck before updating the stable channel; required for latest/stable
+        required: false
+        type: string
+        default: ""
+      artifact-run-id:
+        description: Run whose snap-linux-* artifacts are uploaded
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    name: Publish Snap (Linux ${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: linux-amd64-cpu8
+          - arch: arm64
+            runner: linux-arm64-cpu8
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    environment: ${{ inputs.github-environment || inputs.upload-channel }}
+    concurrency:
+      group: snap-publish-${{ inputs.upload-channel }}-${{ matrix.arch }}
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: inputs.release-tag != ''
+        with:
+          persist-credentials: false
+          ref: ${{ github.workflow_sha }}
+          path: release-workflow
+          sparse-checkout: .github/actions/check-latest-release
+
+      - name: Download built snap and components
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: snap-linux-${{ matrix.arch }}
+          run-id: ${{ inputs.artifact-run-id || github.run_id }}
+          github-token: ${{ inputs.artifact-run-id && github.token || '' }}
+
+      - name: Install snapcraft
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y snapd
+          sudo systemctl enable --now snapd.socket
+          sudo systemctl start snapd
+          sudo snap wait system seed.loaded
+          sudo snap install snapcraft --classic
+
+      - name: Check current latest release
+        id: latest
+        if: inputs.release-tag != ''
+        uses: ./release-workflow/.github/actions/check-latest-release
+        with:
+          release-tag: ${{ inputs.release-tag }}
+
+      - name: Upload snap to Snap Store
+        if: ${{ inputs.release-tag == '' || steps.latest.outputs.make-latest == 'true' }}
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+          INPUTS_UPLOAD_CHANNEL: ${{ inputs.upload-channel }}
+          INPUTS_RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${INPUTS_UPLOAD_CHANNEL}" == latest/stable && -z "${INPUTS_RELEASE_TAG}" ]]; then
+            echo "latest/stable uploads require release-tag" >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          snaps=(*.snap)
+          if [[ "${#snaps[@]}" -ne 1 ]]; then
+            echo "Expected exactly one built snap, found ${#snaps[@]}" >&2
+            exit 1
+          fi
+          snap_file="${snaps[0]}"
+          snap_name="${snap_file%.snap}"
+          snap_name="${snap_name%%_*}"
+          # Artifacts can come from another run, so confirm they were built for this tag.
+          if [[ -n "${INPUTS_RELEASE_TAG}" && "${snap_file}" != "${snap_name}_${INPUTS_RELEASE_TAG#v}_"* ]]; then
+            echo "${snap_file} was not built for ${INPUTS_RELEASE_TAG}" >&2
+            exit 1
+          fi
+          component_args=()
+          for comp in "${snap_name}"+*.comp; do
+            component_file="${comp##*/}"
+            component_name="${component_file#${snap_name}+}"
+            component_name="${component_name%%_*}"
+            component_args+=(--component "${component_name}=${comp}")
+          done
+          snapcraft upload --release "${INPUTS_UPLOAD_CHANNEL}" "$snap_file" "${component_args[@]}"

@@ -41,6 +41,29 @@ use openshell_core::telemetry::TelemetryComputeDriver;
 ))]
 use openshell_server::ComputeDriverRegistration;
 use openshell_server::ComputeDriverRegistry;
+use openshell_server::config_file::OtlpConfig;
+
+#[cfg(all(
+    not(target_os = "windows"),
+    any(
+        feature = "compute-driver-docker",
+        feature = "compute-driver-kubernetes",
+        feature = "compute-driver-podman"
+    )
+))]
+/// The OCSF event export that drivers pass to supervisors, from `[otlp.ocsf]`.
+fn supervisor_ocsf_export(
+    otlp: Option<&OtlpConfig>,
+) -> Option<openshell_core::sandbox_env::OcsfOtlpExport> {
+    let ocsf = otlp?.ocsf.as_ref()?;
+    Some(openshell_core::sandbox_env::OcsfOtlpExport {
+        endpoint: ocsf.endpoint.clone(),
+    })
+}
+
+fn prefer_environment<T>(configured: T, environment: Option<T>) -> T {
+    environment.unwrap_or(configured)
+}
 
 /// Install every first-party compute driver linked into the standard gateway.
 #[must_use]
@@ -239,6 +262,10 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         true
     }
 
+    fn supports_network_supervisor_trust(&self) -> bool {
+        true
+    }
+
     fn validate_config(
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
@@ -248,20 +275,76 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
             .map_err(openshell_core::Error::config)
     }
 
+    fn uses_shared_supervision(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<bool> {
+        Ok(kubernetes_config(context)?.shared_supervisor.is_some())
+    }
+
     async fn build(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let config = kubernetes_config(context.config_context())?;
-        let driver = openshell_driver_kubernetes::KubernetesComputeDriver::new(
-            config,
-            context.shutdown_receiver(),
-        )
-        .await
+        self.build_with_configuration_updates(context)
+            .await
+            .map(|(instance, _)| instance)
+    }
+
+    async fn build_with_configuration_updates(
+        &self,
+        context: openshell_server::ComputeDriverBuildContext<'_>,
+    ) -> openshell_core::Result<(
+        openshell_server::ComputeDriverInstance,
+        Option<openshell_server::SharedComputeDriverConfigurationUpdates>,
+    )> {
+        let mut config = kubernetes_config(context.config_context())?;
+        config.supervisor_otlp_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::traces_endpoint)
+            .map(str::to_string);
+        config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+        config.supervisor_otlp_agent_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::agent_endpoint)
+            .map(str::to_string);
+        config.supervisor_gateway_name = Some(context.gateway_name().to_string());
+        // With the gateway supervisor topology, the gateway owns the shared
+        // supervisor's assignments and token; the driver adapts them to
+        // Kubernetes objects. The experimental shared supervisor topology
+        // does not support the network supervisor additional destination CA;
+        // refuse the combination fail-closed rather than silently
+        // supervising generations without the operator's trust bundle.
+        let network_trust = context.network_trust_bundle().cloned();
+        let driver = if config.shared_supervisor.is_some() {
+            if network_trust.is_some() {
+                return Err(openshell_core::Error::execution(
+                    "the experimental shared supervisor topology does not support the \
+                     network supervisor additional destination CA"
+                        .to_string(),
+                ));
+            }
+            openshell_driver_kubernetes::KubernetesComputeDriver::with_shared_supervision(
+                config,
+                context.shutdown_receiver(),
+                context.shared_supervision(),
+            )
+            .await
+        } else {
+            openshell_driver_kubernetes::KubernetesComputeDriver::new(
+                config,
+                context.shutdown_receiver(),
+                network_trust,
+            )
+            .await
+        }
         .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
-        let driver = openshell_driver_kubernetes::ComputeDriverService::new_in_process(driver);
-        Ok(openshell_server::ComputeDriverInstance::InProcess(
-            std::sync::Arc::new(driver),
+        let driver = std::sync::Arc::new(
+            openshell_driver_kubernetes::ComputeDriverService::new_in_process(driver),
+        );
+        Ok((
+            openshell_server::ComputeDriverInstance::InProcess(driver.clone()),
+            Some(driver),
         ))
     }
 }
@@ -272,6 +355,14 @@ fn kubernetes_config(
 ) -> openshell_core::Result<openshell_driver_kubernetes::KubernetesComputeConfig> {
     let mut config: openshell_driver_kubernetes::KubernetesComputeConfig =
         context.driver_config()?;
+    config.sandbox_runtime_image = prefer_environment(
+        config.sandbox_runtime_image,
+        std::env::var(openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV).ok(),
+    );
+    config.supervisor_image = prefer_environment(
+        config.supervisor_image,
+        std::env::var(openshell_core::config::SUPERVISOR_IMAGE_ENV).ok(),
+    );
     if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
         config.workspace_default_storage_size = size;
     }
@@ -292,11 +383,15 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
         true
     }
 
+    fn supports_network_supervisor_trust(&self) -> bool {
+        true
+    }
+
     fn validate_config(
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
     ) -> openshell_core::Result<()> {
-        let config: openshell_driver_docker::DockerComputeConfig = context.driver_config()?;
+        let config = docker_config(context)?;
         config.validate_configuration(context.gateway_bind_address())
     }
 
@@ -304,13 +399,24 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let mut config: openshell_driver_docker::DockerComputeConfig = context.driver_config()?;
+        let mut config = docker_config(context.config_context())?;
+        config.supervisor_otlp_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::traces_endpoint)
+            .map(str::to_string);
+        config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+        config.supervisor_otlp_agent_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::agent_endpoint)
+            .map(str::to_string);
+        config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         require_guest_tls_for_local_driver(&context, "docker")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
         let driver = openshell_driver_docker::DockerComputeDriver::new(
             context.gateway_bind_address(),
             context.gateway_log_level(),
             &config,
+            context.network_trust_bundle().cloned(),
         )
         .await
         .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
@@ -321,6 +427,26 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
     }
 }
 
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-docker"))]
+fn docker_config(
+    context: openshell_server::ComputeDriverConfigContext<'_>,
+) -> openshell_core::Result<openshell_driver_docker::DockerComputeConfig> {
+    let mut config: openshell_driver_docker::DockerComputeConfig = context.driver_config()?;
+    config.sandbox_runtime_image = prefer_environment(
+        config.sandbox_runtime_image,
+        std::env::var(openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)
+            .ok()
+            .map(Some),
+    );
+    config.supervisor_image = prefer_environment(
+        config.supervisor_image,
+        std::env::var(openshell_core::config::SUPERVISOR_IMAGE_ENV)
+            .ok()
+            .map(Some),
+    );
+    Ok(config)
+}
+
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-podman"))]
 #[derive(Clone, Copy)]
 struct PodmanFactory;
@@ -329,6 +455,10 @@ struct PodmanFactory;
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for PodmanFactory {
     fn supports_config_preflight(&self) -> bool {
+        true
+    }
+
+    fn supports_network_supervisor_trust(&self) -> bool {
         true
     }
 
@@ -346,11 +476,24 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config = podman_config(context.config_context())?;
+        config.supervisor_otlp_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::traces_endpoint)
+            .map(str::to_string);
+        config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+        config.supervisor_otlp_agent_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::agent_endpoint)
+            .map(str::to_string);
+        config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         require_guest_tls_for_local_driver(&context, "podman")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
-        let driver = openshell_driver_podman::PodmanComputeDriver::new(config)
-            .await
-            .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
+        let driver = openshell_driver_podman::PodmanComputeDriver::new(
+            config,
+            context.network_trust_bundle().cloned(),
+        )
+        .await
+        .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
         let driver = openshell_driver_podman::ComputeDriverService::new_in_process(driver);
         Ok(openshell_server::ComputeDriverInstance::InProcess(
             std::sync::Arc::new(driver),
@@ -364,6 +507,14 @@ fn podman_config(
 ) -> openshell_core::Result<openshell_driver_podman::PodmanComputeConfig> {
     let mut config: openshell_driver_podman::PodmanComputeConfig = context.driver_config()?;
     config.gateway_port = context.gateway_port();
+    config.sandbox_runtime_image = prefer_environment(
+        config.sandbox_runtime_image,
+        std::env::var(openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV).ok(),
+    );
+    config.supervisor_image = prefer_environment(
+        config.supervisor_image,
+        std::env::var(openshell_core::config::SUPERVISOR_IMAGE_ENV).ok(),
+    );
     if let Ok(path) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
         config.socket_path = Some(path.into());
     }
@@ -388,6 +539,10 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
         openshell_core::e2fsprogs::preflight(cancellation)
             .await
             .map_err(openshell_core::Error::config)
+    }
+
+    fn supports_network_supervisor_trust(&self) -> bool {
+        true
     }
 
     fn validate_config(
@@ -428,6 +583,7 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
             context.gateway_name(),
             &config,
             context.otlp_config(),
+            context.network_trust_bundle(),
         )
         .await?;
         Ok(openshell_server::ComputeDriverInstance::ManagedRemote(
@@ -575,6 +731,23 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(all(
+        not(target_os = "windows"),
+        any(
+            feature = "compute-driver-docker",
+            feature = "compute-driver-kubernetes",
+            feature = "compute-driver-podman"
+        )
+    ))]
+    fn runtime_image_environment_overrides_configured_value() {
+        assert_eq!(
+            prefer_environment("driver-toml", Some("process-environment")),
+            "process-environment"
+        );
+        assert_eq!(prefer_environment("driver-toml", None), "driver-toml");
+    }
+
+    #[test]
     fn default_registry_contains_exactly_the_enabled_compute_drivers() {
         let expected: Vec<&str> = vec![
             #[cfg(feature = "compute-driver-docker")]
@@ -594,5 +767,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn first_party_network_supervisor_drivers_opt_into_trust_propagation() {
+        #[cfg(feature = "compute-driver-docker")]
+        assert!(<DockerFactory as openshell_server::ComputeDriverFactory>::supports_network_supervisor_trust(&DockerFactory));
+        #[cfg(feature = "compute-driver-kubernetes")]
+        assert!(<KubernetesFactory as openshell_server::ComputeDriverFactory>::supports_network_supervisor_trust(&KubernetesFactory));
+        #[cfg(feature = "compute-driver-podman")]
+        assert!(<PodmanFactory as openshell_server::ComputeDriverFactory>::supports_network_supervisor_trust(&PodmanFactory));
+        #[cfg(feature = "compute-driver-vm")]
+        assert!(<VmFactory as openshell_server::ComputeDriverFactory>::supports_network_supervisor_trust(&VmFactory));
     }
 }

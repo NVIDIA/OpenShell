@@ -33,7 +33,13 @@ pub mod datamodel {
 }
 
 pub mod sandbox {
+    pub mod backend {
+        pub use super::super::generated::openshell::sandbox::backend::v1;
+    }
     pub use super::generated::openshell::sandbox::v1;
+    pub mod protocol {
+        pub use super::super::generated::openshell::sandbox::protocol::v1;
+    }
 }
 
 pub mod compute {
@@ -74,6 +80,11 @@ pub mod pagination {
 
 pub mod gateway_interceptor {
     pub use super::generated::openshell::gateway_interceptor::v1;
+}
+
+/// Private gateway-to-shared-supervisor assignment protocol.
+pub mod supervisor_host {
+    pub use super::generated::openshell::supervisor::host::v1;
 }
 
 pub use datamodel::v1::*;

@@ -20,8 +20,8 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::debug;
 
@@ -66,6 +66,11 @@ impl ResolvedWorkspace {
     }
 }
 
+/// The sandbox launcher as the acting process of the Process Activity events it emits.
+pub(crate) fn ocsf_launcher_process() -> openshell_ocsf::Process {
+    openshell_ocsf::Process::new("openshell-sandbox", i64::from(std::process::id()))
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn prepare_child_sandbox(
     policy: &SandboxPolicy,
@@ -104,6 +109,9 @@ pub(crate) fn ca_runtime_read_only_paths(ca_paths: Option<&(PathBuf, PathBuf)>) 
     paths.push(bundle.clone());
     paths
 }
+
+/// Prefix of environment variable names reserved for `OpenShell`.
+pub(crate) const RESERVED_ENV_PREFIX: &str = "OPENSHELL_";
 
 const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::OCI_IMAGE_USER,
@@ -205,6 +213,21 @@ fn apply_canonical_process_environment(
     interactive: bool,
     user_environment: &HashMap<String, String>,
 ) {
+    // The canonical process inherits the sandbox's environment so the image's
+    // own ENV (PATH, LANG, JAVA_HOME, ...) reaches the workload. Remove the
+    // reserved OPENSHELL_ namespace inherited from the sandbox itself, which
+    // carries its own control state (for example the serialized user
+    // environment and log level), then restore the one marker the workload is
+    // meant to see. The gateway rejects declared variables in this namespace.
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_str()
+            .is_some_and(|key| key.starts_with(RESERVED_ENV_PREFIX))
+        {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.env(openshell_core::sandbox_env::SANDBOX, "1");
     cmd.envs(user_environment);
     let (session_user, session_home) = session_user_and_home(policy, workspace.home());
     // Resolve a shell present in the workload image. This code runs inside the
@@ -230,11 +253,83 @@ fn apply_canonical_process_environment(
     }
 }
 
-fn configured_user_environment() -> HashMap<String, String> {
+static BOUNDARY_USER_ENVIRONMENT: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+pub(crate) fn install_boundary_user_environment(
+    environment: HashMap<String, String>,
+) -> Result<(), String> {
+    BOUNDARY_USER_ENVIRONMENT
+        .set(environment)
+        .map_err(|_| "boundary workload environment already installed".to_string())
+}
+
+pub(crate) fn configured_user_environment() -> HashMap<String, String> {
+    if let Some(environment) = BOUNDARY_USER_ENVIRONMENT.get() {
+        return environment.clone();
+    }
     std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
         .ok()
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default()
+}
+
+/// Composes the environment of a canonical workload process. Shared by the
+/// PTY and pipe spawn paths so both apply the same layering: the inherited
+/// sandbox environment minus the reserved `OPENSHELL_` namespace, the
+/// declared user environment, supervisor-only and proxy variables stripped,
+/// provider placeholders, TLS trust paths, and finally the OTLP relay
+/// default, applied last so a provider cannot redirect traces, and only
+/// while the relay is active and neither the declared environment nor the
+/// image names an OTLP endpoint of its own.
+#[allow(clippy::too_many_arguments)]
+fn compose_canonical_process_environment(
+    cmd: &mut Command,
+    policy: &SandboxPolicy,
+    workspace: &ResolvedWorkspace,
+    interactive: bool,
+    user_environment: &HashMap<String, String>,
+    provider_env: &HashMap<String, String>,
+    ca_paths: Option<&(PathBuf, PathBuf)>,
+    tls_environment_mode: child_env::TlsEnvironmentMode,
+    otlp_relay_active: bool,
+) {
+    apply_canonical_process_environment(cmd, policy, workspace, interactive, user_environment);
+    strip_supervisor_only_env(cmd);
+    inject_provider_env(cmd, provider_env);
+    strip_proxy_env(cmd);
+    // In interception mode OpenShell trust is authoritative. In direct
+    // additional-CA mode, retain all caller values and only fill gaps.
+    if let Some((ca_cert_path, combined_bundle_path)) = ca_paths {
+        // Provider credentials are injected before this point. Reassert
+        // caller TLS values in additive mode so a provider environment
+        // cannot accidentally replace a caller-selected trust store.
+        if matches!(
+            tls_environment_mode,
+            child_env::TlsEnvironmentMode::FillMissing
+        ) {
+            for (key, value) in user_environment {
+                if child_env::is_tls_environment_variable(key) {
+                    cmd.env(key, value);
+                }
+            }
+        }
+        for (key, value) in child_env::tls_env_vars_for_mode(
+            ca_cert_path,
+            combined_bundle_path,
+            tls_environment_mode,
+            user_environment,
+        ) {
+            cmd.env(key, value);
+        }
+    }
+    child_env::apply_otlp_relay_env(
+        cmd,
+        otlp_relay_active,
+        child_env::ChildEnvironment::Inherited,
+        user_environment,
+        &[],
+    );
 }
 
 #[cfg(unix)]
@@ -340,7 +435,7 @@ fn parse_pids_max(contents: &str) -> RuntimePidLimitStatus {
 
 #[cfg(target_os = "linux")]
 pub fn spawn_command_with_workload_launcher(
-    launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+    launcher: &crate::linux::workload_launcher::WorkloadLauncher,
     mut cmd: Command,
 ) -> std::io::Result<Child> {
     let runtime = tokio::runtime::Handle::current();
@@ -352,7 +447,7 @@ pub fn spawn_command_with_workload_launcher(
 
 #[cfg(target_os = "linux")]
 pub fn spawn_std_command_with_workload_launcher(
-    launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+    launcher: &crate::linux::workload_launcher::WorkloadLauncher,
     mut cmd: std::process::Command,
 ) -> std::io::Result<std::process::Child> {
     launcher.execute(move || cmd.spawn())?
@@ -389,14 +484,16 @@ impl ProcessHandle {
     #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
-        launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+        launcher: &crate::linux::workload_launcher::WorkloadLauncher,
         program: &str,
         args: &[String],
         workspace: &ResolvedWorkspace,
         interactive: bool,
         policy: &SandboxPolicy,
         ca_paths: Option<&(PathBuf, PathBuf)>,
+        tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_env: &HashMap<String, String>,
+        otlp_relay_active: bool,
     ) -> Result<Self> {
         Self::spawn_impl(
             launcher,
@@ -406,7 +503,9 @@ impl ProcessHandle {
             interactive,
             policy,
             ca_paths,
+            tls_environment_mode,
             provider_env,
+            otlp_relay_active,
         )
     }
 
@@ -424,7 +523,9 @@ impl ProcessHandle {
         interactive: bool,
         policy: &SandboxPolicy,
         ca_paths: Option<&(PathBuf, PathBuf)>,
+        tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_env: &HashMap<String, String>,
+        otlp_relay_active: bool,
     ) -> Result<Self> {
         Self::spawn_impl(
             program,
@@ -433,26 +534,28 @@ impl ProcessHandle {
             interactive,
             policy,
             ca_paths,
+            tls_environment_mode,
             provider_env,
+            otlp_relay_active,
         )
     }
 
     #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     fn spawn_impl(
-        launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+        launcher: &crate::linux::workload_launcher::WorkloadLauncher,
         program: &str,
         args: &[String],
         workspace: &ResolvedWorkspace,
         interactive: bool,
         policy: &SandboxPolicy,
         ca_paths: Option<&(PathBuf, PathBuf)>,
+        tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_env: &HashMap<String, String>,
+        otlp_relay_active: bool,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
-        cmd.args(args)
-            .kill_on_drop(true)
-            .env(openshell_core::sandbox_env::SANDBOX, "1");
+        cmd.args(args).kill_on_drop(true);
 
         let mut pty_master = None;
         let mut terminal_slave_fd = None;
@@ -477,32 +580,24 @@ impl ProcessHandle {
                 .stderr(Stdio::piped());
         }
 
-        // Strip supervisor-only identity material from the entrypoint's
-        // inherited environment. The entrypoint drops to the sandbox user
-        // before `exec`; without this strip, sandbox code could recover
+        // Build the entrypoint's environment. It also strips supervisor-only
+        // identity material: the entrypoint drops to the sandbox user before
+        // `exec`, and without the strip sandbox code could recover
         // supervisor credentials from its inherited environment.
-        apply_canonical_process_environment(
+        compose_canonical_process_environment(
             &mut cmd,
             policy,
             workspace,
             interactive,
             &configured_user_environment(),
+            provider_env,
+            ca_paths,
+            tls_environment_mode,
+            otlp_relay_active,
         );
-        strip_supervisor_only_env(&mut cmd);
-
-        inject_provider_env(&mut cmd, provider_env);
 
         if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
-        }
-
-        strip_proxy_env(&mut cmd);
-
-        // Set TLS trust store env vars so sandbox processes trust the ephemeral CA
-        if let Some((ca_cert_path, combined_bundle_path)) = ca_paths {
-            for (key, value) in child_env::tls_env_vars(ca_cert_path, combined_bundle_path) {
-                cmd.env(key, value);
-            }
         }
 
         // Probe Landlock availability and emit OCSF logs from the parent
@@ -518,11 +613,8 @@ impl ProcessHandle {
         let prepared_sandbox = prepare_child_sandbox(policy, workspace.root(), &runtime_read_only)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
         #[cfg(target_os = "linux")]
-        let mut child_hardening =
-            openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
-                .map_err(|error| {
-                    miette::miette!("prepare child self-protection filter: {error}")
-                })?;
+        let mut child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
+            .map_err(|error| miette::miette!("prepare child self-protection filter: {error}"))?;
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
@@ -612,12 +704,12 @@ impl ProcessHandle {
         interactive: bool,
         policy: &SandboxPolicy,
         ca_paths: Option<&(PathBuf, PathBuf)>,
+        tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_env: &HashMap<String, String>,
+        otlp_relay_active: bool,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
-        cmd.args(args)
-            .kill_on_drop(true)
-            .env(openshell_core::sandbox_env::SANDBOX, "1");
+        cmd.args(args).kill_on_drop(true);
 
         let mut pty_master = None;
         let mut terminal_slave_fd = None;
@@ -644,30 +736,22 @@ impl ProcessHandle {
                 .stderr(Stdio::piped());
         }
 
-        // Strip supervisor-only identity material from the entrypoint's
-        // inherited environment.
-        apply_canonical_process_environment(
+        // Build the entrypoint's environment, without supervisor-only
+        // identity material.
+        compose_canonical_process_environment(
             &mut cmd,
             policy,
             workspace,
             interactive,
             &configured_user_environment(),
+            provider_env,
+            ca_paths,
+            tls_environment_mode,
+            otlp_relay_active,
         );
-        strip_supervisor_only_env(&mut cmd);
-
-        inject_provider_env(&mut cmd, provider_env);
 
         if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
-        }
-
-        strip_proxy_env(&mut cmd);
-
-        // Set TLS trust store env vars so sandbox processes trust the ephemeral CA
-        if let Some((ca_cert_path, combined_bundle_path)) = ca_paths {
-            for (key, value) in child_env::tls_env_vars(ca_cert_path, combined_bundle_path) {
-                cmd.env(key, value);
-            }
         }
 
         // Create a dedicated session for PTY children and a dedicated process
@@ -810,6 +894,7 @@ impl ProcessHandle {
                     .activity(openshell_ocsf::ActivityId::Close)
                     .severity(openshell_ocsf::SeverityId::Medium)
                     .status(openshell_ocsf::StatusId::Failure)
+                    .actor_process(ocsf_launcher_process())
                     .message(format!("Failed to send SIGTERM: {e}"))
                     .build()
             );
@@ -1122,6 +1207,118 @@ mod tests {
         assert_eq!(variables.get("TERM"), Some(&"xterm-256color"));
     }
 
+    /// Re-executes the test binary for `test_path` with `env` added to its
+    /// environment, so a test can observe an inherited environment without
+    /// touching the harness process. Returns `true` in the parent once the
+    /// child passed, and `false` in the child, which then runs the test body.
+    #[cfg(unix)]
+    fn run_in_isolated_child(marker: &str, test_path: &str, env: &[(&str, String)]) -> bool {
+        if std::env::var_os(marker).is_some() {
+            return false;
+        }
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test_path, "--nocapture"])
+            .env(marker, "1");
+        // A harness that exports OTLP endpoints must not look like an image
+        // that ships one.
+        for key in [
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT,
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+        ] {
+            command.env_remove(key);
+        }
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let output = command.output().expect("run isolated environment test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated environment test failed:\n{stdout}\n{stderr}"
+        );
+        // A filter that matches nothing also exits 0; make sure the test ran.
+        assert!(
+            stdout.contains("1 passed"),
+            "the isolated test did not run; check the test path {test_path}:\n{stdout}"
+        );
+        true
+    }
+
+    /// Runs an `env` probe command on a fresh current-thread runtime and
+    /// parses its `KEY=value` output.
+    #[cfg(unix)]
+    fn probe_environment(mut cmd: Command) -> HashMap<String, String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let output = runtime
+            .block_on(async { cmd.output().await })
+            .expect("run environment probe");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_process_drops_inherited_reserved_environment() {
+        // The sandbox's own control variables live in the reserved
+        // OPENSHELL_ namespace and must not reach the workload, while the
+        // image's ordinary ENV must.
+        if run_in_isolated_child(
+            "OPENSHELL_TEST_RESERVED_ENV_CHILD",
+            "process::tests::canonical_process_drops_inherited_reserved_environment",
+            &[
+                (openshell_core::sandbox_env::LOG_LEVEL, "debug".into()),
+                (openshell_core::sandbox_env::USER_ENVIRONMENT, "{}".into()),
+                ("IMAGE_LANG", "keep".into()),
+            ],
+        ) {
+            return;
+        }
+        let current_user = User::from_uid(nix::unistd::geteuid()).unwrap().unwrap();
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_user.name),
+            run_as_group: None,
+        });
+        // Mirror production: inherit the sandbox environment, no env_clear.
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.stdout(StdStdio::piped());
+        apply_canonical_process_environment(
+            &mut cmd,
+            &policy,
+            &ResolvedWorkspace::default(),
+            false,
+            &HashMap::from([("DECLARED".into(), "yes".into())]),
+        );
+        let variables = probe_environment(cmd);
+        assert!(
+            !variables
+                .keys()
+                .any(|key| key.starts_with(RESERVED_ENV_PREFIX)
+                    && key.as_str() != openshell_core::sandbox_env::SANDBOX),
+            "reserved variables reached the workload: {variables:?}"
+        );
+        assert_eq!(
+            variables
+                .get(openshell_core::sandbox_env::SANDBOX)
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            variables.get("IMAGE_LANG").map(String::as_str),
+            Some("keep")
+        );
+        assert_eq!(variables.get("DECLARED").map(String::as_str), Some("yes"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn canonical_process_receives_declared_environment_and_home() {
@@ -1174,43 +1371,343 @@ mod tests {
         }
     }
 
+    /// The production composition injects the relay default only while the
+    /// relay is active and the declared environment names no OTLP endpoint,
+    /// leaves a caller's own endpoint alone otherwise, and strips the
+    /// collector address in every case. Runs in a re-executed copy of the
+    /// test binary so the collector address can sit in the inherited
+    /// environment, where `OPENSHELL_OTLP_ENDPOINT` lives for a real
+    /// supervisor, without touching the harness environment.
+    #[cfg(unix)]
+    #[test]
+    fn canonical_process_sees_relay_endpoint_and_never_the_collector() {
+        use openshell_core::sandbox_env::{
+            OTEL_EXPORTER_OTLP_COMPRESSION, OTEL_EXPORTER_OTLP_ENDPOINT,
+            OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_EXPORTER_OTLP_TRACES_COMPRESSION,
+            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTLP_RELAY_ENDPOINT,
+        };
+        const COLLECTOR_HOST: &str = "collector.invalid";
+        if run_in_isolated_child(
+            "OPENSHELL_TEST_RELAY_ENV_CHILD",
+            "process::tests::canonical_process_sees_relay_endpoint_and_never_the_collector",
+            &[(
+                openshell_core::sandbox_env::OTLP_ENDPOINT,
+                format!("http://{COLLECTOR_HOST}:4317"),
+            )],
+        ) {
+            return;
+        }
+        let current_user = User::from_uid(nix::unistd::geteuid()).unwrap().unwrap();
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_user.name),
+            run_as_group: None,
+        });
+        let workspace = ResolvedWorkspace::default();
+        let probe = |declared: HashMap<String, String>,
+                     provider_env: HashMap<String, String>,
+                     relay_active: bool| {
+            // Mirror production: inherit the sandbox environment, no env_clear.
+            let mut cmd = Command::new("/usr/bin/env");
+            cmd.stdout(StdStdio::piped());
+            compose_canonical_process_environment(
+                &mut cmd,
+                &policy,
+                &workspace,
+                false,
+                &declared,
+                &provider_env,
+                None,
+                child_env::TlsEnvironmentMode::Override,
+                relay_active,
+            );
+            let variables = probe_environment(cmd);
+            assert!(
+                !variables.contains_key(openshell_core::sandbox_env::OTLP_ENDPOINT),
+                "the collector variable reached the workload: {variables:?}"
+            );
+            assert!(
+                !variables
+                    .values()
+                    .any(|value| value.contains(COLLECTOR_HOST)),
+                "the collector address reached the workload: {variables:?}"
+            );
+            variables
+        };
+        let get = |variables: &HashMap<String, String>, key: &str| variables.get(key).cloned();
+        let provider_redirect = || {
+            HashMap::from([
+                (
+                    OTEL_EXPORTER_OTLP_ENDPOINT.to_string(),
+                    "http://provider.invalid".to_string(),
+                ),
+                (
+                    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT.to_string(),
+                    "http://provider.invalid/v1/traces".to_string(),
+                ),
+            ])
+        };
+
+        // Relay active, no endpoint in the creation request: only the
+        // generic default is set, compression is disabled, and a provider
+        // cannot redirect traces.
+        let variables = probe(
+            HashMap::from([
+                (OTEL_EXPORTER_OTLP_PROTOCOL.into(), "grpc".into()),
+                (OTEL_EXPORTER_OTLP_TRACES_COMPRESSION.into(), "gzip".into()),
+            ]),
+            provider_redirect(),
+            true,
+        );
+        for key in [
+            OTEL_EXPORTER_OTLP_COMPRESSION,
+            OTEL_EXPORTER_OTLP_TRACES_COMPRESSION,
+        ] {
+            assert_eq!(
+                get(&variables, key).as_deref(),
+                Some("none"),
+                "the relay refuses compressed bodies, so {key} is disabled: {variables:?}"
+            );
+        }
+        assert_eq!(
+            get(&variables, OTEL_EXPORTER_OTLP_ENDPOINT).as_deref(),
+            Some(OTLP_RELAY_ENDPOINT),
+            "the relay endpoint wins over a provider's: {variables:?}"
+        );
+        assert_eq!(
+            get(&variables, OTEL_EXPORTER_OTLP_PROTOCOL).as_deref(),
+            Some("http/protobuf"),
+            "a declared protocol without an endpoint is replaced: {variables:?}"
+        );
+        assert!(
+            !variables.contains_key(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT),
+            "no signal-specific endpoint is injected, and a provider's is removed: {variables:?}"
+        );
+        assert!(
+            !variables
+                .values()
+                .any(|value| value.contains("provider.invalid")),
+            "a provider endpoint overrode the relay: {variables:?}"
+        );
+
+        // Relay inactive: nothing points at the relay address.
+        let variables = probe(HashMap::new(), HashMap::new(), false);
+        assert!(
+            !variables.contains_key(OTEL_EXPORTER_OTLP_ENDPOINT),
+            "no endpoint is injected while the relay is inactive: {variables:?}"
+        );
+        assert!(
+            !variables.values().any(|value| value.contains("192.0.0.8")),
+            "the relay address must not appear: {variables:?}"
+        );
+
+        // The creation request names its own endpoint: every caller value
+        // stays as declared and nothing points at the relay.
+        let variables = probe(
+            HashMap::from([
+                (
+                    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT.into(),
+                    "http://own-backend.invalid/v1/traces".into(),
+                ),
+                (OTEL_EXPORTER_OTLP_PROTOCOL.into(), "grpc".into()),
+                (OTEL_EXPORTER_OTLP_TRACES_COMPRESSION.into(), "gzip".into()),
+            ]),
+            HashMap::new(),
+            true,
+        );
+        assert_eq!(
+            get(&variables, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT).as_deref(),
+            Some("http://own-backend.invalid/v1/traces"),
+            "a caller's endpoint is left alone: {variables:?}"
+        );
+        assert_eq!(
+            get(&variables, OTEL_EXPORTER_OTLP_PROTOCOL).as_deref(),
+            Some("grpc")
+        );
+        assert_eq!(
+            get(&variables, OTEL_EXPORTER_OTLP_TRACES_COMPRESSION).as_deref(),
+            Some("gzip")
+        );
+        assert!(
+            !variables.contains_key(OTEL_EXPORTER_OTLP_ENDPOINT),
+            "nothing is injected when the caller named an endpoint: {variables:?}"
+        );
+        assert!(
+            !variables.values().any(|value| value.contains("192.0.0.8")),
+            "the relay address must not appear: {variables:?}"
+        );
+    }
+
+    /// Both TLS environment modes keep their precedence in the composed
+    /// environment while the relay default is applied. In `Override`, the
+    /// `OpenShell` trust files win over the caller and the provider. In
+    /// `FillMissing`, a caller's TLS value wins over the provider and only the
+    /// variables the caller left unset point at `OpenShell` trust.
+    #[cfg(unix)]
+    #[test]
+    fn canonical_process_keeps_tls_mode_precedence_with_the_relay() {
+        use openshell_core::sandbox_env::{OTEL_EXPORTER_OTLP_ENDPOINT, OTLP_RELAY_ENDPOINT};
+        if run_in_isolated_child(
+            "OPENSHELL_TEST_TLS_MODE_ENV_CHILD",
+            "process::tests::canonical_process_keeps_tls_mode_precedence_with_the_relay",
+            &[],
+        ) {
+            return;
+        }
+        let current_user = User::from_uid(nix::unistd::geteuid()).unwrap().unwrap();
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_user.name),
+            run_as_group: None,
+        });
+        let workspace = ResolvedWorkspace::default();
+        let ca_paths = (
+            PathBuf::from("/etc/openshell-tls/ca.pem"),
+            PathBuf::from("/etc/openshell-tls/ca-bundle.pem"),
+        );
+        let openshell_trust: HashMap<&str, String> =
+            child_env::tls_env_vars(&ca_paths.0, &ca_paths.1)
+                .into_iter()
+                .collect();
+        let declared = HashMap::from([("SSL_CERT_FILE".to_string(), "/caller.pem".to_string())]);
+        let provider_env = HashMap::from([
+            ("SSL_CERT_FILE".to_string(), "/provider.pem".to_string()),
+            (
+                "REQUESTS_CA_BUNDLE".to_string(),
+                "/provider.pem".to_string(),
+            ),
+        ]);
+        let probe = |mode: child_env::TlsEnvironmentMode| {
+            let mut cmd = Command::new("/usr/bin/env");
+            cmd.stdout(StdStdio::piped());
+            compose_canonical_process_environment(
+                &mut cmd,
+                &policy,
+                &workspace,
+                false,
+                &declared,
+                &provider_env,
+                Some(&ca_paths),
+                mode,
+                true,
+            );
+            let variables = probe_environment(cmd);
+            assert_eq!(
+                variables
+                    .get(OTEL_EXPORTER_OTLP_ENDPOINT)
+                    .map(String::as_str),
+                Some(OTLP_RELAY_ENDPOINT),
+                "the relay default applies in {mode:?}: {variables:?}"
+            );
+            variables
+        };
+
+        let variables = probe(child_env::TlsEnvironmentMode::Override);
+        for (key, value) in &openshell_trust {
+            assert_eq!(
+                variables.get(*key),
+                Some(value),
+                "OpenShell trust wins for {key} in Override: {variables:?}"
+            );
+        }
+
+        let variables = probe(child_env::TlsEnvironmentMode::FillMissing);
+        assert_eq!(
+            variables.get("SSL_CERT_FILE").map(String::as_str),
+            Some("/caller.pem"),
+            "the caller's value wins over the provider in FillMissing: {variables:?}"
+        );
+        for (key, value) in &openshell_trust {
+            if *key != "SSL_CERT_FILE" {
+                assert_eq!(
+                    variables.get(*key),
+                    Some(value),
+                    "OpenShell trust fills {key} in FillMissing: {variables:?}"
+                );
+            }
+        }
+    }
+
+    /// An endpoint in the image `ENV`, which reaches the canonical process
+    /// through the inherited sandbox environment, is left alone too.
+    #[cfg(unix)]
+    #[test]
+    fn canonical_process_keeps_an_image_endpoint() {
+        use openshell_core::sandbox_env::{
+            OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL,
+        };
+        if run_in_isolated_child(
+            "OPENSHELL_TEST_RELAY_IMAGE_ENV_CHILD",
+            "process::tests::canonical_process_keeps_an_image_endpoint",
+            &[(
+                OTEL_EXPORTER_OTLP_ENDPOINT,
+                "http://image-collector.invalid:4318".to_string(),
+            )],
+        ) {
+            return;
+        }
+        let current_user = User::from_uid(nix::unistd::geteuid()).unwrap().unwrap();
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_user.name),
+            run_as_group: None,
+        });
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.stdout(StdStdio::piped());
+        compose_canonical_process_environment(
+            &mut cmd,
+            &policy,
+            &ResolvedWorkspace::default(),
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            child_env::TlsEnvironmentMode::Override,
+            true,
+        );
+        let variables = probe_environment(cmd);
+        assert_eq!(
+            variables
+                .get(OTEL_EXPORTER_OTLP_ENDPOINT)
+                .map(String::as_str),
+            Some("http://image-collector.invalid:4318"),
+            "the image endpoint is left alone: {variables:?}"
+        );
+        assert!(
+            !variables.contains_key(OTEL_EXPORTER_OTLP_PROTOCOL),
+            "no relay protocol is injected next to an image endpoint: {variables:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[allow(unsafe_code)]
     fn probe_hardened_child(probe: unsafe fn() -> i64) -> i64 {
         const HARDEN_FAILED: i64 = -2;
 
-        let mut fds = [0; 2];
-        let pipe_rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        assert_eq!(
-            pipe_rc,
-            0,
-            "pipe failed: {}",
-            std::io::Error::last_os_error()
-        );
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("create probe pipe");
 
         match unsafe { fork() }.expect("fork should succeed") {
             ForkResult::Child => {
-                unsafe { libc::close(fds[0]) };
+                drop(read_fd);
                 let value = match harden_child_process() {
                     Ok(()) => unsafe { probe() },
                     Err(_) => HARDEN_FAILED,
                 };
                 let bytes = value.to_ne_bytes();
-                let written = unsafe { libc::write(fds[1], bytes.as_ptr().cast(), bytes.len()) };
+                let written = rustix::io::write(&write_fd, &bytes);
+                drop(write_fd);
+                // SAFETY: terminate the fork child without running inherited
+                // parent destructors; the write wrapper performs one syscall.
                 unsafe {
-                    libc::close(fds[1]);
-                    libc::_exit(i32::from(written != bytes.len().cast_signed()));
+                    libc::_exit(i32::from(written != Ok(bytes.len())));
                 }
             }
             ForkResult::Parent { child } => {
-                unsafe { libc::close(fds[1]) };
+                drop(write_fd);
                 let mut bytes = [0u8; size_of::<i64>()];
-                let read = unsafe { libc::read(fds[0], bytes.as_mut_ptr().cast(), bytes.len()) };
-                unsafe { libc::close(fds[0]) };
+                let read = rustix::io::read(&read_fd, &mut bytes[..]);
+                drop(read_fd);
                 assert_eq!(
-                    read.cast_unsigned(),
-                    bytes.len(),
-                    "expected {} probe bytes, got {}",
+                    read,
+                    Ok(bytes.len()),
+                    "expected {} probe bytes, got {:?}",
                     bytes.len(),
                     read
                 );
@@ -1226,15 +1723,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[allow(unsafe_code)]
-    unsafe fn core_dump_limit_is_zero_probe() -> i64 {
-        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-        let rc = unsafe { libc::getrlimit(libc::RLIMIT_CORE, limit.as_mut_ptr()) };
-        if rc != 0 {
-            return -1;
+    fn core_dump_limit_is_zero_probe() -> i64 {
+        match nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_CORE) {
+            Ok((current, maximum)) => i64::from(current == 0 && maximum == 0),
+            Err(_) => -1,
         }
-        let limit = unsafe { limit.assume_init() };
-        i64::from(limit.rlim_cur == 0 && limit.rlim_max == 0)
     }
 
     #[test]

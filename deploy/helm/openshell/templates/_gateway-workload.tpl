@@ -5,12 +5,26 @@
 Gateway pod template shared by the StatefulSet and Deployment workload shapes.
 */}}
 {{- define "openshell.gatewayPodTemplate" -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- $oidcRuntimeConfig := get $gatewayConfig "openshell.gateway.oidc" | default dict -}}
+{{- if not (get $oidcRuntimeConfig "issuer") -}}{{- $oidcRuntimeConfig = .Values.server.oidc | default dict -}}{{- end -}}
+{{- $kubernetesRuntimeConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
+{{- $spiffeSocketPath := get $kubernetesRuntimeConfig "provider_spiffe_workload_api_socket_path" -}}
+{{- $hasExternalCredentialDriver := or (eq (include "openshell.credentialDriverEnabled" (list . "kubernetes-secrets")) "true") (eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true") -}}
+{{- $vaultCredentialDriverEnabled := eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true" -}}
+{{- $credentialDrivers := .Values.credentialDrivers | default dict -}}
+{{- $vaultResources := get $credentialDrivers "vault" | default dict -}}
+{{- $legacyCredentialDrivers := .Values.server.credentialDrivers | default dict -}}
+{{- $legacyVaultResources := get $legacyCredentialDrivers "vault" | default dict -}}
+{{- $vaultCaConfigMapName := get $vaultResources "caConfigMapName" | default (get $legacyVaultResources "caConfigMapName") -}}
+{{- $supervisorNetwork := .Values.supervisor.network | default dict -}}
 metadata:
   annotations:
     # Roll the gateway workload when the rendered gateway TOML changes - the
     # gateway only reads /etc/openshell/gateway.toml at startup, so without
     # this annotation a `helm upgrade` that only mutates the ConfigMap would
-    # leave pods running with stale config.
+    # leave pods running with stale config. The operator-owned additional-CA
+    # ConfigMap is not checksummed; restart the gateway after changing its data.
     checksum/gateway-config: {{ include (print $.Template.BasePath "/gateway-config.yaml") . | sha256sum }}
     {{- with .Values.podAnnotations }}
     {{- toYaml . | nindent 4 }}
@@ -96,7 +110,7 @@ spec:
           value: /etc/openshell-tls/peer-client/tls.key
         {{- end }}
         {{- end }}
-        {{- if not (or .Values.server.credentialDrivers.kubernetesSecrets.enabled .Values.server.credentialDrivers.vault.enabled) }}
+        {{- if not $hasExternalCredentialDriver }}
         - name: {{ include "openshell.credentialStorageKeyEncryptionKeyEnvName" . }}
           valueFrom:
             secretKeyRef:
@@ -114,7 +128,7 @@ spec:
         # mounted at /etc/openshell/gateway.toml. Secret-bearing settings use
         # env vars that the TOML references by name. Some process-level
         # settings consumed by libraries outside gateway code also remain here.
-        {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+        {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
         # OIDC issuer custom-CA: rustls/reqwest read SSL_CERT_FILE for
         # outbound TLS verification. This is a process-level env var
         # consumed by the TLS stack itself, not by gateway code, so it
@@ -122,11 +136,19 @@ spec:
         - name: SSL_CERT_FILE
           value: /etc/openshell-tls/oidc-ca/ca.crt
         {{- end }}
+        # The gateway stages normalized, content-addressed supervisor trust
+        # artifacts under its XDG state directory. Keep that state on a
+        # dedicated writable volume for both StatefulSet and Deployment modes.
+        - name: XDG_STATE_HOME
+          value: /var/lib/openshell-state
         - name: OPENSHELL_TELEMETRY_ENABLED
           value: {{ .Values.server.telemetryEnabled | quote }}
-        {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
+        {{- if $spiffeSocketPath }}
         - name: OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET
-          value: {{ .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
+          value: {{ $spiffeSocketPath | quote }}
+        {{- end }}
+        {{- with .Values.server.extraEnv }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       volumeMounts:
         {{- if eq (include "openshell.workloadKind" .) "statefulset" }}
@@ -146,6 +168,12 @@ spec:
         - name: gateway-peer-token
           mountPath: /var/run/secrets/openshell-peer
           readOnly: true
+        {{- if get $supervisorNetwork "additionalCaConfigMapName" }}
+        - name: additional-ca-source
+          mountPath: /etc/openshell-tls/additional-ca-source/ca.crt
+          subPath: ca.crt
+          readOnly: true
+        {{- end }}
         {{- if not .Values.server.disableTls }}
         - name: tls-cert
           mountPath: /etc/openshell-tls/server
@@ -164,12 +192,12 @@ spec:
           readOnly: true
         {{- end }}
         {{- end }}
-        {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+        {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
         - name: oidc-ca
           mountPath: /etc/openshell-tls/oidc-ca
           readOnly: true
         {{- end }}
-        {{- if and .Values.server.credentialDrivers.vault.enabled .Values.server.credentialDrivers.vault.caConfigMapName }}
+        {{- if and $vaultCredentialDriverEnabled $vaultCaConfigMapName }}
         - name: vault-ca
           mountPath: /etc/openshell-tls/vault-ca
           readOnly: true
@@ -179,14 +207,16 @@ spec:
           mountPath: /etc/openshell-tls/proxy-ca
           readOnly: true
         {{- end }}
-        {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
+        {{- if $spiffeSocketPath }}
         - name: spiffe-workload-api
-          mountPath: {{ dir .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
+          mountPath: {{ dir $spiffeSocketPath | quote }}
           readOnly: true
         {{- end }}
         {{- with .Values.server.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+        - name: gateway-state
+          mountPath: /var/lib/openshell-state
       ports:
         - name: grpc
           containerPort: {{ .Values.service.port }}
@@ -240,6 +270,14 @@ spec:
               path: token
               audience: openshell-gateway-peer
               expirationSeconds: 3600
+    {{- if get $supervisorNetwork "additionalCaConfigMapName" }}
+    - name: additional-ca-source
+      configMap:
+        name: {{ get $supervisorNetwork "additionalCaConfigMapName" | quote }}
+        items:
+          - key: ca.crt
+            path: ca.crt
+    {{- end }}
     {{- if not .Values.server.disableTls }}
     - name: tls-cert
       secret:
@@ -265,15 +303,15 @@ spec:
         {{- end }}
     {{- end }}
     {{- end }}
-    {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+    {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
     - name: oidc-ca
       configMap:
         name: {{ .Values.server.oidc.caConfigMapName }}
     {{- end }}
-    {{- if and .Values.server.credentialDrivers.vault.enabled .Values.server.credentialDrivers.vault.caConfigMapName }}
+    {{- if and $vaultCredentialDriverEnabled $vaultCaConfigMapName }}
     - name: vault-ca
       configMap:
-        name: {{ .Values.server.credentialDrivers.vault.caConfigMapName }}
+        name: {{ $vaultCaConfigMapName }}
         items:
           - key: ca.crt
             path: ca.crt
@@ -283,12 +321,10 @@ spec:
       configMap:
         name: {{ .Values.upstreamProxy.caBundle.configMapName | quote }}
         items:
-          # The mounted filename stays fixed so the rendered proxy_ca_bundle
-          # path does not depend on the operator's ConfigMap key.
           - key: {{ .Values.upstreamProxy.caBundle.key | default "ca.crt" | quote }}
             path: ca.crt
     {{- end }}
-    {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
+    {{- if $spiffeSocketPath }}
     - name: spiffe-workload-api
       csi:
         driver: csi.spiffe.io
@@ -297,6 +333,8 @@ spec:
     {{- with .Values.server.extraVolumes }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
+    - name: gateway-state
+      emptyDir: {}
   {{- with .Values.nodeSelector }}
   nodeSelector:
     {{- toYaml . | nindent 4 }}

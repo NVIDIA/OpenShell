@@ -19,10 +19,12 @@ tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tower = { workspace = true }
 
 [dev-dependencies]
+openshell-crypto = { workspace = true }
 http = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 serde_json = { workspace = true }
+tempfile = "3"
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true, features = ["server", "tls-native-roots"] }
 

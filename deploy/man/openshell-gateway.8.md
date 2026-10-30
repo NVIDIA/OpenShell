@@ -60,6 +60,24 @@ TLS.
     stores SQLite state under *~/.local/state/openshell/gateway/*.
     Environment: **OPENSHELL_DB_URL**.
 
+**--db-max-connections** *N*
+:   Connection ceiling for the database pool, shared by every
+    database-backed request. Must be at least 1, and at least 2 with
+    Postgres, because the SSH identity lock keeps one connection while it
+    queries the pool. When unset, the gateway uses the backend default:
+    **10** for Postgres, **5** for on-disk SQLite. An in-memory SQLite
+    database is always one connection.
+    TOML key: `database_max_connections`.
+    Environment: **OPENSHELL_DB_MAX_CONNECTIONS**.
+
+**--db-lock-max-connections** *N*
+:   Connection ceiling for the Postgres mutation lock pool, which each
+    replica opens on top of its database pool. Each mutation guard holds
+    one lock connection. Must be at least 1. When unset, the gateway uses
+    **4**. SQLite has no lock pool and ignores it.
+    TOML key: `database_lock_max_connections`.
+    Environment: **OPENSHELL_DB_LOCK_MAX_CONNECTIONS**.
+
 **--compute-driver** *DRIVER*
 :   Compute driver. Selects exactly one driver. Options: **podman**,
     **docker**, **kubernetes**, **vm**. When unset, the gateway
@@ -92,6 +110,14 @@ TLS.
     client certificate verification and no OIDC issuer. Not supported with
     the Kubernetes compute driver.
     Environment: **OPENSHELL_ENABLE_MTLS_AUTH**.
+
+**--enable-operator-auth** *BOOL*
+:   Enable direct mTLS operators with a trusted client certificate containing
+    **OU=operator**. Grants user/platform-admin capabilities across all
+    workspaces and access to runtime credential retrieval. Defaults off.
+    Requires TLS and a client CA, independently of ordinary mTLS user auth
+    and OIDC. Do not combine an operator certificate with bearer headers.
+    Environment: **OPENSHELL_ENABLE_OPERATOR_AUTH**.
 
 **--disable-tls**
 :   Disable TLS entirely and listen on plaintext HTTP. When the bind
@@ -140,9 +166,11 @@ Each executable receives only **-V**, with a five-second deadline and an 8 KiB o
 
 The Debian and Ubuntu systemd user unit runs preflight before certificate
 generation, while retaining its EnvironmentFile and bare ExecStart behavior. The
-Snap wrapper replays its effective daemon arguments through preflight. It first
+snap wrapper replays its effective daemon arguments through preflight. It first
 uses a nonempty OPENSHELL_GATEWAY_CONFIG. Otherwise it passes the canonical
-SNAP_COMMON/gateway.toml path whenever it exists or is a symlink. A broken symlink
+service-specific gateway.toml path whenever it exists or is a symlink. The legacy
+system service uses SNAP_COMMON/gateway.toml; the user service uses
+SNAP_USER_COMMON/.config/openshell/gateway.toml. A broken symlink
 fails preflight before the gateway is started. Correct or manually migrate an
 operator-owned v1 file, then run preflight again before restarting the service.
 
@@ -174,6 +202,15 @@ need a custom bundle location.
 
 The gateway then starts from built-in defaults and reads
 *~/.config/openshell/gateway.toml* when that file exists.
+
+The user service also reads *~/.config/openshell/gateway.env* for both config
+preflight and startup. **OPENSHELL_SANDBOX_RUNTIME_IMAGE** and
+**OPENSHELL_SUPERVISOR_IMAGE** accept complete tagged or digest-pinned OCI
+references for the built-in Docker, Podman, and Kubernetes drivers. These
+variables take precedence over explicit image fields in the selected driver's
+TOML table, which take precedence over compiled release defaults.
+These are trusted gateway inputs and cannot be supplied by sandbox requests.
+Do not embed registry credentials in image references.
 
 To persist the service across logouts:
 

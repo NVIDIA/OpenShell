@@ -107,6 +107,8 @@ pub enum TransportError {
     CustomCaRequiresHttps,
     #[error("unix extension endpoint must contain an absolute socket path")]
     InvalidUnixPath,
+    #[error("unix extension endpoint: {0}")]
+    UnixPathTooLong(std::io::Error),
     #[error("unix extension endpoints are not supported on this platform")]
     UnixUnsupported,
     #[error("invalid extension endpoint: {0}")]
@@ -149,10 +151,11 @@ fn validate_config(config: &ExtensionChannelConfig) -> Result<(), TransportError
     if !matches!(&config.server_trust, ExtensionServerTrust::PlatformRoots) && !is_https {
         return Err(TransportError::CustomCaRequiresHttps);
     }
-    if let Some(path) = config.endpoint.strip_prefix("unix://")
-        && (path.is_empty() || !PathBuf::from(path).is_absolute())
-    {
-        return Err(TransportError::InvalidUnixPath);
+    if let Some(path) = config.endpoint.strip_prefix("unix://") {
+        if path.is_empty() || !PathBuf::from(path).is_absolute() {
+            return Err(TransportError::InvalidUnixPath);
+        }
+        crate::unix_socket_path::check(path.as_ref()).map_err(TransportError::UnixPathTooLong)?;
     }
     Ok(())
 }
@@ -192,7 +195,7 @@ mod tests {
     use std::future::{Ready, ready};
     use std::task::{Context, Poll};
 
-    use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+    use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa};
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::body::Body;
@@ -271,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_schemes_and_relative_unix_paths() {
+    fn rejects_unsupported_schemes_and_invalid_unix_paths() {
         assert!(matches!(
             validate_config(&ExtensionChannelConfig::new("tcp://middleware:50051")),
             Err(TransportError::UnsupportedScheme)
@@ -279,6 +282,11 @@ mod tests {
         assert!(matches!(
             validate_config(&ExtensionChannelConfig::new("unix://relative.sock")),
             Err(TransportError::InvalidUnixPath)
+        ));
+        let long = format!("unix:///{}", "a".repeat(crate::unix_socket_path::MAX_LEN));
+        assert!(matches!(
+            validate_config(&ExtensionChannelConfig::new(long)),
+            Err(TransportError::UnixPathTooLong(_))
         ));
     }
 
@@ -292,22 +300,23 @@ mod tests {
 
     #[tokio::test]
     async fn custom_ca_verifies_certificate_and_hostname() {
-        let ca_key = KeyPair::generate().unwrap();
+        let ca_key = openshell_crypto::pki::generate_keypair().unwrap();
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let ca = openshell_crypto::pki::self_signed(ca_params, &ca_key).unwrap();
 
-        let server_key = KeyPair::generate().unwrap();
+        let server_key = openshell_crypto::pki::generate_keypair().unwrap();
         let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        let server_cert = server_params.signed_by(&server_key, &ca, &ca_key).unwrap();
+        let server_cert =
+            openshell_crypto::pki::signed_by(server_params, &server_key, &ca, &ca_key).unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let incoming = TcpListenerStream::new(listener);
         let tls = ServerTlsConfig::new().identity(Identity::from_pem(
             server_cert.pem(),
-            server_key.serialize_pem(),
+            server_key.serialize_pem().unwrap(),
         ));
         tokio::spawn(async move {
             Server::builder()
@@ -331,10 +340,10 @@ mod tests {
             Err(TransportError::Connect(_))
         ));
 
-        let rogue_key = KeyPair::generate().unwrap();
+        let rogue_key = openshell_crypto::pki::generate_keypair().unwrap();
         let mut rogue_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         rogue_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let rogue_ca = rogue_params.self_signed(&rogue_key).unwrap();
+        let rogue_ca = openshell_crypto::pki::self_signed(rogue_params, &rogue_key).unwrap();
         let wrong_ca = ExtensionChannelConfig::new(format!("https://localhost:{}", address.port()))
             .with_custom_ca_pem(rogue_ca.pem());
         assert!(matches!(

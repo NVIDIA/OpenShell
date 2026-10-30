@@ -459,6 +459,17 @@ pub(super) fn validate_string_map(
     Ok(())
 }
 
+/// Validate label keys and values using Kubernetes syntax.
+pub(super) fn validate_labels(
+    labels: &std::collections::HashMap<String, String>,
+) -> Result<(), Status> {
+    for (key, value) in labels {
+        validate_label_key(key)?;
+        validate_label_value(value)?;
+    }
+    Ok(())
+}
+
 /// Validate object annotations.
 ///
 /// Annotation keys use the same qualified-key shape as labels. Annotation
@@ -477,6 +488,33 @@ pub(super) fn validate_annotations(
     )?;
     for key in annotations.keys() {
         validate_label_key(key)?;
+    }
+    Ok(())
+}
+
+/// Annotation key prefix owned by the gateway.
+const RESERVED_ANNOTATION_PREFIX: &str = "internal.openshell.ai/";
+
+/// Validate annotations supplied by an API caller.
+///
+/// Same as [`validate_annotations`], but also rejects keys under the
+/// gateway-owned `internal.openshell.ai/` prefix. The gateway keeps session
+/// and runtime state there and trusts it on read.
+pub(super) fn validate_caller_annotations(
+    annotations: &std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<(), Status> {
+    validate_annotations(annotations, field_name)?;
+    if let Some(key) = annotations
+        .keys()
+        .find(|key| key.starts_with(RESERVED_ANNOTATION_PREFIX))
+    {
+        return Err(invalid_argument(
+            field_name,
+            format!(
+                "{field_name} key '{key}' uses the reserved '{RESERVED_ANNOTATION_PREFIX}' prefix"
+            ),
+        ));
     }
     Ok(())
 }

@@ -27,9 +27,9 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 3. Write in your own words. AI-generated vouch requests will be denied.
 4. A maintainer will comment `/vouch` if approved, and the request discussion
    will close automatically.
-5. Once vouched, you can submit pull requests.
+5. **Get vouched before opening a PR.** Once vouched, you can submit pull requests.
 
-**If you are not vouched, any pull request you open will be automatically closed.** Org members and collaborators with push access bypass this check.
+**If you are not vouched, any pull request you open will be automatically closed.** The PR and its discussion are preserved. Once vouched, open a new PR (preferred) or reopen the closed one. It cannot be held open or converted to a draft to bypass the check. Org members and collaborators with push access bypass this check.
 
 ### Finding Work
 
@@ -68,6 +68,12 @@ Do not start substantial issue-backed work until a maintainer has accepted the i
 
 Use agents and the repository skills as needed to understand the affected code, evaluate tradeoffs, implement the smallest coherent change, and verify it. The pull request should explain what changed and how it was tested; it should not substitute an agent transcript for the contributor's understanding.
 
+Every pull request must be approved by someone listed in [MAINTAINERS.md](MAINTAINERS.md) before it can merge. This is enforced by the `OpenShell / Maintainer Approval` status check, which turns green once one of those reviewers approves. Reviews from other contributors are welcome and count toward the general approval requirement, but they do not satisfy this check.
+
+Pull requests that touch the enforcement machinery itself — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `.github/CODEOWNERS`, or the enforcement scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). The status check reads its inputs from `main`, but a workflow triggered by a review runs the pull request's own copy of the workflow file, so GitHub's native code owner requirement is what keeps a change from disabling the gate that would have blocked it.
+
+Maintainers are not requested automatically. If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
+
 ## Agent Skills
 
 OpenShell keeps skills for using the product separate from skills for developing the repository.
@@ -95,30 +101,53 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Contributing    | `create-rfc`              | Create RFC proposals from the repository template                                                   |
 | Contributing    | `build-from-issue`        | Plan and implement work from a GitHub issue (maintainer workflow)                                   |
 | Contributing    | `create-github-issue`     | Create well-structured GitHub issues                                                                |
+| Contributing    | `create-security-advisory` | Prepare structured vulnerability reports and authorized private GitHub advisory drafts             |
 | Contributing    | `create-github-pr`        | Create pull requests with proper conventions                                                        |
 | Reviewing       | `review-github-pr`        | Summarize PR diffs and key design decisions                                                         |
-| Reviewing       | `review-security-issue`   | Assess security issues for severity and remediation                                                 |
+| Reviewing       | `review-security-issue`   | Assess security issues and private advisories for severity and remediation                           |
 | Reviewing       | `fix-security-issue`      | Implement an approved security remediation plan                                                     |
 | Reviewing       | `watch-github-actions`    | Monitor CI pipeline status and logs                                                                 |
 | Reviewing       | `launch-openshell-gator`  | Launch and supervise OpenShell gator agents for issue and PR monitoring                             |
 | Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
+| Maintenance     | `release-openshell`       | Pick the latest qualified prerelease and tag its commit as stable                                   |
 | Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
+| Triage          | `review-triage-queue`     | Create a local, read-only queue report from GitHub intake                                           |
+| Triage          | `apply-triage-action`     | Apply, reject, or defer one explicitly selected triage recommendation                               |
 | Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
-| Platform        | `build-openshell-mxc-windows` | Maintain and validate the build-only x64 and ARM64 Windows MSVC lane                             |
+| Platform        | `build-openshell-mxc-windows` | Maintain and validate native x64 and ARM64 MSVC builds and MXC runtime on the `windows` branch |
 | Documentation   | `update-docs-from-commits` | Scan recent commits and draft doc updates for user-facing changes                                  |
 | Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
+| Maintenance     | `release-captain`         | Run the weekly Monday pre-flight and Tuesday stable release checklist                               |
 | Reference       | `sbom`                    | Generate SBOMs and resolve dependency licenses                                                      |
 
 ### Issue Workflow
 
-Community issues move through triage, technical validation, and human acceptance. The repository's `state:*` labels record these stages. Inspect the current GitHub labels and their descriptions before applying or interpreting them; do not assume a fixed label list. An agent may assess evidence and request missing information. A maintainer decides whether to accept valid work and where it belongs on the roadmap.
+Community issues move through triage, technical validation, and human acceptance. The repository's `state:*` labels record these stages. Follow [Label Discovery](#label-discovery) before applying or interpreting them; do not assume a fixed label list. An agent may assess evidence and request missing information. A maintainer decides whether to accept valid work and where it belongs on the roadmap.
 
 A direct request to an agent authorizes the requested planning or implementation. A request to plan alone does not authorize implementation. For unattended work, inspect current state descriptions, maintainer assignments, and comments to determine the authorized phase. Technical validation alone does not authorize implementation. Check for an existing owner, branch, or PR before starting.
 
 Do not file suspected vulnerabilities as public issues. Follow [SECURITY.md](SECURITY.md). Use the specialized security skills for authorized review or remediation.
 
+### Label Discovery
+
+Retrieve every page of repository labels and their descriptions:
+
+```shell
+gh api --paginate 'repos/{owner}/{repo}/labels?per_page=100' --jq '.[] | {name, description}'
+```
+
+The default `gh label list` output is limited to 30 labels. Do not treat that first page as the complete workflow definition. If a description is missing or ambiguous, check maintainer instructions and issue comments for the intended meaning. If it remains unclear, ask a maintainer to define it before changing the state or starting unattended work. Do not infer authorization from a label name alone.
+
+When recording a triage outcome, replace the previous assessment state rather than accumulating assessment labels. Preserve maintainer acceptance, execution state, roadmap decisions, and unrelated labels.
+
 ## Prerequisites
+
+Native Windows development uses the [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Follow [Native Windows support](WINDOWS.md) for checkout, MSVC prerequisites,
+runtime requirements, and limitations. Target Windows implementation PRs at
+`windows`. Shared documentation can merge into `main`, but Windows-specific
+source and task links must continue to point to `windows`.
 
 Install [mise](https://mise.jdx.dev/). This is used to set up the development environment.
 
@@ -142,11 +171,34 @@ echo '~/.local/bin/mise activate fish | source' >> ~/.config/fish/config.fish
 echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshrc
 ```
 
-Project requirements:
+Linux/macOS development requirements:
 
 - Rust 1.94+
 - Python 3.11+
 - Docker (running)
+
+### Nix setup
+
+The `nix develop` shell and `nix run .#…` apps, such as tmachine and the test
+guests, need Nix with flakes. We recommend
+[Determinate Nix](https://docs.determinate.systems/), which CI also uses and
+which enables flakes by default. With another installer,
+[enable flakes](https://wiki.nixos.org/wiki/Flakes#Enabling_flakes_permanently)
+yourself.
+
+To download prebuilt dependencies instead of building them from source, add
+the OpenShell binary cache to your Nix configuration. With Determinate Nix, add
+these lines to
+[`/etc/nix/nix.custom.conf`](https://docs.determinate.systems/determinate-nix#configuration)
+and restart the Nix daemon:
+
+```text
+extra-substituters = https://openshell.cachix.org
+extra-trusted-public-keys = openshell.cachix.org-1:OAr5MunsfH5PZvUsfD08OtGx5RtcwdNZGJdU5FqLm5w=
+```
+
+With other installers, follow the setup instructions for the
+[`openshell` Cachix cache](https://app.cachix.org/cache/openshell).
 
 ### Z3 installation
 
@@ -181,7 +233,7 @@ cargo build -p openshell-prover-cli --features vendored-z3
 Local gateway image and E2E builds enable `vendored-z3` so their
 copied gateway binaries do not need a shared Z3 library in the runtime image.
 
-For x86-64 and ARM64 Windows MSVC builds, use one of these Z3 paths:
+For x86-64 and ARM64 Windows MSVC builds from the `windows` branch, use one of these Z3 paths:
 
 - Prebuilt Z3 (the default for `windows:*` tasks): `z3-sys` downloads the
   pinned Z3 5.1.0 GitHub release for the target architecture on the first
@@ -204,8 +256,10 @@ cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features prebu
 
 ### Windows full build
 
-To build the full set of Windows binaries, including `openshell-gateway.exe`
-and `openshell.exe`, use the `windows:build:x64` mise task instead of a
+Run these commands in a `windows`-based checkout. To build the full set of
+Windows binaries, including `openshell-gateway.exe`, `openshell.exe`,
+`openshell-supervisor.exe`, and `openshell-windows-sandbox.exe`,
+use the `windows:build:x64` mise task instead of a
 single-crate `cargo build`. It downloads the pinned prebuilt Z3 release by default. A
 full build also compiles crates that use `bindgen` (e.g. the MXC driver on
 Windows), so it requires `libclang.dll`; if LLVM is not on the default search
@@ -215,6 +269,12 @@ path, set `LIBCLANG_PATH` to the directory containing `libclang.dll`:
 $env:LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Tools\Llvm\x64\bin'
 mise run --skip-tools windows:build:x64
 ```
+
+For ARM64, use `windows:build:arm64` with ARM64 MSVC components and host-native
+LLVM. Keep the matching `libz3.dll` staged by the build beside the executables.
+See [Windows validation](https://github.com/NVIDIA/OpenShell/blob/windows/TESTING.md#native-windows-validation)
+for native tests and MXC E2E requirements. Docker is not required for the native
+Windows build or MXC runtime.
 
 To use a local x64 Z3 release instead of the prebuilt download, set
 `Z3_LIBRARY_PATH_OVERRIDE` and `Z3_SYS_Z3_HEADER` before running the task:
@@ -234,6 +294,9 @@ xcode-select --install
 ```
 
 ## Getting Started
+
+The gateway and shell shortcuts below describe Linux/macOS development.
+For native Windows, use the [Windows build and runtime instructions](WINDOWS.md).
 
 ```bash
 # One-time trust
@@ -279,6 +342,22 @@ each worktree. Cache reuse therefore depends on the compiler inputs: outputs
 that embed absolute paths, including Rust dependencies in some builds, can
 still miss across worktrees.
 
+## Container Image Base Overrides
+
+The gateway and supervisor Dockerfiles accept `GATEWAY_BASE_IMAGE` and
+`SUPERVISOR_BASE_IMAGE` build arguments. Omitting them keeps the pinned
+distroless defaults. To build with your own bases, pass the argument through
+the corresponding task:
+
+```shell
+mise run build:docker:gateway -- --build-arg GATEWAY_BASE_IMAGE=registry.example.com/gateway-base:tag
+mise run build:docker:supervisor -- --build-arg SUPERVISOR_BASE_IMAGE=registry.example.com/supervisor-base:tag
+```
+
+Choose bases that provide the GNU runtime libraries required by the binaries
+and CA certificates for the target architecture. Validate the resulting images
+with your deployment. The sandbox image uses `scratch` and has no base override.
+
 ## Main Tasks
 
 These are the primary `mise` tasks for day-to-day development:
@@ -306,6 +385,10 @@ These are the primary `mise` tasks for day-to-day development:
 | `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |
 | `proto/`        | Protocol buffer definitions and [public API conventions](proto/README.md) |
 | `tasks/`        | `mise` task definitions and build scripts     |
+| `tests/testkit/` | Support library for SDK-driven end-to-end suites |
+| `tests/suites/` | End-to-end suites, grouped by test family |
+| `tests/tmachine/` | QEMU test machines provisioned with Ansible, and the `Session` API that drives them |
+| `tests/runner/` | `openshell-test-runner`: runs a test family in a tmachine environment and checks the results |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
 | `docs/`         | Published Fern docs source, navigation, and content assets |
 | `fern/`         | Fern site config, components, and theme assets |
@@ -345,20 +428,42 @@ mise run docs
 
 PRs that touch `docs/**` or `fern/**` are validated by `.github/workflows/branch-docs.yml`, and they get a preview when `FERN_TOKEN` is available to the workflow.
 
-Release Dev publishes the `dev` docs version from `main`. Release Tag publishes an immutable stable version and updates `latest`. See [fern/README.md](fern/README.md) for the source layout, version model, and publishing workflows.
+Release Dev publishes the `dev` docs version from `main`. Release publishes an immutable stable version and updates `latest`. See [fern/README.md](fern/README.md) for the source layout, version model, and publishing workflows.
 
 `docs/` is the source-of-truth docs tree. `fern/` contains the site configuration, components, theme assets, and its README.
 
 See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authoring guide.
 
+## Stale Issues and Pull Requests
+
+Issues receive `state:stale` after 28 days without activity; pull requests receive it after 14 days. Issues labeled `roadmap`, `lifecycle:frozen`, or `state:frozen` are exempt from stale handling. Both frozen labels are supported while the naming convention is being decided. Issues close after another 14 days without activity; pull requests are not automatically closed. Comment on an item to reset the inactivity timer and remove its stale label.
+
 ## Pull Requests
 
-1. Create a branch from `main` named `<type>/<issue-id>-<short-description>/<github-username>`, using a Conventional Commits type such as `feat`, `fix`, `docs`, or `chore`.
+1. Create a branch from `main`, or from the parent PR branch for dependent work, following [Branch Names](#branch-names).
 2. Make your changes with tests.
 3. Run the checks appropriate to the affected code and behavior, as described below.
 4. Open a PR using the `create-github-pr` skill or manually following the [PR template](.github/PULL_REQUEST_TEMPLATE.md).
 
-Every PR must close an existing issue. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
+For release notes, describe the user-facing change in a few short, easy-to-read sentences in the optional **Release Notes** section of the PR description. Keep the section concise. Stable releases use it when non-empty; otherwise they summarize the PR title and description.
+
+Every PR must close an existing issue, except automated dependency updates and the build and flaky-test fixes described below. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
+
+Authors without write access to the target repository must link at least one issue with `state:accepted`, and every linked issue must be accepted. This applies to drafts and direct requests to agents. Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may create a PR without the acceptance label; they must still follow the issue-linking requirement above. PR body text, roadmap placement, other labels, and vouch status do not bypass acceptance.
+
+The `PR Issue Acceptance` workflow reports the native `OpenShell / PR Issue Acceptance` job result for the triggering PR when it is opened, edited, reopened, or updated with new commits. It does not publish a shared commit status; lookup and execution errors fail the job. Link accepted issues in this repository using `Fixes #NNN` or `Closes #NNN`; GitHub recognizes closing references when a PR targets the default branch. Rerun the workflow after issue labels change. Making the job required for merging and configuring any required Actions event policy are separate repository settings; merge-queue support is not included.
+
+Automated dependency update PRs, including Dependabot PRs, are exempt from the separate issue and closing-reference requirement. Human-authored dependency updates follow the normal issue requirement. The exception does not bypass `PR Issue Acceptance` for authors without repository write access or change applicable verification, review, or private vulnerability disclosure requirements.
+
+Authors with `WRITE`, `MAINTAIN`, or `ADMIN` access may open a PR that only fixes a broken build or flaky tests without a separate issue. Describe the failure in the PR instead. Authors without write access follow the normal issue and acceptance requirements.
+
+### Branch Names
+
+Use `<type>/<issue-id>-<short-description>/<github-username>` for contributor branches. Choose the Conventional Commit type that describes the work, such as `feat`, `fix`, `refactor`, `chore`, `perf`, `docs`, `test`, or `ci`. The description is a short lowercase slug separated by hyphens; the final component is your GitHub login, not initials.
+
+For example, issue 1234 with contributor `octocat` uses `feat/1234-add-pagination/octocat`. A PR without an issue omits the issue ID, such as `fix/flaky-sandbox-tests/octocat`. Dependent PRs follow the same naming rule and branch from their parent PR's branch.
+
+Branches created by automation, such as Dependabot and CI mirror branches, keep their generated names. For private security work, follow the authorized disclosure workflow and use a neutral description that does not expose vulnerability details.
 
 ### Choose Verification for the Change
 
@@ -446,10 +551,17 @@ By making a contribution to this project, I certify that:
 ```
 
 ```bash
-git commit -s -m "feat(sandbox): add new capability"
+git commit --signoff --message "feat(sandbox): add new capability"
 ```
 
-DCO sign-off is separate from cryptographic commit signing. CI requires signing for org members so that copy-pr-bot can mirror your PR automatically; see [CI.md](CI.md#commit-signing) for setup.
+DCO sign-off is separate from cryptographic commit signing, and the two have different requirements:
+
+- **DCO sign-off** (`--signoff`) adds the `Signed-off-by` trailer to each commit. It applies to every contributor. The DCO Assistant bot also asks you to sign the DCO once, by commenting on your PR.
+- **Cryptographic commit signing** applies to org members and collaborators only. CI requires it so that copy-pr-bot can mirror your PR automatically; see [CI.md](CI.md#commit-signing) for setup.
+
+### PR testing checklist
+
+Only mark a checklist item as complete after you have run and verified it, not as a plan for what you intend to test. Unchecked boxes at submission are fine; they show what still needs verification before merge.
 
 ## CI
 

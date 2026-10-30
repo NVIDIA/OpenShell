@@ -1,22 +1,38 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `OpenShell` Sandbox Protocol and its concrete RFC 0012 backend.
+#![deny(unsafe_code)]
+
+//! Concrete supervisor-side client for the Isolation Backend and Sandbox Protocol RPCs.
 //!
-//! [`OpenShellRuntimeBackend`] is the supervisor-side implementation of the
-//! generic `IsolationBackend` interface. The workload-side `openshell-sandbox`
-//! runtime serves the same protocol using the generated server and shared wire
-//! types in this crate.
+//! [`OpenShellRuntimeBackend`] connects to the in-tree runtime or a registered
+//! external backend. Its concrete lifecycle and process handles issue RPCs;
+//! they are not backend implementation traits. The workload-side
+//! `openshell-sandbox` runtime implements the generated server services.
 
+mod audit;
 pub mod boundary_protocol;
+pub mod delegated;
+pub mod isolation_protocol;
 pub mod mediation;
+pub mod protobuf;
 mod runtime;
+mod runtime_initiated;
+pub mod runtime_routed;
 pub mod sandbox_auth;
+pub mod stream_adapter;
 
-pub use runtime::OpenShellRuntimeBackend;
+pub use openshell_core::proto::sandbox::backend::v1 as backend_proto;
+pub use runtime::{
+    BoundBoundary, BoundaryExec, BoundaryLaunchOutcome, BoundaryLoopbackConnector, BoundaryProcess,
+    BoundaryTakeover, BoundaryTerminal, ConfirmedBoundary, ExecSession,
+    MAX_RESTORE_REFERENCE_BYTES, NetworkMediationSource, OpenShellRuntimeBackend,
+    ProcessAttachment, ReadyBoundary, ResumeLaunch, RunningBoundary,
+};
+pub use runtime::{BoundaryTransport, BoundaryTransportConnector, validate_runtime_coordinates};
 
 /// Stable isolation backend name implemented by `openshell-sandbox`.
-pub const BACKEND_NAME: &str = "openshell-sandbox";
+pub const BACKEND_NAME: &str = openshell_core::isolation_registration::BUILTIN_BACKEND_NAME;
 
 /// Resource claim set by compute drivers when the workload requests GPU access.
 pub const GPU_RESOURCE_CLAIM: &str = "openshell.gpu";
@@ -36,16 +52,10 @@ pub const SUPERVISOR_CA_RUNTIME_ROOT: &str = "/run/openshell-supervisor-ca";
 /// tmpfs ownership create this child as the unprivileged sandbox identity.
 pub const SUPERVISOR_CA_RUNTIME_DIR: &str = "/run/openshell-supervisor-ca/material";
 
-/// Generated gRPC transport envelope for the OpenShell Sandbox Protocol.
-#[allow(
-    clippy::all,
-    clippy::pedantic,
-    clippy::nursery,
-    dead_code,
-    unused_imports,
-    unused_qualifications,
-    rust_2018_idioms
-)]
+/// Generated gRPC transport envelope for the `OpenShell` Sandbox Protocol.
 pub mod proto {
-    tonic::include_proto!("openshell.sandbox.protocol.v1");
+    pub use openshell_core::proto::sandbox::protocol::v1::*;
 }
+
+#[cfg(feature = "test-support")]
+pub use runtime::test_support;

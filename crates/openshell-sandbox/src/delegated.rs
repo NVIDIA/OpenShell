@@ -3,6 +3,8 @@
 
 //! Process and access-plane assembly for the capability-free sandbox boundary.
 
+use crate::native_api::{BoundaryExec, BoundaryLoopbackConnector};
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -12,7 +14,6 @@ use miette::WrapErr as _;
 use miette::{IntoDiagnostic as _, Result};
 use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
-use openshell_isolation_interface::contract::{BoundaryExec, BoundaryLoopbackConnector};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, LaunchTypeId, Process as OcsfProcess,
     ProcessActivityBuilder, SeverityId, StatusId, ocsf_emit,
@@ -20,7 +21,7 @@ use openshell_ocsf::{
 
 use crate::process::{ProcessHandle, ProcessStatus, ResolvedWorkspace};
 
-fn ocsf_ctx() -> &'static openshell_ocsf::EventContext {
+fn ocsf_ctx() -> openshell_ocsf::ContextRef<'static> {
     openshell_ocsf::ctx::ctx()
 }
 
@@ -28,7 +29,7 @@ fn ocsf_ctx() -> &'static openshell_ocsf::EventContext {
 /// inside its boundary.
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub async fn spawn_workload(
-    launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+    launcher: &crate::linux::workload_launcher::WorkloadLauncher,
     program: &str,
     args: &[String],
     workdir: Option<&str>,
@@ -40,6 +41,7 @@ pub async fn spawn_workload(
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     boundary_runtime: Option<Arc<crate::boundary_io::BoundaryRuntimeState>>,
+    otlp_relay_active: bool,
 ) -> Result<SpawnedAgent> {
     // Driver-selected workspaces are the sandbox identity's home. This keeps
     // canonical and later exec processes consistent for image WorkingDir and
@@ -54,7 +56,7 @@ pub async fn spawn_workload(
         crate::process::validate_oci_workspace_as_effective_identity(std::path::Path::new(
             workspace_root,
         ))
-        .wrap_err("image workspace validation failed")?;
+        .wrap_err(openshell_core::driver_utils::WORKSPACE_VALIDATION_ERROR_CONTEXT)?;
     }
 
     #[cfg(target_os = "linux")]
@@ -69,11 +71,7 @@ pub async fn spawn_workload(
 
     let boundary_runtime = boundary_runtime
         .unwrap_or_else(crate::boundary_io::BoundaryRuntimeState::new_exclusive_pid_namespace);
-    let mut user_environment: std::collections::HashMap<String, String> =
-        std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
-            .ok()
-            .and_then(|json| serde_json::from_str(&json).ok())
-            .unwrap_or_default();
+    let mut user_environment = crate::process::configured_user_environment();
     user_environment.retain(|key, _value| !crate::process::is_proxy_env_var(key));
     let loopback_connector: Arc<dyn BoundaryLoopbackConnector> = Arc::new(
         crate::boundary_io::LocalLoopbackConnector::new(Some(boundary_runtime.clone())),
@@ -86,9 +84,13 @@ pub async fn spawn_workload(
             provider_credentials,
             user_environment,
             boundary_runtime.clone(),
+            otlp_relay_active,
             launcher.clone(),
         ));
 
+    // The delegated workload runs behind OpenShell's mediated network path,
+    // so the generated trust files remain authoritative for its TLS settings.
+    let tls_environment_mode = crate::child_env::TlsEnvironmentMode::Override;
     #[cfg(target_os = "linux")]
     let mut handle = ProcessHandle::spawn(
         launcher,
@@ -98,7 +100,9 @@ pub async fn spawn_workload(
         interactive,
         policy,
         ca_file_paths.as_ref(),
+        tls_environment_mode,
         &provider_env,
+        otlp_relay_active,
     )
     .wrap_err("spawn delegated workload process")?;
     #[cfg(not(target_os = "linux"))]
@@ -109,7 +113,9 @@ pub async fn spawn_workload(
         interactive,
         policy,
         ca_file_paths.as_ref(),
+        tls_environment_mode,
         &provider_env,
+        otlp_relay_active,
     )?;
 
     entrypoint_pid.store(handle.pid(), Ordering::Release);
@@ -132,6 +138,7 @@ pub async fn spawn_workload(
             .status(StatusId::Success)
             .launch_type(LaunchTypeId::Spawn)
             .process(OcsfProcess::new(program, i64::from(handle.pid())))
+            .actor_process(crate::process::ocsf_launcher_process())
             .message(format!("Process started: pid={}", handle.pid()))
             .build()
     );
@@ -222,6 +229,12 @@ pub struct AgentSignaler {
 
 #[cfg(unix)]
 impl AgentSignaler {
+    /// Process ID of the agent's process group leader.
+    #[cfg(test)]
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
     fn deliver(&self, signal: nix::sys::signal::Signal) -> Result<()> {
         let _guard = self
             .signal_lock

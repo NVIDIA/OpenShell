@@ -16,6 +16,8 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const EXECUTABLE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(50);
+const EXECUTABLE_BUSY_RETRY_LIMIT: usize = 20;
 const INSTALL_GUIDANCE: &str = "Install e2fsprogs 1.43 or newer, or repair the selected installation and the gateway service PATH; rerun config preflight with the service account and environment";
 
 /// Resolve a tool using the VM driver's inherited PATH and existing package prefixes.
@@ -217,15 +219,37 @@ async fn run_version_probe(
     if *cancellation.borrow() {
         return Err("host tool checks cancelled".to_string());
     }
-    let child = tokio::process::Command::from(command)
+    let mut command = tokio::process::Command::from(command);
+    command
         .arg("-V")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| error.to_string())?;
+        .kill_on_drop(true);
+    let mut executable_busy_retries = 0;
+    let child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            // Linux can transiently retain the inode write count after a
+            // newly installed executable's writer closes. Retry only that
+            // condition; configuration and loader errors still fail at once.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && executable_busy_retries < EXECUTABLE_BUSY_RETRY_LIMIT =>
+            {
+                executable_busy_retries += 1;
+                tokio::select! {
+                    biased;
+                    () = cancelled(cancellation) => {
+                        return Err("host tool checks cancelled".to_string());
+                    }
+                    () = tokio::time::sleep(EXECUTABLE_BUSY_RETRY_DELAY) => {}
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
     let group = child
         .id()
         .and_then(|id| i32::try_from(id).ok())
@@ -401,6 +425,28 @@ mod tests {
                 "earlier path lost: {error}"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn filesystem_preflight_retries_a_transiently_busy_executable() {
+        use std::fs::OpenOptions;
+
+        let temp = tempfile::tempdir().expect("busy installation");
+        fake_e2fs_installation(temp.path());
+        let writer = OpenOptions::new()
+            .write(true)
+            .open(temp.path().join("mke2fs"))
+            .expect("hold formatter open for writing");
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(writer);
+        });
+
+        preflight_in(&[temp.path().to_path_buf()])
+            .await
+            .expect("transiently busy formatter should be retried");
+        release.await.expect("release busy formatter");
     }
 
     #[tokio::test]

@@ -10,9 +10,9 @@ use openshell_core::proto::compute::v1::{
     DeleteWorkspaceResponse, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_server::ComputeDriver,
+    StopSandboxRequest, StopSandboxResponse, SuspendSandboxRequest, SuspendSandboxResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
+    WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -167,6 +167,15 @@ impl ComputeDriver for ComputeDriverService {
         .await
     }
 
+    async fn suspend_sandbox(
+        &self,
+        _request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SuspendSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "the Kubernetes compute driver does not support sandbox suspend",
+        ))
+    }
+
     async fn stop_sandbox(
         &self,
         request: Request<StopSandboxRequest>,
@@ -275,12 +284,17 @@ impl ComputeDriver for ComputeDriverService {
                     })?;
                 match self.driver.workspace_mode() {
                     WorkspaceMode::Managed => {
-                        self.driver
-                            .ensure_namespace(&workspace)
-                            .await
-                            .map_err(|e| Status::internal(e.to_string()))?;
+                        self.driver.ensure_namespace(&workspace).await.map_err(
+                            |error| match error {
+                                crate::KubernetesDriverError::Precondition(message) => {
+                                    Status::failed_precondition(message)
+                                }
+                                error => Status::internal(error.to_string()),
+                            },
+                        )?;
                     }
                     WorkspaceMode::Operator => {
+                        self.driver.wait_for_operator_allowlist().await?;
                         if let Some(allowlist) = self.driver.operator_allowlist()
                             && !allowlist.contains(&workspace)
                         {
@@ -320,6 +334,38 @@ impl ComputeDriver for ComputeDriverService {
                 Ok(Response::new(DeleteWorkspaceResponse {}))
             })
             .await
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for ComputeDriverService {
+    async fn update_sandbox_configuration(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>,
+        Status,
+    > {
+        self.rpc_tracer
+            .trace(openshell_otel::rpc::UPDATE_SANDBOX_CONFIGURATION, async {
+                self.driver
+                    .update_sandbox_configuration(&request.into_inner())
+                    .await
+                    .map_err(|error| {
+                        Status::from(openshell_core::ComputeDriverError::from(error))
+                    })?;
+                Ok(Response::new(
+                    openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse {},
+                ))
+            })
+            .await
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdates for ComputeDriverService {
+    async fn update_sandbox_configuration(&self, request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>, Status> {
+        openshell_core::compute::ComputeDriver::update_sandbox_configuration(self, request).await
     }
 }
 

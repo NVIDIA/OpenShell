@@ -5,27 +5,34 @@
 
 use crate::config::{
     DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID, DEFAULT_WORKSPACE_STORAGE_SIZE,
-    KubernetesComputeConfig, OperatorNamespaceAllowlist, WorkspaceMode, is_dns_1123_label,
-    managed_namespace, managed_namespace_prefix, validate_managed_namespace_name,
+    KubernetesComputeConfig, KubernetesControlConnection, OperatorNamespaceAllowlist,
+    WorkspaceMode, is_dns_1123_label, managed_namespace, managed_namespace_prefix,
+    validate_managed_namespace_name,
 };
 use crate::isolation::{
-    BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesSandboxRuntimeBoundarySpec,
+    BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesControlPath,
+    KubernetesSandboxRuntimeBoundarySpec, KubernetesSupervisorClaim,
 };
 use crate::lifecycle::LifecycleGates;
 use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH, ClientTlsMaterial,
-    SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames, SupervisorClientTls,
-    boundary_service, generate_proxy_ca_material, image_pull_secret_copy, sandbox_bootstrap_secret,
-    sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
-    supervisor_bootstrap_secret, supervisor_pod, workload_fence,
+    SHARED_INSTANCE_KEY, SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames,
+    SupervisorClientTls, boundary_service, boundary_service_matches_mode, control_policy,
+    generate_proxy_ca_material, image_pull_secret_copy, sandbox_bootstrap_secret,
+    sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference, shared_control_policy,
+    shared_instance_secret, supervisor_bootstrap_secret, supervisor_pod, workload_fence,
+};
+use crate::shared_supervisor::{
+    ANNOTATION_SUPERVISOR_SESSION, ANNOTATION_SUPERVISOR_TOPOLOGY, GATEWAY_TOPOLOGY,
+    SharedSupervisor, SupervisorPlacement, supervisor_placement,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::authentication::v1::{
     TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
 };
 use k8s_openapi::api::core::v1::{
-    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Secret,
-    Service, ServiceAccount, Volume, VolumeMount,
+    ConfigMap, Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod,
+    Secret, Service, ServiceAccount, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
@@ -42,6 +49,7 @@ use kube::runtime::WatchStreamExt;
 use kube::runtime::wait::await_condition;
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
+use openshell_core::NetworkSupervisorTrustBundle;
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_GATEWAY_ID, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID,
@@ -67,8 +75,12 @@ use openshell_sandbox_backend::boundary_protocol::{
     GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
     generate_sandbox_tls_material,
 };
-use rand::RngCore as _;
+use openshell_supervisor_control::{
+    InstanceSupervision, LaunchError, RecoverableInstance, RecoveryBaseline,
+    RegistrationTraceContext, SandboxInstanceRegistration, SharedSupervision,
+};
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -77,6 +89,9 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::{OnceCell, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
+
+#[path = "image_update.rs"]
+mod image_update;
 
 pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, KubernetesDriverError>> + Send>>;
@@ -104,6 +119,204 @@ const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: &str =
     "openshell.ai/sandbox-runtime-network-policy-uid";
 const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: &str =
     "openshell.ai/sandbox-runtime-network-policy-generation";
+/// Connection mode of the current runtime generation. Absent on legacy
+/// generations, which remain supervisor-initiated until they are replaced.
+const ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION: &str =
+    "openshell.ai/sandbox-runtime-control-connection";
+const ANNOTATION_SANDBOX_RUNTIME_CONTROL_GENERATION: &str =
+    "openshell.ai/sandbox-runtime-control-generation";
+const ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID: &str =
+    "openshell.ai/sandbox-runtime-control-policy-uid";
+const ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_GENERATION: &str =
+    "openshell.ai/sandbox-runtime-control-policy-generation";
+
+/// Full gateway-normalized destination-trust digest recorded on each immutable
+/// `ConfigMap` generation. The digest is intentionally not truncated here even
+/// though the object name uses stable, DNS-safe hash prefixes.
+const ANNOTATION_ADDITIONAL_CA_GENERATION: &str = "openshell.ai/additional-ca-generation";
+const ADDITIONAL_CA_CONFIG_MAP_PREFIX: &str = "openshell-additional-ca-";
+const ADDITIONAL_CA_DATA_KEY: &str = "ca.crt";
+
+/// A validated immutable `ConfigMap` generation selected for a supervisor Pod.
+/// This contains only an object name and non-secret digest; PEM bytes remain in
+/// the API object and are never copied into a workload template or Secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NetworkAdditionalCaConfigMap {
+    name: String,
+    digest: String,
+}
+
+fn network_additional_ca_config_map_name(gateway_id: &str, digest: &str) -> String {
+    // Kubernetes labels have a 63-byte limit. Keep recognizable stable
+    // prefixes while hashing both variable inputs. The complete digest is
+    // retained in an annotation and checked before every supervisor creation.
+    // The hashes derive deterministic object names, not authenticity proofs;
+    // trust comes from the immutable flag, the digest annotation, and the
+    // exact-byte validation. Classified as a non-security identity hash in
+    // openshell-crypto/README.md.
+    let gateway_hash = format!("{:x}", Sha256::digest(gateway_id.as_bytes()));
+    let digest_hash = format!("{:x}", Sha256::digest(digest.as_bytes()));
+    format!(
+        "{ADDITIONAL_CA_CONFIG_MAP_PREFIX}{}-{}",
+        &gateway_hash[..12],
+        &digest_hash[..26],
+    )
+}
+
+fn network_additional_ca_config_map(
+    namespace: &str,
+    gateway_id: &str,
+    bundle: &NetworkSupervisorTrustBundle,
+) -> Result<ConfigMap, KubernetesDriverError> {
+    let pem = std::str::from_utf8(bundle.normalized_pem()).map_err(|_| {
+        KubernetesDriverError::Precondition(
+            "gateway-normalized network additional CA bundle is not UTF-8".to_string(),
+        )
+    })?;
+    let name = network_additional_ca_config_map_name(gateway_id, bundle.digest());
+    Ok(ConfigMap {
+        metadata: ObjectMeta {
+            name: Some(name),
+            namespace: Some(namespace.to_string()),
+            labels: Some(BTreeMap::from([
+                (
+                    LABEL_MANAGED_BY.to_string(),
+                    LABEL_MANAGED_BY_VALUE.to_string(),
+                ),
+                (LABEL_GATEWAY_ID.to_string(), gateway_id.to_string()),
+            ])),
+            annotations: Some(BTreeMap::from([(
+                ANNOTATION_ADDITIONAL_CA_GENERATION.to_string(),
+                bundle.digest().to_string(),
+            )])),
+            // Generations are intentionally retained across Pod and Sandbox
+            // replacement. A sandbox owner reference would allow garbage
+            // collection to remove material still needed by a stopped PVC.
+            owner_references: None,
+            ..Default::default()
+        },
+        immutable: Some(true),
+        data: Some(BTreeMap::from([(
+            ADDITIONAL_CA_DATA_KEY.to_string(),
+            pem.to_string(),
+        )])),
+        binary_data: None,
+    })
+}
+
+fn validate_network_additional_ca_config_map(
+    existing: &ConfigMap,
+    expected: &ConfigMap,
+) -> Result<(), KubernetesDriverError> {
+    let name = expected.metadata.name.as_deref().unwrap_or_default();
+    // Validate the gateway-owned label pairs individually. A mutating
+    // admission webhook may attach organizational labels to the created
+    // ConfigMap; an exact-map comparison would then reject the correct map on
+    // the create response and on every later create/start through this
+    // existing-object path, blocking sandbox launches despite the required
+    // ownership labels, immutable flag, digest, and certificate bytes
+    // remaining correct. Unrelated labels are therefore allowed; each
+    // gateway-owned pair must match exactly.
+    if let Some(expected_labels) = expected.metadata.labels.as_ref() {
+        let existing_labels = existing.metadata.labels.as_ref().ok_or_else(|| {
+            KubernetesDriverError::Precondition(format!(
+                "network additional CA ConfigMap {name} is not owned by this gateway"
+            ))
+        })?;
+        for (key, value) in expected_labels {
+            if existing_labels.get(key) != Some(value) {
+                return Err(KubernetesDriverError::Precondition(format!(
+                    "network additional CA ConfigMap {name} is not owned by this gateway"
+                )));
+            }
+        }
+    }
+    // The immutable generation must outlive individual sandbox objects.
+    // Reject even an explicitly empty ownerReferences field so only the
+    // API representation produced by our ownerless template is accepted.
+    if existing.metadata.owner_references.is_some() {
+        return Err(KubernetesDriverError::Precondition(format!(
+            "network additional CA ConfigMap {name} is not owned by this gateway"
+        )));
+    }
+    let expected_digest = expected
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(ANNOTATION_ADDITIONAL_CA_GENERATION));
+    let actual_digest = existing
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(ANNOTATION_ADDITIONAL_CA_GENERATION));
+    if actual_digest != expected_digest {
+        return Err(KubernetesDriverError::Precondition(format!(
+            "network additional CA ConfigMap {name} has an unexpected trust generation"
+        )));
+    }
+    if existing.immutable != Some(true) {
+        return Err(KubernetesDriverError::Precondition(format!(
+            "network additional CA ConfigMap {name} is not immutable"
+        )));
+    }
+    if existing.data != expected.data || existing.binary_data.is_some() {
+        return Err(KubernetesDriverError::Precondition(format!(
+            "network additional CA ConfigMap {name} did not retain the exact gateway-normalized trust bundle"
+        )));
+    }
+    Ok(())
+}
+
+async fn create_or_validate_network_additional_ca_config_map(
+    config_maps: &Api<ConfigMap>,
+    expected: &ConfigMap,
+) -> Result<(), KubernetesDriverError> {
+    let name = expected.metadata.name.as_deref().ok_or_else(|| {
+        KubernetesDriverError::Message("network additional CA ConfigMap has no name".to_string())
+    })?;
+    match tokio::time::timeout(KUBE_API_TIMEOUT, config_maps.get_opt(name)).await {
+        Ok(Ok(Some(existing))) => {
+            return validate_network_additional_ca_config_map(&existing, expected);
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => return Err(KubernetesDriverError::from_kube(error)),
+        Err(_) => {
+            return Err(KubernetesDriverError::Message(
+                "timed out reading network additional CA ConfigMap".to_string(),
+            ));
+        }
+    }
+
+    match tokio::time::timeout(
+        KUBE_API_TIMEOUT,
+        config_maps.create(&PostParams::default(), expected),
+    )
+    .await
+    {
+        // Validate the server response as well: an admission controller must
+        // not be able to silently alter the immutable material we mount.
+        Ok(Ok(created)) => validate_network_additional_ca_config_map(&created, expected),
+        // A concurrent gateway instance may win creation. Re-read exactly the
+        // named object and subject the winner to the same byte-for-byte checks;
+        // no LIST, WATCH, PATCH, UPDATE, or DELETE is ever used for this API.
+        Ok(Err(KubeError::Api(error))) if error.code == 409 => {
+            let existing = tokio::time::timeout(KUBE_API_TIMEOUT, config_maps.get(name))
+                .await
+                .map_err(|_| {
+                    KubernetesDriverError::Message(
+                        "timed out validating concurrent network additional CA ConfigMap creation"
+                            .to_string(),
+                    )
+                })?
+                .map_err(KubernetesDriverError::from_kube)?;
+            validate_network_additional_ca_config_map(&existing, expected)
+        }
+        Ok(Err(error)) => Err(KubernetesDriverError::from_kube(error)),
+        Err(_) => Err(KubernetesDriverError::Message(
+            "timed out creating network additional CA ConfigMap".to_string(),
+        )),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SandboxRuntimeBootstrapPhase {
@@ -138,11 +351,127 @@ fn boundary_service_authority(
     namespace: &str,
     names: &SandboxRuntimeNames,
     boundary_port: u16,
+    mode: KubernetesControlConnection,
 ) -> String {
     format!(
-        "{}.{}.svc:{boundary_port}",
-        names.boundary_service, namespace
+        "{}.{namespace}.svc:{boundary_port}",
+        names.control_service(mode),
     )
+}
+
+/// Read the current generation's mode without migrating a running workload.
+fn sandbox_runtime_control_connection(
+    object: &DynamicObject,
+) -> Result<KubernetesControlConnection, KubernetesDriverError> {
+    let Some(annotations) = object.metadata.annotations.as_ref() else {
+        return Ok(KubernetesControlConnection::SupervisorInitiated);
+    };
+    let Some(value) = annotations.get(ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION) else {
+        return Ok(KubernetesControlConnection::SupervisorInitiated);
+    };
+    let mode = value.parse().map_err(KubernetesDriverError::Precondition)?;
+    // Old gateways rotate the runtime generation but preserve unknown
+    // annotations. Their replacement uses legacy control, not this stale mode.
+    if annotations
+        .get(ANNOTATION_SANDBOX_RUNTIME_CONTROL_GENERATION)
+        .is_none_or(|generation| {
+            Some(generation) != annotations.get(ANNOTATION_SANDBOX_RUNTIME_GENERATION)
+        })
+    {
+        return Ok(KubernetesControlConnection::SupervisorInitiated);
+    }
+    Ok(mode)
+}
+
+/// Operator-provided bootstrap bytes read once per runtime generation.
+struct StagedBootstrapMaterial {
+    upstream_proxy_ca_bundle: Option<Vec<u8>>,
+    client_tls: Option<ClientTlsMaterial>,
+}
+
+/// The supervisor a generation is installed with.
+enum GenerationSupervisor {
+    /// A supervisor Pod paired with this generation's workload Pod.
+    Dedicated {
+        pod_uid: String,
+        connection: KubernetesControlConnection,
+    },
+    /// A sandbox instance on the gateway's shared supervisor.
+    Shared { route: String },
+}
+
+impl GenerationSupervisor {
+    /// Third component of the runtime identity. An instance route can never
+    /// equal a Pod UID, so no Pod can authenticate as a shared generation.
+    fn runtime_identity_component(&self) -> &str {
+        match self {
+            Self::Dedicated { pod_uid, .. } => pod_uid,
+            Self::Shared { route } => route,
+        }
+    }
+}
+
+/// A generation's supervisor with everything installation binds into its
+/// boundary evidence, resolved and verified once.
+enum GenerationLaunchTarget {
+    Dedicated {
+        pod_uid: String,
+        /// Cluster IP of the boundary Service of the recorded connection mode.
+        service_ip: std::net::IpAddr,
+        /// Present exactly when the runtime initiates the control connection.
+        control_policy: Option<VerifiedControlPolicy>,
+    },
+    Shared {
+        shared: SharedSupervisor,
+        route: String,
+        target: SharedSupervisorTarget,
+        control_policy: VerifiedControlPolicy,
+    },
+}
+
+impl GenerationLaunchTarget {
+    fn control_policy(&self) -> Option<&VerifiedControlPolicy> {
+        match self {
+            Self::Dedicated { control_policy, .. } => control_policy.as_ref(),
+            Self::Shared { control_policy, .. } => Some(control_policy),
+        }
+    }
+}
+
+/// Where workload runtimes reach the gateway's shared supervisor.
+struct SharedSupervisorTarget {
+    namespace: String,
+    authority: String,
+    address: std::net::SocketAddr,
+    /// Labels of the shared supervisor Pods, from their Service.
+    selector: BTreeMap<String, String>,
+}
+
+/// Stored coordinates of a validated runtime-initiated control policy.
+struct VerifiedControlPolicy {
+    uid: String,
+    resource_version: String,
+    generation: i64,
+}
+
+impl VerifiedControlPolicy {
+    fn from_policy(policy: &NetworkPolicy) -> Result<Self, KubernetesDriverError> {
+        let missing = |field: &str| {
+            KubernetesDriverError::Message(format!("control NetworkPolicy has no {field}"))
+        };
+        Ok(Self {
+            uid: policy.metadata.uid.clone().ok_or_else(|| missing("UID"))?,
+            resource_version: policy
+                .metadata
+                .resource_version
+                .clone()
+                .ok_or_else(|| missing("resourceVersion"))?,
+            generation: policy
+                .metadata
+                .generation
+                .ok_or_else(|| missing("generation"))?,
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -267,6 +596,10 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
 /// This prevents gRPC handlers from blocking indefinitely when the k8s
 /// API server is unreachable or slow.
 const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an operator-mode workspace check waits for the namespace label
+/// watcher's first full listing before reporting the driver unavailable.
+const OPERATOR_ALLOWLIST_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+const OPENSHIFT_SCC_ALLOCATOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
 fn admission_error(error: tonic::Status) -> KubernetesDriverError {
     match error.code() {
         tonic::Code::InvalidArgument => {
@@ -279,19 +612,20 @@ fn admission_error(error: tonic::Status) -> KubernetesDriverError {
     }
 }
 const SANDBOX_RUNTIME_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+/// Unsupervised shared sandbox instances removed at once by one reconcile pass.
 /// Bound how long a crash-interrupted, fail-closed bootstrap may remain stranded.
 const SANDBOX_RUNTIME_BOOTSTRAP_GRACE: Duration = Duration::from_mins(5);
 
-fn random_sandbox_runtime_token() -> String {
+fn random_sandbox_runtime_token() -> Result<String, KubernetesDriverError> {
     use std::fmt::Write as _;
 
-    let mut bytes = [0_u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
+    let bytes = openshell_crypto::random_bytes::<32>()
+        .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
     let mut token = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         write!(token, "{byte:02x}").expect("writing to String cannot fail");
     }
-    token
+    Ok(token)
 }
 
 fn decode_launch_authentication(
@@ -519,7 +853,11 @@ const KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES: &[&str] = &[
     WORKSPACE_VOLUME_NAME,
 ];
 
-const KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS: &[&str] = &[SERVICE_ACCOUNT_TOKEN_MOUNT_PATH];
+const KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS: &[&str] = &[
+    SERVICE_ACCOUNT_TOKEN_MOUNT_PATH,
+    SANDBOX_CONTROL_ROOT,
+    SANDBOX_PROXY_CA_MOUNT_PATH,
+];
 
 fn validate_kubernetes_driver_volumes(
     volumes: &[KubernetesDriverVolumeConfig],
@@ -625,13 +963,56 @@ fn validate_kubernetes_protected_path_conflicts(
     protected_paths: &[&str],
 ) -> Result<(), String> {
     for mount in volume_mounts {
-        let mount_path = mount.mount_path.as_str();
-        for protected_path in protected_paths {
-            if mount_path_conflicts_with_protected_path(mount_path, protected_path) {
-                return Err(format!(
-                    "mount path '{mount_path}' conflicts with reserved OpenShell path '{protected_path}'"
-                ));
+        validate_kubernetes_protected_mount_target(&mount.mount_path, protected_paths)?;
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_protected_mount_target(
+    target: &str,
+    protected_paths: &[&str],
+) -> Result<(), String> {
+    let target = driver_mounts::normalize_mount_target(target);
+    for protected in protected_paths {
+        if mount_path_conflicts_with_protected_path(&target, protected) {
+            return Err(format!(
+                "mount path '{target}' conflicts with reserved OpenShell path '{protected}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Recheck caller PVC destinations in saved Pod templates before restart or release.
+fn validate_stored_kubernetes_pvc_mounts(spec: &serde_json::Value) -> Result<(), String> {
+    let caller_volumes: HashSet<_> = spec["volumes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|volume| !volume["persistentVolumeClaim"].is_null())
+        .filter_map(|volume| volume["name"].as_str())
+        .filter(|name| *name != WORKSPACE_VOLUME_NAME)
+        .collect();
+    for container in spec["containers"].as_array().into_iter().flatten() {
+        for mount in container["volumeMounts"].as_array().into_iter().flatten() {
+            if !mount["name"]
+                .as_str()
+                .is_some_and(|name| caller_volumes.contains(name))
+            {
+                continue;
             }
+            let target = mount["mountPath"]
+                .as_str()
+                .ok_or("caller PVC mount lacks a mountPath")?;
+            driver_mounts::validate_container_mount_target(target)?;
+            driver_mounts::validate_workspace_mount_target(
+                target,
+                driver_mounts::DEFAULT_WORKSPACE_ROOT,
+            )?;
+            validate_kubernetes_protected_mount_target(
+                target,
+                KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS,
+            )?;
         }
     }
     Ok(())
@@ -682,6 +1063,23 @@ const WORKSPACE_INIT_CONTAINER_NAME: &str = "workspace-init";
 /// `/sandbox` contents.  Subsequent pod starts skip the copy.
 const WORKSPACE_SENTINEL: &str = ".workspace-initialized";
 
+/// Build a Kubernetes client whose requests time out after `request_timeout`.
+///
+/// kube's `read_timeout` counts the time a pooled connection spent idle, so a
+/// request that reuses a connection idle for nearly that long fails with
+/// `SendRequest` before the API server can answer. A per-request timeout
+/// starts when the request is sent instead.
+fn kubernetes_request_client(
+    mut config: kube::Config,
+    request_timeout: Duration,
+) -> Result<Client, KubernetesDriverError> {
+    config.read_timeout = None;
+    Ok(kube::client::ClientBuilder::try_from(config)
+        .map_err(KubernetesDriverError::from_kube)?
+        .with_layer(&tower::timeout::TimeoutLayer::new(request_timeout))
+        .build())
+}
+
 #[derive(Clone)]
 pub struct KubernetesComputeDriver {
     client: Client,
@@ -689,7 +1087,14 @@ pub struct KubernetesComputeDriver {
     sandbox_api_version: Arc<OnceCell<&'static str>>,
     lifecycle_gates: Arc<LifecycleGates>,
     config: KubernetesComputeConfig,
+    /// Gateway-normalized destination trust available only to this in-process
+    /// driver. The external driver protocol deliberately has no transport for
+    /// the PEM bytes or a gateway-local artifact path.
+    network_trust_bundle: Option<NetworkSupervisorTrustBundle>,
     operator_allowlist: Option<OperatorNamespaceAllowlist>,
+    /// Desired shared sandbox instances while new generations use the gateway
+    /// topology.
+    shared_supervisor: Option<SharedSupervisor>,
 }
 
 impl std::fmt::Debug for KubernetesComputeDriver {
@@ -703,6 +1108,33 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 }
 
 impl KubernetesComputeDriver {
+    /// Environment that lets a supervisor export spans, joining the current
+    /// trace, OCSF events, and relayed workload traces, identifying the
+    /// gateway that launched it.
+    fn supervisor_otlp_environment(&self) -> Vec<(&'static str, String)> {
+        let mut environment = Vec::new();
+        if let Some(endpoint) = self.config.supervisor_otlp_endpoint.as_deref() {
+            environment.push((
+                openshell_core::sandbox_env::OTLP_ENDPOINT,
+                endpoint.to_string(),
+            ));
+            environment.extend(openshell_otel::current_trace_context_environment());
+        }
+        if let Some(export) = &self.config.supervisor_ocsf_export {
+            environment.extend(export.environment());
+        }
+        if let Some(endpoint) = &self.config.supervisor_otlp_agent_endpoint {
+            environment.push((
+                openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT,
+                endpoint.clone(),
+            ));
+        }
+        if let Some(name) = &self.config.supervisor_gateway_name {
+            environment.push((openshell_core::sandbox_env::GATEWAY_NAME, name.clone()));
+        }
+        environment
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test(config: KubernetesComputeConfig) -> Self {
         let service = tower::service_fn(|_request: http::Request<kube::client::Body>| async {
@@ -717,13 +1149,58 @@ impl KubernetesComputeDriver {
             sandbox_api_version: Arc::new(OnceCell::new()),
             lifecycle_gates: Arc::default(),
             config,
+            network_trust_bundle: None,
             operator_allowlist: None,
+            shared_supervisor: None,
         }
     }
 
+    /// A driver whose new generations get a dedicated supervisor Pod each.
+    /// A configuration that places them on the gateway's shared supervisor
+    /// needs [`Self::with_shared_supervision`]; without the gateway's
+    /// coordination it is refused here, before anything runs.
     pub async fn new(
         config: KubernetesComputeConfig,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        network_trust_bundle: Option<NetworkSupervisorTrustBundle>,
+    ) -> Result<Self, KubernetesDriverError> {
+        if config.shared_supervisor.is_some() {
+            return Err(KubernetesDriverError::Precondition(
+                "the gateway supervisor topology requires the gateway's shared supervision, which only the driver linked into the gateway receives"
+                    .to_string(),
+            ));
+        }
+        Self::build(config, shutdown_rx, None, network_trust_bundle).await
+    }
+
+    /// A driver whose new generations become sandbox instances on the shared
+    /// supervisor the gateway coordinates through `supervision`. The driver
+    /// adapts that coordination to Kubernetes: it records placements,
+    /// persists and reads back launch material, provisions egress to the
+    /// supervisor's Service, and delivers the supervisor token into its
+    /// Secret.
+    pub async fn with_shared_supervision(
+        config: KubernetesComputeConfig,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        supervision: SharedSupervision,
+    ) -> Result<Self, KubernetesDriverError> {
+        if config.shared_supervisor.is_none() {
+            return Err(KubernetesDriverError::Precondition(
+                "shared supervision was provided but the configuration does not place generations on the shared supervisor"
+                    .to_string(),
+            ));
+        }
+        // The gateway refuses the additional destination CA under the shared
+        // supervisor topology fail-closed, so no trust bundle reaches this
+        // constructor.
+        Self::build(config, shutdown_rx, Some(supervision), None).await
+    }
+
+    async fn build(
+        config: KubernetesComputeConfig,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        supervision: Option<SharedSupervision>,
+        network_trust_bundle: Option<NetworkSupervisorTrustBundle>,
     ) -> Result<Self, KubernetesDriverError> {
         config
             .resource_admission
@@ -744,6 +1221,15 @@ impl KubernetesComputeDriver {
         config
             .validate_upstream_proxy_config()
             .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_allowed_pod_annotations()
+            .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_allowed_pod_labels()
+            .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_supervisor_topology()
+            .map_err(KubernetesDriverError::Precondition)?;
         // Read the bundle once at startup so an unreadable path or a
         // certificate-free file fails the gateway here, rather than as a
         // repeated sandbox-create failure. The authoritative read still
@@ -761,9 +1247,8 @@ impl KubernetesComputeDriver {
 
         let mut kube_config = base_config.clone();
         kube_config.connect_timeout = Some(Duration::from_secs(10));
-        kube_config.read_timeout = Some(Duration::from_secs(30));
         kube_config.write_timeout = Some(Duration::from_secs(30));
-        let client = Client::try_from(kube_config).map_err(KubernetesDriverError::from_kube)?;
+        let client = kubernetes_request_client(kube_config, KUBE_API_TIMEOUT)?;
 
         let mut watch_kube_config = base_config;
         watch_kube_config.connect_timeout = Some(Duration::from_secs(10));
@@ -793,13 +1278,32 @@ impl KubernetesComputeDriver {
             None
         };
 
+        let shared_supervisor = config
+            .shared_supervisor
+            .clone()
+            .zip(supervision)
+            .map(|(config, supervision)| SharedSupervisor::new(config, supervision));
+        if let Some(shared) = &shared_supervisor {
+            shared.spawn_token_secret_writer(client.clone(), shutdown_rx.clone());
+        }
+        if shared_supervisor.is_some()
+            && (config.supervisor_otlp_endpoint.is_some()
+                || config.supervisor_ocsf_export.is_some()
+                || config.supervisor_otlp_agent_endpoint.is_some())
+        {
+            warn!(
+                "the gateway supervisor topology does not export supervisor OTLP traces or OCSF events or relay workload traces; shared sandbox instances keep console logs and gateway log push"
+            );
+        }
         let driver = Self {
             client,
             watch_client,
             sandbox_api_version: Arc::new(OnceCell::new()),
             lifecycle_gates: Arc::default(),
             config,
+            network_trust_bundle,
             operator_allowlist,
+            shared_supervisor,
         };
 
         if driver.workspace_mode() == WorkspaceMode::Shared {
@@ -840,7 +1344,10 @@ impl KubernetesComputeDriver {
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/kubernetes",
                 openshell_core::VERSION,
-                [],
+                [
+                    openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION
+                        .to_string(),
+                ],
             )),
         })
     }
@@ -871,6 +1378,7 @@ impl KubernetesComputeDriver {
             .ok_or_else(|| tonic::Status::internal("TokenReview response missing status"))?;
         let identity = token_review_identity(&status, &self.config.service_account_name)?
             .ok_or_else(|| tonic::Status::unauthenticated("sandbox credential was not accepted"))?;
+        self.wait_for_operator_allowlist().await?;
         if !self.accepts_auth_namespace(&identity.namespace) {
             return Err(tonic::Status::permission_denied(
                 "sandbox credential namespace is not accepted by the driver",
@@ -944,6 +1452,25 @@ impl KubernetesComputeDriver {
 
     pub fn operator_allowlist(&self) -> Option<&OperatorNamespaceAllowlist> {
         self.operator_allowlist.as_ref()
+    }
+
+    /// Wait for the operator namespace allowlist's first full listing.
+    ///
+    /// The label watcher fills the allowlist in the background after the
+    /// driver starts. Checking a workspace before that listing arrives would
+    /// reject a labeled namespace as unknown, so callers wait here first and
+    /// report `Unavailable` if the listing is still missing.
+    pub async fn wait_for_operator_allowlist(&self) -> Result<(), tonic::Status> {
+        let Some(allowlist) = self.operator_allowlist.as_ref() else {
+            return Ok(());
+        };
+        if allowlist.wait_synced(OPERATOR_ALLOWLIST_SYNC_TIMEOUT).await {
+            Ok(())
+        } else {
+            Err(tonic::Status::unavailable(
+                "operator namespace allowlist has not finished its initial namespace listing",
+            ))
+        }
     }
 
     pub fn default_image(&self) -> &str {
@@ -1063,6 +1590,13 @@ impl KubernetesComputeDriver {
                 )));
             }
         };
+        let openshift_scc_allocator_enabled = [
+            crate::config::ANNOTATION_SCC_MCS,
+            crate::config::ANNOTATION_SCC_UID_RANGE,
+            crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
+        ]
+        .iter()
+        .any(|key| gateway_ns_annotations.contains_key(*key));
 
         let mut labels = BTreeMap::new();
         labels.insert(
@@ -1072,35 +1606,24 @@ impl KubernetesComputeDriver {
         labels.insert(LABEL_GATEWAY_ID.to_string(), self.config.gateway_id.clone());
         labels.insert(LABEL_SANDBOX_WORKSPACE.to_string(), workspace.to_string());
 
-        let mut annotations = BTreeMap::new();
-        for key in [
-            crate::config::ANNOTATION_SCC_UID_RANGE,
-            crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
-        ] {
-            if let Some(val) = gateway_ns_annotations.get(key) {
-                annotations.insert(key.to_string(), val.clone());
-            }
-        }
-
         let ns = Namespace {
             metadata: ObjectMeta {
                 name: Some(ns_name.clone()),
                 labels: Some(labels),
-                annotations: if annotations.is_empty() {
-                    None
-                } else {
-                    Some(annotations)
-                },
                 ..Default::default()
             },
             ..Default::default()
         };
 
-        match tokio::time::timeout(KUBE_API_TIMEOUT, ns_api.create(&PostParams::default(), &ns))
-            .await
+        let initial_namespace = match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            ns_api.create(&PostParams::default(), &ns),
+        )
+        .await
         {
-            Ok(Ok(_)) => {
+            Ok(Ok(created)) => {
                 info!(namespace = %ns_name, workspace = %workspace, "created managed namespace");
+                created
             }
             Ok(Err(KubeError::Api(api))) if api.code == 409 => {
                 let existing =
@@ -1122,6 +1645,7 @@ impl KubernetesComputeDriver {
                     )));
                 }
                 debug!(namespace = %ns_name, "managed namespace already exists");
+                existing
             }
             Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
             Err(_) => {
@@ -1129,12 +1653,73 @@ impl KubernetesComputeDriver {
                     "timeout creating namespace {ns_name}"
                 )));
             }
+        };
+
+        if openshift_scc_allocator_enabled {
+            self.wait_for_openshift_scc_annotations(&ns_api, &ns_name, initial_namespace)
+                .await?;
         }
 
         self.ensure_service_account(&ns_name).await?;
         self.ensure_managed_ssh_network_policy(&ns_name).await?;
 
         Ok(ns_name)
+    }
+
+    async fn wait_for_openshift_scc_annotations(
+        &self,
+        ns_api: &Api<Namespace>,
+        namespace: &str,
+        mut current: Namespace,
+    ) -> Result<(), KubernetesDriverError> {
+        let operation = async {
+            loop {
+                let annotations = current.metadata.annotations.unwrap_or_default();
+                if [
+                    crate::config::ANNOTATION_SCC_MCS,
+                    crate::config::ANNOTATION_SCC_UID_RANGE,
+                    crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
+                ]
+                .into_iter()
+                .all(|key| {
+                    annotations
+                        .get(key)
+                        .is_some_and(|value| !value.trim().is_empty())
+                }) {
+                    return Ok(());
+                }
+
+                let has_uid_range = annotations
+                    .get(crate::config::ANNOTATION_SCC_UID_RANGE)
+                    .is_some_and(|value| !value.trim().is_empty());
+                let has_mcs = annotations
+                    .get(crate::config::ANNOTATION_SCC_MCS)
+                    .is_some_and(|value| !value.trim().is_empty());
+                if has_uid_range && !has_mcs {
+                    return Err(KubernetesDriverError::Precondition(format!(
+                        "managed namespace {namespace} has an OpenShift UID range but no MCS annotation; the SCC allocator skips namespaces with an existing UID range, so delete and recreate this workspace namespace"
+                    )));
+                }
+
+                tokio::time::sleep(OPENSHIFT_SCC_ALLOCATOR_POLL_INTERVAL).await;
+                current = match ns_api.get(namespace).await {
+                    Ok(namespace) => namespace,
+                    Err(KubeError::Api(api)) if api.code == 404 => {
+                        return Err(KubernetesDriverError::Message(format!(
+                            "managed namespace {namespace} disappeared while waiting for OpenShift SCC allocator annotations"
+                        )));
+                    }
+                    Err(error) => return Err(KubernetesDriverError::from_kube(error)),
+                };
+            }
+        };
+        tokio::time::timeout(KUBE_API_TIMEOUT, operation)
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(format!(
+                    "timed out waiting for OpenShift SCC allocator annotations on managed namespace {namespace}"
+                ))
+            })?
     }
 
     async fn ensure_managed_ssh_network_policy(
@@ -1340,6 +1925,17 @@ impl KubernetesComputeDriver {
         kubernetes_driver_config_for_spec(sandbox.spec.as_ref())
     }
 
+    fn validate_pod_metadata_for_sandbox(&self, sandbox: &Sandbox) -> Result<(), String> {
+        let Some(template) = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+        else {
+            return Ok(());
+        };
+        validate_pod_metadata(template, &self.config)
+    }
+
     fn agent_sandbox_api(
         client: Client,
         sandbox_api_version: &str,
@@ -1532,6 +2128,8 @@ impl KubernetesComputeDriver {
             .map_err(tonic::Status::failed_precondition)?;
         let _ = Self::validate_driver_config_for_sandbox(sandbox)
             .map_err(tonic::Status::invalid_argument)?;
+        self.validate_pod_metadata_for_sandbox(sandbox)
+            .map_err(tonic::Status::invalid_argument)?;
         match self.config.workspace_mode {
             WorkspaceMode::Shared => {
                 validate_kube_resource_name_length(&sandbox.workspace, &sandbox.name)?;
@@ -1568,6 +2166,7 @@ impl KubernetesComputeDriver {
         )?;
         self.validate_workspace_namespace(&sandbox.workspace)
             .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
+        self.wait_for_operator_allowlist().await?;
         let namespace = self
             .config
             .namespace_for_workspace(&sandbox.workspace, self.operator_allowlist.as_ref())
@@ -1593,6 +2192,8 @@ impl KubernetesComputeDriver {
     }
 
     async fn admit_stored_resources(&self, object: &DynamicObject) -> Result<(), tonic::Status> {
+        validate_stored_kubernetes_pvc_mounts(&object.data["spec"]["podTemplate"]["spec"])
+            .map_err(tonic::Status::failed_precondition)?;
         if self.config.allow_driver_config && !self.config.resource_admission.enabled {
             return Ok(());
         }
@@ -1663,12 +2264,15 @@ impl KubernetesComputeDriver {
                     .namespace
                     .clone()
                     .unwrap_or_else(|| self.config.namespace.clone());
-                Ok(
-                    sandbox_from_object_with_sandbox_runtime_readiness(&self.client, &ns, obj)
-                        .await
-                        .ok()
-                        .map(|(_, sandbox)| sandbox),
+                Ok(sandbox_from_object_with_sandbox_runtime_readiness(
+                    &self.client,
+                    self.shared_supervisor.as_ref(),
+                    &ns,
+                    obj,
                 )
+                .await
+                .ok()
+                .map(|(_, sandbox)| sandbox))
             }
             Ok(Err(err)) => {
                 warn!(
@@ -1719,8 +2323,13 @@ impl KubernetesComputeDriver {
                         .namespace
                         .clone()
                         .unwrap_or_else(|| self.config.namespace.clone());
-                    match sandbox_from_object_with_sandbox_runtime_readiness(&self.client, &ns, obj)
-                        .await
+                    match sandbox_from_object_with_sandbox_runtime_readiness(
+                        &self.client,
+                        self.shared_supervisor.as_ref(),
+                        &ns,
+                        obj,
+                    )
+                    .await
                     {
                         Ok((_, sandbox)) => sandboxes.push(sandbox),
                         Err(err) => {
@@ -1787,6 +2396,8 @@ impl KubernetesComputeDriver {
             sandbox,
         )
         .map_err(admission_error)?;
+        self.validate_pod_metadata_for_sandbox(sandbox)
+            .map_err(KubernetesDriverError::InvalidArgument)?;
         let gpu_requirements = sandbox
             .spec
             .as_ref()
@@ -1807,6 +2418,9 @@ impl KubernetesComputeDriver {
             WorkspaceMode::Shared => self.config.namespace.clone(),
             WorkspaceMode::Managed => self.ensure_namespace(workspace).await?,
             WorkspaceMode::Operator => {
+                self.wait_for_operator_allowlist()
+                    .await
+                    .map_err(admission_error)?;
                 if let Some(ref allowlist) = self.operator_allowlist
                     && !allowlist.contains(workspace)
                 {
@@ -1842,7 +2456,8 @@ impl KubernetesComputeDriver {
             .resolve_sandbox_identity_in_namespace(&target_namespace)
             .await;
 
-        let generation = random_sandbox_runtime_token();
+        let generation = random_sandbox_runtime_token()?;
+        let placement = self.new_generation_placement();
         let proxy_names = SandboxRuntimeNames::for_generation(&sandbox.id, &generation);
         let image_pull_secrets = self.generation_image_pull_secret_names(&proxy_names);
         let main_process_spec = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(
@@ -1928,6 +2543,22 @@ impl KubernetesComputeDriver {
             ANNOTATION_SANDBOX_RUNTIME_LOG_LEVEL.to_string(),
             log_level.clone(),
         );
+        let control_connection = KubernetesControlConnection::RuntimeInitiated;
+        annotations.insert(
+            ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION.to_string(),
+            control_connection.as_str().to_string(),
+        );
+        annotations.insert(
+            ANNOTATION_SANDBOX_RUNTIME_CONTROL_GENERATION.to_string(),
+            generation.clone(),
+        );
+        if let SupervisorPlacement::Shared { route } = &placement {
+            annotations.insert(
+                ANNOTATION_SUPERVISOR_TOPOLOGY.to_string(),
+                GATEWAY_TOPOLOGY.to_string(),
+            );
+            annotations.insert(ANNOTATION_SUPERVISOR_SESSION.to_string(), route.clone());
+        }
         for key in [
             crate::config::ANNOTATION_SCC_UID_RANGE,
             crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
@@ -1989,7 +2620,8 @@ impl KubernetesComputeDriver {
                 &agent_sandbox_api,
                 &created,
                 &proxy_names,
-                &generation,
+                control_connection,
+                &placement,
                 resolved_user_id,
                 resolved_group_id,
                 &main_process_spec,
@@ -2000,6 +2632,7 @@ impl KubernetesComputeDriver {
             Ok(runtime_identity) => runtime_identity,
             Err(error) => {
                 warn!(sandbox_id = %sandbox.id, %error, "sandbox-runtime provisioning failed; rolling back Sandbox CR");
+                self.remove_shared_instance(&placement);
                 let _ = agent_sandbox_api
                     .api
                     .delete(&kube_name, &DeleteParams::default())
@@ -2008,6 +2641,208 @@ impl KubernetesComputeDriver {
             }
         };
         Ok(runtime_identity)
+    }
+
+    /// Create or validate this sandbox's control egress policy and return the
+    /// stored coordinates bound into its boundary evidence.
+    async fn ensure_sandbox_runtime_control_policy(
+        &self,
+        namespace: &str,
+        names: &SandboxRuntimeNames,
+        sandbox_id: &str,
+        owner: OwnerReference,
+    ) -> Result<VerifiedControlPolicy, KubernetesDriverError> {
+        let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
+        let expected = control_policy(
+            namespace,
+            names,
+            sandbox_id,
+            self.config.sandbox_runtime.boundary_port,
+            owner,
+        );
+        create_or_validate_sandbox_runtime_fence(&policies, &expected).await?;
+        // Bind the coordinates of the object that was actually validated.
+        let stored = tokio::time::timeout(KUBE_API_TIMEOUT, policies.get(&names.control_policy))
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(
+                    "timed out reading sandbox-runtime control NetworkPolicy".to_string(),
+                )
+            })?
+            .map_err(KubernetesDriverError::from_kube)?;
+        validate_sandbox_runtime_fence(&stored, &expected)?;
+        VerifiedControlPolicy::from_policy(&stored)
+    }
+
+    fn sandbox_runtime_control_path(
+        &self,
+        namespace: &str,
+        names: &SandboxRuntimeNames,
+        service_ip: std::net::IpAddr,
+        control_policy: Option<&VerifiedControlPolicy>,
+    ) -> KubernetesControlPath {
+        let port = self.config.sandbox_runtime.boundary_port;
+        let unspecified = std::net::SocketAddr::new(
+            if service_ip.is_ipv6() {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+            } else {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            },
+            port,
+        );
+        let mode = if control_policy.is_some() {
+            KubernetesControlConnection::RuntimeInitiated
+        } else {
+            KubernetesControlConnection::SupervisorInitiated
+        };
+        let control_authority = boundary_service_authority(namespace, names, port, mode);
+        let service_address = std::net::SocketAddr::new(service_ip, port);
+        match control_policy {
+            None => KubernetesControlPath::SupervisorInitiated {
+                boundary_listener: unspecified,
+                control_authority,
+                control_address: service_address,
+            },
+            Some(policy) => KubernetesControlPath::RuntimeInitiated {
+                control_authority,
+                supervisor_address: service_address,
+                supervisor_listen: unspecified,
+                control_policy_uid: policy.uid.clone(),
+                control_policy_resource_version: policy.resource_version.clone(),
+            },
+        }
+    }
+
+    /// Fail closed when a sandbox's boundary Service or control policy no
+    /// longer matches the mode recorded for its generation. This is the reconcile
+    /// pass's only Service read; a missing Service is drift once the sandbox
+    /// should be running. Returns `Precondition` for drift that must suspend.
+    async fn verify_sandbox_runtime_control_path(
+        &self,
+        object: &DynamicObject,
+        sandbox_id: &str,
+        namespace: &str,
+        require_service: bool,
+    ) -> Result<(), KubernetesDriverError> {
+        let mode = sandbox_runtime_control_connection(object)?;
+        let names = SandboxRuntimeNames::new(sandbox_id);
+        if let SupervisorPlacement::Shared { .. } = supervisor_placement(object)? {
+            return self
+                .verify_sandbox_runtime_shared_control_policy(object, namespace, &names)
+                .await;
+        }
+        let service_name = names.control_service(mode);
+        let services = Api::<Service>::namespaced(self.client.clone(), namespace);
+        let service = tokio::time::timeout(KUBE_API_TIMEOUT, services.get_opt(service_name))
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(
+                    "timed out reading sandbox-runtime boundary Service".to_string(),
+                )
+            })?
+            .map_err(KubernetesDriverError::from_kube)?;
+        match service {
+            None if require_service => {
+                return Err(KubernetesDriverError::Precondition(format!(
+                    "sandbox-runtime boundary Service {service_name} is missing and its allocated address cannot be safely reconstructed",
+                )));
+            }
+            Some(service) if !boundary_service_matches_mode(&service, sandbox_id, mode) => {
+                return Err(KubernetesDriverError::Precondition(format!(
+                    "boundary Service {} no longer selects the {} listener",
+                    service_name,
+                    mode.as_str()
+                )));
+            }
+            _ => {}
+        }
+        if mode == KubernetesControlConnection::SupervisorInitiated {
+            return Ok(());
+        }
+        let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), namespace);
+        let stored =
+            tokio::time::timeout(KUBE_API_TIMEOUT, policies.get_opt(&names.control_policy))
+                .await
+                .map_err(|_| {
+                    KubernetesDriverError::Message(
+                        "timed out reading sandbox-runtime control NetworkPolicy".to_string(),
+                    )
+                })?
+                .map_err(KubernetesDriverError::from_kube)?
+                .ok_or_else(|| {
+                    KubernetesDriverError::Precondition(format!(
+                        "control NetworkPolicy {} is missing",
+                        names.control_policy
+                    ))
+                })?;
+        // Ownership is not part of enforcement; compare the spec and labels.
+        let expected = control_policy(
+            namespace,
+            &names,
+            sandbox_id,
+            self.config.sandbox_runtime.boundary_port,
+            OwnerReference::default(),
+        );
+        validate_sandbox_runtime_fence(&stored, &expected)?;
+        if !sandbox_runtime_policy_generation_matches(
+            &stored,
+            object,
+            ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID,
+            ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_GENERATION,
+        ) {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "control NetworkPolicy {} changed after it was bound",
+                names.control_policy
+            )));
+        }
+        Ok(())
+    }
+
+    /// A shared generation's egress allowance must remain the object bound
+    /// into its boundary evidence; any change can widen workload egress.
+    async fn verify_sandbox_runtime_shared_control_policy(
+        &self,
+        object: &DynamicObject,
+        namespace: &str,
+        names: &SandboxRuntimeNames,
+    ) -> Result<(), KubernetesDriverError> {
+        let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), namespace);
+        let stored = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            policies.get_opt(&names.shared_control_policy),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(
+                "timed out reading the shared control NetworkPolicy".to_string(),
+            )
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+        // A bootstrap still installing has not bound its policy yet.
+        if stored.is_none()
+            && sandbox_runtime_bootstrap_phase(object)
+                == Some(SandboxRuntimeBootstrapPhase::Preparing)
+        {
+            return Ok(());
+        }
+        let stored = stored.ok_or_else(|| {
+            KubernetesDriverError::Precondition(format!(
+                "shared control NetworkPolicy {} is missing",
+                names.shared_control_policy
+            ))
+        })?;
+        if !sandbox_runtime_policy_generation_matches(
+            &stored,
+            object,
+            ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID,
+            ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_GENERATION,
+        ) {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "shared control NetworkPolicy {} changed after it was bound",
+                names.shared_control_policy
+            )));
+        }
+        Ok(())
     }
 
     async fn create_sandbox_runtime_fence(
@@ -2030,6 +2865,29 @@ impl KubernetesComputeDriver {
             create_or_validate_sandbox_runtime_fence(&policies, &policy).await?;
         }
         Ok(())
+    }
+
+    /// Create or validate the gateway-owned destination-trust generation for
+    /// one target namespace. The source PEM never crosses the external driver
+    /// boundary: only this in-process driver receives the normalized bundle.
+    async fn ensure_network_additional_ca_config_map(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<NetworkAdditionalCaConfigMap>, KubernetesDriverError> {
+        let Some(bundle) = self.network_trust_bundle.as_ref() else {
+            return Ok(None);
+        };
+        let expected =
+            network_additional_ca_config_map(namespace, &self.config.gateway_id, bundle)?;
+        let name = expected.metadata.name.clone().ok_or_else(|| {
+            KubernetesDriverError::Message(
+                "network additional CA ConfigMap has no name".to_string(),
+            )
+        })?;
+        let digest = bundle.digest().to_string();
+        let config_maps = Api::<ConfigMap>::namespaced(self.client.clone(), namespace);
+        create_or_validate_network_additional_ca_config_map(&config_maps, &expected).await?;
+        Ok(Some(NetworkAdditionalCaConfigMap { name, digest }))
     }
 
     async fn wait_for_bootstrap_workload_pod(
@@ -2242,7 +3100,7 @@ impl KubernetesComputeDriver {
             .as_deref()
             .unwrap_or_default()
             .iter()
-            .find(|container| container.name == "openshell-sandbox-bootstrap")
+            .find(|container| container.name == SANDBOX_BOOTSTRAP_CONTAINER_NAME)
             .ok_or_else(|| fail("trusted bootstrap init container missing"))?;
         check_container(bootstrap, "bootstrap init container")?;
         let mounts_volume = |container: &k8s_openapi::api::core::v1::Container,
@@ -2289,176 +3147,14 @@ impl KubernetesComputeDriver {
         sandbox_api: &AgentSandboxApi,
         sandbox_cr: &DynamicObject,
         names: &SandboxRuntimeNames,
-        _generation: &str,
+        control_connection: KubernetesControlConnection,
+        placement: &SupervisorPlacement,
         agent_uid: u32,
         agent_gid: u32,
         main_process_spec: &str,
         log_level: &str,
     ) -> Result<String, KubernetesDriverError> {
-        // Read once per call so the whole generation stages, mounts, and
-        // references the same bytes, and so a bundle that became unreadable
-        // fails before any Service, Pod, or Secret is created.
-        let upstream_proxy_ca_bundle =
-            read_staged_upstream_proxy_ca_bundle(self.config.proxy_ca_bundle.as_deref()).await?;
-        let client_tls = self.read_client_tls_material().await?;
-        let cr_uid = sandbox_cr.metadata.uid.as_deref().ok_or_else(|| {
-            KubernetesDriverError::Message("created Sandbox CR has no UID".to_string())
-        })?;
-        let namespace_uid = Api::<Namespace>::all(self.client.clone())
-            .get(namespace)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?
-            .metadata
-            .uid
-            .ok_or_else(|| {
-                KubernetesDriverError::Message("sandbox namespace has no UID".to_string())
-            })?;
-        let dependent_owner = sandbox_runtime_sandbox_owner_reference(
-            cr_name,
-            cr_uid,
-            &sandbox_api.resource.api_version,
-            false,
-        );
-        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
-        let service = services
-            .create(
-                &PostParams::default(),
-                &boundary_service(
-                    namespace,
-                    names,
-                    &sandbox.id,
-                    self.config.sandbox_runtime.boundary_port,
-                    dependent_owner.clone(),
-                ),
-            )
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        let service_ip: std::net::IpAddr = service
-            .spec
-            .and_then(|spec| spec.cluster_ip)
-            .filter(|ip| ip != "None")
-            .ok_or_else(|| {
-                KubernetesDriverError::Message("boundary Service has no ClusterIP".to_string())
-            })?
-            .parse()
-            .map_err(|error| {
-                KubernetesDriverError::Message(format!(
-                    "invalid boundary Service ClusterIP: {error}"
-                ))
-            })?;
-
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
-        let supervisor = pods
-            .create(
-                &PostParams::default(),
-                &supervisor_pod(
-                    namespace,
-                    names,
-                    &sandbox.id,
-                    &sandbox.name,
-                    &self.config.gateway_id,
-                    &self.config.supervisor_image,
-                    self.config.supervisor_image_pull_policy,
-                    &self.config.service_account_name,
-                    agent_uid,
-                    agent_gid,
-                    &self.generation_image_pull_secret_names(names),
-                    &self.config.grpc_endpoint,
-                    self.config.supervisor_client_tls(),
-                    main_process_spec,
-                    log_level,
-                    self.config.effective_sa_token_ttl_secs(),
-                    self.config.https_proxy.as_deref(),
-                    self.config.no_proxy.as_deref(),
-                    self.config
-                        .proxy_auth_secret_name
-                        .as_deref()
-                        .zip(self.config.proxy_auth_secret_key.as_deref()),
-                    self.config.proxy_auth_allow_insecure == Some(true),
-                    self.config.proxy_connect_by_hostname == Some(true),
-                    upstream_proxy_ca_bundle.is_some(),
-                    self.config.provider_spiffe_enabled().then_some(
-                        self.config
-                            .provider_spiffe_workload_api_socket_path
-                            .as_str(),
-                    ),
-                    dependent_owner.clone(),
-                )
-                .map_err(KubernetesDriverError::Message)?,
-            )
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        let supervisor_uid = supervisor.metadata.uid.ok_or_else(|| {
-            KubernetesDriverError::Message("supervisor Pod has no UID".to_string())
-        })?;
-
-        let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
-        let fence = policies
-            .get(&names.workload_policy)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        let fence_uid = fence.metadata.uid.ok_or_else(|| {
-            KubernetesDriverError::Message("workload NetworkPolicy has no UID".to_string())
-        })?;
-        let fence_generation = fence.metadata.generation.ok_or_else(|| {
-            KubernetesDriverError::Message("workload NetworkPolicy has no generation".to_string())
-        })?;
-        let fence_resource_version = fence.metadata.resource_version.ok_or_else(|| {
-            KubernetesDriverError::Message(
-                "workload NetworkPolicy has no resourceVersion".to_string(),
-            )
-        })?;
-
-        // Release the Sandbox CR only far enough for the controller to create
-        // the workload Pod. The Pod remains unschedulable because its template
-        // carries the OpenShell scheduling gate and references a Secret that
-        // does not exist yet.
-        patch_dynamic_object_with_resource_version_retry(&sandbox_api.api, cr_name, |version| {
-            sandbox_operating_state_patch(&sandbox_api.resource.version, version, true)
-        })
-        .await?;
-
-        let workload_pod = self
-            .wait_for_bootstrap_workload_pod(&pods, cr_name, cr_uid)
-            .await?;
-        let admission_object = sandbox_api
-            .api
-            .get(cr_name)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        self.admit_stored_resources(&admission_object)
-            .await
-            .map_err(admission_error)?;
-        Self::validate_capability_free_workload_pod(
-            &workload_pod,
-            cr_uid,
-            &sandbox.id,
-            agent_uid,
-            agent_gid,
-            &names.sandbox_secret,
-        )?;
-        let workload_pod_uid =
-            workload_pod.metadata.uid.clone().ok_or_else(|| {
-                KubernetesDriverError::Message("workload Pod has no UID".to_string())
-            })?;
-        let workload_pod_name = workload_pod.metadata.name.clone().ok_or_else(|| {
-            KubernetesDriverError::Message("workload Pod has no name".to_string())
-        })?;
-        patch_dynamic_object_with_resource_version_retry(&sandbox_api.api, cr_name, |version| {
-            serde_json::json!({
-                "metadata": {
-                    "resourceVersion": version,
-                    "annotations": {
-                        ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: workload_pod_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: fence_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: fence_generation.to_string(),
-                    }
-                }
-            })
-        })
-        .await?;
-
+        let staged = self.read_staged_bootstrap_material().await?;
         let launch_authentication = sandbox
             .spec
             .as_ref()
@@ -2469,6 +3165,67 @@ impl KubernetesComputeDriver {
                 )
             })
             .and_then(|spec| decode_launch_authentication(&spec.launch_authentication))?;
+        let cr_uid = sandbox_cr.metadata.uid.as_deref().ok_or_else(|| {
+            KubernetesDriverError::Message("created Sandbox CR has no UID".to_string())
+        })?;
+        let dependent_owner = sandbox_runtime_sandbox_owner_reference(
+            cr_name,
+            cr_uid,
+            &sandbox_api.resource.api_version,
+            false,
+        );
+        let supervisor = match placement {
+            SupervisorPlacement::Dedicated => {
+                // Preserve the legacy workload endpoint even for newly created
+                // sandboxes: an old gateway may handle their next start mid-rollout.
+                for mode in [
+                    KubernetesControlConnection::SupervisorInitiated,
+                    KubernetesControlConnection::RuntimeInitiated,
+                ] {
+                    self.ensure_sandbox_runtime_service(
+                        namespace,
+                        names,
+                        &sandbox.id,
+                        mode,
+                        dependent_owner.clone(),
+                    )
+                    .await?;
+                }
+                let pod_uid = self
+                    .create_sandbox_runtime_supervisor(
+                        namespace,
+                        names,
+                        &sandbox.id,
+                        &sandbox.name,
+                        dependent_owner,
+                        agent_uid,
+                        agent_gid,
+                        main_process_spec,
+                        log_level,
+                        staged.upstream_proxy_ca_bundle.is_some(),
+                    )
+                    .await?;
+                GenerationSupervisor::Dedicated {
+                    pod_uid,
+                    connection: control_connection,
+                }
+            }
+            // The shared supervisor already runs; this generation becomes a
+            // sandbox instance on it during installation.
+            SupervisorPlacement::Shared { route } => GenerationSupervisor::Shared {
+                route: route.clone(),
+            },
+        };
+
+        // Release the Sandbox CR only far enough for the controller to create
+        // the workload Pod. The Pod remains unschedulable because its template
+        // carries the OpenShell scheduling gate and references a Secret that
+        // does not exist yet.
+        patch_dynamic_object_with_resource_version_retry(&sandbox_api.api, cr_name, |version| {
+            sandbox_operating_state_patch(&sandbox_api.resource.version, version, true)
+        })
+        .await?;
+
         let mut child_env = sandbox
             .spec
             .as_ref()
@@ -2480,155 +3237,354 @@ impl KubernetesComputeDriver {
             child_env.extend(spec.environment.clone());
         }
         child_env.retain(|name, _| !name.starts_with("OPENSHELL_"));
-        let host_gateway_ip = self.config.host_gateway_ip.parse().ok();
-        let session_id = launch_authentication.supervisor.session_id;
-        let tls = generate_sandbox_tls_material(session_id)
-            .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
-        let verification_keys =
-            gateway_verification_keys(&launch_authentication.verification_keys)?;
-        let proxy_ca = generate_proxy_ca_material().map_err(KubernetesDriverError::Message)?;
-        let workload_identity = ResolvedWorkloadIdentity::new(
+        self.install_sandbox_runtime_generation(
+            namespace,
+            cr_name,
+            sandbox_api,
+            &sandbox.id,
+            cr_uid,
+            names,
+            &supervisor,
             agent_uid,
             agent_gid,
-            Vec::new(),
-            "kubernetes-config".to_string(),
-            format!("sandbox:{cr_uid}"),
-        )
-        .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
-        let provisioned = KubernetesSandboxRuntimeBoundarySpec {
-            boundary_id: sandbox.id.clone(),
-            generation: launch_authentication
-                .supervisor
-                .runtime_generation
-                .to_string(),
-            session_id,
-            session_rotation: launch_authentication.supervisor.session_rotation,
-            auth_epoch: launch_authentication.supervisor.auth_epoch,
-            gateway_id: launch_authentication.gateway_id,
-            verification_keys,
-            namespace_uid,
-            sandbox_resource_uid: cr_uid.to_string(),
-            workload_pod_uid: workload_pod_uid.clone(),
-            workload_pod_uid_path: PathBuf::from(SANDBOX_POD_UID_PATH),
-            supervisor_pod_uid: supervisor_uid.clone(),
-            egress_policy_uid: fence_uid.clone(),
-            egress_policy_resource_version: fence_resource_version.clone(),
-            boundary_listener: std::net::SocketAddr::new(
-                if service_ip.is_ipv6() {
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
-                } else {
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-                },
-                self.config.sandbox_runtime.boundary_port,
-            ),
-            control_authority: boundary_service_authority(
-                namespace,
-                names,
-                self.config.sandbox_runtime.boundary_port,
-            ),
-            control_address: std::net::SocketAddr::new(
-                service_ip,
-                self.config.sandbox_runtime.boundary_port,
-            ),
-            sandbox_tls: SandboxTlsServerConfig {
-                certificate_chain_path: PathBuf::from(BOUNDARY_CERTIFICATE_PATH),
-                private_key_path: PathBuf::from(BOUNDARY_PRIVATE_KEY_PATH),
-            },
-            supervisor_tls: SandboxTlsClientConfig {
-                server_name: tls.server_name.clone(),
-                trust_anchor_pem: tls.trust_anchor_pem.clone(),
-            },
-            host_gateway_ip,
-            workload_identity,
             child_env,
-        }
-        .provision()
-        .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
-        let descriptor = provisioned
-            .runtime_descriptor
-            .backend_descriptor()
-            .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
-        let workload_owner = runtime_pod_owner(&workload_pod_name, &workload_pod_uid);
-        let supervisor_owner = runtime_pod_owner(&names.supervisor_pod, &supervisor_uid);
-        let sandbox_secret = sandbox_bootstrap_secret(
-            namespace,
-            names,
-            &sandbox.id,
-            provisioned
-                .boundary_config
-                .encode()
-                .map_err(|error| KubernetesDriverError::Message(error.to_string()))?,
-            tls.certificate_chain_pem.into_bytes(),
-            tls.private_key_pem.into_bytes(),
-            workload_owner.clone(),
-        );
-        let supervisor_secret = supervisor_bootstrap_secret(
-            namespace,
-            names,
-            &sandbox.id,
-            descriptor.payload,
-            serde_json::to_vec(&launch_authentication.supervisor).map_err(|error| {
-                KubernetesDriverError::Message(format!("encode supervisor auth bundle: {error}"))
-            })?,
-            proxy_ca.certificate_pem.into_bytes(),
-            proxy_ca.private_key_pem.into_bytes(),
-            upstream_proxy_ca_bundle.clone(),
-            client_tls,
-            supervisor_owner.clone(),
-        );
-        let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
-        secrets
-            .create(&PostParams::default(), &sandbox_secret)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        secrets
-            .create(&PostParams::default(), &supervisor_secret)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        self.create_generation_image_pull_secrets(
-            namespace,
-            names,
-            &sandbox.id,
-            vec![workload_owner, supervisor_owner],
+            &launch_authentication,
+            staged,
         )
         .await?;
-
-        pods.patch(
-            &names.supervisor_pod,
-            &PatchParams::default(),
-            &Patch::Merge(&serde_json::json!({"spec": {"schedulingGates": []}})),
-        )
-        .await
-        .map_err(KubernetesDriverError::from_kube)?;
-        pods.patch(
-            &workload_pod_name,
-            &PatchParams::default(),
-            &Patch::Merge(&serde_json::json!({"spec": {"schedulingGates": []}})),
-        )
-        .await
-        .map_err(KubernetesDriverError::from_kube)?;
-        patch_dynamic_object_with_resource_version_retry(&sandbox_api.api, cr_name, |version| {
-            sandbox_runtime_bootstrap_phase_patch(version, SandboxRuntimeBootstrapPhase::Released)
-        })
-        .await?;
-        spawn_sandbox_runtime_bootstrap_completion(
-            pods.clone(),
-            sandbox_api.api.clone(),
-            names.supervisor_pod.clone(),
-            cr_name.to_string(),
-            Some(cr_uid.to_string()),
-        );
         // Return while the CR remains explicitly bootstrapping. The gateway
         // can now commit the sandbox configuration required by a policy-less
         // control process without deadlocking behind this driver call. Only
         // boundary PID 1 is running at this point; the agent process cannot
         // start until control attaches and confirms enforcement. Reconcile
-        // removes the marker after the supervisor Pod becomes Ready.
+        // removes the marker after the supervisor becomes ready.
         Ok(kubernetes_runtime_identity(
             namespace,
             cr_uid,
-            &supervisor_uid,
+            supervisor.runtime_identity_component(),
         ))
+    }
+
+    /// Add an endpoint without changing the destination of an existing one.
+    async fn ensure_sandbox_runtime_service(
+        &self,
+        namespace: &str,
+        names: &SandboxRuntimeNames,
+        sandbox_id: &str,
+        mode: KubernetesControlConnection,
+        owner: OwnerReference,
+    ) -> Result<(), KubernetesDriverError> {
+        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let expected = boundary_service(
+            namespace,
+            names,
+            sandbox_id,
+            self.config.sandbox_runtime.boundary_port,
+            mode,
+            owner,
+        );
+        let service = match services.create(&PostParams::default(), &expected).await {
+            Ok(service) => service,
+            Err(kube::Error::Api(error)) if error.code == 409 => services
+                .get(names.control_service(mode))
+                .await
+                .map_err(KubernetesDriverError::from_kube)?,
+            Err(error) => return Err(KubernetesDriverError::from_kube(error)),
+        };
+        if !boundary_service_matches_mode(&service, sandbox_id, mode) {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "control Service {} does not select the {} listener",
+                names.control_service(mode),
+                mode.as_str(),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Placement for a generation this driver starts now.
+    fn new_generation_placement(&self) -> SupervisorPlacement {
+        if self.shared_supervisor.is_some() {
+            SupervisorPlacement::Shared {
+                route: openshell_sandbox_backend::runtime_routed::new_route_handle(),
+            }
+        } else {
+            SupervisorPlacement::Dedicated
+        }
+    }
+
+    /// Withdraw a shared generation's sandbox instance, if any, so the host
+    /// stops it. Instance loss also ends supervision when the workload is
+    /// suspended, so a missing configuration only logs.
+    fn remove_shared_instance(&self, placement: &SupervisorPlacement) {
+        let SupervisorPlacement::Shared { route } = placement else {
+            return;
+        };
+        if let Some(shared) = &self.shared_supervisor {
+            shared.supervision().withdraw(route);
+        } else {
+            warn!(
+                route,
+                "shared supervisor is not configured; its sandbox instance cannot be withdrawn"
+            );
+        }
+    }
+
+    /// Read operator-provided bootstrap material once per generation, so the
+    /// whole generation stages, mounts, and references the same bytes, and so
+    /// unreadable material fails before any Service, Pod, or Secret is created.
+    async fn read_staged_bootstrap_material(
+        &self,
+    ) -> Result<StagedBootstrapMaterial, KubernetesDriverError> {
+        Ok(StagedBootstrapMaterial {
+            upstream_proxy_ca_bundle: read_staged_upstream_proxy_ca_bundle(
+                self.config.proxy_ca_bundle.as_deref(),
+            )
+            .await?,
+            client_tls: self.read_client_tls_material().await?,
+        })
+    }
+
+    /// Create one generation's gated supervisor Pod and return its UID.
+    #[allow(clippy::too_many_arguments, clippy::similar_names)]
+    async fn create_sandbox_runtime_supervisor(
+        &self,
+        namespace: &str,
+        names: &SandboxRuntimeNames,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        owner: OwnerReference,
+        agent_uid: u32,
+        agent_gid: u32,
+        main_process_spec: &str,
+        log_level: &str,
+        upstream_proxy_ca_bundle_staged: bool,
+    ) -> Result<String, KubernetesDriverError> {
+        // Validate or create the immutable trust generation before creating
+        // the dedicated supervisor Pod. A same-name delete/recreate with
+        // altered bytes therefore fails closed while no control process runs.
+        let network_additional_ca = self
+            .ensure_network_additional_ca_config_map(namespace)
+            .await?;
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        pods.create(
+            &PostParams::default(),
+            &supervisor_pod(
+                namespace,
+                names,
+                sandbox_id,
+                sandbox_name,
+                &self.config.gateway_id,
+                &self.config.supervisor_image,
+                self.config.supervisor_image_pull_policy,
+                &self.config.service_account_name,
+                agent_uid,
+                agent_gid,
+                &self.generation_image_pull_secret_names(names),
+                &self.config.grpc_endpoint,
+                self.config.supervisor_client_tls(),
+                main_process_spec,
+                log_level,
+                self.config.effective_sa_token_ttl_secs(),
+                self.config.https_proxy.as_deref(),
+                self.config.no_proxy.as_deref(),
+                self.config
+                    .proxy_auth_secret_name
+                    .as_deref()
+                    .zip(self.config.proxy_auth_secret_key.as_deref()),
+                self.config.proxy_auth_allow_insecure == Some(true),
+                self.config.proxy_connect_by_hostname == Some(true),
+                upstream_proxy_ca_bundle_staged,
+                self.config.provider_spiffe_enabled().then_some(
+                    self.config
+                        .provider_spiffe_workload_api_socket_path
+                        .as_str(),
+                ),
+                network_additional_ca
+                    .as_ref()
+                    .map(|generation| (generation.name.as_str(), generation.digest.as_str())),
+                owner,
+                &self.supervisor_otlp_environment(),
+            )
+            .map_err(KubernetesDriverError::Message)?,
+        )
+        .await
+        .map_err(KubernetesDriverError::from_kube)?
+        .metadata
+        .uid
+        .ok_or_else(|| KubernetesDriverError::Message("supervisor Pod has no UID".to_string()))
+    }
+
+    /// Read the gateway's shared supervisor Service: its address and the
+    /// labels of the Pods it selects.
+    async fn shared_supervisor_target(
+        &self,
+    ) -> Result<(SharedSupervisor, SharedSupervisorTarget), KubernetesDriverError> {
+        let shared = self.shared_supervisor.as_ref().ok_or_else(|| {
+            KubernetesDriverError::Precondition(
+                "the gateway supervisor topology is not configured".to_string(),
+            )
+        })?;
+        let config = shared.config();
+        let services = Api::<Service>::namespaced(self.client.clone(), &config.service_namespace);
+        let service = tokio::time::timeout(KUBE_API_TIMEOUT, services.get(&config.service_name))
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(
+                    "timed out reading the shared supervisor Service".to_string(),
+                )
+            })?
+            .map_err(KubernetesDriverError::from_kube)?;
+        let spec = service.spec.unwrap_or_default();
+        let selector = spec
+            .selector
+            .filter(|selector| !selector.is_empty())
+            .ok_or_else(|| {
+                KubernetesDriverError::Precondition(
+                    "the shared supervisor Service selects no Pods".to_string(),
+                )
+            })?;
+        let address: std::net::IpAddr = spec
+            .cluster_ip
+            .filter(|ip| ip != "None")
+            .ok_or_else(|| {
+                KubernetesDriverError::Precondition(
+                    "the shared supervisor Service has no ClusterIP".to_string(),
+                )
+            })?
+            .parse()
+            .map_err(|error| {
+                KubernetesDriverError::Message(format!(
+                    "invalid shared supervisor Service ClusterIP: {error}"
+                ))
+            })?;
+        Ok((
+            shared.clone(),
+            SharedSupervisorTarget {
+                namespace: config.service_namespace.clone(),
+                authority: format!("{}:{}", config.service_host(), config.runtime_port),
+                address: std::net::SocketAddr::new(address, config.runtime_port),
+                selector,
+            },
+        ))
+    }
+
+    /// Create or validate this sandbox's egress allowance to the shared
+    /// supervisor and return the stored coordinates bound into its evidence.
+    async fn ensure_sandbox_runtime_shared_control_policy(
+        &self,
+        namespace: &str,
+        names: &SandboxRuntimeNames,
+        sandbox_id: &str,
+        target: &SharedSupervisorTarget,
+        owner: OwnerReference,
+    ) -> Result<VerifiedControlPolicy, KubernetesDriverError> {
+        let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
+        let expected = shared_control_policy(
+            namespace,
+            names,
+            sandbox_id,
+            &target.namespace,
+            target.selector.clone(),
+            target.address.port(),
+            owner,
+        );
+        create_or_validate_sandbox_runtime_fence(&policies, &expected).await?;
+        let stored =
+            tokio::time::timeout(KUBE_API_TIMEOUT, policies.get(&names.shared_control_policy))
+                .await
+                .map_err(|_| {
+                    KubernetesDriverError::Message(
+                        "timed out reading the shared control NetworkPolicy".to_string(),
+                    )
+                })?
+                .map_err(KubernetesDriverError::from_kube)?;
+        validate_sandbox_runtime_fence(&stored, &expected)?;
+        VerifiedControlPolicy::from_policy(&stored)
+    }
+
+    /// Resolve and verify where `supervisor` serves this generation: the
+    /// boundary Service and, for runtime-initiated connections, the control
+    /// policy of a dedicated supervisor, or the shared supervisor's Service and
+    /// this sandbox's egress allowance to it.
+    async fn resolve_generation_launch_target(
+        &self,
+        namespace: &str,
+        names: &SandboxRuntimeNames,
+        sandbox_id: &str,
+        supervisor: &GenerationSupervisor,
+        policy_owner: OwnerReference,
+    ) -> Result<GenerationLaunchTarget, KubernetesDriverError> {
+        match supervisor {
+            GenerationSupervisor::Dedicated {
+                pod_uid,
+                connection,
+            } => {
+                let services = Api::<Service>::namespaced(self.client.clone(), namespace);
+                let service_name = names.control_service(*connection);
+                let service = services
+                    .get(service_name)
+                    .await
+                    .map_err(KubernetesDriverError::from_kube)?;
+                // Running generations must retain the Service role prepared for them.
+                if !boundary_service_matches_mode(&service, sandbox_id, *connection) {
+                    return Err(KubernetesDriverError::Precondition(format!(
+                        "boundary Service {} does not select the {} listener recorded for this sandbox",
+                        service_name,
+                        connection.as_str()
+                    )));
+                }
+                let service_ip: std::net::IpAddr = service
+                    .spec
+                    .and_then(|spec| spec.cluster_ip)
+                    .filter(|ip| ip != "None")
+                    .ok_or_else(|| {
+                        KubernetesDriverError::Message(
+                            "boundary Service has no ClusterIP".to_string(),
+                        )
+                    })?
+                    .parse()
+                    .map_err(|error| {
+                        KubernetesDriverError::Message(format!(
+                            "invalid boundary Service ClusterIP: {error}"
+                        ))
+                    })?;
+                let control_policy = match connection {
+                    KubernetesControlConnection::SupervisorInitiated => None,
+                    KubernetesControlConnection::RuntimeInitiated => Some(
+                        self.ensure_sandbox_runtime_control_policy(
+                            namespace,
+                            names,
+                            sandbox_id,
+                            policy_owner,
+                        )
+                        .await?,
+                    ),
+                };
+                Ok(GenerationLaunchTarget::Dedicated {
+                    pod_uid: pod_uid.clone(),
+                    service_ip,
+                    control_policy,
+                })
+            }
+            GenerationSupervisor::Shared { route } => {
+                let (shared, target) = self.shared_supervisor_target().await?;
+                let control_policy = self
+                    .ensure_sandbox_runtime_shared_control_policy(
+                        namespace,
+                        names,
+                        sandbox_id,
+                        &target,
+                        policy_owner,
+                    )
+                    .await?;
+                Ok(GenerationLaunchTarget::Shared {
+                    shared,
+                    route: route.clone(),
+                    target,
+                    control_policy,
+                })
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments, clippy::similar_names)]
@@ -2640,19 +3596,13 @@ impl KubernetesComputeDriver {
         sandbox_id: &str,
         cr_uid: &str,
         names: &SandboxRuntimeNames,
-        _generation: &str,
-        supervisor_uid: &str,
+        supervisor: &GenerationSupervisor,
         agent_uid: u32,
         agent_gid: u32,
         child_env: std::collections::HashMap<String, String>,
         launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
+        staged: StagedBootstrapMaterial,
     ) -> Result<(), KubernetesDriverError> {
-        // Read once per call so the whole generation stages, mounts, and
-        // references the same bytes, and so a bundle that became unreadable
-        // fails before any Service, Pod, or Secret is created.
-        let upstream_proxy_ca_bundle =
-            read_staged_upstream_proxy_ca_bundle(self.config.proxy_ca_bundle.as_deref()).await?;
-        let client_tls = self.read_client_tls_material().await?;
         let namespace_uid = Api::<Namespace>::all(self.client.clone())
             .get(namespace)
             .await
@@ -2661,23 +3611,6 @@ impl KubernetesComputeDriver {
             .uid
             .ok_or_else(|| {
                 KubernetesDriverError::Message("sandbox namespace has no UID".to_string())
-            })?;
-        let services = Api::<Service>::namespaced(self.client.clone(), namespace);
-        let service_ip: std::net::IpAddr = services
-            .get(&names.boundary_service)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?
-            .spec
-            .and_then(|spec| spec.cluster_ip)
-            .filter(|ip| ip != "None")
-            .ok_or_else(|| {
-                KubernetesDriverError::Message("boundary Service has no ClusterIP".to_string())
-            })?
-            .parse()
-            .map_err(|error| {
-                KubernetesDriverError::Message(format!(
-                    "invalid boundary Service ClusterIP: {error}"
-                ))
             })?;
         let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), namespace);
         let fence = policies
@@ -2695,6 +3628,20 @@ impl KubernetesComputeDriver {
                 "workload NetworkPolicy has no resourceVersion".to_string(),
             )
         })?;
+        let target = self
+            .resolve_generation_launch_target(
+                namespace,
+                names,
+                sandbox_id,
+                supervisor,
+                sandbox_runtime_sandbox_owner_reference(
+                    cr_name,
+                    cr_uid,
+                    &sandbox_api.resource.api_version,
+                    false,
+                ),
+            )
+            .await?;
 
         let pods = Api::<Pod>::namespaced(self.client.clone(), namespace);
         let workload_pod = self
@@ -2723,17 +3670,22 @@ impl KubernetesComputeDriver {
         let workload_pod_name = workload_pod.metadata.name.clone().ok_or_else(|| {
             KubernetesDriverError::Message("workload Pod has no name".to_string())
         })?;
+        let mut annotations = serde_json::json!({
+            ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: workload_pod_uid.clone(),
+            ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: fence_uid.clone(),
+            ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: fence_generation.to_string(),
+        });
+        if let GenerationLaunchTarget::Dedicated { pod_uid, .. } = &target {
+            annotations[ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID] = pod_uid.clone().into();
+        }
+        if let Some(policy) = target.control_policy() {
+            annotations[ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID] = policy.uid.clone().into();
+            annotations[ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_GENERATION] =
+                policy.generation.to_string().into();
+        }
         patch_dynamic_object_with_resource_version_retry(&sandbox_api.api, cr_name, |version| {
             serde_json::json!({
-                "metadata": {
-                    "resourceVersion": version,
-                    "annotations": {
-                        ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: workload_pod_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid,
-                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: fence_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: fence_generation.to_string(),
-                    }
-                }
+                "metadata": {"resourceVersion": version, "annotations": annotations.clone()}
             })
         })
         .await?;
@@ -2752,6 +3704,37 @@ impl KubernetesComputeDriver {
             format!("sandbox:{cr_uid}"),
         )
         .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
+        let (supervisor_claim, control_path) = match &target {
+            GenerationLaunchTarget::Dedicated {
+                pod_uid,
+                service_ip,
+                control_policy,
+            } => (
+                KubernetesSupervisorClaim::Pod(pod_uid.clone()),
+                self.sandbox_runtime_control_path(
+                    namespace,
+                    names,
+                    *service_ip,
+                    control_policy.as_ref(),
+                ),
+            ),
+            GenerationLaunchTarget::Shared {
+                route,
+                target,
+                control_policy,
+                ..
+            } => (
+                KubernetesSupervisorClaim::SandboxInstance(route.clone()),
+                KubernetesControlPath::RuntimeInitiatedShared {
+                    control_authority: target.authority.clone(),
+                    supervisor_address: target.address,
+                    supervisor_namespace: target.namespace.clone(),
+                    route: route.clone(),
+                    control_policy_uid: control_policy.uid.clone(),
+                    control_policy_resource_version: control_policy.resource_version.clone(),
+                },
+            ),
+        };
         let provisioned = KubernetesSandboxRuntimeBoundarySpec {
             boundary_id: sandbox_id.to_string(),
             generation: launch_authentication
@@ -2767,26 +3750,10 @@ impl KubernetesComputeDriver {
             sandbox_resource_uid: cr_uid.to_string(),
             workload_pod_uid: workload_pod_uid.clone(),
             workload_pod_uid_path: PathBuf::from(SANDBOX_POD_UID_PATH),
-            supervisor_pod_uid: supervisor_uid.to_string(),
+            supervisor: supervisor_claim,
             egress_policy_uid: fence_uid.clone(),
             egress_policy_resource_version: fence_resource_version.clone(),
-            boundary_listener: std::net::SocketAddr::new(
-                if service_ip.is_ipv6() {
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
-                } else {
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-                },
-                self.config.sandbox_runtime.boundary_port,
-            ),
-            control_authority: boundary_service_authority(
-                namespace,
-                names,
-                self.config.sandbox_runtime.boundary_port,
-            ),
-            control_address: std::net::SocketAddr::new(
-                service_ip,
-                self.config.sandbox_runtime.boundary_port,
-            ),
+            control_path,
             sandbox_tls: SandboxTlsServerConfig {
                 certificate_chain_path: PathBuf::from(BOUNDARY_CERTIFICATE_PATH),
                 private_key_path: PathBuf::from(BOUNDARY_PRIVATE_KEY_PATH),
@@ -2801,12 +3768,8 @@ impl KubernetesComputeDriver {
         }
         .provision()
         .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
-        let descriptor = provisioned
-            .runtime_descriptor
-            .backend_descriptor()
-            .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
         let workload_owner = runtime_pod_owner(&workload_pod_name, &workload_pod_uid);
-        let supervisor_owner = runtime_pod_owner(&names.supervisor_pod, supervisor_uid);
+        let instance_owner = workload_owner.clone();
         let sandbox_secret = sandbox_bootstrap_secret(
             namespace,
             names,
@@ -2819,44 +3782,116 @@ impl KubernetesComputeDriver {
             tls.private_key_pem.into_bytes(),
             workload_owner.clone(),
         );
-        let supervisor_secret = supervisor_bootstrap_secret(
-            namespace,
-            names,
-            sandbox_id,
-            descriptor.payload,
-            serde_json::to_vec(&launch_authentication.supervisor).map_err(|error| {
-                KubernetesDriverError::Message(format!("encode supervisor auth bundle: {error}"))
-            })?,
-            proxy_ca.certificate_pem.into_bytes(),
-            proxy_ca.private_key_pem.into_bytes(),
-            upstream_proxy_ca_bundle.clone(),
-            client_tls,
-            supervisor_owner.clone(),
-        );
         let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
         secrets
             .create(&PostParams::default(), &sandbox_secret)
             .await
             .map_err(KubernetesDriverError::from_kube)?;
-        secrets
-            .create(&PostParams::default(), &supervisor_secret)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        self.create_generation_image_pull_secrets(
-            namespace,
-            names,
-            sandbox_id,
-            vec![workload_owner, supervisor_owner],
-        )
-        .await?;
-
-        pods.patch(
-            &names.supervisor_pod,
-            &PatchParams::default(),
-            &Patch::Merge(&serde_json::json!({"spec": {"schedulingGates": []}})),
-        )
-        .await
-        .map_err(KubernetesDriverError::from_kube)?;
+        match &target {
+            GenerationLaunchTarget::Dedicated { pod_uid, .. } => {
+                let descriptor = provisioned
+                    .runtime_descriptor
+                    .backend_descriptor()
+                    .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
+                let supervisor_owner = runtime_pod_owner(&names.supervisor_pod, pod_uid);
+                let supervisor_secret = supervisor_bootstrap_secret(
+                    namespace,
+                    names,
+                    sandbox_id,
+                    descriptor.payload,
+                    serde_json::to_vec(&launch_authentication.supervisor).map_err(|error| {
+                        KubernetesDriverError::Message(format!(
+                            "encode supervisor auth bundle: {error}"
+                        ))
+                    })?,
+                    proxy_ca.certificate_pem.into_bytes(),
+                    proxy_ca.private_key_pem.into_bytes(),
+                    staged.upstream_proxy_ca_bundle,
+                    staged.client_tls,
+                    supervisor_owner.clone(),
+                );
+                secrets
+                    .create(&PostParams::default(), &supervisor_secret)
+                    .await
+                    .map_err(KubernetesDriverError::from_kube)?;
+                self.create_generation_image_pull_secrets(
+                    namespace,
+                    names,
+                    sandbox_id,
+                    vec![workload_owner, supervisor_owner],
+                )
+                .await?;
+                // A restarted generation must revalidate immediately before
+                // resuming the gated supervisor as well as before creating
+                // it. The shared topology never carries an additional CA:
+                // the gateway refuses that combination fail-closed.
+                self.ensure_network_additional_ca_config_map(namespace)
+                    .await?;
+                pods.patch(
+                    &names.supervisor_pod,
+                    &PatchParams::default(),
+                    &Patch::Merge(&serde_json::json!({"spec": {"schedulingGates": []}})),
+                )
+                .await
+                .map_err(KubernetesDriverError::from_kube)?;
+            }
+            GenerationLaunchTarget::Shared { shared, route, .. } => {
+                self.create_generation_image_pull_secrets(
+                    namespace,
+                    names,
+                    sandbox_id,
+                    vec![workload_owner],
+                )
+                .await?;
+                let registration = shared_instance_registration(
+                    &admission_object,
+                    route,
+                    sandbox_id,
+                    provisioned.runtime_descriptor,
+                    launch_authentication,
+                    proxy_ca,
+                )?;
+                // The coordinator persists the launch material with the
+                // generation before it assigns the instance, so a restarted
+                // gateway rebuilds the host's assignments from the
+                // generation's own resources; assignment then publishes it to
+                // the host without waiting for the runtime.
+                shared
+                    .supervision()
+                    .launch(&registration, |launch_material| async {
+                        secrets
+                            .create(
+                                &PostParams::default(),
+                                &shared_instance_secret(
+                                    namespace,
+                                    names,
+                                    sandbox_id,
+                                    launch_material,
+                                    instance_owner,
+                                ),
+                            )
+                            .await
+                            .map(|_| ())
+                            .map_err(KubernetesDriverError::from_kube)
+                    })
+                    .await
+                    .map_err(|error| match error {
+                        LaunchError::Persist(error) => error,
+                        // The host is at capacity, or the pool could not
+                        // place the instance; the create fails before its
+                        // workload runs.
+                        LaunchError::Refused(error) => {
+                            KubernetesDriverError::Precondition(error.to_string())
+                        }
+                        LaunchError::Unplaced(reason) => {
+                            KubernetesDriverError::Precondition(reason)
+                        }
+                        LaunchError::Invalid(error) => {
+                            KubernetesDriverError::Message(error.to_string())
+                        }
+                    })?;
+            }
+        }
         pods.patch(
             &workload_pod_name,
             &PatchParams::default(),
@@ -2868,10 +3903,22 @@ impl KubernetesComputeDriver {
             sandbox_runtime_bootstrap_phase_patch(version, SandboxRuntimeBootstrapPhase::Released)
         })
         .await?;
+        let control = match target {
+            GenerationLaunchTarget::Dedicated { .. } => BootstrapControl::SupervisorPod {
+                pods,
+                name: names.supervisor_pod.clone(),
+            },
+            GenerationLaunchTarget::Shared { shared, route, .. } => {
+                BootstrapControl::SharedInstance {
+                    shared,
+                    route,
+                    sandbox_id: sandbox_id.to_string(),
+                }
+            }
+        };
         spawn_sandbox_runtime_bootstrap_completion(
-            pods,
+            control,
             sandbox_api.api.clone(),
-            names.supervisor_pod.clone(),
             cr_name.to_string(),
             Some(cr_uid.to_string()),
         );
@@ -2895,10 +3942,10 @@ impl KubernetesComputeDriver {
     }
 
     async fn stop_sandbox_inner(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
-        let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout, phase) =
+        let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout, phase, placement) =
             self.prepare_sandbox_stop(sandbox_id).await?;
         if phase != Some(SandboxRuntimeBootstrapPhase::Suspending) {
-            self.delete_sandbox_runtime_supervisor_pod(sandbox_id, &namespace)
+            self.release_generation_supervisor(sandbox_id, &namespace, &placement)
                 .await?;
             patch_dynamic_object_with_resource_version_retry(
                 &agent_sandbox_api.api,
@@ -3008,11 +4055,7 @@ impl KubernetesComputeDriver {
         encoded_authentication: &[u8],
         encoded_expected_runtime_identity: &str,
     ) -> Result<String, KubernetesDriverError> {
-        // Read once per call so the whole generation stages, mounts, and
-        // references the same bytes, and so a bundle that became unreadable
-        // fails before any Service, Pod, or Secret is created.
-        let upstream_proxy_ca_bundle =
-            read_staged_upstream_proxy_ca_bundle(self.config.proxy_ca_bundle.as_deref()).await?;
+        let staged = self.read_staged_bootstrap_material().await?;
         let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
             encoded_generation.to_string(),
         )
@@ -3054,7 +4097,14 @@ impl KubernetesComputeDriver {
                     .namespace
                     .as_deref()
                     .unwrap_or(&self.config.namespace);
-                if sandbox_runtime_control_availability(&self.client, namespace, sandbox_id).await
+                if generation_control_availability(
+                    &self.client,
+                    self.shared_supervisor.as_ref(),
+                    namespace,
+                    sandbox_id,
+                    &object,
+                )
+                .await
                     == SandboxRuntimeControlAvailability::Available
                     && sandbox_runtime_bootstrap_is_ready_to_complete(&object)
                 {
@@ -3063,15 +4113,14 @@ impl KubernetesComputeDriver {
                     let cr_uid = object.metadata.uid.as_deref().ok_or_else(|| {
                         KubernetesDriverError::Message("sandbox resource has no UID".to_string())
                     })?;
-                    let supervisor_uid = required_sandbox_annotation(
-                        &object,
-                        ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID,
-                    )?;
-                    return Ok(kubernetes_runtime_identity(
-                        namespace,
-                        cr_uid,
-                        &supervisor_uid,
-                    ));
+                    let supervisor = match supervisor_placement(&object)? {
+                        SupervisorPlacement::Dedicated => required_sandbox_annotation(
+                            &object,
+                            ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID,
+                        )?,
+                        SupervisorPlacement::Shared { route } => route,
+                    };
+                    return Ok(kubernetes_runtime_identity(namespace, cr_uid, &supervisor));
                 }
             }
 
@@ -3108,16 +4157,17 @@ impl KubernetesComputeDriver {
             &namespace,
         );
         let pods = Api::<Pod>::namespaced(self.client.clone(), &namespace);
-        if pods
+        let workload_exists = pods
             .get_opt(cr_name)
             .await
             .map_err(KubernetesDriverError::from_kube)?
-            .is_some()
-        {
+            .is_some();
+        if workload_exists || sandbox_runtime_should_run(&object) {
             if !encoded_authentication.is_empty() {
                 // Gateway restart creates a fresh in-memory launch session.
-                // Recreate both Pods so neither side retains credentials for
-                // the gateway instance that was replaced.
+                // Suspend the controller and recreate both Pods so neither
+                // side retains credentials for the replaced gateway. Suspend
+                // even if the old workload Pod disappeared before this call.
                 self.stop_sandbox_inner(sandbox_id).await?;
                 return Box::pin(self.start_sandbox_runtime_generation(
                     sandbox_id,
@@ -3132,13 +4182,71 @@ impl KubernetesComputeDriver {
             ));
         }
 
+        let control_connection = KubernetesControlConnection::RuntimeInitiated;
+        let placement = self.new_generation_placement();
         let names = SandboxRuntimeNames::for_generation(sandbox_id, generation.as_str());
         self.create_sandbox_runtime_fence(&namespace, &names)
+            .await?;
+        // Validate the current gateway generation before touching a stopped
+        // sandbox's stale companion. This detects equal-generation
+        // delete/recreate tampering before a supervisor can be created or
+        // released, while running supervisors remain untouched.
+        self.ensure_network_additional_ca_config_map(&namespace)
             .await?;
         let mut stale_generations = sandbox_runtime_generation(&object).as_slice().to_vec();
         stale_generations.push(generation.as_str());
         self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace, &stale_generations)
             .await?;
+        // The legacy Service keeps selecting the workload for old gateways.
+        // Add the supervisor endpoint when upgrading a legacy sandbox. A
+        // shared generation has no endpoint of its own, so a dedicated
+        // generation that follows one creates both.
+        if placement == SupervisorPlacement::Dedicated {
+            let owner = sandbox_runtime_sandbox_owner_reference(
+                cr_name,
+                cr_uid,
+                &sandbox_api.resource.api_version,
+                false,
+            );
+            let services = Api::<Service>::namespaced(self.client.clone(), &namespace);
+            let legacy = services
+                .get_opt(&names.boundary_service)
+                .await
+                .map_err(KubernetesDriverError::from_kube)?;
+            match legacy {
+                Some(service)
+                    if !boundary_service_matches_mode(
+                        &service,
+                        sandbox_id,
+                        KubernetesControlConnection::SupervisorInitiated,
+                    ) =>
+                {
+                    return Err(KubernetesDriverError::Precondition(format!(
+                        "boundary Service {} no longer selects the workload",
+                        names.boundary_service
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    self.ensure_sandbox_runtime_service(
+                        &namespace,
+                        &names,
+                        sandbox_id,
+                        KubernetesControlConnection::SupervisorInitiated,
+                        owner.clone(),
+                    )
+                    .await?;
+                }
+            }
+            self.ensure_sandbox_runtime_service(
+                &namespace,
+                &names,
+                sandbox_id,
+                control_connection,
+                owner,
+            )
+            .await?;
+        }
         let main_process_spec =
             required_sandbox_annotation(&object, ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC)?;
         let log_level = required_sandbox_annotation(&object, ANNOTATION_SANDBOX_RUNTIME_LOG_LEVEL)?;
@@ -3149,54 +4257,48 @@ impl KubernetesComputeDriver {
         })?;
         let (agent_uid, agent_gid, _) =
             self.resolve_sandbox_identity_in_namespace(&namespace).await;
-        let supervisor = pods
-            .create(
-                &PostParams::default(),
-                &supervisor_pod(
-                    &namespace,
-                    &names,
-                    sandbox_id,
-                    &sandbox_name,
-                    &self.config.gateway_id,
-                    &self.config.supervisor_image,
-                    self.config.supervisor_image_pull_policy,
-                    &self.config.service_account_name,
-                    agent_uid,
-                    agent_gid,
-                    &self.generation_image_pull_secret_names(&names),
-                    &self.config.grpc_endpoint,
-                    self.config.supervisor_client_tls(),
-                    &main_process_spec,
-                    &log_level,
-                    self.config.effective_sa_token_ttl_secs(),
-                    self.config.https_proxy.as_deref(),
-                    self.config.no_proxy.as_deref(),
-                    self.config
-                        .proxy_auth_secret_name
-                        .as_deref()
-                        .zip(self.config.proxy_auth_secret_key.as_deref()),
-                    self.config.proxy_auth_allow_insecure == Some(true),
-                    self.config.proxy_connect_by_hostname == Some(true),
-                    upstream_proxy_ca_bundle.is_some(),
-                    self.config.provider_spiffe_enabled().then_some(
-                        self.config
-                            .provider_spiffe_workload_api_socket_path
-                            .as_str(),
-                    ),
-                    sandbox_runtime_sandbox_owner_reference(
-                        cr_name,
-                        cr_uid,
-                        &sandbox_api.resource.api_version,
-                        false,
-                    ),
-                )
-                .map_err(KubernetesDriverError::Message)?,
-            )
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-        let supervisor_uid = supervisor.metadata.uid.ok_or_else(|| {
-            KubernetesDriverError::Message("replacement supervisor Pod has no UID".to_string())
-        })?;
+        let mut init_containers = object
+            .data
+            .pointer("/spec/podTemplate/spec/initContainers")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        replace_sandbox_bootstrap_init_container(
+            &mut init_containers,
+            sandbox_bootstrap_init_container(
+                &self.config.sandbox_runtime_image,
+                self.config.sandbox_runtime_image_pull_policy,
+                agent_uid,
+                agent_gid,
+            ),
+        )?;
+        let supervisor = match &placement {
+            SupervisorPlacement::Dedicated => GenerationSupervisor::Dedicated {
+                pod_uid: self
+                    .create_sandbox_runtime_supervisor(
+                        &namespace,
+                        &names,
+                        sandbox_id,
+                        &sandbox_name,
+                        sandbox_runtime_sandbox_owner_reference(
+                            cr_name,
+                            cr_uid,
+                            &sandbox_api.resource.api_version,
+                            false,
+                        ),
+                        agent_uid,
+                        agent_gid,
+                        &main_process_spec,
+                        &log_level,
+                        staged.upstream_proxy_ca_bundle.is_some(),
+                    )
+                    .await?,
+                connection: control_connection,
+            },
+            SupervisorPlacement::Shared { route } => GenerationSupervisor::Shared {
+                route: route.clone(),
+            },
+        };
 
         let mut volumes = object
             .data
@@ -3229,6 +4331,16 @@ impl KubernetesComputeDriver {
                 |version| {
                     let mut running_patch =
                         sandbox_operating_state_patch(&sandbox_api.resource.version, version, true);
+                    let (supervisor_uid, topology, instance_route) = match &supervisor {
+                        GenerationSupervisor::Dedicated { pod_uid, .. } => {
+                            (pod_uid.as_str().into(), serde_json::Value::Null, serde_json::Value::Null)
+                        }
+                        GenerationSupervisor::Shared { route } => (
+                            serde_json::Value::Null,
+                            GATEWAY_TOPOLOGY.into(),
+                            route.as_str().into(),
+                        ),
+                    };
                     running_patch["metadata"]["annotations"] = serde_json::json!({
                         ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: "true",
                         ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: openshell_core::time::now_ms().to_string(),
@@ -3236,10 +4348,17 @@ impl KubernetesComputeDriver {
                         ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: SandboxRuntimeBootstrapPhase::Preparing.as_str(),
                         ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_SESSION: launch_authentication.supervisor.session_id.to_string(),
                         ANNOTATION_SANDBOX_RUNTIME_GENERATION: generation.as_str(),
-                        ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid.clone(),
+                        ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid,
+                        ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION: control_connection.as_str(),
+                        ANNOTATION_SANDBOX_RUNTIME_CONTROL_GENERATION: generation.as_str(),
+                        ANNOTATION_SUPERVISOR_TOPOLOGY: topology,
+                        ANNOTATION_SUPERVISOR_SESSION: instance_route,
                     });
-                    running_patch["spec"]["podTemplate"]["spec"] =
-                        restart_pod_template_spec(&volumes, &image_pull_secrets);
+                    running_patch["spec"]["podTemplate"]["spec"] = restart_pod_template_spec(
+                        &volumes,
+                        &init_containers,
+                        &image_pull_secrets,
+                    );
                     running_patch
                 },
             )
@@ -3253,18 +4372,20 @@ impl KubernetesComputeDriver {
                 sandbox_id,
                 cr_uid,
                 &names,
-                generation.as_str(),
-                &supervisor_uid,
+                &supervisor,
                 agent_uid,
                 agent_gid,
                 child_env,
                 &launch_authentication,
+                staged,
             )
             .await
         }
         .await;
 
         if let Err(error) = restart {
+            // The restart patch may not have recorded the sandbox instance yet.
+            self.remove_shared_instance(&placement);
             if let Err(rollback_error) = self.stop_sandbox_inner(sandbox_id).await {
                 return Err(KubernetesDriverError::Message(format!(
                     "restart failed: {error}; rollback remains pending: {rollback_error}"
@@ -3275,7 +4396,7 @@ impl KubernetesComputeDriver {
         Ok(kubernetes_runtime_identity(
             &namespace,
             cr_uid,
-            &supervisor_uid,
+            supervisor.runtime_identity_component(),
         ))
     }
 
@@ -3290,6 +4411,7 @@ impl KubernetesComputeDriver {
             String,
             Duration,
             Option<SandboxRuntimeBootstrapPhase>,
+            SupervisorPlacement,
         ),
         KubernetesDriverError,
     > {
@@ -3318,6 +4440,7 @@ impl KubernetesComputeDriver {
             .next()
             .ok_or(KubernetesDriverError::NotFound)?;
         let phase = sandbox_runtime_bootstrap_phase(&object);
+        let placement = placement_for_release(&object, sandbox_id);
         let namespace = object
             .metadata
             .namespace
@@ -3365,7 +4488,32 @@ impl KubernetesComputeDriver {
             namespace,
             stop_timeout,
             phase,
+            placement,
         ))
+    }
+
+    /// End supervision of the current generation before its workload stops.
+    ///
+    /// A shared sandbox instance is removed best effort: suspending the
+    /// workload ends that instance's supervision anyway, and reconciliation
+    /// removes any instance left behind once the shared supervisor is
+    /// reachable.
+    async fn release_generation_supervisor(
+        &self,
+        sandbox_id: &str,
+        namespace: &str,
+        placement: &SupervisorPlacement,
+    ) -> Result<(), KubernetesDriverError> {
+        match placement {
+            SupervisorPlacement::Dedicated => {
+                self.delete_sandbox_runtime_supervisor_pod(sandbox_id, namespace)
+                    .await
+            }
+            SupervisorPlacement::Shared { .. } => {
+                self.remove_shared_instance(placement);
+                Ok(())
+            }
+        }
     }
 
     async fn delete_sandbox_runtime_supervisor_pod(
@@ -3485,7 +4633,7 @@ impl KubernetesComputeDriver {
             .await?;
         let selector = self.sandbox_lookup_selector(sandbox_id);
         let lp = ListParams::default().labels(&selector);
-        let (kube_name, obj_namespace, _workspace, preconditions, pod_name) =
+        let (kube_name, obj_namespace, _workspace, preconditions, pod_name, placement) =
             match tokio::time::timeout(KUBE_API_TIMEOUT, lookup_api.api.list(&lp)).await {
                 Ok(Ok(list)) => {
                     if let Some(obj) = list.items.into_iter().next() {
@@ -3502,6 +4650,8 @@ impl KubernetesComputeDriver {
                                     .as_ref()
                                     .and_then(|l| l.get(LABEL_SANDBOX_WORKSPACE).cloned())
                                     .unwrap_or_default();
+                                // An unreadable placement leaves any instance to reconciliation.
+                                let placement = supervisor_placement(&obj).ok();
                                 let pc = Preconditions {
                                     uid: obj.metadata.uid,
                                     resource_version: obj.metadata.resource_version,
@@ -3515,7 +4665,7 @@ impl KubernetesComputeDriver {
                                     })
                                     .cloned()
                                     .unwrap_or_else(|| name.clone());
-                                (name, ns, ws, pc, pod_name)
+                                (name, ns, ws, pc, pod_name, placement)
                             }
                             None => return Ok(false),
                         }
@@ -3552,6 +4702,12 @@ impl KubernetesComputeDriver {
         match tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.delete(&kube_name, &dp)).await {
             Ok(Ok(_response)) => {
                 info!(sandbox_id = %sandbox_id, namespace = %obj_namespace, "Sandbox deleted from Kubernetes");
+                // The workload is going away, so its sandbox instance cannot
+                // stop it gracefully; end the instance without delaying the
+                // delete.
+                if let Some(placement @ SupervisorPlacement::Shared { .. }) = placement {
+                    self.remove_shared_instance(&placement);
+                }
                 {
                     let pod_api = Api::<Pod>::namespaced(self.client.clone(), &obj_namespace);
                     let deadline = tokio::time::Instant::now()
@@ -3646,6 +4802,12 @@ impl KubernetesComputeDriver {
                 return;
             }
         };
+        // Begin the recovery before the list so a lifecycle edit that lands
+        // in between cannot be undone by the completion below.
+        let shared_recovery = self
+            .shared_supervisor
+            .as_ref()
+            .map(|shared| shared.supervision().begin_recovery());
         let list = match tokio::time::timeout(
             KUBE_API_TIMEOUT,
             lookup_api
@@ -3664,6 +4826,13 @@ impl KubernetesComputeDriver {
                 return;
             }
         };
+
+        // The shared supervisor's desired set is derived from the Sandbox
+        // resources that may run, so instances of deleted Sandboxes and of
+        // stops that happened while this gateway was down are withdrawn here.
+        if let Some(baseline) = shared_recovery {
+            self.recover_shared_instances(baseline, &list.items).await;
+        }
 
         for object in list.items {
             let Ok(sandbox_id) = sandbox_id_from_object(&object) else {
@@ -3780,8 +4949,39 @@ impl KubernetesComputeDriver {
                     .await;
                 continue;
             }
+            if workload_may_run {
+                let require_service = !sandbox_runtime_bootstrap_in_progress(&object);
+                match self
+                    .verify_sandbox_runtime_control_path(
+                        &object,
+                        &sandbox_id,
+                        namespace,
+                        require_service,
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(KubernetesDriverError::Precondition(error)) => {
+                        warn!(sandbox_id, %error, "sandbox-runtime control path drifted; suspending workload");
+                        self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
+                            .await;
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(sandbox_id, %error, "could not verify sandbox-runtime control path; reconciliation will retry");
+                        continue;
+                    }
+                }
+            }
             if sandbox_runtime_bootstrap_in_progress(&object) {
-                if sandbox_runtime_control_availability(&self.client, namespace, &sandbox_id).await
+                if generation_control_availability(
+                    &self.client,
+                    self.shared_supervisor.as_ref(),
+                    namespace,
+                    &sandbox_id,
+                    &object,
+                )
+                .await
                     == SandboxRuntimeControlAvailability::Available
                     && sandbox_runtime_bootstrap_is_ready_to_complete(&object)
                 {
@@ -3849,7 +5049,7 @@ impl KubernetesComputeDriver {
                     &sandbox_id,
                     namespace,
                     desired_running,
-                    sandbox_runtime_generation(&object).as_slice(),
+                    &object,
                 )
                 .await
             {
@@ -3863,8 +5063,14 @@ impl KubernetesComputeDriver {
                     warn!(sandbox_id, %error, "failed to reconcile sandbox-runtime supervisor Pod");
                 }
             }
-            let availability =
-                sandbox_runtime_control_availability(&self.client, namespace, &sandbox_id).await;
+            let availability = generation_control_availability(
+                &self.client,
+                self.shared_supervisor.as_ref(),
+                namespace,
+                &sandbox_id,
+                &object,
+            )
+            .await;
             if desired_running && availability == SandboxRuntimeControlAvailability::Unavailable {
                 warn!(
                     sandbox_id,
@@ -3877,6 +5083,75 @@ impl KubernetesComputeDriver {
             self.publish_sandbox_runtime_readiness_transition(&lookup_api, &object, availability)
                 .await;
         }
+    }
+
+    /// Complete a recovery of the shared supervisor's desired set from the
+    /// Sandbox resources that may run. The coordinator reuses current
+    /// assignments and otherwise reads each generation's launch Secret
+    /// through [`Self::read_shared_instance_material`]; it keeps the previous
+    /// set when any read fails and refuses a list that raced a lifecycle
+    /// edit.
+    async fn recover_shared_instances(
+        &self,
+        baseline: RecoveryBaseline,
+        sandboxes: &[DynamicObject],
+    ) {
+        let Some(shared) = &self.shared_supervisor else {
+            return;
+        };
+        let candidates = runnable_shared_generations(sandboxes)
+            .into_iter()
+            .filter_map(|(object, route)| {
+                let sandbox_id = sandbox_id_from_object(object).ok()?;
+                let generation = sandbox_runtime_generation(object)?.to_string();
+                let namespace = object
+                    .metadata
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| self.config.namespace.clone());
+                Some(RecoverableInstance {
+                    route,
+                    sandbox_id: sandbox_id.clone(),
+                    record: SharedInstanceSecretRecord {
+                        namespace,
+                        sandbox_id,
+                        generation,
+                    },
+                })
+            })
+            .collect();
+        // Outcomes are logged by the coordinator; a conflict is derived again
+        // on the next reconciliation.
+        shared
+            .supervision()
+            .complete_recovery(baseline, candidates, |record| {
+                self.read_shared_instance_material(record.clone())
+            })
+            .await;
+    }
+
+    /// Launch material persisted with a shared generation, or `None` when its
+    /// Secret is gone or belongs to a dedicated generation. The bytes are
+    /// decoded and bound to the generation by the coordinator.
+    async fn read_shared_instance_material(
+        &self,
+        record: SharedInstanceSecretRecord,
+    ) -> Result<Option<Vec<u8>>, KubernetesDriverError> {
+        let names = SandboxRuntimeNames::for_generation(&record.sandbox_id, &record.generation);
+        let secrets = Api::<Secret>::namespaced(self.client.clone(), &record.namespace);
+        let secret =
+            tokio::time::timeout(KUBE_API_TIMEOUT, secrets.get_opt(&names.supervisor_secret))
+                .await
+                .map_err(|_| {
+                    KubernetesDriverError::Message(
+                        "timed out reading the shared sandbox instance launch Secret".to_string(),
+                    )
+                })?
+                .map_err(KubernetesDriverError::from_kube)?;
+        Ok(secret
+            .and_then(|secret| secret.data)
+            .and_then(|mut data| data.remove(SHARED_INSTANCE_KEY))
+            .map(|material| material.0))
     }
 
     async fn reconcile_sandbox_runtime_suspending(
@@ -3902,6 +5177,10 @@ impl KubernetesComputeDriver {
                 debug!(sandbox_id, %error, "could not verify sandbox-runtime suspension; reconciliation will retry");
                 return;
             }
+        }
+        // Completion forgets the placement, so withdraw a shared sandbox instance now.
+        if let Ok(placement) = supervisor_placement(object) {
+            self.remove_shared_instance(&placement);
         }
         if let Err(error) = self
             .delete_sandbox_runtime_supervisor(
@@ -3948,8 +5227,9 @@ impl KubernetesComputeDriver {
         namespace: &str,
         cr_name: &str,
     ) {
+        let placement = placement_for_release(object, sandbox_id);
         if let Err(error) = self
-            .delete_sandbox_runtime_supervisor_pod(sandbox_id, namespace)
+            .release_generation_supervisor(sandbox_id, namespace, &placement)
             .await
         {
             warn!(sandbox_id, %error, "could not release sandbox-runtime control; reconciliation will retry");
@@ -4176,31 +5456,20 @@ impl KubernetesComputeDriver {
         sandbox_id: &str,
         namespace: &str,
         desired_running: bool,
-        generations: &[&str],
+        object: &DynamicObject,
     ) -> Result<(), KubernetesDriverError> {
+        let generations = sandbox_runtime_generation(object);
         if !desired_running {
             return self
-                .delete_sandbox_runtime_supervisor(sandbox_id, namespace, generations)
+                .delete_sandbox_runtime_supervisor(sandbox_id, namespace, generations.as_slice())
                 .await;
         }
-        let names = SandboxRuntimeNames::new(sandbox_id);
-        let services = Api::<Service>::namespaced(self.client.clone(), namespace);
-        let service_exists =
-            tokio::time::timeout(KUBE_API_TIMEOUT, services.get_opt(&names.boundary_service))
-                .await
-                .map_err(|_| {
-                    KubernetesDriverError::Message(
-                        "timed out reading sandbox-runtime boundary Service".to_string(),
-                    )
-                })?
-                .map_err(KubernetesDriverError::from_kube)?
-                .is_some();
-        if !service_exists {
-            return Err(KubernetesDriverError::Precondition(format!(
-                "sandbox-runtime boundary Service {} is missing and its allocated address cannot be safely reconstructed",
-                names.boundary_service
-            )));
+        if let SupervisorPlacement::Shared { .. } = supervisor_placement(object)? {
+            // Sandbox instance availability is part of control availability.
+            return Ok(());
         }
+        // The boundary Service was checked by verify_sandbox_runtime_control_path.
+        let names = SandboxRuntimeNames::new(sandbox_id);
         let pods = Api::<Pod>::namespaced(self.client.clone(), namespace);
         tokio::time::timeout(
             KUBE_API_TIMEOUT,
@@ -4284,6 +5553,7 @@ impl KubernetesComputeDriver {
         let (tx, rx) = mpsc::channel(256);
         self.spawn_sandbox_runtime_periodic_reconcile(tx.clone());
         let readiness_client = self.watch_client.clone();
+        let readiness_shared = self.shared_supervisor.clone();
 
         tokio::spawn(async move {
             let mut sandbox_name_to_id = std::collections::HashMap::<String, String>::new();
@@ -4293,7 +5563,7 @@ impl KubernetesComputeDriver {
                 tokio::select! {
                     event = sandbox_stream.next() => match event {
                         Some(Event::Apply(obj) | Event::InitApply(obj)) => {
-                            if let Ok((kube_name, sandbox)) = sandbox_from_object_with_sandbox_runtime_readiness(&readiness_client, &namespace, obj).await {
+                            if let Ok((kube_name, sandbox)) = sandbox_from_object_with_sandbox_runtime_readiness(&readiness_client, readiness_shared.as_ref(), &namespace, obj).await {
                                 update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
                                 let event = WatchSandboxesEvent {
                                     payload: Some(watch_sandboxes_event::Payload::Sandbox(
@@ -4387,6 +5657,30 @@ impl KubernetesComputeDriver {
     }
 }
 
+/// Placement to release before a stop. An unreadable record must not block
+/// suspending the workload, which ends any supervision on its own.
+fn placement_for_release(object: &DynamicObject, sandbox_id: &str) -> SupervisorPlacement {
+    supervisor_placement(object).unwrap_or_else(|error| {
+        warn!(sandbox_id, %error, "invalid sandbox-runtime supervisor placement; stopping without releasing a sandbox instance");
+        SupervisorPlacement::Dedicated
+    })
+}
+
+/// Shared generations that may currently run, with their sandbox instance
+/// routes: the desired set of the shared supervisor.
+fn runnable_shared_generations(sandboxes: &[DynamicObject]) -> Vec<(&DynamicObject, String)> {
+    sandboxes
+        .iter()
+        .filter(|object| {
+            sandbox_runtime_should_run(object) || sandbox_runtime_bootstrap_in_progress(object)
+        })
+        .filter_map(|object| match supervisor_placement(object) {
+            Ok(SupervisorPlacement::Shared { route }) => Some((object, route)),
+            _ => None,
+        })
+        .collect()
+}
+
 fn sandbox_runtime_bootstrap_completion_patch(resource_version: &str) -> serde_json::Value {
     serde_json::json!({
         "metadata": {
@@ -4403,33 +5697,120 @@ fn sandbox_runtime_bootstrap_completion_patch(resource_version: &str) -> serde_j
     })
 }
 
+/// Where a shared generation's launch material is persisted: the
+/// generation's supervisor Secret, read back by recovery.
+#[derive(Clone)]
+struct SharedInstanceSecretRecord {
+    namespace: String,
+    sandbox_id: String,
+    generation: String,
+}
+
+/// Launch material of one shared-supervisor sandbox instance, taken from the
+/// generation's own Sandbox resource and gateway-issued credentials. The
+/// coordinator validates, encodes, persists, and assigns it.
+fn shared_instance_registration(
+    object: &DynamicObject,
+    route: &str,
+    sandbox_id: &str,
+    runtime_descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor,
+    launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
+    proxy_ca: crate::sandbox_runtime::ProxyCaMaterial,
+) -> Result<SandboxInstanceRegistration, KubernetesDriverError> {
+    Ok(SandboxInstanceRegistration {
+        route: route.to_string(),
+        sandbox_id: sandbox_id.to_string(),
+        sandbox_name: annotation_or_label(object, LABEL_SANDBOX_NAME).ok_or_else(|| {
+            KubernetesDriverError::Precondition(
+                "Sandbox resource is missing its OpenShell sandbox name".to_string(),
+            )
+        })?,
+        runtime_descriptor,
+        auth: launch_authentication.supervisor.clone(),
+        main_process_spec: required_sandbox_annotation(
+            object,
+            ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC,
+        )?,
+        workdir: Some(WORKSPACE_MOUNT_PATH.to_string()),
+        container_image: object
+            .data
+            .pointer("/spec/podTemplate/spec/containers")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|containers| {
+                containers.iter().find(|container| {
+                    container.get("name").and_then(serde_json::Value::as_str) == Some("agent")
+                })
+            })
+            .and_then(|container| container.get("image"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        proxy_ca: openshell_supervisor_control::ProxyCaMaterial {
+            certificate_pem: proxy_ca.certificate_pem,
+            private_key_pem: openshell_supervisor_control::SecretPem::new(proxy_ca.private_key_pem),
+        },
+        trace_context: RegistrationTraceContext::current(),
+    })
+}
+
+/// What bootstrap completion waits for before the runtime is declared ready.
+enum BootstrapControl {
+    /// The generation's dedicated supervisor Pod becomes Ready.
+    SupervisorPod { pods: Api<Pod>, name: String },
+    /// The gateway accepts the generation's shared-supervisor sandbox instance.
+    SharedInstance {
+        shared: SharedSupervisor,
+        route: String,
+        sandbox_id: String,
+    },
+}
+
+impl BootstrapControl {
+    async fn wait_available(self) -> bool {
+        match self {
+            Self::SupervisorPod { pods, name } => {
+                let available = |pod: Option<&Pod>| {
+                    pod.is_some_and(|pod| {
+                        sandbox_runtime_control_availability_from_pod(pod)
+                            == SandboxRuntimeControlAvailability::Available
+                    })
+                };
+                match await_condition(pods, &name, available).await {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(error) => {
+                        debug!(%error, pod = name, "sandbox-runtime bootstrap availability watch failed; reconciliation will retry");
+                        false
+                    }
+                }
+            }
+            // A disconnected or still-reconciling host is not a verdict; the
+            // coordinator keeps waiting within the bootstrap grace.
+            Self::SharedInstance {
+                shared,
+                route,
+                sandbox_id,
+            } => {
+                shared
+                    .supervision()
+                    .wait_for_ready(&route, &sandbox_id)
+                    .await
+            }
+        }
+    }
+}
+
 fn spawn_sandbox_runtime_bootstrap_completion(
-    pods: Api<Pod>,
+    control: BootstrapControl,
     sandboxes: Api<DynamicObject>,
-    supervisor_pod_name: String,
     sandbox_name: String,
     expected_sandbox_uid: Option<String>,
 ) {
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + SANDBOX_RUNTIME_BOOTSTRAP_GRACE;
-        let available = |pod: Option<&Pod>| {
-            pod.is_some_and(|pod| {
-                sandbox_runtime_control_availability_from_pod(pod)
-                    == SandboxRuntimeControlAvailability::Available
-            })
-        };
-        match tokio::time::timeout_at(
-            deadline,
-            await_condition(pods, &supervisor_pod_name, available),
-        )
-        .await
-        {
-            Ok(Ok(Some(_))) => {}
-            Ok(Ok(None)) | Err(_) => return,
-            Ok(Err(error)) => {
-                debug!(%error, sandbox = sandbox_name, "sandbox-runtime bootstrap availability watch failed; reconciliation will retry");
-                return;
-            }
+        match tokio::time::timeout_at(deadline, control.wait_available()).await {
+            Ok(true) => {}
+            Ok(false) | Err(_) => return,
         }
 
         // A replacement control can become Available before the Agent
@@ -4606,6 +5987,7 @@ where
 {
     let (tx, rx) = mpsc::channel(256);
     driver.spawn_sandbox_runtime_periodic_reconcile(tx.clone());
+    let readiness_shared = driver.shared_supervisor;
 
     tokio::spawn(async move {
         loop {
@@ -4614,7 +5996,7 @@ where
                     Some(Event::Apply(obj) | Event::InitApply(obj)) => {
                         let ns = obj.metadata.namespace.clone()
                             .unwrap_or_else(|| default_namespace.clone());
-                        if let Ok((_kube_name, sandbox)) = sandbox_from_object_with_sandbox_runtime_readiness(&readiness_client, &ns, obj).await {
+                        if let Ok((_kube_name, sandbox)) = sandbox_from_object_with_sandbox_runtime_readiness(&readiness_client, readiness_shared.as_ref(), &ns, obj).await {
                             let event = WatchSandboxesEvent {
                                 payload: Some(watch_sandboxes_event::Payload::Sandbox(
                                     WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
@@ -4850,12 +6232,35 @@ fn runtime_pod_owner(name: &str, uid: &str) -> OwnerReference {
 /// generation.
 fn restart_pod_template_spec(
     volumes: &[serde_json::Value],
+    init_containers: &[serde_json::Value],
     image_pull_secrets: &[String],
 ) -> serde_json::Value {
     serde_json::json!({
         "volumes": volumes,
+        "initContainers": init_containers,
         "imagePullSecrets": image_pull_secret_refs(image_pull_secrets),
     })
+}
+
+/// Replace the stored trusted bootstrap init container in place. Entry order
+/// must not change because `workspace-init` runs the binary it stages.
+fn replace_sandbox_bootstrap_init_container(
+    init_containers: &mut [serde_json::Value],
+    bootstrap: serde_json::Value,
+) -> Result<(), KubernetesDriverError> {
+    let stored = init_containers
+        .iter_mut()
+        .find(|container| {
+            container.get("name").and_then(serde_json::Value::as_str)
+                == Some(SANDBOX_BOOTSTRAP_CONTAINER_NAME)
+        })
+        .ok_or_else(|| {
+            KubernetesDriverError::Precondition(
+                "Sandbox pod template is missing its trusted bootstrap init container".to_string(),
+            )
+        })?;
+    *stored = bootstrap;
+    Ok(())
 }
 
 fn sandbox_annotations(sandbox: &Sandbox) -> BTreeMap<String, String> {
@@ -5336,6 +6741,94 @@ async fn sandbox_runtime_control_availability(
     combine_sandbox_runtime_control_availability([control, service, fence, supervisor_fence])
 }
 
+/// Availability of a generation's supervision, by its recorded placement.
+async fn generation_control_availability(
+    client: &Client,
+    shared: Option<&SharedSupervisor>,
+    namespace: &str,
+    sandbox_id: &str,
+    object: &DynamicObject,
+) -> SandboxRuntimeControlAvailability {
+    match supervisor_placement(object) {
+        Ok(SupervisorPlacement::Dedicated) => {
+            sandbox_runtime_control_availability(client, namespace, sandbox_id).await
+        }
+        Ok(SupervisorPlacement::Shared { route }) => {
+            shared_instance_control_availability(client, shared, namespace, sandbox_id, &route)
+                .await
+        }
+        Err(error) => {
+            warn!(sandbox_id, %error, "sandbox-runtime supervisor placement is invalid");
+            SandboxRuntimeControlAvailability::Unavailable
+        }
+    }
+}
+
+/// A shared generation is supervised while its sandbox instance is registered
+/// for this sandbox and accepted by the gateway, and its fence and egress
+/// allowance exist.
+async fn shared_instance_control_availability(
+    client: &Client,
+    shared: Option<&SharedSupervisor>,
+    namespace: &str,
+    sandbox_id: &str,
+    route: &str,
+) -> SandboxRuntimeControlAvailability {
+    let Some(shared) = shared else {
+        warn!(
+            sandbox_id,
+            "the gateway supervisor topology is not configured for a shared generation"
+        );
+        return SandboxRuntimeControlAvailability::Unavailable;
+    };
+    let names = SandboxRuntimeNames::new(sandbox_id);
+    let policies = Api::<NetworkPolicy>::namespaced(client.clone(), namespace);
+    let exists = |result: Result<Result<Option<NetworkPolicy>, KubeError>, _>, what: &str| {
+        match result {
+            Ok(Ok(Some(_))) => SandboxRuntimeControlAvailability::Available,
+            Ok(Ok(None)) => SandboxRuntimeControlAvailability::Unavailable,
+            Ok(Err(error)) => {
+                warn!(sandbox_id, %error, "could not determine sandbox-runtime {what} availability");
+                SandboxRuntimeControlAvailability::Unknown
+            }
+            Err(tokio::time::error::Elapsed { .. }) => {
+                warn!(
+                    sandbox_id,
+                    "timed out checking sandbox-runtime {what} availability"
+                );
+                SandboxRuntimeControlAvailability::Unknown
+            }
+        }
+    };
+    // The coordinator renders the host's verdict; a disconnected or
+    // still-reconciling host is not one and must not suspend a running sandbox.
+    let instance = match shared.supervision().supervision(route, sandbox_id) {
+        InstanceSupervision::Available => SandboxRuntimeControlAvailability::Available,
+        InstanceSupervision::Degraded => SandboxRuntimeControlAvailability::Degraded,
+        InstanceSupervision::Unavailable => SandboxRuntimeControlAvailability::Unavailable,
+        InstanceSupervision::Unknown => {
+            warn!(
+                sandbox_id,
+                "no shared supervisor host is connected; sandbox instance availability is unknown"
+            );
+            SandboxRuntimeControlAvailability::Unknown
+        }
+    };
+    let (fence, control) = tokio::join!(
+        tokio::time::timeout(KUBE_API_TIMEOUT, policies.get_opt(&names.workload_policy)),
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            policies.get_opt(&names.shared_control_policy)
+        ),
+    );
+    combine_sandbox_runtime_control_availability([
+        instance,
+        exists(fence, "workload fence"),
+        exists(control, "shared control policy"),
+        SandboxRuntimeControlAvailability::Available,
+    ])
+}
+
 fn combine_sandbox_runtime_control_availability(
     dependencies: [SandboxRuntimeControlAvailability; 4],
 ) -> SandboxRuntimeControlAvailability {
@@ -5401,6 +6894,14 @@ async fn sandbox_runtime_supervisor_generation_matches(
     sandbox_id: &str,
     sandbox: &DynamicObject,
 ) -> SandboxRuntimeControlAvailability {
+    match supervisor_placement(sandbox) {
+        Ok(SupervisorPlacement::Dedicated) => {}
+        // The sandbox instance's sandbox is checked with its availability.
+        Ok(SupervisorPlacement::Shared { .. }) => {
+            return SandboxRuntimeControlAvailability::Available;
+        }
+        Err(_) => return SandboxRuntimeControlAvailability::Unavailable,
+    }
     let Some(expected_uid) = sandbox
         .metadata
         .annotations
@@ -5432,6 +6933,7 @@ async fn sandbox_runtime_supervisor_generation_matches(
 
 async fn sandbox_from_object_with_sandbox_runtime_readiness(
     client: &Client,
+    shared: Option<&SharedSupervisor>,
     namespace: &str,
     obj: DynamicObject,
 ) -> Result<(String, Sandbox), String> {
@@ -5447,10 +6949,12 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
         mark_sandbox_runtime_bootstrapping(&mut sandbox);
     }
     if !sandbox_id.is_empty() {
-        let dependencies = Box::pin(sandbox_runtime_control_availability(
+        let dependencies = Box::pin(generation_control_availability(
             client,
+            shared,
             &object_namespace,
             &sandbox_id,
+            &obj,
         ));
         let workload_generation = Box::pin(sandbox_runtime_workload_generation_matches(
             client,
@@ -5671,7 +7175,10 @@ fn extract_image_size(message: &str) -> Option<u64> {
 const SANDBOX_RUNTIME_VOLUME_NAME: &str = "openshell-runtime";
 const SANDBOX_STATE_VOLUME_NAME: &str = "openshell-runtime-state";
 const SANDBOX_BOOTSTRAP_VOLUME_NAME: &str = "openshell-sandbox-bootstrap";
+const SANDBOX_BOOTSTRAP_CONTAINER_NAME: &str = "openshell-sandbox-bootstrap";
 const SANDBOX_POD_IDENTITY_VOLUME_NAME: &str = "openshell-pod-identity";
+// Reserve the entire control tree, including future runtime/bootstrap paths.
+const SANDBOX_CONTROL_ROOT: &str = "/.openshell";
 const SANDBOX_RUNTIME_MOUNT_PATH: &str = "/.openshell/runtime";
 const SANDBOX_STATE_MOUNT_PATH: &str = "/.openshell/state";
 const SANDBOX_POD_IDENTITY_MOUNT_PATH: &str = "/.openshell/pod-identity";
@@ -5687,6 +7194,37 @@ fn sandbox_bootstrap_secret_name(spec: &serde_json::Value) -> Option<&str> {
         .find(|volume| volume["name"] == SANDBOX_BOOTSTRAP_VOLUME_NAME)?["secret"]["secretName"]
         .as_str()
         .filter(|name| !name.is_empty())
+}
+
+/// Render the trusted init container that stages the sandbox runtime binary.
+fn sandbox_bootstrap_init_container(
+    image: &str,
+    pull_policy: Option<crate::KubernetesImagePullPolicy>,
+    uid: u32,
+    gid: u32,
+) -> serde_json::Value {
+    let mut bootstrap = serde_json::json!({
+        "name": SANDBOX_BOOTSTRAP_CONTAINER_NAME,
+        "image": image,
+        "command": ["/openshell-sandbox", "bootstrap"],
+        "securityContext": {
+            "runAsUser": uid,
+            "runAsGroup": gid,
+            "runAsNonRoot": true,
+            "readOnlyRootFilesystem": true,
+            "allowPrivilegeEscalation": false,
+            "capabilities": {"drop": ["ALL"]}
+        },
+        "volumeMounts": [
+            {"name": SANDBOX_BOOTSTRAP_VOLUME_NAME, "mountPath": crate::sandbox_runtime::SANDBOX_BOOTSTRAP_INPUT_PATH, "readOnly": true},
+            {"name": SANDBOX_RUNTIME_VOLUME_NAME, "mountPath": SANDBOX_RUNTIME_MOUNT_PATH},
+            {"name": SANDBOX_STATE_VOLUME_NAME, "mountPath": SANDBOX_STATE_MOUNT_PATH}
+        ]
+    });
+    if let Some(policy) = pull_policy {
+        bootstrap["imagePullPolicy"] = serde_json::json!(policy.as_kubernetes_str());
+    }
+    bootstrap
 }
 
 /// Render the workload Pod that runs the `OpenShell` sandbox runtime.
@@ -5808,28 +7346,12 @@ fn apply_supervisor_sandbox_runtime_boundary(
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
         .expect("pod init containers must be an array");
-    let mut bootstrap = serde_json::json!({
-        "name": "openshell-sandbox-bootstrap",
-        "image": params.sandbox_runtime_image,
-        "command": ["/openshell-sandbox", "bootstrap"],
-        "securityContext": {
-            "runAsUser": params.sandbox_uid,
-            "runAsGroup": params.sandbox_gid,
-            "runAsNonRoot": true,
-            "readOnlyRootFilesystem": true,
-            "allowPrivilegeEscalation": false,
-            "capabilities": {"drop": ["ALL"]}
-        },
-        "volumeMounts": [
-            {"name": SANDBOX_BOOTSTRAP_VOLUME_NAME, "mountPath": crate::sandbox_runtime::SANDBOX_BOOTSTRAP_INPUT_PATH, "readOnly": true},
-            {"name": SANDBOX_RUNTIME_VOLUME_NAME, "mountPath": SANDBOX_RUNTIME_MOUNT_PATH},
-            {"name": SANDBOX_STATE_VOLUME_NAME, "mountPath": SANDBOX_STATE_MOUNT_PATH}
-        ]
-    });
-    if let Some(policy) = params.sandbox_runtime_image_pull_policy {
-        bootstrap["imagePullPolicy"] = serde_json::json!(policy.as_kubernetes_str());
-    }
-    init_containers.push(bootstrap);
+    init_containers.push(sandbox_bootstrap_init_container(
+        params.sandbox_runtime_image,
+        params.sandbox_runtime_image_pull_policy,
+        params.sandbox_uid,
+        params.sandbox_gid,
+    ));
 
     let containers = spec
         .get_mut("containers")
@@ -6664,6 +8186,47 @@ fn platform_config_string(template: &SandboxTemplate, key: &str) -> Option<Strin
     }
 }
 
+/// Reject template pod annotations and labels whose keys are not in the
+/// operator's `allowed_pod_annotations` / `allowed_pod_labels` lists.
+fn validate_pod_metadata(
+    template: &SandboxTemplate,
+    config: &KubernetesComputeConfig,
+) -> Result<(), String> {
+    if let Some(serde_json::Value::Object(annotations)) =
+        platform_config_struct(template, "annotations")
+    {
+        reject_disallowed_pod_metadata_keys(
+            "annotations",
+            "allowed_pod_annotations",
+            annotations.keys().map(String::as_str),
+            |key| config.pod_annotation_allowed(key),
+        )?;
+    }
+    reject_disallowed_pod_metadata_keys(
+        "labels",
+        "allowed_pod_labels",
+        template.labels.keys().map(String::as_str),
+        |key| config.pod_label_allowed(key),
+    )
+}
+
+fn reject_disallowed_pod_metadata_keys<'a>(
+    kind: &str,
+    field: &str,
+    keys: impl Iterator<Item = &'a str>,
+    allowed: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    let mut rejected: Vec<&str> = keys.filter(|key| !allowed(key)).collect();
+    if rejected.is_empty() {
+        return Ok(());
+    }
+    rejected.sort_unstable();
+    Err(format!(
+        "pod {kind} not permitted by the gateway's {field}: {}",
+        rejected.join(", ")
+    ))
+}
+
 /// Extract a nested Struct value from the template's `platform_config`,
 /// converting it to `serde_json::Value`.
 fn platform_config_struct(template: &SandboxTemplate, key: &str) -> Option<serde_json::Value> {
@@ -6824,7 +8387,7 @@ fn validate_sandbox_runtime_fence(
     } else {
         let name = expected.metadata.name.as_deref().unwrap_or_default();
         Err(KubernetesDriverError::Precondition(format!(
-            "sandbox-runtime workload fence {name} exists but does not match the intended enforcement"
+            "sandbox-runtime NetworkPolicy {name} exists but does not match the intended enforcement"
         )))
     }
 }
@@ -6870,15 +8433,28 @@ fn sandbox_runtime_namespace_fence_generation_matches(
     policy: &NetworkPolicy,
     sandbox: &DynamicObject,
 ) -> bool {
+    sandbox_runtime_policy_generation_matches(
+        policy,
+        sandbox,
+        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID,
+        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION,
+    )
+}
+
+/// Whether `policy` is the exact object and generation recorded on the
+/// sandbox under the given annotation keys.
+fn sandbox_runtime_policy_generation_matches(
+    policy: &NetworkPolicy,
+    sandbox: &DynamicObject,
+    uid_annotation: &str,
+    generation_annotation: &str,
+) -> bool {
     let Some(annotations) = sandbox.metadata.annotations.as_ref() else {
         return false;
     };
-    policy.metadata.uid.as_deref()
-        == annotations
-            .get(ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID)
-            .map(String::as_str)
+    policy.metadata.uid.as_deref() == annotations.get(uid_annotation).map(String::as_str)
         && annotations
-            .get(ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION)
+            .get(generation_annotation)
             .and_then(|generation| generation.parse::<i64>().ok())
             == policy.metadata.generation
 }
@@ -7075,6 +8651,8 @@ fn sandbox_runtime_suspension_completion_patch(resource_version: &str) -> serde_
                 ANNOTATION_SANDBOX_RUNTIME_GENERATION: serde_json::Value::Null,
                 ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: serde_json::Value::Null,
                 ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: serde_json::Value::Null,
+                ANNOTATION_SUPERVISOR_TOPOLOGY: serde_json::Value::Null,
+                ANNOTATION_SUPERVISOR_SESSION: serde_json::Value::Null,
                 ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: serde_json::Value::Null,
                 ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: serde_json::Value::Null,
                 ANNOTATION_SANDBOX_RUNTIME_READINESS: "unavailable",
@@ -7242,6 +8820,9 @@ fn spawn_namespace_file_watcher(
                 error = %err,
                 "failed to load initial operator namespace file, allowlist empty"
             );
+            // The file is the only source, so an unreadable file is an empty
+            // allowlist rather than one still loading.
+            allowlist.mark_synced();
         }
     }
 
@@ -7350,6 +8931,113 @@ fn spawn_namespace_file_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serve Pod GETs over one reusable HTTP/1 connection per client,
+    /// delaying a request for Pod `slow-<millis>` by that many milliseconds.
+    async fn serve_delayed_pods() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(hyper::server::conn::http1::Builder::new().serve_connection(
+                    hyper_util::rt::TokioIo::new(stream),
+                    hyper::service::service_fn(|request: http::Request<_>| async move {
+                        let delay = request
+                            .uri()
+                            .path()
+                            .rsplit_once("/slow-")
+                            .and_then(|(_, millis)| millis.parse().ok())
+                            .map_or(Duration::ZERO, Duration::from_millis);
+                        tokio::time::sleep(delay).await;
+                        Ok::<_, std::convert::Infallible>(http::Response::new(
+                            http_body_util::Full::new(bytes::Bytes::from_static(
+                                br#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"pod"}}"#,
+                            )),
+                        ))
+                    }),
+                ));
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn request_timeout_ignores_pooled_connection_idle_time() {
+        let addr = serve_delayed_pods().await;
+        let config = kube::Config::new(format!("http://{addr}").parse().unwrap());
+        let client = kubernetes_request_client(config, Duration::from_secs(1)).unwrap();
+        let pods = Api::<Pod>::namespaced(client, "default");
+
+        pods.get("warm").await.unwrap();
+        // With a connection-level read timeout, 800ms of idle time would leave
+        // this 500ms request only 200ms on the reused connection.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        pods.get("slow-500").await.unwrap();
+
+        let error = pods.get("slow-1500").await.unwrap_err();
+        assert!(
+            matches!(&error, KubeError::Service(source) if source.is::<tower::timeout::error::Elapsed>()),
+            "expected request timeout, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_otlp_environment_carries_only_configured_signals() {
+        use openshell_core::sandbox_env::{OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OcsfOtlpExport};
+
+        let names = |config: KubernetesComputeConfig| {
+            KubernetesComputeDriver::new_for_test(config)
+                .supervisor_otlp_environment()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
+        };
+        assert!(names(KubernetesComputeConfig::default()).is_empty());
+        assert_eq!(
+            names(KubernetesComputeConfig {
+                supervisor_otlp_endpoint: Some("http://traces:4317".into()),
+                ..Default::default()
+            })
+            .first(),
+            Some(&OTLP_ENDPOINT)
+        );
+
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+            supervisor_ocsf_export: Some(OcsfOtlpExport {
+                endpoint: "http://siem:4317".into(),
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            driver.supervisor_otlp_environment(),
+            [(OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string())]
+        );
+
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+            supervisor_otlp_agent_endpoint: Some("http://agents:4317".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            driver.supervisor_otlp_environment(),
+            [(
+                openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT,
+                "http://agents:4317".to_string()
+            )]
+        );
+
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+            supervisor_gateway_name: Some("prod-west".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            driver.supervisor_otlp_environment(),
+            [(
+                openshell_core::sandbox_env::GATEWAY_NAME,
+                "prod-west".to_string()
+            )]
+        );
+    }
 
     #[tokio::test]
     async fn admission_defaults_reject_driver_config_before_kubernetes_io_in_every_mode() {
@@ -7545,7 +9233,9 @@ mod tests {
             sandbox_api_version: Arc::new(OnceCell::new()),
             lifecycle_gates: Arc::default(),
             config: KubernetesComputeConfig::default(),
+            network_trust_bundle: None,
             operator_allowlist: None,
+            shared_supervisor: None,
         };
         driver
             .sandbox_api_version
@@ -7557,6 +9247,7 @@ mod tests {
         assert!(steps.lock().unwrap().is_empty());
     }
 
+    use crate::sandbox_runtime::{ADDITIONAL_CA_MOUNT_PATH, ADDITIONAL_CA_VOLUME_NAME};
     use openshell_core::progress::{
         PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
         PROGRESS_COMPLETE_STEP_KEY,
@@ -7672,14 +9363,233 @@ mod tests {
         )
     }
 
+    fn network_trust_bundle(gateway_id: &str, digest: &str) -> NetworkSupervisorTrustBundle {
+        NetworkSupervisorTrustBundle::new(
+            b"-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n".to_vec(),
+            1,
+            digest,
+            PathBuf::from(format!("/gateway-state/{gateway_id}.crt")),
+        )
+    }
+
+    #[test]
+    fn destination_trust_config_map_is_immutable_content_addressed_and_retained() {
+        let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let bundle = network_trust_bundle("gateway-a", digest);
+        let expected = network_additional_ca_config_map("workspace-a", "gateway-a", &bundle)
+            .expect("normalized PEM must be valid UTF-8");
+        let name = expected.metadata.name.as_deref().expect("ConfigMap name");
+        assert_eq!(name.len(), 63);
+        assert!(name.starts_with(ADDITIONAL_CA_CONFIG_MAP_PREFIX));
+        assert!(
+            name.bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        );
+        assert_eq!(expected.immutable, Some(true));
+        assert_eq!(expected.metadata.owner_references, None);
+        assert_eq!(
+            expected.metadata.labels.as_ref(),
+            Some(&BTreeMap::from([
+                (
+                    LABEL_MANAGED_BY.to_string(),
+                    LABEL_MANAGED_BY_VALUE.to_string()
+                ),
+                (LABEL_GATEWAY_ID.to_string(), "gateway-a".to_string()),
+            ]))
+        );
+        assert_eq!(
+            expected
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(ANNOTATION_ADDITIONAL_CA_GENERATION)),
+            Some(&digest.to_string())
+        );
+        assert_eq!(
+            expected.data.as_ref(),
+            Some(&BTreeMap::from([(
+                ADDITIONAL_CA_DATA_KEY.to_string(),
+                String::from_utf8(bundle.normalized_pem().to_vec()).unwrap(),
+            )]))
+        );
+        assert_eq!(expected.binary_data, None);
+        assert_ne!(
+            name,
+            network_additional_ca_config_map_name("gateway-b", digest),
+            "gateway identity participates in content addressing"
+        );
+        assert_ne!(
+            name,
+            network_additional_ca_config_map_name("gateway-a", "sha256:other-generation"),
+            "trust generation participates in content addressing"
+        );
+        assert!(validate_network_additional_ca_config_map(&expected, &expected).is_ok());
+    }
+
+    #[test]
+    fn destination_trust_config_map_rejects_same_name_recreation_tampering() {
+        let bundle = network_trust_bundle(
+            "gateway-a",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        let expected = network_additional_ca_config_map("workspace-a", "gateway-a", &bundle)
+            .expect("normalized PEM must be valid UTF-8");
+
+        let mut replaced = expected.clone();
+        replaced.data = Some(BTreeMap::from([(
+            ADDITIONAL_CA_DATA_KEY.to_string(),
+            "not-a-certificate\n".to_string(),
+        )]));
+        assert!(matches!(
+            validate_network_additional_ca_config_map(&replaced, &expected),
+            Err(KubernetesDriverError::Precondition(message))
+                if message.contains("did not retain the exact gateway-normalized trust bundle")
+        ));
+
+        let mut binary_data = expected.clone();
+        binary_data.binary_data = Some(BTreeMap::new());
+        assert!(matches!(
+            validate_network_additional_ca_config_map(&binary_data, &expected),
+            Err(KubernetesDriverError::Precondition(message))
+                if message.contains("did not retain the exact gateway-normalized trust bundle")
+        ));
+
+        let mut wrong_gateway = expected.clone();
+        wrong_gateway
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(LABEL_GATEWAY_ID.to_string(), "other-gateway".to_string());
+        assert!(matches!(
+            validate_network_additional_ca_config_map(&wrong_gateway, &expected),
+            Err(KubernetesDriverError::Precondition(message))
+                if message.contains("is not owned by this gateway")
+        ));
+
+        let mut sandbox_owned = expected.clone();
+        sandbox_owned.metadata.owner_references =
+            Some(vec![sandbox_runtime_sandbox_owner_reference(
+                "sandbox",
+                "sandbox-uid",
+                "agents.x-k8s.io/v1beta1",
+                false,
+            )]);
+        assert!(matches!(
+            validate_network_additional_ca_config_map(&sandbox_owned, &expected),
+            Err(KubernetesDriverError::Precondition(message))
+                if message.contains("is not owned by this gateway")
+        ));
+
+        let mut stale_digest = expected.clone();
+        stale_digest.metadata.annotations.as_mut().unwrap().insert(
+            ANNOTATION_ADDITIONAL_CA_GENERATION.to_string(),
+            "sha256:stale".to_string(),
+        );
+        assert!(matches!(
+            validate_network_additional_ca_config_map(&stale_digest, &expected),
+            Err(KubernetesDriverError::Precondition(message))
+                if message.contains("unexpected trust generation")
+        ));
+    }
+
+    #[test]
+    fn destination_trust_config_map_allows_admission_added_labels() {
+        // A mutating admission webhook may attach organizational labels to
+        // the created ConfigMap. The gateway-owned pairs must still match
+        // exactly, but unrelated labels must not block every later
+        // create/start through the existing-object validation path.
+        let bundle = network_trust_bundle(
+            "gateway-a",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        let expected = network_additional_ca_config_map("workspace-a", "gateway-a", &bundle)
+            .expect("normalized PEM must be valid UTF-8");
+
+        let mut admitted = expected.clone();
+        admitted
+            .metadata
+            .labels
+            .as_mut()
+            .expect("expected ConfigMap has gateway-owned labels")
+            .insert(
+                "org.example/compliance-scan".to_string(),
+                "managed".to_string(),
+            );
+        assert!(
+            validate_network_additional_ca_config_map(&admitted, &expected).is_ok(),
+            "an admission-added organizational label must not reject a correct \
+             ConfigMap"
+        );
+
+        let mut missing_gateway_label = expected.clone();
+        missing_gateway_label
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .remove(&LABEL_GATEWAY_ID.to_string());
+        assert!(matches!(
+            validate_network_additional_ca_config_map(&missing_gateway_label, &expected),
+            Err(KubernetesDriverError::Precondition(message))
+                if message.contains("is not owned by this gateway")
+        ));
+    }
+
     #[test]
     fn boundary_authority_uses_stable_service_dns_name() {
         let names = SandboxRuntimeNames::new("sandbox-1");
 
         assert_eq!(
-            boundary_service_authority("workspace-a", &names, 5500),
+            boundary_service_authority(
+                "workspace-a",
+                &names,
+                5500,
+                KubernetesControlConnection::SupervisorInitiated,
+            ),
             "os-boundary-sandbox-1.workspace-a.svc:5500"
         );
+        assert_eq!(
+            boundary_service_authority(
+                "workspace-a",
+                &names,
+                5500,
+                KubernetesControlConnection::RuntimeInitiated,
+            ),
+            "os-supervisor-sandbox-1.workspace-a.svc:5500"
+        );
+    }
+
+    #[test]
+    fn control_mode_does_not_survive_an_old_gateways_generation_replacement() {
+        let mut object: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {"annotations": {
+                ANNOTATION_SANDBOX_RUNTIME_GENERATION: "new-generation",
+                ANNOTATION_SANDBOX_RUNTIME_CONTROL_GENERATION: "new-generation",
+                ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION: "runtime-initiated",
+            }},
+        }))
+        .unwrap();
+        assert_eq!(
+            sandbox_runtime_control_connection(&object).unwrap(),
+            KubernetesControlConnection::RuntimeInitiated
+        );
+        let annotations = object.metadata.annotations.as_mut().unwrap();
+        annotations.insert(
+            ANNOTATION_SANDBOX_RUNTIME_GENERATION.into(),
+            "old-gateway-generation".into(),
+        );
+        assert_eq!(
+            sandbox_runtime_control_connection(&object).unwrap(),
+            KubernetesControlConnection::SupervisorInitiated
+        );
+        object.metadata.annotations.as_mut().unwrap().insert(
+            ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION.into(),
+            "unknown".into(),
+        );
+        assert!(sandbox_runtime_control_connection(&object).is_err());
     }
 
     #[tokio::test]
@@ -8078,6 +9988,66 @@ mod tests {
             sandbox_id.to_string(),
         )]));
         sandbox
+    }
+
+    #[test]
+    fn only_runnable_shared_generations_keep_their_instances() {
+        let shared = |route: &str, operating_mode: &str, annotations: &[(&str, &str)]| {
+            let mut object = sandbox_object_for_test(route, route);
+            object.data = serde_json::json!({"spec": {"operatingMode": operating_mode}});
+            let mut recorded = BTreeMap::from([
+                (
+                    ANNOTATION_SUPERVISOR_TOPOLOGY.to_string(),
+                    GATEWAY_TOPOLOGY.to_string(),
+                ),
+                (ANNOTATION_SUPERVISOR_SESSION.to_string(), route.to_string()),
+            ]);
+            recorded.extend(
+                annotations
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+            );
+            object.metadata.annotations = Some(recorded);
+            object
+        };
+        let running = "rt-running-route-0001";
+        let stopping = "rt-stopping-route-0001";
+        let stopped = "rt-stopped-route-00001";
+        let mut dedicated = sandbox_object_for_test("dedicated", "dedicated");
+        dedicated.data = serde_json::json!({"spec": {"operatingMode": "Running"}});
+        let sandboxes = [
+            shared(running, "Running", &[]),
+            // A stop in progress still ends its sandbox instance itself.
+            shared(
+                stopping,
+                "Suspended",
+                &[(ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING, "true")],
+            ),
+            shared(stopped, "Suspended", &[]),
+            dedicated,
+        ];
+        let routes = runnable_shared_generations(&sandboxes)
+            .into_iter()
+            .map(|(_, route)| route)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            routes,
+            HashSet::from([running.to_string(), stopping.to_string()])
+        );
+    }
+
+    #[test]
+    fn suspension_completion_forgets_the_generation_placement() {
+        let patch = sandbox_runtime_suspension_completion_patch("7");
+        let annotations = &patch["metadata"]["annotations"];
+        assert!(annotations[ANNOTATION_SUPERVISOR_TOPOLOGY].is_null());
+        assert!(annotations[ANNOTATION_SUPERVISOR_SESSION].is_null());
+        assert!(
+            annotations
+                .as_object()
+                .unwrap()
+                .contains_key(ANNOTATION_SUPERVISOR_SESSION)
+        );
     }
 
     #[test]
@@ -8521,6 +10491,8 @@ mod tests {
             lifecycle_gates: Arc::default(),
             config: KubernetesComputeConfig::default(),
             operator_allowlist: None,
+            shared_supervisor: None,
+            network_trust_bundle: None,
         };
         driver
             .sandbox_api_version
@@ -8612,6 +10584,8 @@ mod tests {
             lifecycle_gates: Arc::default(),
             config: KubernetesComputeConfig::default(),
             operator_allowlist: None,
+            shared_supervisor: None,
+            network_trust_bundle: None,
         };
 
         driver
@@ -8863,6 +10837,23 @@ mod tests {
         let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
 
         assert!(err.contains("unknown field"));
+    }
+
+    #[test]
+    fn sandbox_driver_config_rejects_trusted_runtime_image_overrides() {
+        for field in ["sandbox_runtime_image", "supervisor_image"] {
+            let template = SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    (field): "registry.example.com/openshell/runtime:untrusted"
+                }))),
+                ..Default::default()
+            };
+
+            let error = KubernetesSandboxDriverConfig::from_template(&template)
+                .expect_err("sandbox requests must not select trusted runtime images");
+            assert!(error.contains("unknown field"), "{error}");
+            assert!(error.contains(field), "{error}");
+        }
     }
 
     #[test]
@@ -9235,6 +11226,192 @@ mod tests {
         assert!(err.contains("/var/run/secrets/openshell"));
     }
 
+    fn spec_with_pvc_mount(mount_path: &str, sub_path: Option<&str>) -> SandboxSpec {
+        SandboxSpec {
+            template: Some(SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "volumes": [{
+                        "name": "user-data",
+                        "persistent_volume_claim": {
+                            "claim_name": "pvc-user-data",
+                            "read_only": true
+                        }
+                    }],
+                    "containers": {"agent": {"volume_mounts": [{
+                        "name": "user-data",
+                        "mount_path": mount_path,
+                        "sub_path": sub_path,
+                        "read_only": true
+                    }]}}
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn driver_config_rejects_runtime_control_mounts_with_driver_config_enabled() {
+        for workspace_mode in [
+            WorkspaceMode::Shared,
+            WorkspaceMode::Managed,
+            WorkspaceMode::Operator,
+        ] {
+            let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+                allow_driver_config: true,
+                workspace_mode,
+                ..Default::default()
+            });
+            for mount_path in [
+                "/.openshell",
+                "/.openshell/",
+                SANDBOX_RUNTIME_MOUNT_PATH,
+                "/.openshell/runtime/openshell-sandbox",
+                "/.openshell/runtime/openshell-sandbox/",
+                SANDBOX_STATE_MOUNT_PATH,
+                "/.openshell/state/bootstrap",
+                BOUNDARY_CONFIG_PATH,
+                BOUNDARY_PRIVATE_KEY_PATH,
+                SANDBOX_POD_IDENTITY_MOUNT_PATH,
+                SANDBOX_POD_UID_PATH,
+                crate::sandbox_runtime::SANDBOX_BOOTSTRAP_INPUT_PATH,
+                "/run",
+                "/run/",
+                "/run/custom",
+            ] {
+                for sub_path in [None, Some("payload/runtime")] {
+                    let spec = spec_with_pvc_mount(mount_path, sub_path);
+                    // Rendering must fail before a caller mount can cover a control file.
+                    let error =
+                        sandbox_to_k8s_spec(Some(&spec), &SandboxPodParams::default()).unwrap_err();
+                    assert!(
+                        error.contains("reserved OpenShell path"),
+                        "{mount_path}: {error}"
+                    );
+                    let sandbox = Sandbox {
+                        workspace: "team-a".into(),
+                        name: "custom-mount".into(),
+                        spec: Some(spec),
+                        ..Default::default()
+                    };
+                    let error = driver.validate_sandbox_create(&sandbox).await.unwrap_err();
+                    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+                    assert!(error.message().contains("reserved OpenShell path"));
+                    // Shared-mode provisioning reaches validation without namespace creation.
+                    if workspace_mode == WorkspaceMode::Shared {
+                        assert!(matches!(
+                            Box::pin(driver.create_sandbox_inner(&sandbox)).await,
+                            Err(KubernetesDriverError::InvalidArgument(message))
+                                if message.contains("reserved OpenShell path")
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn driver_config_renders_non_control_pvc_mounts() {
+        for mount_path in [
+            "/data",
+            "/sandbox/.openshell/workspace",
+            "/.openshell-data",
+            "/runner",
+        ] {
+            let spec = spec_with_pvc_mount(mount_path, Some("payload/data"));
+            let rendered = sandbox_to_k8s_spec(Some(&spec), &SandboxPodParams::default()).unwrap();
+            let agent = rendered["spec"]["podTemplate"]["spec"]["containers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|container| container["name"] == "agent")
+                .unwrap();
+            assert!(
+                agent["volumeMounts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|mount| {
+                        mount["name"] == "user-data"
+                            && mount["mountPath"] == mount_path
+                            && mount["subPath"] == "payload/data"
+                            && mount["readOnly"] == true
+                    }),
+                "caller data mount missing: {mount_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_runtime_control_mounts_are_protected_from_caller_mounts() {
+        let rendered = sandbox_to_k8s_spec(None, &SandboxPodParams::default()).unwrap();
+        let pod = &rendered["spec"]["podTemplate"]["spec"];
+        for container in pod["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(pod["initContainers"].as_array().unwrap())
+        {
+            for mount in container["volumeMounts"].as_array().unwrap() {
+                // Workspace data deliberately permits caller mounts below /sandbox.
+                if mount["name"] == WORKSPACE_VOLUME_NAME {
+                    continue;
+                }
+                let target = mount["mountPath"].as_str().unwrap();
+                assert!(
+                    KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS.iter().any(|root| {
+                        driver_mounts::path_is_or_under(Path::new(target), Path::new(root))
+                    }),
+                    "driver-managed control mount lacks a protected root: {target}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_rejects_saved_control_mounts_even_when_resource_admission_is_disabled() {
+        let spec = spec_with_pvc_mount("/data", Some("payload/data"));
+        let rendered = sandbox_to_k8s_spec(Some(&spec), &SandboxPodParams::default()).unwrap();
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut saved = DynamicObject::new("saved-mount", &resource);
+        saved.data = rendered;
+        validate_stored_kubernetes_pvc_mounts(&saved.data["spec"]["podTemplate"]["spec"]).unwrap();
+        for enabled in [true, false] {
+            let mut config = KubernetesComputeConfig {
+                allow_driver_config: true,
+                ..Default::default()
+            };
+            config.resource_admission.enabled = enabled;
+            let driver = KubernetesComputeDriver::new_for_test(config);
+            for target in [
+                "/.openshell/runtime/openshell-sandbox",
+                BOUNDARY_CONFIG_PATH,
+                "/run/custom",
+            ] {
+                let agent = saved.data["spec"]["podTemplate"]["spec"]["containers"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|container| container["name"] == "agent")
+                    .unwrap();
+                let mount = agent["volumeMounts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|mount| mount["name"] == "user-data")
+                    .unwrap();
+                mount["mountPath"] = target.into();
+                let error = driver.admit_stored_resources(&saved).await.unwrap_err();
+                assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+                assert!(error.message().contains("reserved OpenShell path"));
+            }
+        }
+    }
+
     #[test]
     fn driver_config_allows_spiffe_workload_path_without_provider_spiffe() {
         let spec = SandboxSpec {
@@ -9444,6 +11621,80 @@ mod tests {
         assert!(err.message().contains("gpu count must be greater than 0"));
     }
 
+    fn template_with_pod_annotations(keys: &[&str]) -> SandboxTemplate {
+        let annotations: serde_json::Map<_, _> = keys
+            .iter()
+            .map(|key| ((*key).to_string(), "v".into()))
+            .collect();
+        SandboxTemplate {
+            platform_config: Some(json_struct(
+                serde_json::json!({ "annotations": annotations }),
+            )),
+            ..SandboxTemplate::default()
+        }
+    }
+
+    fn template_with_pod_labels(keys: &[&str]) -> SandboxTemplate {
+        SandboxTemplate {
+            labels: keys
+                .iter()
+                .map(|key| ((*key).to_string(), "v".to_string()))
+                .collect(),
+            ..SandboxTemplate::default()
+        }
+    }
+
+    #[test]
+    fn validate_pod_metadata_reports_keys_outside_allowlists() {
+        let config = KubernetesComputeConfig {
+            allowed_pod_annotations: vec!["example.com/*".into()],
+            allowed_pod_labels: vec!["app".into()],
+            ..KubernetesComputeConfig::default()
+        };
+        validate_pod_metadata(&SandboxTemplate::default(), &config).unwrap();
+        validate_pod_metadata(&template_with_pod_annotations(&["example.com/a"]), &config).unwrap();
+        validate_pod_metadata(&template_with_pod_labels(&["app"]), &config).unwrap();
+
+        let template =
+            template_with_pod_annotations(&["example.com/a", "sub.example.com/a", "other.net/a"]);
+        let err = validate_pod_metadata(&template, &config).unwrap_err();
+        assert!(
+            err.ends_with("allowed_pod_annotations: other.net/a, sub.example.com/a"),
+            "{err}"
+        );
+
+        let template = template_with_pod_labels(&["app", "team", "openshell.ai/managed-by"]);
+        let err = validate_pod_metadata(&template, &config).unwrap_err();
+        assert!(
+            err.ends_with("allowed_pod_labels: openshell.ai/managed-by, team"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_disallowed_pod_metadata() {
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+        for (template, key) in [
+            (
+                template_with_pod_annotations(&["example.com/owner"]),
+                "example.com/owner",
+            ),
+            (template_with_pod_labels(&["app"]), "app"),
+        ] {
+            let sandbox = Sandbox {
+                spec: Some(SandboxSpec {
+                    template: Some(template),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(matches!(
+                Box::pin(driver.create_sandbox_inner(&sandbox)).await,
+                Err(KubernetesDriverError::InvalidArgument(message)) if message.contains(key)
+            ));
+        }
+    }
+
     #[test]
     fn kube_pulling_event_adds_image_progress_metadata() {
         let mut metadata = std::collections::HashMap::new();
@@ -9616,6 +11867,33 @@ mod tests {
         );
 
         let volumes = pod_template["spec"]["volumes"].as_array().unwrap();
+        assert!(
+            !volumes
+                .iter()
+                .any(|volume| volume["name"] == ADDITIONAL_CA_VOLUME_NAME),
+            "destination trust is exclusive to the separate supervisor Pod"
+        );
+        for container in pod_template["spec"]["containers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(
+                pod_template["spec"]["initContainers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten(),
+            )
+        {
+            assert!(
+                !container["volumeMounts"].as_array().is_some_and(|mounts| {
+                    mounts.iter().any(|mount| {
+                        mount["name"] == ADDITIONAL_CA_VOLUME_NAME
+                            || mount["mountPath"] == ADDITIONAL_CA_MOUNT_PATH
+                    })
+                }),
+                "destination trust leaked into a workload or init container: {container:#?}"
+            );
+        }
         let pod_identity = volumes
             .iter()
             .find(|volume| volume["name"] == SANDBOX_POD_IDENTITY_VOLUME_NAME)
@@ -11073,7 +13351,9 @@ mod tests {
             sandbox_api_version: Arc::new(OnceCell::new()),
             lifecycle_gates: Arc::default(),
             config,
+            network_trust_bundle: None,
             operator_allowlist: None,
+            shared_supervisor: None,
         };
         (driver, steps, bodies)
     }
@@ -11098,6 +13378,370 @@ mod tests {
             client_tls_secret_name: "openshell-client-tls".into(),
             ..Default::default()
         }
+    }
+
+    async fn call_ensure_workspace(
+        service: &crate::ComputeDriverService,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::EnsureWorkspaceResponse>,
+        tonic::Status,
+    > {
+        openshell_core::proto::compute::v1::compute_driver_server::ComputeDriver::ensure_workspace(
+            service,
+            tonic::Request::new(openshell_core::proto::compute::v1::EnsureWorkspaceRequest {
+                workspace: "team-a".into(),
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn managed_openshift_namespace_waits_for_allocator_without_copying_annotations() {
+        let namespace = "openshell-gateway-a-team-a";
+        let gateway_namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "openshell",
+                "annotations": {
+                    "openshift.io/sa.scc.mcs": "s0:c1,c2",
+                    "openshift.io/sa.scc.uid-range": "1000000000/10000",
+                    "openshift.io/sa.scc.supplemental-groups": "1000000000/10000"
+                }
+            }
+        });
+        let pending_namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": namespace}
+        });
+        let allocated_namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": namespace,
+                "annotations": {
+                    "openshift.io/sa.scc.mcs": "s0:c3,c4",
+                    "openshift.io/sa.scc.uid-range": "1000000001/10000",
+                    "openshift.io/sa.scc.supplemental-groups": "1000000001/10000"
+                }
+            }
+        });
+        for allocated_on_create in [true, false] {
+            let mut steps = vec![
+                (
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell",
+                    kube_test_response(http::StatusCode::OK, gateway_namespace.clone()),
+                ),
+                (
+                    http::Method::POST,
+                    "/api/v1/namespaces",
+                    kube_test_response(
+                        http::StatusCode::CREATED,
+                        if allocated_on_create {
+                            allocated_namespace.clone()
+                        } else {
+                            pending_namespace.clone()
+                        },
+                    ),
+                ),
+            ];
+            if !allocated_on_create {
+                steps.push((
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell-gateway-a-team-a",
+                    kube_test_response(http::StatusCode::OK, allocated_namespace.clone()),
+                ));
+            }
+            steps.push((
+                http::Method::POST,
+                "/api/v1/namespaces/openshell-gateway-a-team-a/serviceaccounts",
+                kube_test_response(
+                    http::StatusCode::CREATED,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ServiceAccount",
+                        "metadata": {"name": "default", "namespace": namespace}
+                    }),
+                ),
+            ));
+            let (driver, steps, bodies) = scripted_driver(managed_config(&[]), steps);
+
+            assert_eq!(driver.ensure_namespace("team-a").await.unwrap(), namespace);
+            assert!(steps.lock().unwrap().is_empty());
+            assert_eq!(
+                bodies.lock().unwrap()[0]["metadata"].get("annotations"),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_workspace_rejects_existing_uid_range_without_mcs() {
+        let namespace = "openshell-gateway-a-team-a";
+        let gateway_namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "openshell",
+                "annotations": {
+                    "openshift.io/sa.scc.mcs": "s0:c1,c2",
+                    "openshift.io/sa.scc.uid-range": "1000000000/10000",
+                    "openshift.io/sa.scc.supplemental-groups": "1000000000/10000"
+                }
+            }
+        });
+        let existing_namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": namespace,
+                "labels": {
+                    "openshell.ai/managed-by": "openshell",
+                    "openshell.ai/gateway-id": "gateway-a",
+                    "openshell.ai/sandbox-workspace": "team-a"
+                },
+                "annotations": {
+                    "openshift.io/sa.scc.uid-range": "1000000001/10000",
+                    "openshift.io/sa.scc.supplemental-groups": "1000000001/10000"
+                }
+            }
+        });
+        let (driver, steps, _) = scripted_driver(
+            managed_config(&[]),
+            vec![
+                (
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell",
+                    kube_test_response(http::StatusCode::OK, gateway_namespace),
+                ),
+                (
+                    http::Method::POST,
+                    "/api/v1/namespaces",
+                    kube_test_response(
+                        http::StatusCode::CONFLICT,
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "status": "Failure",
+                            "reason": "AlreadyExists",
+                            "message": format!("namespaces {namespace:?} already exists"),
+                            "code": 409
+                        }),
+                    ),
+                ),
+                (
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell-gateway-a-team-a",
+                    kube_test_response(http::StatusCode::OK, existing_namespace),
+                ),
+            ],
+        );
+
+        let service = crate::ComputeDriverService::new(driver);
+
+        let error = call_ensure_workspace(&service)
+            .await
+            .expect_err("a stale OpenShift namespace should be a permanent precondition failure");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("MCS") && error.message().contains("recreate"));
+        assert!(steps.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ensure_workspace_keeps_namespace_setup_failures_internal() {
+        let gateway_namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "openshell",
+                "annotations": {"openshift.io/sa.scc.uid-range": "1000000000/10000"}
+            }
+        });
+        for steps in [
+            vec![(
+                http::Method::GET,
+                "/api/v1/namespaces/openshell",
+                kube_test_not_found("namespaces", "openshell"),
+            )],
+            vec![
+                (
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell",
+                    kube_test_response(http::StatusCode::OK, gateway_namespace),
+                ),
+                (
+                    http::Method::POST,
+                    "/api/v1/namespaces",
+                    kube_test_response(
+                        http::StatusCode::CREATED,
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Namespace",
+                            "metadata": {"name": "openshell-gateway-a-team-a"}
+                        }),
+                    ),
+                ),
+                (
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell-gateway-a-team-a",
+                    kube_test_not_found("namespaces", "openshell-gateway-a-team-a"),
+                ),
+            ],
+        ] {
+            let (driver, steps, _) = scripted_driver(managed_config(&[]), steps);
+            let service = crate::ComputeDriverService::new(driver);
+
+            let error = call_ensure_workspace(&service)
+                .await
+                .expect_err("namespace setup failures should remain internal");
+
+            assert_eq!(error.code(), tonic::Code::Internal);
+            assert!(steps.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_workspace_reports_scc_allocator_timeout_as_internal() {
+        let namespace = "openshell-gateway-a-team-a";
+        let gateway_namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "openshell",
+                "annotations": {
+                    "openshift.io/sa.scc.uid-range": "1000000000/10000"
+                }
+            }
+        });
+        let pending_namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": namespace}
+        });
+        for stalled_get in [false, true] {
+            let gateway_namespace = gateway_namespace.clone();
+            let pending_namespace = pending_namespace.clone();
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let service_reads = reads.clone();
+            let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                let gateway_namespace = gateway_namespace.clone();
+                let pending_namespace = pending_namespace.clone();
+                let reads = service_reads.clone();
+                async move {
+                    let response = match (request.method(), request.uri().path()) {
+                        (&http::Method::GET, "/api/v1/namespaces/openshell") => {
+                            kube_test_response(http::StatusCode::OK, gateway_namespace)
+                        }
+                        (&http::Method::POST, "/api/v1/namespaces") => {
+                            kube_test_response(http::StatusCode::CREATED, pending_namespace)
+                        }
+                        (&http::Method::GET, "/api/v1/namespaces/openshell-gateway-a-team-a") => {
+                            reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if stalled_get {
+                                std::future::pending::<()>().await;
+                            }
+                            kube_test_response(http::StatusCode::OK, pending_namespace)
+                        }
+                        unexpected => panic!("unexpected Kubernetes API request: {unexpected:?}"),
+                    };
+                    Ok::<_, std::convert::Infallible>(response)
+                }
+            });
+            let client = Client::new(service, "openshell");
+            let driver = KubernetesComputeDriver {
+                client: client.clone(),
+                watch_client: client,
+                sandbox_api_version: Arc::new(OnceCell::new()),
+                lifecycle_gates: Arc::default(),
+                config: managed_config(&[]),
+                network_trust_bundle: None,
+                operator_allowlist: None,
+                shared_supervisor: None,
+            };
+            let service = crate::ComputeDriverService::new(driver);
+
+            let error = call_ensure_workspace(&service)
+                .await
+                .expect_err("allocator timeout should remain a retryable setup failure");
+
+            assert_eq!(error.code(), tonic::Code::Internal);
+            assert!(error.message().contains("timed out"));
+            let reads = reads.load(std::sync::atomic::Ordering::Relaxed);
+            if stalled_get {
+                assert_eq!(reads, 1);
+            } else {
+                assert!(reads > 1);
+            }
+        }
+    }
+
+    fn operator_driver_with_allowlist(
+        allowlist: OperatorNamespaceAllowlist,
+    ) -> crate::ComputeDriverService {
+        let mut driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Operator,
+            operator_namespace_label: Some("openshell.ai/workspace=true".into()),
+            ..Default::default()
+        });
+        driver.operator_allowlist = Some(allowlist);
+        crate::ComputeDriverService::new(driver)
+    }
+
+    #[tokio::test]
+    async fn ensure_workspace_waits_for_operator_allowlist_initial_listing() {
+        let allowlist = OperatorNamespaceAllowlist::new();
+        let service = operator_driver_with_allowlist(allowlist.clone());
+
+        let request = tokio::spawn(async move { call_ensure_workspace(&service).await });
+        tokio::task::yield_now().await;
+        allowlist.replace(BTreeSet::from(["team-a".to_string()]));
+
+        request
+            .await
+            .unwrap()
+            .expect("a labeled workspace should be accepted once the listing arrives");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_workspace_reports_unlisted_operator_allowlist_unavailable() {
+        let service = operator_driver_with_allowlist(OperatorNamespaceAllowlist::new());
+
+        let error = call_ensure_workspace(&service)
+            .await
+            .expect_err("an allowlist without its first listing cannot admit the workspace");
+
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn ensure_workspace_denies_workspace_missing_from_listed_operator_allowlist() {
+        let allowlist = OperatorNamespaceAllowlist::new();
+        allowlist.replace(BTreeSet::from(["team-b".to_string()]));
+        let service = operator_driver_with_allowlist(allowlist);
+
+        let error = call_ensure_workspace(&service)
+            .await
+            .expect_err("an unlabeled workspace should stay denied");
+
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn unreadable_operator_namespace_file_leaves_a_listed_empty_allowlist() {
+        let path = std::env::temp_dir().join(format!(
+            "openshell-missing-namespaces-{}.json",
+            std::process::id()
+        ));
+        let allowlist = OperatorNamespaceAllowlist::new();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        spawn_namespace_file_watcher(path, allowlist.clone(), shutdown_rx);
+
+        assert!(allowlist.is_synced());
+        assert!(allowlist.read().is_empty());
     }
 
     #[tokio::test]
@@ -11154,12 +13798,32 @@ mod tests {
     #[test]
     fn restart_template_references_the_generation_image_pull_secrets() {
         let volumes = vec![serde_json::json!({"name": "bootstrap"})];
-        let spec = restart_pod_template_spec(&volumes, &["os-pull-sandbox-1-gen7-0".to_string()]);
+        let init_containers = vec![serde_json::json!({"name": SANDBOX_BOOTSTRAP_CONTAINER_NAME})];
+        let spec = restart_pod_template_spec(
+            &volumes,
+            &init_containers,
+            &["os-pull-sandbox-1-gen7-0".to_string()],
+        );
         assert_eq!(spec["volumes"], serde_json::json!(volumes));
+        assert_eq!(spec["initContainers"], serde_json::json!(init_containers));
         assert_eq!(
             spec["imagePullSecrets"],
             serde_json::json!([{"name": "os-pull-sandbox-1-gen7-0"}])
         );
+    }
+
+    #[test]
+    fn restart_rerenders_stored_bootstrap_init_container() {
+        let workspace_init = serde_json::json!({"name": WORKSPACE_INIT_CONTAINER_NAME});
+        let mut init_containers = vec![
+            serde_json::json!({"name": "openshell-sandbox-bootstrap", "image": "sandbox:0.1.2"}),
+            workspace_init.clone(),
+        ];
+        let bootstrap = sandbox_bootstrap_init_container("sandbox:0.1.3", None, 1500, 1500);
+
+        replace_sandbox_bootstrap_init_container(&mut init_containers, bootstrap.clone()).unwrap();
+
+        assert_eq!(init_containers, vec![bootstrap, workspace_init]);
     }
 
     #[tokio::test]

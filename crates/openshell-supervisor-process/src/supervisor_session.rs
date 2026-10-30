@@ -10,18 +10,26 @@
 //! and bridges bytes. The supervisor is a dumb byte bridge after target
 //! selection — it has no protocol awareness of the bytes flowing through.
 
+#[cfg(test)]
+use openshell_sandbox_backend::test_support as rpc_test;
+
+use openshell_sandbox_backend::BoundaryLoopbackConnector;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use openshell_core::grpc_client::SettingsPollResult;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    FinalizeMainProcessExitRequest, GatewayMessage, RelayFrame, RelayInit, RelayOpen,
-    RelayOpenResult, ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello,
-    SupervisorMessage, TcpRelayTarget, gateway_message, relay_open, supervisor_message,
+    ConfigApplyFailure, ConfigApplyOutcome, ConfigSnapshotRevision, ConfigUpdate,
+    ConfigUpdateResult, ConfigurationAdmissionState, FinalizeMainProcessExitRequest,
+    GatewayMessage, RelayFrame, RelayInit, RelayOpen, RelayOpenResult,
+    ReportMainProcessExitRequest, SandboxConfigRevision, SandboxConfigurationAdmission,
+    SupervisorHeartbeat, SupervisorHello, SupervisorMessage, TcpRelayTarget,
+    config_snapshot_revision, gateway_message, relay_open, supervisor_message,
 };
-use openshell_isolation_interface::contract::{BoundaryLoopbackConnector, LoopbackTarget};
+use openshell_isolation_interface::contract::LoopbackTarget;
 use openshell_ocsf::{
     ActivityId, BaseEventBuilder, ConnectionInfo, Endpoint, EventContext, NetworkActivityBuilder,
     OcsfEvent, SeverityId, StatusId, ocsf_emit,
@@ -29,13 +37,86 @@ use openshell_ocsf::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use openshell_core::grpc_client;
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const CONFIG_APPLY_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// A stream-delivered configuration update awaiting application by the
+/// supervisor runtime, including a session's bootstrap. The response travels
+/// back over `ConnectSupervisor`.
+pub struct ConfigApplyRequest {
+    pub update: ConfigUpdate,
+    pub response: tokio::sync::oneshot::Sender<ConfigUpdateResult>,
+}
+
+/// Revision token the gateway correlates with a sandbox configuration result.
+pub fn sandbox_config_revision(snapshot: &SettingsPollResult) -> ConfigSnapshotRevision {
+    ConfigSnapshotRevision {
+        component: Some(config_snapshot_revision::Component::SandboxConfig(
+            SandboxConfigRevision {
+                config_revision: snapshot.config_revision,
+                policy_version: snapshot.version,
+                policy_source: snapshot.policy_source.into(),
+                global_policy_version: snapshot.global_policy_version,
+                settings_revision: snapshot.settings_revision,
+            },
+        )),
+    }
+}
+
+/// Sanitized failure for a configuration update result. The message is
+/// bounded for the wire.
+pub fn config_apply_failure(code: &str, message: &str, retryable: bool) -> ConfigApplyFailure {
+    ConfigApplyFailure {
+        code: code.to_string(),
+        message: message.chars().take(1024).collect(),
+        retryable,
+    }
+}
+
+/// Admission for a sandbox configuration snapshot. Only a gateway-admitted
+/// snapshot that the runtime activated is accepted.
+pub fn config_admission(
+    snapshot: &SettingsPollResult,
+    activated: bool,
+) -> SandboxConfigurationAdmission {
+    let accepted = snapshot.configuration_admitted && activated;
+    SandboxConfigurationAdmission {
+        instance_id: snapshot.configuration_instance_id.clone(),
+        state: if accepted {
+            ConfigurationAdmissionState::Accepted.into()
+        } else {
+            ConfigurationAdmissionState::Rejected.into()
+        },
+        policy_version: snapshot.version,
+        policy_hash: snapshot.policy_hash.clone(),
+        config_revision: snapshot.config_revision,
+        provider_env_revision: snapshot.provider_env_revision,
+        error: if accepted {
+            String::new()
+        } else if snapshot.configuration_error.is_empty() {
+            "effective configuration could not be activated".to_string()
+        } else {
+            snapshot.configuration_error.clone()
+        },
+    }
+}
+
+/// Result for an update the runtime did not apply.
+fn unapplied_update(update_id: String, code: &str, message: &str) -> ConfigUpdateResult {
+    ConfigUpdateResult {
+        update_id,
+        outcome: ConfigApplyOutcome::Unsupported.into(),
+        failure: Some(config_apply_failure(code, message, false)),
+        admission: None,
+        policy_load: None,
+    }
+}
 
 /// Runtime identity and status channel shared with a supervisor session task.
 pub struct SessionRuntimeContext {
@@ -43,6 +124,11 @@ pub struct SessionRuntimeContext {
     pub instance_id: String,
     /// Publishes the currently accepted gateway session to sibling reporters.
     pub session_id_updates: Option<watch::Sender<Option<String>>>,
+    /// Applies streamed configuration updates to the running supervisor.
+    pub config_apply_tx: mpsc::Sender<ConfigApplyRequest>,
+    /// Publishes whether the current session pushes configuration, so the
+    /// runtime stops polling while it does.
+    pub config_push_updates: watch::Sender<bool>,
 }
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
@@ -295,16 +381,16 @@ fn map_session_stream_message<T>(
 /// The task runs for the lifetime of the sandbox process, reconnecting with
 /// exponential backoff on failures.
 pub fn spawn(
-    endpoint: String,
+    gateway: grpc_client::GatewayEndpoint,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
-    port_forward: Arc<dyn BoundaryLoopbackConnector>,
+    port_forward: Arc<BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     runtime: SessionRuntimeContext,
 ) -> tokio::task::JoinHandle<()> {
     spawn_with_readiness(
-        endpoint,
+        gateway,
         sandbox_id,
         ssh_socket_path,
         port_forward,
@@ -317,17 +403,17 @@ pub fn spawn(
 
 /// Spawn the supervisor session and expose when the gateway has accepted it.
 pub fn spawn_with_readiness(
-    endpoint: String,
+    gateway: grpc_client::GatewayEndpoint,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
-    port_forward: Arc<dyn BoundaryLoopbackConnector>,
+    port_forward: Arc<BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     runtime: SessionRuntimeContext,
 ) -> (tokio::task::JoinHandle<()>, watch::Receiver<bool>) {
     let (ready_tx, ready_rx) = watch::channel(false);
     let config = SessionConfig {
-        endpoint,
+        gateway,
         sandbox_id,
         ssh_socket_path,
         port_forward,
@@ -335,74 +421,181 @@ pub fn spawn_with_readiness(
         terminating,
         instance_id: runtime.instance_id,
         session_id_updates: runtime.session_id_updates,
+        config_apply_tx: runtime.config_apply_tx,
+        config_push_updates: runtime.config_push_updates,
         ready_tx,
     };
     (tokio::spawn(run_session_loop(config)), ready_rx)
 }
 
 struct SessionConfig {
-    endpoint: String,
+    gateway: grpc_client::GatewayEndpoint,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
-    port_forward: Arc<dyn BoundaryLoopbackConnector>,
+    port_forward: Arc<BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
     /// Publishes the currently accepted session to sibling control-plane reporters.
     session_id_updates: Option<watch::Sender<Option<String>>>,
+    config_apply_tx: mpsc::Sender<ConfigApplyRequest>,
+    /// Publishes whether the current session pushes configuration. A
+    /// reconnect to a gateway that does not push resumes polling.
+    config_push_updates: watch::Sender<bool>,
     ready_tx: watch::Sender<bool>,
 }
 
 async fn run_session_loop(config: SessionConfig) {
-    let mut backoff = INITIAL_BACKOFF;
+    let mut backoff = ReconnectBackoff::new();
     let mut attempt: u64 = 0;
+
+    // The gateway may hand this sandbox to the replica that should own it. We
+    // dial `target` for the next attempt and mark it as redirected so that
+    // replica serves us rather than redirecting again. Any failure sends us
+    // back to the configured address, which load-balances across replicas.
+    let mut target = config.gateway.clone();
+    let mut redirected = false;
 
     loop {
         attempt += 1;
 
-        let result = run_single_session(&config, attempt).await;
+        let result = run_single_session(&config, &target, redirected, attempt).await;
         if let Some(updates) = &config.session_id_updates {
             updates.send_replace(None);
         }
         match result {
-            Ok(()) => {
+            Ok(SessionOutcome::Closed) => {
                 config.ready_tx.send_replace(false);
                 let event = session_closed_event(
-                    openshell_ocsf::ctx::ctx(),
-                    &config.endpoint,
+                    &openshell_ocsf::ctx::ctx(),
+                    target.url(),
                     &config.sandbox_id,
                 );
                 ocsf_emit!(event);
                 break;
             }
+            Ok(SessionOutcome::Redirect {
+                peer_endpoint,
+                owner_replica_id,
+            }) => {
+                backoff.on_redirect(config.ready_tx.send_replace(false));
+                info!(
+                    sandbox_id = %config.sandbox_id,
+                    owner_replica_id = %owner_replica_id,
+                    peer_endpoint = %peer_endpoint,
+                    "supervisor session: following gateway redirect"
+                );
+                target = config.gateway.with_url(peer_endpoint);
+                redirected = true;
+                // No backoff: this is an expected handoff, not a failure.
+            }
             Err(e) => {
-                config.ready_tx.send_replace(false);
+                let accepted = config.ready_tx.send_replace(false);
                 let event = session_failed_event(
-                    openshell_ocsf::ctx::ctx(),
-                    &config.endpoint,
+                    &openshell_ocsf::ctx::ctx(),
+                    target.url(),
                     attempt,
                     &e.to_string(),
                 );
                 ocsf_emit!(event);
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                // Fall back to the configured gateway address so a redirect
+                // to a replica that is going away cannot strand the sandbox.
+                let failed_redirect_target = target.url() != config.gateway.url() && !accepted;
+                target.clone_from(&config.gateway);
+                redirected = redirect_survives_failure(redirected, accepted);
+                if let Some(delay) = backoff.on_failure(accepted, failed_redirect_target) {
+                    tokio::time::sleep(delay).await;
+                }
             }
         }
     }
 }
 
+/// Reconnect delays for the supervisor session loop.
+///
+/// Delays double up to [`MAX_BACKOFF`] while reconnects keep failing. A session
+/// the gateway accepted proves the path works again, so its loss starts the
+/// delays over. Without that reset, every gateway restart over the sandbox's
+/// lifetime would compound until each reconnect waited the full maximum.
+#[derive(Debug)]
+struct ReconnectBackoff {
+    delay: Duration,
+    skipped_since_accept: bool,
+}
+
+impl ReconnectBackoff {
+    fn new() -> Self {
+        Self {
+            delay: INITIAL_BACKOFF,
+            skipped_since_accept: false,
+        }
+    }
+
+    /// Record a gateway redirect. Following it is an expected handoff, so the
+    /// supervisor reconnects without waiting.
+    fn on_redirect(&mut self, accepted: bool) {
+        if accepted {
+            *self = Self::new();
+        }
+    }
+
+    /// Record a failed or dropped session and return how long to wait before
+    /// the next attempt, or `None` to reconnect at once.
+    fn on_failure(&mut self, accepted: bool, failed_redirect_target: bool) -> Option<Duration> {
+        if accepted {
+            *self = Self::new();
+        }
+        if skip_backoff(failed_redirect_target, self.skipped_since_accept) {
+            self.skipped_since_accept = true;
+            return None;
+        }
+        let delay = self.delay;
+        self.delay = (self.delay * 2).min(MAX_BACKOFF);
+        Some(delay)
+    }
+}
+
+/// Keep asking not to be redirected when a redirected attempt never got a
+/// session, so a stale ring pointing at a dead replica cannot bounce us back
+/// to it. A session that was accepted and later dropped starts placement over.
+fn redirect_survives_failure(redirected: bool, accepted: bool) -> bool {
+    redirected && !accepted
+}
+
+/// A failed redirect target goes straight back to the configured endpoint, but
+/// only once until a session is accepted, so a draining gateway and a dead
+/// target cannot bounce the supervisor without backing off.
+fn skip_backoff(failed_redirect_target: bool, skipped_since_accept: bool) -> bool {
+    failed_redirect_target && !skipped_since_accept
+}
+
+/// How a session ended, when it ended without an error.
+enum SessionOutcome {
+    /// The gateway closed the session normally.
+    Closed,
+    /// The gateway declined to own this sandbox and named the replica that
+    /// should. The caller reconnects there once.
+    Redirect {
+        peer_endpoint: String,
+        owner_replica_id: String,
+    },
+}
+
 async fn run_single_session(
     config: &SessionConfig,
+    target: &grpc_client::GatewayEndpoint,
+    redirected: bool,
     connection_epoch: u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<SessionOutcome, Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
     // every relay rides the same TCP+TLS+HTTP/2 connection — no new TLS
     // handshake per relay.
-    let channel = grpc_client::connect_channel_pub(&config.endpoint)
+    let channel = grpc_client::connect_channel_pub(target)
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
-    let mut client = OpenShellClient::new(channel.clone());
+    let mut client = OpenShellClient::new(channel.clone())
+        .max_decoding_message_size(grpc_client::MAX_SUPERVISOR_STREAM_MESSAGE_BYTES);
 
     // Create the outbound message stream.
     let (tx, rx) = mpsc::channel::<SupervisorMessage>(64);
@@ -415,6 +608,9 @@ async fn run_single_session(
             instance_id: config.instance_id.clone(),
             connection_epoch,
             supports_provider_readiness: true,
+            redirected,
+            supports_session_redirect: true,
+            supports_config_push: true,
         })),
     })
     .await
@@ -438,7 +634,31 @@ async fn run_single_session(
         Some(gateway_message::Payload::SessionRejected(r)) => {
             return Err(format!("session rejected: {}", r.reason).into());
         }
+        Some(gateway_message::Payload::SessionRedirect(r)) => {
+            return Ok(SessionOutcome::Redirect {
+                peer_endpoint: r.peer_endpoint,
+                owner_replica_id: r.owner_replica_id,
+            });
+        }
         _ => return Err("expected SessionAccepted or SessionRejected".into()),
+    };
+    let bootstrap = if accepted.config_push_enabled {
+        let bootstrap = accepted
+            .bootstrap
+            .ok_or("gateway enabled config push without a bootstrap")?;
+        info!(
+            sandbox_id = %config.sandbox_id,
+            session_id = %accepted.session_id,
+            "supervisor session: gateway pushes configuration over the session"
+        );
+        Some(bootstrap)
+    } else {
+        debug!(
+            sandbox_id = %config.sandbox_id,
+            session_id = %accepted.session_id,
+            "supervisor session: gateway did not enable streamed configuration; polling remains active"
+        );
+        None
     };
 
     let heartbeat_secs = accepted
@@ -450,13 +670,25 @@ async fn run_single_session(
         updates.send_replace(Some(accepted.session_id.clone()));
     }
     let event = session_established_event(
-        openshell_ocsf::ctx::ctx(),
-        &config.endpoint,
+        &openshell_ocsf::ctx::ctx(),
+        target.url(),
         &accepted.session_id,
         u32::try_from(heartbeat_secs).unwrap_or(u32::MAX),
     );
     ocsf_emit!(event);
     config.ready_tx.send_replace(true);
+
+    // The runtime stops polling while this session pushes configuration, and
+    // applies the bootstrap as an ordinary update.
+    config
+        .config_push_updates
+        .send_replace(accepted.config_push_enabled);
+    let config_apply_tx = accepted
+        .config_push_enabled
+        .then_some(&config.config_apply_tx);
+    if let (Some(apply_tx), Some(bootstrap)) = (config_apply_tx, bootstrap) {
+        spawn_config_apply(apply_tx.clone(), bootstrap, tx.clone(), &config.sandbox_id);
+    }
 
     // Main loop: receive gateway messages + send heartbeats.
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));
@@ -471,8 +703,19 @@ async fn run_single_session(
                     &config.terminating,
                 )? {
                     SessionStreamMessage::Message(msg) => msg,
-                    SessionStreamMessage::ExpectedShutdownClose => return Ok(()),
+                    SessionStreamMessage::ExpectedShutdownClose => {
+                        return Ok(SessionOutcome::Closed);
+                    }
                 };
+                if let Some(gateway_message::Payload::SessionRedirect(r)) = &msg.payload {
+                    if supervisor_is_terminating(&config.terminating) {
+                        return Ok(SessionOutcome::Closed);
+                    }
+                    return Ok(SessionOutcome::Redirect {
+                        peer_endpoint: r.peer_endpoint.clone(),
+                        owner_replica_id: r.owner_replica_id.clone(),
+                    });
+                }
                 let context = GatewayMessageContext {
                     sandbox_id: &config.sandbox_id,
                     ssh_socket_path: &config.ssh_socket_path,
@@ -481,11 +724,9 @@ async fn run_single_session(
                     channel: &channel,
                     tx: &tx,
                     terminating: &config.terminating,
+                    config_apply_tx,
                 };
-                handle_gateway_message(
-                    &msg,
-                    &context,
-                );
+                handle_gateway_message(&msg, &context);
             }
             _ = heartbeat_interval.tick() => {
                 let hb = SupervisorMessage {
@@ -501,14 +742,80 @@ async fn run_single_session(
     }
 }
 
+/// Apply one delivered update in the background and send its result. The
+/// gateway sends the next update only after this one's result, so updates
+/// reach the runtime in order.
+fn spawn_config_apply(
+    apply_tx: mpsc::Sender<ConfigApplyRequest>,
+    update: ConfigUpdate,
+    tx: mpsc::Sender<SupervisorMessage>,
+    sandbox_id: &str,
+) {
+    let sandbox_id = sandbox_id.to_string();
+    tokio::spawn(async move {
+        let result = apply_update(&apply_tx, update).await;
+        if tx
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::ConfigUpdateResult(result)),
+            })
+            .await
+            .is_err()
+        {
+            debug!(
+                sandbox_id,
+                "configuration result dropped after session close"
+            );
+        }
+    });
+}
+
+/// Hand one delivered update to the supervisor runtime and wait for its
+/// result.
+async fn apply_update(
+    apply_tx: &mpsc::Sender<ConfigApplyRequest>,
+    update: ConfigUpdate,
+) -> ConfigUpdateResult {
+    if update.update_id.is_empty()
+        || update.sandbox_config.is_none()
+        || update.provider_environment.is_none()
+    {
+        return unapplied_update(
+            update.update_id,
+            "invalid_update",
+            "configuration update identity and both configuration parts are required",
+        );
+    }
+    let update_id = update.update_id.clone();
+    let (response, receiver) = tokio::sync::oneshot::channel();
+    if apply_tx
+        .send(ConfigApplyRequest { update, response })
+        .await
+        .is_err()
+    {
+        return unapplied_update(
+            update_id,
+            "apply_unavailable",
+            "configuration apply service is unavailable",
+        );
+    }
+    match tokio::time::timeout(CONFIG_APPLY_TIMEOUT, receiver).await {
+        Ok(Ok(result)) => result,
+        _ => unapplied_update(
+            update_id,
+            "apply_timeout",
+            "configuration application timed out",
+        ),
+    }
+}
+
 /// Report the canonical process result and wait for durable handling.
 pub async fn report_main_process_exit(
-    endpoint: &str,
+    gateway: &grpc_client::GatewayEndpoint,
     sandbox_id: &str,
     instance_id: &str,
     exit_code: i32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let channel = grpc_client::connect_channel_pub(endpoint)
+    let channel = grpc_client::connect_channel_pub(gateway)
         .await
         .map_err(|error| format!("connect failed: {error}"))?;
     let mut client = OpenShellClient::new(channel);
@@ -522,7 +829,7 @@ pub async fn report_main_process_exit(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) async fn test_bridge_ssh_relay(
     target: tokio::net::UnixStream,
     inbound: mpsc::Receiver<Result<RelayFrame, tonic::Status>>,
@@ -540,11 +847,11 @@ pub(crate) async fn test_bridge_ssh_relay(
 
 /// Confirm terminal delivery and permit ephemeral cleanup.
 pub async fn finalize_main_process_exit(
-    endpoint: &str,
+    gateway: &grpc_client::GatewayEndpoint,
     sandbox_id: &str,
     instance_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let channel = grpc_client::connect_channel_pub(endpoint)
+    let channel = grpc_client::connect_channel_pub(gateway)
         .await
         .map_err(|error| format!("connect failed: {error}"))?;
     let mut client = OpenShellClient::new(channel);
@@ -560,17 +867,34 @@ pub async fn finalize_main_process_exit(
 struct GatewayMessageContext<'a> {
     sandbox_id: &'a str,
     ssh_socket_path: &'a std::path::Path,
-    port_forward: &'a Arc<dyn BoundaryLoopbackConnector>,
+    port_forward: &'a Arc<BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     channel: &'a grpc_client::AuthedChannel,
     tx: &'a mpsc::Sender<SupervisorMessage>,
     terminating: &'a Arc<AtomicBool>,
+    /// Present while the session pushes configuration.
+    config_apply_tx: Option<&'a mpsc::Sender<ConfigApplyRequest>>,
 }
 
 fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<'_>) {
     match &msg.payload {
         Some(gateway_message::Payload::Heartbeat(_)) => {
             // Gateway heartbeat — nothing to do.
+        }
+        Some(gateway_message::Payload::ConfigUpdate(update)) => {
+            let Some(apply_tx) = context.config_apply_tx.cloned() else {
+                warn!(
+                    sandbox_id = %context.sandbox_id,
+                    "supervisor session: ignored configuration update on a session without config push"
+                );
+                return;
+            };
+            spawn_config_apply(
+                apply_tx,
+                update.clone(),
+                context.tx.clone(),
+                context.sandbox_id,
+            );
         }
         Some(gateway_message::Payload::RelayOpen(open)) => {
             let channel_id = open.channel_id.clone();
@@ -583,7 +907,8 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
             let expected_ssh_peer_pid = context.expected_ssh_peer_pid;
             let terminating = Arc::clone(context.terminating);
 
-            let event = relay_open_event(openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
+            let event =
+                relay_open_event(&openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
             ocsf_emit!(event);
 
             tokio::spawn(async move {
@@ -601,7 +926,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
                 {
                     Ok(()) => {
                         let event = relay_closed_event(
-                            openshell_ocsf::ctx::ctx(),
+                            &openshell_ocsf::ctx::ctx(),
                             &event_open,
                             &ssh_socket_path,
                         );
@@ -609,7 +934,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
                     }
                     Err(e) => {
                         let event = relay_failed_event(
-                            openshell_ocsf::ctx::ctx(),
+                            &openshell_ocsf::ctx::ctx(),
                             &event_open,
                             &ssh_socket_path,
                             &e.to_string(),
@@ -627,7 +952,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
         }
         Some(gateway_message::Payload::RelayClose(close)) => {
             let event = relay_close_from_gateway_event(
-                openshell_ocsf::ctx::ctx(),
+                &openshell_ocsf::ctx::ctx(),
                 &close.channel_id,
                 &close.reason,
             );
@@ -648,7 +973,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
 async fn handle_relay_open(
     relay_open: RelayOpen,
     ssh_socket_path: &std::path::Path,
-    port_forward: Arc<dyn BoundaryLoopbackConnector>,
+    port_forward: Arc<BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     channel: grpc_client::AuthedChannel,
     tx: mpsc::Sender<SupervisorMessage>,
@@ -848,32 +1173,42 @@ async fn send_relay_open_result(
 async fn open_target(
     relay_open: &RelayOpen,
     ssh_socket_path: &std::path::Path,
-    port_forward: &Arc<dyn BoundaryLoopbackConnector>,
+    port_forward: &Arc<BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
 ) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(not(unix))]
+    let _ = (ssh_socket_path, expected_ssh_peer_pid);
     match relay_open.target.as_ref() {
         Some(relay_open::Target::Tcp(target)) => open_tcp_target(target, port_forward).await,
         Some(relay_open::Target::Ssh(_)) | None => {
-            let runtime_path = crate::unix_socket::runtime_path(ssh_socket_path);
-            let stream = tokio::net::UnixStream::connect(runtime_path.as_ref()).await?;
-            if let Some(expected_pid) = expected_ssh_peer_pid {
-                let credentials = stream.peer_cred()?;
-                let actual_pid = credentials.pid().and_then(|pid| u32::try_from(pid).ok());
-                if actual_pid != Some(expected_pid) {
-                    return Err(format!(
+            if ssh_socket_path.as_os_str().is_empty() {
+                return Err("SSH access is not configured for this supervisor".into());
+            }
+            #[cfg(not(unix))]
+            return Err("SSH relay targets are unsupported by the Windows supervisor".into());
+            #[cfg(unix)]
+            {
+                let runtime_path = crate::unix_socket::runtime_path(ssh_socket_path);
+                let stream = tokio::net::UnixStream::connect(runtime_path.as_ref()).await?;
+                if let Some(expected_pid) = expected_ssh_peer_pid {
+                    let credentials = stream.peer_cred()?;
+                    let actual_pid = credentials.pid().and_then(|pid| u32::try_from(pid).ok());
+                    if actual_pid != Some(expected_pid) {
+                        return Err(format!(
                         "SSH relay peer PID mismatch: expected {expected_pid}, got {actual_pid:?}"
                     )
                     .into());
+                    }
                 }
+                Ok(Box::new(stream))
             }
-            Ok(Box::new(stream))
         }
     }
 }
 
 async fn open_tcp_target(
     target: &TcpRelayTarget,
-    port_forward: &Arc<dyn BoundaryLoopbackConnector>,
+    port_forward: &Arc<BoundaryLoopbackConnector>,
 ) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
     let host = normalize_tcp_target_host(target)?;
     let port = u16::try_from(target.port).map_err(|_| "tcp target port must fit in u16")?;
@@ -925,6 +1260,58 @@ fn normalize_tcp_target_host(target: &TcpRelayTarget) -> Result<String, String> 
 mod target_tests {
     use super::*;
 
+    fn update() -> ConfigUpdate {
+        ConfigUpdate {
+            update_id: "update-1".into(),
+            sandbox_config: Some(openshell_core::proto::SandboxConfigSnapshot {
+                config_revision: 7,
+                version: 2,
+                ..Default::default()
+            }),
+            provider_environment: Some(openshell_core::proto::ProviderEnvironmentSnapshot {
+                provider_env_revision: 3,
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn assert_unapplied(result: &ConfigUpdateResult, code: &str) {
+        assert_eq!(result.update_id, "update-1");
+        assert_eq!(result.outcome, i32::from(ConfigApplyOutcome::Unsupported));
+        assert_eq!(result.failure.as_ref().unwrap().code, code);
+        assert!(result.admission.is_none());
+    }
+
+    #[tokio::test]
+    async fn unavailable_runtime_answers_the_update() {
+        let (apply_tx, apply_rx) = mpsc::channel(1);
+        drop(apply_rx);
+
+        let result = apply_update(&apply_tx, update()).await;
+
+        assert_unapplied(&result, "apply_unavailable");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn apply_timeout_answers_the_update() {
+        let (apply_tx, _apply_rx) = mpsc::channel(1);
+
+        let result = apply_update(&apply_tx, update()).await;
+
+        assert_unapplied(&result, "apply_timeout");
+    }
+
+    #[tokio::test]
+    async fn update_without_both_parts_is_answered_without_the_runtime() {
+        let (apply_tx, _apply_rx) = mpsc::channel(1);
+        let mut partial = update();
+        partial.provider_environment = None;
+
+        let result = apply_update(&apply_tx, partial).await;
+
+        assert_unapplied(&result, "invalid_update");
+    }
+
     fn tcp(host: &str, port: u32) -> TcpRelayTarget {
         TcpRelayTarget {
             host: host.to_string(),
@@ -974,12 +1361,10 @@ mod target_tests {
 mod ocsf_event_tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     struct UnusedLoopbackConnector;
 
-    #[cfg(target_os = "linux")]
     #[async_trait::async_trait]
-    impl BoundaryLoopbackConnector for UnusedLoopbackConnector {
+    impl rpc_test::BoundaryLoopbackConnector for UnusedLoopbackConnector {
         async fn connect(
             &self,
             _target: LoopbackTarget,
@@ -1002,6 +1387,23 @@ mod ocsf_event_tests {
             proxy_port: 3128,
             origin: openshell_ocsf::EventOrigin::Supervisor,
         }
+    }
+
+    #[tokio::test]
+    async fn ssh_relay_without_adapter_is_rejected_on_every_host() {
+        let connector: Arc<BoundaryLoopbackConnector> =
+            rpc_test::loopback(Arc::new(UnusedLoopbackConnector));
+        let result = open_target(
+            &ssh_relay_open("no-ssh"),
+            std::path::Path::new(""),
+            &connector,
+            None,
+        )
+        .await;
+        let error = result
+            .err()
+            .expect("missing SSH adapter must fail explicitly");
+        assert!(error.to_string().contains("not configured"));
     }
 
     #[test]
@@ -1226,6 +1628,58 @@ mod ocsf_event_tests {
         assert!(err.to_string().contains("policy evaluation failed"));
     }
 
+    #[test]
+    fn failed_redirect_is_served_on_the_next_attempt() {
+        assert!(redirect_survives_failure(true, false));
+        assert!(!redirect_survives_failure(true, true));
+        assert!(!redirect_survives_failure(false, false));
+        assert!(!redirect_survives_failure(false, true));
+    }
+
+    #[test]
+    fn reconnect_backoff_doubles_until_a_session_is_accepted() {
+        let mut backoff = ReconnectBackoff::new();
+        let delays: Vec<_> = (0..7)
+            .map(|_| backoff.on_failure(false, false).unwrap())
+            .collect();
+        assert_eq!(
+            delays,
+            [1, 2, 4, 8, 16, 30, 30].map(Duration::from_secs).to_vec()
+        );
+
+        // Losing an accepted session starts over instead of waiting the maximum.
+        assert_eq!(backoff.on_failure(true, false), Some(INITIAL_BACKOFF));
+        assert_eq!(backoff.on_failure(false, false), Some(INITIAL_BACKOFF * 2));
+    }
+
+    #[test]
+    fn reconnect_backoff_resets_when_an_accepted_session_redirects() {
+        let mut backoff = ReconnectBackoff::new();
+        for _ in 0..5 {
+            backoff.on_failure(false, false);
+        }
+
+        backoff.on_redirect(true);
+        assert_eq!(backoff.on_failure(false, false), Some(INITIAL_BACKOFF));
+    }
+
+    #[test]
+    fn reconnect_backoff_skips_one_failed_redirect_target_per_accepted_session() {
+        let mut backoff = ReconnectBackoff::new();
+        assert_eq!(backoff.on_failure(false, true), None);
+        assert_eq!(backoff.on_failure(false, true), Some(INITIAL_BACKOFF));
+
+        backoff.on_redirect(true);
+        assert_eq!(backoff.on_failure(false, true), None);
+    }
+
+    #[test]
+    fn backoff_is_skipped_once_per_accepted_session() {
+        assert!(skip_backoff(true, false));
+        assert!(!skip_backoff(true, true));
+        assert!(!skip_backoff(false, false));
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn ssh_target_requires_authenticated_supervisor_peer_pid() {
@@ -1242,7 +1696,8 @@ mod ocsf_event_tests {
 
         // The SSH relay path does not use the port-forward (that is the TCP
         // target path); connect from the supervisor's own namespace.
-        let port_forward: Arc<dyn BoundaryLoopbackConnector> = Arc::new(UnusedLoopbackConnector);
+        let port_forward: Arc<BoundaryLoopbackConnector> =
+            rpc_test::loopback(Arc::new(UnusedLoopbackConnector));
 
         let trusted = open_target(&relay, &socket, &port_forward, Some(std::process::id()))
             .await

@@ -20,7 +20,8 @@ type Config = types.Config
 type ClientInterface interface {
 	Sandboxes() SandboxInterface
 	SandboxTemplates() SandboxTemplateInterface
-	CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
+	CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error)
+	SandboxSuspendResume() SandboxSuspendResumeInterface
 	Providers() ProviderInterface
 	Services() ServiceInterface
 	Exec() ExecInterface
@@ -53,6 +54,7 @@ type Client struct {
 
 	sandboxes      SandboxInterface
 	templateCreate SandboxTemplateCreateInterface
+	suspendResume  SandboxSuspendResumeInterface
 	templates      SandboxTemplateInterface
 	providers      ProviderInterface
 	services       ServiceInterface
@@ -99,6 +101,7 @@ func NewClient(cfg Config) (*Client, error) {
 	sandboxes := newSandboxClient(conn)
 	c.sandboxes = sandboxes
 	c.templateCreate = sandboxes
+	c.suspendResume = sandboxes
 	c.templates = newSandboxTemplateClient(conn)
 	c.providers = newProviderClient(conn)
 	c.services = newServiceClient(conn)
@@ -122,9 +125,12 @@ func (c *Client) SandboxTemplates() SandboxTemplateInterface { return c.template
 
 // CreateSandboxFromTemplate creates a sandbox from a named workload template
 // without changing the legacy Sandboxes() interface.
-func (c *Client) CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
-	return c.templateCreate.CreateFromTemplate(ctx, workspace, name, templateName, spec, labels, opts...)
+func (c *Client) CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error) {
+	return c.templateCreate.CreateFromTemplate(ctx, workspace, name, templateName, spec, opts...)
 }
+
+// SandboxSuspendResume returns the sandbox suspend and resume sub-client.
+func (c *Client) SandboxSuspendResume() SandboxSuspendResumeInterface { return c.suspendResume }
 
 // Providers returns the provider sub-client.
 func (c *Client) Providers() ProviderInterface { return c.providers }

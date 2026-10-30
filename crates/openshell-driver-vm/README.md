@@ -4,6 +4,14 @@
 
 Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) for OpenShell. The gateway spawns this binary as a subprocess and talks to it over the `openshell.compute.v1.ComputeDriver` Unix-socket surface. `openshell-supervisor` runs as a native host process, while `openshell-sandbox` runs as capability-free PID 1 inside each microVM and applies guest-local isolation over virtio-vsock.
 
+New VM generations initiate the control connection to host CID 2 over vsock.
+Libkrun forwards that guest connection to the supervisor's protected Unix
+socket; QEMU uses a host vsock listener on a per-guest port and checks the guest
+CID before TLS authentication. Existing protocol roles and authorization stay
+unchanged. Running legacy generations retain their original descriptors;
+newly booted generations require matching embedded runtime and supervisor
+binaries.
+
 The driver embeds libkrun, libkrunfw, the guest OCI unpacker, the portable guest sandbox, and the custom kernel runtime. Each sandbox boots from a cached immutable bootstrap ext4 root disk plus a per-sandbox writable overlay disk. When the requested sandbox image differs from the bootstrap image, the driver prepares a read-only image ext4 disk inside a bootstrap VM and mounts that unpacked rootfs as the sandbox lowerdir.
 
 ## How it fits together
@@ -60,9 +68,9 @@ By default `mise run gateway:vm`:
   `~/.config/openshell/gateways/vm-dev/metadata.json`. It does not modify the
   workspace `.env`.
 - Persists the gateway SQLite DB under `.cache/gateway-vm/gateway.db`.
-- Places the VM driver state (per-sandbox `overlay.ext4`, image cache, and `run/compute-driver.sock`) under `/tmp/openshell-vm-driver-$USER-vm-dev/` so the AF_UNIX socket path stays under macOS `SUN_LEN`.
+- Places the VM driver state (per-sandbox `overlay.ext4` and image cache) under `/tmp/openshell-vm-driver-$USER-vm-dev/`.
 - Writes `.cache/gateway-vm/gateway.toml` with `[openshell.drivers.vm].driver_dir = "$PWD/target/debug"` so the freshly built `openshell-driver-vm` is used instead of an older installed copy from `~/.local/libexec/openshell`, `/usr/libexec/openshell`, or `/usr/local/libexec`.
-- Enables OTLP trace export to `http://127.0.0.1:4317` only when a local collector is listening there. Otherwise, it omits the OTLP configuration to avoid repeated export failures.
+- Enables OTLP trace export, OCSF log export, and the agent trace relay to `http://127.0.0.1:4317` only when a local collector is listening there. Otherwise, it omits the OTLP configuration to avoid repeated export failures.
 
 For GPU passthrough (VFIO), pass `-- --gpu` and run with root privileges:
 
@@ -158,7 +166,7 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | Configuration key | Default | Purpose |
 |---|---|---|
 | `grpc_endpoint` | empty | Required. URL the native host supervisor uses to reach the gateway. Host loopback such as `http://127.0.0.1:<port>` is valid. Legacy guest aliases are normalized to host loopback. This endpoint is never sent into the VM. |
-| `state_dir` | `target/openshell-vm-driver` | Per-sandbox overlay disks, console logs, image cache, and private `run/compute-driver.sock` UDS. Relative paths are resolved to absolute paths at driver startup. |
+| `state_dir` | `target/openshell-vm-driver` | Per-sandbox overlay disks, console logs, and image cache. Relative paths are resolved to absolute paths at driver startup. |
 | `driver_dir` | unset | Override the directory searched for `openshell-driver-vm`. |
 | `default_image` | OpenShell base image | Sandbox image used when a create request omits one. |
 | `bootstrap_image` | unset | VM runtime image used as the immutable bootstrap root disk. Falls back only to the operator-configured `default_image`; the driver refuses to start when both are empty. |
@@ -174,6 +182,7 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | `proxy_connect_by_hostname` | unset | Send hostnames rather than validated IPs in CONNECT. Last resort for proxies whose ACLs reject IP CONNECT targets. |
 | `proxy_ca_bundle` | unset | Gateway-host PEM CA bundle trusted for the corporate proxy and TLS-intercepted server certificates. The driver validates it and stages it at a fixed non-secret guest path in the protected overlay. Requires `https_proxy`. |
 | `provider_spiffe_workload_api_tcp_endpoint` | unset | Explicit guest-reachable `tcp:IP:port` SPIFFE Workload API listener for provider token exchange. It requires `provider_spiffe_allow_guest_tcp = true`; a host UNIX socket is never silently exposed to a VM guest. |
+| `enable_bind_mounts` | `false` | Allow per-sandbox `driver_config.vm.mounts` host directory shares (libkrun virtiofs only). The driver writes a `tag\ttarget\tmode` manifest to `/.openshell/mounts.manifest` in the overlay, and guest init mounts each share after `/sandbox` ownership fixups. Rejected while resource admission is enabled. |
 
 The proxy settings are operator-owned and deployment-level: they are not accepted through `template.driver_config.vm`, and the driver passes them only to native host control. Every present-but-invalid value is fatal at gateway or sandbox startup rather than degrading to a direct dial.
 
@@ -208,6 +217,13 @@ prepared inside the bootstrap VM. The driver checks that a prepared disk
 contains the unpacked rootfs before caching it; on failure it caches nothing
 and reports the image-prep console tail. Set `OPENSHELL_VM_IMAGE_PULL_CONCURRENCY` to
 tune registry layer download parallelism (default `4`, maximum `16`).
+Registry pulls in both caches use the resolved digest as an immutable reference.
+The driver verifies the downloaded manifest against that digest before downloading
+layers. For multi-platform images, it verifies the index and then the selected
+platform manifest. Digest-pinned requests retain the caller's digest.
+Cache keys hash source identities to keep cache and staging filenames bounded.
+Bootstrap cache layout v6 and prepared-image layout v4 rebuild older entries on
+first use; older cache files remain on disk but are not reused for registry images.
 Both caches are scoped by source image identity and OpenShell version, so an
 OpenShell upgrade builds a fresh guest rootfs instead of reusing one with an old
 embedded supervisor. Host-side bootstrap layer assembly preserves relative
@@ -267,8 +283,8 @@ RUST_LOG=openshell_server=debug,openshell_driver_vm=debug \
   mise run gateway:vm
 ```
 
-The VM guest's serial console is appended to `<state-dir>/<sandbox-id>/console.log`. Sandbox IDs must match `[A-Za-z0-9._-]{1,128}` before the driver uses them in host paths. The gateway-owned compute-driver socket lives at `<state-dir>/run/compute-driver.sock`; OpenShell creates `run/` with owner-only permissions and removes same-owner stale sockets. On clean shutdown, the gateway sends the managed driver `SIGTERM`, waits up to five seconds for it to flush telemetry and exit, then force-kills it if necessary and removes the socket. UDS clients must match the driver UID and provide the expected gateway process PID by default. Standalone same-UID UDS mode requires the explicit `--allow-same-uid-peer` development flag. TCP mode is disabled by default because it is unauthenticated; use `--allow-unauthenticated-tcp --bind-address 127.0.0.1:50061` only for local development.
-The VM serial console is appended to `<state-dir>/sandboxes/<sandbox-id>/rootfs-console.log`. Host-supervisor stdout and stderr are written beside it as `supervisor.log` and `supervisor.err.log`. Sandbox IDs must match `[A-Za-z0-9._-]{1,128}` before the driver uses them in host paths. The gateway-owned compute-driver socket lives at `<state-dir>/run/compute-driver.sock`; OpenShell creates `run/` with owner-only permissions, removes same-owner stale sockets, and the gateway removes the socket on clean shutdown via `ManagedDriverProcess::drop`. UDS clients must match the driver UID and provide the expected gateway process PID by default. Standalone same-UID UDS mode requires the explicit `--allow-same-uid-peer` development flag. TCP mode is disabled by default because it is unauthenticated; use `--allow-unauthenticated-tcp --bind-address 127.0.0.1:50061` only for local development.
+The VM guest's serial console is appended to `<state-dir>/<sandbox-id>/console.log`. Sandbox IDs must match `[A-Za-z0-9._-]{1,128}` before the driver uses them in host paths. The gateway-owned compute-driver socket lives in a private, randomly named `/tmp/os-gw-<euid>-<random>/` directory, independent of `state_dir`. On clean shutdown, the gateway sends the managed driver `SIGTERM`, waits up to five seconds for it to flush telemetry and exit, then force-kills it if necessary and removes the socket directory. UDS clients must match the driver UID and provide the expected gateway process PID by default. Standalone same-UID UDS mode requires the explicit `--allow-same-uid-peer` development flag. TCP mode is disabled by default because it is unauthenticated; use `--allow-unauthenticated-tcp --bind-address 127.0.0.1:50061` only for local development.
+The VM serial console is appended to `<state-dir>/sandboxes/<sandbox-id>/rootfs-console.log`. Host-supervisor stdout and stderr are written beside it as `supervisor.log` and `supervisor.err.log`. Sandbox IDs must match `[A-Za-z0-9._-]{1,128}` before the driver uses them in host paths. The gateway-owned compute-driver socket lives in a private, randomly named `/tmp/os-gw-<euid>-<random>/` directory, which `ManagedDriverProcess::drop` removes. UDS clients must match the driver UID and provide the expected gateway process PID by default. Standalone same-UID UDS mode requires the explicit `--allow-same-uid-peer` development flag. TCP mode is disabled by default because it is unauthenticated; use `--allow-unauthenticated-tcp --bind-address 127.0.0.1:50061` only for local development.
 
 ## Network isolation
 

@@ -21,8 +21,8 @@ use hyper::{Request, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, SandboxGuard};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::{ClientConfig, RootCertStore};
+use rustls::RootCertStore;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -32,7 +32,7 @@ use url::Position;
 
 const SERVICE_PORT: &str = "4500";
 const BEARER_TOKEN: &str = "Bearer openshell-e2e-application-token";
-const READY_TIMEOUT: Duration = Duration::from_secs(60);
+const READY_TIMEOUT: Duration = Duration::from_mins(1);
 const HEADER_ECHO_SERVER: &str = r#"
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -129,7 +129,7 @@ fn load_certificates(
     let file = File::open(path)
         .map_err(|error| format!("open {description} '{}': {error}", path.display()))?;
     let mut reader = BufReader::new(file);
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_reader_iter(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("parse {description} '{}': {error}", path.display()))
 }
@@ -138,7 +138,9 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
     let file = File::open(path)
         .map_err(|error| format!("open client TLS key '{}': {error}", path.display()))?;
     let mut reader = BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)
+    PrivateKeyDer::pem_reader_iter(&mut reader)
+        .next()
+        .transpose()
         .map_err(|error| format!("parse client TLS key '{}': {error}", path.display()))?
         .ok_or_else(|| format!("client TLS key '{}' is empty", path.display()))
 }
@@ -158,7 +160,7 @@ fn e2e_tls_connector() -> Result<TlsConnector, String> {
     let client_certificates =
         load_certificates(&mtls_dir.join("tls.crt"), "client TLS certificate")?;
     let client_key = load_private_key(&mtls_dir.join("tls.key"))?;
-    let config = ClientConfig::builder()
+    let config = openshell_crypto::tls::client_builder()
         .with_root_certificates(roots)
         .with_client_auth_cert(client_certificates, client_key)
         .map_err(|error| format!("build e2e mTLS client configuration: {error}"))?;

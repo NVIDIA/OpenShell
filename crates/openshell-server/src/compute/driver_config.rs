@@ -9,7 +9,7 @@
 
 use crate::config_file;
 use crate::defaults::LocalTlsPaths;
-use openshell_core::{Error, Result};
+use openshell_core::{Error, NetworkSupervisorTrustBundle, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -67,6 +67,14 @@ impl GuestTlsPaths {
 pub struct DriverStartupContext<'a> {
     pub file: Option<&'a config_file::ConfigFile>,
     pub guest_tls: Option<&'a GuestTlsPaths>,
+    /// A staged artifact for runtime driver construction. This is deliberately
+    /// absent during effective-config preflight.
+    pub network_trust: Option<&'a NetworkSupervisorTrustBundle>,
+    /// Whether destination trust sources were configured and normalized.
+    ///
+    /// This remains available during preflight so selection can reject a
+    /// driver that cannot propagate trust, without fabricating an artifact.
+    pub network_trust_configured: bool,
     pub gateway_port: u16,
     pub gateway_tls_enabled: bool,
     pub endpoint_overrides: &'a BTreeMap<String, PathBuf>,
@@ -189,12 +197,13 @@ fn apply_remote_driver_overrides(
 }
 
 fn validate_remote_driver_config(cfg: &RemoteDriverConfig, name: &str) -> Result<()> {
-    if !cfg.socket_path.as_os_str().is_empty() {
-        return Ok(());
+    if cfg.socket_path.as_os_str().is_empty() {
+        return Err(Error::config(format!(
+            "remote compute driver '{name}' requires socket_path"
+        )));
     }
-    Err(Error::config(format!(
-        "remote compute driver '{name}' requires socket_path"
-    )))
+    openshell_core::unix_socket_path::check(&cfg.socket_path)
+        .map_err(|err| Error::config(format!("remote compute driver '{name}' socket_path: {err}")))
 }
 
 #[cfg(test)]
@@ -216,10 +225,32 @@ mod tests {
         DriverStartupContext {
             file,
             guest_tls: None,
+            network_trust: None,
+            network_trust_configured: false,
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
             gateway_tls_enabled: false,
             endpoint_overrides,
         }
+    }
+
+    #[test]
+    fn driver_specific_decoder_does_not_receive_the_isolation_selector() {
+        #[derive(Default, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StrictDriverConfig {
+            socket_path: PathBuf,
+        }
+        let file: config_file::ConfigFile = toml::from_str(
+            "[openshell.drivers.external]\nsocket_path = '/run/compute.sock'\nisolation_backend = 'agent-substrate'",
+        )
+        .unwrap();
+        let decoded: StrictDriverConfig =
+            driver_config_from_context(test_context(Some(&file)), "external").unwrap();
+        assert_eq!(decoded.socket_path, PathBuf::from("/run/compute.sock"));
+        assert_eq!(
+            file.openshell.drivers["external"]["isolation_backend"].as_str(),
+            Some("agent-substrate")
+        );
     }
 
     #[test]
@@ -479,5 +510,22 @@ socket_path = "/run/openshell/kyma.sock"
             err.to_string()
                 .contains("remote compute driver 'kyma' requires socket_path")
         );
+    }
+
+    #[test]
+    fn remote_driver_config_rejects_overlong_socket_path() {
+        let socket_path = PathBuf::from(format!(
+            "/{}/kyma.sock",
+            "a".repeat(openshell_core::unix_socket_path::MAX_LEN)
+        ));
+        let endpoint_overrides = BTreeMap::from([("kyma".to_string(), socket_path)]);
+
+        let err = remote_driver_config_from_context(
+            test_context_with_endpoint_overrides(None, &endpoint_overrides),
+            "kyma",
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("-byte limit"), "{err}");
     }
 }

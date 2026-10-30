@@ -13,9 +13,8 @@
 # - Plaintext HTTP on 127.0.0.1:18081
 # - Gateway installation and CLI registration name "vm-dev"
 # - Persistent gateway state (SQLite DB) under .cache/gateway-vm
-# - Per-sandbox VM driver state (rootfs + compute-driver.sock) under
-#   /tmp/openshell-vm-driver-<user>-<gateway-name> so the AF_UNIX socket
-#   path stays under macOS SUN_LEN
+# - Per-sandbox VM driver state (rootfs and image cache) under
+#   /tmp/openshell-vm-driver-<user>-<gateway-name>
 #
 # Common overrides:
 #   OPENSHELL_SERVER_PORT=18091 mise run gateway:vm
@@ -35,6 +34,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=tasks/scripts/gateway-toml.sh
 source "${ROOT}/tasks/scripts/gateway-toml.sh"
+# shellcheck source=tasks/scripts/build-env.sh
+source "${ROOT}/tasks/scripts/build-env.sh"
+ensure_build_nofile_limit
 PORT="${OPENSHELL_SERVER_PORT:-18081}"
 GATEWAY_NAME="${OPENSHELL_VM_GATEWAY_NAME:-vm-dev}"
 STATE_DIR="${OPENSHELL_VM_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-vm}"
@@ -90,7 +92,7 @@ port_is_in_use() {
 append_local_otlp_config_if_available() {
   local config_path=$1
   if ! port_is_in_use 4317; then
-    echo "OTLP collector not detected on 127.0.0.1:4317; trace export disabled."
+    echo "OTLP collector not detected on 127.0.0.1:4317; trace export, OCSF log export, and the agent trace relay disabled."
     return
   fi
 
@@ -98,8 +100,14 @@ append_local_otlp_config_if_available() {
 
 [openshell.gateway.otlp]
 endpoint = "http://127.0.0.1:4317"
+
+[openshell.gateway.otlp.ocsf]
+enabled = true
+
+[openshell.gateway.otlp.agent]
+enabled = true
 EOF
-  echo "OTLP trace export enabled for http://127.0.0.1:4317."
+  echo "OTLP trace export, OCSF log export, and the agent trace relay enabled for http://127.0.0.1:4317."
 }
 
 invoking_user() {
@@ -278,10 +286,8 @@ if port_is_in_use "${PORT}"; then
   exit 2
 fi
 
-# AF_UNIX SUN_LEN on macOS is 104 bytes; the VM driver places
-# `compute-driver.sock` directly under VM_DRIVER_STATE_DIR, so anchor it
-# under /tmp instead of `${ROOT}/.cache` (which is typically too long on
-# macOS dev boxes with worktree paths).
+# Keep VM driver state outside the worktree. The gateway places the driver
+# socket in its own /tmp directory, so this path length does not matter.
 STATE_LABEL="$(printf '%s' "${GATEWAY_NAME}" | tr -cs '[:alnum:]._-' '-')"
 if [ -z "${STATE_LABEL}" ]; then
   STATE_LABEL="vm-dev"

@@ -12,7 +12,9 @@ pub mod delegated;
 pub mod log_push;
 pub mod main_session;
 pub mod skills;
+#[cfg(unix)]
 pub mod ssh;
 pub mod supervisor_session;
 
+#[cfg(unix)]
 mod unix_socket;

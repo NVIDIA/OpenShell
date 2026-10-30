@@ -607,13 +607,9 @@ cargo fmt -p openshell-tui
 cargo clippy -p openshell-tui
 ```
 
-### Pre-commit
+### Verification
 
-Always run before committing:
-
-```bash
-mise run pre-commit
-```
+Follow Choose Verification for the Change in `CONTRIBUTING.md`. Select format, lint, and tests for the affected TUI behavior and its dependencies. Use `mise run pre-commit` when its broader scope is warranted.
 
 ### Gateway changes
 

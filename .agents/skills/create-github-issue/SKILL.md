@@ -135,7 +135,7 @@ EOF
 
 GitHub built-in issue types (`Bug`, `Feature`, `Task`) should come from the matching issue template when possible, or be set manually afterward. Do not try to emulate them through labels.
 
-Creating an issue does not accept it. Inspect the repository’s current `state:*` labels and follow its triage → validation → human acceptance process. Agents may assess facts, but only humans decide whether to accept work or place it on the roadmap. A direct user request authorizes the requested planning or implementation phase without changing issue disposition.
+Creating an issue does not accept it. Follow Label Discovery in `CONTRIBUTING.md` to retrieve every page of current `state:*` label definitions and resolve unclear meanings, then follow its triage → validation → human acceptance process. Agents may assess facts, but only humans decide whether to accept work or place it on the roadmap. A direct user request authorizes the requested planning or implementation phase without changing issue disposition.
 
 ## Useful Options
 
@@ -161,4 +161,4 @@ Created issue [#123](https://github.com/OWNER/REPO/issues/123)
 Use the issue number to:
 
 - Reference in signed-off Conventional Commits: `git commit --signoff -m "fix(cli): validate empty requests (fixes #123)"`
-- Create a branch following project convention: `<type>/<issue-id>-<short-description>/<github-username>`, where `<type>` is a Conventional Commits type.
+- Create a branch following Branch Names in `CONTRIBUTING.md`.

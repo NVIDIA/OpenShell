@@ -114,7 +114,7 @@ openshell logs github-demo --since 5m --source sandbox
 You should see a denial for a request resembling this one:
 
 ```text
-[1775014140.412] [sandbox] [OCSF ] [ocsf] HTTP:POST [MED] DENIED POST http://github.com:443/<org>/<repo>.git/git-receive-pack [policy:_provider_my_github engine:l7] [reason:L7_REQUEST deny POST github.com:443/<org>/<repo>.git/git-receive-pack reason=POST /<org>/<repo>.git/git-receive-pack not permitted by policy]
+[1775014140.412] [sandbox] [OCSF ] [ocsf] HTTP:POST [MED] DENIED POST https://github.com/<org>/<repo>.git/git-receive-pack [policy:_provider_my_github engine:l7] [reason:L7_REQUEST deny POST github.com:443/<org>/<repo>.git/git-receive-pack reason=POST /<org>/<repo>.git/git-receive-pack not permitted by policy]
 ```
 
 `_provider_my_github` is the rule that OpenShell composes from the attached

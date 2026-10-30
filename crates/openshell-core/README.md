@@ -3,6 +3,13 @@
 Shared types, constants, configuration, and helpers used across OpenShell
 crates.
 
+## Isolation registrations
+
+`isolation_registration` owns the operator registry's backend names, byte-stream
+endpoints, and shared validation. Its fallible conversions carry registrations
+through the compute-driver protobuf and back into the supervisor's JSON launch
+file. These routes contain no credentials or driver-owned launch coordinates.
+
 ## Object Metadata
 
 Top-level user-facing objects use a Kubernetes-style metadata convention. The
@@ -57,6 +64,20 @@ Built-in supervisor middleware identifiers, host-selector matching, and pure
 configuration validation live in `openshell_core::middleware`. Policy admission
 and the supervisor runtime consume the same contract without introducing a
 dependency from the policy crate to the supervisor implementation.
+
+## Optional Compute Updates
+
+The generated `proto::compute::v1::compute_driver_server::ComputeDriver` trait
+retains its baseline methods and streaming associated type. Supporting external
+drivers additionally serve `ComputeDriverConfigurationUpdates` on the same
+endpoint and advertise `openshell.compute.update-sandbox-configuration`.
+The request carries image and lifecycle preconditions plus optional command and
+environment replacements. Drivers without the capability need no new method.
+
+Linked drivers opt in through `openshell_core::compute::ComputeDriver` and
+`ComputeDriverFactory::build_with_configuration_updates`. The default factory
+hook calls `build` without an updater. Registration and capability negotiation
+are both required. Metadata-only updates are handled by the gateway.
 
 ## Protobuf Struct Conversion
 

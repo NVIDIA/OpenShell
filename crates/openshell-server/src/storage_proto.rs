@@ -15,6 +15,11 @@
 
 include!(concat!(env!("OUT_DIR"), "/openshell.storage.v1.rs"));
 
+mod sandbox_image {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.image.v1.rs"));
+}
+pub(crate) use sandbox_image::{StoredSandboxImageState, StoredSandboxImageUpdate};
+
 pub(crate) const STORAGE_FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/storage_descriptor.bin"));
 
@@ -123,7 +128,8 @@ mod tests {
     // Unspecified (treated as Never), zero count, and absent timestamps.
     // ProviderProfileFile is reachable from stored provider profiles. Its
     // additive declaration changes the durable and public/durable overlap
-    // inventories; the provider-environment file map is public-only. The
+    // inventories; the provider-environment file map and peer configuration
+    // notification are public-only. The
     // request has no provider-file capability field: older supervisors ignore
     // the additive file map while retaining the rest of the response.
     // Preparation timing adds two optional timestamps to SandboxProvisioning.
@@ -131,15 +137,55 @@ mod tests {
     // no stored attempt gains another phase or time budget on upgrade.
     // Service authorization also extends both schemas additively. Legacy
     // payloads retain the safe Strip default.
+    // Sandbox field 6 adds its public SSH fingerprint. Older persisted
+    // sandboxes decode with an empty fingerprint, provisioned at next launch.
     // Driver-operation ownership adds pending and a retained operation ID to
     // SandboxProvisioning in both closures. Old rows decode false and empty;
     // decoding or deadline updates cannot claim an existing attempt.
+    // Stable placeholders add a stored credential flag whose absent value is
+    // false. Capability negotiation and delivered key lists are public-only;
+    // the set of shared message and enum types remains unchanged. Delivered
+    // provider snapshots carry the same flag per value and are never stored.
+    // SessionRedirect and SupervisorHello.redirected are supervisor control
+    // traffic and are never stored.
+    // Token-grant owner fields add gateway-derived metadata to endpoints and
+    // profile credentials reachable from stored policies and provider profiles.
+    // Legacy payloads decode empty owners; the gateway rebuilds their authority
+    // from effective policy rather than trusting persisted owner stamps.
+    // Operator credential export adds four public messages and no durable types.
+    // ListProvidersRequest field 4 adds a public-only label selector. Older
+    // requests decode an empty selector; durable schemas remain unchanged.
+    // Endpoint failure causes add EndpointFailure and EndpointFailureDomain to
+    // both closures through EndpointStatus.last_failure. Stored statuses decode
+    // without a cause, and the next accepted report or reset replaces them.
+    // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
+    // closures and TokenGrantStatus to public reports. Older rows have no grant
+    // record; absent report extensions retain compatibility without a rewrite.
+    // Supervisor middleware binding policy and selectors are public-only. An
+    // absent policy preserves dynamic discovery; older supervisors ignore both fields.
+    // Suspend/resume adds two public request messages without durable request
+    // admission, the restart_if_restore_fails resume option, and the SUSPENDING
+    // and SUSPENDED values to the shared
+    // SandboxPhase enum. Stored rows never carried those values, so prior
+    // payloads decode unchanged.
+
+    // Image updates add a separate public service/request and a new private
+    // image-state format. Existing public status and frozen storage.v1 stay
+    // unchanged; only the private durable closure grows.
+    // Configuration updates add presence-aware argv/map wrappers shared with
+    // private durable intent. Existing image-only payloads decode with all four
+    // selections absent; storage.v1 remains frozen. Public field 3 retains its
+    // image wire identity, now with explicit presence. Compute configuration
+    // updates use a separate capability/service and add one classified RPC.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "18206c52e68fdb0af60f8bb8dfaf47d9bc8021222cb49cacffab6352d3ad5549";
+        "be99bb3fcc7894eb85d774f54b642173e70dd37bc8e5fcaf3fdff2454ae689e1";
     const DURABLE_SCHEMA_SHA256: &str =
-        "76487ab369fc3a4b03a179bb5e7ea6be8d20e380ad5563075dff8ee50e539406";
+        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
+        "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
+    // Encoded with the schema that omitted stable_placeholder. Keep these
+    // bytes fixed so the current encoder cannot hide a compatibility change.
+    const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -181,6 +227,9 @@ mod tests {
         "openshell.v1.OpenShell/PeerReportEndpointStatus|.openshell.v1.ReportEndpointStatusRequest|.openshell.v1.ReportEndpointStatusResponse|false|false",
         "openshell.v1.OpenShell/PeerReportProviderReadiness|.openshell.v1.ReportProviderReadinessRequest|.openshell.v1.ReportProviderReadinessResponse|false|false",
     ];
+    const PEER_CONFIG_RPC_SIGNATURES: [&str; 1] = [
+        "openshell.v1.OpenShell/PeerNotifyConfigUpdate|.openshell.v1.PeerNotifyConfigUpdateRequest|.openshell.v1.PeerNotifyConfigUpdateResponse|false|false",
+    ];
     // Synthetic SandboxSpec bytes with log level, provider, and command fields,
     // emitted before the gateway-owned attachment epoch field was introduced.
     const PRE_READINESS_SANDBOX_SPEC: &str =
@@ -194,6 +243,7 @@ mod tests {
         ".openshell.storage.v1.StoredConfigUpdateOperation",
         ".openshell.storage.v1.StoredProviderCredentialRefreshStateV2",
         ".openshell.storage.v1.StoredProviderProfile",
+        ".openshell.storage.image.v1.StoredSandboxImageState",
         ".openshell.v1.Sandbox",
         ".openshell.v1.SandboxWorkloadTemplate",
         ".openshell.v1.ServiceEndpoint",
@@ -436,7 +486,12 @@ mod tests {
         let public = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET)
             .expect("public descriptor set must decode");
         for file in public.file {
-            assert_ne!(file.package.as_deref(), Some("openshell.storage.v1"));
+            assert!(
+                !file
+                    .package
+                    .as_deref()
+                    .is_some_and(|package| package.starts_with("openshell.storage."))
+            );
             for message in file.message_type {
                 let name = message.name.expect("message name");
                 assert!(
@@ -505,14 +560,44 @@ mod tests {
         let mut methods = Vec::new();
         let mut public_roots = BTreeSet::new();
         let mut compiled_method_count = 0;
+        let mut isolation_methods = BTreeSet::new();
+        let mut sandbox_protocol_methods = BTreeSet::new();
+        let mut supervisor_host_methods = BTreeSet::new();
         for file in &public.file {
             let package = file.package.as_deref().unwrap_or_default();
             for service in &file.service {
                 let service_name = service.name.as_deref().expect("service name");
                 compiled_method_count += service.method.len();
+                if package == "openshell.sandbox.backend.v1" {
+                    assert_eq!(service_name, "IsolationBackend");
+                    isolation_methods.extend(
+                        service
+                            .method
+                            .iter()
+                            .map(|method| method.name.as_deref().expect("isolation method name")),
+                    );
+                }
+                if package == "openshell.sandbox.protocol.v1" {
+                    assert_eq!(service_name, "SandboxProtocol");
+                    sandbox_protocol_methods.extend(service.method.iter().map(|method| {
+                        method
+                            .name
+                            .as_deref()
+                            .expect("sandbox protocol method name")
+                    }));
+                }
+                // Private gateway-to-shared-supervisor protocol: served by the
+                // gateway but never part of the public SDK surface.
+                if package == "openshell.supervisor.host.v1" {
+                    assert_eq!(service_name, "SupervisorHost");
+                    supervisor_host_methods.extend(service.method.iter().map(|method| {
+                        method.name.as_deref().expect("supervisor host method name")
+                    }));
+                }
                 if !matches!(
                     (package, service_name),
-                    ("openshell.v1", "OpenShell") | ("openshell.inference.v1", "Inference")
+                    ("openshell.v1", "OpenShell" | "SandboxUpdates")
+                        | ("openshell.inference.v1", "Inference")
                 ) {
                     continue;
                 }
@@ -533,6 +618,20 @@ mod tests {
             }
         }
         methods.sort();
+        assert_eq!(
+            isolation_methods,
+            BTreeSet::from([
+                "Describe",
+                "OpenBoundary",
+                "ResumeBoundary",
+                "SuspendBoundary"
+            ])
+        );
+        assert_eq!(
+            sandbox_protocol_methods,
+            BTreeSet::from(["Exchange", "Mediate"])
+        );
+        assert_eq!(supervisor_host_methods, BTreeSet::from(["Attach"]));
         for signature in PROVIDER_READINESS_RPC_SIGNATURES {
             assert!(
                 methods.iter().any(|method| method == signature),
@@ -545,14 +644,27 @@ mod tests {
                 "peer owner RPC is missing or changed: {signature}"
             );
         }
+        for signature in PEER_CONFIG_RPC_SIGNATURES {
+            assert!(
+                methods.iter().any(|method| method == signature),
+                "peer config RPC is missing or changed: {signature}"
+            );
+        }
         assert_eq!(
             compiled_method_count,
-            102 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            108 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PEER_CONFIG_RPC_SIGNATURES.len()
+                + isolation_methods.len()
+                + sandbox_protocol_methods.len()
+                + supervisor_host_methods.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            77 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            81 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -560,9 +672,16 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            77 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
+            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PEER_CONFIG_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
+        assert!(
+            methods
+                .iter()
+                .all(|method| !method.contains(".supervisor.host."))
+        );
 
         let public_closure = schema_closure(&index, public_roots);
         let durable_closure =
@@ -604,9 +723,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (306, 27),
-                (93, 21),
-                (81, 21),
+                (334, 31),
+                (100, 22),
+                (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -675,6 +794,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_stored_profile_preserves_revision_scoped_credentials() {
+        let bytes = legacy_bytes(LEGACY_STATIC_PROFILE);
+        let stored = StoredProviderProfile::decode(bytes.as_slice())
+            .expect("legacy static profile must decode");
+        assert_eq!(stored.encode_to_vec(), bytes);
+        let profile = stored.profile.expect("profile");
+        assert_eq!(profile.id, "legacy-static");
+        assert_eq!(profile.credentials.len(), 1);
+        let credential = &profile.credentials[0];
+        assert_eq!(credential.name, "api_key");
+        assert_eq!(credential.env_vars, ["SYNTHETIC_API_KEY"]);
+        assert!(credential.required);
+        assert_eq!(credential.auth_style, "bearer");
+        assert!(!credential.stable_placeholder);
+    }
+
+    #[test]
     fn sandbox_payload_without_endpoint_status_decodes() {
         use openshell_core::proto::{Sandbox, SandboxPhase};
 
@@ -690,6 +826,7 @@ mod tests {
         assert_eq!(status.main_process_instance_id, "supervisor-id");
         assert_eq!(status.exit_code, None);
         assert_eq!(status.restart_count, 0);
+        assert!(status.last_token_grant_failure.is_none());
         assert!(status.next_restart_time.is_none());
         assert!(status.main_process_started_time.is_none());
         assert_eq!(status.conditions.len(), 1);

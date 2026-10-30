@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
 
-use crate::{OtlpTraceConfig, SdkTracerProvider, ServiceName, SetupError};
+use crate::{OtlpExportConfig, SdkTracerProvider, ServiceName, SetupError};
 
 /// Target used by every in-process compute-driver RPC boundary.
 pub const IN_PROCESS_COMPUTE_DRIVER_TARGET: &str = "openshell_otel::in_process_compute_driver";
@@ -77,7 +77,7 @@ impl ComputeDriverTracing {
         gateway_name: Option<&str>,
         compute_driver: Option<&str>,
     ) -> (Option<SdkTracerProvider>, Option<SetupError>) {
-        crate::provider_for(endpoint.map(|endpoint| OtlpTraceConfig {
+        crate::provider_for(endpoint.map(|endpoint| OtlpExportConfig {
             endpoint,
             service_name: ServiceName::Fixed(self.service_name),
             service_version: Some(service_version),

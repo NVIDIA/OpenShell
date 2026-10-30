@@ -397,12 +397,31 @@ mod tests {
     #[test]
     fn metadata_events_include_response_for_ocsf18() {
         use openshell_ocsf::tracing_layers::OcsfJsonlLayer;
-        use openshell_ocsf::validation::{
-            load_class_schema, validate_enum_value, validate_required_fields,
-        };
         use tracing_subscriber::prelude::*;
 
-        let schema = load_class_schema("http_activity");
+        const CHILD: &str = "OPENSHELL_TEST_GCP_METADATA_OCSF_CHILD";
+        // Tracing callsite interest is process-wide, so concurrent tests with
+        // other subscribers can disable this thread's capture. Run the capture
+        // in an isolated process while keeping the same test executable.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "google_cloud_metadata::tests::metadata_events_include_response_for_ocsf18",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         for (method, path, headers, expected_code, expected_activity_id) in [
             ("GET", PATH_TOKEN, flavor_headers(), 200, 3),
             ("GET", "/?token=secret-query", Vec::new(), 403, 3),
@@ -434,8 +453,7 @@ mod tests {
             );
             assert_eq!(json["http_request"]["http_method"], method);
             assert!(json["http_request"].get("url").is_none());
-            validate_required_fields(&json, &schema);
-            validate_enum_value(&json, "activity_id", &schema);
+            openshell_ocsf_validate::validate_event(&json).unwrap_or_else(|e| panic!("{e}"));
         }
     }
 

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [build-system]
-requires = ["setuptools>=80", "setuptools-scm[simple]>=8"]
+requires = ["setuptools>=84.1.0", "setuptools-scm[simple]>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -44,16 +44,19 @@ documentation = "https://docs.nvidia.com/openshell/latest/"
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.0.3",
     "pytest-asyncio>=0.23",
     "pytest-cov>=4.0",
     "pytest-xdist>=3.0",
     "ruff>=0.4",
-    "ty>=0.0.1a6",
+    "ty>=0.0.94",
     "grpcio-tools>=1.60",
     "pyelftools>=0.30",
     "pyyaml==6.0.2",
     "types-pyyaml>=6.0.12.20260518",
+    "mypy-protobuf>=5.1",
+    "types-grpcio>=1.0.0.20251009",
+    "types-protobuf>=6.32,<7",
 ]
 
 [tool.setuptools]
@@ -67,6 +70,10 @@ namespaces = false
 
 [tool.setuptools.package-data]
 openshell = ["py.typed", "_proto/*.py", "_proto/*.pyi"]
+
+# Ignore non-release tags such as sdk/go/vX.Y.Z, which share the release commit.
+[tool.setuptools_scm]
+git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "v[0-9]*"]
 
 [tool.ruff]
 target-version = "py311"

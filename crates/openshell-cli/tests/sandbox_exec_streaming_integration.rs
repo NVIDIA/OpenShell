@@ -236,6 +236,8 @@ mock_gateway! {
         delete_sandbox(proto::DeleteSandboxRequest) -> proto::DeleteSandboxResponse;
         stop_sandbox(proto::StopSandboxRequest) -> proto::SandboxResponse;
         start_sandbox(proto::StartSandboxRequest) -> proto::SandboxResponse;
+        suspend_sandbox(proto::SuspendSandboxRequest) -> proto::SandboxResponse;
+        resume_sandbox(proto::ResumeSandboxRequest) -> proto::SandboxResponse;
         create_ssh_session(proto::CreateSshSessionRequest) -> proto::CreateSshSessionResponse;
         expose_service(proto::ExposeServiceRequest) -> proto::ServiceEndpointResponse;
         get_service(proto::GetServiceRequest) -> proto::ServiceEndpointResponse;
@@ -243,6 +245,7 @@ mock_gateway! {
         delete_service(proto::DeleteServiceRequest) -> proto::DeleteServiceResponse;
         revoke_ssh_session(proto::RevokeSshSessionRequest) -> proto::RevokeSshSessionResponse;
         create_provider(proto::CreateProviderRequest) -> proto::ProviderResponse;
+        get_provider_credentials(proto::GetProviderCredentialsRequest) -> proto::GetProviderCredentialsResponse;
         get_provider(proto::GetProviderRequest) -> proto::ProviderResponse;
         list_providers(proto::ListProvidersRequest) -> proto::ListProvidersResponse;
         list_provider_profiles(proto::ListProviderProfilesRequest) -> proto::ListProviderProfilesResponse;
@@ -274,6 +277,7 @@ mock_gateway! {
         peer_report_provider_readiness(proto::ReportProviderReadinessRequest) -> proto::ReportProviderReadinessResponse;
         peer_report_endpoint_status(proto::ReportEndpointStatusRequest) -> proto::ReportEndpointStatusResponse;
         peer_get_sandbox_provider_status(proto::GetSandboxProviderStatusRequest) -> proto::GetSandboxProviderStatusResponse;
+        peer_notify_config_update(proto::PeerNotifyConfigUpdateRequest) -> proto::PeerNotifyConfigUpdateResponse;
         submit_policy_analysis(proto::SubmitPolicyAnalysisRequest) -> proto::SubmitPolicyAnalysisResponse;
         get_draft_policy(proto::GetDraftPolicyRequest) -> proto::GetDraftPolicyResponse;
         approve_draft_chunk(proto::ApproveDraftChunkRequest) -> proto::ApproveDraftChunkResponse;

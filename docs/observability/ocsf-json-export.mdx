@@ -3,21 +3,60 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "OCSF JSON Export"
 sidebar-title: "OCSF JSON Export"
-description: "How to enable full OCSF JSON logging for SIEM integration, compliance, and structured analysis. Includes schema version downgrade for AWS Security Lake, Splunk, and CrowdStrike compatibility."
+description: "How to enable full OCSF JSON logging for SIEM integration, compliance, and structured analysis."
 keywords: "Generative AI, Cybersecurity, OCSF, JSON, SIEM, Compliance, Observability"
 ---
 
-The [shorthand log format](/observability/logging) is optimized for humans and agents reading logs in real time. For machine consumption or SIEM integration, enable OCSF JSON output: one native JSON object per line. Collection is best-effort, not a guarantee of complete audit history.
+The [shorthand log format](/observability/logging) is optimized for humans and agents reading logs in real time. For machine consumption or SIEM integration, enable OCSF JSON output: one native JSON object per record. Collection is best-effort, not a guarantee of complete audit history.
 
 ## Gateway Output
 
 Configure `[openshell.gateway.ocsf_log]` in `gateway.toml` to collect gateway-origin OCSF events into one JSONL file. This includes gateway-wide events such as TLS certificate reloads, even when no sandbox log stream applies. Collection preserves native OCSF fields and event IDs and does not depend on `RUST_LOG`.
 
+To send gateway OCSF events directly to an OpenTelemetry collector instead, enable [OCSF log export](/how-it-works/gateways/configuration#ocsf-log-export).
+
 The gateway writes OCSF events to a local JSONL file. Give each replica its own path and configure the shipper to follow renamed rotation segments. See [OCSF JSONL configuration](/how-it-works/gateways/configuration#ocsf-jsonl-output) for queue bounds, retention, loss metrics, and best-effort delivery limits.
 
-This output is separate from the sandbox-local file described below. Enabling one does not enable the other.
+This output is separate from the supervisor stderr and file output described below. Enabling one does not enable the other. The gateway JSONL sink does not archive supervisor log lines pushed to the gateway; those lines carry OCSF shorthand text, not the full structured record.
 
 Gateway records use the configured gateway name for both `device.uid` and `device.name`. Replicas of one installation share that identity; `device.hostname` identifies the emitting replica. Assign distinct gateway names to installations whose events are collected together. Reusing a name, including the default name, groups those installations under the same identity. Renaming a gateway changes its audit identity.
+
+The gateway emits an Authentication (`class_uid: 3002`) event when it rejects a gRPC request during authentication. The caller receives the same error either way. It also emits one when a handler rejects a credential it checks itself: the SSH session token of a `ForwardTcp` SSH connection, or a compute-driver identity on `IssueSandboxToken` that no longer matches the sandbox's recorded runtime. Those events identify the already-authenticated caller in `user`. `auth_protocol` names the mechanism involved, when one applies: `OpenID` for OIDC bearer tokens, or `mtls`, `sandbox_jwt`, `compute_driver`, `k8s_service_account`, or `ssh_session_token`. `status_detail` holds the reason category:
+
+| Reason | Severity | Meaning |
+|---|---|---|
+| `missing_credential` | Low | No credential was presented. |
+| `expired_credential` | Low | The credential has expired. |
+| `conflicting_credentials` | Medium | An operator certificate arrived together with an `authorization` header. |
+| `malformed_credential` | Medium | The credential could not be parsed. |
+| `invalid_credential` | Medium | The credential failed signature, key, or claim verification. |
+| `audience_or_issuer_mismatch` | Medium | The credential was issued by or for a different party. |
+| `unknown_identity` | Medium | The credential names an identity the gateway does not recognize. |
+| `stale_identity` | Medium | The credential names a sandbox runtime or gateway pod that has since been replaced or stopped. |
+| `identity_provider_unavailable` | Medium | The OIDC key endpoint, Kubernetes API, compute driver, or gateway database could not verify the credential. |
+
+`src_endpoint` holds the address of the connection's immediate peer, which is the proxy or load balancer when one fronts the gateway, or the name `edge-tunnel` for requests carried over the WebSocket tunnel. `metadata.correlation_uid` holds the request's `x-request-id` when it is a UUID. The gateway generates one when the client sends none and returns it in the response. A client-supplied ID is recorded as sent, so it identifies the request, not the client.
+
+The gateway also emits an Informational Authentication event with `status: Success` the first time a replica accepts a credential, such as a bearer token, client certificate, or SSH session token. Later requests with the same credential emit nothing, so supervisor polling does not repeat the event. A refreshed token or renewed certificate is a new credential and logs on again, as does a credential still in use an hour later. Each replica records its own logons, and a replica tracking more than 16,384 credentials forgets the oldest early. `user` identifies the principal the same way `actor.user` does for authorization denials, described below. The `src_endpoint` and `metadata.correlation_uid` come from the request that logged on. A sandbox credential on `IssueSandboxToken` or `RefreshSandboxToken` logs on only after the gateway has checked the sandbox's recorded runtime or token lineage, so a credential that fails that check records no successful logon. Requests admitted by `auth.allow_unauthenticated_users`, or by a gateway with no authentication configured, emit no success event, though SSH session tokens they present still log on. To select only rejected requests, filter Authentication events on `status_id: 2` (Failure) rather than on `class_uid` alone.
+
+These events never include presented credentials, other request headers, or verification error text.
+
+The gateway emits an API Activity (`class_uid: 6003`) event with Medium severity when its method, role, scope, sandbox, workspace, or operator checks refuse an authenticated caller. `actor.user` identifies the principal: its `type` is `User`, `Admin` for an mTLS operator, `Sandbox`, or `Gateway Peer`, and `uid` is the subject, sandbox ID, or gateway replica ID. `api.operation` names the gRPC method, and `resources` names the sandbox, workspace, or extension service that was refused, when one applies, by `uid` for a sandbox ID or by `name` otherwise. `status_detail` holds the reason category:
+
+| Reason | Meaning |
+|---|---|
+| `method_not_permitted` | The principal type may not call the method, or may not call it with these arguments. |
+| `unknown_method` | The gateway does not recognize the method, for example one added in a newer client. |
+| `missing_role` | The caller lacks the OIDC role the method requires. |
+| `missing_scope` | The caller's token lacks the scope the method requires. |
+| `cross_sandbox` | A sandbox principal referenced a sandbox other than its own, by ID or by name. |
+| `not_workspace_member` | The caller is not a member of the workspace. |
+| `insufficient_workspace_role` | The caller's workspace role is below the one the operation requires. |
+| `platform_admin_required` | The operation spans workspaces or assigns the workspace admin role. |
+| `operator_required` | The operation requires a verified mTLS operator. |
+| `extension_service_not_selected` | A sandbox requested a credential for an extension service its policy does not select. A policy update can race the request, so this raises no finding. |
+
+When a sandbox principal is refused with `method_not_permitted`, `cross_sandbox`, or `platform_admin_required`, the gateway also emits a High-severity Detection Finding (`class_uid: 2004`) with `finding_info.uid` `sandbox-authorization-boundary`. Supervisors never make these requests, so the sandbox's credential may be compromised. Both events carry the same `metadata.correlation_uid`. Some methods answer a refused request with "not found" so callers cannot probe for resources; the event still records the denial.
 
 Without JSONL enabled, gateway OCSF events still appear as shorthand in console output, subject to the diagnostic log filter. Events associated with a sandbox also appear in its gateway log stream; gateway-wide events have no sandbox association.
 
@@ -63,26 +102,58 @@ $env:OPENSHELL_OCSF_LOG_DIR = "D:\OpenShell\audit"
 openshell-gateway --drivers mxc --config gateway.toml
 ```
 
-The sink is available only when Windows selects the MXC driver. It rotates
+This environment-configured sink is available on all platforms independently of
+the selected compute driver. On Unix hosts its default directory is
+`$XDG_STATE_HOME/openshell/logs` (or `$HOME/.local/state/openshell/logs`). It rotates
 daily and retains the three most recent files. Diagnostic `--log-level` values
 do not suppress records in this explicitly enabled audit sink.
+Prefer the `gateway.toml` output above for configured retention and loss metrics;
+enabling both sinks writes to both independently.
 
 ## Output Location
 
-For sandbox supervisors, OCSF JSON records are written to
-`/var/log/openshell-ocsf.YYYY-MM-DD.log` inside the sandbox. Windows MXC gateway
-records use `%PROGRAMDATA%\OpenShell\logs` or `OPENSHELL_OCSF_LOG_DIR`. Both
-sinks rotate daily and retain the three most recent files.
+When `ocsf_json_enabled=true`, sandbox supervisors emit full OCSF JSON to stderr alongside shorthand output:
+
+```text
+2026-10-07T23:21:19.000Z OCSF NET:OPEN [MED] DENIED ...
+2026-10-07T23:21:19.000Z OCSF-JSON {"class_uid":4001,...}
+```
+
+The example payload is abbreviated. Each actual `OCSF-JSON` line contains one complete compact JSON object. Configure your collector to match the `OCSF-JSON` token after the UTC timestamp and decode everything after the following space as JSON. Select these lines to avoid ingesting the shorthand copy of each event. The JSON preserves the original `metadata.uid`.
+
+Collect stderr through the supervisor's platform log interface:
+
+```shell
+docker logs --follow <supervisor-container>
+podman logs --follow <supervisor-container>
+kubectl -n <sandbox-namespace> logs <supervisor-pod> -c supervisor --follow
+```
+
+JSON stderr output works independently of writable log storage and the diagnostic log filter. Disabling the setting stops new JSON records. The console writer uses a bounded queue of 1,024 complete lines shared by diagnostics, shorthand, and JSON; when the queue is full, new lines are dropped rather than blocking enforcement. Delivery is best-effort, and retention depends on your runtime and external collector. The gateway log API and `openshell logs` continue to return shorthand.
+
+When file logging is available, supervisors also write plain JSONL to `/var/log/openshell-ocsf.YYYY-MM-DD.jsonl` in their own filesystem, separate from the workload. `openshell sandbox exec` cannot read those files. File output requires a writable `/var/log`; a missing file sink does not disable JSON stderr output.
+
+This file contains supervisor-originated events, not the [sandbox-runtime events](/observability/accessing-logs#main-process-output) emitted into workload container logs.
+
+Supervisor files rotate daily with an independent three-file limit per format. Docker and Podman store them on tmpfs; Kubernetes stores them in the supervisor pod's `emptyDir`. For durable retention, arrange external collection before rotation or teardown. See [supervisor file access](/observability/accessing-logs#direct-filesystem-access) for collection paths and best-effort limits.
+
+Windows MXC gateway records use `%PROGRAMDATA%\OpenShell\logs` or `OPENSHELL_OCSF_LOG_DIR`. That sink also rotates daily and retains the three most recent files. The separate `[openshell.gateway.ocsf_log]` sink uses its configured path and retention.
 
 ## JSON Record Structure
 
 Gateway-produced records use the `OpenShell Gateway` product identity; supervisor records use `OpenShell Sandbox Supervisor`. The producing device and the affected sandbox are separate identities, so a gateway event can still identify an affected sandbox through its container fields.
 
-For gateway-produced records, `device.os.name` identifies the OS running the gateway process: Linux, Windows, or macOS. Linux supervisor records continue to report Linux, regardless of the gateway's OS. A native macOS gateway therefore reports macOS while its Linux sandboxes report Linux; a gateway running inside a Linux container reports Linux, even on a Mac host.
+For gateway-produced records, `device.os.name` and `device.os.type_id` identify the OS running the gateway process: Linux (200), Windows (100), or macOS (300). Linux supervisor records continue to report Linux, regardless of the gateway's OS. A native macOS gateway therefore reports macOS while its Linux sandboxes report Linux; a gateway running inside a Linux container reports Linux, even on a Mac host.
 
 `metadata.uid` uniquely identifies an event and stays unchanged when that record is serialized again. Use `container.uid` to associate the event with its sandbox, not `metadata.uid`. Records without a sandbox association omit the container; unknown images are omitted rather than represented by an empty image name.
 
-Each line is a complete OCSF v1.8.0 JSON object. Here is an example of a network connection event:
+Some fields depend on the event class:
+
+- SSH Activity records name the supervisor's SSH server as `dst_endpoint`, with `svc_name: "ssh"` and the listen socket path in `name`, because the server listens on a Unix socket rather than a network address.
+- Process Activity records from the sandbox name the `openshell-sandbox` launcher as `actor.process`.
+- `connection_info` carries `direction_id` and `direction`. OpenShell reports Unknown (`0`) where it does not track the direction.
+
+Each JSONL file line, or the payload after the stderr marker, is a complete OCSF v1.8.0 JSON object. Records validate against OCSF v1.8.0 except for the top-level `container` object, which OCSF does not define at the event level. Here is an example of a network connection event:
 
 ```json
 {
@@ -92,6 +163,8 @@ Each line is a complete OCSF v1.8.0 JSON object. Here is an example of a network
   "category_name": "Network Activity",
   "activity_id": 1,
   "activity_name": "Open",
+  "type_uid": 400101,
+  "type_name": "Network Activity: Open",
   "severity_id": 1,
   "severity": "Informational",
   "status_id": 1,
@@ -101,8 +174,8 @@ Each line is a complete OCSF v1.8.0 JSON object. Here is an example of a network
   "metadata": {
     "product": {
       "name": "OpenShell Sandbox Supervisor",
-      "vendor_name": "NVIDIA",
-      "version": "0.3.0"
+      "vendor_name": "OpenShell",
+      "version": "0.1.4"
     },
     "version": "1.8.0"
   },
@@ -131,38 +204,75 @@ Each line is a complete OCSF v1.8.0 JSON object. Here is an example of a network
 }
 ```
 
-And a denied connection:
+And a denied connection, produced when `curl https://github.com` runs in a sandbox without a network policy that allows `github.com`:
 
 ```json
 {
   "class_uid": 4001,
   "class_name": "Network Activity",
+  "category_uid": 4,
+  "category_name": "Network Activity",
   "activity_id": 1,
   "activity_name": "Open",
+  "type_uid": 400101,
+  "type_name": "Network Activity: Open",
+  "time": 1791996125789,
   "severity_id": 3,
   "severity": "Medium",
   "status_id": 2,
   "status": "Failure",
-  "action_id": 2,
-  "action": "Denied",
-  "disposition_id": 2,
-  "disposition": "Blocked",
-  "status_detail": "no matching policy",
-  "message": "CONNECT denied httpbin.org:443",
+  "message": "Transparent TCP denied before relay: network connections not allowed by policy",
+  "status_detail": "transparent_tcp_policy_denied",
+  "metadata": {
+    "version": "1.8.0",
+    "product": {
+      "name": "OpenShell Sandbox Supervisor",
+      "vendor_name": "OpenShell",
+      "version": "0.1.4"
+    },
+    "profiles": [
+      "security_control",
+      "network_proxy",
+      "container",
+      "host"
+    ],
+    "uid": "b885957d-124a-4af7-9eef-75cc410ff070"
+  },
+  "device": {
+    "hostname": "docker-desktop",
+    "type_id": 99,
+    "type": "Sandbox",
+    "os": {
+      "name": "Linux",
+      "type_id": 200,
+      "type": "Linux"
+    }
+  },
+  "container": {
+    "name": "docs-deny",
+    "uid": "3949f6fc-2b84-45b2-a631-46debe41d84f"
+  },
   "dst_endpoint": {
-    "domain": "httpbin.org",
+    "domain": "github.com",
+    "ip": "198.18.0.2",
     "port": 443
+  },
+  "proxy_endpoint": {
+    "ip": "127.0.0.1",
+    "port": 3128
   },
   "actor": {
     "process": {
       "name": "/usr/bin/curl",
-      "pid": 63
+      "pid": 2187,
+      "cmd_line": "curl https://github.com"
     }
   },
-  "firewall_rule": {
-    "name": "-",
-    "type": "opa"
-  }
+  "action_id": 2,
+  "action": "Denied",
+  "disposition_id": 2,
+  "disposition": "Blocked",
+  "is_src_dst_assignment_known": true
 }
 ```
 
@@ -182,8 +292,10 @@ The `class_uid` field identifies the event type:
 | 4007 | SSH Activity | `SSH:` |
 | 1007 | Process Activity | `PROC:` |
 | 2004 | Detection Finding | `FINDING:` |
+| 3002 | Authentication | `AUTH:` |
 | 5019 | Device Config State Change | `CONFIG:` |
 | 6002 | Application Lifecycle | `LIFECYCLE:` |
+| 6003 | API Activity | `API:` |
 
 HTTP Activity records include request or response details. Rejections that have
 parsed a request, including early credential-binding failures, include safe
@@ -198,66 +310,9 @@ failures without an observed network endpoint, use Base Event (`class_uid: 0`).
 Include these classes when filtering supervisor operational events. Relay-control
 records that previously appeared as `NET:*` now appear as `EVENT`.
 
-## SIEM Schema Version Compatibility
+## Schema Version
 
-OpenShell emits OCSF v1.8.0 events internally, but many SIEMs only support older schema versions. The `ocsf_schema_version` setting tells the JSONL layer to downgrade events before writing, stripping fields and profiles that don't exist in the target version.
-
-For gateway JSONL, set `schema_version` on the output destination. The target applies uniformly to every record written to that file and requires a gateway restart:
-
-```toml
-[openshell.gateway.ocsf_log]
-path = "/var/log/openshell/gateway-ocsf.jsonl"
-schema_version = "1.3"
-```
-
-The sandbox-scoped setting below controls the legacy supervisor-local JSONL file only.
-
-Set the target version globally:
-
-```shell
-openshell settings set --global --key ocsf_schema_version --value "1.1"
-```
-
-Or per-sandbox:
-
-```shell
-openshell settings set my-sandbox --key ocsf_schema_version --value "1.3"
-```
-
-The setting takes effect on the next poll cycle, by default every 10 seconds. No sandbox restart is required.
-
-Supported target versions are `1.1` and `1.3`. When set, the JSONL layer applies the following transformations:
-
-- Strips fields added after the target version: `ai_model`, `container`, `observation_point_id`
-- Removes unknown profile names from `metadata.profiles`: `ai_operation`, `container`
-- Rewrites `metadata.version` to match the target version
-
-The shorthand log output is unaffected. The internal event model stays at v1.8.0; only the serialized JSONL is transformed.
-
-When unset or empty, no downgrade is applied and events are written at the current schema version.
-
-| SIEM | Required OCSF Version | `ocsf_schema_version` Value |
-|---|---|---|
-| AWS Security Lake | v1.1.0 | `1.1` |
-| Splunk CIM Add-On | v1.1-v1.3 | `1.1` or `1.3` |
-| CrowdStrike FDR | v1.5.0 | Not yet supported |
-| Datadog Cloud SIEM | v1.5.0 (selectable) | Not yet supported |
-
-<Warning>
-Downgrading is lossy. The `ai_model` field and `ai_operation` profile are stripped for v1.1 and v1.3 targets, so AI model attribution is not present in downgraded events. If your audit workflow requires knowing which model handled a request, use the full schema version (leave `ocsf_schema_version` unset). OpenShell supports OCSF v1.8.0 natively; upgrade your SIEM's OCSF schema if you need AI attribution alongside backward-compatible ingestion.
-</Warning>
-
-Downgraded events include a `downgraded_from` marker in the `unmapped` object so auditors can distinguish "no model was involved" from "model attribution was stripped":
-
-```json
-{
-  "unmapped": {
-    "downgraded_from": "1.8.0"
-  }
-}
-```
-
-The core OCSF event structure (class UIDs, activity IDs, network and HTTP fields) is identical across v1.1 through v1.8. The stripped fields are all profile-gated additions.
+OpenShell emits OCSF v1.8.0 only. The `ocsf_schema_version` sandbox setting and the gateway `schema_version` fields under `[openshell.gateway.ocsf_log]` and `[openshell.gateway.otlp.ocsf]` are deprecated and ignored; remove them from your configuration. The gateway logs a warning at startup for each field that is set, and a sandbox reports a set `ocsf_schema_version` as a Device Config State Change event.
 
 ## Integration with External Tools
 
@@ -265,28 +320,28 @@ The JSONL file can be shipped to any tool that accepts OCSF-formatted data:
 
 | Tool | Integration Path |
 |---|---|
-| Splunk | Use the [Splunk OCSF Add-on](https://splunkbase.splunk.com/app/6943) to ingest OCSF JSONL files. Set `ocsf_schema_version` to `1.3` for CIM Add-On compatibility. |
-| Amazon Security Lake | OCSF is the native schema for Security Lake. Set `ocsf_schema_version` to `1.1` for v1.1.0 compatibility. |
-| CrowdStrike FDR | Ship JSONL files to Falcon Data Replicator. v1.5 downgrade target is not yet supported. |
+| Splunk | Use the [Splunk OCSF Add-on](https://splunkbase.splunk.com/app/6943) to ingest OCSF JSONL files. |
+| Amazon Security Lake | OCSF is the native schema for Security Lake. |
+| CrowdStrike FDR | Ship JSONL files to Falcon Data Replicator. |
 | Elastic | Use Filebeat to ship JSONL files with the OCSF field mappings. |
 | Custom pipelines | Parse the JSONL file with `jq`, Python, or any JSON-capable tool. |
 
-Example with `jq` to extract all denied connections:
+After [copying supervisor files](/observability/accessing-logs#direct-filesystem-access) into `./supervisor-logs`, use `jq` to extract all denied connections:
 
 ```shell
-cat /var/log/openshell-ocsf.2026-04-01.log | \
-  jq -c 'select(.action == "Denied")'
+jq -c 'select(.action == "Denied")' ./supervisor-logs/openshell-ocsf.*.jsonl
 ```
 
 ## Relationship to Shorthand Logs
 
 Sandbox events identify the sandbox environment with `device.type_id: 99` (Other) and `device.type: "Sandbox"`. The operating system is reported separately in `device.os.name`; the device type does not classify the underlying host or compute backend.
 
-The shorthand format in `openshell.YYYY-MM-DD.log` and the JSON format in `openshell-ocsf.YYYY-MM-DD.log` are derived from the same OCSF events. The shorthand is a human-readable projection; the JSON is the full structured record when no schema downgrade is configured. When `ocsf_schema_version` is set, the JSON export is a lossy projection of the internal event model. Both formats are generated at the same time from the same event data.
+The shorthand format in `openshell.YYYY-MM-DD.log` and the JSON format in `openshell-ocsf.YYYY-MM-DD.jsonl` are derived from the same OCSF events. The shorthand is a human-readable projection; the JSON is the full structured record. Both formats are generated at the same time from the same event data.
 
-The shorthand log is always active. The JSON export is opt-in through `ocsf_json_enabled`.
+Shorthand stderr output follows the diagnostic log filter; its local file is available when file logging starts successfully. JSON stderr and file export are opt-in through `ocsf_json_enabled`. File export requires the supervisor's JSONL sink to start successfully; stderr export is independent of that sink.
 
 ## Next Steps
 
+- See the [Observability Overview](/observability/overview) to compare JSONL files with OTLP log export.
 - Learn how to [read the shorthand format](/observability/logging) for real-time monitoring.
 - Refer to the [OCSF specification](https://schema.ocsf.io/) for the full schema reference.

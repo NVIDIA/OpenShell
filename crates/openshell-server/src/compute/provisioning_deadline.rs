@@ -14,6 +14,16 @@ use serde::{Deserialize, Serialize};
 
 const REPAIR_WINDOW_MS: i64 = 300_000;
 
+/// How long one scan pass waits, in total, for sandboxes' local keys. A sandbox
+/// whose keys are still busy is skipped until the next pass. Keys are taken in
+/// ascending order, so the scan can hold X(sandbox) while it waits for
+/// S(workspace) behind a provider or profile writer, and the sandbox's
+/// lifecycle operations wait behind the scan. Once the budget is spent, the
+/// rest of the pass waits about a timer tick for each sandbox's keys, so a
+/// busy workspace or global key costs one wait per pass, not one per sandbox.
+/// Well under the mutation lock timeout.
+pub(super) const SCAN_LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Opaque identity of a committed effective configuration change. A -> B -> A
 /// must use three different IDs even if the first and last content hashes match.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,7 +457,7 @@ impl super::ComputeRuntime {
     pub(super) async fn reconcile_provisioning_deadlines(&self, now_ms: i64) -> Result<(), String> {
         use crate::persistence::{ObjectListQuery, ObjectType};
         use openshell_core::{
-            ObjectId,
+            ObjectId, ObjectWorkspace,
             proto::{Sandbox, SandboxPhase},
         };
         use prost::Message;
@@ -456,6 +466,7 @@ impl super::ComputeRuntime {
             .collect_records(Sandbox::object_type(), ObjectListQuery::AllWorkspaces)
             .await
             .map_err(|error| error.to_string())?;
+        let mut lock_wait_left = SCAN_LOCK_WAIT_BUDGET;
         for record in records {
             let candidate =
                 Sandbox::decode(record.payload.as_slice()).map_err(|error| error.to_string())?;
@@ -469,7 +480,35 @@ impl super::ComputeRuntime {
             // Expiration can fence Starting while its driver RPC owns the
             // lifecycle gate. Cleanup waits for that gate; Error never waits
             // for compute I/O, matching the existing driver-observation fence.
-            let global = self.sync_lock.clone().lock_owned().await;
+            // A timed-out acquisition releases the keys it already took. With
+            // no budget left, the timeout still polls the keys before its timer
+            // fires, and unlike `now_or_never` it yields instead of skipping
+            // free keys when the task's coop budget is spent.
+            let wait_started = tokio::time::Instant::now();
+            let acquired = tokio::time::timeout(
+                lock_wait_left,
+                self.lock_sandbox_local_in_workspace(candidate.object_workspace(), &record.id),
+            )
+            .await;
+            lock_wait_left = lock_wait_left.saturating_sub(wait_started.elapsed());
+            let Ok(local_guard) = acquired else {
+                // Brief contention is routine; a skip past the deadline delays
+                // expiry. The counter shows both without a warning per pass.
+                let overdue = candidate
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.provisioning.as_ref())
+                    .and_then(|record| record.deadline.as_ref())
+                    .and_then(|deadline| timestamp_to_millis(deadline).ok())
+                    .is_some_and(|deadline| deadline <= now_ms);
+                crate::gateway_metrics::record_provisioning_deadline_skip(overdue);
+                tracing::debug!(
+                    sandbox_id = %record.id,
+                    overdue,
+                    "Provisioning deadline scan skipped a sandbox whose locks are busy"
+                );
+                continue;
+            };
             let Some(mut current) = self
                 .store
                 .get_message::<Sandbox>(&record.id)
@@ -495,7 +534,7 @@ impl super::ComputeRuntime {
             if let Some(expired) = self.claim_provisioning_timeout(&current, now_ms).await? {
                 current = expired;
             }
-            drop(global);
+            drop(local_guard);
             if timed_out(&current)
                 && current
                     .status
@@ -510,10 +549,9 @@ impl super::ComputeRuntime {
                                 .is_none_or(|t| t <= now_ms)
                     })
             {
-                let Ok(guard) = self.lifecycle_gates.gate_for(&record.id).try_lock_owned() else {
+                let Some(gate) = self.lifecycle_gates.try_lock_for(&record.id) else {
                     continue;
                 };
-                let gate = super::SandboxLifecycleGuard { _guard: guard };
                 let runtime = self.clone();
                 tokio::spawn(async move {
                     if let Err(error) = runtime.reclaim_provisioning_timeout(&current, &gate).await
@@ -527,7 +565,7 @@ impl super::ComputeRuntime {
     }
 
     /// Claim expiration durably before touching the backend. The caller owns the
-    /// global configuration guard; CAS fences concurrent lifecycle operations.
+    /// sandbox's local mutation lock; CAS fences concurrent lifecycle operations.
     /// The separate cleanup step also requires the per-sandbox lifecycle gate.
     pub(crate) async fn claim_provisioning_timeout(
         &self,
@@ -621,7 +659,7 @@ impl super::ComputeRuntime {
         use openshell_core::proto::compute::v1::StopSandboxRequest;
         use openshell_core::{ObjectId, ObjectName};
         let current = {
-            let _global_guard = self.lock_global_for_lifecycle(lifecycle_guard).await;
+            let _sandbox_guard = self.lock_sandbox_for_lifecycle(lifecycle_guard).await;
             self.store
                 .get_message::<Sandbox>(expired.object_id())
                 .await
@@ -674,7 +712,7 @@ impl super::ComputeRuntime {
         // Cross-replica cleanup claim. A replacement leader waits longer than
         // the bounded driver call before retrying an interrupted reclamation.
         {
-            let _global_guard = self.lock_global_for_lifecycle(lifecycle_guard).await;
+            let _sandbox_guard = self.lock_sandbox_for_lifecycle(lifecycle_guard).await;
             self.store
                 .update_message_cas::<Sandbox, _>(
                     expired.object_id(),
@@ -716,7 +754,7 @@ impl super::ComputeRuntime {
         let reclaimed = !pending_before_stop
             && (matches!(&result, Ok(Ok(_)))
                 || matches!(&result, Ok(Err(error)) if error.code() == tonic::Code::NotFound));
-        let _global_guard = self.lock_global_for_lifecycle(lifecycle_guard).await;
+        let _sandbox_guard = self.lock_sandbox_for_lifecycle(lifecycle_guard).await;
         let Some(current) = self
             .store
             .get_message::<Sandbox>(&sandbox_id)
