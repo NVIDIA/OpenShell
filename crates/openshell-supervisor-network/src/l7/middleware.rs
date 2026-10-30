@@ -24,8 +24,8 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-/// How long the sandbox may stop sending a request body while a STREAM
-/// request middleware session is held. STREAM has no total deadline, so this
+/// How long the sandbox may stop sending a request body while a DUPLEX
+/// request middleware session is held. DUPLEX has no total deadline, so this
 /// bounds a paused upload; it matches the WebSocket message-assembly limit.
 pub const REQUEST_CLIENT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -1017,8 +1017,8 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
 ) -> Result<MiddlewareApplyResult> {
     let head = &req.raw_header[..request_header_end(&req.raw_header)];
     // Output that cannot stream to the upstream is withheld up to the route's
-    // limit, and STREAM stages learn that limit at preflight. A chain whose
-    // final stage buffers is withheld too, but within its smaller BUFFERED cap.
+    // limit, and DUPLEX stages learn that limit at preflight. A chain whose
+    // final stage buffers is withheld too, but within its smaller WHOLE_BODY cap.
     let withheld_limit = delivery.withheld_limit().or_else(|| {
         (matches!(req.body_length, crate::l7::provider::BodyLength::None)
             || !request_line_is_http11(head)
@@ -1552,7 +1552,7 @@ pub(super) fn request_middleware_events(
     )
 }
 
-/// The sandbox stopped sending a request body that STREAM request
+/// The sandbox stopped sending a request body that DUPLEX request
 /// middleware was processing; the request was aborted.
 pub(super) fn request_client_timeout_event(
     ctx: &L7EvalContext,

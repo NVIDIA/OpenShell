@@ -7,7 +7,7 @@
 //! client. The response head commits on the pipeline's output `Start`, with
 //! `Content-Length` when the output declares its length, chunked framing
 //! otherwise, or close-delimited framing where the client cannot use chunked
-//! framing. STREAM is offered only where the client can receive chunked
+//! framing. DUPLEX is offered only where the client can receive chunked
 //! framing, so a streamed body's truncation stays detectable.
 //!
 //! Until every stage has returned its terminal result, the relay holds back
@@ -17,7 +17,7 @@
 //!
 //! A failure before commit returns the canonical 403 or 502 response. After
 //! commit, delivery aborts: no terminating chunk, final byte, trailers, or
-//! error body, and the connection closes. STREAM has no total deadline, and
+//! error body, and the connection closes. DUPLEX has no total deadline, and
 //! upstream silence never fails a response. As for an uninspected response,
 //! an upstream body without framing ends when the upstream closes, or, except
 //! for server-sent events, after the relay's idle timeout.
@@ -134,7 +134,7 @@ where
         request_headers: request_headers.clone().unwrap_or_default(),
     };
     let delivery = HttpResponseDelivery {
-        buffered_body_timeout: middleware.whole_body_timeout,
+        whole_body_timeout: middleware.whole_body_timeout,
         ..HttpResponseDelivery::new(chunked)
     };
     let preflight = if parsed.representable && request_headers.is_some() {

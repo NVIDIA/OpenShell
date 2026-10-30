@@ -366,15 +366,15 @@ pub const MAX_CONCURRENT_MIDDLEWARE_WORK: usize = 32;
 /// [`MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS`] instead.
 pub const MAX_CONCURRENT_MIDDLEWARE_SESSIONS: usize = 32;
 /// Process-wide bound on HTTP session hook messages in preflight or in a
-/// BUFFERED body.
+/// `WHOLE_BODY` stage.
 ///
 /// A request and its response each hold one slot, and only while a stage
 /// inspects them: a message whose stages all continue at preflight releases
 /// its slot then. A message waits for a slot within its chain deadline.
 pub const MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS: usize = 64;
-/// Process-wide bound on HTTP session hook messages with a STREAM stage.
+/// Process-wide bound on HTTP session hook messages with a DUPLEX stage.
 ///
-/// A STREAM body has no total deadline, so a server-sent events response can
+/// A DUPLEX body has no total deadline, so a server-sent events response can
 /// hold its slot indefinitely. This separate budget keeps such streams from
 /// starving short messages. It allows a request and a response stream for each
 /// of the 96 network streams the `OpenShell` sandbox runtime relays at once.

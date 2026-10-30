@@ -7402,8 +7402,8 @@ mod tests {
             tonic::Status,
         > {
             use openshell_core::proto::{
-                HttpDenial, HttpFinish, HttpInspect, HttpOutputChunk, HttpOutputStart,
-                HttpPreflightResult, HttpStreamMode, MiddlewareDiagnostics, http_inspect,
+                HttpDenial, HttpDuplexMode, HttpFinish, HttpInspect, HttpOutputChunk,
+                HttpOutputStart, HttpPreflightResult, MiddlewareDiagnostics, http_inspect,
                 http_preflight_result, http_response_session_event, http_response_session_result,
             };
             let (declared, reject, gate) = (self.declared, self.reject, self.gate.clone());
@@ -7424,8 +7424,8 @@ mod tests {
                                     HttpPreflightResult {
                                         decision: Some(http_preflight_result::Decision::Inspect(
                                             HttpInspect {
-                                                mode: Some(http_inspect::Mode::Stream(
-                                                    HttpStreamMode {},
+                                                mode: Some(http_inspect::Mode::Duplex(
+                                                    HttpDuplexMode {},
                                                 )),
                                             },
                                         )),
@@ -7658,7 +7658,7 @@ mod tests {
     async fn session_response_stages_own_integrity_headers() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"v1\"\r\nContent-MD5: md5\r\n\r\nhello";
         for (name, late_mutations, kept, absent) in [
-            // A STREAM stage that passes the body through keeps the
+            // A DUPLEX stage that passes the body through keeps the
             // upstream's validators.
             (
                 "pass-through",

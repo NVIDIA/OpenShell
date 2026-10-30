@@ -23,9 +23,9 @@ pub(crate) enum Mode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BodyMode {
     /// Inspect one complete body, up to 256 KiB.
-    Buffered,
+    WholeBody,
     /// Inspect the body as it streams, with no size limit.
-    Stream,
+    Duplex,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -82,10 +82,10 @@ impl GuardConfig {
         if mode == Mode::Deny && config.fields.contains_key("replacement") {
             return Err("config.replacement is only valid in redact mode".into());
         }
-        let body_mode = match optional_string_field(config, "body_mode")?.unwrap_or("buffered") {
-            "buffered" => BodyMode::Buffered,
-            "stream" => BodyMode::Stream,
-            _ => return Err("config.body_mode must be 'buffered' or 'stream'".into()),
+        let body_mode = match optional_string_field(config, "body_mode")?.unwrap_or("whole_body") {
+            "whole_body" => BodyMode::WholeBody,
+            "duplex" => BodyMode::Duplex,
+            _ => return Err("config.body_mode must be 'whole_body' or 'duplex'".into()),
         };
 
         Ok(Self {
@@ -509,6 +509,6 @@ mod tests {
         let parsed = GuardConfig::parse(Some(&fields)).expect("valid config");
         assert_eq!(parsed.mode, Mode::Redact);
         assert_eq!(parsed.replacement, DEFAULT_REPLACEMENT);
-        assert_eq!(parsed.body_mode, BodyMode::Buffered);
+        assert_eq!(parsed.body_mode, BodyMode::WholeBody);
     }
 }

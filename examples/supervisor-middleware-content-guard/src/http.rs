@@ -4,7 +4,7 @@
 //! HTTP session hooks (`HttpSessionMiddleware.EvaluateRequest` and
 //! `HttpSessionMiddleware.EvaluateResponse`) for requests and responses.
 //!
-//! The guard selects its configured body mode, BUFFERED by default, and falls
+//! The guard selects its configured body mode, `WHOLE_BODY` by default, and falls
 //! back to the other mode when OpenShell offers only that one. A message
 //! without a body continues. A message the guard cannot inspect, such as an
 //! encoded body, is denied with reason code `cannot_inspect`.
@@ -17,13 +17,13 @@ use std::pin::Pin;
 use openshell_core::middleware::{HttpRequestSessionResultStream, HttpResponseSessionResultStream};
 use openshell_core::proto::{
     HeaderMutation, HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable,
-    HttpBodyUnavailableReason, HttpBufferedBody, HttpBufferedMode, HttpBufferedResult,
-    HttpContinue, HttpDenial, HttpFinish, HttpInputChunk, HttpInspect, HttpOutputChunk,
-    HttpOutputStart, HttpPreflightResult, HttpRequestPreflightHead, HttpRequestSessionEvent,
-    HttpRequestSessionResult, HttpResponseSessionEvent, HttpResponseSessionResult, HttpStreamMode,
-    HttpUnchanged, MiddlewareDiagnostics, RemoveHeader, header_mutation, http_buffered_result,
+    HttpBodyUnavailableReason, HttpContinue, HttpDenial, HttpDuplexMode, HttpFinish,
+    HttpInputChunk, HttpInspect, HttpOutputChunk, HttpOutputStart, HttpPreflightResult,
+    HttpRequestPreflightHead, HttpRequestSessionEvent, HttpRequestSessionResult,
+    HttpResponseSessionEvent, HttpResponseSessionResult, HttpUnchanged, HttpWholeBody,
+    HttpWholeBodyMode, HttpWholeBodyResult, MiddlewareDiagnostics, RemoveHeader, header_mutation,
     http_inspect, http_preflight_result, http_request_session_event, http_request_session_result,
-    http_response_session_event, http_response_session_result,
+    http_response_session_event, http_response_session_result, http_whole_body_result,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -99,7 +99,7 @@ where
 enum Event {
     Preflight(Box<Preflight>),
     Begin,
-    BufferedBody(HttpBufferedBody),
+    WholeBody(HttpWholeBody),
     InputChunk(HttpInputChunk),
     InputEnd,
     SessionEnd,
@@ -136,7 +136,7 @@ fn request_event(event: HttpRequestSessionEvent) -> Option<Event> {
             declared_body_bytes: preflight.declared_body_bytes,
         })),
         Wire::Begin(_) => Event::Begin,
-        Wire::BufferedBody(body) => Event::BufferedBody(body),
+        Wire::WholeBody(body) => Event::WholeBody(body),
         Wire::InputChunk(chunk) => Event::InputChunk(chunk),
         Wire::InputEnd(_) => Event::InputEnd,
         Wire::SessionEnd(_) => Event::SessionEnd,
@@ -159,7 +159,7 @@ fn response_event(event: HttpResponseSessionEvent) -> Option<Event> {
             declared_body_bytes: preflight.declared_body_bytes,
         })),
         Wire::Begin(_) => Event::Begin,
-        Wire::BufferedBody(body) => Event::BufferedBody(body),
+        Wire::WholeBody(body) => Event::WholeBody(body),
         Wire::InputChunk(chunk) => Event::InputChunk(chunk),
         Wire::InputEnd(_) => Event::InputEnd,
         Wire::SessionEnd(_) => Event::SessionEnd,
@@ -170,7 +170,7 @@ fn response_event(event: HttpResponseSessionEvent) -> Option<Event> {
 #[derive(Debug)]
 enum Reply {
     Preflight(HttpPreflightResult),
-    Buffered(HttpBufferedResult),
+    WholeBody(HttpWholeBodyResult),
     OutputStart(HttpOutputStart),
     OutputChunk(HttpOutputChunk),
     Finish(HttpFinish),
@@ -181,7 +181,7 @@ impl From<Reply> for http_request_session_result::Result {
     fn from(reply: Reply) -> Self {
         match reply {
             Reply::Preflight(result) => Self::PreflightResult(result),
-            Reply::Buffered(result) => Self::BufferedResult(result),
+            Reply::WholeBody(result) => Self::WholeBodyResult(result),
             Reply::OutputStart(start) => Self::OutputStart(start),
             Reply::OutputChunk(chunk) => Self::OutputChunk(chunk),
             Reply::Finish(finish) => Self::Finish(finish),
@@ -194,7 +194,7 @@ impl From<Reply> for http_response_session_result::Result {
     fn from(reply: Reply) -> Self {
         match reply {
             Reply::Preflight(result) => Self::PreflightResult(result),
-            Reply::Buffered(result) => Self::BufferedResult(result),
+            Reply::WholeBody(result) => Self::WholeBodyResult(result),
             Reply::OutputStart(start) => Self::OutputStart(start),
             Reply::OutputChunk(chunk) => Self::OutputChunk(chunk),
             Reply::Finish(finish) => Self::Finish(finish),
@@ -206,9 +206,9 @@ impl From<Reply> for http_response_session_result::Result {
 enum Stage {
     Preflight,
     Begin(GuardConfig, Selected),
-    Buffered(GuardConfig),
-    /// STREAM, with the largest output chunk OpenShell accepts.
-    Stream(GuardConfig, StreamScanner, usize),
+    WholeBody(GuardConfig),
+    /// DUPLEX, with the largest output chunk OpenShell accepts.
+    Duplex(GuardConfig, StreamScanner, usize),
     Done,
 }
 
@@ -229,10 +229,10 @@ impl Stage {
                     })]),
                     Decision::Inspect(config, selected) => {
                         let mode = match selected {
-                            Selected::Buffered(max_body_bytes) => {
-                                http_inspect::Mode::Buffered(HttpBufferedMode { max_body_bytes })
+                            Selected::WholeBody(max_body_bytes) => {
+                                http_inspect::Mode::WholeBody(HttpWholeBodyMode { max_body_bytes })
                             }
-                            Selected::Stream(_) => http_inspect::Mode::Stream(HttpStreamMode {}),
+                            Selected::Duplex(_) => http_inspect::Mode::Duplex(HttpDuplexMode {}),
                         };
                         *self = Self::Begin(config, selected);
                         Ok(vec![Reply::Preflight(HttpPreflightResult {
@@ -244,11 +244,11 @@ impl Stage {
                     }
                 }
             }
-            (Self::Begin(config, Selected::Buffered(_)), Event::Begin) => {
-                *self = Self::Buffered(config);
+            (Self::Begin(config, Selected::WholeBody(_)), Event::Begin) => {
+                *self = Self::WholeBody(config);
                 Ok(Vec::new())
             }
-            (Self::Begin(config, Selected::Stream(max_chunk_bytes)), Event::Begin) => {
+            (Self::Begin(config, Selected::Duplex(max_chunk_bytes)), Event::Begin) => {
                 let scanner = StreamScanner::new(&config);
                 // The head goes out before the guard knows whether it will
                 // redact anything. Deny mode passes the body through unchanged.
@@ -257,25 +257,25 @@ impl Stage {
                 } else {
                     Vec::new()
                 };
-                *self = Self::Stream(config, scanner, max_chunk_bytes);
+                *self = Self::Duplex(config, scanner, max_chunk_bytes);
                 Ok(vec![Reply::OutputStart(HttpOutputStart {
                     header_mutations,
                     output_body_bytes: None,
                 })])
             }
-            (Self::Buffered(config), Event::BufferedBody(body)) => {
-                Ok(vec![buffered_result(inspect(&config, &body.data))])
+            (Self::WholeBody(config), Event::WholeBody(body)) => {
+                Ok(vec![whole_body_result(inspect(&config, &body.data))])
             }
-            (Self::Stream(config, mut scanner, max_chunk_bytes), Event::InputChunk(chunk)) => {
+            (Self::Duplex(config, mut scanner, max_chunk_bytes), Event::InputChunk(chunk)) => {
                 match scanner.push(&chunk.data, config.mode == Mode::Deny) {
                     Ok(output) => {
-                        *self = Self::Stream(config, scanner, max_chunk_bytes);
+                        *self = Self::Duplex(config, scanner, max_chunk_bytes);
                         Ok(output_chunks(&output, max_chunk_bytes))
                     }
                     Err(_) => Ok(vec![deny(&config, &scanner)]),
                 }
             }
-            (Self::Stream(config, mut scanner, max_chunk_bytes), Event::InputEnd) => {
+            (Self::Duplex(config, mut scanner, max_chunk_bytes), Event::InputEnd) => {
                 match scanner.finish(config.mode == Mode::Deny) {
                     Ok(output) => {
                         let (match_count, matched_term_count) = scanner.counts();
@@ -301,9 +301,9 @@ impl Stage {
 
 #[derive(Clone, Copy)]
 enum Selected {
-    Buffered(u64),
+    WholeBody(u64),
     /// The largest output chunk OpenShell accepts.
-    Stream(usize),
+    Duplex(usize),
 }
 
 enum Decision {
@@ -342,26 +342,26 @@ fn preflight_decision(preflight: Preflight) -> Result<Decision, Status> {
         return Ok(Decision::Continue);
     }
     let permitted = |mode: HttpBodyMode| preflight.permitted_body_modes.contains(&(mode as i32));
-    let buffered = permitted(HttpBodyMode::Buffered).then(|| {
+    let whole_body = permitted(HttpBodyMode::WholeBody).then(|| {
         let offered = preflight
             .limits
-            .map_or(0, |limits| limits.max_buffered_body_bytes);
-        Selected::Buffered(offered.min(MAX_PAYLOAD_BYTES))
+            .map_or(0, |limits| limits.max_whole_body_bytes);
+        Selected::WholeBody(offered.min(MAX_PAYLOAD_BYTES))
     });
-    let stream = permitted(HttpBodyMode::Stream).then(|| {
+    let duplex = permitted(HttpBodyMode::Duplex).then(|| {
         let max_chunk_bytes = preflight.limits.map_or(0, |limits| limits.max_chunk_bytes);
-        Selected::Stream(usize::try_from(max_chunk_bytes).unwrap_or(usize::MAX))
+        Selected::Duplex(usize::try_from(max_chunk_bytes).unwrap_or(usize::MAX))
     });
     let selected = match config.body_mode {
-        BodyMode::Buffered => buffered.or(stream),
-        BodyMode::Stream => stream.or(buffered),
+        BodyMode::WholeBody => whole_body.or(duplex),
+        BodyMode::Duplex => duplex.or(whole_body),
     };
     match selected {
-        Some(Selected::Buffered(0)) => Err(Status::invalid_argument(
-            "BUFFERED requires a positive max_buffered_body_bytes",
+        Some(Selected::WholeBody(0)) => Err(Status::invalid_argument(
+            "WHOLE_BODY requires a positive max_whole_body_bytes",
         )),
-        Some(Selected::Stream(0)) => Err(Status::invalid_argument(
-            "STREAM requires a positive max_chunk_bytes",
+        Some(Selected::Duplex(0)) => Err(Status::invalid_argument(
+            "DUPLEX requires a positive max_chunk_bytes",
         )),
         Some(selected) => Ok(Decision::Inspect(config, selected)),
         // A message without a body has nothing to guard. The guard never
@@ -391,7 +391,7 @@ fn diagnostics(outcome: GuardOutcome) -> MiddlewareDiagnostics {
     }
 }
 
-fn buffered_result(outcome: GuardOutcome) -> Reply {
+fn whole_body_result(outcome: GuardOutcome) -> Reply {
     if outcome.denied {
         return Reply::Deny(HttpDenial {
             diagnostics: Some(diagnostics(outcome)),
@@ -400,16 +400,16 @@ fn buffered_result(outcome: GuardOutcome) -> Reply {
     let mut outcome = outcome;
     let (body, header_mutations) = match outcome.replacement.take() {
         Some(replacement) => (
-            http_buffered_result::Body::Replacement(replacement),
+            http_whole_body_result::Body::Replacement(replacement),
             remove_integrity_headers(),
         ),
         None => (
-            http_buffered_result::Body::Unchanged(HttpUnchanged {}),
+            http_whole_body_result::Body::Unchanged(HttpUnchanged {}),
             Vec::new(),
         ),
     };
     let diagnostics = (!outcome.findings.is_empty()).then(|| diagnostics(outcome));
-    Reply::Buffered(HttpBufferedResult {
+    Reply::WholeBody(HttpWholeBodyResult {
         body: Some(body),
         header_mutations,
         diagnostics,
@@ -486,7 +486,7 @@ mod tests {
             permitted_body_modes: permitted.iter().map(|mode| *mode as i32).collect(),
             limits: Some(HttpBodyLimits {
                 max_chunk_bytes: 64 * 1024,
-                max_buffered_body_bytes: 1024 * 1024,
+                max_whole_body_bytes: 1024 * 1024,
                 ..Default::default()
             }),
             declared_body_bytes: Some(32),
@@ -503,8 +503,8 @@ mod tests {
         replies.into_iter().next().unwrap()
     }
 
-    fn buffered_body(data: &[u8]) -> Event {
-        Event::BufferedBody(HttpBufferedBody {
+    fn whole_body(data: &[u8]) -> Event {
+        Event::WholeBody(HttpWholeBody {
             data: data.to_vec(),
             trailers: Vec::new(),
         })
@@ -525,14 +525,14 @@ mod tests {
                 let mut stage = Stage::Preflight;
                 let selected = only(
                     stage
-                        .handle(preflight(subject(), mode, &[], &[HttpBodyMode::Buffered]))
+                        .handle(preflight(subject(), mode, &[], &[HttpBodyMode::WholeBody]))
                         .unwrap(),
                 );
                 assert!(matches!(
                     selected,
                     Reply::Preflight(HttpPreflightResult {
                         decision: Some(http_preflight_result::Decision::Inspect(HttpInspect {
-                            mode: Some(http_inspect::Mode::Buffered(HttpBufferedMode {
+                            mode: Some(http_inspect::Mode::WholeBody(HttpWholeBodyMode {
                                 max_body_bytes: MAX_PAYLOAD_BYTES
                             })),
                         })),
@@ -540,26 +540,26 @@ mod tests {
                     })
                 ));
                 assert!(stage.handle(Event::Begin).unwrap().is_empty());
-                let body = only(stage.handle(buffered_body(input.as_bytes())).unwrap());
+                let body = only(stage.handle(whole_body(input.as_bytes())).unwrap());
                 match (mode, expected, body) {
                     ("deny", _, Reply::Deny(deny)) => {
                         let diagnostics = deny.diagnostics.unwrap();
                         assert_eq!(diagnostics.reason_code, "content_match");
                         assert!(!diagnostics.reason.contains("prototype-secret"));
                     }
-                    (_, Some(expected), Reply::Buffered(result)) => {
+                    (_, Some(expected), Reply::WholeBody(result)) => {
                         assert_eq!(
                             result.body,
-                            Some(http_buffered_result::Body::Replacement(
+                            Some(http_whole_body_result::Body::Replacement(
                                 expected.as_bytes().to_vec()
                             ))
                         );
                         assert_eq!(result.header_mutations, remove_integrity_headers());
                     }
-                    (_, None, Reply::Buffered(result)) => {
+                    (_, None, Reply::WholeBody(result)) => {
                         assert_eq!(
                             result.body,
-                            Some(http_buffered_result::Body::Unchanged(HttpUnchanged {}))
+                            Some(http_whole_body_result::Body::Unchanged(HttpUnchanged {}))
                         );
                         assert!(result.header_mutations.is_empty());
                     }
@@ -577,8 +577,8 @@ mod tests {
                 .handle(preflight(
                     Subject::Response,
                     "redact",
-                    &[("body_mode", "stream")],
-                    &[HttpBodyMode::Buffered, HttpBodyMode::Stream],
+                    &[("body_mode", "duplex")],
+                    &[HttpBodyMode::WholeBody, HttpBodyMode::Duplex],
                 ))
                 .unwrap(),
         );
@@ -586,7 +586,7 @@ mod tests {
             selected,
             Reply::Preflight(HttpPreflightResult {
                 decision: Some(http_preflight_result::Decision::Inspect(HttpInspect {
-                    mode: Some(http_inspect::Mode::Stream(_)),
+                    mode: Some(http_inspect::Mode::Duplex(_)),
                 })),
                 ..
             })
@@ -623,8 +623,8 @@ mod tests {
         let mut selected = preflight(
             Subject::Response,
             "redact",
-            &[("body_mode", "stream")],
-            &[HttpBodyMode::Stream],
+            &[("body_mode", "duplex")],
+            &[HttpBodyMode::Duplex],
         );
         let Event::Preflight(preflight_event) = &mut selected else {
             unreachable!()
@@ -664,10 +664,10 @@ mod tests {
             unreachable!()
         };
         preflight_event.unavailable_body_modes = vec![HttpBodyModeUnavailable {
-            mode: HttpBodyMode::Buffered as i32,
+            mode: HttpBodyMode::WholeBody as i32,
             reason: HttpBodyUnavailableReason::Bodyless as i32,
         }];
-        let mut empty = preflight(request(), "redact", &[], &[HttpBodyMode::Buffered]);
+        let mut empty = preflight(request(), "redact", &[], &[HttpBodyMode::WholeBody]);
         let Event::Preflight(preflight_event) = &mut empty else {
             unreachable!()
         };
@@ -691,13 +691,14 @@ mod tests {
             let Event::Preflight(preflight_event) = &mut encoded else {
                 unreachable!()
             };
-            preflight_event.unavailable_body_modes = [HttpBodyMode::Buffered, HttpBodyMode::Stream]
-                .into_iter()
-                .map(|mode| HttpBodyModeUnavailable {
-                    mode: mode as i32,
-                    reason: HttpBodyUnavailableReason::Encoded as i32,
-                })
-                .collect();
+            preflight_event.unavailable_body_modes =
+                [HttpBodyMode::WholeBody, HttpBodyMode::Duplex]
+                    .into_iter()
+                    .map(|mode| HttpBodyModeUnavailable {
+                        mode: mode as i32,
+                        reason: HttpBodyUnavailableReason::Encoded as i32,
+                    })
+                    .collect();
             let Reply::Deny(deny) = only(Stage::Preflight.handle(encoded).unwrap()) else {
                 panic!("deny")
             };
@@ -721,7 +722,12 @@ mod tests {
             });
             let denied = only(
                 Stage::Preflight
-                    .handle(preflight(subject, "redact", &[], &[HttpBodyMode::Buffered]))
+                    .handle(preflight(
+                        subject,
+                        "redact",
+                        &[],
+                        &[HttpBodyMode::WholeBody],
+                    ))
                     .unwrap(),
             );
             let Reply::Deny(deny) = denied else {
@@ -737,7 +743,7 @@ mod tests {
     fn stage_enforces_its_lifecycle() {
         assert_eq!(
             Stage::Preflight
-                .handle(buffered_body(b"early"))
+                .handle(whole_body(b"early"))
                 .unwrap_err()
                 .code(),
             tonic::Code::InvalidArgument
@@ -748,26 +754,26 @@ mod tests {
                 request(),
                 "redact",
                 &[],
-                &[HttpBodyMode::Buffered],
+                &[HttpBodyMode::WholeBody],
             ))
             .unwrap();
         assert_eq!(
-            stage.handle(buffered_body(b"early")).unwrap_err().code(),
+            stage.handle(whole_body(b"early")).unwrap_err().code(),
             tonic::Code::InvalidArgument
         );
     }
 
-    /// Wire preflight fields shared by both RPCs, for a BUFFERED body.
+    /// Wire preflight fields shared by both RPCs, for a `WHOLE_BODY` body.
     fn buffered_offer() -> (
         Vec<i32>,
         Option<HttpBodyLimits>,
         Option<prost_types::Struct>,
     ) {
         (
-            vec![HttpBodyMode::Buffered as i32],
+            vec![HttpBodyMode::WholeBody as i32],
             Some(HttpBodyLimits {
                 max_chunk_bytes: 64 * 1024,
-                max_buffered_body_bytes: 1024,
+                max_whole_body_bytes: 1024,
                 ..Default::default()
             }),
             Some(config("redact", &["prototype-secret"], &[])),
@@ -776,7 +782,7 @@ mod tests {
 
     #[tokio::test]
     async fn both_rpcs_run_the_same_exchange() {
-        let body = || HttpBufferedBody {
+        let body = || HttpWholeBody {
             data: b"a prototype-secret".to_vec(),
             trailers: Vec::new(),
         };
@@ -791,7 +797,7 @@ mod tests {
                     ..Default::default()
                 }),
                 http_request_session_event::Event::Begin(HttpBegin::default()),
-                http_request_session_event::Event::BufferedBody(body()),
+                http_request_session_event::Event::WholeBody(body()),
             ]
             .map(|event| Ok(HttpRequestSessionEvent { event: Some(event) })),
         ));
@@ -803,7 +809,7 @@ mod tests {
             request.as_slice(),
             [
                 http_request_session_result::Result::PreflightResult(_),
-                http_request_session_result::Result::BufferedResult(_),
+                http_request_session_result::Result::WholeBodyResult(_),
             ]
         ));
 
@@ -817,7 +823,7 @@ mod tests {
                     ..Default::default()
                 }),
                 http_response_session_event::Event::Begin(HttpBegin::default()),
-                http_response_session_event::Event::BufferedBody(body()),
+                http_response_session_event::Event::WholeBody(body()),
             ]
             .map(|event| Ok(HttpResponseSessionEvent { event: Some(event) })),
         ));
@@ -829,7 +835,7 @@ mod tests {
             response.as_slice(),
             [
                 http_response_session_result::Result::PreflightResult(_),
-                http_response_session_result::Result::BufferedResult(_),
+                http_response_session_result::Result::WholeBodyResult(_),
             ]
         ));
     }

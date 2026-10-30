@@ -12,7 +12,7 @@ mod response;
 mod websocket;
 
 pub use http_session::{
-    ChainHttpHookVersion, HTTP_BUFFERED_BODY_TIMEOUT, HTTP_STREAM_IDLE_TIMEOUT, HttpBodyInput,
+    ChainHttpHookVersion, HTTP_STREAM_IDLE_TIMEOUT, HTTP_WHOLE_BODY_TIMEOUT, HttpBodyInput,
     HttpBodyOutput, HttpFailureCode, HttpMiddlewareFailure, HttpPipelineFinish,
     HttpRequestPreflightInput, HttpRequestPreflightOutcome, HttpRequestSession,
     HttpResponseDelivery, HttpResponsePipelinePreflight, HttpResponsePipelineSession,
@@ -1820,7 +1820,7 @@ impl ChainRunner {
     }
 
     /// Wait until `deadline` for one HTTP session hook slot, held through
-    /// preflight and BUFFERED bodies. `None` when none freed up in time.
+    /// preflight and `WHOLE_BODY` stages. `None` when none freed up in time.
     async fn reserve_http_session(
         &self,
         deadline: tokio::time::Instant,
@@ -1828,7 +1828,7 @@ impl ChainRunner {
         reserve_until(&self.registry.http_session_admission, deadline).await
     }
 
-    /// Take one HTTP session hook STREAM slot if one is free now.
+    /// Take one HTTP session hook DUPLEX slot if one is free now.
     fn try_reserve_http_stream(&self) -> Option<MiddlewareSessionPermit> {
         Arc::clone(&self.registry.http_stream_admission)
             .try_acquire_owned()
@@ -1836,7 +1836,7 @@ impl ChainRunner {
             .map(|permit| MiddlewareSessionPermit { _session: permit })
     }
 
-    /// Wait until `deadline` for one HTTP session hook STREAM slot.
+    /// Wait until `deadline` for one HTTP session hook DUPLEX slot.
     async fn reserve_http_stream(
         &self,
         deadline: tokio::time::Instant,

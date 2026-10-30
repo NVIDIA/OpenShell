@@ -1575,8 +1575,8 @@ impl openshell_core::middleware::InProcessMiddleware for ForwardedHeadStage {
         tonic::Status,
     > {
         use openshell_core::proto::{
-            ExistingHeaderAction, HeaderMutation, HttpFinish, HttpInspect, HttpOutputChunk,
-            HttpOutputStart, HttpPreflightResult, HttpRequestSessionResult, HttpStreamMode,
+            ExistingHeaderAction, HeaderMutation, HttpDuplexMode, HttpFinish, HttpInspect,
+            HttpOutputChunk, HttpOutputStart, HttpPreflightResult, HttpRequestSessionResult,
             WriteHeader, header_mutation, http_inspect, http_preflight_result,
             http_request_session_event, http_request_session_result,
         };
@@ -1600,7 +1600,7 @@ impl openshell_core::middleware::InProcessMiddleware for ForwardedHeadStage {
                         declared = preflight.declared_body_bytes;
                         http_request_session_result::Result::PreflightResult(HttpPreflightResult {
                             decision: Some(http_preflight_result::Decision::Inspect(HttpInspect {
-                                mode: Some(http_inspect::Mode::Stream(HttpStreamMode {})),
+                                mode: Some(http_inspect::Mode::Duplex(HttpDuplexMode {})),
                             })),
                             header_mutations: vec![preflight_mutation.clone()],
                             ..Default::default()

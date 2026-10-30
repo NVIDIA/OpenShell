@@ -51,7 +51,7 @@ pub struct HttpRequestPreflightInput {
     pub credential_reference_headers: Vec<String>,
     /// Largest final body output the caller accepts when it withholds the
     /// output until the chain finishes. `None` when output streams to the
-    /// upstream. Advertised to STREAM stages as `max_output_body_bytes`.
+    /// upstream. Advertised to DUPLEX stages as `max_output_body_bytes`.
     pub max_output_body_bytes: Option<u64>,
 }
 
@@ -96,7 +96,7 @@ impl HttpRequestSession {
         self.pipeline.buffers_final_output()
     }
 
-    /// True when a stage runs or may later select STREAM. The caller bounds
+    /// True when a stage runs or may later select DUPLEX. The caller bounds
     /// how long the sandbox may pause its upload.
     #[must_use]
     pub fn may_stream(&self) -> bool {
@@ -160,16 +160,19 @@ impl StageHead for RequestHead {
         // The original head decides: no stage sees an encoded body, so none
         // can decode it for the next.
         if has_content_coding(headers) {
-            offer.withhold(HttpBodyMode::Buffered, HttpBodyUnavailableReason::Encoded);
-            offer.withhold(HttpBodyMode::Stream, HttpBodyUnavailableReason::Encoded);
+            offer.withhold(HttpBodyMode::WholeBody, HttpBodyUnavailableReason::Encoded);
+            offer.withhold(HttpBodyMode::Duplex, HttpBodyUnavailableReason::Encoded);
             return offer;
         }
         if declared_body_bytes.is_none_or(|length| length <= limit as u64) {
-            offer.permit(HttpBodyMode::Buffered);
+            offer.permit(HttpBodyMode::WholeBody);
         } else {
-            offer.withhold(HttpBodyMode::Buffered, HttpBodyUnavailableReason::OverLimit);
+            offer.withhold(
+                HttpBodyMode::WholeBody,
+                HttpBodyUnavailableReason::OverLimit,
+            );
         }
-        offer.permit(HttpBodyMode::Stream);
+        offer.permit(HttpBodyMode::Duplex);
         offer
     }
 

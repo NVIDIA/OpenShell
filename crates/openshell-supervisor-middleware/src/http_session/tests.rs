@@ -10,14 +10,14 @@ use openshell_core::extension_protocol::{
     http_session_middleware_metadata,
 };
 use openshell_core::proto::{
-    ExistingHeaderAction, HeaderMutation, HttpBodyMode, HttpBufferedMode, HttpBufferedResult,
-    HttpContinue, HttpDenial, HttpFinish, HttpHeader, HttpInspect, HttpOutputChunk,
-    HttpOutputStart, HttpPreflightResult, HttpRequestResult, HttpRequestSessionEvent,
-    HttpRequestSessionPreflight, HttpRequestSessionResult, HttpRequestTarget, HttpStreamMode,
+    ExistingHeaderAction, HeaderMutation, HttpBodyMode, HttpContinue, HttpDenial, HttpDuplexMode,
+    HttpFinish, HttpHeader, HttpInspect, HttpOutputChunk, HttpOutputStart, HttpPreflightResult,
+    HttpRequestResult, HttpRequestSessionEvent, HttpRequestSessionPreflight,
+    HttpRequestSessionResult, HttpRequestTarget, HttpWholeBodyMode, HttpWholeBodyResult,
     MiddlewareBinding, MiddlewareDiagnostics, MiddlewareManifest, RequestContext,
     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
-    WriteHeader, header_mutation, http_buffered_result, http_inspect, http_preflight_result,
-    http_request_session_event, http_request_session_result,
+    WriteHeader, header_mutation, http_inspect, http_preflight_result, http_request_session_event,
+    http_request_session_result, http_whole_body_result,
 };
 use tokio::sync::mpsc;
 
@@ -287,7 +287,7 @@ impl InProcessMiddleware for ScriptedStage {
                         assert!(preflight_event.request.is_some());
                         let buffered_limit = preflight_event
                             .limits
-                            .map_or(0, |limits| limits.max_buffered_body_bytes);
+                            .map_or(0, |limits| limits.max_whole_body_bytes);
                         let applies = inspect_content_type.is_none_or(|content_type| {
                             preflight_event
                                 .request
@@ -320,12 +320,12 @@ impl InProcessMiddleware for ScriptedStage {
                             }
                             Preflight::Inspect(mode) => {
                                 let mode = match mode {
-                                    HttpBodyMode::Buffered => {
-                                        http_inspect::Mode::Buffered(HttpBufferedMode {
+                                    HttpBodyMode::WholeBody => {
+                                        http_inspect::Mode::WholeBody(HttpWholeBodyMode {
                                             max_body_bytes: buffered_limit,
                                         })
                                     }
-                                    _ => http_inspect::Mode::Stream(HttpStreamMode {}),
+                                    _ => http_inspect::Mode::Duplex(HttpDuplexMode {}),
                                 };
                                 result(http_request_session_result::Result::PreflightResult(
                                     HttpPreflightResult {
@@ -362,16 +362,16 @@ impl InProcessMiddleware for ScriptedStage {
                             continue;
                         }
                     }
-                    Some(http_request_session_event::Event::BufferedBody(buffered)) => result(
-                        http_request_session_result::Result::BufferedResult(HttpBufferedResult {
+                    Some(http_request_session_event::Event::WholeBody(buffered)) => result(
+                        http_request_session_result::Result::WholeBodyResult(HttpWholeBodyResult {
                             body: Some(match body {
                                 Body::Replace(replacement) => {
-                                    http_buffered_result::Body::Replacement(replacement.to_vec())
+                                    http_whole_body_result::Body::Replacement(replacement.to_vec())
                                 }
-                                Body::Uppercase => http_buffered_result::Body::Replacement(
+                                Body::Uppercase => http_whole_body_result::Body::Replacement(
                                     buffered.data.to_ascii_uppercase(),
                                 ),
-                                Body::Unchanged => http_buffered_result::Body::Unchanged(
+                                Body::Unchanged => http_whole_body_result::Body::Unchanged(
                                     openshell_core::proto::HttpUnchanged {},
                                 ),
                             }),
@@ -466,7 +466,7 @@ impl InProcessMiddleware for ScriptedStage {
                         })
                     }
                     E::Begin(v) => http_request_session_event::Event::Begin(v),
-                    E::BufferedBody(v) => http_request_session_event::Event::BufferedBody(v),
+                    E::WholeBody(v) => http_request_session_event::Event::WholeBody(v),
                     E::InputChunk(v) => http_request_session_event::Event::InputChunk(v),
                     E::InputEnd(v) => http_request_session_event::Event::InputEnd(v),
                     E::SessionEnd(v) => http_request_session_event::Event::SessionEnd(v),
@@ -487,7 +487,9 @@ impl InProcessMiddleware for ScriptedStage {
                     http_request_session_result::Result::PreflightResult(v) => {
                         R::PreflightResult(v)
                     }
-                    http_request_session_result::Result::BufferedResult(v) => R::BufferedResult(v),
+                    http_request_session_result::Result::WholeBodyResult(v) => {
+                        R::WholeBodyResult(v)
+                    }
                     http_request_session_result::Result::OutputStart(v) => R::OutputStart(v),
                     http_request_session_result::Result::OutputChunk(v) => R::OutputChunk(v),
                     http_request_session_result::Result::Finish(v) => R::Finish(v),
@@ -708,10 +710,10 @@ async fn request_stages_follow_the_protocol_2_state_machine() {
             },
         },
         Case {
-            name: "BUFFERED replaces the body",
+            name: "WHOLE_BODY replaces the body",
             stages: vec![stage(
                 "example/a",
-                Preflight::Inspect(HttpBodyMode::Buffered),
+                Preflight::Inspect(HttpBodyMode::WholeBody),
                 Body::Replace(b"[redacted]"),
             )],
             expected: Run {
@@ -720,14 +722,14 @@ async fn request_stages_follow_the_protocol_2_state_machine() {
                 preflight_mutations: Vec::new(),
                 late_mutations: Vec::new(),
                 body: b"[redacted]".to_vec(),
-                outcomes: vec![Outcome::Buffered, Outcome::Replacement],
+                outcomes: vec![Outcome::WholeBody, Outcome::Replacement],
             },
         },
         Case {
-            name: "STREAM transforms every chunk",
+            name: "DUPLEX transforms every chunk",
             stages: vec![stage(
                 "example/a",
-                Preflight::Inspect(HttpBodyMode::Stream),
+                Preflight::Inspect(HttpBodyMode::Duplex),
                 Body::Uppercase,
             )],
             expected: Run {
@@ -736,7 +738,7 @@ async fn request_stages_follow_the_protocol_2_state_machine() {
                 preflight_mutations: Vec::new(),
                 late_mutations: Vec::new(),
                 body: b"HELLO WORLD".to_vec(),
-                outcomes: vec![Outcome::Stream, Outcome::Finish],
+                outcomes: vec![Outcome::Duplex, Outcome::Finish],
             },
         },
         Case {
@@ -773,14 +775,14 @@ async fn request_stages_follow_the_protocol_2_state_machine() {
 async fn each_stage_sees_only_earlier_stages_complete_header_mutations() {
     let mut first = ScriptedStage::new(
         "example/a",
-        Preflight::Inspect(HttpBodyMode::Buffered),
+        Preflight::Inspect(HttpBodyMode::WholeBody),
         Body::Unchanged,
     );
     first.preflight_mutation = true;
     first.late_mutation = true;
     let mut second = ScriptedStage::new(
         "example/b",
-        Preflight::Inspect(HttpBodyMode::Stream),
+        Preflight::Inspect(HttpBodyMode::Duplex),
         Body::Uppercase,
     );
     second.preflight_mutation = true;
@@ -819,7 +821,7 @@ fn scripted(name: &'static str, preflight: Preflight, body: Body) -> Arc<Scripte
     Arc::new(ScriptedStage::new(name, preflight, body))
 }
 
-/// Free HTTP session hook slots, then free STREAM slots.
+/// Free HTTP session hook slots, then free DUPLEX slots.
 fn free_slots(runner: &ChainRunner) -> (usize, usize) {
     (
         runner.registry.http_session_admission.available_permits(),
@@ -829,7 +831,7 @@ fn free_slots(runner: &ChainRunner) -> (usize, usize) {
 
 #[tokio::test]
 async fn a_message_holds_session_slots_only_while_a_stage_inspects_it() {
-    use HttpBodyMode::{Buffered, Stream};
+    use HttpBodyMode::{Duplex, WholeBody};
     let full = (
         MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
         MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS,
@@ -841,28 +843,28 @@ async fn a_message_holds_session_slots_only_while_a_stage_inspects_it() {
             (full.0, full.1),
         ),
         (
-            "BUFFERED keeps the preflight slot",
+            "WHOLE_BODY keeps the preflight slot",
             vec![scripted(
                 "example/a",
-                Preflight::Inspect(Buffered),
+                Preflight::Inspect(WholeBody),
                 Body::Unchanged,
             )],
             (full.0 - 1, full.1),
         ),
         (
-            "STREAM moves to the stream budget",
+            "DUPLEX moves to the stream budget",
             vec![scripted(
                 "example/a",
-                Preflight::Inspect(Stream),
+                Preflight::Inspect(Duplex),
                 Body::Uppercase,
             )],
             (full.0, full.1 - 1),
         ),
         (
-            "BUFFERED and STREAM hold both",
+            "WHOLE_BODY and DUPLEX hold both",
             vec![
-                scripted("example/a", Preflight::Inspect(Buffered), Body::Unchanged),
-                scripted("example/b", Preflight::Inspect(Stream), Body::Uppercase),
+                scripted("example/a", Preflight::Inspect(WholeBody), Body::Unchanged),
+                scripted("example/b", Preflight::Inspect(Duplex), Body::Uppercase),
             ],
             (full.0 - 1, full.1 - 1),
         ),
@@ -895,15 +897,15 @@ async fn a_message_holds_session_slots_only_while_a_stage_inspects_it() {
             session.run_with_body_policy(inputs, output, TransformedBodyPolicy::NotPolicyRelevant);
         let check = async {
             if buffers && streams {
-                // The BUFFERED stage ends while the output is not read, and
-                // its slot frees up before the STREAM stage ends.
+                // The WHOLE_BODY stage ends while the output is not read, and
+                // its slot frees up before the DUPLEX stage ends.
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     while free_slots(&runner).0 != full.0 {
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
                 })
                 .await
-                .expect("the BUFFERED slot frees up");
+                .expect("the WHOLE_BODY slot frees up");
                 assert_eq!(free_slots(&runner), (full.0, full.1 - 1), "{case}");
             }
             while outputs.recv().await.is_some() {}
@@ -949,16 +951,16 @@ async fn preflight_waits_for_a_session_slot_within_the_chain_deadline() {
 
 #[tokio::test(start_paused = true)]
 async fn waiting_for_a_stream_slot_does_not_hold_a_preflight_slot() {
-    use HttpBodyMode::{Buffered, Stream};
+    use HttpBodyMode::{Duplex, WholeBody};
     let (runner, described) = scripted_chain(vec![
         scripted(
             "example/stream",
-            Preflight::Inspect(Stream),
+            Preflight::Inspect(Duplex),
             Body::Uppercase,
         ),
         scripted(
             "example/buffered",
-            Preflight::Inspect(Buffered),
+            Preflight::Inspect(WholeBody),
             Body::Unchanged,
         ),
     ])
@@ -972,7 +974,7 @@ async fn waiting_for_a_stream_slot_does_not_hold_a_preflight_slot() {
         .await
         .expect("hold every stream slot");
 
-    // Enough waiting STREAM messages to take every preflight slot if they
+    // Enough waiting DUPLEX messages to take every preflight slot if they
     // kept theirs, plus one that also buffers.
     let spawn = |described: Vec<DescribedChainEntry>| {
         let runner = runner.clone();
@@ -1144,13 +1146,13 @@ async fn an_encoded_request_offers_no_body_mode() {
             "gzip",
             vec![],
             vec![
-                encoded(HttpBodyMode::Buffered),
-                encoded(HttpBodyMode::Stream),
+                encoded(HttpBodyMode::WholeBody),
+                encoded(HttpBodyMode::Duplex),
             ],
         ),
         (
             "identity",
-            vec![HttpBodyMode::Buffered as i32, HttpBodyMode::Stream as i32],
+            vec![HttpBodyMode::WholeBody as i32, HttpBodyMode::Duplex as i32],
             vec![],
         ),
     ] {
@@ -1184,7 +1186,7 @@ async fn preflight_advertises_the_withheld_output_cap_only_with_stream() {
     for (coding, cap, advertised) in [
         ("identity", Some(CAP), Some(CAP)),
         ("identity", None, None),
-        // No body mode is offered, so there is no STREAM output to cap.
+        // No body mode is offered, so there is no DUPLEX output to cap.
         ("gzip", Some(CAP), None),
     ] {
         let stage = scripted("example/a", Preflight::Continue, Body::Unchanged);
@@ -1208,7 +1210,7 @@ async fn preflight_advertises_the_withheld_output_cap_only_with_stream() {
     // carries the same cap.
     let first = scripted(
         "example/a",
-        Preflight::Inspect(HttpBodyMode::Stream),
+        Preflight::Inspect(HttpBodyMode::Duplex),
         Body::Uppercase,
     );
     let second = scripted("example/b", Preflight::Continue, Body::Unchanged);
@@ -1226,12 +1228,12 @@ async fn downstream_preflight_receives_the_transformed_length() {
     for (preflight, body, length) in [
         (Preflight::Continue, Body::Unchanged, Some(5)),
         (
-            Preflight::Inspect(HttpBodyMode::Buffered),
+            Preflight::Inspect(HttpBodyMode::WholeBody),
             Body::Replace(b"replacement"),
             Some(11),
         ),
         (
-            Preflight::Inspect(HttpBodyMode::Stream),
+            Preflight::Inspect(HttpBodyMode::Duplex),
             Body::Uppercase,
             None,
         ),
@@ -1317,11 +1319,11 @@ async fn run_response(
 #[tokio::test]
 async fn downstream_inspects_the_content_type_produced_by_each_body_mode() {
     for response in [false, true] {
-        for mode in [HttpBodyMode::Buffered, HttpBodyMode::Stream] {
+        for mode in [HttpBodyMode::WholeBody, HttpBodyMode::Duplex] {
             let mut first = ScriptedStage::new(
                 "example/a",
                 Preflight::Inspect(mode),
-                if mode == HttpBodyMode::Buffered {
+                if mode == HttpBodyMode::WholeBody {
                     Body::Replace(b"{\"safe\":true}")
                 } else {
                     Body::Uppercase
@@ -1331,13 +1333,13 @@ async fn downstream_inspects_the_content_type_produced_by_each_body_mode() {
             first.output_after_input = true;
             let mut second = ScriptedStage::new(
                 "example/b",
-                Preflight::Inspect(HttpBodyMode::Buffered),
+                Preflight::Inspect(HttpBodyMode::WholeBody),
                 Body::Unchanged,
             );
             second.inspect_content_type = Some("application/json");
             let (first, second) = (Arc::new(first), Arc::new(second));
             let original = b"{\"safe\":true}";
-            let expected = if mode == HttpBodyMode::Buffered {
+            let expected = if mode == HttpBodyMode::WholeBody {
                 original.to_vec()
             } else {
                 original.to_ascii_uppercase()
@@ -1375,7 +1377,7 @@ async fn downstream_inspects_the_content_type_produced_by_each_body_mode() {
 async fn downstream_can_deny_after_an_earlier_stage_changes_the_content_type() {
     let mut first = ScriptedStage::new(
         "example/a",
-        Preflight::Inspect(HttpBodyMode::Stream),
+        Preflight::Inspect(HttpBodyMode::Duplex),
         Body::Uppercase,
     );
     first.output_content_type = Some("application/json");
@@ -1406,12 +1408,12 @@ async fn adjacent_streams_preserve_all_chunks_before_completion() {
     for response in [false, true] {
         let first = scripted(
             "example/a",
-            Preflight::Inspect(HttpBodyMode::Stream),
+            Preflight::Inspect(HttpBodyMode::Duplex),
             Body::Uppercase,
         );
         let mut second = ScriptedStage::new(
             "example/b",
-            Preflight::Inspect(HttpBodyMode::Stream),
+            Preflight::Inspect(HttpBodyMode::Duplex),
             Body::Uppercase,
         );
         second.output_after_input = true;
@@ -1434,7 +1436,7 @@ async fn adjacent_streams_preserve_all_chunks_before_completion() {
 async fn downstream_preflight_waits_for_output_headers_without_spending_its_timeout() {
     let mut first = ScriptedStage::new(
         "example/a",
-        Preflight::Inspect(HttpBodyMode::Stream),
+        Preflight::Inspect(HttpBodyMode::Duplex),
         Body::Uppercase,
     );
     first.output_after_input = true;
@@ -1482,12 +1484,12 @@ async fn adjacent_buffered_stages_share_capacity_instead_of_deadlocking() {
     let stages = vec![
         scripted(
             "example/a",
-            Preflight::Inspect(HttpBodyMode::Buffered),
+            Preflight::Inspect(HttpBodyMode::WholeBody),
             Body::Unchanged,
         ),
         scripted(
             "example/b",
-            Preflight::Inspect(HttpBodyMode::Buffered),
+            Preflight::Inspect(HttpBodyMode::WholeBody),
             Body::Unchanged,
         ),
     ];
@@ -1541,12 +1543,12 @@ async fn adjacent_buffered_stages_share_capacity_instead_of_deadlocking() {
 async fn deferred_preflight_capacity_wait_is_bounded_and_releases_the_stream_slot() {
     let first = scripted(
         "example/a",
-        Preflight::Inspect(HttpBodyMode::Stream),
+        Preflight::Inspect(HttpBodyMode::Duplex),
         Body::Uppercase,
     );
     let second = scripted(
         "example/b",
-        Preflight::Inspect(HttpBodyMode::Buffered),
+        Preflight::Inspect(HttpBodyMode::WholeBody),
         Body::Unchanged,
     );
     let (runner, described) = scripted_chain(vec![first, Arc::clone(&second)]).await;
@@ -1596,7 +1598,7 @@ async fn deferred_preflight_capacity_wait_is_bounded_and_releases_the_stream_slo
 async fn cancellation_closes_only_opened_stages_and_releases_capacity() {
     let mut first = ScriptedStage::new(
         "example/a",
-        Preflight::Inspect(HttpBodyMode::Stream),
+        Preflight::Inspect(HttpBodyMode::Duplex),
         Body::Uppercase,
     );
     first.output_after_input = true;
@@ -1684,18 +1686,18 @@ async fn response_preflight_carries_request_headers_within_head_limits() {
 
 #[tokio::test]
 async fn stages_cannot_change_headers_that_reference_credentials() {
-    use HttpBodyMode::{Buffered, Stream};
+    use HttpBodyMode::{Duplex, WholeBody};
     for (case, preflight, preflight_mutation, late_mutation) in [
         ("preflight mutation", Preflight::Continue, true, false),
         (
-            "BUFFERED late mutation",
-            Preflight::Inspect(Buffered),
+            "WHOLE_BODY late mutation",
+            Preflight::Inspect(WholeBody),
             false,
             true,
         ),
         (
-            "STREAM late mutation",
-            Preflight::Inspect(Stream),
+            "DUPLEX late mutation",
+            Preflight::Inspect(Duplex),
             false,
             true,
         ),

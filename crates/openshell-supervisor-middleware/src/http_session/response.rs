@@ -13,12 +13,12 @@
 //!
 //! 1. A bodyless, partial, `no-transform`, or content-coded response offers
 //!    no body mode.
-//! 2. STREAM needs chunked delivery, the only framing in which the client can
+//! 2. DUPLEX needs chunked delivery, the only framing in which the client can
 //!    detect a truncated body: both the client request and the response
 //!    status line use HTTP/1.1.
 //! 3. An open-ended response, such as server-sent events, is never offered
-//!    BUFFERED, and a declared length over the stage's limit removes
-//!    BUFFERED.
+//!    `WHOLE_BODY`, and a declared length over the stage's limit removes
+//!    `WHOLE_BODY`.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -32,10 +32,9 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::pipeline::{
-    self, BodyModeOffer, HTTP_BUFFERED_BODY_TIMEOUT, HttpBodyInput, HttpBodyOutput,
-    HttpFailureCode, HttpMiddlewareFailure, HttpPipelineFinish, HttpStageDiagnostics,
-    MiddlewareFailureDetail, Pipeline, PipelineSpec, PipelineTimeouts, PreflightFields, StageHead,
-    StagePreflight,
+    self, BodyModeOffer, HTTP_WHOLE_BODY_TIMEOUT, HttpBodyInput, HttpBodyOutput, HttpFailureCode,
+    HttpMiddlewareFailure, HttpPipelineFinish, HttpStageDiagnostics, MiddlewareFailureDetail,
+    Pipeline, PipelineSpec, PipelineTimeouts, PreflightFields, StageHead, StagePreflight,
 };
 use super::{has_content_coding, validate_head_input, validate_header_input};
 use crate::headers::HeaderAuthority;
@@ -49,11 +48,11 @@ use crate::{
 pub struct HttpResponseDelivery {
     /// The relay can frame the body chunked: both the client request and the
     /// response status line use HTTP/1.1. Only chunked framing lets the client
-    /// detect a truncated body, so STREAM is offered only then. Otherwise
-    /// BUFFERED output declares its length and trailers are dropped.
+    /// detect a truncated body, so DUPLEX is offered only then. Otherwise
+    /// `WHOLE_BODY` output declares its length and trailers are dropped.
     pub chunked: bool,
-    /// Whole-body deadline of each BUFFERED stage.
-    pub buffered_body_timeout: Duration,
+    /// Deadline of each `WHOLE_BODY` stage.
+    pub whole_body_timeout: Duration,
 }
 
 impl HttpResponseDelivery {
@@ -61,7 +60,7 @@ impl HttpResponseDelivery {
     pub fn new(chunked: bool) -> Self {
         Self {
             chunked,
-            buffered_body_timeout: HTTP_BUFFERED_BODY_TIMEOUT,
+            whole_body_timeout: HTTP_WHOLE_BODY_TIMEOUT,
         }
     }
 }
@@ -230,11 +229,13 @@ impl ResponseHead {
             return Some(restriction.reason());
         }
         match mode {
-            HttpBodyMode::Stream if !self.chunked => {
+            HttpBodyMode::Duplex if !self.chunked => {
                 Some(HttpBodyUnavailableReason::TruncationUndetectable)
             }
-            HttpBodyMode::Buffered if self.open_ended => Some(HttpBodyUnavailableReason::OpenEnded),
-            HttpBodyMode::Buffered
+            HttpBodyMode::WholeBody if self.open_ended => {
+                Some(HttpBodyUnavailableReason::OpenEnded)
+            }
+            HttpBodyMode::WholeBody
                 if declared_body_bytes.is_some_and(|length| length > limit as u64) =>
             {
                 Some(HttpBodyUnavailableReason::OverLimit)
@@ -304,7 +305,7 @@ impl StageHead for ResponseHead {
         if limit == 0 {
             return offer;
         }
-        for mode in [HttpBodyMode::Buffered, HttpBodyMode::Stream] {
+        for mode in [HttpBodyMode::WholeBody, HttpBodyMode::Duplex] {
             match head.unavailable(mode, limit, declared_body_bytes) {
                 Some(reason) => offer.withhold(mode, reason),
                 None => offer.permit(mode),
@@ -351,7 +352,7 @@ impl ChainRunner {
             // Only request heads omit credential-bearing headers.
             credential_reference_headers: Vec::new(),
             timeouts: PipelineTimeouts {
-                buffered_body: delivery.buffered_body_timeout,
+                whole_body: delivery.whole_body_timeout,
                 ..PipelineTimeouts::default()
             },
             output_trailers: delivery.chunked,
@@ -528,7 +529,7 @@ mod tests {
 
     #[test]
     fn response_eligibility_offers_only_body_modes_the_message_supports() {
-        use HttpBodyMode::{Buffered, Stream};
+        use HttpBodyMode::{Duplex, WholeBody};
         use HttpBodyUnavailableReason as Reason;
         let json = [("content-type", "application/json")];
         let cases: Vec<EligibilityCase> = vec![
@@ -536,7 +537,7 @@ mod tests {
                 "ordinary body",
                 response("GET", 200, &json, Some(10)),
                 true,
-                vec![Buffered, Stream],
+                vec![WholeBody, Duplex],
                 vec![],
             ),
             (
@@ -544,35 +545,35 @@ mod tests {
                 response("HEAD", 200, &json, Some(10)),
                 true,
                 vec![],
-                vec![(Buffered, Reason::Bodyless), (Stream, Reason::Bodyless)],
+                vec![(WholeBody, Reason::Bodyless), (Duplex, Reason::Bodyless)],
             ),
             (
                 "204",
                 response("GET", 204, &[], None),
                 true,
                 vec![],
-                vec![(Buffered, Reason::Bodyless), (Stream, Reason::Bodyless)],
+                vec![(WholeBody, Reason::Bodyless), (Duplex, Reason::Bodyless)],
             ),
             (
                 "304",
                 response("GET", 304, &[], None),
                 true,
                 vec![],
-                vec![(Buffered, Reason::Bodyless), (Stream, Reason::Bodyless)],
+                vec![(WholeBody, Reason::Bodyless), (Duplex, Reason::Bodyless)],
             ),
             (
                 "partial",
                 response("GET", 206, &json, Some(10)),
                 true,
                 vec![],
-                vec![(Buffered, Reason::Partial), (Stream, Reason::Partial)],
+                vec![(WholeBody, Reason::Partial), (Duplex, Reason::Partial)],
             ),
             (
                 "content-range",
                 response("GET", 200, &[("content-range", "bytes 0-9/20")], Some(10)),
                 true,
                 vec![],
-                vec![(Buffered, Reason::Partial), (Stream, Reason::Partial)],
+                vec![(WholeBody, Reason::Partial), (Duplex, Reason::Partial)],
             ),
             (
                 "no-transform",
@@ -585,8 +586,8 @@ mod tests {
                 true,
                 vec![],
                 vec![
-                    (Buffered, Reason::NoTransform),
-                    (Stream, Reason::NoTransform),
+                    (WholeBody, Reason::NoTransform),
+                    (Duplex, Reason::NoTransform),
                 ],
             ),
             (
@@ -594,21 +595,21 @@ mod tests {
                 response("GET", 200, &[("content-encoding", "gzip")], Some(10)),
                 true,
                 vec![],
-                vec![(Buffered, Reason::Encoded), (Stream, Reason::Encoded)],
+                vec![(WholeBody, Reason::Encoded), (Duplex, Reason::Encoded)],
             ),
             (
                 "identity coding",
                 response("GET", 200, &[("content-encoding", "identity")], Some(10)),
                 true,
-                vec![Buffered, Stream],
+                vec![WholeBody, Duplex],
                 vec![],
             ),
             (
                 "over the limit",
                 response("GET", 200, &json, Some(4096)),
                 true,
-                vec![Stream],
-                vec![(Buffered, Reason::OverLimit)],
+                vec![Duplex],
+                vec![(WholeBody, Reason::OverLimit)],
             ),
             (
                 "server-sent events",
@@ -619,8 +620,8 @@ mod tests {
                     None,
                 ),
                 true,
-                vec![Stream],
-                vec![(Buffered, Reason::OpenEnded)],
+                vec![Duplex],
+                vec![(WholeBody, Reason::OpenEnded)],
             ),
             (
                 "multipart replace",
@@ -631,15 +632,15 @@ mod tests {
                     None,
                 ),
                 true,
-                vec![Stream],
-                vec![(Buffered, Reason::OpenEnded)],
+                vec![Duplex],
+                vec![(WholeBody, Reason::OpenEnded)],
             ),
             (
                 "HTTP/1.0 client",
                 response("GET", 200, &json, Some(10)),
                 false,
-                vec![Buffered],
-                vec![(Stream, Reason::TruncationUndetectable)],
+                vec![WholeBody],
+                vec![(Duplex, Reason::TruncationUndetectable)],
             ),
             (
                 "SSE to an HTTP/1.0 client",
@@ -647,8 +648,8 @@ mod tests {
                 false,
                 vec![],
                 vec![
-                    (Buffered, Reason::OpenEnded),
-                    (Stream, Reason::TruncationUndetectable),
+                    (WholeBody, Reason::OpenEnded),
+                    (Duplex, Reason::TruncationUndetectable),
                 ],
             ),
         ];
@@ -674,7 +675,7 @@ mod tests {
     }
     #[test]
     fn deferred_response_metadata_tracks_the_current_representation() {
-        use HttpBodyMode::{Buffered, Stream};
+        use HttpBodyMode::{Duplex, WholeBody};
         let original = response(
             "GET",
             200,
@@ -703,11 +704,11 @@ mod tests {
         );
         assert_eq!(
             head.body_modes(&entry(10), &current, Some(5)).permitted,
-            [Buffered, Stream]
+            [WholeBody, Duplex]
         );
         assert_eq!(
             head.body_modes(&entry(4), &current, Some(5)).permitted,
-            [Stream]
+            [Duplex]
         );
         assert!(
             !head

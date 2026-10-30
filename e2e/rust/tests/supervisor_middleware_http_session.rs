@@ -14,12 +14,12 @@
 //!
 //! The test registers the service in the managed gateway config, restarts
 //! the gateway (which describes it), and checks with sandboxes that:
-//! - BUFFERED redacts and denies request and response bodies;
+//! - `WHOLE_BODY` redacts and denies request and response bodies;
 //! - a response stage inspects the body of a server that compresses, because
 //!   OpenShell asks for an identity-coded response when the workload asks for
 //!   gzip;
-//! - STREAM carries a request body larger than any BUFFERED limit;
-//! - STREAM delivers server-sent events one by one;
+//! - DUPLEX carries a request body larger than any `WHOLE_BODY` limit;
+//! - DUPLEX delivers server-sent events one by one;
 //! - a preflight rejection never contacts the upstream;
 //! - a policy that mixes HTTP hook versions on one destination, or in which
 //!   the guard selects a `tls: skip` endpoint, is rejected at `policy set`.
@@ -523,7 +523,7 @@ network_policies:
     file
 }
 
-/// Upload size larger than any BUFFERED limit (256 KiB), so only STREAM can
+/// Upload size larger than any `WHOLE_BODY` limit (256 KiB), so only DUPLEX can
 /// carry it.
 const LARGE_UPLOAD_LINES: usize = 600;
 
@@ -536,7 +536,7 @@ import json
 
 HOST = "{SANDBOX_HOST}"
 PORT = {upstream_port}
-STREAM = {stream}
+DUPLEX = {duplex}
 
 def call(method, path, body=None, headers=None):
     conn = http.client.HTTPConnection(HOST, PORT, timeout=60)
@@ -560,7 +560,7 @@ results = {{
     "compressible": call("GET", "/compressible", headers={{"Accept-Encoding": "gzip, deflate"}}),
 }}
 
-if STREAM:
+if DUPLEX:
     upload = (b"x" * 1000 + b" prototype-secret\n") * {LARGE_UPLOAD_LINES}
     echoed = call("POST", "/echo", upload)
     expected = upload.replace(b"prototype-secret", b"[FILTERED]")
@@ -591,7 +591,7 @@ if STREAM:
 
 print(json.dumps(results, sort_keys=True))
 "#,
-        stream = if case.body_mode == "stream" {
+        duplex = if case.body_mode == "duplex" {
             "True"
         } else {
             "False"
@@ -666,12 +666,12 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
     let upstream = Upstream::start().await;
     let registration = GatewayRegistration::apply(guard.port).await;
 
-    // BUFFERED redaction in both directions and a preflight rejection.
+    // WHOLE_BODY redaction in both directions and a preflight rejection.
     let redact = run_workload(
         &upstream,
         &PolicyCase {
             mode: "redact",
-            body_mode: "buffered",
+            body_mode: "whole_body",
             tls_skip_port: None,
             mixed: false,
         },
@@ -718,13 +718,13 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
         "a preflight rejection never contacts the upstream"
     );
 
-    // BUFFERED denial in both directions.
+    // WHOLE_BODY denial in both directions.
     let echo_bodies_before = upstream.bodies("/echo").len();
     let deny = run_workload(
         &upstream,
         &PolicyCase {
             mode: "deny",
-            body_mode: "buffered",
+            body_mode: "whole_body",
             tls_skip_port: None,
             mixed: false,
         },
@@ -742,12 +742,12 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
         "a denied request body never reaches the upstream"
     );
 
-    // STREAM: a large upload and server-sent events one by one.
+    // DUPLEX: a large upload and server-sent events one by one.
     let stream = run_workload(
         &upstream,
         &PolicyCase {
             mode: "redact",
-            body_mode: "stream",
+            body_mode: "duplex",
             tls_skip_port: None,
             mixed: false,
         },
@@ -763,7 +763,7 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
         .expect("the upstream received the large upload");
     assert!(
         large.len() > 256 * 1024,
-        "the large upload exceeds every BUFFERED limit"
+        "the large upload exceeds every WHOLE_BODY limit"
     );
     assert!(!String::from_utf8_lossy(&large).contains("prototype-secret"));
     assert_eq!(stream["events"]["status"], 200, "{stream}");
@@ -782,7 +782,7 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
         upstream.port,
         &PolicyCase {
             mode: "redact",
-            body_mode: "buffered",
+            body_mode: "whole_body",
             tls_skip_port: None,
             mixed: false,
         },
@@ -791,7 +791,7 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
         upstream.port,
         &PolicyCase {
             mode: "redact",
-            body_mode: "buffered",
+            body_mode: "whole_body",
             tls_skip_port: None,
             mixed: true,
         },
@@ -836,7 +836,7 @@ async fn http_session_hook_content_guard_runs_against_the_gateway_and_supervisor
         upstream.port,
         &PolicyCase {
             mode: "redact",
-            body_mode: "buffered",
+            body_mode: "whole_body",
             tls_skip_port: Some(find_free_port()),
             mixed: false,
         },

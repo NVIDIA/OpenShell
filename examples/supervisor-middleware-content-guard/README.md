@@ -101,14 +101,14 @@ The echoed JSON body contains `[FILTERED]` instead of the configured term.
 
 ## HTTP behavior
 
-At preflight, the guard selects its configured `body_mode`, BUFFERED by default, and falls back to the other mode when OpenShell offers only that one. BUFFERED inspects one complete body of at most 256 KiB. STREAM has no size limit: it releases every complete line at once and withholds only the bytes that may begin a term split across chunks, so line-oriented streams such as server-sent events keep flowing. Redaction can make the output longer than the input, so the guard splits it into chunks within the limit OpenShell offers.
+At preflight, the guard selects its configured `body_mode`, WHOLE_BODY by default, and falls back to the other mode when OpenShell offers only that one. WHOLE_BODY inspects one complete body of at most 256 KiB. DUPLEX has no size limit: it releases every complete line at once and withholds only the bytes that may begin a term split across chunks, so line-oriented streams such as server-sent events keep flowing. Redaction can make the output longer than the input, so the guard splits it into chunks within the limit OpenShell offers.
 
 - The guard denies a request whose path or query contains a configured term at preflight with reason code `content_match`. This happens before the guard receives body bytes or OpenShell contacts the upstream. Earlier middleware may already have processed the body.
 - A message with an empty or absent body continues without inspection.
 - When OpenShell offers no body mode, such as for an encoded request or response, or a partial or `no-transform` response, the guard rejects the message with reason code `cannot_inspect`.
 - The guard never sees connections OpenShell cannot inspect. OpenShell denies h2c, raw TCP, and other uninspectable connections to hosts the guard selects, and the gateway rejects a policy in which the guard can select a `tls: skip` endpoint.
 
-Redact mode replaces matching spans. Deny mode rejects the message with reason code `content_match`. In STREAM mode, a response whose head has already reached the sandbox is aborted instead.
+Redact mode replaces matching spans. Deny mode rejects the message with reason code `content_match`. In DUPLEX mode, a response whose head has already reached the sandbox is aborted instead.
 
 ### HTTP responses
 
@@ -146,7 +146,7 @@ The service advertises a 256 KiB limit for complete WebSocket text messages. Ope
 | `mode` | No | `redact` (default) replaces matches; `deny` rejects the request. |
 | `terms` | Yes | Non-empty list of non-empty, case-sensitive literal strings. Overlapping match ranges are merged before redaction. |
 | `replacement` | No | Replacement text for `redact`; defaults to `[REDACTED]` and is invalid with `deny`. |
-| `body_mode` | No | `buffered` (default) or `stream`: the HTTP body mode the guard prefers when OpenShell offers both. |
+| `body_mode` | No | `whole_body` (default) or `duplex`: the HTTP body mode the guard prefers when OpenShell offers both. |
 
 To exercise denial, change the policy config to:
 

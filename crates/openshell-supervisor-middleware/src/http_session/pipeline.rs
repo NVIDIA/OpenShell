@@ -8,10 +8,10 @@
 //! after their preflight and body-time header changes. Bounded channels link
 //! the stages, and the relay commits headers only on the final `Start`.
 //!
-//! BUFFERED stages hold one bounded body under a whole-body deadline. STREAM
+//! `WHOLE_BODY` stages hold one bounded body under a whole-body deadline. DUPLEX
 //! stages run independent input and output pumps with no total deadline and
 //! no total byte cap; a stage fails only when it stalls. The supervisor never
-//! retains STREAM input for replay.
+//! retains DUPLEX input for replay.
 //!
 //! A request whose policy inspects the body runs with a checkpoint after
 //! every stage: it holds the stage's output until the stage ends and
@@ -30,13 +30,13 @@ use tokio::time::Instant;
 
 use openshell_core::proto::{
     Decision, HeaderMutation, HttpBegin, HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable,
-    HttpBodyUnavailableReason, HttpBufferedBody, HttpBufferedResult, HttpDenial, HttpFinish,
-    HttpHeader, HttpInputChunk, HttpInputEnd, HttpOutputChunk, HttpOutputStart,
-    HttpPreflightResult, HttpRequestPreflightHead, HttpRequestSessionEvent,
-    HttpRequestSessionPreflight, HttpResponsePreflightHead, HttpResponseSessionEvent,
-    HttpResponseSessionPreflight, MiddlewareDiagnostics, MiddlewareSessionEnd,
-    MiddlewareSessionEndReason, RequestContext, SupervisorMiddlewarePhase, http_buffered_result,
-    http_inspect, http_preflight_result, http_request_session_event, http_response_session_event,
+    HttpBodyUnavailableReason, HttpDenial, HttpFinish, HttpHeader, HttpInputChunk, HttpInputEnd,
+    HttpOutputChunk, HttpOutputStart, HttpPreflightResult, HttpRequestPreflightHead,
+    HttpRequestSessionEvent, HttpRequestSessionPreflight, HttpResponsePreflightHead,
+    HttpResponseSessionEvent, HttpResponseSessionPreflight, HttpWholeBody, HttpWholeBodyResult,
+    MiddlewareDiagnostics, MiddlewareSessionEnd, MiddlewareSessionEndReason, RequestContext,
+    SupervisorMiddlewarePhase, http_inspect, http_preflight_result, http_request_session_event,
+    http_response_session_event, http_whole_body_result,
 };
 
 use crate::headers::{self, HeaderAuthority};
@@ -49,15 +49,15 @@ use crate::{
 
 /// Largest normalized body chunk a stage sends or receives.
 pub const MAX_HTTP_STREAM_UNIT_BYTES: usize = 64 * 1024;
-/// STREAM middleware-stall timeout.
+/// DUPLEX middleware-stall timeout.
 ///
-/// A STREAM stage fails when it does not accept the next input within this
+/// A DUPLEX stage fails when it does not accept the next input within this
 /// duration while its output is not held back downstream, or when it returns
 /// nothing within this duration after it accepted the end of its input.
 pub const HTTP_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// BUFFERED whole-body deadline, covering receipt, processing, and delivery
+/// `WHOLE_BODY` deadline, covering receipt, processing, and delivery
 /// of one stage's body.
-pub const HTTP_BUFFERED_BODY_TIMEOUT: Duration = Duration::from_mins(2);
+pub const HTTP_WHOLE_BODY_TIMEOUT: Duration = Duration::from_mins(2);
 /// Messages each link and stage queue holds.
 pub const STAGE_QUEUE_MESSAGES: usize = 4;
 const SESSION_END_TIMEOUT: Duration = Duration::from_millis(10);
@@ -79,9 +79,9 @@ pub enum HttpFailureCode {
     /// The message head cannot be shown to middleware.
     CannotInspect,
     /// A stage missed its binding timeout, the chain deadline, or the
-    /// BUFFERED whole-body deadline.
+    /// `WHOLE_BODY` deadline.
     Timeout,
-    /// A STREAM stage stalled.
+    /// A DUPLEX stage stalled.
     StreamIdleTimeout,
     /// The middleware was unreachable, failed with an RPC status, or had no
     /// capacity.
@@ -176,15 +176,15 @@ pub enum HttpStageOutcome {
     Continue,
     /// The stage denied the exchange.
     Deny,
-    /// Preflight selected BUFFERED.
-    Buffered,
-    /// Preflight selected STREAM.
-    Stream,
-    /// The BUFFERED result kept the body.
+    /// Preflight selected `WHOLE_BODY`.
+    WholeBody,
+    /// Preflight selected DUPLEX.
+    Duplex,
+    /// The `WHOLE_BODY` result kept the body.
     Unchanged,
-    /// The BUFFERED result replaced the body.
+    /// The `WHOLE_BODY` result replaced the body.
     Replacement,
-    /// The STREAM stage finished.
+    /// The DUPLEX stage finished.
     Finish,
     /// The stage failed and the exchange failed closed.
     FailClosed,
@@ -242,7 +242,7 @@ impl HttpStageDiagnostics {
             );
             let decided = !matches!(
                 invocation.outcome,
-                HttpStageOutcome::Buffered | HttpStageOutcome::Stream
+                HttpStageOutcome::WholeBody | HttpStageOutcome::Duplex
             );
             if let Some((existing, existing_decided)) = applied
                 .iter_mut()
@@ -320,14 +320,14 @@ pub struct HttpPipelineFinish {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipelineTimeouts {
     pub stream_idle: Duration,
-    pub buffered_body: Duration,
+    pub whole_body: Duration,
 }
 
 impl Default for PipelineTimeouts {
     fn default() -> Self {
         Self {
             stream_idle: HTTP_STREAM_IDLE_TIMEOUT,
-            buffered_body: HTTP_BUFFERED_BODY_TIMEOUT,
+            whole_body: HTTP_WHOLE_BODY_TIMEOUT,
         }
     }
 }
@@ -345,7 +345,7 @@ pub struct PipelineSpec {
     /// target them.
     pub credential_reference_headers: Vec<String>,
     pub timeouts: PipelineTimeouts,
-    /// False when the outgoing message cannot carry trailers. BUFFERED stages
+    /// False when the outgoing message cannot carry trailers. `WHOLE_BODY` stages
     /// then always declare their output length, and the caller drops the
     /// final trailers.
     pub output_trailers: bool,
@@ -488,7 +488,7 @@ pub enum StagePreflight {
 #[derive(Debug)]
 enum StageEvent {
     Begin(HttpBegin),
-    BufferedBody(HttpBufferedBody),
+    WholeBody(HttpWholeBody),
     InputChunk(HttpInputChunk),
     InputEnd(HttpInputEnd),
     SessionEnd(MiddlewareSessionEnd),
@@ -498,7 +498,7 @@ enum StageEvent {
 #[derive(Debug)]
 pub(super) enum StageResult {
     PreflightResult(HttpPreflightResult),
-    BufferedResult(HttpBufferedResult),
+    WholeBodyResult(HttpWholeBodyResult),
     OutputStart(HttpOutputStart),
     OutputChunk(HttpOutputChunk),
     Finish(HttpFinish),
@@ -517,7 +517,7 @@ macro_rules! session_messages {
             fn from(event: StageEvent) -> Self {
                 match event {
                     StageEvent::Begin(begin) => Self::Begin(begin),
-                    StageEvent::BufferedBody(body) => Self::BufferedBody(body),
+                    StageEvent::WholeBody(body) => Self::WholeBody(body),
                     StageEvent::InputChunk(chunk) => Self::InputChunk(chunk),
                     StageEvent::InputEnd(end) => Self::InputEnd(end),
                     StageEvent::SessionEnd(end) => Self::SessionEnd(end),
@@ -530,7 +530,7 @@ macro_rules! session_messages {
                 use openshell_core::proto::$result::Result as Wire;
                 match result {
                     Wire::PreflightResult(result) => Self::PreflightResult(result),
-                    Wire::BufferedResult(result) => Self::BufferedResult(result),
+                    Wire::WholeBodyResult(result) => Self::WholeBodyResult(result),
                     Wire::OutputStart(start) => Self::OutputStart(start),
                     Wire::OutputChunk(chunk) => Self::OutputChunk(chunk),
                     Wire::Finish(finish) => Self::Finish(finish),
@@ -589,8 +589,8 @@ fn stage_results<R: 'static>(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageMode {
-    Buffered { max_body_bytes: usize },
-    Stream,
+    WholeBody { max_body_bytes: usize },
+    Duplex,
 }
 
 /// One stage that selected a body mode.
@@ -879,8 +879,8 @@ async fn prepare_stage(
                 entry,
                 match mode {
                     None => HttpStageOutcome::Continue,
-                    Some(StageMode::Buffered { .. }) => HttpStageOutcome::Buffered,
-                    Some(StageMode::Stream) => HttpStageOutcome::Stream,
+                    Some(StageMode::WholeBody { .. }) => HttpStageOutcome::WholeBody,
+                    Some(StageMode::Duplex) => HttpStageOutcome::Duplex,
                 },
                 reason_code,
             )
@@ -1026,12 +1026,12 @@ struct BodyAdmission {
     /// The first stage retains its preflight slot while it buffers.
     buffered: Option<Arc<MiddlewareSessionPermit>>,
     runner: Option<ChainRunner>,
-    /// A STREAM slot, kept until the pipeline ends.
+    /// A DUPLEX slot, kept until the pipeline ends.
     stream: Option<MiddlewareSessionPermit>,
 }
 
 impl ChainRunner {
-    /// Reserve a stream slot for a STREAM stage or a chain with deferred
+    /// Reserve a stream slot for a DUPLEX stage or a chain with deferred
     /// stages. Keep the initial preflight slot only if the first stage
     /// buffers. Later stages share or acquire a preflight/buffering slot
     /// when their input headers arrive.
@@ -1039,7 +1039,7 @@ impl ChainRunner {
     /// A message never waits for a stream slot while holding a preflight
     /// slot: messages queued behind open streams would otherwise starve every
     /// preflight. When it has to wait, it releases the preflight slot and,
-    /// if a BUFFERED stage runs, takes one again after the stream slot. No
+    /// if a `WHOLE_BODY` stage runs, takes one again after the stream slot. No
     /// message holds a preflight slot while waiting for a stream slot, so the
     /// two waits cannot deadlock.
     pub(super) async fn admit_body(
@@ -1095,12 +1095,12 @@ impl Pipeline {
     }
 
     fn buffers(&self) -> bool {
-        matches!(self.stage.mode, StageMode::Buffered { .. })
+        matches!(self.stage.mode, StageMode::WholeBody { .. })
     }
 
-    /// True when this pipeline runs or may later select STREAM.
+    /// True when this pipeline runs or may later select DUPLEX.
     pub fn may_stream(&self) -> bool {
-        self.stage.mode == StageMode::Stream || !self.pending.is_empty()
+        self.stage.mode == StageMode::Duplex || !self.pending.is_empty()
     }
 
     #[cfg(test)]
@@ -1325,8 +1325,8 @@ fn end_reason_name(reason: MiddlewareSessionEndReason) -> String {
 
 fn input_unit_limit(stage: &Stage) -> usize {
     match stage.mode {
-        StageMode::Stream => stage_chunk_limit(&stage.entry),
-        StageMode::Buffered { .. } => MAX_HTTP_STREAM_UNIT_BYTES,
+        StageMode::Duplex => stage_chunk_limit(&stage.entry),
+        StageMode::WholeBody { .. } => MAX_HTTP_STREAM_UNIT_BYTES,
     }
 }
 
@@ -1357,7 +1357,7 @@ struct Shared {
     admission: BufferAdmission,
 }
 
-/// Buffered stages of one message share a slot, including while passing
+/// `WHOLE_BODY` stages of one message share a slot, including while passing
 /// output to the next stage. A stream releases the slot until it is needed.
 struct BufferAdmission {
     runner: ChainRunner,
@@ -1794,7 +1794,7 @@ async fn drive_stage(
         }
     };
     match stage.mode {
-        StageMode::Buffered { max_body_bytes } => {
+        StageMode::WholeBody { max_body_bytes } => {
             drive_buffered(
                 stage,
                 input,
@@ -1807,7 +1807,7 @@ async fn drive_stage(
             )
             .await
         }
-        StageMode::Stream => {
+        StageMode::Duplex => {
             *permit = None;
             drive_stream(
                 stage,
@@ -1889,7 +1889,7 @@ async fn drive_buffered(
 ) -> Result<StageDone, StageError> {
     let Stage { entry, stream, .. } = stage;
     // One deadline for receipt, processing, and delivery of the body.
-    let body_deadline = Instant::now() + shared.spec.timeouts.buffered_body;
+    let body_deadline = Instant::now() + shared.spec.timeouts.whole_body;
     send_until(
         entry,
         stream,
@@ -1932,7 +1932,7 @@ async fn drive_buffered(
         (body_deadline, "middleware_body_timeout")
     };
     let input_bytes = body.len();
-    let event = StageEvent::BufferedBody(HttpBufferedBody {
+    let event = StageEvent::WholeBody(HttpWholeBody {
         data: body.clone(),
         trailers: trailers.clone(),
     });
@@ -1951,11 +1951,11 @@ async fn drive_buffered(
         .await
         .map_err(|_| entry_failure(entry, timeout_reason))??;
     let result = match classify_result(entry, next)? {
-        StageResult::BufferedResult(result) => result,
+        StageResult::WholeBodyResult(result) => result,
         StageResult::Deny(deny) => {
             return Err(denial(entry, deny.diagnostics.as_ref()).into());
         }
-        _ => return Err(entry_failure(entry, "buffered_result_expected").into()),
+        _ => return Err(entry_failure(entry, "whole_body_result_expected").into()),
     };
     let diagnostics = validate_diagnostics(entry, result.diagnostics.as_ref())?;
     let late_head = shared
@@ -1970,14 +1970,14 @@ async fn drive_buffered(
     )
     .map_err(|error| mutation_failure(entry, &error))?;
     let (body, outcome) = match result.body {
-        Some(http_buffered_result::Body::Unchanged(_)) => (body, HttpStageOutcome::Unchanged),
-        Some(http_buffered_result::Body::Replacement(replacement)) => {
+        Some(http_whole_body_result::Body::Unchanged(_)) => (body, HttpStageOutcome::Unchanged),
+        Some(http_whole_body_result::Body::Replacement(replacement)) => {
             if replacement.len() > max_body_bytes {
                 return Err(entry_failure(entry, "buffered_output_over_capacity").into());
             }
             (replacement, HttpStageOutcome::Replacement)
         }
-        None => return Err(entry_failure(entry, "buffered_result_unknown").into()),
+        None => return Err(entry_failure(entry, "whole_body_result_unknown").into()),
     };
     let head_changed = late_head != begin_head;
     let transformed = outcome == HttpStageOutcome::Replacement;
@@ -2026,20 +2026,20 @@ fn transformed_body_denial(policy: TransformedBodyPolicy<'_>, body: &[u8]) -> Op
     }
 }
 
-/// Why a STREAM stage's input pump stopped early.
+/// Why a DUPLEX stage's input pump stopped early.
 enum InputStop {
     /// The stage stopped reading input.
     Closed,
     Failed(StageError),
 }
 
-/// Why sending STREAM input to a stage stopped.
+/// Why sending DUPLEX input to a stage stopped.
 enum StallError {
     Closed,
     Stalled,
 }
 
-/// Send STREAM input, failing when the stage does not accept it within
+/// Send DUPLEX input, failing when the stage does not accept it within
 /// `idle`. Time the stage's output spends held back downstream does not
 /// count, and the timer restarts when that backpressure ends.
 async fn send_stalled(
@@ -2311,18 +2311,18 @@ fn validate_inspect(
     buffered_limit: usize,
 ) -> Result<StageMode, &'static str> {
     match mode {
-        http_inspect::Mode::Buffered(mode)
-            if permitted.contains(&HttpBodyMode::Buffered)
+        http_inspect::Mode::WholeBody(mode)
+            if permitted.contains(&HttpBodyMode::WholeBody)
                 && mode.max_body_bytes > 0
                 && mode.max_body_bytes <= buffered_limit as u64 =>
         {
-            Ok(StageMode::Buffered {
+            Ok(StageMode::WholeBody {
                 max_body_bytes: usize::try_from(mode.max_body_bytes)
                     .map_err(|_| "body_mode_not_permitted")?,
             })
         }
-        http_inspect::Mode::Stream(_) if permitted.contains(&HttpBodyMode::Stream) => {
-            Ok(StageMode::Stream)
+        http_inspect::Mode::Duplex(_) if permitted.contains(&HttpBodyMode::Duplex) => {
+            Ok(StageMode::Duplex)
         }
         _ => Err("body_mode_not_permitted"),
     }
@@ -2340,10 +2340,10 @@ fn body_limits(
     } else {
         stage_chunk_limit(entry) as u64
     };
-    let streams = permitted.contains(&HttpBodyMode::Stream);
+    let streams = permitted.contains(&HttpBodyMode::Duplex);
     HttpBodyLimits {
         max_chunk_bytes: chunk,
-        max_buffered_body_bytes: if permitted.contains(&HttpBodyMode::Buffered) {
+        max_whole_body_bytes: if permitted.contains(&HttpBodyMode::WholeBody) {
             buffered_limit as u64
         } else {
             0

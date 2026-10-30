@@ -42,7 +42,7 @@ use crate::guard::{GuardConfig, MAX_PAYLOAD_BYTES};
 
 const MANIFEST_NAME: &str = "example/content-guard-service";
 /// gRPC message limit for a 4 MiB payload plus the rest of its event or
-/// result. A `buffered_body` event or `replacement` at the 4 MiB platform
+/// result. A `whole_body` event or `replacement` at the 4 MiB platform
 /// limit exceeds tonic's 4 MiB default once encoded.
 const MAX_GRPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024 + 512 * 1024;
 

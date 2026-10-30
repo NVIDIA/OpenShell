@@ -12028,8 +12028,8 @@ network_policies:
             tonic::Status,
         > {
             use openshell_core::proto::{
-                HttpDenial, HttpFinish, HttpInspect, HttpOutputChunk, HttpOutputStart,
-                HttpPreflightResult, HttpRequestSessionResult, HttpStreamMode,
+                HttpDenial, HttpDuplexMode, HttpFinish, HttpInspect, HttpOutputChunk,
+                HttpOutputStart, HttpPreflightResult, HttpRequestSessionResult,
                 MiddlewareDiagnostics, http_inspect, http_preflight_result,
                 http_request_session_event, http_request_session_result,
             };
@@ -12051,8 +12051,8 @@ network_policies:
                                 HttpPreflightResult {
                                     decision: Some(http_preflight_result::Decision::Inspect(
                                         HttpInspect {
-                                            mode: Some(http_inspect::Mode::Stream(
-                                                HttpStreamMode {},
+                                            mode: Some(http_inspect::Mode::Duplex(
+                                                HttpDuplexMode {},
                                             )),
                                         },
                                     )),
@@ -12311,7 +12311,7 @@ network_policies:
       - { path: /usr/bin/curl }
 "#;
         let limit = crate::l7::rest::MAX_SIGV4_BODY_BYTES;
-        // A pass-through STREAM stage keeps the route's 10 MiB signing limit
+        // A pass-through DUPLEX stage keeps the route's 10 MiB signing limit
         // instead of the 4 MiB default: a 6 MiB body is signed and forwarded,
         // and one byte over the limit fails before upstream contact.
         for body_len in [6 * 1024 * 1024, limit + 1] {
@@ -12727,7 +12727,7 @@ network_policies:
         Missing,
     }
 
-    /// HTTP session hook counterpart of [`McpToolReplacingService`]: a BUFFERED stage
+    /// HTTP session hook counterpart of [`McpToolReplacingService`]: a `WHOLE_BODY` stage
     /// that replaces the tool call and writes the sessionless `Mcp-Name`
     /// mirror as a late mutation in its body result, at preflight, or not at
     /// all.
@@ -12780,10 +12780,10 @@ network_policies:
             tonic::Status,
         > {
             use openshell_core::proto::{
-                ExistingHeaderAction, HeaderMutation, HttpBufferedMode, HttpBufferedResult,
-                HttpInspect, HttpPreflightResult, HttpRequestSessionResult, WriteHeader,
-                header_mutation, http_buffered_result, http_inspect, http_preflight_result,
-                http_request_session_event, http_request_session_result,
+                ExistingHeaderAction, HeaderMutation, HttpInspect, HttpPreflightResult,
+                HttpRequestSessionResult, HttpWholeBodyMode, HttpWholeBodyResult, WriteHeader,
+                header_mutation, http_inspect, http_preflight_result, http_request_session_event,
+                http_request_session_result, http_whole_body_result,
             };
             let mirror = vec![HeaderMutation {
                 operation: Some(header_mutation::Operation::Write(WriteHeader {
@@ -12808,12 +12808,12 @@ network_policies:
                                 HttpPreflightResult {
                                     decision: Some(http_preflight_result::Decision::Inspect(
                                         HttpInspect {
-                                            mode: Some(http_inspect::Mode::Buffered(
-                                                HttpBufferedMode {
+                                            mode: Some(http_inspect::Mode::WholeBody(
+                                                HttpWholeBodyMode {
                                                     max_body_bytes: preflight
                                                         .limits
                                                         .map_or(1, |limits| {
-                                                            limits.max_buffered_body_bytes
+                                                            limits.max_whole_body_bytes
                                                         }),
                                                 },
                                             )),
@@ -12824,14 +12824,14 @@ network_policies:
                                 },
                             )
                         }
-                        Some(http_request_session_event::Event::BufferedBody(body)) => {
+                        Some(http_request_session_event::Event::WholeBody(body)) => {
                             let original: serde_json::Value =
                                 serde_json::from_slice(&body.data).unwrap();
                             assert_eq!(original["params"]["name"], "read_status");
                             invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            http_request_session_result::Result::BufferedResult(
-                                HttpBufferedResult {
-                                    body: Some(http_buffered_result::Body::Replacement(
+                            http_request_session_result::Result::WholeBodyResult(
+                                HttpWholeBodyResult {
+                                    body: Some(http_whole_body_result::Body::Replacement(
                                         replacement.clone(),
                                     )),
                                     header_mutations: late_mutations.clone(),
