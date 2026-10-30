@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Rust Cache
+
+# Branch Checks never runs on main, so this saves the rust-checks cache that PR
+# mirrors and merge groups restore. Keep env and build commands aligned with
+# the Branch Checks rust-test job so the cache keys and contents match.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Let runs finish so frequent merges cannot keep cancelling the save.
+  cancel-in-progress: false
+
+jobs:
+  rust-checks:
+    name: Rust checks cache (${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: linux-amd64-cpu8
+            system: x86_64-linux
+          - runner: linux-arm64-cpu8
+            system: aarch64-linux
+          - runner: macos-15-xlarge
+            system: aarch64-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          prepare-shell: "true"
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - id: rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-checks-v2
+          save-cache: "true"
+
+      - name: Build tests
+        if: steps.rust.outputs.cache-hit != 'true'
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo test --locked -p openshell-crypto --no-default-features --test independent_backend --no-run
+          cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support --no-run
+          cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --no-run
+          cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/testkit/Cargo.toml --no-run

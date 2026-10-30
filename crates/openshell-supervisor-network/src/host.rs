@@ -224,6 +224,7 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         None,
         Some(direct_listener_identity),
         None,
+        None,
     )
     .await?;
 

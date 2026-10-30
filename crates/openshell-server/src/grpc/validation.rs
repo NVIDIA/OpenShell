@@ -459,6 +459,17 @@ pub(super) fn validate_string_map(
     Ok(())
 }
 
+/// Validate label keys and values using Kubernetes syntax.
+pub(super) fn validate_labels(
+    labels: &std::collections::HashMap<String, String>,
+) -> Result<(), Status> {
+    for (key, value) in labels {
+        validate_label_key(key)?;
+        validate_label_value(value)?;
+    }
+    Ok(())
+}
+
 /// Validate object annotations.
 ///
 /// Annotation keys use the same qualified-key shape as labels. Annotation

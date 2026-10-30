@@ -22,6 +22,13 @@ pub const COMPUTE_LAUNCH_AUTHENTICATION: &str = "openshell.compute.launch-authen
 /// Driver stages operator-selected external isolation routes for the supervisor.
 pub const COMPUTE_ISOLATION_BACKEND: &str = "openshell.compute.isolation-backend";
 
+/// Driver implements `SuspendSandbox` and resuming through `StartSandbox`.
+pub const COMPUTE_SUSPEND_RESUME: &str = "openshell.compute.suspend-resume";
+
+/// Optional stopped-state workload configuration updates retaining the resource and storage.
+pub const COMPUTE_UPDATE_SANDBOX_CONFIGURATION: &str =
+    "openshell.compute.update-sandbox-configuration";
+
 /// Capability for supervisor middleware that implements HTTP session hooks.
 ///
 /// A service selects HTTP session hooks for all of its HTTP bindings by
@@ -134,6 +141,7 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
         ExtensionFamily::Compute => {
             supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
             supported_capabilities.push(COMPUTE_ISOLATION_BACKEND.to_string());
+            supported_capabilities.push(COMPUTE_UPDATE_SANDBOX_CONFIGURATION.to_string());
         }
         ExtensionFamily::SupervisorMiddleware => {
             supported_capabilities.push(SUPERVISOR_MIDDLEWARE_HTTP_SESSION.to_string());
@@ -430,6 +438,23 @@ fn valid_capability(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_gateway_advertises_both_optional_extensions() {
+        let gateway = gateway_metadata(ExtensionFamily::Compute);
+        assert!(
+            gateway
+                .supported_capabilities
+                .iter()
+                .any(|c| c == COMPUTE_ISOLATION_BACKEND)
+        );
+        assert!(
+            gateway
+                .supported_capabilities
+                .iter()
+                .any(|c| c == COMPUTE_UPDATE_SANDBOX_CONFIGURATION)
+        );
+    }
 
     fn compatible() -> (PeerMetadata, PeerMetadata) {
         let gateway = gateway_metadata(ExtensionFamily::Compute);

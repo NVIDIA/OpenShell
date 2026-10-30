@@ -15,19 +15,21 @@ use openshell_core::proto::{
     HttpOutputStart, HttpPreflightResult, HttpRequestResult, HttpRequestSessionEvent,
     HttpRequestSessionPreflight, HttpRequestSessionResult, HttpRequestTarget, HttpStreamMode,
     MiddlewareBinding, MiddlewareDiagnostics, MiddlewareManifest, RequestContext,
-    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, WriteHeader, header_mutation,
-    http_buffered_result, http_inspect, http_preflight_result, http_request_session_event,
-    http_request_session_result,
+    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
+    WriteHeader, header_mutation, http_buffered_result, http_inspect, http_preflight_result,
+    http_request_session_event, http_request_session_result,
 };
 use tokio::sync::mpsc;
 
 use super::pipeline::entry_failure;
+use crate::binding_policy::BindingPolicy;
 use crate::{
     ChainEntry, ChainRunner, DescribedChainEntry, HttpBodyInput, HttpBodyOutput, HttpFailureCode,
     HttpRequestPreflightInput, HttpRequestSessionResultStream, HttpRequestView, HttpStageOutcome,
     InProcessMiddleware, MAX_CONCURRENT_HTTP_MIDDLEWARE_SESSIONS,
     MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS, MAX_MIDDLEWARE_CHAIN_TIMEOUT, MiddlewareFailureDetail,
-    MiddlewareRegistry, OnError, TransformedBodyPolicy, validate_manifest_bindings,
+    MiddlewareRegistry, OnError, TransformedBodyPolicy, authorize_external_manifest,
+    validate_manifest_bindings,
 };
 
 fn binding(operation: SupervisorMiddlewareOperation) -> MiddlewareBinding {
@@ -83,7 +85,7 @@ fn registration_requires_the_http_session_capability_it_supports() {
             session_manifest(vec![binding(HttpRequest), binding(WebsocketMessage)]),
         ),
     ] {
-        validate_manifest_bindings("test service", &manifest, None)
+        validate_manifest_bindings("test service", &manifest)
             .unwrap_or_else(|error| panic!("{case}: {error}"));
     }
 
@@ -97,7 +99,7 @@ fn registration_requires_the_http_session_capability_it_supports() {
         .expect("test manifest carries extension metadata")
         .supported_capabilities
         .push(SUPERVISOR_MIDDLEWARE_HTTP_SESSION.into());
-    let error = validate_manifest_bindings("test service", &supported_only, None)
+    let error = validate_manifest_bindings("test service", &supported_only)
         .expect_err("a supported but not required capability is rejected")
         .to_string();
     assert!(error.contains("without requiring it"), "{error}");
@@ -108,7 +110,6 @@ fn registration_requires_the_http_session_capability_it_supports() {
             phase: SupervisorMiddlewarePhase::PreReturn as i32,
             ..binding(HttpRequest)
         }]),
-        None,
     )
     .expect_err("a request operation at the response phase is rejected")
     .to_string();
@@ -120,18 +121,25 @@ fn registration_requires_the_http_session_capability_it_supports() {
     // An HTTP session hook binding without a payload limit is preflight-only.
     let mut preflight_only = binding(HttpRequest);
     preflight_only.max_payload_bytes = 0;
-    validate_manifest_bindings(
-        "test service",
+    // The registration leaves the operator payload limit unset.
+    let registration = SupervisorMiddlewareService {
+        name: "example/guard".into(),
+        ..Default::default()
+    };
+    authorize_external_manifest(
+        &registration,
         &session_manifest(vec![preflight_only]),
-        Some(0),
+        false,
+        &BindingPolicy::Dynamic,
     )
     .expect("a preflight-only binding carries no payload");
-    validate_manifest_bindings("test service", &manifest(vec![preflight_only]), None)
+    validate_manifest_bindings("test service", &manifest(vec![preflight_only]))
         .expect_err("a v1 HTTP hook binding needs a payload limit");
-    validate_manifest_bindings(
-        "test service",
+    authorize_external_manifest(
+        &registration,
         &session_manifest(vec![binding(HttpRequest)]),
-        Some(0),
+        false,
+        &BindingPolicy::Dynamic,
     )
     .expect_err("an HTTP session hook binding with a payload limit needs an operator limit");
 }

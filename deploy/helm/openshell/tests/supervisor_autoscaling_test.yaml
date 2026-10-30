@@ -1,0 +1,214 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+suite: shared supervisor memory autoscaling
+templates:
+  - templates/supervisor-hpa.yaml
+  - templates/supervisor.yaml
+  - templates/supervisor-pdb.yaml
+  - templates/hpa.yaml
+release:
+  name: openshell
+  namespace: gateway
+set:
+  gatewayConfig:
+    openshell.drivers.kubernetes:
+      supervisor_topology: gateway
+  supervisor.autoscaling.enabled: true
+tests:
+  - it: renders the memory HPA with gradual downscaling
+    template: templates/supervisor-hpa.yaml
+    asserts:
+      - isKind:
+          of: HorizontalPodAutoscaler
+      - isAPIVersion:
+          of: autoscaling/v2
+      - equal:
+          path: metadata.namespace
+          value: gateway
+      - equal:
+          path: metadata.name
+          value: openshell-supervisor
+      - equal:
+          path: spec.scaleTargetRef
+          value:
+            apiVersion: apps/v1
+            kind: Deployment
+            name: openshell-supervisor
+      - equal:
+          path: spec.minReplicas
+          value: 2
+      - equal:
+          path: spec.maxReplicas
+          value: 4
+      - equal:
+          path: spec.metrics
+          value:
+            - type: Resource
+              resource:
+                name: memory
+                target:
+                  type: AverageValue
+                  averageValue: 512Mi
+      - equal:
+          path: spec.behavior.scaleDown
+          value:
+            stabilizationWindowSeconds: 300
+            policies:
+              - type: Pods
+                value: 1
+                periodSeconds: 120
+  - it: omits fixed replicas when the HPA owns them
+    template: templates/supervisor.yaml
+    set:
+      supervisor.replicas: 0
+    documentIndex: 0
+    asserts:
+      - notExists:
+          path: spec.replicas
+  - it: preserves fixed replicas when autoscaling is disabled
+    template: templates/supervisor.yaml
+    set:
+      supervisor.autoscaling.enabled: false
+      supervisor.replicas: 3
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 3
+  - it: keeps the PodDisruptionBudget alongside the HPA by default
+    template: templates/supervisor-pdb.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+  - it: drops only the PodDisruptionBudget when disabled under the HPA
+    set:
+      supervisor.podDisruptionBudget.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+        template: templates/supervisor-pdb.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-hpa.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor.yaml
+      - notExists:
+          path: spec.replicas
+        template: templates/supervisor.yaml
+  - it: adds no supervisor HPA when disabled
+    template: templates/supervisor-hpa.yaml
+    set:
+      supervisor.autoscaling.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: treats missing autoscaling values as disabled
+    template: templates/supervisor-hpa.yaml
+    set:
+      supervisor.autoscaling: null
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: leaves gateway autoscaling disabled
+    template: templates/hpa.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: lets gateway and supervisor HPAs coexist
+    template: templates/hpa.yaml
+    values:
+      - ../ci/values-autoscaling.yaml
+    asserts:
+      - equal:
+          path: spec.scaleTargetRef.name
+          value: openshell
+  - it: uses the same overridden name for the HPA and its target
+    template: templates/supervisor-hpa.yaml
+    set:
+      fullnameOverride: my-gateway
+      supervisor.autoscaling.minReplicas: 3
+      supervisor.autoscaling.maxReplicas: 6
+      supervisor.autoscaling.targetMemoryAverageValue: 768Mi
+      supervisor.autoscaling.behavior.scaleUp.stabilizationWindowSeconds: 30
+    asserts:
+      - equal:
+          path: metadata.name
+          value: my-gateway-supervisor
+      - equal:
+          path: spec.scaleTargetRef.name
+          value: my-gateway-supervisor
+      - equal:
+          path: spec.minReplicas
+          value: 3
+      - equal:
+          path: spec.maxReplicas
+          value: 6
+      - equal:
+          path: spec.metrics[0].resource.target.averageValue
+          value: 768Mi
+      - equal:
+          path: spec.behavior.scaleUp.stabilizationWindowSeconds
+          value: 30
+      - equal:
+          path: spec.behavior.scaleDown.stabilizationWindowSeconds
+          value: 300
+  - it: requires the shared supervisor topology
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig: null
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.autoscaling.enabled requires supervisor_topology = gateway
+  - it: rejects non-boolean enabling values
+    template: templates/supervisor.yaml
+    set:
+      supervisor.autoscaling.enabled: "false"
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.autoscaling.enabled must be a boolean
+  - it: rejects zero minimum replicas
+    template: templates/supervisor.yaml
+    set:
+      supervisor.autoscaling.minReplicas: 0
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.autoscaling.minReplicas must be an integer of at least 1; when upgrading older values, use --reset-then-reuse-values or set all supervisor.autoscaling values explicitly
+  - it: rejects a fractional maximum
+    template: templates/supervisor.yaml
+    set:
+      supervisor.autoscaling.maxReplicas: 4.5
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.autoscaling.maxReplicas must be an integer greater than or equal to minReplicas
+  - it: rejects a maximum below the minimum
+    template: templates/supervisor.yaml
+    set:
+      supervisor.autoscaling.maxReplicas: 1
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.autoscaling.maxReplicas must be an integer greater than or equal to minReplicas
+  - it: rejects a zero memory target
+    template: templates/supervisor.yaml
+    set:
+      supervisor.autoscaling.targetMemoryAverageValue: 0Mi
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.autoscaling.targetMemoryAverageValue must be a positive Kubernetes memory quantity, such as 512Mi
+  - it: rejects malformed memory quantities
+    template: templates/supervisor.yaml
+    set:
+      supervisor.autoscaling.targetMemoryAverageValue: 512megabytes
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.autoscaling.targetMemoryAverageValue must be a positive Kubernetes memory quantity, such as 512Mi
+  - it: rejects missing memory targets in older reused values
+    template: templates/supervisor.yaml
+    set:
+      supervisor.autoscaling.targetMemoryAverageValue: null
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.autoscaling.targetMemoryAverageValue must be a positive Kubernetes memory quantity, such as 512Mi

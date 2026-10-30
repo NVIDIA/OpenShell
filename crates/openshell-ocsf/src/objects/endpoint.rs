@@ -25,6 +25,10 @@ pub struct Endpoint {
     /// Short name for an endpoint with no address of its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+
+    /// Name of the service the endpoint provides.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub svc_name: Option<String>,
 }
 
 impl Endpoint {
@@ -36,6 +40,7 @@ impl Endpoint {
             ip: None,
             port: Some(port),
             name: None,
+            svc_name: None,
         }
     }
 
@@ -47,6 +52,7 @@ impl Endpoint {
             ip: None,
             port: None,
             name: Some(name.to_string()),
+            svc_name: None,
         }
     }
 
@@ -58,6 +64,7 @@ impl Endpoint {
             ip: Some(addr.to_string()),
             port: Some(port),
             name: None,
+            svc_name: None,
         }
     }
 
@@ -69,6 +76,20 @@ impl Endpoint {
             ip: Some(addr.to_string()),
             port: Some(port),
             name: None,
+            svc_name: None,
+        }
+    }
+
+    /// Create an endpoint for a local service with no network address, such as
+    /// a server on a Unix socket.
+    #[must_use]
+    pub fn local_service(svc_name: &str, name: Option<&str>) -> Self {
+        Self {
+            domain: None,
+            ip: None,
+            port: None,
+            name: name.map(str::to_string),
+            svc_name: Some(svc_name.to_string()),
         }
     }
 
@@ -85,6 +106,21 @@ impl Endpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_service_endpoint_names_the_service_and_socket() {
+        let json = serde_json::to_value(Endpoint::local_service(
+            "ssh",
+            Some("/run/openshell/ssh.sock"),
+        ))
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"name": "/run/openshell/ssh.sock", "svc_name": "ssh"})
+        );
+        let json = serde_json::to_value(Endpoint::local_service("ssh", None)).unwrap();
+        assert_eq!(json, serde_json::json!({"svc_name": "ssh"}));
+    }
 
     #[test]
     fn test_endpoint_domain() {

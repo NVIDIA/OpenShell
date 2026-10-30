@@ -23,6 +23,7 @@ mod config_runtime;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
+mod otlp_relay;
 mod provider_readiness;
 pub mod sandbox_instance_host;
 pub mod shared_host;
@@ -378,6 +379,115 @@ async fn wait_for_control_shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// SIGUSR1 asks the supervisor to suspend its boundary. The handler is
+/// installed at startup so an early signal never takes the default
+/// terminating disposition.
+#[cfg(unix)]
+struct SuspendSignal(tokio::signal::unix::Signal);
+
+#[cfg(unix)]
+impl SuspendSignal {
+    fn install() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        signal(SignalKind::user_defined1())
+            .into_diagnostic()
+            .wrap_err("install SIGUSR1 suspension handler")
+            .map(Self)
+    }
+
+    async fn recv(&mut self) {
+        if self.0.recv().await.is_none() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Suspension requests are signal-driven and unavailable on non-Unix hosts.
+#[cfg(not(unix))]
+struct SuspendSignal;
+
+#[cfg(not(unix))]
+impl SuspendSignal {
+    #[allow(clippy::unnecessary_wraps)]
+    fn install() -> Result<Self> {
+        Ok(Self)
+    }
+
+    async fn recv(&mut self) {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Handle one suspension request. Returns true only after the backend fenced
+/// the generation and retained its state; the caller
+/// must then exit without terminating the boundary or publishing an exit.
+async fn suspend_on_request(
+    running: &openshell_sandbox_backend::RunningBoundary,
+    backend_name: &str,
+) -> bool {
+    if !running.supports_suspend() {
+        warn!(
+            backend = %backend_name,
+            "Ignoring SIGUSR1: isolation backend does not advertise suspend/resume"
+        );
+        return false;
+    }
+    let failure = |reason: String| {
+        ocsf_emit!(
+            AppLifecycleBuilder::new(ocsf_ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .message(format!(
+                    "Sandbox suspend failed [backend:{backend_name}]: {reason}"
+                ))
+                .build()
+        );
+    };
+    match running.suspend().await {
+        Ok(_) => {}
+        Err(error) => {
+            failure(error.to_string());
+            return false;
+        }
+    }
+    ocsf_emit!(
+        AppLifecycleBuilder::new(ocsf_ctx())
+            .activity(ActivityId::Fail)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .message(format!(
+                "Sandbox suspended; state retained by backend [backend:{backend_name}]"
+            ))
+            .build()
+    );
+    true
+}
+
+/// Report the completed launch path after `StartAgent` succeeds.
+fn report_boundary_resumed(
+    outcome: openshell_sandbox_backend::BoundaryLaunchOutcome,
+    backend_name: &str,
+) {
+    use openshell_sandbox_backend::BoundaryLaunchOutcome;
+    let severity = match outcome {
+        BoundaryLaunchOutcome::Restored => SeverityId::Informational,
+        // The backend booted cleanly instead; in-memory state was lost.
+        BoundaryLaunchOutcome::ColdStartFallback | BoundaryLaunchOutcome::Fresh => SeverityId::Low,
+    };
+    ocsf_emit!(
+        AppLifecycleBuilder::new(ocsf_ctx())
+            .activity(ActivityId::Reset)
+            .severity(severity)
+            .status(StatusId::Success)
+            .message(format!(
+                "Sandbox boundary resumed [backend:{backend_name} outcome:{}]",
+                outcome.as_str()
+            ))
+            .build()
+    );
+}
+
 use openshell_core::denial::DenialEvent;
 use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use openshell_core::proposals::AgentProposals;
@@ -634,6 +744,7 @@ pub async fn run_network_proxy(
         None,
         None,
         None,
+        None,
     )
     .await?;
 
@@ -705,12 +816,22 @@ pub async fn run_sandbox_with_backend(
         .chain(health_port.map(ReadinessEndpoint::Tcp))
         .map(|endpoint| ControlReadiness::start(endpoint, Some(instance_readiness.clone())))
         .collect::<Result<Vec<_>>>()?;
+    // Only a dedicated process maps process-wide signals to one instance.
+    let suspend_signal = SuspendSignal::install()?;
+    let suspend = Box::pin(futures::stream::unfold(
+        suspend_signal,
+        |mut signal| async move {
+            signal.recv().await;
+            Some(((), signal))
+        },
+    ));
     let result = Box::pin(run_sandbox_instance(
         backend_setup,
         config,
         bindings,
         SandboxInstanceControls {
             shutdown: Box::pin(wait_for_control_shutdown_signal()),
+            suspend,
             readiness,
         },
     ))
@@ -791,6 +912,16 @@ pub struct SandboxInstanceConfig {
     /// SPIFFE Workload API socket for provider token grants; absent fails closed.
     pub provider_workload_api_socket: Option<std::path::PathBuf>,
     pub proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles,
+    /// Gateway-granted authority to replace the generation's current owner.
+    /// The instance then adopts the running workload instead of starting it.
+    pub takeover: Option<openshell_sandbox_backend::BoundaryTakeover>,
+    /// Recovery deadline (seconds) offered to the sandbox runtime at every
+    /// attach: how long it keeps the workload frozen after losing this
+    /// supervisor. `None` leaves the runtime default.
+    pub supervisor_recovery_timeout_secs: Option<u32>,
+    /// OTLP/gRPC collector for relayed agent traces; `None` keeps the relay
+    /// inactive.
+    pub otlp_agent_endpoint: Option<String>,
 }
 
 impl SandboxInstanceConfig {
@@ -849,6 +980,9 @@ pub struct SandboxInstanceControls {
     /// Completes when the owner asks the instance to stop its workload. It is
     /// first polled once the workload has started.
     pub shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+    /// Requests to suspend only this instance. A failed suspension can be
+    /// retried by sending another request. Closing the stream disables it.
+    pub suspend: Pin<Box<dyn futures::Stream<Item = ()> + Send>>,
     /// True while the gateway has accepted this instance's supervision and its
     /// access plane is retained; false otherwise.
     pub readiness: tokio::sync::watch::Sender<bool>,
@@ -939,6 +1073,9 @@ pub async fn run_sandbox_instance(
         trace_context,
         provider_workload_api_socket,
         proxy_tls,
+        takeover,
+        supervisor_recovery_timeout_secs,
+        otlp_agent_endpoint,
     } = config;
     // The owner binds the event context and log sink to the instance's
     // threads; the instance itself uses the rest.
@@ -950,6 +1087,7 @@ pub async fn run_sandbox_instance(
     } = bindings;
     let SandboxInstanceControls {
         shutdown: shutdown_requested,
+        mut suspend,
         readiness,
     } = controls;
     // The current client attachment adapter is SSH; retaining a process's I/O
@@ -1153,6 +1291,13 @@ pub async fn run_sandbox_instance(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
+    // The agent trace relay must exist before networking starts so the
+    // handler is installed when the first staged connection arrives, and
+    // before attach so the agent spec can tell the boundary whether to point
+    // workload SDKs at it.
+    let (mut otlp_relay, otlp_reserved_destination) =
+        otlp_relay::activate(otlp_agent_endpoint, sandbox_id.clone());
+
     // Construct the selected client only after shared policy and credential
     // setup has completed. Keep live credentials and later CA publication in
     // supervisor-owned handles shared with the backend.
@@ -1164,6 +1309,8 @@ pub async fn run_sandbox_instance(
                 ca_file_paths: ca_file_paths.clone(),
                 provider_credentials: provider_credentials.clone(),
                 sandbox_bearer,
+                takeover,
+                supervisor_recovery_timeout_secs,
             },
             policy.clone(),
             openshell_isolation_interface::AgentSpec {
@@ -1172,6 +1319,7 @@ pub async fn run_sandbox_instance(
                 workdir: workspace,
                 timeout_secs,
                 interactive,
+                otlp_relay_active: otlp_relay.is_some(),
             },
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.attach"))
@@ -1249,18 +1397,20 @@ pub async fn run_sandbox_instance(
         .is_none()
         .then(|| remote_boundary.0.network_mediation_source());
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
-    let (remote_ready, backend_name, ca_file_paths) = {
-        let (bound, backend_name, ca_file_paths) = remote_boundary;
+    let takeover_attach = remote_boundary.0.is_takeover();
+    let adopts_running_agent = remote_boundary.0.adopts_running_agent();
+    let (bound, backend_name, ca_file_paths) = remote_boundary;
+    let confirm = Box::pin(async {
         let ready = bound
             .confirm()
             .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.confirm"))
             .await
             .map_err(|error| miette::miette!(error.to_string()))?;
         info!(backend = %backend_name, "Isolation boundary enforcement confirmed");
-        (ready, backend_name, ca_file_paths)
-    };
-
-    let mut networking = Some(
+        Ok::<_, miette::Report>(ready)
+    });
+    // Both startup futures are boxed: the order below holds them at once.
+    let start_networking = Box::pin(async {
         openshell_supervisor_network::run::run_networking(
             &policy,
             None,
@@ -1293,9 +1443,39 @@ pub async fn run_sandbox_instance(
             None,
             remote_network_source,
             proxy_listener,
+            otlp_reserved_destination,
         )
-        .await?,
-    );
+        .await
+    });
+    // A replacement supervisor confirms only once its own enforcement is up:
+    // confirmation resumes a frozen workload, whose network opens then wait
+    // for this supervisor's mediation rather than for nothing. Mediation
+    // accepts start once the boundary is confirmed.
+    let (remote_ready, networking) = if takeover_attach {
+        let networking = start_networking.await?;
+        (confirm.await?, networking)
+    } else {
+        let ready = confirm.await?;
+        (ready, start_networking.await?)
+    };
+    let mut networking = Some(networking);
+    if takeover_attach {
+        info!(
+            adopts_running_agent,
+            "Supervisor takeover confirmed; previous owner fenced"
+        );
+        ocsf_emit!(
+            // Lifecycle activity 3 is Start.
+            AppLifecycleBuilder::new(ocsf_ctx())
+                .activity(ActivityId::Reset)
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .message(format!(
+                    "Supervisor took over the sandbox runtime [adopted_workload:{adopts_running_agent}]"
+                ))
+                .build()
+        );
+    }
 
     ca_file_paths
         .lock()
@@ -1410,7 +1590,7 @@ pub async fn run_sandbox_instance(
         let poll_gateway = gateway.clone();
         let poll_engine = engine.clone();
         let poll_ocsf_enabled = ocsf_json.enabled.clone();
-        let poll_ocsf_schema_version = ocsf_json.target_version.clone();
+        let poll_ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
         let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
@@ -1489,8 +1669,25 @@ pub async fn run_sandbox_instance(
             .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.start_agent"))
             .await
             .map_err(|error| start_agent_error(error.to_string()))?;
+        // Opening can only prepare a restore. Report success after StartAgent
+        // has completed restoration, so a late failure is never logged as resumed.
+        if let Some(outcome) = running.launch_outcome()
+            && outcome != openshell_sandbox_backend::BoundaryLaunchOutcome::Fresh
+        {
+            report_boundary_resumed(outcome, &backend_name);
+        }
         workload_started_tx.send_replace(true);
-        info!(backend = %backend_name, "Isolation boundary agent started");
+        if running.agent_adopted() {
+            info!(
+                backend = %backend_name,
+                process_id = %running.agent().process_id(),
+                adopted_execs = running.adopted_exec_processes().len(),
+                "Adopted the running agent from the previous supervisor"
+            );
+            observe_adopted_execs(running.adopted_exec_processes());
+        } else {
+            info!(backend = %backend_name, "Isolation boundary agent started");
+        }
         let agent = running.agent();
         let boundary_access = openshell_supervisor_process::delegated::start_boundary_access(
             sandbox_id.as_deref(),
@@ -1528,55 +1725,75 @@ pub async fn run_sandbox_instance(
         let mut instance_readiness =
             SandboxInstanceReadiness::start(readiness, boundary_access.session_readiness());
         let instance_id = boundary_access.instance_id().to_string();
-        let wait_agent = agent.clone();
         let mut shutdown_requested = shutdown_requested;
-        let wait = async move {
-            wait_agent
-                .wait()
-                .await
-                .map(|status| match status {
-                    openshell_isolation_interface::contract::BoundaryExitStatus::Exited(code) => {
-                        code
-                    }
-                    openshell_isolation_interface::contract::BoundaryExitStatus::Signaled(
-                        signal,
-                    ) => 128_i32.saturating_add(signal),
-                })
-                .map_err(|error| miette::miette!(error.to_string()))
-        };
-        let (exit_code, mut retain_access) = tokio::select! {
-            result = wait => (result?, true),
-            () = &mut proxy_exited => {
-                let _ = running.terminate().await;
-                return Err(miette::miette!(
-                    "control-mode proxy accept loop exited unexpectedly"
-                ));
-            }
-            () = &mut shutdown_requested => {
-                let _ = agent
-                    .signal(openshell_isolation_interface::contract::BoundarySignal::Term)
-                    .await;
-                let status = if let Ok(result) = timeout(Duration::from_secs(5), agent.wait()).await {
-                    result
-                } else {
-                    let _ = agent.terminate().await;
-                    agent.wait().await
-                }
-                .map_err(|error| miette::miette!(error.to_string()))?;
-                let exit_code = match status {
-                    openshell_isolation_interface::contract::BoundaryExitStatus::Exited(code) => code,
-                    openshell_isolation_interface::contract::BoundaryExitStatus::Signaled(signal) => {
-                        128_i32.saturating_add(signal)
-                    }
-                };
-                running
-                    .terminate()
+        // `None` means the boundary was suspended and its reference persisted.
+        let lifecycle = loop {
+            let wait_agent = agent.clone();
+            let wait = async move {
+                wait_agent
+                    .wait()
                     .await
-                    .map_err(|error| miette::miette!(
-                        "sandbox did not acknowledge terminal state: {error}"
-                    ))?;
-                (exit_code, false)
+                    .map(boundary_exit_code)
+                    .map_err(|error| miette::miette!(error.to_string()))
+            };
+            tokio::select! {
+                result = wait => break Some((result?, true)),
+                () = &mut proxy_exited => {
+                    let _ = running.terminate().await;
+                    return Err(miette::miette!(
+                        "control-mode proxy accept loop exited unexpectedly"
+                    ));
+                }
+                () = &mut shutdown_requested => {
+                    let _ = agent
+                        .signal(openshell_isolation_interface::contract::BoundarySignal::Term)
+                        .await;
+                    let status = if let Ok(result) = timeout(Duration::from_secs(5), agent.wait()).await {
+                        result
+                    } else {
+                        let _ = agent.terminate().await;
+                        agent.wait().await
+                    }
+                    .map_err(|error| miette::miette!(error.to_string()))?;
+                    running
+                        .terminate()
+                        .await
+                        .map_err(|error| miette::miette!(
+                            "sandbox did not acknowledge terminal state: {error}"
+                        ))?;
+                    break Some((boundary_exit_code(status), false));
+                }
+                // The agent wait is cancelled while suspending so a fenced
+                // generation's stream failure cannot race the suspension.
+                Some(()) = futures::StreamExt::next(&mut suspend) => {
+                    // Boxed to keep the startup future's stack frame small.
+                    if Box::pin(suspend_on_request(
+                        &running,
+                        &backend_name,
+                    ))
+                    .await
+                    {
+                        break None;
+                    }
+                }
             }
+        };
+        let Some((exit_code, mut retain_access)) = lifecycle else {
+            // A suspended boundary is retained by the backend: never send
+            // TerminateBoundary or publish a main-process exit. Dropping the
+            // access plane closes this supervisor's gateway session.
+            instance_readiness.release();
+            drop(running);
+            drop(boundary_access);
+            // The workload is frozen, so no new spans arrive. Export what the
+            // relay already acknowledged; the agent will not resend it after
+            // resume. Bounded; never fails.
+            if let Some(relay) = otlp_relay.take() {
+                relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
+            }
+            drop(networking);
+            info!(backend = %backend_name, "Isolation boundary suspended; supervisor instance exiting");
+            return Ok(0);
         };
         if !retain_access {
             instance_readiness.release();
@@ -1584,6 +1801,17 @@ pub async fn run_sandbox_instance(
         boundary_access
             .publish_main_exit(exit_code, await_main_process_attachment)
             .await;
+        // Flush relayed agent traces before the exit is reported so the last
+        // spans of a short run are not lost. Bounded; never fails. When the
+        // access plane is retained for exec sessions, the relay keeps serving
+        // them and shuts down at final teardown instead.
+        if retain_access {
+            if let Some(relay) = otlp_relay.as_ref() {
+                relay.flush(otlp_relay::FLUSH_TIMEOUT).await;
+            }
+        } else if let Some(relay) = otlp_relay.take() {
+            relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
+        }
         // `shutdown_requested` has already completed when shutdown won the
         // lifecycle select above and must not be polled again.
         let mut completion_cancelled = !retain_access;
@@ -1628,6 +1856,11 @@ pub async fn run_sandbox_instance(
             info!(backend = %backend_name, "Canonical process exited; retaining control-mode access plane");
             retain_remote_access_plane(&mut proxy_exited, &mut shutdown_requested).await?;
         }
+        // Exec sessions served after the main exit may have exported traces;
+        // flush those too before the relay goes away.
+        if let Some(relay) = otlp_relay.take() {
+            relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
+        }
         drop(instance_readiness);
         drop(running);
         drop(boundary_access);
@@ -1640,20 +1873,57 @@ pub async fn run_sandbox_instance(
     Ok(exit_code)
 }
 
+fn boundary_exit_code(status: openshell_isolation_interface::contract::BoundaryExitStatus) -> i32 {
+    match status {
+        openshell_isolation_interface::contract::BoundaryExitStatus::Exited(code) => code,
+        openshell_isolation_interface::contract::BoundaryExitStatus::Signaled(signal) => {
+            128_i32.saturating_add(signal)
+        }
+    }
+}
+
+/// Exec processes a replacement supervisor adopted outlive their original
+/// clients; record when each exits so their end is not silent.
+fn observe_adopted_execs(processes: &[Arc<openshell_sandbox_backend::BoundaryProcess>]) {
+    for process in processes {
+        let process = process.clone();
+        tokio::spawn(async move {
+            match process.wait().await {
+                Ok(status) => info!(
+                    process_id = %process.process_id(),
+                    ?status,
+                    "Adopted exec process exited"
+                ),
+                Err(error) => debug!(
+                    process_id = %process.process_id(),
+                    %error,
+                    "Stopped observing adopted exec process"
+                ),
+            }
+        });
+    }
+}
+
 fn persist_main_exit_marker(path: &std::path::Path, exit_code: i32) -> std::io::Result<()> {
+    write_private_file_atomically(path, format!("exit_code={exit_code}\n").as_bytes())
+}
+
+/// Replace `path` with `contents` via an owner-only (0600) temporary file in
+/// the same directory, fsync, rename, and directory fsync.
+fn write_private_file_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("completion marker has no parent: {}", path.display()),
+                format!("{} has no parent directory", path.display()),
             )
         })?;
     let name = path.file_name().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("completion marker has no file name: {}", path.display()),
+            format!("{} has no file name", path.display()),
         )
     })?;
     let temporary = parent.join(format!(
@@ -1661,17 +1931,24 @@ fn persist_main_exit_marker(path: &std::path::Path, exit_code: i32) -> std::io::
         name.to_string_lossy(),
         std::process::id()
     ));
+    // A stale temporary could keep broader permissions; always create anew.
+    let _ = std::fs::remove_file(&temporary);
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
     let mut file = options.open(&temporary)?;
-    writeln!(file, "exit_code={exit_code}")?;
-    file.sync_all()?;
-    std::fs::rename(&temporary, path)?;
+    let written = file
+        .write_all(contents)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&temporary, path));
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
     // Windows cannot open directories through File::open. The marker data is
     // flushed above and rename still atomically replaces the previous value.
     #[cfg(unix)]
@@ -3930,6 +4207,7 @@ struct PolicyPollLoopContext {
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<AtomicBool>,
+    /// Last value of the deprecated `ocsf_schema_version` setting.
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     provider_credentials: ProviderCredentialState,
     provider_readiness: ProviderReadinessTracker,
@@ -4367,6 +4645,9 @@ mod tests {
             trace_context: None,
             provider_workload_api_socket: None,
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
+            takeover: None,
+            supervisor_recovery_timeout_secs: None,
+            otlp_agent_endpoint: None,
         };
         let bindings = SandboxInstanceBindings::dedicated(
             &config,
@@ -4622,6 +4903,29 @@ mod tests {
                 .join(format!(".main-exited.tmp-{}", std::process::id()))
                 .exists()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_reference_write_is_owner_only_and_replaces_stale_temporary() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let reference = directory.path().join("restore-reference");
+        let temporary = directory
+            .path()
+            .join(format!(".restore-reference.tmp-{}", std::process::id()));
+        std::fs::write(&temporary, b"stale").unwrap();
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_private_file_atomically(&reference, b"\0opaque\xff").unwrap();
+
+        assert_eq!(std::fs::read(&reference).unwrap(), b"\0opaque\xff");
+        assert_eq!(
+            std::fs::metadata(&reference).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!temporary.exists());
+        assert!(write_private_file_atomically(std::path::Path::new("/"), b"x").is_err());
     }
 
     #[tokio::test]
@@ -5620,6 +5924,8 @@ network_policies:
         .await;
     }
 
+    // Baseline enrichment adds host paths that only exist on Unix.
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_baseline_write_back_waits_for_repair() {
         // The gateway policy has network rules but lacks the proxy baseline
@@ -5749,6 +6055,8 @@ network_policies:
         .await;
     }
 
+    // Baseline enrichment adds host paths that only exist on Unix.
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_baseline_repair_before_report_refetches() {
         let mut repaired = proto_tcp_policy_fixture();
@@ -5892,6 +6200,8 @@ network_policies:
         .await;
     }
 
+    // Baseline enrichment adds host paths that only exist on Unix.
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_write_back_outlasts_the_attempt_limit() {
         // The same limit applies to a refused baseline-path write-back.
@@ -5979,6 +6289,8 @@ network_policies:
         );
     }
 
+    // Baseline enrichment adds host paths that only exist on Unix.
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_global_policy_skips_baseline_write_back() {
         use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
@@ -6067,18 +6379,18 @@ network_policies:
         // Both writes are checked: the image policy upload to a gateway with
         // no policy, and the write-back of a stored policy that lacks the
         // proxy baseline paths.
-        let writes = [
-            (
-                "image policy upload",
-                unset_policy_snapshot(),
-                ImagePolicyDiscovery::Policy(Box::new(proto_tcp_policy_fixture())),
-            ),
-            (
-                "baseline write-back",
-                settings_poll_result(Some(proto_tcp_policy_fixture()), 1, PolicySource::Sandbox),
-                ImagePolicyDiscovery::Missing,
-            ),
-        ];
+        let image_upload = (
+            "image policy upload",
+            unset_policy_snapshot(),
+            ImagePolicyDiscovery::Policy(Box::new(proto_tcp_policy_fixture())),
+        );
+        let baseline_write_back = (
+            "baseline write-back",
+            settings_poll_result(Some(proto_tcp_policy_fixture()), 1, PolicySource::Sandbox),
+            ImagePolicyDiscovery::Missing,
+        );
+        // Baseline enrichment adds host paths that only exist on Unix.
+        let writes = std::iter::once(image_upload).chain(cfg!(unix).then_some(baseline_write_back));
         for (write, initial, discovery) in writes {
             for code in [
                 tonic::Code::PermissionDenied,

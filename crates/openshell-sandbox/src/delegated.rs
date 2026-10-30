@@ -41,6 +41,7 @@ pub async fn spawn_workload(
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     boundary_runtime: Option<Arc<crate::boundary_io::BoundaryRuntimeState>>,
+    otlp_relay_active: bool,
 ) -> Result<SpawnedAgent> {
     // Driver-selected workspaces are the sandbox identity's home. This keeps
     // canonical and later exec processes consistent for image WorkingDir and
@@ -83,9 +84,13 @@ pub async fn spawn_workload(
             provider_credentials,
             user_environment,
             boundary_runtime.clone(),
+            otlp_relay_active,
             launcher.clone(),
         ));
 
+    // The delegated workload runs behind OpenShell's mediated network path,
+    // so the generated trust files remain authoritative for its TLS settings.
+    let tls_environment_mode = crate::child_env::TlsEnvironmentMode::Override;
     #[cfg(target_os = "linux")]
     let mut handle = ProcessHandle::spawn(
         launcher,
@@ -95,7 +100,9 @@ pub async fn spawn_workload(
         interactive,
         policy,
         ca_file_paths.as_ref(),
+        tls_environment_mode,
         &provider_env,
+        otlp_relay_active,
     )
     .wrap_err("spawn delegated workload process")?;
     #[cfg(not(target_os = "linux"))]
@@ -106,7 +113,9 @@ pub async fn spawn_workload(
         interactive,
         policy,
         ca_file_paths.as_ref(),
+        tls_environment_mode,
         &provider_env,
+        otlp_relay_active,
     )?;
 
     entrypoint_pid.store(handle.pid(), Ordering::Release);
@@ -129,6 +138,7 @@ pub async fn spawn_workload(
             .status(StatusId::Success)
             .launch_type(LaunchTypeId::Spawn)
             .process(OcsfProcess::new(program, i64::from(handle.pid())))
+            .actor_process(crate::process::ocsf_launcher_process())
             .message(format!("Process started: pid={}", handle.pid()))
             .build()
     );
@@ -219,6 +229,12 @@ pub struct AgentSignaler {
 
 #[cfg(unix)]
 impl AgentSignaler {
+    /// Process ID of the agent's process group leader.
+    #[cfg(test)]
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
     fn deliver(&self, signal: nix::sys::signal::Signal) -> Result<()> {
         let _guard = self
             .signal_lock

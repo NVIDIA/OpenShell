@@ -140,10 +140,7 @@ mod tests {
     use crate::builders::test_sandbox_context;
     use crate::enums::{HttpMethod, UserTypeId};
     use crate::objects::Url;
-    use crate::validation::schema::{
-        load_class_schema, load_object_schema, validate_enum_value, validate_known_fields,
-        validate_required_fields,
-    };
+    use openshell_ocsf_validate::validate_event;
 
     fn gateway_failure() -> serde_json::Value {
         let ctx = test_sandbox_context();
@@ -171,37 +168,7 @@ mod tests {
 
     #[test]
     fn failure_event_matches_vendored_schema() {
-        let json = gateway_failure();
-
-        let class = load_class_schema("authentication");
-        validate_required_fields(&json, &class);
-        validate_known_fields(&json, &class);
-        for field in [
-            "activity_id",
-            "action_id",
-            "auth_protocol_id",
-            "disposition_id",
-            "severity_id",
-            "status_id",
-        ] {
-            validate_enum_value(&json, field, &class);
-        }
-
-        let user = load_object_schema("user");
-        validate_required_fields(&json["user"], &user);
-        validate_known_fields(&json["user"], &user);
-        validate_enum_value(&json["user"], "type_id", &user);
-
-        let service = load_object_schema("service");
-        validate_required_fields(&json["service"], &service);
-        validate_known_fields(&json["service"], &service);
-
-        let endpoint = load_object_schema("network_endpoint");
-        validate_required_fields(&json["src_endpoint"], &endpoint);
-
-        let url = load_object_schema("url");
-        validate_required_fields(&json["http_request"]["url"], &url);
-        validate_known_fields(&json["http_request"]["url"], &url);
+        validate_event(&gateway_failure()).unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[test]
@@ -252,11 +219,7 @@ mod tests {
         .to_json()
         .unwrap();
 
-        let endpoint = load_object_schema("network_endpoint");
-        validate_known_fields(&json["src_endpoint"], &endpoint);
-        let metadata = load_object_schema("metadata");
-        validate_required_fields(&json["metadata"], &metadata);
-        validate_known_fields(&json["metadata"], &metadata);
+        validate_event(&json).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
             json["src_endpoint"],
             serde_json::json!({"name": "edge-tunnel"})

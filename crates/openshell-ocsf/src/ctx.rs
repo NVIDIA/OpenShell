@@ -59,3 +59,13 @@ pub fn ctx() -> ContextRef<'static> {
     }
     ContextRef::Borrowed(OCSF_CTX.get().unwrap_or(&OCSF_CTX_FALLBACK))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_context_names_no_sandbox() {
+        assert!(OCSF_CTX_FALLBACK.container().is_none());
+    }
+}

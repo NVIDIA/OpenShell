@@ -12,7 +12,7 @@ Install OpenShell on a local workstation or Kubernetes.
 
 ## Install OpenShell
 
-Install the CLI, policy prover, and a local gateway with one command:
+On Linux or macOS, install the CLI, policy prover, and a local gateway with one command:
 
 ```shell
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
@@ -38,7 +38,7 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
   OPENSHELL_VERSION=pre sh
 ```
 
-The installer checks prerelease tags from newest to oldest, selects an unexpired published package for the current platform, and downloads only that artifact. The selected candidate may still be qualifying or may have failed qualification. Installed packages keep the candidate's exact version, such as `0.1.0-pre.3`. Prerelease tags do not create entries on the GitHub Releases page. On Linux, prereleases and explicit release tags use Debian or RPM packages.
+The installer checks prerelease tags from newest to oldest, selects an unexpired published package for the current platform, and downloads only that artifact. The selected candidate may still be qualifying or may have failed qualification. Installed packages keep the candidate's exact version, such as `0.1.0-pre.3`. Prerelease tags do not create entries on the GitHub Releases page. On Linux, explicit release tags use Debian or RPM packages, as do prereleases by default. Set `OPENSHELL_INSTALL_METHOD=snap` with `OPENSHELL_VERSION=pre` to track the newest published prerelease snap in `latest/beta`. Beta publication runs alongside qualification, so the channel may contain a candidate that later fails qualification.
 
 The rolling [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) does not require GitHub authentication:
 
@@ -72,6 +72,21 @@ The local gateway auto-detects an available runtime. To pin one, set `compute_dr
 | Docker | Docker Desktop or Docker Engine 28.0 or later. |
 | Podman | Linux with Podman 5.x, cgroups v2, and an active Podman user socket. |
 | MicroVM | Host virtualization: Hypervisor.framework on macOS or KVM on Linux. |
+| [Windows MXC](#windows) | Native Windows x64 or ARM64 with MXC 1.0.0 and a host that passes the ProcessContainer capability probe. Development; not production-qualified. |
+
+## Windows
+
+Build native Windows x64 or ARM64 binaries from the
+[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Follow the [Windows build and runtime guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md)
+for MSVC prerequisites, MXC host probing, and gateway setup. Select
+`compute_driver = "mxc"` in the gateway TOML file.
+
+Native Windows uses Microsoft MXC ProcessContainer isolation. It is under
+development and is not production-qualified; see the
+[current runtime limitations](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md#runtime-and-current-limits).
+The installer and release channels above do not supply native Windows binaries.
+Running Linux OpenShell inside WSL 2 is a separate, experimental option.
 
 ## macOS
 
@@ -127,6 +142,16 @@ The snap does not migrate existing Debian, RPM, or Homebrew installs. Remove any
 sudo snap install openshell
 systemctl --user enable --now snap.openshell.user-gateway.service
 ```
+
+To install a prerelease build, select the corresponding Store channel:
+
+```shell
+sudo snap install openshell --channel=latest/beta
+# or, if already installed
+sudo snap refresh openshell --channel=latest/beta
+```
+
+`latest/beta` contains the newest prerelease published by CI and may not have passed qualification. Stable releases rebuild the selected qualified commit with the final stable version before publishing to `latest/stable`.
 
 The user gateway is disabled globally by default. The install script enables it only for the user who ran the script. After a direct snap installation, choose one user account to run the gateway and enable it with the command above. Do not enable the gateway for multiple users who may be logged in at the same time: every user gateway binds to `127.0.0.1:17670`, so only one can run on the system at a time.
 

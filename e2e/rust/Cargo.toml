@@ -26,6 +26,7 @@ e2e = []
 # when it has resolved an IP.
 e2e-host-gateway = ["e2e"]
 e2e-local-container-driver = ["e2e"]
+e2e-additional-ca = ["e2e", "e2e-host-gateway"]
 e2e-docker = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 # Selects tests that need a Docker gateway with config_delivery_mode = "push".
 e2e-config-push = ["e2e-docker"]
@@ -38,6 +39,11 @@ e2e-kubernetes-workspace-managed = ["e2e-kubernetes"]
 e2e-kubernetes-workspace-operator = ["e2e-kubernetes"]
 # One supervisor process shared by the gateway's sandboxes.
 e2e-kubernetes-shared-supervisor = ["e2e-kubernetes", "e2e-host-gateway"]
+# A high-availability pool of shared supervisors.
+e2e-kubernetes-shared-supervisor-ha = ["e2e-kubernetes", "e2e-host-gateway"]
+# Scaling a one-member high-availability pool of shared supervisors to two
+# members and back. It upgrades the release, so it runs on its own release.
+e2e-kubernetes-shared-supervisor-scaling = ["e2e-kubernetes", "e2e-host-gateway"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
 e2e-oidc-pkce = []
@@ -94,6 +100,11 @@ path = "tests/docker_corporate_proxy.rs"
 required-features = ["e2e-docker"]
 
 [[test]]
+name = "additional_ca"
+path = "tests/additional_ca.rs"
+required-features = ["e2e-additional-ca"]
+
+[[test]]
 name = "driver_config_volume"
 path = "tests/driver_config_volume.rs"
 required-features = ["e2e-local-container-driver"]
@@ -121,6 +132,11 @@ required-features = ["e2e-podman"]
 [[test]]
 name = "podman_host_gateway"
 path = "tests/podman_host_gateway.rs"
+required-features = ["e2e-podman"]
+
+[[test]]
+name = "ocsf_jsonl_conformance"
+path = "tests/ocsf_jsonl_conformance.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
@@ -253,8 +269,15 @@ name = "gpu"
 path = "tests/gpu.rs"
 required-features = ["e2e-gpu"]
 
+[[test]]
+name = "otlp_relay"
+path = "tests/otlp_relay.rs"
+required-features = ["e2e-local-container-driver"]
+
 [dependencies]
 openshell-crypto = { path = "../../crates/openshell-crypto" }
+openshell-otel-test-support = { path = "../../crates/openshell-otel-test-support" }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace"] }
 base64 = "0.22"
 bollard = "0.20"
 bytes = "1"
@@ -272,7 +295,6 @@ sha2 = "0.10"
 hex = "0.4"
 rand = "0.9"
 rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12"] }
-rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = { package = "noyalib", version = "0.0.53", default-features = false, features = ["std", "compat-serde-yaml"] }
@@ -285,6 +307,7 @@ nix = { version = "0.29", features = ["process", "signal", "term", "user"] }
 
 [dev-dependencies]
 flate2 = "1"
+openshell-ocsf-validate = { path = "../../crates/openshell-ocsf-validate" }
 serial_test = "3"
 
 [lints.rust]

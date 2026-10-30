@@ -237,6 +237,21 @@ if [ -s "$err" ]; then
   exit 1
 fi
 
+if ! OPENSHELL_VERSION=pre openshell_snap_channel >"$out" 2>"$err"; then
+  echo "FAIL: pre must select the latest/beta snap channel" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+if [ "$(cat "$out")" != "latest/beta" ]; then
+  echo "FAIL: pre must select the latest/beta snap channel" >&2
+  exit 1
+fi
+if [ -s "$err" ]; then
+  echo "FAIL: pre must not warn about an ignored version" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+
 if ! OPENSHELL_VERSION="" openshell_snap_channel >"$out" 2>"$err"; then
   echo "FAIL: unset OPENSHELL_VERSION must select the latest/stable snap channel" >&2
   cat "$err" >&2 || true
@@ -385,6 +400,18 @@ assert_snap_install_flow \
   1 0 "" \
   "wait:user-docker
 root:snap install openshell --channel=latest/stable
+root:systemctl --global disable snap.openshell.user-gateway.service
+target:systemctl --user daemon-reload
+target:systemctl --user enable --now snap.openshell.user-gateway.service
+wait:user-gateway-listener
+register:user-gateway
+wait:gateway-status"
+
+assert_snap_install_flow \
+  "prerelease snap tracks beta" \
+  1 0 "pre" \
+  "wait:user-docker
+root:snap install openshell --channel=latest/beta
 root:systemctl --global disable snap.openshell.user-gateway.service
 target:systemctl --user daemon-reload
 target:systemctl --user enable --now snap.openshell.user-gateway.service

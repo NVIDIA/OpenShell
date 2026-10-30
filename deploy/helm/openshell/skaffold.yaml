@@ -169,6 +169,18 @@ profiles:
       - op: add
         path: /deploy/helm/releases/1/valuesFiles/-
         value: ci/values-gateway.yaml
+  # Shared supervisor pool: two supervisor replicas that take over each other's
+  # sandboxes. The topology requires gateway TLS, so this profile turns it back
+  # on over ci/values-skaffold.yaml.
+  - name: shared-supervisor-high-availability
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0/valuesFiles/-
+        value: ci/values-supervisor-ha.yaml
+      - op: add
+        path: /deploy/helm/releases/0/setValues
+        value:
+          server.disableTls: "false"
   - name: credential-driver-kubernetes-secrets
     patches:
       - op: add

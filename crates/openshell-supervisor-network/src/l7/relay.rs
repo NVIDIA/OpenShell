@@ -4249,15 +4249,11 @@ mod tests {
 
     #[test]
     fn early_http_rejections_include_method_and_response() {
-        use openshell_ocsf::validation::{
-            load_class_schema, validate_enum_value, validate_required_fields,
-        };
         let ctx = L7EvalContext {
             host: "example.com".into(),
             port: 443,
             ..Default::default()
         };
-        let schema = load_class_schema("http_activity");
         for (event, method, response_code) in [
             (
                 build_request_authority_mismatch_event(&ctx, "GET"),
@@ -4282,8 +4278,7 @@ mod tests {
             assert_eq!(json["http_request"]["http_method"], method);
             assert!(json["http_request"].get("url").is_none());
             assert_eq!(json["http_response"]["code"], response_code);
-            validate_required_fields(&json, &schema);
-            validate_enum_value(&json, "activity_id", &schema);
+            openshell_ocsf_validate::validate_event(&json).unwrap_or_else(|e| panic!("{e}"));
         }
     }
 
@@ -5037,9 +5032,7 @@ network_policies:
                     seconds: 2,
                     nanos: 0,
                 }),
-                tls_ca_cert_pem: Vec::new(),
-                audience: String::new(),
-                allow_insecure_transport: false,
+                ..Default::default()
             }],
         )
         .await
