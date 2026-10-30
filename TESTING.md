@@ -232,9 +232,9 @@ a suite in another environment on CI, add a row.
 
 ### Adding a feature suite
 
-A feature suite tests one OpenShell feature and lives in the
-`tests/suites/features` workspace. `tests/suites/features/keycloak` is the
-example to copy.
+Feature suites live in the `tests/suites/features` workspace, one crate per
+suite, with a name that says what the suite tests.
+`tests/suites/features/keycloak-provider-refresh` is the example to copy.
 
 1. Add a crate under `tests/suites/features/<name>` that depends on
    `openshell-testkit`, and add it to `members` in
@@ -264,21 +264,23 @@ service.
   `OPENSHELL_TEST_` prefix, and the tests get the variables in the guest, so
   values never appear in a runner command. Values are taken literally, without
   quoting.
-- **Fixture.** In the suite's `src/lib.rs`, define the variable names as
-  constants and a `<Service>Context::new(cx)` that reads them, waits for the
-  service, and wraps the testkit `Context`. Each test calls it on its first
-  line. Nextest runs each test in its own process, so the fixture builds its
+- **Fixture.** Put the service's fixture in a support crate under
+  `tests/support/<service>`, so any suite can depend on it, or reuse the
+  existing one. It defines the variable names as constants and a
+  `<Service>Context::new(cx)` that reads them, waits for the service, and
+  wraps the testkit `Context`. Each test calls it on its first line. Nextest runs each test in its own process, so the fixture builds its
   clients there from the variables. A missing variable fails the test; it
   never skips it.
 - **Documentation.** Document the variables in the fixture's module docs, so
   anyone can run the suite against their own deployment by setting them.
 
-Run the Keycloak suite with:
+The Keycloak fixture is `tests/support/keycloak`. Run the suite that uses it
+with:
 
 ```shell
 nix run .#openshell-test-runner -- \
   --environment ubuntu-docker-rootful-keycloak --installer deb \
-  --family features --package keycloak
+  --family features --package keycloak-provider-refresh
 ```
 
 ### Python E2E (`e2e/python/`)

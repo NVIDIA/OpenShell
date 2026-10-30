@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "keycloak"
-description = "Features suites: behavior that needs a Keycloak OIDC issuer"
+name = "keycloak-provider-refresh"
+description = "Features suite: provider OAuth refresh against Keycloak"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.94"
@@ -12,7 +12,6 @@ repository = "https://github.com/NVIDIA/OpenShell"
 publish = false
 
 [dependencies]
+keycloak = { path = "../../../support/keycloak" }
 openshell-testkit = { path = "../../../testkit/testkit" }
-serde_json = "1"
 tempfile = "3"
-tokio = { version = "1.43", features = ["io-util", "process"] }

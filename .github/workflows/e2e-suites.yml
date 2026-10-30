@@ -53,7 +53,7 @@ jobs:
           - environment: ubuntu-docker-rootful-keycloak
             installer: deb
             family: features
-            package: keycloak
+            package: keycloak-provider-refresh
             runner: ubuntu-24.04
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90

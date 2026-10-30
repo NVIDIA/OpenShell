@@ -1584,8 +1584,16 @@ version = "0.0.0"
 dependencies = [
  "openshell-testkit",
  "serde_json",
- "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "keycloak-provider-refresh"
+version = "0.0.0"
+dependencies = [
+ "keycloak",
+ "openshell-testkit",
+ "tempfile",
 ]
 
 [[package]]

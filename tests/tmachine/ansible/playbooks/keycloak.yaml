@@ -4,8 +4,8 @@
 # Run Keycloak in the environment and publish how tests reach it.
 #
 # Environment setup applies this once and caches the disk, so the container
-# restarts on every boot (see the keycloak role). The keycloak features suite
-# (tests/suites/features/keycloak) reads the variables published below.
+# restarts on every boot (see the keycloak role). The Keycloak fixture
+# (tests/support/keycloak) reads the variables published below.
 ---
 - name: Keycloak for tests
   hosts: all
