@@ -14,7 +14,7 @@ hide = true
 
 ["build:rust:workspace"]
 description = "Build all Rust crates"
-run = "cargo build --workspace"
+run = "cargo build --workspace --features experimental"
 hide = true
 
 ["build:release"]

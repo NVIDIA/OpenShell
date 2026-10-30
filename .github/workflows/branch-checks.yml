@@ -278,7 +278,7 @@ jobs:
       - name: Lint
         shell: nix develop -c bash -euo pipefail {0}
         run: |
-          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo clippy --locked --workspace --all-targets --features experimental -- -D warnings
           cargo clippy --locked --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings
@@ -333,7 +333,7 @@ jobs:
         env:
           OPENSHELL_TELEMETRY_ENABLED: "false"
         run: |
-          cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support
+          cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support,experimental
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/testkit/Cargo.toml
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/tmachine/Cargo.toml

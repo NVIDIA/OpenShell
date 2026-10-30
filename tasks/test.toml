@@ -121,8 +121,8 @@ run = [
   "cargo test -p openshell-crypto --no-default-features --test independent_backend",
   # Run the workspace once without openshell-server so we can run that crate
   # with test-only helpers enabled.
-  "cargo test --workspace --exclude openshell-server",
-  "cargo test -p openshell-server --features test-support",
+  "cargo test --workspace --exclude openshell-server --features experimental",
+  "cargo test -p openshell-server --features test-support,experimental",
   "cargo nextest run --config-file .config/nextest.toml --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml",
   "cargo nextest run --config-file .config/nextest.toml --manifest-path tests/testkit/Cargo.toml",
   "cargo nextest run --config-file .config/nextest.toml --manifest-path tests/tmachine/Cargo.toml",

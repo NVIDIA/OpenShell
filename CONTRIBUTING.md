@@ -306,6 +306,11 @@ mise trust
 mise run gateway
 ```
 
+The normal Rust workspace build, check, lint, and test tasks enable the
+`experimental` feature bundle. CI uses the same development configuration. Use
+`--features experimental` to select it in direct Cargo builds; Cargo's `dev` profile
+does not enable it automatically. Prerelease and stable builds leave it off.
+
 ## Building the `openshell` CLI
 
 Inside this repository, `openshell` is a local shortcut script at `scripts/bin/openshell`. The script will
