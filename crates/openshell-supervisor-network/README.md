@@ -15,6 +15,13 @@ default features, so this instrumentation does not
 require the compute runtime or Unix-only sandbox library. It is a development
 dependency only.
 
+## Direct proxy support
+
+Isolation backends can reuse the supervisor's explicit proxy with a reserved
+listener and per-connection executable identity. This keeps network policy
+enforcement in the supervisor while the backend's launcher retains its socket
+reservation through sandbox cleanup. Attribution failures deny the request.
+
 ## Sandbox instance inputs
 
 `run_networking` takes a `SandboxInstanceNetwork` with the sandbox identity,
