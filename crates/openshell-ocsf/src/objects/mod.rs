@@ -23,7 +23,7 @@ pub use ai_model::AiModel;
 pub use api::Api;
 pub use attack::{Attack, Tactic, Technique};
 pub use connection::ConnectionInfo;
-pub use container::{Container, Image};
+pub use container::Container;
 pub use device::{Device, OsInfo};
 pub use endpoint::Endpoint;
 pub use finding::{Evidence, FindingInfo, Remediation};

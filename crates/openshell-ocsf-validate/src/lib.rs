@@ -68,12 +68,8 @@ struct Schema {
 
 impl Schema {
     fn validator(&self) -> &jsonschema::Validator {
-        self.validator.get_or_init(|| {
-            let mut json = self.json.clone();
-            // OCSF defines no top-level `container`; OpenShell emits it (NVIDIA/OpenShell#4915).
-            json["properties"]["container"] = Value::Bool(true);
-            jsonschema::draft7::new(&json).expect("vendored schema compiles")
-        })
+        self.validator
+            .get_or_init(|| jsonschema::draft7::new(&self.json).expect("vendored schema compiles"))
     }
 }
 
@@ -319,10 +315,10 @@ mod tests {
     }
 
     #[test]
-    fn accepts_top_level_container() {
+    fn rejects_top_level_container() {
         let mut event = base_event();
-        event["container"] = json!({"name": "sandbox", "image": {"name": "example/sandbox:test"}});
-        validate_event(&event).unwrap();
+        event["container"] = json!({"name": "sandbox"});
+        assert_violation(&event, "", "container");
     }
 
     #[test]

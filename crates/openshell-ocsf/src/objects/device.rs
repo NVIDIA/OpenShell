@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::enums::{DeviceTypeId, OsTypeId};
+use crate::objects::Container;
 
 /// OCSF Device object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +32,10 @@ pub struct Device {
     /// Operating system info.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub os: Option<OsInfo>,
+
+    /// Sandbox the event concerns (`container` profile).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<Container>,
 }
 
 /// OCSF OS Info object.
@@ -78,30 +83,36 @@ impl OsInfo {
 }
 
 impl Device {
-    /// Create a Linux sandbox device with the given hostname.
-    #[must_use]
-    pub fn linux(hostname: &str) -> Self {
+    /// Create a sandbox device with the given hostname for a `std::env::consts::OS` value.
+    fn sandbox(hostname: &str, os: &str) -> Self {
         Self {
             hostname: hostname.to_string(),
             name: None,
             uid: None,
             type_id: DeviceTypeId::Other,
             type_label: "Sandbox".to_string(),
-            os: Some(OsInfo::for_target("linux")),
+            os: Some(OsInfo::for_target(os)),
+            container: None,
         }
+    }
+
+    /// Create a Linux sandbox device with the given hostname.
+    #[must_use]
+    pub fn linux(hostname: &str) -> Self {
+        Self::sandbox(hostname, "linux")
     }
 
     /// Create a Windows device with the given hostname.
     #[must_use]
     pub fn windows(hostname: &str) -> Self {
-        Self {
-            hostname: hostname.to_string(),
-            name: None,
-            uid: None,
-            type_id: DeviceTypeId::Other,
-            type_label: "Sandbox".to_string(),
-            os: Some(OsInfo::for_target("windows")),
-        }
+        Self::sandbox(hostname, "windows")
+    }
+
+    /// Attach the sandbox the event concerns.
+    #[must_use]
+    pub fn with_container(mut self, container: Option<Container>) -> Self {
+        self.container = container;
+        self
     }
 
     /// Create a device stamped with the OS this build is running on.
@@ -132,6 +143,7 @@ impl Device {
             // Operators assign a unique name per installation; replicas share this UID.
             uid: Some(name.to_string()),
             os: Some(OsInfo::for_target(std::env::consts::OS)),
+            container: None,
         }
     }
 }

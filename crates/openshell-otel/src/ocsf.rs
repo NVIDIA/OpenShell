@@ -391,8 +391,7 @@ fn log_record(
         record.add_attribute("ocsf.metadata.uid", uid.clone());
     }
     if let Some(sandbox_id) = base
-        .container
-        .as_ref()
+        .container()
         .and_then(|container| container.uid.clone())
         .filter(|id| !id.is_empty())
     {

@@ -120,7 +120,7 @@ use std::sync::Arc;
 use crate::OCSF_VERSION;
 use crate::enums::StatusId;
 use crate::events::base_event::BaseEventData;
-use crate::objects::{Container, Device, Endpoint, Image, Metadata, Product};
+use crate::objects::{Container, Device, Endpoint, Metadata, Product};
 
 /// Which `OpenShell` component produced an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +144,7 @@ pub struct EventContext {
     pub sandbox_id: String,
     /// Sandbox display name.
     pub sandbox_name: String,
-    /// Container image reference.
+    /// Container image reference. Not emitted: OCSF requires an image `uid`.
     pub container_image: String,
     /// Device hostname.
     pub hostname: String,
@@ -225,9 +225,6 @@ impl EventContext {
         Some(Container {
             name: self.sandbox_name.clone(),
             uid: Some(self.sandbox_id.clone()),
-            image: (!self.container_image.is_empty()).then(|| Image {
-                name: self.container_image.clone(),
-            }),
         })
     }
 
@@ -248,7 +245,7 @@ impl EventContext {
     }
 
     /// Apply the fields common to every builder's `build()` method onto `base`:
-    /// optional status, optional message, device info, and container info.
+    /// optional status, optional message, and device info with its container.
     pub fn apply_common_fields(
         &self,
         base: &mut BaseEventData,
@@ -261,10 +258,7 @@ impl EventContext {
         if let Some(m) = message {
             base.set_message(m);
         }
-        base.set_device(self.device());
-        if let Some(container) = self.container() {
-            base.set_container(container);
-        }
+        base.set_device(self.device().with_container(self.container()));
     }
 }
 

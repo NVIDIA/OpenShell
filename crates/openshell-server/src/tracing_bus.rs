@@ -353,8 +353,7 @@ where
             // affected sandbox, not by the gateway that produced the event.
             visitor.sandbox_id = ocsf
                 .base()
-                .container
-                .as_ref()
+                .container()
                 .and_then(|container| container.uid.clone())
                 .filter(|id| !id.is_empty());
             visitor.message = Some(ocsf.format_shorthand());

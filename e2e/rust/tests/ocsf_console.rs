@@ -126,7 +126,7 @@ async fn network_events_are_json_on_supervisor_stderr_only() {
                 .as_str()
                 .is_some_and(|uid| !uid.is_empty())
         );
-        assert_eq!(record["container"]["name"], sandbox.name);
+        assert_eq!(record["device"]["container"]["name"], sandbox.name);
     }
     // Allow the existing best-effort push batch to reach the gateway.
     sleep(Duration::from_secs(2)).await;

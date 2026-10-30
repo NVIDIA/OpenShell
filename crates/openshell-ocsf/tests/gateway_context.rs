@@ -127,7 +127,7 @@ fn gateway_events_omit_the_container_object() {
     let json = event.to_json().unwrap();
 
     assert!(
-        json.get("container").is_none(),
+        json["device"].get("container").is_none(),
         "a gateway event without a sandbox association should omit container: {json}"
     );
 }
@@ -142,7 +142,7 @@ fn supervisor_events_still_carry_their_sandbox_container() {
         .build();
     let json = event.to_json().unwrap();
 
-    assert_eq!(json["container"]["name"], "agent-01");
-    assert_eq!(json["container"]["uid"], "sb-1");
+    assert_eq!(json["device"]["container"]["name"], "agent-01");
+    assert_eq!(json["device"]["container"]["uid"], "sb-1");
     assert!(json["device"].get("name").is_none());
 }
