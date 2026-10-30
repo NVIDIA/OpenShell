@@ -856,6 +856,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             &config,
             openshell_core::grpc_client::GatewayCredentials::from_auth_bundle(&setup.auth).unwrap(),
             openshell_ocsf::OcsfJsonSettings::default(),
+            PathBuf::from(openshell_core::sandbox_env::DEFAULT_LOG_DIR),
         );
         Box::pin(crate::run_sandbox_with_backend(
             &setup,
@@ -1060,6 +1061,7 @@ async fn suspend_signal_exits_without_terminating_boundary() {
             &config,
             openshell_core::grpc_client::GatewayCredentials::from_auth_bundle(&setup.auth).unwrap(),
             openshell_ocsf::OcsfJsonSettings::default(),
+            PathBuf::from(openshell_core::sandbox_env::DEFAULT_LOG_DIR),
         );
         Box::pin(crate::run_sandbox_with_backend(
             &setup,

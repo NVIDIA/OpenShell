@@ -91,7 +91,7 @@ from sandbox runtimes)",
         // settings apply to the events its threads emit.
         let (logging_layers, _logging_guards, _) = crate::logging::layers(
             std::io::stderr(),
-            std::path::Path::new("/var/log"),
+            &args.log_dir,
             console_filter,
             Arc::new(AtomicBool::new(false)),
         );
