@@ -245,12 +245,8 @@ async fn auth_connect(
 
     if let Some(token) = cf_token {
         let nonce = uuid::Uuid::new_v4().to_string();
-        // The page's only network egress is the POST to the CLI callback
-        // server, so CSP `connect-src` targets the validated callback host.
         let (url_host, _) = sanitize_callback_host(&params.callback_host);
-        let csp = format!(
-            "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; connect-src http://{url_host}:*"
-        );
+        let csp = connect_page_csp(&nonce, &url_host);
         (
             [(header::CONTENT_SECURITY_POLICY, csp)],
             Html(render_connect_page(
@@ -276,6 +272,26 @@ async fn auth_connect(
         )
             .into_response()
     }
+}
+
+/// Build the Content-Security-Policy for the connect page.
+///
+/// The page's only network egress is the POST to the CLI callback server,
+/// so `connect-src` targets the validated callback host. The IPv4 loopback
+/// source is always included: Chrome's CSP implementation does not support
+/// IPv6 literals in host-source expressions, so an IPv6 target's source is
+/// dropped there and the policy must not degrade to empty. The IPv6
+/// edge-login limitation this implies is documented in the CLI auth
+/// reference.
+fn connect_page_csp(nonce: &str, url_host: &str) -> String {
+    let connect_src = if url_host == "127.0.0.1" {
+        "http://127.0.0.1:*".to_string()
+    } else {
+        format!("http://127.0.0.1:* http://{url_host}:*")
+    };
+    format!(
+        "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; connect-src {connect_src}"
+    )
 }
 
 /// Extract a named cookie value from a `Cookie` header string.
@@ -691,6 +707,21 @@ mod tests {
         let html = render_connect_page("gw", 1234, "[::1]", "jwt", "ABC-1234", "nonce");
         assert!(html.contains(r#"var host = "[::1]""#));
         assert!(html.contains("'http://' + host + ':' + port + '/callback'"));
+    }
+
+    #[test]
+    fn connect_page_csp_targets_callback_host() {
+        let ipv4 = connect_page_csp("n", "127.0.0.1");
+        assert!(ipv4.contains("connect-src http://127.0.0.1:*"), "{ipv4}");
+        assert_eq!(ipv4.matches("http://127.0.0.1").count(), 1);
+
+        // Chrome drops IPv6 host-source expressions it cannot parse, so the
+        // IPv4 loopback source must always remain in the policy.
+        let ipv6 = connect_page_csp("n", "[::1]");
+        assert!(
+            ipv6.contains("connect-src http://127.0.0.1:* http://[::1]:*"),
+            "{ipv6}"
+        );
     }
 
     #[test]
