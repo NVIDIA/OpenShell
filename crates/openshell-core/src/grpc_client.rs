@@ -379,7 +379,7 @@ fn configure_gateway_tls(
     ca_pem: Vec<u8>,
     server_name: Option<&str>,
 ) -> Result<Endpoint> {
-    openshell_crypto::tls::ensure_default_provider();
+    openshell_crypto::tls::try_ensure_default_provider().into_diagnostic()?;
     let mut tls_config = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem));
     if let Some(server_name) = server_name.filter(|name| !name.is_empty()) {
         tls_config = tls_config.domain_name(server_name);
@@ -470,7 +470,7 @@ impl Drop for ClientSpanStatus {
 mod gateway_tls_isolation_tests {
     use super::*;
     use rcgen::{CertificateParams, IsCa};
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
     use std::io::Cursor;
     use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
@@ -504,11 +504,13 @@ mod gateway_tls_isolation_tests {
     }
 
     async fn start_h2_tls_server(pki: &TestPki) -> std::net::SocketAddr {
-        let certificates = rustls_pemfile::certs(&mut Cursor::new(&pki.server_cert_pem))
+        let certificates = CertificateDer::pem_reader_iter(&mut Cursor::new(&pki.server_cert_pem))
             .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
             .unwrap();
         let key: PrivateKeyDer<'static> =
-            rustls_pemfile::private_key(&mut Cursor::new(&pki.server_key_pem))
+            PrivateKeyDer::pem_reader_iter(&mut Cursor::new(&pki.server_key_pem))
+                .next()
+                .transpose()
                 .unwrap()
                 .unwrap();
         let mut config = rustls::ServerConfig::builder()

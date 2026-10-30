@@ -174,7 +174,8 @@ async fn open_ws(config: &TunnelConfig) -> Result<WebSocketStream<MaybeTlsStream
     debug!(url = %config.ws_url, "opening WebSocket to edge");
 
     if config.ws_url.starts_with("wss://") {
-        openshell_crypto::tls::ensure_default_provider();
+        openshell_crypto::tls::try_ensure_default_provider()
+            .map_err(|e| SdkError::tls(e.to_string()))?;
     }
     let (ws_stream, response) = tokio_tungstenite::connect_async(request)
         .await

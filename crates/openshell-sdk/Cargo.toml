@@ -10,6 +10,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Application opt-in; libraries remain backend-neutral by default.
+aws-lc = ["openshell-crypto/aws-lc"]
+
 [dependencies]
 openshell-crypto = { workspace = true }
 openshell-core = { path = "../openshell-core" }

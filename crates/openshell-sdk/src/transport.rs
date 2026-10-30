@@ -128,7 +128,8 @@ pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
     // `build_channel` only owns the TLS layer.
 
     // Tonic must use the host or facade provider, including backend-free builds.
-    openshell_crypto::tls::ensure_default_provider();
+    openshell_crypto::tls::try_ensure_default_provider()
+        .map_err(|e| SdkError::tls(e.to_string()))?;
     let mut tls_config = config.ca_cert.as_ref().map_or_else(
         || ClientTlsConfig::new().with_enabled_roots(),
         |ca_cert| ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_cert)),
@@ -196,10 +197,11 @@ impl ServerCertVerifier for InsecureServerCertVerifier {
 /// rustls client config that disables server certificate verification.
 ///
 /// Pairs with [`InsecureTlsConnector`] for transports that need to skip
-/// verification (development, debug). Returns `Result` for symmetry with
-/// future verifying variants; the current implementation cannot fail.
+/// verification (development, debug). Returns an error if the selected crypto
+/// provider cannot support the TLS configuration.
 pub fn build_insecure_rustls_config() -> Result<rustls::ClientConfig> {
-    Ok(openshell_crypto::tls::client_builder()
+    Ok(openshell_crypto::tls::try_client_builder()
+        .map_err(|e| SdkError::invalid_config(format!("configure gateway TLS client: {e}")))?
         .dangerous()
         .with_custom_certificate_verifier(std::sync::Arc::new(InsecureServerCertVerifier))
         .with_no_client_auth())

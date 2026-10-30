@@ -3,15 +3,18 @@
 
 //! Backend-neutral crypto operations and library-specific protocol adapters.
 //!
-//! AWS-LC is the only production implementation in this first stage. This crate
+//! AWS-LC is the default; an opt-in system-OpenSSL backend supports explicit selection. This crate
 //! does not enable FIPS mode, change algorithms, or attest dependency-owned crypto.
-//! The extension target is a system-OpenSSL backend for regulated deployments
-//! (<https://github.com/NVIDIA/OpenShell/issues/900>). See the crate README for
+//! See the crate README for
 //! initialization, key ownership, and dependency coverage boundaries.
 
 pub mod aead;
 #[cfg(feature = "aws-lc")]
 mod aws_lc;
+#[cfg(feature = "openssl")]
+mod openssl_backend;
+#[cfg(feature = "openssl")]
+pub use openssl_backend::OpenSsl;
 pub mod jwt;
 pub mod pki;
 pub mod tls;
@@ -21,6 +24,11 @@ use std::sync::{Arc, OnceLock};
 /// Errors contain no key material or authentication-failure details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum CryptoError {
+    /// No backend was selected by the application.
+    #[error(
+        "enable the aws-lc feature on openshell-sdk, openshell-core, or openshell-crypto, or call install_default_context before crypto use"
+    )]
+    MissingContext,
     /// A backend could not obtain cryptographic randomness.
     #[error("cryptographic random generation failed")]
     Random,
@@ -46,6 +54,10 @@ pub enum FipsState {
 }
 
 /// Operations implemented by a backend. Protocol coverage is documented separately.
+///
+/// These lists describe each backend individually, not a common set required of
+/// every backend. Host provider policy can still reject a listed operation;
+/// capabilities do not guarantee runtime availability or FIPS compliance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
     /// Stable backend identifier.
@@ -56,7 +68,8 @@ pub struct Capabilities {
     pub fips: FipsState,
     /// Primitive operations supported by this implementation.
     pub primitives: &'static [&'static str],
-    /// Key generation algorithms available through the PKI adapter.
+    /// Key algorithms implemented by this backend's PKI and JWT adapters.
+    /// Listing an algorithm does not imply support for every operation or variant.
     pub key_algorithms: &'static [&'static str],
 }
 
@@ -172,21 +185,27 @@ pub(crate) fn explicitly_selected() -> bool {
 /// Application default, initialized lazily to AWS-LC unless selected before first use.
 #[must_use]
 pub fn default_context() -> &'static CryptoContext {
+    try_default_context()
+        .expect("enable openshell-crypto/aws-lc or call install_default_context before crypto use")
+}
+
+/// Obtain the application context, failing when no backend has been selected.
+pub fn try_default_context() -> Result<&'static CryptoContext, CryptoError> {
     #[cfg(feature = "aws-lc")]
     {
-        &DEFAULT
+        Ok(&DEFAULT
             .get_or_init(|| DefaultContext {
                 context: CryptoContext::default(),
                 explicit: false,
             })
-            .context
+            .context)
     }
     #[cfg(not(feature = "aws-lc"))]
     {
-        &DEFAULT
+        DEFAULT
             .get()
-            .expect("install a crypto context before use when no default backend is built")
-            .context
+            .map(|selected| &selected.context)
+            .ok_or(CryptoError::MissingContext)
     }
 }
 

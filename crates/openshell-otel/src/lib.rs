@@ -135,6 +135,8 @@ pub struct OtlpExportConfig<'a> {
 /// Failure to set up OTLP export.
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
+    #[error("could not select OTLP TLS provider: {0}")]
+    Crypto(#[from] openshell_crypto::CryptoError),
     #[error("OTLP endpoint is empty")]
     EmptyEndpoint,
 
@@ -227,17 +229,17 @@ impl OtlpTarget {
     }
 
     /// Point an exporter builder at this target, over TLS for `https://`.
-    pub(crate) fn configure<B>(&self, builder: B) -> B
+    pub(crate) fn configure<B>(&self, builder: B) -> Result<B, SetupError>
     where
         B: WithExportConfig + WithTonicConfig,
     {
         let builder = builder.with_endpoint(self.endpoint.clone());
         if self.tls {
-            openshell_crypto::tls::ensure_default_provider();
+            openshell_crypto::tls::try_ensure_default_provider()?;
             // Tonic trusts nothing by default, so enable the platform roots.
-            builder.with_tls_config(ClientTlsConfig::new().with_enabled_roots())
+            Ok(builder.with_tls_config(ClientTlsConfig::new().with_enabled_roots()))
         } else {
-            builder
+            Ok(builder)
         }
     }
 
@@ -254,7 +256,7 @@ impl OtlpTarget {
     /// Build a trace provider that exports spans to this target in batches.
     pub fn tracer_provider(&self) -> Result<SdkTracerProvider, SetupError> {
         let exporter = self
-            .configure(SpanExporter::builder().with_tonic())
+            .configure(SpanExporter::builder().with_tonic())?
             .build()?;
         Ok(SdkTracerProvider::builder()
             .with_batch_exporter(exporter)

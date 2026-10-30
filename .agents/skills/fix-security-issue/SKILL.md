@@ -18,3 +18,5 @@ Use this skill after an authorized `review-security-issue` review identifies an 
 Begin any fix comments with `> **🔧 security-fix-agent**`. Do not change human disposition or introduce `agent:*` workflow labels.
 
 For first-party security-sensitive crypto, use `openshell-crypto` and extend its facade/backend contracts when needed. Follow the [crypto architecture](../../../crates/openshell-crypto/CRYPTO.md) for compatibility, failure handling, and explicit coverage exceptions.
+
+When changing crypto dependencies, run `mise run rust:deny:policy`, including its dependency-boundary regression fixtures. Review any `deny.toml` wrapper change against the documented exception scope; an existing allowance does not authorize new security-sensitive operations outside the facade.

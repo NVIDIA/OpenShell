@@ -7,8 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use openshell_ocsf::format::downgrade::downgrade_event;
-use openshell_ocsf::{OCSF_TARGET, OcsfEvent, OcsfSchemaVersion, SeverityId, clone_current_event};
+use openshell_ocsf::{OCSF_TARGET, OcsfEvent, SeverityId, clone_current_event};
 use opentelemetry::InstrumentationScope;
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity};
 use opentelemetry_sdk::Resource;
@@ -45,11 +44,7 @@ pub struct OcsfOtlp {
 
 impl OcsfOtlp {
     /// Start exporting through `exporter`.
-    pub fn start<E>(
-        mut exporter: E,
-        resource: Resource,
-        schema_version: Option<OcsfSchemaVersion>,
-    ) -> Self
+    pub fn start<E>(mut exporter: E, resource: Resource) -> Self
     where
         E: LogExporter + 'static,
     {
@@ -71,7 +66,6 @@ impl OcsfOtlp {
             layer: OcsfOtlpLayer {
                 sender,
                 logger,
-                schema_version,
                 gap,
                 pending_bytes,
             },
@@ -110,7 +104,6 @@ impl OcsfOtlp {
 pub struct OcsfOtlpLayer {
     sender: mpsc::Sender<Queued>,
     logger: SdkLogger,
-    schema_version: Option<OcsfSchemaVersion>,
     gap: Arc<Gap>,
     pending_bytes: Arc<AtomicUsize>,
 }
@@ -123,8 +116,7 @@ impl<S: Subscriber> Layer<S> for OcsfOtlpLayer {
         let Some(event) = clone_current_event() else {
             return;
         };
-        let Ok(record) = log_record(&self.logger, &event, self.schema_version, SystemTime::now())
-        else {
+        let Ok(record) = log_record(&self.logger, &event, SystemTime::now()) else {
             self.gap.record_loss("serialization", 1);
             return;
         };
@@ -377,14 +369,11 @@ fn logger() -> SdkLogger {
 
 /// Map one OCSF event onto an OTLP log record.
 ///
-/// The body is the OCSF JSON record, downgraded when a schema version is
-/// configured. Attributes come from the event itself, so identifiers that a
-/// downgrade strips, such as the sandbox container, remain available for
-/// routing.
+/// The body is the OCSF JSON record. Attributes repeat identifiers from the
+/// event, such as the sandbox container, for routing.
 fn log_record(
     logger: &SdkLogger,
     event: &OcsfEvent,
-    schema_version: Option<OcsfSchemaVersion>,
     observed: SystemTime,
 ) -> Result<SdkLogRecord, serde_json::Error> {
     let base = event.base();
@@ -410,14 +399,7 @@ fn log_record(
         record.add_attribute("openshell.sandbox.id", sandbox_id);
     }
 
-    let body = match schema_version {
-        None => serde_json::to_string(event)?,
-        Some(schema_version) => {
-            let mut body = serde_json::to_value(event)?;
-            downgrade_event(&mut body, schema_version.as_str());
-            serde_json::to_string(&body)?
-        }
-    };
+    let body = serde_json::to_string(event)?;
     record.set_body(AnyValue::String(body.into()));
     Ok(record)
 }
@@ -491,29 +473,21 @@ mod tests {
             .map(|(_, value)| value.clone())
     }
 
-    fn record(event: &OcsfEvent, schema_version: Option<OcsfSchemaVersion>) -> SdkLogRecord {
-        log_record(&logger(), event, schema_version, SystemTime::UNIX_EPOCH).unwrap()
+    fn record(event: &OcsfEvent) -> SdkLogRecord {
+        log_record(&logger(), event, SystemTime::UNIX_EPOCH).unwrap()
     }
 
     #[test]
     fn body_is_the_native_ocsf_json_record() {
         let event = event("sandbox-1", SeverityId::Informational);
-        assert_eq!(body(&record(&event, None)), native(&event));
-    }
-
-    #[test]
-    fn body_follows_the_configured_schema_version() {
-        let event = event("sandbox-1", SeverityId::Informational);
-        let body = body(&record(&event, Some(OcsfSchemaVersion::V1_3)));
-        assert_eq!(body["metadata"]["version"], "1.3");
-        assert!(body.get("container").is_none());
+        assert_eq!(body(&record(&event)), native(&event));
     }
 
     #[test]
     fn timestamps_are_event_time_and_observed_time() {
         let event = event("sandbox-1", SeverityId::Informational);
         let observed = SystemTime::UNIX_EPOCH + Duration::from_secs(42);
-        let record = log_record(&logger(), &event, None, observed).unwrap();
+        let record = log_record(&logger(), &event, observed).unwrap();
         let time_ms = native(&event)["time"].as_u64().unwrap();
         assert_eq!(
             record.timestamp(),
@@ -534,7 +508,7 @@ mod tests {
             (SeverityId::Fatal, Severity::Fatal),
             (SeverityId::Other, Severity::Info),
         ] {
-            let record = record(&event("", severity), None);
+            let record = record(&event("", severity));
             assert_eq!(record.severity_number(), Some(number), "{severity:?}");
             assert_eq!(record.severity_text(), Some(severity.label()));
         }
@@ -544,8 +518,7 @@ mod tests {
     fn attributes_identify_the_event_and_its_sandbox() {
         let event = event("sandbox-1", SeverityId::Medium);
         let native = native(&event);
-        // The sandbox identity survives a downgrade that strips `container`.
-        let record = record(&event, Some(OcsfSchemaVersion::V1_1));
+        let record = record(&event);
         let int = |key| match attribute(&record, key) {
             Some(AnyValue::Int(value)) => value,
             other => panic!("{key}: {other:?}"),
@@ -574,7 +547,7 @@ mod tests {
 
     #[test]
     fn events_without_a_sandbox_carry_no_sandbox_attribute() {
-        let record = record(&event("", SeverityId::Informational), None);
+        let record = record(&event("", SeverityId::Informational));
         assert!(attribute(&record, "openshell.sandbox.id").is_none());
     }
 
@@ -696,7 +669,7 @@ mod tests {
     #[tokio::test]
     async fn emitted_ocsf_events_reach_the_exporter_with_its_resource() {
         let exporter = RecordingExporter::default();
-        let otlp = OcsfOtlp::start(exporter.clone(), exporter_resource(), None);
+        let otlp = OcsfOtlp::start(exporter.clone(), exporter_resource());
         let subscriber = tracing_subscriber::registry().with(otlp.layer());
         let event = event("sandbox-1", SeverityId::Medium);
         let expected = native(&event);
@@ -716,7 +689,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_exports_every_queued_record_in_bounded_batches() {
         let exporter = RecordingExporter::default();
-        let otlp = OcsfOtlp::start(exporter.clone(), exporter_resource(), None);
+        let otlp = OcsfOtlp::start(exporter.clone(), exporter_resource());
         emit(&otlp, BATCH_SIZE * 2 + 1);
         otlp.shutdown().await;
         assert_eq!(exporter.exported().len(), BATCH_SIZE * 2 + 1);
@@ -734,7 +707,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn transient_export_failures_are_retried_without_loss() {
         let exporter = RecordingExporter::failing(MAX_EXPORT_ATTEMPTS - 1);
-        let otlp = OcsfOtlp::start(exporter.clone(), exporter_resource(), None);
+        let otlp = OcsfOtlp::start(exporter.clone(), exporter_resource());
         emit(&otlp, 3);
         settle().await;
         otlp.shutdown().await;
@@ -748,7 +721,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn exhausted_retries_drop_the_batch_and_report_the_gap_next() {
         let exporter = RecordingExporter::failing(MAX_EXPORT_ATTEMPTS);
-        let otlp = OcsfOtlp::start(exporter.clone(), exporter_resource(), None);
+        let otlp = OcsfOtlp::start(exporter.clone(), exporter_resource());
         emit(&otlp, 3);
         settle().await;
         emit(&otlp, 1);
@@ -778,7 +751,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn batches_stay_within_the_byte_limit() {
         let exporter = RecordingExporter::default();
-        let otlp = OcsfOtlp::start(exporter.clone(), exporter_resource(), None);
+        let otlp = OcsfOtlp::start(exporter.clone(), exporter_resource());
         emit_sized(&otlp, 5, BATCH_MAX_BYTES * 2 / 5);
         settle().await;
         let pending_bytes = Arc::clone(&otlp.layer.pending_bytes);
@@ -797,7 +770,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn records_larger_than_a_batch_are_dropped_and_reported() {
         let exporter = RecordingExporter::default();
-        let otlp = OcsfOtlp::start(exporter.clone(), exporter_resource(), None);
+        let otlp = OcsfOtlp::start(exporter.clone(), exporter_resource());
         emit_sized(&otlp, 1, BATCH_MAX_BYTES);
         emit(&otlp, 1);
         settle().await;
@@ -814,7 +787,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_queue_rejects_records_beyond_its_byte_limit() {
-        let otlp = OcsfOtlp::start(HangingExporter::default(), exporter_resource(), None);
+        let otlp = OcsfOtlp::start(HangingExporter::default(), exporter_resource());
         let events = QUEUE_MAX_BYTES / (BATCH_MAX_BYTES / 2) + 4;
         emit_sized(&otlp, events, BATCH_MAX_BYTES / 2);
 
@@ -841,7 +814,7 @@ mod tests {
     async fn shutdown_stops_a_worker_that_outlasts_the_budget() {
         let exporter = HangingExporter::default();
         let alive = Arc::clone(&exporter.alive);
-        let otlp = OcsfOtlp::start(exporter, exporter_resource(), None);
+        let otlp = OcsfOtlp::start(exporter, exporter_resource());
         emit(&otlp, 1);
         settle().await;
         otlp.shutdown().await;

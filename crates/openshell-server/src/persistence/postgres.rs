@@ -40,7 +40,7 @@ use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE}
 
 #[derive(Debug, Clone)]
 pub struct PostgresStore {
-    pool: PgPool,
+    pub(super) pool: PgPool,
     /// Dedicated connections for session-level mutation advisory locks.
     lock_pool: PgPool,
     /// How acquisitions and guards use the lock pool's connections.

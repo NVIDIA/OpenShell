@@ -33,7 +33,6 @@ url = { workspace = true }
 uuid = { workspace = true }
 ipnet = "2"
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 base64 = { workspace = true }
 jsonwebtoken = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
@@ -49,6 +48,8 @@ rustix = { workspace = true }
 libc = "0.2"
 
 [features]
+# Application opt-in; libraries remain backend-neutral by default.
+aws-lc = ["openshell-crypto/aws-lc"]
 default = ["telemetry"]
 ## Compile in anonymous telemetry emission support. On by default; disable with
 ## `--no-default-features` (plus any other features you need) for a build that

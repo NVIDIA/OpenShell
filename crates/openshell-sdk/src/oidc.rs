@@ -114,7 +114,7 @@ impl std::fmt::Debug for RefreshTokenOutput {
 pub async fn discover(issuer: &str, insecure: bool) -> Result<OidcDiscovery> {
     let normalized_issuer = issuer.trim_end_matches('/');
     let url = format!("{normalized_issuer}/.well-known/openid-configuration");
-    let client = http_client(insecure);
+    let client = try_http_client(insecure)?;
     let resp: OidcDiscovery = client
         .get(&url)
         .send()
@@ -139,12 +139,19 @@ pub async fn discover(issuer: &str, insecure: bool) -> Result<OidcDiscovery> {
 /// followed; OIDC providers should not redirect on the token endpoint.
 /// When `insecure` is true, TLS certificate verification is disabled.
 pub fn http_client(insecure: bool) -> reqwest::Client {
-    openshell_crypto::tls::ensure_default_provider();
+    try_http_client(insecure)
+        .expect("enable openshell-sdk/aws-lc or call install_default_context before OIDC use")
+}
+
+/// Build an OIDC HTTP client, returning provider and client initialization errors.
+pub fn try_http_client(insecure: bool) -> Result<reqwest::Client> {
+    openshell_crypto::tls::try_ensure_default_provider()
+        .map_err(|e| SdkError::tls(e.to_string()))?;
     let mut builder = reqwest::ClientBuilder::new().redirect(reqwest::redirect::Policy::none());
     if insecure {
         builder = builder.danger_accept_invalid_certs(true);
     }
-    builder.build().expect("failed to build HTTP client")
+    builder.build().map_err(|e| SdkError::tls(e.to_string()))
 }
 
 /// Refresh an OIDC access token using the `refresh_token` grant.
@@ -168,7 +175,7 @@ pub async fn refresh_token(input: &RefreshTokenInput) -> Result<RefreshTokenOutp
         request = request.add_scope(Scope::new(scope.clone()));
     }
 
-    let http = http_client(input.insecure);
+    let http = try_http_client(input.insecure)?;
     let token_response = request
         .request_async(&http)
         .await

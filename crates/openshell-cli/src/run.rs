@@ -4116,6 +4116,14 @@ pub async fn sandbox_stop(
         .into_inner()
         .sandbox
         .ok_or_else(|| miette!("gateway returned no sandbox after stop"))?;
+    // A successful stop can preserve a canonical result when the transient
+    // compute resource is already gone. There is no Stopped event to wait for.
+    if sandbox.phase() == SandboxPhase::Completed as i32
+        || (sandbox.phase() == SandboxPhase::Error as i32 && has_main_process_result(&sandbox))
+    {
+        println!("{} Sandbox {name} already finished", "✓".green().bold());
+        return Ok(());
+    }
     wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Stopped).await?;
     println!("{} Stopped sandbox {name}", "✓".green().bold());
     Ok(())

@@ -11,14 +11,17 @@
 //!
 //! # Cryptography
 //!
-//! This library does not select a crypto implementation. Add `openshell-crypto`
-//! with its default features for AWS-LC, or disable those defaults and install
-//! your own `CryptoContext` before constructing TLS/JWT clients or using crypto.
+//! This library is backend-neutral by default. Enable its `aws-lc` feature, or
+//! add `openshell-crypto` with defaults disabled and install your own
+//! `CryptoContext` before constructing TLS/JWT clients or using crypto.
 //! Existing Rustls process providers are preserved by dependency-owned clients;
 //! selecting a context does not replace an already installed process provider.
+//! If no provider is installed, the first TLS use installs the facade provider
+//! process-wide. Install any host provider before that first use.
 
 pub mod activity;
 pub mod auth;
+pub mod compute;
 pub mod config;
 pub mod container_paths;
 pub mod denial;
@@ -66,6 +69,7 @@ pub mod rpc_error;
 pub mod sandbox_env;
 pub mod sandbox_generation;
 pub mod sandbox_session;
+pub mod sandbox_update;
 pub mod secrets;
 pub mod settings;
 pub mod shell;

@@ -1517,8 +1517,7 @@ fn docker_child_environment_strips_supervisor_control_keys() {
 #[test]
 fn supervisor_otlp_environment_carries_only_configured_signals() {
     use openshell_core::sandbox_env::{
-        GATEWAY_NAME, OTLP_AGENT_ENDPOINT, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT,
-        OTLP_OCSF_SCHEMA_VERSION, OcsfOtlpExport,
+        GATEWAY_NAME, OTLP_AGENT_ENDPOINT, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OcsfOtlpExport,
     };
 
     let mut config = runtime_config();
@@ -1533,14 +1532,10 @@ fn supervisor_otlp_environment_carries_only_configured_signals() {
     config.supervisor_otlp_endpoint = None;
     config.supervisor_ocsf_export = Some(OcsfOtlpExport {
         endpoint: "http://siem:4317".to_string(),
-        schema_version: Some("1.3".to_string()),
     });
     assert_eq!(
         supervisor_otlp_environment(&config),
-        [
-            format!("{OTLP_OCSF_ENDPOINT}=http://siem:4317"),
-            format!("{OTLP_OCSF_SCHEMA_VERSION}=1.3"),
-        ]
+        [format!("{OTLP_OCSF_ENDPOINT}=http://siem:4317")]
     );
 
     config.supervisor_ocsf_export = None;

@@ -229,17 +229,12 @@ async fn supervisor_jsonl_conforms_to_the_native_schema() {
     );
     let mut failures = Vec::new();
     for record in &records {
-        match openshell_ocsf_validate::validate_event(record) {
-            Ok(()) => {}
-            Err(openshell_ocsf_validate::Error::UnsupportedVersion(version)) => panic!(
-                "record labelled {version}; native validation needs ocsf_schema_version unset \
-                 for this sandbox and the gateway"
-            ),
-            Err(reason) => failures.push(format!(
+        if let Err(reason) = openshell_ocsf_validate::validate_event(record) {
+            failures.push(format!(
                 "{} \"{}\": {reason}",
                 record["class_name"],
                 record["message"].as_str().unwrap_or_default()
-            )),
+            ));
         }
     }
     assert!(

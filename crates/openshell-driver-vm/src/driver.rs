@@ -5324,6 +5324,9 @@ fn configure_main_exit_marker(command: &mut Command, state_dir: &Path) {
 }
 
 #[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for VmDriver {}
+
+#[tonic::async_trait]
 impl ComputeDriver for VmDriver {
     async fn authenticate_sandbox(
         &self,
@@ -12341,6 +12344,28 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn extracts_zstd_compressed_oci_layer() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = tar_bytes_with_file("bin/tool", b"tool contents");
+        let compressed = zstd::encode_all(archive.as_slice(), 0).unwrap();
+        let blob = temp.path().join("layer.tar.zst");
+        let extracted = temp.path().join("extracted");
+        fs::write(&blob, compressed).unwrap();
+
+        extract_layer_blob_to_dir(
+            &blob,
+            "application/vnd.oci.image.layer.v1.tar+zstd",
+            &extracted,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(extracted.join("bin/tool")).unwrap(),
+            b"tool contents"
+        );
     }
 
     #[test]

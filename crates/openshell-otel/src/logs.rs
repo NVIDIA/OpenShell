@@ -23,7 +23,7 @@ impl OtlpTarget {
         &self,
         headers: Option<&str>,
     ) -> Result<LogExporter, SetupError> {
-        let mut builder = self.configure(LogExporter::builder().with_tonic());
+        let mut builder = self.configure(LogExporter::builder().with_tonic())?;
         if let Some(headers) = headers {
             builder = builder.with_metadata(header_metadata(headers));
         }

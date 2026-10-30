@@ -44,7 +44,6 @@ regorus = { version = "0.9", default-features = false, features = ["std", "arc",
 reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
-rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
