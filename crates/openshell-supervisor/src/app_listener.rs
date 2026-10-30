@@ -140,6 +140,14 @@ pub struct Routes {
     registration: Option<Arc<Registration>>,
     sender: watch::Sender<Snapshot>,
     stopped: Arc<AtomicBool>,
+    #[cfg(test)]
+    install_probe: Option<Arc<InstallProbe>>,
+}
+
+#[cfg(test)]
+struct InstallProbe {
+    checked_running: std::sync::Barrier,
+    resume: std::sync::Barrier,
 }
 
 impl Default for Routes {
@@ -148,6 +156,8 @@ impl Default for Routes {
             sender: watch::channel(Snapshot::default()).0,
             stopped: Arc::new(AtomicBool::new(false)),
             registration: None,
+            #[cfg(test)]
+            install_probe: None,
         }
     }
 }
@@ -176,6 +186,11 @@ impl Routes {
     pub(crate) fn install(&self, result: &SettingsPollResult) {
         if self.stopped.load(Ordering::Acquire) {
             return;
+        }
+        #[cfg(test)]
+        if let Some(probe) = &self.install_probe {
+            probe.checked_running.wait();
+            probe.resume.wait();
         }
         let mut routes = BTreeMap::new();
         if !result.configuration_admitted {
@@ -209,7 +224,7 @@ impl Routes {
             return;
         }
         if let Some(registration) = &self.registration
-            && !registration.bind(&result.workspace)
+            && !registration.bind(&result.workspace, &self.stopped)
         {
             self.suspend();
             return;
@@ -359,12 +374,18 @@ struct Registration {
 }
 
 impl Registration {
-    fn bind(&self, workspace: &str) -> bool {
+    fn bind(&self, workspace: &str, stopped: &AtomicBool) -> bool {
         let next = format!("{workspace}--{}", self.sandbox);
         let mut prefix = self
             .prefix
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Shutdown sets stopped before taking this same prefix lock to remove
+        // the registration. An install that passed its first check must not
+        // reinsert the old sender after that removal.
+        if stopped.load(Ordering::Acquire) {
+            return false;
+        }
         let mut entries = self
             .router
             .registrations
@@ -1172,6 +1193,42 @@ mod tests {
                 .lock()
                 .unwrap()
                 .contains_key(prefix)
+        );
+    }
+
+    #[tokio::test]
+    async fn install_racing_shutdown_cannot_reinsert_a_stopped_instance() {
+        let f = fixture();
+        let probe = Arc::new(InstallProbe {
+            checked_running: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+        });
+        let mut installing_routes = f.routes.clone();
+        installing_routes.install_probe = Some(probe.clone());
+        let snapshot = installed(vec![f.route.clone()]);
+        let installer = std::thread::spawn(move || installing_routes.install(&snapshot));
+        probe.checked_running.wait();
+        // Complete shutdown after install's optimistic stopped check but
+        // before its registration insertion, rather than relying on timing.
+        drop(f.handle);
+        probe.resume.wait();
+        installer.join().unwrap();
+        assert!(
+            !f.host
+                .router()
+                .registrations
+                .lock()
+                .unwrap()
+                .contains_key("default--sandbox-a")
+        );
+        let replacement = f.host.router().instance("sandbox-a").unwrap();
+        replacement.routes.install(&installed(vec![f.route]));
+        assert!(
+            replacement
+                .routes
+                .resolve(HOST, "default--sandbox-a", "svc.openshell.internal")
+                .is_some(),
+            "the stopped instance must not prevent its replacement from serving"
         );
     }
 

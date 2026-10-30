@@ -19,11 +19,13 @@ use crate::ServerState;
 use crate::auth::workspace_authz::{
     AuthorizedWorkspaceScope, MinWorkspaceRole, authorize_list_workspace_selector,
 };
+use crate::compute::MutationScope;
 use crate::pagination::Pagination;
 use crate::persistence::{ObjectListQuery, ObjectType, WriteCondition};
 use crate::service_routing;
 
 const MAX_SERVICE_NAME_LEN: usize = super::MAX_ROUTABLE_NAME_LEN;
+const MAX_APP_SERVICE_ROUTES: u32 = 1024;
 
 #[cfg(test)]
 #[derive(Default)]
@@ -92,6 +94,21 @@ pub(super) async fn expose_service_endpoint(
     authorization_mode: ServiceAuthorizationMode,
 ) -> Result<Response<ServiceEndpointResponse>, Status> {
     let sandbox_name = sandbox.object_name();
+    // Count and persist under the same fleet-wide sandbox guard, including
+    // create-time exposure, so concurrent gateways cannot overfill the allowlist.
+    let _mutation_guard = if state.config.supervisor_app_listener.enabled {
+        Some(
+            state
+                .compute
+                .mutation_guard(MutationScope::sandbox(workspace, sandbox.object_id()))
+                .await
+                .map_err(|error| {
+                    super::persistence_error_to_status(error, "acquire sandbox mutation lock")
+                })?,
+        )
+    } else {
+        None
+    };
 
     let now = crate::persistence::current_time_ms();
     let key = service_routing::endpoint_key(sandbox_name, service);
@@ -102,6 +119,15 @@ pub(super) async fn expose_service_endpoint(
         .get_message_by_name::<ServiceEndpoint>(workspace, &key)
         .await
         .map_err(|e| Status::internal(format!("fetch endpoint failed: {e}")))?;
+
+    if state.config.supervisor_app_listener.enabled
+        && existing.is_none()
+        && app_service_endpoints(state, sandbox).await?.len() >= MAX_APP_SERVICE_ROUTES as usize
+    {
+        return Err(Status::resource_exhausted(
+            "too many application service declarations",
+        ));
+    }
 
     let (id, created_at_ms, condition, created) = if let Some(existing) = existing {
         // Update path: preserve id and created_at, use CAS to prevent conflicts
@@ -383,26 +409,8 @@ pub(super) async fn configured_app_routes(
     if !state.config.supervisor_app_listener.enabled {
         return Ok(Vec::new());
     }
-    let selector = format!("sandbox={}", sandbox.object_name());
-    let page = state
-        .store
-        .list_message_page::<ServiceEndpoint>(
-            ObjectListQuery::WorkspaceSelector {
-                workspace: sandbox.object_workspace(),
-                label_selector: &selector,
-            },
-            None,
-            1024,
-        )
-        .await
-        .map_err(|_| Status::unavailable("service declarations unavailable"))?;
-    if page.next_cursor.is_some() {
-        return Err(Status::resource_exhausted(
-            "too many application service declarations",
-        ));
-    }
-    let mut service_routes: Vec<_> = page
-        .messages
+    let mut service_routes: Vec<_> = app_service_endpoints(state, sandbox)
+        .await?
         .into_iter()
         .filter(|ep| {
             ep.sandbox_id == sandbox.object_id()
@@ -422,6 +430,31 @@ pub(super) async fn configured_app_routes(
         .collect();
     service_routes.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(service_routes)
+}
+
+async fn app_service_endpoints(
+    state: &ServerState,
+    sandbox: &Sandbox,
+) -> Result<Vec<ServiceEndpoint>, Status> {
+    let selector = format!("sandbox={}", sandbox.object_name());
+    let page = state
+        .store
+        .list_message_page::<ServiceEndpoint>(
+            ObjectListQuery::WorkspaceSelector {
+                workspace: sandbox.object_workspace(),
+                label_selector: &selector,
+            },
+            None,
+            MAX_APP_SERVICE_ROUTES,
+        )
+        .await
+        .map_err(|_| Status::unavailable("service declarations unavailable"))?;
+    if page.next_cursor.is_some() {
+        return Err(Status::resource_exhausted(
+            "too many application service declarations",
+        ));
+    }
+    Ok(page.messages)
 }
 
 async fn get_service_endpoint(
@@ -534,6 +567,130 @@ mod tests {
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
+    }
+
+    async fn app_listener_state() -> Arc<ServerState> {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .supervisor_app_listener = openshell_core::app_listener::AppListenerConfig {
+            enabled: true,
+            port: 9443,
+            domain: "services.example.com".into(),
+        };
+        seed_sandbox(&state, "limited").await;
+        state
+    }
+
+    async fn seed_app_services(state: &Arc<ServerState>, count: u32) {
+        for index in 0..count {
+            let name = format!("web-{index}");
+            state
+                .store
+                .put_message(&ServiceEndpoint {
+                    metadata: Some(ObjectMeta {
+                        id: format!("endpoint-{index}"),
+                        name: service_routing::endpoint_key("limited", &name),
+                        workspace: "default".into(),
+                        labels: HashMap::from([("sandbox".into(), "limited".into())]),
+                        ..Default::default()
+                    }),
+                    sandbox_id: "sandbox-limited".into(),
+                    sandbox: "limited".into(),
+                    name,
+                    target_port: 8080,
+                    domain: true,
+                    authorization_mode: ServiceAuthorizationMode::Strip as i32,
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn expose_limited(
+        state: &Arc<ServerState>,
+        name: &str,
+    ) -> Result<Response<ServiceEndpointResponse>, Status> {
+        handle_expose_service(
+            state,
+            authed_request(ExposeServiceRequest {
+                sandbox: "limited".into(),
+                name: name.into(),
+                target_port: 9090,
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn app_listener_rejects_overflow_before_persistence_and_keeps_config_deliverable() {
+        let state = app_listener_state().await;
+        seed_app_services(&state, MAX_APP_SERVICE_ROUTES).await;
+        assert_eq!(
+            expose_limited(&state, "overflow").await.unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert!(
+            get_service_endpoint(&state, "default", "limited", "overflow")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Editing a route at capacity must remain possible, as must unrelated
+        // policy changes and the complete configuration that delivers them.
+        expose_limited(&state, "web-0").await.unwrap();
+        super::super::policy::handle_update_config(
+            &state,
+            authed_request(openshell_core::proto::UpdateConfigRequest {
+                sandbox: "limited".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                policy: Some(openshell_policy::restrictive_default_policy()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>("sandbox-limited")
+            .await
+            .unwrap()
+            .unwrap();
+        let config = super::super::policy::load_sandbox_config(&state, &sandbox)
+            .await
+            .unwrap();
+        assert_eq!(config.service_routes.len(), MAX_APP_SERVICE_ROUTES as usize);
+        assert!(config.policy.is_some());
+        assert_eq!(config.service_routes[0].target_port, 9090);
+    }
+
+    #[tokio::test]
+    async fn app_listener_concurrent_exposures_cannot_exceed_capacity() {
+        let state = app_listener_state().await;
+        seed_app_services(&state, MAX_APP_SERVICE_ROUTES - 1).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let spawn_exposure = |name: &'static str| {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                expose_limited(&state, name).await
+            })
+        };
+        let (first, second) = tokio::join!(spawn_exposure("first"), spawn_exposure("second"));
+        let results = [first.unwrap(), second.unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .find_map(|result| result.as_ref().err())
+                .unwrap()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
     }
 
     #[test]

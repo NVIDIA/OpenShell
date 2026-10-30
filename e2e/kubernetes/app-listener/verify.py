@@ -22,9 +22,16 @@ from urllib.parse import urlsplit
 HERE = Path(__file__).resolve().parent
 
 
+def check_app_service_count(services, topology):
+    assert not services, (
+        f"{topology} topology expected 0 app Services, found {len(services)}"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--namespace", required=True)
+    parser.add_argument("--topology", choices=("shared", "dedicated"), required=True)
     parser.add_argument("--gateway-endpoint", required=True)
     parser.add_argument(
         "--forward-gateway",
@@ -504,12 +511,14 @@ def main():
             host = hostname(name)
             print("PASS unique serving supervisor and named HTTP route", flush=True)
             services = json.loads(run([*k, "get", "services", "-o", "json"]).stdout)
-            assert not any(
-                service["metadata"]["name"].startswith("os-app-")
+            app_services = [
+                service
+                for service in services["items"]
+                if service["metadata"]["name"].startswith("os-app-")
                 or service["metadata"].get("labels", {}).get("openshell.ai/component")
                 == "app-service"
-                for service in services["items"]
-            ), "listener deployment created app Services"
+            ]
+            check_app_service_count(app_services, args.topology)
             print("PASS Pod-IP ingress without per-sandbox app Services", flush=True)
             assert json.loads(probe("http", ip, hostname(name, "")).stdout)[0] == 200
             print("PASS unnamed HTTP route", flush=True)

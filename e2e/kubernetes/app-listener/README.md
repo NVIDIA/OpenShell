@@ -56,6 +56,7 @@ Run from the repository root, supplying the public application certificate/CA:
 KUBECONFIG="$PWD/kubeconfig" uv run --no-project python \
   e2e/kubernetes/app-listener/verify.py \
   --namespace listener-review-shared \
+  --topology shared \
   --gateway-endpoint https://localhost:29203 \
   --forward-gateway service/listener-review \
   --app-ca /path/to/app-ca.crt \

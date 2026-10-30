@@ -288,7 +288,10 @@ run = "e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:kubernetes:app-listener"]
 description = "Deploy an isolated Helm release and verify application ingress, isolation, freshness, and supervisor ownership"
-run = "uv run --no-project python e2e/kubernetes/app-listener/run.py"
+run = [
+  "uv run --no-project python -m unittest discover -s e2e/kubernetes/app-listener -p '*_test.py'",
+  "uv run --no-project python e2e/kubernetes/app-listener/run.py",
+]
 
 ["e2e:kubernetes:shared-supervisor"]
 description = "Run Kubernetes e2e with a one-member shared supervisor pool for the gateway's sandboxes (gateway supervisor topology)"

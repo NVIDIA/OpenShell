@@ -247,6 +247,8 @@ def main():
                 str(HERE / "verify.py"),
                 "--namespace",
                 namespace,
+                "--topology",
+                args.topology,
                 "--gateway-endpoint",
                 f"https://localhost:{port}",
                 "--forward-gateway",
