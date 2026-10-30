@@ -2236,6 +2236,43 @@ describe('forward', () => {
     expect(revokedToken).toBe('fwd-tok');
   });
 
+  it('revokes the token of a connection still open at close()', async () => {
+    const revoked: string[] = [];
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-open'),
+      createSshSession: () => ({
+        sandboxId: 'sb-id-open',
+        token: 'open-tok',
+        gatewayHost: 'gw',
+        gatewayPort: 443,
+        gatewayScheme: 'https',
+        hostKeyFingerprint: '',
+        expirationTime: undefined,
+      }),
+      // A real transport never delivers a call whose signal is already aborted.
+      revokeSshSession: (req, ctx) => {
+        if (!ctx.signal.aborted) revoked.push(req.token);
+        return { outcome: 1 };
+      },
+      forwardTcp: async function* (requests) {
+        for await (const frame of requests) {
+          if (frame.payload.case === 'data') yield { payload: { case: 'data', value: frame.payload.value } };
+        }
+      },
+    });
+
+    const handle = await sandbox.forward('sb', { targetPort: 9000 });
+    const socket = net.connect(handle.localPort, handle.localHost);
+    socket.on('error', () => {});
+    await new Promise<void>((resolve) => {
+      socket.once('data', () => resolve());
+      socket.write('ping');
+    });
+
+    await handle.close();
+    expect(revoked).toEqual(['open-tok']);
+  });
+
   it('rejects when the sandbox is not ready', async () => {
     const sandbox = client({
       getSandbox: () => ({
