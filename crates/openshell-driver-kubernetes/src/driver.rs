@@ -90,6 +90,9 @@ use tokio::sync::{OnceCell, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
 
+#[path = "image_update.rs"]
+mod image_update;
+
 pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, KubernetesDriverError>> + Send>>;
 
@@ -1341,7 +1344,10 @@ impl KubernetesComputeDriver {
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/kubernetes",
                 openshell_core::VERSION,
-                [],
+                [
+                    openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION
+                        .to_string(),
+                ],
             )),
         })
     }
@@ -8978,9 +8984,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_otlp_environment_carries_only_configured_signals() {
-        use openshell_core::sandbox_env::{
-            OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OTLP_OCSF_SCHEMA_VERSION, OcsfOtlpExport,
-        };
+        use openshell_core::sandbox_env::{OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OcsfOtlpExport};
 
         let names = |config: KubernetesComputeConfig| {
             KubernetesComputeDriver::new_for_test(config)
@@ -9002,16 +9006,12 @@ mod tests {
         let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
             supervisor_ocsf_export: Some(OcsfOtlpExport {
                 endpoint: "http://siem:4317".into(),
-                schema_version: Some("1.1".into()),
             }),
             ..Default::default()
         });
         assert_eq!(
             driver.supervisor_otlp_environment(),
-            [
-                (OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string()),
-                (OTLP_OCSF_SCHEMA_VERSION, "1.1".to_string()),
-            ]
+            [(OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string())]
         );
 
         let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {

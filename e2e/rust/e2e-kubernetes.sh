@@ -98,10 +98,20 @@ run_suite() {
 }
 
 run_e2e() {
+  if [ "${OPENSHELL_E2E_KUBE_TEST:-}" = "kubernetes_image_update" ]; then
+    cargo test --locked --manifest-path "${ROOT}/tests/suites/features/Cargo.toml" \
+      -p openshell-test-feature-kubernetes-updates -- --nocapture
+    return
+  fi
   run_conformance
   if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
     echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
     return 0
+  fi
+
+  if [ -z "${OPENSHELL_E2E_KUBE_TEST:-}" ]; then
+    cargo test --locked --manifest-path "${ROOT}/tests/suites/features/Cargo.toml" \
+      -p openshell-test-feature-kubernetes-updates -- --nocapture
   fi
 
   # Pin `--target-dir` so the profile `junit.path` resolves regardless of `CARGO_TARGET_DIR`.

@@ -164,6 +164,13 @@ not substitute the current `main` tip or the event's older PR base SHA. Merge
 groups and manual runs use their explicit baseline. Findings are reported by
 `Reject new high or critical findings`; distinguish those from scanner failures.
 
+For `Cargo Deny`, the metadata-only commands clear Rust compiler wrappers after
+entering mise; they do not require sccache. For OpenSSL backend and dynamic-linkage
+checks, use `nix develop .#crypto` from outside the default shell. The release
+toolchains in the default shell expose an unprefixed system AWS-LC that conflicts
+with OpenSSL. The crypto shell uses native OpenSSL and Cargo's symbol-prefixed
+AWS-LC build for dual-backend tests.
+
 For `Protobuf Compatibility`, check the logged train and comparison baseline.
 Branch Checks compares the prospective merge tree with its target; release qualification
 compares the tagged candidate with the previous stable release. Both use

@@ -1435,6 +1435,52 @@ network supervisor logs for CONNECT and upstream-proxy decisions:
 kubectl -n <sandbox-namespace> logs pod/<supervisor-pod> --tail=200 | grep -Ei 'upstream|connect|proxy'
 ```
 
+#### Sandbox image-update activation and recovery
+
+`openshell.v1.SandboxUpdates/UpdateSandbox` uses the existing authenticated
+gateway listener and defaults to disabled. Check the effective
+`[openshell.gateway] enable_sandbox_updates` value and its overrides,
+`--enable-sandbox-updates true` or
+`OPENSHELL_ENABLE_SANDBOX_UPDATES=true`. Canonical Helm values use:
+
+```yaml
+gatewayConfig:
+  "openshell.gateway":
+    enable_sandbox_updates: true
+```
+
+Do not enable the flag to work around an error. It attests that all incompatible
+gateways, including unregistered processes and Jobs, have been drained and
+retired, their outstanding driver operations have settled, and old binaries
+cannot return through rollout or rollback configurations. Keep it false during
+a rolling upgrade. SQLite supports one gateway process, not shared-file HA.
+
+On PostgreSQL, fresh gateway membership must advertise sandbox-update protocol 1;
+malformed or truncated membership reads fail closed. Administrative, monitoring,
+and backup connections do not block updates, and custom `application_name` values
+are preserved. Membership expiry does not prove a gateway has stopped. Follow the
+[activation checklist](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#activate-sandbox-updates).
+
+The gateway retries accepted updates automatically, even with new updates disabled.
+Repeated automatic failures back off up to 15 minutes per gateway. Replicas retry
+independently, and restarting a gateway resets its delay. Recovery warnings include
+the attempt count and retry delay.
+To resume immediately, read the sandbox resource version and call `UpdateSandbox`
+with that version and no selected fields. Restore a compatible driver if recovery
+reports missing support. Start, stop, and provisioning retry retain the barrier;
+explicit deletion can reclaim an unrecoverable sandbox and its storage. Preserve
+request admission semantics: use a new ID or no ID for the explicit resume request,
+and never change the original payload under its original ID. See the
+[recovery contract](https://docs.nvidia.com/openshell/latest/sdk/api-errors#sandbox-image-update-recovery).
+
+Split Helm deployments need the current `openshell-workspace` Role. Update
+preflight requires `get` on Pods: it checks the controller-recorded workload
+name, the Sandbox resource name, and `os-supervisor-<sandbox-id>` directly.
+Any remaining Pod at those names, including a terminating Pod, blocks the update.
+The checks make at most three Pod reads regardless of namespace size and do not
+discover unexpectedly named Pods. Upgrade the workspace chart alongside the
+gateway chart.
+
 ### Step 7: Check VM-Backed Gateways
 
 Use the VM driver logs and host diagnostics available in the user's environment. Verify:
@@ -1493,7 +1539,7 @@ credential failures.
 |---|---|---|
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
 | Collector receives no OCSF log records, or `openshell.ocsf.gap` records | `[openshell.gateway.otlp.ocsf]` missing or without `enabled = true`, an unreachable or non-gRPC endpoint, or export failures and queue pressure | Check `[openshell.gateway.otlp.ocsf]` for `enabled = true` and the endpoint it resolves to, the gateway's `OTLP exporting enabled` startup log for `ocsf_endpoint`, export warnings, and `openshell_ocsf_otlp_*` metrics. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
-| Gateway OCSF JSONL stops growing, has gaps, or is rejected by a SIEM | File errors, queue pressure, shipper falling behind retention, or a schema mismatch | Inspect gateway warnings and `openshell_ocsf_log_*` metrics; check `[openshell.gateway.ocsf_log]`, `schema_version`, directory permissions, free space, per-replica paths, and shipper rotation checkpoints. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
+| Gateway OCSF JSONL stops growing, has gaps, or is rejected by a SIEM | File errors, queue pressure, or shipper falling behind retention | Inspect gateway warnings and `openshell_ocsf_log_*` metrics; check `[openshell.gateway.ocsf_log]`, directory permissions, free space, per-replica paths, and shipper rotation checkpoints. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
 | `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with OTLP configured but the collector forwarding task later stopped, or the config was created manually | Restart `gateway:docker`, `gateway:podman`, or `gateway:vm` so it re-detects the listener; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
 | Sandbox log shows `OTLP agent trace relay inactive: not enabled by the gateway` at startup, then `agent OTLP export attempted but the agent trace relay is not enabled` when the agent exports | The gateway does not enable `[openshell.gateway.otlp.agent]`, so the supervisor refuses the workload's OTLP relay address | Set `enabled = true` in `[openshell.gateway.otlp.agent]` (Helm: `gatewayConfig."openshell.gateway.otlp.agent".enabled`) with an endpoint from that table or `[openshell.gateway.otlp]`, and recreate the sandbox; `openshell logs <sandbox> --source sandbox` then shows `OTLP agent trace relay enabled` |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |

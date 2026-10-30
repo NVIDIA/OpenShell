@@ -148,6 +148,39 @@ workspace for repeated exec, stop, start, and delete operations. List methods
 return lazy `Pager` instances; use `list_all()` only when you want to fetch the
 complete collection.
 
+## Call Generated RPCs
+
+The generated gRPC stubs include concrete request and response types for synchronous `grpc.Channel` and asynchronous `grpc.aio.Channel` connections. Install the dependency type stubs in your development environment for editor signatures and type checking:
+
+```shell
+uv add --dev types-grpcio 'types-protobuf>=6.32,<7'
+```
+
+Construct `OpenShellStub` with your channel. The channel determines whether calls return responses directly or awaitable gRPC calls:
+
+```python
+import grpc.aio
+
+from openshell._proto import datamodel_pb2 as dm
+from openshell._proto import openshell_pb2 as pb
+from openshell._proto.openshell_pb2_grpc import OpenShellStub
+
+
+async def get_provider(channel: grpc.aio.Channel, name: str) -> pb.ProviderResponse:
+    stub = OpenShellStub(channel)
+    return await stub.GetProvider(
+        pb.GetProviderRequest(
+            workspace_scope=dm.WorkspaceSelector(workspace="default"),
+            name=name,
+        ),
+        timeout=30,
+    )
+```
+
+Your application configures the channel's TLS and authentication, supplies RPC deadlines, and closes the channel. Create and use async channels on the same event loop. Cancellation and gRPC errors propagate directly. Generated stubs do not reuse `SandboxClient` authentication automatically; `SandboxClient` and `ProviderClient` remain synchronous.
+
+If you annotate a stored async stub explicitly, use a deferred annotation such as `"openshell_pb2_grpc.OpenShellAsyncStub"`. That type exists only in the `.pyi` file; construct `OpenShellStub` at runtime. The same convention applies to credential-driver stubs.
+
 ## Implement a Credential Driver
 
 The SDK includes generated message classes, type stubs, and gRPC bindings for

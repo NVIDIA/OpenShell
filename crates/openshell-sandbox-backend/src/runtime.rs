@@ -28,6 +28,7 @@ use openshell_isolation_interface::contract::{
     MediationTiming, PendingDnsQuery, PendingTcpOpen, ProviderEnvironmentInstallation,
     ResolvedWorkloadIdentity, SandboxContext, TcpOpenDecision, TcpOpenDenial,
 };
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -658,7 +659,7 @@ pub fn validate_client_tls(tls: &SandboxTlsClientConfig) -> Result<(), BackendEr
 
 fn tls_client_config(tls: &SandboxTlsClientConfig) -> Result<rustls::ClientConfig, BackendError> {
     openshell_crypto::tls::ensure_default_provider();
-    let certificates = rustls_pemfile::certs(&mut tls.trust_anchor_pem.as_bytes())
+    let certificates = CertificateDer::pem_reader_iter(&mut tls.trust_anchor_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
             BackendError::Descriptor(format!("parse boundary TLS CA certificate: {error}"))
@@ -674,10 +675,12 @@ fn tls_client_config(tls: &SandboxTlsClientConfig) -> Result<rustls::ClientConfi
             BackendError::Descriptor(format!("load boundary TLS CA certificate: {error}"))
         })?;
     }
-    let mut config =
-        openshell_crypto::tls::client_builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+    let mut config = openshell_crypto::tls::try_client_builder_with_protocol_versions(&[
+        &rustls::version::TLS13,
+    ])
+    .map_err(|error| BackendError::Descriptor(format!("configure boundary TLS client: {error}")))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     config.alpn_protocols = vec![b"h2".to_vec()];
     Ok(config)
 }
@@ -3040,6 +3043,7 @@ mod tests {
     mod protocol_errors;
 
     use crate::isolation_protocol::exchange_frame;
+    use rustls::pki_types::PrivateKeyDer;
     use std::path::PathBuf;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -4166,10 +4170,13 @@ mod tests {
         openshell_crypto::tls::ensure_default_provider();
         let material =
             generate_sandbox_tls_material(test_session_id()).expect("generate test material");
-        let certificates = rustls_pemfile::certs(&mut material.certificate_chain_pem.as_bytes())
-            .collect::<Result<Vec<_>, _>>()
-            .expect("parse server certificate");
-        let private_key = rustls_pemfile::private_key(&mut material.private_key_pem.as_bytes())
+        let certificates =
+            CertificateDer::pem_reader_iter(&mut material.certificate_chain_pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .expect("parse server certificate");
+        let private_key = PrivateKeyDer::pem_reader_iter(&mut material.private_key_pem.as_bytes())
+            .next()
+            .transpose()
             .expect("parse server private key")
             .expect("server private key");
         let mut server_config =

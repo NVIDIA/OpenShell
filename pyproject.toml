@@ -49,11 +49,14 @@ dev = [
     "pytest-cov>=4.0",
     "pytest-xdist>=3.0",
     "ruff>=0.4",
-    "ty>=0.0.1a6",
+    "ty>=0.0.94",
     "grpcio-tools>=1.60",
     "pyelftools>=0.30",
     "pyyaml==6.0.2",
     "types-pyyaml>=6.0.12.20260518",
+    "mypy-protobuf>=5.1",
+    "types-grpcio>=1.0.0.20251009",
+    "types-protobuf>=6.32,<7",
 ]
 
 [tool.setuptools]

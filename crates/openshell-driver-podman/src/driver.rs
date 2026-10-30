@@ -109,7 +109,6 @@ fn select_supervisor_ocsf_export(
     config.supervisor_ocsf_export.clone().map(|export| {
         openshell_core::sandbox_env::OcsfOtlpExport {
             endpoint: supervisor_collector_endpoint(&export.endpoint, environment),
-            ..export
         }
     })
 }
@@ -3575,7 +3574,6 @@ mod tests {
     fn supervisor_ocsf_endpoint_uses_host_alias_for_loopback_on_podman_machine() {
         let export = |endpoint: &str| openshell_core::sandbox_env::OcsfOtlpExport {
             endpoint: endpoint.to_string(),
-            schema_version: Some("1.3".to_string()),
         };
         let config = PodmanComputeConfig {
             supervisor_ocsf_export: Some(export("http://127.0.0.1:4317")),

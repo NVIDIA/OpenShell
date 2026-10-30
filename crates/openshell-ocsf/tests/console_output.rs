@@ -51,15 +51,13 @@ fn context() -> EventContext {
 }
 
 #[test]
-fn console_json_toggles_and_downgrades_without_changing_event_identity() {
+fn console_json_toggles_without_changing_event_identity() {
     let records = Records::default();
     let enabled = Arc::new(AtomicBool::new(false));
-    let version = Arc::new(Mutex::new(String::new()));
     let subscriber = tracing_subscriber::registry().with(
         OcsfJsonlLayer::new(records.clone())
             .with_console_format()
-            .with_enabled_flag(enabled.clone())
-            .with_target_version(version.clone()),
+            .with_enabled_flag(enabled.clone()),
     );
     let event = NetworkActivityBuilder::new(&context())
         .dst_endpoint(openshell_ocsf::Endpoint::from_domain("example.com", 443))
@@ -71,18 +69,12 @@ fn console_json_toggles_and_downgrades_without_changing_event_identity() {
         tracing::warn!("diagnostics are not JSON audit events");
         enabled.store(true, Ordering::Relaxed);
         ocsf_emit!(event.clone());
-        *version.lock().unwrap() = "1.3".to_string();
-        ocsf_emit!(event.clone());
         enabled.store(false, Ordering::Relaxed);
         ocsf_emit!(event);
     });
     let records = records.0.lock().unwrap();
-    assert_eq!(records.len(), 2);
+    assert_eq!(records.len(), 1);
     assert_eq!(payload(&records[0]), expected);
-    let downgraded = payload(&records[1]);
-    assert_eq!(downgraded["metadata"]["version"], "1.3");
-    assert_eq!(downgraded["metadata"]["uid"], expected["metadata"]["uid"]);
-    assert_eq!(downgraded["message"], expected["message"]);
 }
 
 #[test]

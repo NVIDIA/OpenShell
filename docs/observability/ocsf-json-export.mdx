@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "OCSF JSON Export"
 sidebar-title: "OCSF JSON Export"
-description: "How to enable full OCSF JSON logging for SIEM integration, compliance, and structured analysis. Includes schema version downgrade for AWS Security Lake, Splunk, and CrowdStrike compatibility."
+description: "How to enable full OCSF JSON logging for SIEM integration, compliance, and structured analysis."
 keywords: "Generative AI, Cybersecurity, OCSF, JSON, SIEM, Compliance, Observability"
 ---
 
@@ -119,7 +119,7 @@ When `ocsf_json_enabled=true`, sandbox supervisors emit full OCSF JSON to stderr
 2026-10-07T23:21:19.000Z OCSF-JSON {"class_uid":4001,...}
 ```
 
-The example payload is abbreviated. Each actual `OCSF-JSON` line contains one complete compact JSON object. Configure your collector to match the `OCSF-JSON` token after the UTC timestamp and decode everything after the following space as JSON. Select these lines to avoid ingesting the shorthand copy of each event. The JSON preserves the original `metadata.uid` and follows `ocsf_schema_version`; with that setting unset, it uses the full native schema.
+The example payload is abbreviated. Each actual `OCSF-JSON` line contains one complete compact JSON object. Configure your collector to match the `OCSF-JSON` token after the UTC timestamp and decode everything after the following space as JSON. Select these lines to avoid ingesting the shorthand copy of each event. The JSON preserves the original `metadata.uid`.
 
 Collect stderr through the supervisor's platform log interface:
 
@@ -153,7 +153,7 @@ Some fields depend on the event class:
 - Process Activity records from the sandbox name the `openshell-sandbox` launcher as `actor.process`.
 - `connection_info` carries `direction_id` and `direction`. OpenShell reports Unknown (`0`) where it does not track the direction.
 
-Each JSONL file line, or the payload after the stderr marker, is a complete OCSF v1.8.0 JSON object when no downgrade is configured. Records validate against OCSF v1.8.0. Here is an example of a network connection event:
+Each JSONL file line, or the payload after the stderr marker, is a complete OCSF v1.8.0 JSON object. Records validate against OCSF v1.8.0. Here is an example of a network connection event:
 
 ```json
 {
@@ -310,66 +310,9 @@ failures without an observed network endpoint, use Base Event (`class_uid: 0`).
 Include these classes when filtering supervisor operational events. Relay-control
 records that previously appeared as `NET:*` now appear as `EVENT`.
 
-## SIEM Schema Version Compatibility
+## Schema Version
 
-OpenShell emits OCSF v1.8.0 events internally, but many SIEMs only support older schema versions. The `ocsf_schema_version` setting tells the JSONL layer to downgrade events before writing, stripping fields and profiles that don't exist in the target version.
-
-For gateway JSONL, set `schema_version` on the output destination. The target applies uniformly to every record written to that file and requires a gateway restart:
-
-```toml
-[openshell.gateway.ocsf_log]
-path = "/var/log/openshell/gateway-ocsf.jsonl"
-schema_version = "1.3"
-```
-
-The sandbox-scoped setting below controls the legacy supervisor-local JSONL file only.
-
-Set the target version globally:
-
-```shell
-openshell settings set --global --key ocsf_schema_version --value "1.1"
-```
-
-Or per-sandbox:
-
-```shell
-openshell settings set my-sandbox --key ocsf_schema_version --value "1.3"
-```
-
-The setting takes effect on the next poll cycle, by default every 10 seconds. No sandbox restart is required.
-
-Supported target versions are `1.1` and `1.3`. When set, the JSONL layer applies the following transformations:
-
-- Strips fields added after the target version: `ai_model`, `device.container`, `observation_point_id`
-- Removes unknown profile names from `metadata.profiles`: `ai_operation`, `container`
-- Rewrites `metadata.version` to match the target version
-
-The shorthand log output is unaffected. The internal event model stays at v1.8.0; only the serialized JSONL is transformed.
-
-When unset or empty, no downgrade is applied and events are written at the current schema version.
-
-| SIEM | Required OCSF Version | `ocsf_schema_version` Value |
-|---|---|---|
-| AWS Security Lake | v1.1.0 | `1.1` |
-| Splunk CIM Add-On | v1.1-v1.3 | `1.1` or `1.3` |
-| CrowdStrike FDR | v1.5.0 | Not yet supported |
-| Datadog Cloud SIEM | v1.5.0 (selectable) | Not yet supported |
-
-<Warning>
-Downgrading is lossy. The `ai_model` field and `ai_operation` profile are stripped for v1.1 and v1.3 targets, so AI model attribution is not present in downgraded events. If your audit workflow requires knowing which model handled a request, use the full schema version (leave `ocsf_schema_version` unset). OpenShell supports OCSF v1.8.0 natively; upgrade your SIEM's OCSF schema if you need AI attribution alongside backward-compatible ingestion.
-</Warning>
-
-Downgraded events include a `downgraded_from` marker in the `unmapped` object so auditors can distinguish "no model was involved" from "model attribution was stripped":
-
-```json
-{
-  "unmapped": {
-    "downgraded_from": "1.8.0"
-  }
-}
-```
-
-The core OCSF event structure (class UIDs, activity IDs, network and HTTP fields) is identical across v1.1 through v1.8. The stripped fields are all profile-gated additions.
+OpenShell emits OCSF v1.8.0 only. The `ocsf_schema_version` sandbox setting and the gateway `schema_version` fields under `[openshell.gateway.ocsf_log]` and `[openshell.gateway.otlp.ocsf]` are deprecated and ignored; remove them from your configuration. The gateway logs a warning at startup for each field that is set, and a sandbox reports a set `ocsf_schema_version` as a Device Config State Change event.
 
 ## Integration with External Tools
 
@@ -377,9 +320,9 @@ The JSONL file can be shipped to any tool that accepts OCSF-formatted data:
 
 | Tool | Integration Path |
 |---|---|
-| Splunk | Use the [Splunk OCSF Add-on](https://splunkbase.splunk.com/app/6943) to ingest OCSF JSONL files. Set `ocsf_schema_version` to `1.3` for CIM Add-On compatibility. |
-| Amazon Security Lake | OCSF is the native schema for Security Lake. Set `ocsf_schema_version` to `1.1` for v1.1.0 compatibility. |
-| CrowdStrike FDR | Ship JSONL files to Falcon Data Replicator. v1.5 downgrade target is not yet supported. |
+| Splunk | Use the [Splunk OCSF Add-on](https://splunkbase.splunk.com/app/6943) to ingest OCSF JSONL files. |
+| Amazon Security Lake | OCSF is the native schema for Security Lake. |
+| CrowdStrike FDR | Ship JSONL files to Falcon Data Replicator. |
 | Elastic | Use Filebeat to ship JSONL files with the OCSF field mappings. |
 | Custom pipelines | Parse the JSONL file with `jq`, Python, or any JSON-capable tool. |
 
@@ -393,7 +336,7 @@ jq -c 'select(.action == "Denied")' ./supervisor-logs/openshell-ocsf.*.jsonl
 
 Sandbox events identify the sandbox environment with `device.type_id: 99` (Other) and `device.type: "Sandbox"`. The operating system is reported separately in `device.os.name`; the device type does not classify the underlying host or compute backend.
 
-The shorthand format in `openshell.YYYY-MM-DD.log` and the JSON format in `openshell-ocsf.YYYY-MM-DD.jsonl` are derived from the same OCSF events. The shorthand is a human-readable projection; the JSON is the full structured record when no schema downgrade is configured. When `ocsf_schema_version` is set, the JSON export is a lossy projection of the internal event model. Both formats are generated at the same time from the same event data.
+The shorthand format in `openshell.YYYY-MM-DD.log` and the JSON format in `openshell-ocsf.YYYY-MM-DD.jsonl` are derived from the same OCSF events. The shorthand is a human-readable projection; the JSON is the full structured record. Both formats are generated at the same time from the same event data.
 
 Shorthand stderr output follows the diagnostic log filter; its local file is available when file logging starts successfully. JSON stderr and file export are opt-in through `ocsf_json_enabled`. File export requires the supervisor's JSONL sink to start successfully; stderr export is independent of that sink.
 

@@ -4810,7 +4810,11 @@ mod tests {
         let launching = fixture.replica("gw-b");
         let (pass, launched) = tokio::join!(
             pool.reconcile_once(),
-            launching.place_launch(launch("rt-route-new0", "sandbox-new", "generation-1")),
+            Box::pin(launching.place_launch(launch(
+                "rt-route-new0",
+                "sandbox-new",
+                "generation-1"
+            ))),
         );
         pass.unwrap();
         // Every route is re-adopted by the new process at the next term,

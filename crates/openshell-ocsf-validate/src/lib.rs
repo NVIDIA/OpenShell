@@ -375,9 +375,9 @@ mod tests {
     #[test]
     fn rejects_versions_without_vendored_schemas() {
         let mut event = base_event();
-        event["metadata"]["version"] = json!("1.1.0");
+        event["metadata"]["version"] = json!("2.0.0");
         assert!(
-            matches!(validate_event(&event), Err(Error::UnsupportedVersion(found)) if found == "1.1.0")
+            matches!(validate_event(&event), Err(Error::UnsupportedVersion(found)) if found == "2.0.0")
         );
     }
 

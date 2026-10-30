@@ -13,6 +13,7 @@ import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 const defaultPollInterval = 500 * time.Millisecond
@@ -116,10 +117,28 @@ func validateTemplateCreateSpec(spec *SandboxSpec) error {
 }
 
 func (s *sandboxClient) Get(ctx context.Context, workspace, name string) (*Sandbox, error) {
+	return s.get(ctx, workspace, name)
+}
+
+// getWithOwner is Get that also asks the gateway for the owner replica.
+func (s *sandboxClient) getWithOwner(ctx context.Context, workspace, name string) (*Sandbox, string, error) {
+	var md metadata.MD
+	sb, err := s.get(metadata.AppendToOutgoingContext(ctx, ownerRequestHeader, "1"), workspace, name, grpc.Header(&md))
+	if err != nil {
+		return nil, "", err
+	}
+	var owner string
+	if v := md.Get(ownerReplicaHeader); len(v) > 0 {
+		owner = v[0]
+	}
+	return sb, owner, nil
+}
+
+func (s *sandboxClient) get(ctx context.Context, workspace, name string, opts ...grpc.CallOption) (*Sandbox, error) {
 	resp, err := s.client.GetSandbox(ctx, &pb.GetSandboxRequest{
 		Name:           name,
 		WorkspaceScope: namedWorkspaceScope(workspace),
-	})
+	}, opts...)
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
