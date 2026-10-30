@@ -10,6 +10,7 @@ use tracing::info;
 
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_core::sandbox_env::{OtlpExport, OtlpProtocol, SupervisorOtlp};
 use openshell_driver_kubernetes::{
     ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
     KubernetesComputeConfig, KubernetesComputeDriver, KubernetesImagePullPolicy,
@@ -45,18 +46,30 @@ struct Args {
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
 
-    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
+    /// Transport to the trace collector: `grpc` or `http/protobuf`.
+    #[arg(long, env = "OPENSHELL_OTLP_PROTOCOL", default_value_t)]
+    otlp_protocol: OtlpProtocol,
+
+    /// OTLP collector endpoint for supervisor OCSF event export.
     #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
     otlp_ocsf_endpoint: Option<String>,
+
+    /// Transport to the OCSF collector: `grpc` or `http/protobuf`.
+    #[arg(long, env = "OPENSHELL_OTLP_OCSF_PROTOCOL", default_value_t)]
+    otlp_ocsf_protocol: OtlpProtocol,
 
     /// Deprecated and ignored: `OpenShell` emits OCSF 1.8.0 only.
     #[arg(long, env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION", hide = true)]
     otlp_ocsf_schema_version: Option<String>,
 
-    /// OTLP/gRPC collector endpoint that supervisors relay workload traces
-    /// to. Absent keeps the agent trace relay off.
+    /// OTLP collector endpoint that supervisors relay workload traces to.
+    /// Absent keeps the agent trace relay off.
     #[arg(long, env = "OPENSHELL_OTLP_AGENT_ENDPOINT")]
     otlp_agent_endpoint: Option<String>,
+
+    /// Transport to the agent trace relay's collector: `grpc` or `http/protobuf`.
+    #[arg(long, env = "OPENSHELL_OTLP_AGENT_PROTOCOL", default_value_t)]
+    otlp_agent_protocol: OtlpProtocol,
 
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
@@ -209,6 +222,21 @@ struct Args {
     sandbox_gid: Option<u32>,
 }
 
+impl Args {
+    fn supervisor_otlp(&self) -> SupervisorOtlp {
+        let export = |endpoint: &Option<String>, protocol| {
+            endpoint
+                .clone()
+                .map(|endpoint| OtlpExport { endpoint, protocol })
+        };
+        SupervisorOtlp {
+            traces: export(&self.otlp_endpoint, self.otlp_protocol),
+            ocsf: export(&self.otlp_ocsf_endpoint, self.otlp_ocsf_protocol),
+            agent: export(&self.otlp_agent_endpoint, self.otlp_agent_protocol),
+        }
+    }
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -239,6 +267,7 @@ async fn main() -> Result<()> {
         openshell_driver_kubernetes::otel_tracing::TRACING,
         openshell_otel::DriverTracingConfig {
             endpoint: args.otlp_endpoint.as_deref(),
+            protocol: args.otlp_protocol.into(),
             gateway_name: args.gateway_name.as_deref(),
             service_version: VERSION,
             log_level: &args.log_level,
@@ -263,6 +292,7 @@ async fn main() -> Result<()> {
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
 
+    let supervisor_otlp = args.supervisor_otlp();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let driver = KubernetesComputeDriver::new(
         KubernetesComputeConfig {
@@ -303,13 +333,8 @@ async fn main() -> Result<()> {
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
             proxy_ca_bundle: args.proxy_ca_bundle,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
-            supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
-            supervisor_otlp_agent_endpoint: args.otlp_agent_endpoint.clone(),
+            supervisor_otlp,
             supervisor_gateway_name: args.gateway_name.clone(),
-            supervisor_ocsf_export: args
-                .otlp_ocsf_endpoint
-                .clone()
-                .map(|endpoint| openshell_core::sandbox_env::OcsfOtlpExport { endpoint }),
             ssh_socket_path: args.sandbox_ssh_socket_path,
             client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
             host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
@@ -384,6 +409,16 @@ mod tests {
             "openshell-driver-kubernetes",
             "--otlp-endpoint",
             "http://collector.example:4317",
+            "--otlp-ocsf-endpoint",
+            "http://siem.example:4318",
+            "--otlp-ocsf-protocol",
+            "http/protobuf",
+            "--otlp-ocsf-schema-version",
+            "2.0",
+            "--otlp-agent-endpoint",
+            "http://agents.example:4318",
+            "--otlp-agent-protocol",
+            "http/protobuf",
             "--gateway-name",
             "kubernetes-dev",
         ])
@@ -394,5 +429,22 @@ mod tests {
             Some("http://collector.example:4317")
         );
         assert_eq!(args.gateway_name.as_deref(), Some("kubernetes-dev"));
+        assert_eq!(
+            args.supervisor_otlp(),
+            SupervisorOtlp {
+                traces: Some(OtlpExport {
+                    endpoint: "http://collector.example:4317".into(),
+                    protocol: OtlpProtocol::Grpc,
+                }),
+                ocsf: Some(OtlpExport {
+                    endpoint: "http://siem.example:4318".into(),
+                    protocol: OtlpProtocol::HttpProtobuf,
+                }),
+                agent: Some(OtlpExport {
+                    endpoint: "http://agents.example:4318".into(),
+                    protocol: OtlpProtocol::HttpProtobuf,
+                }),
+            }
+        );
     }
 }

@@ -11,6 +11,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true, features = ["tokio"] }
 openshell-otel = { path = "../openshell-otel" }
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "logs", "trace"] }
 prost = { workspace = true }

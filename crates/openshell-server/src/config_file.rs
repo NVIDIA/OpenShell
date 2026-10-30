@@ -29,6 +29,7 @@ use base64::Engine as _;
 use openshell_core::proto::{
     SupervisorMiddlewareBinding, SupervisorMiddlewareBindingPolicy, SupervisorMiddlewareService,
 };
+use openshell_core::sandbox_env::OtlpProtocol;
 use openshell_core::{
     ExtensionBindingPolicy, GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
     GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig,
@@ -380,29 +381,85 @@ fn serialize_enabled<T: Serialize, S: serde::Serializer>(
 impl OtlpConfig {
     /// The collector that receives traces, when trace export is enabled.
     pub fn traces_endpoint(&self) -> Option<&str> {
-        self.traces.as_ref().map(|traces| traces.endpoint.as_str())
+        self.traces
+            .as_ref()
+            .map(|traces| traces.collector.endpoint.as_str())
     }
 
     /// The collector that receives relayed workload traces, when the agent
     /// trace relay is enabled.
     pub fn agent_endpoint(&self) -> Option<&str> {
-        self.agent.as_ref().map(|agent| agent.endpoint.as_str())
+        self.agent
+            .as_ref()
+            .map(|agent| agent.collector.endpoint.as_str())
     }
+
+    /// The exports that compute drivers pass to supervisors.
+    pub fn supervisor_otlp(&self) -> openshell_core::sandbox_env::SupervisorOtlp {
+        openshell_core::sandbox_env::SupervisorOtlp {
+            traces: self.traces.as_ref().map(|traces| traces.collector.export()),
+            ocsf: self.ocsf.as_ref().map(|ocsf| ocsf.collector.export()),
+            agent: self.agent.as_ref().map(|agent| agent.collector.export()),
+        }
+    }
+}
+
+/// One OTLP collector. A lane table with its own `endpoint` describes its
+/// own collector; one without inherits the whole `[openshell.gateway.otlp]`
+/// collector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OtlpCollectorConfig {
+    /// Collector endpoint, e.g.
+    /// `http://otel-collector.observability.svc:4317`.
+    pub endpoint: String,
+
+    /// Transport to the collector. Defaults to gRPC.
+    #[serde(default, skip_serializing_if = "is_grpc")]
+    pub protocol: OtlpProtocol,
+}
+
+impl OtlpCollectorConfig {
+    /// Rejects an `https://` endpoint for `http/protobuf`, which has no TLS.
+    fn checked(self, table: &str) -> Result<Self, String> {
+        let https = self
+            .endpoint
+            .trim()
+            .get(..8)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"));
+        if https && self.protocol == OtlpProtocol::HttpProtobuf {
+            return Err(format!(
+                "{table} uses an https:// endpoint, which http/protobuf does not support"
+            ));
+        }
+        Ok(self)
+    }
+
+    fn export(&self) -> openshell_core::sandbox_env::OtlpExport {
+        openshell_core::sandbox_env::OtlpExport {
+            endpoint: self.endpoint.clone(),
+            protocol: self.protocol,
+        }
+    }
+}
+
+// Signature dictated by serde's `skip_serializing_if`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_grpc(protocol: &OtlpProtocol) -> bool {
+    *protocol == OtlpProtocol::Grpc
 }
 
 /// `[openshell.gateway.otlp.traces]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OtlpTracesConfig {
-    /// OTLP/gRPC collector endpoint, e.g.
-    /// `http://otel-collector.observability.svc:4317`.
-    pub endpoint: String,
+    #[serde(flatten)]
+    pub collector: OtlpCollectorConfig,
 }
 
 /// `[openshell.gateway.otlp.ocsf]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OcsfOtlpConfig {
-    /// OTLP/gRPC collector endpoint for OCSF log records.
-    pub endpoint: String,
+    #[serde(flatten)]
+    pub collector: OtlpCollectorConfig,
 
     /// Deprecated and ignored: `OpenShell` emits OCSF 1.8.0 only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -412,9 +469,9 @@ pub struct OcsfOtlpConfig {
 /// `[openshell.gateway.otlp.agent]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentOtlpConfig {
-    /// OTLP/gRPC collector endpoint that sandbox supervisors forward
-    /// workload traces to.
-    pub endpoint: String,
+    /// The collector that sandbox supervisors forward workload traces to.
+    #[serde(flatten)]
+    pub collector: OtlpCollectorConfig,
 }
 
 #[derive(Deserialize)]
@@ -422,6 +479,8 @@ pub struct AgentOtlpConfig {
 struct RawOtlpConfig {
     #[serde(default)]
     endpoint: Option<String>,
+    #[serde(default)]
+    protocol: Option<OtlpProtocol>,
     #[serde(default)]
     service_name: Option<String>,
     #[serde(default)]
@@ -439,6 +498,8 @@ struct RawAgentOtlp {
     enabled: bool,
     #[serde(default)]
     endpoint: Option<String>,
+    #[serde(default)]
+    protocol: Option<OtlpProtocol>,
 }
 
 #[derive(Deserialize)]
@@ -446,6 +507,8 @@ struct RawAgentOtlp {
 struct RawOtlpTraces {
     #[serde(default)]
     endpoint: Option<String>,
+    #[serde(default)]
+    protocol: Option<OtlpProtocol>,
 }
 
 #[derive(Deserialize)]
@@ -456,6 +519,8 @@ struct RawOcsfOtlp {
     #[serde(default)]
     endpoint: Option<String>,
     #[serde(default)]
+    protocol: Option<OtlpProtocol>,
+    #[serde(default)]
     schema_version: Option<String>,
 }
 
@@ -463,22 +528,52 @@ impl TryFrom<RawOtlpConfig> for OtlpConfig {
     type Error = String;
 
     fn try_from(raw: RawOtlpConfig) -> Result<Self, Self::Error> {
-        let endpoint_for = |table: &str, endpoint: Option<String>| {
-            endpoint.or_else(|| raw.endpoint.clone()).ok_or_else(|| {
-                format!("otlp.{table} needs an endpoint, or otlp.endpoint to default to")
-            })
-        };
-        let traces = match raw.traces {
-            Some(traces) => Some(endpoint_for("traces", traces.endpoint)?),
-            None => raw.endpoint.clone(),
+        if raw.endpoint.is_none() && raw.protocol.is_some() {
+            return Err(
+                "otlp sets protocol without its own endpoint; a table with its own \
+                 endpoint takes nothing from otlp"
+                    .to_string(),
+            );
         }
-        .map(|endpoint| OtlpTracesConfig { endpoint });
+        let shared = raw
+            .endpoint
+            .clone()
+            .map(|endpoint| {
+                OtlpCollectorConfig {
+                    endpoint,
+                    protocol: raw.protocol.unwrap_or_default(),
+                }
+                .checked("otlp")
+            })
+            .transpose()?;
+        let collector_for =
+            |table: &str, endpoint: Option<String>, protocol: Option<OtlpProtocol>| match (
+                endpoint, protocol,
+            ) {
+                (Some(endpoint), protocol) => OtlpCollectorConfig {
+                    endpoint,
+                    protocol: protocol.unwrap_or_default(),
+                }
+                .checked(&format!("otlp.{table}")),
+                (None, Some(_)) => Err(format!(
+                    "otlp.{table} sets protocol without its own endpoint; a table without \
+                     an endpoint inherits the whole otlp collector"
+                )),
+                (None, None) => shared.clone().ok_or_else(|| {
+                    format!("otlp.{table} needs an endpoint, or otlp.endpoint to default to")
+                }),
+            };
+        let traces = match raw.traces {
+            Some(traces) => Some(collector_for("traces", traces.endpoint, traces.protocol)?),
+            None => shared.clone(),
+        }
+        .map(|collector| OtlpTracesConfig { collector });
         let ocsf = raw
             .ocsf
             .filter(|ocsf| ocsf.enabled)
             .map(|ocsf| {
                 Ok::<_, String>(OcsfOtlpConfig {
-                    endpoint: endpoint_for("ocsf", ocsf.endpoint)?,
+                    collector: collector_for("ocsf", ocsf.endpoint, ocsf.protocol)?,
                     schema_version: ocsf.schema_version,
                 })
             })
@@ -488,7 +583,7 @@ impl TryFrom<RawOtlpConfig> for OtlpConfig {
             .filter(|agent| agent.enabled)
             .map(|agent| {
                 Ok::<_, String>(AgentOtlpConfig {
-                    endpoint: endpoint_for("agent", agent.endpoint)?,
+                    collector: collector_for("agent", agent.endpoint, agent.protocol)?,
                 })
             })
             .transpose()?;
@@ -1498,7 +1593,10 @@ service_name = "openshell-gateway-dev"
         assert_eq!(
             otlp.ocsf,
             Some(OcsfOtlpConfig {
-                endpoint: "http://127.0.0.1:4317".into(),
+                collector: OtlpCollectorConfig {
+                    endpoint: "http://127.0.0.1:4317".into(),
+                    protocol: OtlpProtocol::Grpc,
+                },
                 schema_version: None,
             })
         );
@@ -1515,7 +1613,10 @@ service_name = "openshell-gateway-dev"
         assert_eq!(
             otlp.ocsf,
             Some(OcsfOtlpConfig {
-                endpoint: "http://siem:4317".into(),
+                collector: OtlpCollectorConfig {
+                    endpoint: "http://siem:4317".into(),
+                    protocol: OtlpProtocol::Grpc,
+                },
                 schema_version: None,
             })
         );
@@ -1538,7 +1639,7 @@ service_name = "openshell-gateway-dev"
             otlp("[openshell.gateway.otlp.ocsf]\nenabled = true\nendpoint = 'http://siem:4317'\n");
         assert_eq!(otlp.traces_endpoint(), None);
         assert_eq!(
-            otlp.ocsf.map(|ocsf| ocsf.endpoint).as_deref(),
+            otlp.ocsf.map(|ocsf| ocsf.collector.endpoint).as_deref(),
             Some("http://siem:4317")
         );
     }
@@ -1596,11 +1697,101 @@ service_name = "openshell-gateway-dev"
     }
 
     #[test]
+    fn otlp_lanes_inherit_the_whole_shared_collector_or_none_of_it() {
+        use openshell_core::sandbox_env::{OtlpExport, SupervisorOtlp};
+
+        let export = |endpoint: &str, protocol| {
+            Some(OtlpExport {
+                endpoint: endpoint.into(),
+                protocol,
+            })
+        };
+        let shared = otlp(
+            "[openshell.gateway.otlp]\nendpoint = 'http://shared:4318'\n\
+             protocol = 'http/protobuf'\n\n\
+             [openshell.gateway.otlp.ocsf]\nenabled = true\n\n\
+             [openshell.gateway.otlp.agent]\nenabled = true\nendpoint = 'http://agents:4317'\n",
+        );
+        assert_eq!(
+            shared.supervisor_otlp(),
+            SupervisorOtlp {
+                traces: export("http://shared:4318", OtlpProtocol::HttpProtobuf),
+                ocsf: export("http://shared:4318", OtlpProtocol::HttpProtobuf),
+                agent: export("http://agents:4317", OtlpProtocol::Grpc),
+            },
+            "lanes without an endpoint inherit the shared protocol; a lane \
+             with its own endpoint does not"
+        );
+
+        let separate = otlp(
+            "[openshell.gateway.otlp.traces]\nendpoint = 'http://traces:4318'\n\
+             protocol = 'http/protobuf'\n\n\
+             [openshell.gateway.otlp.agent]\nenabled = true\nendpoint = 'http://agents:4318'\n\
+             protocol = 'http/protobuf'\n",
+        );
+        assert_eq!(
+            separate.supervisor_otlp(),
+            SupervisorOtlp {
+                traces: export("http://traces:4318", OtlpProtocol::HttpProtobuf),
+                agent: export("http://agents:4318", OtlpProtocol::HttpProtobuf),
+                ..SupervisorOtlp::default()
+            }
+        );
+    }
+
+    #[test]
+    fn otlp_lane_protocol_needs_its_own_endpoint() {
+        for table in [
+            "[openshell.gateway.otlp.traces]\nprotocol = 'http/protobuf'\n",
+            "[openshell.gateway.otlp.ocsf]\nenabled = true\nprotocol = 'http/protobuf'\n",
+            "[openshell.gateway.otlp.agent]\nenabled = true\nprotocol = 'http/protobuf'\n",
+        ] {
+            let tmp = write_tmp(&format!(
+                "[openshell.gateway.otlp]\nendpoint = 'http://shared:4317'\n\n{table}"
+            ));
+            let error = load(tmp.path()).expect_err("protocol without endpoint");
+            assert!(
+                format!("{error:#}").contains("protocol without its own endpoint"),
+                "{table}: {error:#}"
+            );
+        }
+        let tmp = write_tmp(
+            "[openshell.gateway.otlp]\nprotocol = 'http/protobuf'\n\n\
+             [openshell.gateway.otlp.traces]\nendpoint = 'http://traces:4318'\n",
+        );
+        let error = load(tmp.path()).expect_err("a shared protocol without a shared endpoint");
+        assert!(
+            format!("{error:#}").contains("otlp sets protocol without its own endpoint"),
+            "{error:#}"
+        );
+        let tmp = write_tmp(
+            "[openshell.gateway.otlp.agent]\nenabled = true\n\
+             endpoint = 'http://agents:4318'\nprotocol = 'http/json'\n",
+        );
+        let error = load(tmp.path()).expect_err("http/json is not supported");
+        assert!(format!("{error:#}").contains("http/json"), "{error:#}");
+
+        for table in [
+            "[openshell.gateway.otlp]\nendpoint = 'https://shared:4318'\nprotocol = 'http/protobuf'\n",
+            "[openshell.gateway.otlp.agent]\nenabled = true\nendpoint = 'HTTPS://agents:4318'\n\
+             protocol = 'http/protobuf'\n",
+        ] {
+            let tmp = write_tmp(table);
+            let error = load(tmp.path()).expect_err("https is not supported over http/protobuf");
+            assert!(
+                format!("{error:#}").contains("which http/protobuf does not support"),
+                "{table}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn otlp_config_round_trips() {
         let tmp = write_tmp(
             "[openshell.gateway.otlp]\nendpoint = 'http://shared:4317'\nservice_name = 'gw'\n\n\
              [openshell.gateway.otlp.ocsf]\nenabled = true\n\n\
-             [openshell.gateway.otlp.agent]\nenabled = true\nendpoint = 'http://agents:4317'\n",
+             [openshell.gateway.otlp.agent]\nenabled = true\nendpoint = 'http://agents:4318'\n\
+             protocol = 'http/protobuf'\n",
         );
         let file = load(tmp.path()).unwrap();
         let encoded = toml::to_string(&file).unwrap();

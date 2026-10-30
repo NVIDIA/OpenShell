@@ -307,6 +307,7 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         takeover: None,
         supervisor_recovery_timeout_secs: None,
         otlp_agent_endpoint: None,
+        otlp_agent_protocol: openshell_core::sandbox_env::OtlpProtocol::Grpc,
     };
     let bindings = SandboxInstanceBindings::dedicated(
         &config,

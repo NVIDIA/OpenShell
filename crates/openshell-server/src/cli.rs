@@ -849,10 +849,14 @@ async fn run_from_args(
             "OTLP exporting is configured but could not be started; continuing without it"
         );
     } else if let Some(otlp) = &otlp_export {
+        let [traces_protocol, ocsf_protocol, agent_protocol] = otlp.protocols();
         info!(
             traces_endpoint = otlp.traces_endpoint().map(tracing::field::display),
+            traces_protocol = traces_protocol.map(tracing::field::display),
             ocsf_endpoint = otlp.ocsf_endpoint().map(tracing::field::display),
+            ocsf_protocol = ocsf_protocol.map(tracing::field::display),
             agent_endpoint = otlp.agent_endpoint().map(tracing::field::display),
+            agent_protocol = agent_protocol.map(tracing::field::display),
             "OTLP exporting enabled"
         );
     }

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use tracing::info;
 
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_core::sandbox_env::{OtlpExport, OtlpProtocol, SupervisorOtlp};
 use openshell_core::{AppArmorProfile, ImagePullPolicy, VERSION};
 use openshell_driver_podman::config::{DEFAULT_NETWORK_NAME, DEFAULT_PODMAN_STOP_TIMEOUT_SECS};
 use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanComputeDriver};
@@ -42,18 +43,30 @@ struct Args {
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
 
-    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
+    /// Transport to the trace collector: `grpc` or `http/protobuf`.
+    #[arg(long, env = "OPENSHELL_OTLP_PROTOCOL", default_value_t)]
+    otlp_protocol: OtlpProtocol,
+
+    /// OTLP collector endpoint for supervisor OCSF event export.
     #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
     otlp_ocsf_endpoint: Option<String>,
+
+    /// Transport to the OCSF collector: `grpc` or `http/protobuf`.
+    #[arg(long, env = "OPENSHELL_OTLP_OCSF_PROTOCOL", default_value_t)]
+    otlp_ocsf_protocol: OtlpProtocol,
 
     /// Deprecated and ignored: `OpenShell` emits OCSF 1.8.0 only.
     #[arg(long, env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION", hide = true)]
     otlp_ocsf_schema_version: Option<String>,
 
-    /// OTLP/gRPC collector endpoint that supervisors relay workload traces
-    /// to. Absent keeps the agent trace relay off.
+    /// OTLP collector endpoint that supervisors relay workload traces to.
+    /// Absent keeps the agent trace relay off.
     #[arg(long, env = "OPENSHELL_OTLP_AGENT_ENDPOINT")]
     otlp_agent_endpoint: Option<String>,
+
+    /// Transport to the agent trace relay's collector: `grpc` or `http/protobuf`.
+    #[arg(long, env = "OPENSHELL_OTLP_AGENT_PROTOCOL", default_value_t)]
+    otlp_agent_protocol: OtlpProtocol,
 
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
@@ -215,6 +228,21 @@ struct Args {
     enable_bind_mounts: bool,
 }
 
+impl Args {
+    fn supervisor_otlp(&self) -> SupervisorOtlp {
+        let export = |endpoint: &Option<String>, protocol| {
+            endpoint
+                .clone()
+                .map(|endpoint| OtlpExport { endpoint, protocol })
+        };
+        SupervisorOtlp {
+            traces: export(&self.otlp_endpoint, self.otlp_protocol),
+            ocsf: export(&self.otlp_ocsf_endpoint, self.otlp_ocsf_protocol),
+            agent: export(&self.otlp_agent_endpoint, self.otlp_agent_protocol),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -222,6 +250,7 @@ async fn main() -> Result<()> {
         openshell_driver_podman::otel_tracing::TRACING,
         openshell_otel::DriverTracingConfig {
             endpoint: args.otlp_endpoint.as_deref(),
+            protocol: args.otlp_protocol.into(),
             gateway_name: args.gateway_name.as_deref(),
             service_version: VERSION,
             log_level: &args.log_level,
@@ -233,6 +262,7 @@ async fn main() -> Result<()> {
         );
     }
 
+    let supervisor_otlp = args.supervisor_otlp();
     // External drivers have no gateway-local staged artifact. Do not accept
     // a path or silently emulate destination-CA delivery outside the gateway.
     let driver = PodmanComputeDriver::new(
@@ -243,13 +273,8 @@ async fn main() -> Result<()> {
             default_image: args.sandbox_image.unwrap_or_default(),
             image_pull_policy: args.sandbox_image_pull_policy,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
-            supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
-            supervisor_otlp_agent_endpoint: args.otlp_agent_endpoint.clone(),
+            supervisor_otlp,
             supervisor_gateway_name: args.gateway_name.clone(),
-            supervisor_ocsf_export: args
-                .otlp_ocsf_endpoint
-                .clone()
-                .map(|endpoint| openshell_core::sandbox_env::OcsfOtlpExport { endpoint }),
             gateway_port: args.gateway_port,
             host_gateway_ip: args
                 .host_gateway_ip
@@ -367,6 +392,16 @@ mod tests {
             "openshell-driver-podman",
             "--otlp-endpoint",
             "http://collector.internal:4317",
+            "--otlp-ocsf-endpoint",
+            "http://siem.internal:4318",
+            "--otlp-ocsf-protocol",
+            "http/protobuf",
+            "--otlp-ocsf-schema-version",
+            "2.0",
+            "--otlp-agent-endpoint",
+            "http://agents.internal:4318",
+            "--otlp-agent-protocol",
+            "http/protobuf",
             "--gateway-name",
             "production-us-west",
         ])
@@ -377,6 +412,23 @@ mod tests {
             Some("http://collector.internal:4317")
         );
         assert_eq!(args.gateway_name.as_deref(), Some("production-us-west"));
+        assert_eq!(
+            args.supervisor_otlp(),
+            SupervisorOtlp {
+                traces: Some(OtlpExport {
+                    endpoint: "http://collector.internal:4317".into(),
+                    protocol: OtlpProtocol::Grpc,
+                }),
+                ocsf: Some(OtlpExport {
+                    endpoint: "http://siem.internal:4318".into(),
+                    protocol: OtlpProtocol::HttpProtobuf,
+                }),
+                agent: Some(OtlpExport {
+                    endpoint: "http://agents.internal:4318".into(),
+                    protocol: OtlpProtocol::HttpProtobuf,
+                }),
+            }
+        );
     }
 
     #[test]

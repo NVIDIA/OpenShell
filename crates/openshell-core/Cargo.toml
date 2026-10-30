@@ -58,8 +58,10 @@ telemetry = ["dep:reqwest", "dep:chrono", "reqwest?/blocking"]
 oauth = ["dep:reqwest"]
 ## Strict Ed25519 JWT issuance and verification for authenticated sandbox sessions.
 jwt = ["dep:jsonwebtoken", "dep:zeroize"]
+## Conversions to `openshell-otel` types.
+otel = ["dep:openshell-otel"]
 ## Propagate the active W3C trace context on supervisor gateway calls.
-trace-context = ["dep:openshell-otel"]
+trace-context = ["otel"]
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

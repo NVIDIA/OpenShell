@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OTLP/gRPC log export support.
+//! OTLP log export support.
 
 use http::{HeaderMap, HeaderName, HeaderValue};
 use opentelemetry_otlp::tonic_types::metadata::MetadataMap;
-use opentelemetry_otlp::{LogExporter, WithTonicConfig};
+use opentelemetry_otlp::{LogExporter, WithExportConfig, WithHttpConfig, WithTonicConfig};
 
-use crate::{OtlpTarget, SetupError};
+use crate::{OtlpHttpClient, OtlpTarget, Protocol, SetupError};
 
 impl OtlpTarget {
     /// Build a log exporter for this target. Callers attach
@@ -23,19 +23,37 @@ impl OtlpTarget {
         &self,
         headers: Option<&str>,
     ) -> Result<LogExporter, SetupError> {
-        let mut builder = self.configure(LogExporter::builder().with_tonic());
-        if let Some(headers) = headers {
-            builder = builder.with_metadata(header_metadata(headers));
+        let headers = headers.map(parse_headers).unwrap_or_default();
+        match self.protocol {
+            Protocol::Grpc => Ok(self
+                .configure(LogExporter::builder().with_tonic())
+                .with_metadata(MetadataMap::from_headers(headers))
+                .build()?),
+            Protocol::HttpProtobuf => Ok(LogExporter::builder()
+                .with_http()
+                .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+                .with_endpoint(self.http_signal_url("v1/logs")?)
+                .with_http_client(OtlpHttpClient::new(crate::transport::export_timeout(
+                    "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
+                ))?)
+                .with_headers(
+                    headers
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            Some((name.to_string(), value.to_str().ok()?.to_string()))
+                        })
+                        .collect(),
+                )
+                .build()?),
         }
-        Ok(builder.build()?)
     }
 }
 
 /// Parse headers the way the SDK parses `OTEL_EXPORTER_OTLP_HEADERS`:
 /// comma-separated `key=value` pairs with percent-encoded values. Entries
-/// that are empty or not valid gRPC metadata are skipped.
-fn header_metadata(headers: &str) -> MetadataMap {
-    let mut metadata = HeaderMap::new();
+/// that are empty or not valid headers are skipped.
+fn parse_headers(headers: &str) -> HeaderMap {
+    let mut map = HeaderMap::new();
     for (key, value) in headers.split_terminator(',').filter_map(|entry| {
         let (key, value) = entry.trim().split_once('=')?;
         let (key, value) = (key.trim(), value.trim());
@@ -46,10 +64,10 @@ fn header_metadata(headers: &str) -> MetadataMap {
             HeaderName::try_from(key),
             HeaderValue::try_from(value.as_str()),
         ) {
-            metadata.insert(key, value);
+            map.insert(key, value);
         }
     }
-    MetadataMap::from_headers(metadata)
+    map
 }
 
 fn percent_decode(value: &str) -> Option<String> {
@@ -100,7 +118,7 @@ mod tests {
 
     #[test]
     fn headers_parse_like_the_sdk_environment_variable() {
-        let metadata = super::header_metadata(
+        let metadata = super::parse_headers(
             "authorization=Bearer%20secret, x-tenant = blue ,=empty-key,no-value=,bad",
         );
         assert_eq!(
@@ -113,7 +131,7 @@ mod tests {
 
     #[test]
     fn malformed_percent_encoding_is_kept_verbatim() {
-        let metadata = super::header_metadata("token=abc%zz");
+        let metadata = super::parse_headers("token=abc%zz");
         assert_eq!(metadata.get("token").unwrap().to_str().unwrap(), "abc%zz");
     }
 
