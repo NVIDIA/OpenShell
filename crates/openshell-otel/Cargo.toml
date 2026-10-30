@@ -37,6 +37,7 @@ openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 opentelemetry-proto = { workspace = true, features = ["logs"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 prost = { workspace = true }
+tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

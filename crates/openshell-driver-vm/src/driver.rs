@@ -11242,7 +11242,9 @@ mod tests {
                 sandbox_token: SecretJwt::parse(format!("sandbox-{label}")).expect("sandbox token"),
                 sandbox_expires_at: 1,
                 ssh_host_private_key: None,
+                traces_otlp_headers: None,
                 ocsf_otlp_headers: None,
+                agent_otlp_headers: None,
             },
             gateway_id: "gateway-a".to_string(),
             verification_keys: vec![SessionVerificationKey {

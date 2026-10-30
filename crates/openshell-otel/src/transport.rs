@@ -306,7 +306,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    http_target(endpoint).log_exporter_with_headers(None),
+                    http_target(endpoint).log_exporter(),
                     Err(SetupError::HttpsUnsupported)
                 ),
                 "{endpoint}"
@@ -317,12 +317,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn trace_provider_exports_over_http_from_the_batch_thread() {
         let mut collector = OtlpHttpTestServer::start().await;
-        let provider = http_target(collector.endpoint()).tracer_provider().unwrap();
+        let provider = http_target(collector.endpoint())
+            .with_headers(crate::parse_otlp_headers("x-mlflow-experiment-id=7"))
+            .tracer_provider()
+            .unwrap();
         provider.tracer("test").in_span("http-span", |_| {});
         let flush = tokio::task::spawn_blocking(move || provider.force_flush());
 
         let export = collector.next_export().await;
         assert_eq!(export.method, http::Method::POST);
+        assert_eq!(export.headers["x-mlflow-experiment-id"], "7");
         assert_eq!(export.path, "/v1/traces");
         assert_eq!(
             export.headers[http::header::CONTENT_TYPE],
@@ -336,27 +340,37 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn log_exporter_sends_headers_over_http_from_a_blocking_thread() {
-        let mut collector = OtlpHttpTestServer::start().await;
-        let exporter = http_target(collector.endpoint())
-            .log_exporter_with_headers(Some("authorization=Bearer%20token,x-token=abc%252F"))
-            .unwrap();
-        let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
-            .with_simple_exporter(exporter)
-            .build();
-        let emit = tokio::task::spawn_blocking(move || {
-            let logger = provider.logger("test");
-            let mut record = logger.create_log_record();
-            record.set_body(AnyValue::from("ocsf-event"));
-            logger.emit(record);
-        });
+        crate::test_environment::Environment::new()
+            .remove("OTEL_EXPORTER_OTLP_HEADERS")
+            .remove("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+            .remove("OTEL_EXPORTER_OTLP_LOGS_HEADERS")
+            .run_async(async {
+                let mut collector = OtlpHttpTestServer::start().await;
+                let exporter = http_target(collector.endpoint())
+                    .with_headers(crate::parse_otlp_headers(
+                        "authorization=Bearer%20token,x-token=abc%252F",
+                    ))
+                    .log_exporter()
+                    .unwrap();
+                let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+                    .with_simple_exporter(exporter)
+                    .build();
+                let emit = tokio::task::spawn_blocking(move || {
+                    let logger = provider.logger("test");
+                    let mut record = logger.create_log_record();
+                    record.set_body(AnyValue::from("ocsf-event"));
+                    logger.emit(record);
+                });
 
-        let export = collector.next_export().await;
-        assert_eq!(export.path, "/v1/logs");
-        assert_eq!(export.headers["authorization"], "Bearer token");
-        assert_eq!(export.headers["x-token"], "abc%2F", "decoded exactly once");
-        let request = ExportLogsServiceRequest::decode(export.body).unwrap();
-        let record = &request.resource_logs[0].scope_logs[0].log_records[0];
-        assert!(format!("{:?}", record.body).contains("ocsf-event"));
-        emit.await.unwrap();
+                let export = collector.next_export().await;
+                assert_eq!(export.path, "/v1/logs");
+                assert_eq!(export.headers["authorization"], "Bearer token");
+                assert_eq!(export.headers["x-token"], "abc%2F", "decoded exactly once");
+                let request = ExportLogsServiceRequest::decode(export.body).unwrap();
+                let record = &request.resource_logs[0].scope_logs[0].log_records[0];
+                assert!(format!("{:?}", record.body).contains("ocsf-event"));
+                emit.await.unwrap();
+            })
+            .await;
     }
 }
