@@ -187,6 +187,91 @@ impl ResolvedWorkloadIdentity {
     }
 }
 
+/// Where a rejected workload-identity component's numeric value came from.
+///
+/// Used only to build an actionable diagnostic when a resolved identity
+/// contains UID or GID 0. It describes provenance for the error message and
+/// does not influence how identities are resolved or enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityComponentOrigin {
+    /// Selected from the image's OCI `USER` directive.
+    ImageUser,
+    /// Resolved through the image's `/etc/passwd`.
+    ImagePasswd,
+    /// Resolved through the image's `/etc/group`.
+    ImageGroup,
+    /// Selected by the sandbox policy (`process.run_as_user` / `run_as_group`).
+    Policy,
+}
+
+/// Build an actionable error message when a resolved workload identity contains
+/// UID or GID 0.
+///
+/// The Docker and Podman drivers never run a workload as root, so they
+/// reject any resolved identity with a zero user, primary group, or
+/// supplementary group. That numeric rejection is the invariant enforced by
+/// [`ResolvedWorkloadIdentity::new`]; this helper changes nothing about it. It
+/// only explains an already-rejected identity in terms a user can act on,
+/// naming the image, which component is zero, and where its value came from.
+/// The remediation it suggests is tailored to the cause: a root UID points at
+/// `process.run_as_user`, a root primary group at `process.run_as_group`, and a
+/// root supplementary group at choosing a different user or image, because
+/// those policy fields do not drop supplementary group memberships.
+///
+/// Returns `None` when no component is zero.
+#[must_use]
+pub fn root_identity_rejection_message(
+    image_reference: &str,
+    uid: u32,
+    uid_origin: IdentityComponentOrigin,
+    gid: u32,
+    gid_origin: IdentityComponentOrigin,
+    supplementary_gids: &[u32],
+) -> Option<String> {
+    use IdentityComponentOrigin::{ImageGroup, ImagePasswd, ImageUser, Policy};
+
+    // The shared invariant. The remediation that follows is tailored to which
+    // component is zero: advice that fits a root UID can be wrong for a root
+    // group, and advice that fits a root primary group can be wrong for a root
+    // supplementary group, because `process.run_as_user` and
+    // `process.run_as_group` do not drop supplementary memberships.
+    const NEVER_ROOT: &str = "OpenShell never runs a workload as root.";
+
+    if uid == 0 {
+        let origin = match uid_origin {
+            Policy => "the policy's `process.run_as_user`",
+            _ => "the image's `USER`",
+        };
+        return Some(format!(
+            "image '{image_reference}' resolves to a root workload: {origin} selects UID 0. {NEVER_ROOT} \
+Use an image with a non-root `USER`, or set `process.run_as_user` and `process.run_as_group` \
+to a non-root identity in the creation policy."
+        ));
+    }
+    if gid == 0 {
+        let origin = match gid_origin {
+            Policy => "the policy's `process.run_as_group`",
+            ImageUser => "the image's `USER`",
+            ImagePasswd => "the image's `/etc/passwd`",
+            ImageGroup => "the image's `/etc/group`",
+        };
+        return Some(format!(
+            "image '{image_reference}' resolves to a root primary group: {origin} selects GID 0. {NEVER_ROOT} \
+Set `process.run_as_group` to a non-root group in the creation policy, or use an image whose \
+user has a non-root primary group."
+        ));
+    }
+    if supplementary_gids.contains(&0) {
+        return Some(format!(
+            "image '{image_reference}' lists the workload user in group 0 (root) through its `/etc/group`. \
+{NEVER_ROOT} `process.run_as_user` and `process.run_as_group` do not drop supplementary group \
+memberships, so overriding them cannot remove this one. Use an image whose user is not a member \
+of the root group, or select a user that is not listed in group 0 in `/etc/group`."
+        ));
+    }
+    None
+}
+
 /// The trusted sandbox context, constructed by trusted common code after the
 /// control plane assigns the resource to the admitted sandbox.
 ///
@@ -622,4 +707,96 @@ pub struct PendingDnsQuery {
     pub timing: MediationTiming,
     /// Single-use response channel owned by the backend adapter.
     pub response: oneshot::Sender<Result<Vec<u8>, BackendError>>,
+}
+
+#[cfg(test)]
+mod root_identity_rejection_tests {
+    use super::{IdentityComponentOrigin, root_identity_rejection_message};
+
+    #[test]
+    fn image_user_root_names_image_and_remediation() {
+        let message = root_identity_rejection_message(
+            "nicolaka/netshoot:latest",
+            0,
+            IdentityComponentOrigin::ImageUser,
+            0,
+            IdentityComponentOrigin::ImageUser,
+            &[],
+        )
+        .expect("root UID is rejected");
+        assert!(message.contains("nicolaka/netshoot:latest"));
+        assert!(message.contains("the image's `USER`"));
+        assert!(message.contains("UID 0"));
+        assert!(message.contains("process.run_as_user"));
+        assert!(message.contains("process.run_as_group"));
+    }
+
+    #[test]
+    fn policy_user_zero_blames_policy() {
+        let message = root_identity_rejection_message(
+            "example:1.0",
+            0,
+            IdentityComponentOrigin::Policy,
+            1000,
+            IdentityComponentOrigin::Policy,
+            &[],
+        )
+        .expect("root UID is rejected");
+        assert!(message.contains("the policy's `process.run_as_user`"));
+    }
+
+    #[test]
+    fn primary_group_zero_reports_passwd_origin() {
+        let message = root_identity_rejection_message(
+            "example:1.0",
+            1000,
+            IdentityComponentOrigin::ImageUser,
+            0,
+            IdentityComponentOrigin::ImagePasswd,
+            &[],
+        )
+        .expect("root primary GID is rejected");
+        assert!(message.contains("root primary group"));
+        assert!(message.contains("the image's `/etc/passwd`"));
+        assert!(message.contains("GID 0"));
+        // A root primary group is remedied by `run_as_group`; advising
+        // `run_as_user` would be beside the point.
+        assert!(message.contains("`process.run_as_group`"));
+        assert!(!message.contains("`process.run_as_user`"));
+    }
+
+    #[test]
+    fn supplementary_group_zero_advises_changing_user_not_setting_policy_fields() {
+        let message = root_identity_rejection_message(
+            "example:1.0",
+            1000,
+            IdentityComponentOrigin::ImageUser,
+            1000,
+            IdentityComponentOrigin::ImagePasswd,
+            &[0],
+        )
+        .expect("supplementary group 0 is rejected");
+        assert!(message.contains("group 0 (root)"));
+        assert!(message.contains("/etc/group"));
+        // The advice must explain that the policy fields cannot drop a
+        // supplementary membership, so a user who has already set them is not
+        // told to set them again.
+        assert!(message.contains("do not drop supplementary group memberships"));
+        assert!(message.contains("user is not a member"));
+    }
+
+    #[test]
+    fn non_root_identity_is_accepted() {
+        assert!(
+            root_identity_rejection_message(
+                "example:1.0",
+                1000,
+                IdentityComponentOrigin::ImageUser,
+                1000,
+                IdentityComponentOrigin::ImagePasswd,
+                &[10, 20],
+            )
+            .is_none()
+        );
+    }
 }

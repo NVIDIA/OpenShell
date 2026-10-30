@@ -1874,7 +1874,95 @@ fn docker_identity_resolution_honors_policy_selectors_and_rejects_root() {
         b"root:x:0:\n",
     )
     .unwrap_err();
-    assert!(error.message().contains("UID or GID zero"));
+    let message = error.message();
+    assert!(!message.contains("descriptor error"));
+    assert!(message.contains("resolves to a root workload"));
+    assert!(message.contains("the policy's `process.run_as_user`"));
+    assert!(message.contains("nvcr.io/nvidia/base/ubuntu:24.04"));
+}
+
+#[test]
+fn docker_identity_resolution_rejects_image_user_root_with_actionable_error() {
+    // An off-the-shelf image that declares `USER root` and no policy identity.
+    let sandbox = test_sandbox();
+    let image = DockerImageMetadata {
+        id: "sha256:image".to_string(),
+        user: "root".to_string(),
+        working_dir: "/root".to_string(),
+        volumes: Vec::new(),
+    };
+    let error = resolve_docker_identity_from_accounts(
+        &sandbox,
+        &image,
+        b"root:x:0:0:root:/root:/bin/sh\n",
+        b"root:x:0:\n",
+    )
+    .unwrap_err();
+    let message = error.message();
+    // Names the image, blames the image USER, and gives a remediation path.
+    assert!(message.contains("nvcr.io/nvidia/base/ubuntu:24.04"));
+    assert!(message.contains("the image's `USER`"));
+    assert!(message.contains("UID 0"));
+    assert!(message.contains("non-root"));
+    assert!(message.contains("process.run_as_user"));
+    // The internal `descriptor error:` prefix must not leak to users.
+    assert!(!message.contains("descriptor error"));
+}
+
+#[test]
+fn docker_identity_resolution_rejects_supplementary_group_zero_from_etc_group() {
+    // A non-root user whose /etc/group membership puts it in group 0.
+    let sandbox = test_sandbox();
+    let image = DockerImageMetadata {
+        id: "sha256:image".to_string(),
+        user: "agent".to_string(),
+        working_dir: "/sandbox".to_string(),
+        volumes: Vec::new(),
+    };
+    let error = resolve_docker_identity_from_accounts(
+        &sandbox,
+        &image,
+        b"root:x:0:0:root:/root:/bin/sh\nagent:x:10001:10002::/sandbox:/bin/sh\n",
+        b"root:x:0:agent\nagent:x:10002:\n",
+    )
+    .unwrap_err();
+    let message = error.message();
+    assert!(message.contains("group 0 (root)"));
+    assert!(message.contains("/etc/group"));
+    // The user here has already set non-root `run_as_user`/`run_as_group`, yet
+    // the supplementary membership still grants GID 0. The advice must not tell
+    // them to set those fields again (doing so reproduces the error); it must
+    // explain the fields cannot drop a supplementary membership and point at a
+    // different user or image.
+    assert!(message.contains("do not drop supplementary group memberships"));
+    assert!(message.contains("user is not a member of the root group"));
+    assert!(!message.contains("descriptor error"));
+}
+
+#[test]
+fn docker_identity_resolution_rejects_primary_group_zero_with_group_scoped_advice() {
+    // A non-root user whose `/etc/passwd` primary group is 0.
+    let sandbox = test_sandbox();
+    let image = DockerImageMetadata {
+        id: "sha256:image".to_string(),
+        user: "app".to_string(),
+        working_dir: "/sandbox".to_string(),
+        volumes: Vec::new(),
+    };
+    let error = resolve_docker_identity_from_accounts(
+        &sandbox,
+        &image,
+        b"app:x:1001:0::/sandbox:/bin/sh\n",
+        b"root:x:0:\n",
+    )
+    .unwrap_err();
+    let message = error.message();
+    assert!(message.contains("root primary group"));
+    assert!(message.contains("GID 0"));
+    // A root primary group is remedied by `run_as_group`, not `run_as_user`.
+    assert!(message.contains("`process.run_as_group`"));
+    assert!(!message.contains("`process.run_as_user`"));
+    assert!(!message.contains("descriptor error"));
 }
 
 #[test]
