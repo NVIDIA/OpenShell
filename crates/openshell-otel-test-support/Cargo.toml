@@ -12,7 +12,7 @@ repository.workspace = true
 
 [dependencies]
 openshell-otel = { path = "../openshell-otel" }
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs", "trace"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "logs", "trace"] }
 prost = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
