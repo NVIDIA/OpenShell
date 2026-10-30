@@ -30,15 +30,17 @@ e2e_run_openshell_conformance() {
 
   e2e_require_openshell_bin || return
 
+  # The tests find the gateway as the CLI does: OPENSHELL_GATEWAY_ENDPOINT,
+  # else OPENSHELL_GATEWAY, else the active gateway. The gateway wrappers set
+  # these for the gateway they started.
   echo "==> Running conformance suites against the ${gateway_label} gateway"
-  cargo test \
+  cargo nextest run \
     --locked \
     --manifest-path "${root}/tests/suites/conformance/Cargo.toml" \
-    --package openshell-test-conformance-cli \
+    --package sandbox \
+    --test-threads 1 \
     --no-fail-fast \
-    -- \
-    --test-threads=1 \
-    --nocapture
+    --no-tests fail
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
