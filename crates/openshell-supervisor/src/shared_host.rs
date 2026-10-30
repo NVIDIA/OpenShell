@@ -209,6 +209,9 @@ pub struct SharedHost {
     leaving: watch::Sender<bool>,
     /// A gateway currently accepts this host's stream.
     gateway_connected: watch::Sender<bool>,
+    /// Peer endpoint of the gateway replica accepting this host's stream;
+    /// hosted instances dial their sessions there.
+    gateway_home: watch::Sender<Option<String>>,
     /// Recovery deadline (seconds) the latest snapshot offers the runtimes
     /// of instances this host starts or takes over; `None` keeps the runtime
     /// default.
@@ -303,6 +306,7 @@ impl SharedHost {
             deferred_reports: Mutex::new(BTreeMap::new()),
             leaving: watch::Sender::new(false),
             gateway_connected: watch::Sender::new(false),
+            gateway_home: watch::Sender::new(None),
             recovery_timeout_secs: Mutex::new(None),
             #[cfg(test)]
             reconcile_probe: ReconcileProbe::default(),
@@ -785,6 +789,7 @@ impl SharedHost {
             sandbox: Some(registration.sandbox_name),
             container_image: registration.container_image,
             openshell_endpoint: Some(self.gateway_endpoint.clone()),
+            gateway_home: Some(self.gateway_home.subscribe()),
             policy_rules: None,
             policy_data: None,
             ssh_socket_path: Some(ssh_socket.to_string_lossy().into_owned()),
@@ -1417,6 +1422,9 @@ async fn run_stream(
                     Some(host_gateway_message::Payload::Accepted(accepted_message)) => {
                         accepted = true;
                         host.gateway_connected.send_replace(true);
+                        host.gateway_home.send_replace(
+                            Some(accepted_message.peer_endpoint.clone()).filter(|endpoint| !endpoint.is_empty()),
+                        );
                         tracing::info!(session = %accepted_message.session_id, "gateway accepted the supervisor host");
                         // A pool gateway detects failed members by silence,
                         // so it asks for more frequent heartbeats.
@@ -1517,6 +1525,7 @@ async fn run_stream(
         }
     };
     host.gateway_connected.send_replace(false);
+    host.gateway_home.send_replace(None);
     end
 }
 
@@ -1982,6 +1991,10 @@ mod tests {
     }
 
     fn accepted() -> HostGatewayMessage {
+        accepted_by("")
+    }
+
+    fn accepted_by(peer_endpoint: &str) -> HostGatewayMessage {
         gateway_message(host_gateway_message::Payload::Accepted(
             openshell_core::proto::supervisor_host::v1::HostAccepted {
                 session_id: "session".to_string(),
@@ -1989,6 +2002,7 @@ mod tests {
                     seconds: 1,
                     nanos: 0,
                 }),
+                peer_endpoint: peer_endpoint.to_string(),
             },
         ))
     }
@@ -2218,6 +2232,26 @@ mod tests {
         );
         assert!(attempt >= pool_timing::HOST_ATTEMPT_TIMEOUT);
         assert_eq!(gateway.calls.lock().unwrap().len(), 2);
+    }
+
+    /// Hosted instances dial the replica that accepted the host, until its
+    /// stream is lost.
+    #[tokio::test(start_paused = true)]
+    async fn the_accepting_replica_is_the_hosted_instances_gateway() {
+        let (host, _gateway, mut streams, _root) =
+            attach_pool_host(vec![Attempt::Now, Attempt::Hang]);
+        let mut home = host.gateway_home.subscribe();
+        let stream = streams.recv().await.unwrap();
+        stream
+            .inbound
+            .send(Ok(accepted_by("https://gw-a:8443")))
+            .await
+            .unwrap();
+        home.wait_for(|home| home.as_deref() == Some("https://gw-a:8443"))
+            .await
+            .unwrap();
+        drop(stream);
+        home.wait_for(Option::is_none).await.unwrap();
     }
 
     /// A replica that keeps writing but stops reading fills the host's

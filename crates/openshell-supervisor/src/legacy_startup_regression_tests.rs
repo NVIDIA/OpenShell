@@ -287,6 +287,7 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         sandbox: Some("legacy-restart".into()),
         container_image: String::new(),
         openshell_endpoint: Some(endpoint),
+        gateway_home: None,
         policy_rules: None,
         policy_data: None,
         ssh_socket_path: None,

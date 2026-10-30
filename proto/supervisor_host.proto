@@ -84,6 +84,10 @@ message HostAccepted {
   // Scopes every snapshot revision and status report of this stream.
   string session_id = 1;
   google.protobuf.Duration heartbeat_interval = 2;
+  // Address of the accepting gateway replica. A pool host dials its sandbox
+  // instances' sessions here so they run on the replica serving this stream.
+  // Empty when the replica has no peer endpoint.
+  string peer_endpoint = 3;
 }
 
 // The gateway refuses the host; the stream ends after this message.
