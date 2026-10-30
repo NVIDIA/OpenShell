@@ -12,7 +12,7 @@ use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_crypto::pki::KeyPair;
 use rcgen::{CertificateParams, DnType, IsCa, KeyUsagePurpose};
 use rustls::ClientConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject};
 use std::collections::HashMap;
 use std::io::{BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -105,7 +105,7 @@ impl SandboxCa {
         let ca_key = KeyPair::from_pem(private_key_pem)
             .into_diagnostic()
             .wrap_err("parse proxy CA private key")?;
-        let certificates = rustls_pemfile::certs(&mut certificate_pem.as_bytes())
+        let certificates = CertificateDer::pem_reader_iter(&mut certificate_pem.as_bytes())
             .collect::<std::result::Result<Vec<_>, _>>()
             .into_diagnostic()
             .wrap_err("parse proxy CA certificate")?;
@@ -114,7 +114,9 @@ impl SandboxCa {
                 "proxy CA certificate file must contain exactly one certificate"
             ));
         }
-        let private_key = rustls_pemfile::private_key(&mut private_key_pem.as_bytes())
+        let private_key = PrivateKeyDer::pem_reader_iter(&mut private_key_pem.as_bytes())
+            .next()
+            .transpose()
             .into_diagnostic()
             .wrap_err("parse proxy CA private key")?
             .ok_or_else(|| miette!("proxy CA private key file contains no private key"))?;
@@ -434,10 +436,9 @@ fn load_pem_certs_into_store(
         return (0, 0);
     }
     let mut reader = BufReader::new(pem_data.as_bytes());
-    // Collect all results so we can count PEM blocks that fail base64
-    // decoding — rustls_pemfile::certs silently drops those, so without
-    // this they wouldn't be reflected in the `ignored` count.
-    let all_results: Vec<_> = rustls_pemfile::certs(&mut reader).collect();
+    // Count PEM decoding errors before filtering them out so they contribute
+    // to the `ignored` count alongside certificates rejected by the root store.
+    let all_results: Vec<_> = CertificateDer::pem_reader_iter(&mut reader).collect();
     let pem_errors = all_results.iter().filter(|r| r.is_err()).count();
     let certs: Vec<CertificateDer<'static>> =
         all_results.into_iter().filter_map(Result::ok).collect();
@@ -466,7 +467,7 @@ pub fn read_system_ca_bundle() -> String {
 pub fn parse_pem_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let file = std::fs::File::open(path).into_diagnostic()?;
     let mut reader = BufReader::new(file);
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_reader_iter(&mut reader)
         .collect::<std::result::Result<Vec<_>, _>>()
         .into_diagnostic()
 }
@@ -742,7 +743,7 @@ mod tests {
         // Bundle should be parseable as PEM certificates
         let mut reader = BufReader::new(bundle_pem.as_bytes());
         assert!(
-            rustls_pemfile::certs(&mut reader).any(|r| r.is_ok()),
+            CertificateDer::pem_reader_iter(&mut reader).any(|r| r.is_ok()),
             "bundle should contain at least one cert",
         );
     }
@@ -778,7 +779,7 @@ mod tests {
 
         assert_eq!(loaded.cert_pem(), certificate);
         assert_eq!(loaded.private_key_pem().unwrap(), private_key);
-        let original_der = rustls_pemfile::certs(&mut certificate.as_bytes())
+        let original_der = CertificateDer::pem_reader_iter(&mut certificate.as_bytes())
             .next()
             .unwrap()
             .unwrap();

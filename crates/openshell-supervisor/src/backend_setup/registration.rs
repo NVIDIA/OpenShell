@@ -113,6 +113,11 @@ impl PreparedBackend for RegisteredLaunch {
         self: Box<Self>,
         services: BackendServices,
     ) -> std::result::Result<BuiltBackend, BackendError> {
+        if services.takeover.is_some() {
+            return Err(BackendError::Unsupported(
+                "registered isolation backends do not support supervisor takeover".to_string(),
+            ));
+        }
         let payload = self.payload.clone();
         let backend = Arc::new(OpenShellRuntimeBackend::registered(
             self.name,

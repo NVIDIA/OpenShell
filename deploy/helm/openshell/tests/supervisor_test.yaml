@@ -3,6 +3,10 @@
 suite: supervisor deployment
 templates:
   - templates/supervisor.yaml
+  - templates/supervisor-service.yaml
+  - templates/supervisor-networkpolicy.yaml
+  - templates/supervisor-token-secret.yaml
+  - templates/supervisor-pdb.yaml
   - templates/gateway-config.yaml
 release:
   name: openshell
@@ -13,7 +17,20 @@ tests:
     asserts:
       - hasDocuments:
           count: 0
-  - it: deploys one instance host without Kubernetes identity in the gateway namespace
+        template: templates/supervisor.yaml
+      - hasDocuments:
+          count: 0
+        template: templates/supervisor-service.yaml
+      - hasDocuments:
+          count: 0
+        template: templates/supervisor-networkpolicy.yaml
+      - hasDocuments:
+          count: 0
+        template: templates/supervisor-token-secret.yaml
+      - hasDocuments:
+          count: 0
+        template: templates/supervisor-pdb.yaml
+  - it: deploys the supervisor pool without Kubernetes identity in the gateway namespace
     template: templates/supervisor.yaml
     set:
       gatewayConfig:
@@ -22,7 +39,20 @@ tests:
           supervisor_image: example.com/supervisor:shared
     asserts:
       - hasDocuments:
-          count: 4
+          count: 1
+        template: templates/supervisor.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-service.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-networkpolicy.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-token-secret.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-pdb.yaml
       - equal:
           path: kind
           value: Deployment
@@ -87,7 +117,8 @@ tests:
               port: 5500
               targetPort: runtime
               protocol: TCP
-        documentIndex: 1
+        template: templates/supervisor-service.yaml
+        documentIndex: 0
       - equal:
           path: spec.template.spec.automountServiceAccountToken
           value: false
@@ -121,21 +152,26 @@ tests:
       - equal:
           path: kind
           value: Secret
-        documentIndex: 3
+        template: templates/supervisor-token-secret.yaml
+        documentIndex: 0
       - equal:
           path: metadata.name
           value: openshell-supervisor-token
-        documentIndex: 3
+        template: templates/supervisor-token-secret.yaml
+        documentIndex: 0
       - equal:
           path: type
           value: Opaque
-        documentIndex: 3
+        template: templates/supervisor-token-secret.yaml
+        documentIndex: 0
       - notExists:
           path: data
-        documentIndex: 3
+        template: templates/supervisor-token-secret.yaml
+        documentIndex: 0
       - notExists:
           path: stringData
-        documentIndex: 3
+        template: templates/supervisor-token-secret.yaml
+        documentIndex: 0
       - contains:
           path: spec.template.spec.volumes
           content:
@@ -149,22 +185,26 @@ tests:
       - equal:
           path: kind
           value: Service
-        documentIndex: 1
+        template: templates/supervisor-service.yaml
+        documentIndex: 0
       - equal:
           path: spec.selector
           value:
             app.kubernetes.io/name: openshell-supervisor
             app.kubernetes.io/instance: openshell
             app.kubernetes.io/component: supervisor
-        documentIndex: 1
+        template: templates/supervisor-service.yaml
+        documentIndex: 0
       - equal:
           path: kind
           value: NetworkPolicy
-        documentIndex: 2
+        template: templates/supervisor-networkpolicy.yaml
+        documentIndex: 0
       - lengthEqual:
           path: spec.ingress
           count: 1
-        documentIndex: 2
+        template: templates/supervisor-networkpolicy.yaml
+        documentIndex: 0
       - equal:
           path: spec.ingress[0]
           value:
@@ -178,7 +218,8 @@ tests:
             ports:
               - protocol: TCP
                 port: 5500
-        documentIndex: 2
+        template: templates/supervisor-networkpolicy.yaml
+        documentIndex: 0
   - it: admits runtimes only from this gateway's managed namespaces
     template: templates/supervisor.yaml
     set:
@@ -194,7 +235,8 @@ tests:
             matchLabels:
               openshell.ai/managed-by: openshell
               openshell.ai/gateway-id: gw-a
-        documentIndex: 2
+        template: templates/supervisor-networkpolicy.yaml
+        documentIndex: 0
   - it: admits runtimes only from operator-labeled namespaces
     template: templates/supervisor.yaml
     set:
@@ -209,7 +251,8 @@ tests:
           value:
             matchLabels:
               example.com/openshell-workspace: "true"
-        documentIndex: 2
+        template: templates/supervisor-networkpolicy.yaml
+        documentIndex: 0
   - it: rejects operator namespace selectors it cannot scope
     template: templates/supervisor.yaml
     set:
@@ -232,11 +275,13 @@ tests:
       - matchRegex:
           path: metadata.name
           pattern: ^openshell-gateway-release-with-a-very-very-[0-9a-f]{8}-supervisor$
-        documentIndex: 1
+        template: templates/supervisor-service.yaml
+        documentIndex: 0
       - notEqual:
           path: metadata.name
           value: openshell-gateway-release-with-a-very-very-long-name-0057
-        documentIndex: 1
+        template: templates/supervisor-service.yaml
+        documentIndex: 0
   - it: requires gateway TLS for the supervisor token
     template: templates/supervisor.yaml
     set:
@@ -261,6 +306,470 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: 'shared_supervisor = \{ runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
+  - it: runs one replica as a high-availability pool by default
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-service.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-networkpolicy.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-token-secret.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-pdb.yaml
+      - equal:
+          path: spec.replicas
+          value: 1
+        documentIndex: 0
+      - equal:
+          path: spec.strategy
+          value:
+            type: RollingUpdate
+            rollingUpdate:
+              maxSurge: 1
+              maxUnavailable: 0
+        documentIndex: 0
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 60
+        documentIndex: 0
+      - notExists:
+          path: spec.template.spec.affinity
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_SUPERVISOR_POOL_MEMBER_ID
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+        documentIndex: 0
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+        template: templates/supervisor-pdb.yaml
+        documentSelector:
+          path: kind
+          value: PodDisruptionBudget
+  - it: runs two or more replicas as a high-availability pool
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        replicas: 3
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-service.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-networkpolicy.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-token-secret.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-pdb.yaml
+      - equal:
+          path: spec.replicas
+          value: 3
+        documentIndex: 0
+      - equal:
+          path: spec.strategy
+          value:
+            type: RollingUpdate
+            rollingUpdate:
+              maxSurge: 1
+              maxUnavailable: 0
+        documentIndex: 0
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 60
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_SUPERVISOR_POOL_MEMBER_ID
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+        documentIndex: 0
+      - equal:
+          path: spec.selector
+          value:
+            app.kubernetes.io/name: openshell-supervisor
+            app.kubernetes.io/instance: openshell
+            app.kubernetes.io/component: supervisor
+        template: templates/supervisor-service.yaml
+        documentIndex: 0
+      - equal:
+          path: spec.ingress[0].ports
+          value:
+            - protocol: TCP
+              port: 5500
+        template: templates/supervisor-networkpolicy.yaml
+        documentIndex: 0
+      - equal:
+          path: apiVersion
+          value: policy/v1
+        template: templates/supervisor-pdb.yaml
+        documentSelector:
+          path: kind
+          value: PodDisruptionBudget
+      - equal:
+          path: metadata.name
+          value: openshell-supervisor
+        template: templates/supervisor-pdb.yaml
+        documentSelector:
+          path: kind
+          value: PodDisruptionBudget
+      - equal:
+          path: spec
+          value:
+            maxUnavailable: 1
+            selector:
+              matchLabels:
+                app.kubernetes.io/name: openshell-supervisor
+                app.kubernetes.io/instance: openshell
+                app.kubernetes.io/component: supervisor
+        template: templates/supervisor-pdb.yaml
+        documentSelector:
+          path: kind
+          value: PodDisruptionBudget
+  - it: protects the pool from voluntary disruption without a NetworkPolicy
+    template: templates/supervisor.yaml
+    set:
+      networkPolicy:
+        enabled: false
+      supervisor:
+        replicas: 2
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-service.yaml
+      - hasDocuments:
+          count: 0
+        template: templates/supervisor-networkpolicy.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-token-secret.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-pdb.yaml
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+        template: templates/supervisor-pdb.yaml
+        documentSelector:
+          path: kind
+          value: PodDisruptionBudget
+  - it: enables the supervisor PodDisruptionBudget by default
+    template: templates/supervisor-pdb.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+  - it: keeps the PodDisruptionBudget enabled when older reused values lack the setting
+    template: templates/supervisor-pdb.yaml
+    set:
+      supervisor:
+        podDisruptionBudget: null
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+  - it: renders only the PodDisruptionBudget away when it is disabled
+    set:
+      supervisor:
+        replicas: 3
+        podDisruptionBudget:
+          enabled: false
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - hasDocuments:
+          count: 0
+        template: templates/supervisor-pdb.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-service.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-networkpolicy.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/supervisor-token-secret.yaml
+      - equal:
+          path: spec.replicas
+          value: 3
+        template: templates/supervisor.yaml
+      - notExists:
+          path: spec.template.metadata.annotations
+        template: templates/supervisor.yaml
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'shared_supervisor = \{ runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
+        template: templates/gateway-config.yaml
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: (?i)disruption
+        template: templates/gateway-config.yaml
+  - it: renders no PodDisruptionBudget without the gateway topology
+    template: templates/supervisor-pdb.yaml
+    set:
+      supervisor:
+        podDisruptionBudget:
+          enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: rejects a non-boolean PodDisruptionBudget toggle
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        podDisruptionBudget:
+          enabled: "false"
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.podDisruptionBudget.enabled must be a boolean
+  - it: renders the pool's recovery deadline in the gateway table by default
+    template: templates/gateway-config.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'shared_supervisor = \{ runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.supervisor_pool\]\nrecovery_timeout_secs = 60\n'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_pool\]\n[^\[]*(enabled|high_availability)'
+  - it: renders no pool tuning when the recovery timeout is null, leaving the gateway's defaults
+    template: templates/gateway-config.yaml
+    set:
+      supervisor:
+        recoveryTimeoutSeconds: null
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_topology = "gateway"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: supervisor_pool|recovery_timeout_secs
+  - it: renders a configured recovery timeout into the supervisor pool table
+    template: templates/gateway-config.yaml
+    set:
+      supervisor:
+        replicas: 2
+        recoveryTimeoutSeconds: 45
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.supervisor_pool\]\nrecovery_timeout_secs = 45\n'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'shared_supervisor = \{ runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
+  - it: renders no supervisor pool without the gateway topology
+    template: templates/gateway-config.yaml
+    set:
+      supervisor:
+        replicas: 2
+        recoveryTimeoutSeconds: 120
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: supervisor_pool|recovery_timeout_secs|shared_supervisor
+  - it: rejects a hand-written supervisor pool table
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        replicas: 2
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.supervisor_pool:
+          enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds
+  - it: rejects a hand-written supervisor pool inside the gateway table
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway:
+          supervisor_pool:
+            enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds
+  - it: rejects a hand-written supervisor pool without the gateway topology
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.gateway.supervisor_pool:
+          enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds
+  - it: rejects zero supervisor replicas
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        replicas: 0
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.replicas must be an integer of at least 1
+  - it: rejects fractional supervisor replicas
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        replicas: 1.5
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.replicas must be an integer of at least 1
+  - it: rejects supervisor replicas given as a string
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        replicas: "2"
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.replicas must be an integer of at least 1
+  - it: rejects a recovery timeout below 30 seconds
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        recoveryTimeoutSeconds: 29
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.recoveryTimeoutSeconds must be an integer between 30 and 300, or null for the default
+  - it: rejects a recovery timeout above 300 seconds
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        replicas: 2
+        recoveryTimeoutSeconds: 301
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.recoveryTimeoutSeconds must be an integer between 30 and 300, or null for the default
+  - it: rejects a fractional recovery timeout
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        recoveryTimeoutSeconds: 30.5
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.recoveryTimeoutSeconds must be an integer between 30 and 300, or null for the default
+  - it: ignores supervisor pool values without the gateway topology
+    template: templates/supervisor.yaml
+    set:
+      supervisor:
+        replicas: 0
+        recoveryTimeoutSeconds: 5
+    asserts:
+      - hasDocuments:
+          count: 0
+        template: templates/supervisor.yaml
+      - hasDocuments:
+          count: 0
+        template: templates/supervisor-service.yaml
+      - hasDocuments:
+          count: 0
+        template: templates/supervisor-networkpolicy.yaml
+      - hasDocuments:
+          count: 0
+        template: templates/supervisor-token-secret.yaml
+      - hasDocuments:
+          count: 0
+        template: templates/supervisor-pdb.yaml
   - it: rejects a hand-written shared supervisor connection
     template: templates/supervisor.yaml
     set:

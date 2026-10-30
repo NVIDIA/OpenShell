@@ -4,6 +4,7 @@
 {
   pkgs,
   toolchains,
+  rustToolchain,
   qemuPkgs ? pkgs,
   firmwarePkgs ? pkgs,
 }:
@@ -16,6 +17,9 @@ let
     inherit pkgs qemuPkgs firmwarePkgs;
   };
   tmachine = pkgs.callPackage ./. {
+    OVMF = firmwarePkgs.OVMF;
+  };
+  testRunnerUnwrapped = pkgs.callPackage ../runner {
     OVMF = firmwarePkgs.OVMF;
   };
   qemu = qemuPkgs.qemu.override { hostCpuOnly = true; };
@@ -232,9 +236,36 @@ let
       exec ${tmachine}/bin/tmachine --config ${config} "$@"
     '';
   };
+
+  # Runs a test family in a tmachine environment with tests/runner
+  # (`nix run .#openshell-test-runner -- --environment ubuntu-docker-rootful
+  # --installer deb --family conformance`). It cross-builds guest test bundles
+  # and drives tmachine sessions, so it needs the toolchains and the VM tools.
+  testRunner = pkgs.writeShellApplication {
+    name = "openshell-test-runner";
+    runtimeInputs = [
+      qemu
+      pkgs.ansible
+      pkgs.cargo-nextest
+      pkgs.coreutils
+      pkgs.git
+      pkgs.sshpass
+      rustToolchain
+    ];
+    runtimeEnv =
+      pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (builtins.attrValues toolchains)
+      // {
+        TMACHINE_CONFIG = "${config}";
+      };
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      export ANSIBLE_CONFIG="$root/tests/tmachine/ansible/ansible.cfg"
+      exec ${testRunnerUnwrapped}/bin/openshell-test-runner "$@"
+    '';
+  };
 in
 {
   package = runner;
   unwrapped = tmachine;
-  inherit config;
+  inherit config testRunner;
 }

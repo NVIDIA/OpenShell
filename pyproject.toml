@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [build-system]
-requires = ["setuptools>=83", "setuptools-scm[simple]>=8"]
+requires = ["setuptools>=84.1.0", "setuptools-scm[simple]>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -67,6 +67,10 @@ namespaces = false
 
 [tool.setuptools.package-data]
 openshell = ["py.typed", "_proto/*.py", "_proto/*.pyi"]
+
+# Ignore non-release tags such as sdk/go/vX.Y.Z, which share the release commit.
+[tool.setuptools_scm]
+git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "v[0-9]*"]
 
 [tool.ruff]
 target-version = "py311"

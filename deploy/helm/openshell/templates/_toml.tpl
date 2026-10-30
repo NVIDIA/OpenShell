@@ -110,6 +110,11 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- range $legacyKey, $runtimeKey := dict "logLevel" "log_level" "enableLoopbackServiceHttp" "enable_loopback_service_http" "enableWebsocketTunnel" "enable_websocket_tunnel" "policyValidationFailureMode" "policy_validation_failure_mode" -}}
 {{- if not (hasKey $gateway $runtimeKey) -}}{{- $_ := set $gateway $runtimeKey (get $legacyServer $legacyKey) -}}{{- end -}}
 {{- end -}}
+{{/* An empty hostname format means "unset"; only translate it when set. The
+     discriminator is the gateway installation name, rendered above. */}}
+{{- if and (get $legacyServer "serviceHostnameFormat") (not (hasKey $gateway "service_hostname_format")) -}}
+{{- $_ := set $gateway "service_hostname_format" (get $legacyServer "serviceHostnameFormat") -}}
+{{- end -}}
 {{- if not (hasKey $gateway "compute_driver") -}}{{- $_ := set $gateway "compute_driver" "kubernetes" -}}{{- end -}}
 {{- $serverDnsNames := .Values.pkiInitJob.serverDnsNames | default list -}}
 {{- if .Values.certManager.enabled -}}{{- $serverDnsNames = .Values.certManager.serverDnsNames | default list -}}{{- end -}}
@@ -303,6 +308,22 @@ owner: server.*. Override any gatewayConfig copies before serializing TOML. */}}
 {{- $_ := unset $gatewayTls "external_server_names" -}}
 {{- end -}}
 {{- $_ := set $config "openshell.gateway.tls" $gatewayTls -}}
+{{- end -}}
+{{/* The chart owns the shared supervisor pool; see
+openshell.supervisorPoolConfig. */}}
+{{- $supervisorPool := include "openshell.supervisorPoolConfig" . | fromYaml -}}
+{{- if $supervisorPool -}}
+{{- $_ := set $config "openshell.gateway.supervisor_pool" $supervisorPool -}}
+{{- end -}}
+{{/* Additional destination CA trust is chart plumbing: the runtime table is
+owned by the chart, not gatewayConfig. Derive it only from the chart-owned
+operator ConfigMap reference. */}}
+{{- $supervisorNetwork := .Values.supervisor.network | default dict -}}
+{{- if get $supervisorNetwork "additionalCaConfigMapName" -}}
+{{- if hasKey $config "openshell.supervisor.network" -}}
+{{- fail "gatewayConfig must not define openshell.supervisor.network; the chart derives it from supervisor.network.additionalCaConfigMapName" -}}
+{{- end -}}
+{{- $_ := set $config "openshell.supervisor.network" (dict "additional_ca_bundle" "/etc/openshell-tls/additional-ca-source/ca.crt") -}}
 {{- end -}}
 {{/* A nested YAML map and its dotted top-level table would serialize to
 conflicting TOML definitions. Fail before rendering an invalid ConfigMap. */}}

@@ -1,0 +1,120 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Publish Wheels
+
+on:
+  workflow_call:
+    inputs:
+      release-tag:
+        required: true
+        type: string
+      source-sha:
+        required: true
+        type: string
+      python-version:
+        required: true
+        type: string
+      wheel-filenames:
+        required: true
+        type: string
+    secrets:
+      GITLAB_CI_TRIGGER_TOKEN:
+        required: false
+      GITLAB_CI_TRIGGER_URL:
+        required: false
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: Stable tag whose GitHub Release holds the wheels, e.g. v0.1.6
+        required: true
+        type: string
+      source-sha:
+        description: Commit the tag points to
+        required: true
+        type: string
+      python-version:
+        description: Python package version, e.g. 0.1.6
+        required: true
+        type: string
+      wheel-filenames:
+        description: Wheel filenames attached to the GitHub Release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # Dispatch inputs are free-form, so confirm they describe a published release.
+  verify:
+    name: Verify Release Inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check tag, commit and wheels
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ inputs.source-sha }}
+          RELEASE_VERSION: ${{ inputs.python-version }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+          WHEEL_FILENAMES: ${{ inputs.wheel-filenames }}
+        run: |
+          set -euo pipefail
+          tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_TAG}" --jq .sha)
+          if [[ "${tag_sha}" != "${COMMIT_SHA}" ]]; then
+            echo "${RELEASE_TAG} points to ${tag_sha}, not ${COMMIT_SHA}" >&2
+            exit 1
+          fi
+          assets=$(gh release view "${RELEASE_TAG}" -R "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')
+          for wheel in ${WHEEL_FILENAMES//,/ }; do
+            if ! grep -qxF "${wheel}" <<<"${assets}"; then
+              echo "${wheel} is not attached to the ${RELEASE_TAG} release" >&2
+              exit 1
+            fi
+            if [[ "${wheel}" != *"-${RELEASE_VERSION}-"* ]]; then
+              echo "${wheel} is not version ${RELEASE_VERSION}" >&2
+              exit 1
+            fi
+          done
+
+  trigger:
+    name: Trigger Wheel Publish
+    needs: verify
+    runs-on: [self-hosted, nv]
+    timeout-minutes: 10
+    steps:
+      - name: Trigger GitLab CI
+        shell: bash
+        env:
+          GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
+          GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
+          COMMIT_SHA: ${{ inputs.source-sha }}
+          RELEASE_VERSION: ${{ inputs.python-version }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+          WHEEL_FILENAMES: ${{ inputs.wheel-filenames }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WHEEL_FILENAMES}" ]; then
+            echo "No wheel filenames provided by build job" >&2
+            exit 1
+          fi
+
+          response=$(curl -X POST \
+            --fail \
+            --silent \
+            --show-error \
+            -F "token=${GITLAB_CI_TRIGGER_TOKEN}" \
+            -F "ref=main" \
+            -F "variables[PIPELINE_ACTION]=publish_wheels" \
+            -F "variables[GITHUB_REPOSITORY]=${GITHUB_REPOSITORY}" \
+            -F "variables[COMMIT_SHA]=${COMMIT_SHA}" \
+            -F "variables[RELEASE_TAG]=${RELEASE_TAG}" \
+            -F "variables[RELEASE_VERSION]=${RELEASE_VERSION}" \
+            -F "variables[RELEASE_KIND]=stable" \
+            -F "variables[WHEEL_FILENAMES]=${WHEEL_FILENAMES}" \
+            "${GITLAB_CI_TRIGGER_URL}")
+          pipeline_id=$(printf '%s' "$response" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+          pipeline_status=$(printf '%s' "$response" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
+          echo "Triggered GitLab pipeline ${pipeline_id:-unknown} with status=${pipeline_status:-unknown}"

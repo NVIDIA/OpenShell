@@ -34,9 +34,6 @@ pub mod sanitize;
 pub mod tracing_layers;
 
 #[cfg(any(test, feature = "test-support"))]
-pub mod validation;
-
-#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
 // --- Core event types ---
@@ -48,9 +45,9 @@ pub use events::{
 
 // --- Enum types ---
 pub use enums::{
-    ActionId, ActivityId, AuthProtocolId, AuthTypeId, ConfidenceId, DeviceTypeId, DispositionId,
-    HttpMethod, LaunchTypeId, OcsfEnum, OsTypeId, RiskLevelId, SecurityLevelId, SeverityId,
-    StateId, StatusId, UserTypeId,
+    ActionId, ActivityId, AuthProtocolId, AuthTypeId, ConfidenceId, ConnectionDirectionId,
+    DeviceTypeId, DispositionId, HttpMethod, LaunchTypeId, OcsfEnum, OsTypeId, RiskLevelId,
+    SecurityLevelId, SeverityId, StateId, StatusId, UserTypeId,
 };
 
 // --- Object types ---

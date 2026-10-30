@@ -14,20 +14,7 @@ yanked = "warn"
 unmaintained = "workspace"
 maximum-db-staleness = "P30D"
 ignore = [
-    # Pre-existing advisories acknowledged at onboarding. Each should be
-    # resolved by upgrading the affected transitive dependency and then
-    # removing the ignore entry.
-    { id = "RUSTSEC-2026-0190", reason = "anyhow unsoundness in downcast_mut — awaiting upstream fix" },
-    { id = "RUSTSEC-2026-0204", reason = "crossbeam-epoch pointer deref — transitive via metrics/quanta" },
-    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin attack — transitive via spiffe, no direct exposure" },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — transitive via older kube/hyper" },
-    # zip is used only by z3-sys's build script with prebuilt-z3 enabled to
-    # extract upstream Z3 GitHub release assets, never runtime/user archives.
-    # Accept the build-time risk of a compromised upstream release asset until
-    # z3-sys supports zip >=9; remove these exceptions once it can be upgraded.
-    { id = "RUSTSEC-2026-0367", reason = "zip privileged permission bits — build-only Z3 release extraction; awaiting z3-sys support for zip >=9" },
-    { id = "RUSTSEC-2026-0368", reason = "zip symlink target escape — build-only Z3 release extraction; awaiting z3-sys support for zip >=9" },
-    { id = "RUSTSEC-2026-0369", reason = "zip permissions follow symlinks — build-only Z3 release extraction; awaiting z3-sys support for zip >=9" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin attack — required by russh/ssh-key and RSA test fixtures; no patched release is available" },
 ]
 
 # -- Licenses ------------------------------------------------------------------
@@ -169,7 +156,9 @@ wrappers = [
     "oci-client",
     "openshell-core",
     "openshell-driver-docker",
+    "openshell-driver-kubernetes",
     "openshell-driver-kubernetes-secrets",
+    "openshell-driver-podman",
     "openshell-driver-vault",
     "openshell-driver-vm",
     "openshell-gateway-interceptors",

@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "High Availability"
 sidebar-title: "High Availability"
-description: "Run multiple OpenShell gateway replicas on Kubernetes with shared PostgreSQL, authenticated peer routing, capacity metrics, and optional autoscaling."
-keywords: "Generative AI, Cybersecurity, Kubernetes, High Availability, HA, Gateway, PostgreSQL, Replicas, Failover, Autoscaling, HPA, Metrics"
+description: "Run multiple OpenShell gateway replicas on Kubernetes with shared PostgreSQL, authenticated peer routing, capacity metrics, optional autoscaling, and an experimental multi-tenant supervisor."
+keywords: "Generative AI, Cybersecurity, Kubernetes, High Availability, HA, Gateway, PostgreSQL, Replicas, Failover, Autoscaling, HPA, Metrics, Shared Supervisor, Multi-tenant Supervisor"
 position: 3
 ---
 
@@ -503,6 +503,113 @@ While gateways from the earlier release and the new release run together
 during the upgrade, the older replicas serialize every mutation across the
 fleet. Mutations can be slower and can briefly fail under load until the
 rollout finishes.
+
+## (Experimental) Multi-tenant supervisor
+
+By default, the Kubernetes driver runs a supervisor Pod for each sandbox. With
+the multi-tenant topology, a shared supervisor Deployment hosts many sandboxes,
+and each sandbox keeps its own policy and identity. Supervisor replicas are
+independent of the gateway replica count.
+
+Enable the topology in your release values. Run at least two supervisor
+replicas so sandboxes can fail over:
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    # Creates a supervisor Deployment alongside the gateway.
+    # Per-workspace and per-node supervisor options are planned.
+    supervisor_topology: gateway
+
+supervisor:
+  replicas: 2
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: openshell-supervisor
+              app.kubernetes.io/instance: openshell
+              app.kubernetes.io/component: supervisor
+          topologyKey: kubernetes.io/hostname
+```
+
+The chart creates the supervisor Deployment and connects it to the gateway.
+Tune the pool through the top-level `supervisor` values.
+
+The chart sets no supervisor affinity by default. The example rule places each
+supervisor replica on a different node, so losing one node leaves another
+supervisor to take over. Replace `openshell` in `app.kubernetes.io/instance`
+with your Helm release name. A required rule leaves a replica Pending when there
+are not enough nodes; use `preferredDuringSchedulingIgnoredDuringExecution` to
+spread replicas when possible without blocking scheduling.
+
+The chart also creates a PodDisruptionBudget that lets voluntary disruptions,
+such as node drains, evict one supervisor at a time. If maintenance must evict
+more supervisors at once, set `supervisor.podDisruptionBudget.enabled` to
+`false` for the maintenance window and set it back to `true` afterward:
+
+```shell
+helm upgrade openshell <chart> -n openshell --reuse-values --set supervisor.podDisruptionBudget.enabled=false
+```
+
+### Recover from a Supervisor Failure
+
+When a supervisor fails, the gateway moves its sandboxes to a live supervisor.
+The sandboxes keep their running processes and in-memory state. They pause
+briefly during the move, and open proxied connections and interactive sessions
+must reconnect. Recovery does not restore a sandbox whose own Pod or node is
+lost.
+
+If no supervisor takes over within `supervisor.recoveryTimeoutSeconds`, the
+sandbox terminates its workload. The timeout defaults to `60` seconds and
+accepts values from `30` to `300`.
+
+### Scale Supervisors Manually
+
+Change `supervisor.replicas` to scale the pool:
+
+```shell
+helm upgrade openshell <chart> -n openshell --reuse-values --set supervisor.replicas=2
+helm upgrade openshell <chart> -n openshell --reuse-values --set supervisor.replicas=1
+```
+
+Scaling up adds capacity for new sandboxes without moving existing ones.
+Scaling down hands the removed supervisor's sandboxes to the
+remaining supervisors, where they keep running and their open connections must
+reconnect.
+
+### Autoscale shared supervisors by memory
+
+Set `supervisor.autoscaling.enabled` to let a HorizontalPodAutoscaler manage
+the supervisor replica count. Your cluster must provide the Kubernetes resource
+metrics API, usually through Metrics Server.
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    supervisor_topology: gateway
+
+supervisor:
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+    targetMemoryAverageValue: 512Mi
+```
+
+Autoscaling is off by default. The replica limits and memory target shown are
+the defaults. The target is an absolute average memory usage per supervisor
+Pod. When enabled, the HPA owns the replica count and the chart ignores
+`supervisor.replicas`. Scaling up adds room for new sandboxes but does
+not rebalance existing ones.
+
+Enabling the HPA on an existing release can briefly reset the supervisor
+Deployment to one Pod, so enable it at install time or during a maintenance
+window. If your release uses older values, upgrade with
+`--reset-then-reuse-values` as described in
+[Autoscale with a HorizontalPodAutoscaler](#autoscale-with-a-horizontalpodautoscaler).
+When you disable the HPA, set `supervisor.replicas` in the same upgrade.
 
 ## Next Steps
 

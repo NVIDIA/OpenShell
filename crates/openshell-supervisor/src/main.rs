@@ -83,6 +83,19 @@ struct Args {
     #[arg(long, required_if_eq("mode", "shared"))]
     session_root: Option<PathBuf>,
 
+    /// Opaque, stable logical ID of this shared supervisor as a member of
+    /// the gateway's supervisor pool, so the gateway can place, keep, and
+    /// fail over sandbox instances among members. One process serves a
+    /// member at a time. Required for `--mode=shared`.
+    #[arg(long, env = "OPENSHELL_SUPERVISOR_POOL_MEMBER_ID")]
+    pool_member_id: Option<String>,
+
+    /// IP address, reachable from sandbox runtimes, that other pool members
+    /// redirect this member's sandbox runtimes to; the runtime listener's
+    /// port is appended. Required for `--mode=shared`.
+    #[arg(long, env = "OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP")]
+    pool_advertise_ip: Option<std::net::IpAddr>,
+
     /// Supervisor responsibility to run.
     #[arg(long, value_enum, default_value_t)]
     role: SupervisorRole,
@@ -132,6 +145,11 @@ struct Args {
     /// OCSF schema version that exported events are downgraded to.
     #[arg(long, env = openshell_core::sandbox_env::OTLP_OCSF_SCHEMA_VERSION)]
     otlp_ocsf_schema_version: Option<openshell_ocsf::OcsfSchemaVersion>,
+
+    /// OTLP/gRPC collector endpoint that workload traces are relayed to.
+    /// Absent keeps the relay inactive.
+    #[arg(long, env = openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT)]
+    otlp_agent_endpoint: Option<String>,
 
     /// Name of the gateway that launched this sandbox, for telemetry.
     #[arg(long, env = openshell_core::sandbox_env::GATEWAY_NAME)]
@@ -248,6 +266,26 @@ fn backend_descriptor(args: &Args, admitted_backend: &str) -> Result<BackendDesc
     })
 }
 
+// Bound the protected identity and TLS metadata before allocating it.
+const MAX_BOUNDARY_LAUNCH_BYTES: usize = 1024 * 1024;
+
+fn read_boundary_launch(
+    path: &Path,
+) -> Result<openshell_sandbox_backend::delegated::DelegatedLaunch> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)
+        .map_err(|error| miette::miette!("read boundary launch metadata: {error}"))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_BOUNDARY_LAUNCH_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| miette::miette!("read boundary launch metadata: {error}"))?;
+    if bytes.len() > MAX_BOUNDARY_LAUNCH_BYTES {
+        return Err(miette::miette!("boundary launch metadata exceeds 1 MiB"));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| miette::miette!("decode boundary launch metadata: {error}"))
+}
+
 fn backend_setup(
     args: &Args,
     admitted_backend: &str,
@@ -287,10 +325,7 @@ fn backend_setup(
     let path = args.boundary_launch_file.as_ref().ok_or_else(|| {
         miette::miette!("--boundary-launch-file is required for a registered external backend")
     })?;
-    let bytes = std::fs::read(path)
-        .map_err(|error| miette::miette!("read boundary launch metadata: {error}"))?;
-    let launch = serde_json::from_slice(&bytes)
-        .map_err(|error| miette::miette!("decode boundary launch metadata: {error}"))?;
+    let launch = read_boundary_launch(path)?;
     Ok(Box::new(registrations.resolve(admitted_backend, launch)?))
 }
 
@@ -596,6 +631,9 @@ fn main() -> Result<()> {
                     .filter(|path| !path.is_empty())
                     .map(PathBuf::from),
                     proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
+                    takeover: None,
+                    supervisor_recovery_timeout_secs: None,
+                    otlp_agent_endpoint: args.otlp_agent_endpoint.clone(),
                 };
                 // Log push already shares these credentials and the logging
                 // layers these OCSF JSON settings.
@@ -904,6 +942,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn agent_relay_endpoint_is_separate_from_trace_export() {
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--otlp-endpoint",
+            "http://traces:4317",
+        ])
+        .expect("parse trace export");
+        assert_eq!(
+            args.otlp_agent_endpoint, None,
+            "trace export alone leaves the relay inactive"
+        );
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--otlp-agent-endpoint",
+            "http://agents:4317",
+        ])
+        .expect("parse agent relay");
+        assert_eq!(
+            args.otlp_agent_endpoint.as_deref(),
+            Some("http://agents:4317")
+        );
+        assert_eq!(args.otlp_endpoint, None);
+    }
+
     #[tokio::test]
     async fn ocsf_export_starts_only_with_a_valid_endpoint() {
         let config = |endpoint| openshell_otel::OtlpExportConfig {
@@ -1046,6 +1109,18 @@ mod tests {
         ])
         .expect("network-proxy arguments");
         assert!(validate_role_arguments(&args).is_err());
+    }
+
+    #[test]
+    fn boundary_launch_input_is_bounded_before_decoding() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("boundary.json");
+        assert!(read_boundary_launch(&path).is_err());
+        std::fs::write(&path, vec![b' '; MAX_BOUNDARY_LAUNCH_BYTES + 1]).unwrap();
+        let error = read_boundary_launch(&path).unwrap_err();
+        assert!(error.to_string().contains("exceeds 1 MiB"));
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(read_boundary_launch(&path).is_err());
     }
 
     #[test]

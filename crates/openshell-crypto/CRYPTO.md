@@ -107,6 +107,7 @@ is migrated or deleted.
 | --- | --- | --- |
 | `sha2` | `openshell-core` | Endpoint identities and canonical policy hashes; policy binding still requires migration. |
 | `sha2` | `openshell-driver-docker`, `openshell-driver-kubernetes-secrets`, `openshell-driver-vault` | Deterministic volume and credential-storage names, not authentication. |
+| `sha2` | `openshell-driver-kubernetes`, `openshell-driver-podman` | Destination-trust ConfigMap names and operator-bundle generation labels, not authenticity proofs. Trust relies on immutable staging, exact-byte validation, and TLS verification; see the README's destination-trust classification. |
 | `sha2` | `openshell-driver-vm`, `openshell-isolation-interface`, `openshell-supervisor-network` | Artifact integrity, outer-fence evidence, and DNS policy binding; security-sensitive migration remains required. |
 | `sha2` | `openshell-gateway-interceptors` | Provider-profile snapshot revision hashes; content identity outside backend dispatch. |
 | `sha2` | `openshell-supervisor-process` | Diagnostic debug-token fingerprints. |

@@ -54,7 +54,6 @@ nix = { workspace = true, features = ["resource", "socket", "feature", "poll"] }
 
 # TLS crypto provider install (main.rs)
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
 
 # Serialization (serde_json::json! for OCSF unmapped fields)
@@ -79,8 +78,11 @@ socket2 = { workspace = true, features = ["all"] }
 tempfile = "3"
 
 [dev-dependencies]
+hyper-util = { workspace = true }
+openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 rcgen = { workspace = true }
 tempfile = "3"
+tower = { workspace = true }
 
 [lints]
 workspace = true

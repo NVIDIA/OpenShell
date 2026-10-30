@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+{{- include "openshell.validateValues" . }}
+{{- if include "openshell.supervisorEnabled" . }}
+{{- $kubernetes := include "openshell.effectiveKubernetesConfig" . | fromYaml }}
+{{- $shared := get $kubernetes "shared_supervisor" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "openshell.supervisorName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: supervisor
+spec:
+  selector:
+    {{- include "openshell.supervisorSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: runtime
+      port: {{ get $shared "runtime_port" }}
+      targetPort: runtime
+      protocol: TCP
+{{- end }}

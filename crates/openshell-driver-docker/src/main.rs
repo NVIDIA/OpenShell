@@ -59,6 +59,11 @@ struct Args {
     )]
     otlp_ocsf_schema_version: Option<String>,
 
+    /// OTLP/gRPC collector endpoint that supervisors relay workload traces
+    /// to. Absent keeps the agent trace relay off.
+    #[arg(long, env = "OPENSHELL_OTLP_AGENT_ENDPOINT")]
+    otlp_agent_endpoint: Option<String>,
+
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
 }
@@ -90,6 +95,7 @@ async fn main() -> Result<()> {
         docker_config.supervisor_image = Some(image);
     }
     docker_config.supervisor_otlp_endpoint = args.otlp_endpoint.clone();
+    docker_config.supervisor_otlp_agent_endpoint = args.otlp_agent_endpoint.clone();
     docker_config.supervisor_gateway_name = args.gateway_name.clone();
     docker_config.supervisor_ocsf_export = args.otlp_ocsf_endpoint.clone().map(|endpoint| {
         openshell_core::sandbox_env::OcsfOtlpExport {
@@ -97,7 +103,7 @@ async fn main() -> Result<()> {
             schema_version: args.otlp_ocsf_schema_version.clone(),
         }
     });
-    let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config)
+    let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config, None)
         .await
         .into_diagnostic()?;
 
