@@ -63,10 +63,12 @@ TLS.
 **--db-max-connections** *N*
 :   Connection ceiling for the database pool, shared by every
     database-backed request. Must be at least 1, and at least 2 with
-    Postgres, because the SSH identity lock keeps one connection while it
-    queries the pool. When unset, the gateway uses the backend default:
-    **10** for Postgres, **5** for on-disk SQLite. An in-memory SQLite
-    database is always one connection.
+    Postgres: an SSH identity or provider-refresh lock holder keeps one
+    data connection for its lock and queries the pool on another, and the
+    gateway caps those holders at half of `database_max_connections` per
+    replica. When unset, the gateway uses
+    the backend default: **10** for Postgres, **5** for on-disk SQLite. An
+    in-memory SQLite database is always one connection.
     TOML key: `database_max_connections`.
     Environment: **OPENSHELL_DB_MAX_CONNECTIONS**.
 
