@@ -1,7 +1,7 @@
 # Cryptography and FIPS
 
 OpenShell routes first-party security-sensitive cryptography through
-`openshell-crypto`. The workspace selects AWS-LC as the production backend.
+`openshell-crypto`. Executable packages select AWS-LC as the production backend.
 The opt-in `openssl` feature supplies a system-OpenSSL backend for explicit
 context selection. Neither backend asserts deployment FIPS compliance, and strict
 posture requests fail closed. Application startup, dependency-owned transports,
@@ -29,9 +29,11 @@ remain compatibility constraints when adding or changing a backend.
 
 ## Selection and initialization
 
-Consumer crates inherit the workspace's backend choice and enable integration
-features on the facade. A build without the default backend must install a
-context before facade use. Select the context before constructing clients,
+Reusable libraries inherit a backend-neutral workspace dependency and enable
+integration features on the facade. Executable packages select AWS-LC explicitly;
+standalone library tests select it through development dependencies. An embedder
+must select a backend and install its context before facade use. Select the
+context before constructing clients,
 listeners, or dependencies that initialize process-wide crypto providers.
 
 Explicit context selection controls first-party TLS builders even when a

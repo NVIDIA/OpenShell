@@ -11,6 +11,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+openshell-crypto = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio"] }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
@@ -19,7 +20,7 @@ tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tower = { workspace = true }
 
 [dev-dependencies]
-openshell-crypto = { workspace = true }
+openshell-crypto = { workspace = true, features = ["aws-lc"] }
 http = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }

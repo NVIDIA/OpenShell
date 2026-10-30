@@ -19,11 +19,26 @@ The Rust SDK is currently consumed from source. Pin the dependency to the same
 release tag as your gateway:
 
 ```shell
-cargo add openshell-sdk \
+cargo add openshell-sdk --features aws-lc \
   --git https://github.com/NVIDIA/OpenShell \
   --tag <release-tag>
 cargo add tokio --features macros,rt-multi-thread
 ```
+
+The SDK is backend-neutral by default. When upgrading an existing application,
+add the `aws-lc` feature to retain the previous crypto behavior. Without a backend
+or an installed host TLS provider, HTTPS connections fail during initialization.
+
+If your application supplies its own backend, omit `aws-lc`, depend on
+`openshell-crypto` from the same release with default features disabled, and call
+`install_default_context` before using the SDK. For system OpenSSL, enable that
+crate's `openssl` feature and install `CryptoContext::new(Box::new(OpenSsl))`.
+See the [crypto initialization guide](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-crypto/README.md)
+for imports, system requirements, and backend limitations.
+
+TLS clients preserve an existing Rustls process provider. If none is installed,
+the first TLS use installs the facade provider process-wide. Install any host
+provider before constructing SDK clients.
 
 ## Connect to a Gateway
 

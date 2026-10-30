@@ -331,3 +331,13 @@ gh run rerun <run-id>
    ```bash
    gh run rerun <run-id> --failed
    ```
+
+## Crypto backend independence
+
+For failures in Branch Checks' library crypto selection step (Linux x86_64), run
+`mise run rust:verify:library-crypto` from the checkout. It checks external library
+consumer graphs and TLS/JWT behavior separately from workspace tests, then checks
+executable backend defaults across all targets. It also exercises a system-OpenSSL
+consumer; use `nix develop .#crypto` for the required libraries. Do not add AWS-LC
+to a shared library's defaults to make a test
+pass; standalone library tests select their backend in development dependencies.

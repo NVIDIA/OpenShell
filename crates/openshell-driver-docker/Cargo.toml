@@ -15,6 +15,8 @@ name = "openshell-driver-docker"
 path = "src/main.rs"
 
 [dependencies]
+# Product backend selection also applies when building without default features.
+openshell-crypto = { workspace = true, features = ["aws-lc"] }
 openshell-core = { path = "../openshell-core", default-features = false, features = ["driver-extraction"] }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }

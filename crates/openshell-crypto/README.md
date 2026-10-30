@@ -44,14 +44,33 @@ depending on rcgen's compiled crypto implementation.
 
 ## Build selection
 
-The crate's default `aws-lc` feature selects the current implementation. The root
-workspace declares that choice once in its `openshell-crypto` dependency;
-application crates inherit it rather than choosing a backend independently.
-Standalone examples select their own default through their path dependency.
-Disabling crate defaults removes its AWS-LC implementation and requires an
-explicit context before use; use without initialization fails closed with an
-initialization panic. This mode is for embedders and backend contract tests, not
-an independently runnable OpenShell product configuration.
+The crate's default `aws-lc` feature selects the current implementation. The
+workspace dependency disables defaults and selects no backend. Reusable libraries
+including `openshell-core`, `openshell-sdk`, and `openshell-policy` therefore do
+not enable AWS-LC, including through core's optional telemetry and tracing features.
+Their development dependencies select AWS-LC only for standalone crate tests.
+
+Executable packages explicitly enable `openshell-crypto/aws-lc`, including builds
+with package defaults disabled, except the VM guest init package mode, which
+does not use cryptography. This preserves shipped behavior. Cargo features
+apply to a whole package: the library targets in CLI, gateway, supervisor, sandbox,
+and standalone driver packages also carry that product choice. Embed through the
+backend-neutral core/SDK/policy crates when choosing your own implementation.
+Standalone examples and test harnesses select their backend explicitly.
+
+An embedder can depend on `openshell-crypto` with `default-features = false`,
+implement `CryptoBackend` and `ProtocolBackend`, and call
+`install_default_context(CryptoContext::new(Box::new(backend)))` before constructing
+clients or performing cryptography. Merely installing a Rustls provider does not
+supply primitive, PKI, or JWT operations. To retain OpenShell's AWS-LC behavior,
+enable the opt-in `aws-lc` feature on `openshell-core` or `openshell-sdk`, or add
+`openshell-crypto` with its default features enabled. SDK connections and fallible
+TLS builders return initialization errors when no provider is available. Legacy
+infallible helpers still panic; prefer `try_default_context`,
+`tls::try_ensure_default_provider`, and `openshell_sdk::oidc::try_http_client`.
+If a host has not installed a Rustls provider, the first dependency-owned TLS
+client installs the facade provider process-wide. Install a host provider first
+when it must own that global.
 
 Integration features (`tls-tonic`, `tls-kube`, `tls-sqlx`) activate
 dependencies. The `aws-lc` feature supplies their AWS-LC choices conditionally.
@@ -321,3 +340,11 @@ not target RHEL qualification or product E2E tests.
 Existing bootstrap, credential-store, gateway TLS/OIDC, and proxy tests exercise the
 migrated consumers. The cargo-deny Ring restrictions and their explicit wrapper
 exceptions remain in force.
+
+`mise run rust:verify:library-crypto` checks isolated consumer graphs for core,
+SDK, and policy, then runs TLS and JWT probes with consumer-owned Ring/RustCrypto
+implementations. The fixture is outside the product workspace, so product and
+dev-dependency feature unification cannot hide regressions. Ring here is a test
+consumer choice, not a new production backend or a relaxation of `deny.toml`.
+The same check verifies AWS-LC remains selected by executable packages both with
+and without their default features.

@@ -24,6 +24,11 @@ use std::sync::{Arc, OnceLock};
 /// Errors contain no key material or authentication-failure details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum CryptoError {
+    /// No backend was selected by the application.
+    #[error(
+        "enable the aws-lc feature on openshell-sdk, openshell-core, or openshell-crypto, or call install_default_context before crypto use"
+    )]
+    MissingContext,
     /// A backend could not obtain cryptographic randomness.
     #[error("cryptographic random generation failed")]
     Random,
@@ -180,21 +185,27 @@ pub(crate) fn explicitly_selected() -> bool {
 /// Application default, initialized lazily to AWS-LC unless selected before first use.
 #[must_use]
 pub fn default_context() -> &'static CryptoContext {
+    try_default_context()
+        .expect("enable openshell-crypto/aws-lc or call install_default_context before crypto use")
+}
+
+/// Obtain the application context, failing when no backend has been selected.
+pub fn try_default_context() -> Result<&'static CryptoContext, CryptoError> {
     #[cfg(feature = "aws-lc")]
     {
-        &DEFAULT
+        Ok(&DEFAULT
             .get_or_init(|| DefaultContext {
                 context: CryptoContext::default(),
                 explicit: false,
             })
-            .context
+            .context)
     }
     #[cfg(not(feature = "aws-lc"))]
     {
-        &DEFAULT
+        DEFAULT
             .get()
-            .expect("install a crypto context before use when no default backend is built")
-            .context
+            .map(|selected| &selected.context)
+            .ok_or(CryptoError::MissingContext)
     }
 }
 

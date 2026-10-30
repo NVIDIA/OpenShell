@@ -2043,7 +2043,6 @@ dependencies = [
  "reqwest",
  "rustix",
  "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2116,6 +2115,7 @@ name = "openshell-extension-core"
 version = "0.0.0"
 dependencies = [
  "hyper-util",
+ "openshell-crypto",
  "serde",
  "thiserror 2.0.20",
  "tokio",
@@ -2143,6 +2143,7 @@ dependencies = [
  "futures",
  "http",
  "metrics",
+ "openshell-crypto",
  "openshell-ocsf",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -2248,6 +2249,7 @@ dependencies = [
  "futures",
  "openshell-bootstrap",
  "openshell-core",
+ "openshell-crypto",
  "openshell-sdk",
  "openshell-testkit-macros",
  "rand 0.9.5",

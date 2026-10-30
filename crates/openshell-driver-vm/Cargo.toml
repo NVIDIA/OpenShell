@@ -69,6 +69,8 @@ allocation-tracking = []
 default = ["compute-driver", "telemetry"]
 ## Build the standalone compute driver and its host runtime implementation.
 compute-driver = [
+    "dep:openshell-crypto",
+    "openshell-crypto/aws-lc",
     "dep:base64",
     "dep:bollard",
     "dep:clap",
@@ -88,7 +90,6 @@ compute-driver = [
     "dep:polling",
     "dep:prost",
     "dep:prost-types",
-    "dep:openshell-crypto",
     "dep:sha2",
     "dep:tar",
     "dep:tokio-stream",

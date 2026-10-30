@@ -21,7 +21,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-openshell-crypto = { workspace = true }
+openshell-crypto = { workspace = true, features = ["aws-lc"] }
 rcgen = { workspace = true }
 tempfile = "3"
 

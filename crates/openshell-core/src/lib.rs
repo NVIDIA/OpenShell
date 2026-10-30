@@ -8,6 +8,16 @@
 //! - Configuration management
 //! - Common error types
 //! - Build version metadata
+//!
+//! # Cryptography
+//!
+//! This library is backend-neutral by default. Enable its `aws-lc` feature, or
+//! add `openshell-crypto` with defaults disabled and install your own
+//! `CryptoContext` before constructing TLS/JWT clients or using crypto.
+//! Existing Rustls process providers are preserved by dependency-owned clients;
+//! selecting a context does not replace an already installed process provider.
+//! If no provider is installed, the first TLS use installs the facade provider
+//! process-wide. Install any host provider before that first use.
 
 pub mod activity;
 pub mod auth;

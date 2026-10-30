@@ -10,6 +10,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Application opt-in; libraries remain backend-neutral by default.
+aws-lc = ["openshell-crypto/aws-lc"]
+
 [dependencies]
 openshell-crypto = { workspace = true }
 openshell-core = { path = "../openshell-core" }
@@ -32,6 +36,7 @@ tracing = { workspace = true }
 async-stream = "0.3.6"
 
 [dev-dependencies]
+openshell-crypto = { workspace = true, features = ["aws-lc"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-stream = { workspace = true }

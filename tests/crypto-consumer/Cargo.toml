@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-library-crypto-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Deliberately outside the product workspace: its dev dependencies and executable
+# packages must not supply the backend missing from a real consumer's graph.
+[workspace]
+resolver = "2"
+
+[features]
+core-minimal = ["dep:openshell-core"]
+core-default = ["core-minimal", "openshell-core/default"]
+core-all = ["core-default", "openshell-core/oauth", "openshell-core/jwt", "openshell-core/trace-context", "openshell-core/driver-extraction"]
+sdk = ["dep:openshell-sdk"]
+policy = ["dep:openshell-policy"]
+integration = ["core-all", "sdk", "policy", "dep:openshell-crypto", "dep:rcgen", "dep:rustls", "dep:jsonwebtoken", "dep:tokio", "dep:tokio-rustls", "dep:h2"]
+
+runtime = ["integration", "rcgen/ring", "rustls/ring", "jsonwebtoken/rust_crypto", "dep:openshell-extension-core", "dep:openshell-otel"]
+openssl-runtime = ["integration", "openshell-crypto/openssl"]
+core-aws-lc = ["core-all", "openshell-core/aws-lc"]
+sdk-aws-lc = ["sdk", "openshell-sdk/aws-lc"]
+
+[dependencies]
+openshell-extension-core = { path = "../../crates/openshell-extension-core", optional = true }
+openshell-otel = { path = "../../crates/openshell-otel", optional = true }
+openshell-core = { path = "../../crates/openshell-core", default-features = false, optional = true }
+openshell-sdk = { path = "../../crates/openshell-sdk", optional = true }
+openshell-policy = { path = "../../crates/openshell-policy", optional = true }
+openshell-crypto = { path = "../../crates/openshell-crypto", default-features = false, optional = true }
+# Consumer-owned implementations, used only by this isolated regression fixture.
+rcgen = { version = "0.14.10", default-features = false, features = ["pem"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"], optional = true }
+tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "net", "time"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, optional = true }
+h2 = { version = "0.4", optional = true }
+
+[[test]]
+name = "selected_backend"
+required-features = ["integration"]
+
+[[test]]
+name = "missing_context"
+required-features = ["runtime"]
+
+[[test]]
+name = "host_tls_provider"
+required-features = ["runtime"]

@@ -11,6 +11,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+openshell-crypto = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
 metrics = { workspace = true }
@@ -28,6 +29,7 @@ tonic = { workspace = true }
 tower-http = { workspace = true }
 
 [dev-dependencies]
+openshell-crypto = { workspace = true, features = ["aws-lc"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["test-util"] }
 

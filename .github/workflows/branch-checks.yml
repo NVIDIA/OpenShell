@@ -337,6 +337,11 @@ jobs:
           fi
           cargo test --locked -p openshell-crypto --no-default-features --test independent_backend
 
+      - name: Verify library crypto selection
+        if: matrix.system == 'x86_64-linux'
+        shell: nix develop .#crypto -c bash -euo pipefail {0}
+        run: mise run rust:verify:library-crypto
+
       - name: Verify OpenSSL backend
         shell: nix develop .#crypto -c bash -euo pipefail {0}
         env:
