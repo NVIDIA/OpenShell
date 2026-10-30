@@ -1411,7 +1411,6 @@ mod tests {
                         enabled,
                         ..Default::default()
                     },
-                    ..Default::default()
                 },
             );
             let spec = pod.spec.expect("Pod spec");

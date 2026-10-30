@@ -80,6 +80,24 @@ runs:
         CLUSTER_NAME: ${{ inputs.cluster-name }}
       run: |
         set -euo pipefail
+        collect_cni_diagnostics() {
+          failure_status=$?
+          set +e
+          diagnostics="$GITHUB_WORKSPACE/results/app-listener/cni-setup"
+          mkdir -p "$diagnostics"
+          kubectl --context "kind-$CLUSTER_NAME" get nodes -o wide > "$diagnostics/nodes.txt" 2>&1
+          kubectl --context "kind-$CLUSTER_NAME" describe nodes > "$diagnostics/node-details.txt" 2>&1
+          kubectl --context "kind-$CLUSTER_NAME" -n kube-system get pods -o wide > "$diagnostics/pods.txt" 2>&1
+          kubectl --context "kind-$CLUSTER_NAME" -n kube-system get events --sort-by=.lastTimestamp > "$diagnostics/events.txt" 2>&1
+          for component in calico-node calico-kube-controllers; do
+            kubectl --context "kind-$CLUSTER_NAME" -n kube-system describe pods -l "k8s-app=$component" > "$diagnostics/$component-details.txt" 2>&1
+            kubectl --context "kind-$CLUSTER_NAME" -n kube-system logs -l "k8s-app=$component" --all-containers --prefix --tail=200 > "$diagnostics/$component.log" 2>&1
+            kubectl --context "kind-$CLUSTER_NAME" -n kube-system logs -l "k8s-app=$component" --all-containers --prefix --tail=200 --previous > "$diagnostics/$component-previous.log" 2>&1
+          done
+          cat "$diagnostics/pods.txt" "$diagnostics/events.txt"
+          exit "$failure_status"
+        }
+        trap collect_cni_diagnostics ERR
         curl -fsSL https://raw.githubusercontent.com/projectcalico/calico/v3.30.3/manifests/calico.yaml \
           -o "$RUNNER_TEMP/calico.yaml"
         sed 's@192.168.0.0/16@10.244.0.0/16@g' "$RUNNER_TEMP/calico.yaml" > "$RUNNER_TEMP/calico-kind.yaml"

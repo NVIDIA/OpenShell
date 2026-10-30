@@ -125,6 +125,12 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
+For Kubernetes app-listener E2E failures during kind setup, inspect the uploaded
+`results/app-listener/cni-setup/` evidence. It includes node and Calico pod
+descriptions, events, and current/previous container logs. A CNI rollout timeout
+occurs before the listener tests run; use these diagnostics to distinguish image
+pulls, init failures, and readiness failures.
+
 For tmachine Kubernetes conformance failures, inspect the `tmachine-diagnostics-*` artifact. The K3s report includes Agent Sandbox controller state, leader leases, events, and current and previous controller logs. The conformance playbook checks reconciliation after guest boot with a temporary scheduling-gated Sandbox probe before running tests. Distinguish a failed controller probe from a failed conformance scenario; gateway connectivity and controller Deployment availability do not prove reconciliation works.
 
 For the `e2e-suites` lane (`.github/workflows/e2e-suites.yml`), the last lines of the job log give the runner's result: PASS, FAIL (exit 1) after the end of the nextest log (which names the failed tests), or ERROR (exit 2) with the step that broke. FAIL and ERROR also appear as annotations on the run's summary page. Then inspect the `e2e-results-<family>-<package>-<environment>-<installer>` artifact, which holds `junit.xml`, `nextest.log` and, after a failure, the guest's `diagnostics/`.
