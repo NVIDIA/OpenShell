@@ -1859,11 +1859,7 @@ fn local_owner_endpoint(replica_id: &str) -> String {
     )
 }
 
-/// Where this sandbox's session belongs, when that is not this replica.
-///
-/// A shared supervisor pool sandbox belongs with the replica serving its
-/// owning member; any other sandbox, or a pool sandbox whose parent is not
-/// known to be live, goes where the ring says.
+/// Where the ring says this sandbox belongs, when that is not this replica.
 ///
 /// Returns `None` whenever this replica should serve the session itself, which
 /// covers single-replica mode, an empty ring, the ring naming this replica, and
@@ -1875,25 +1871,9 @@ fn preferred_peer_redirect(state: &Arc<ServerState>, sandbox_id: &str) -> Option
         return None;
     }
 
-    let shutting_down = state.gateway_shutting_down.load(Ordering::Acquire);
-    let parent = {
-        let parents = state.pool_session_parents.read().ok()?;
-        let peers = state.gateway_peers.read().ok()?;
-        pool_session_parent(
-            &parents,
-            &peers,
-            &state.replica_id,
-            sandbox_id,
-            shutting_down,
-        )
-    };
-    if let Some((parent, peer_endpoint)) = parent {
-        return ring_redirect(&state.replica_id, &parent, peer_endpoint);
-    }
-
     let preferred = {
         let ring = state.gateway_ring.read().ok()?;
-        if shutting_down {
+        if state.gateway_shutting_down.load(Ordering::Acquire) {
             ring.without(&state.replica_id)
                 .owner_for(sandbox_id)?
                 .to_string()
@@ -1907,46 +1887,6 @@ fn preferred_peer_redirect(state: &Arc<ServerState>, sandbox_id: &str) -> Option
     };
 
     ring_redirect(&state.replica_id, &preferred, peer_endpoint)
-}
-
-/// The replica serving the pool member that owns `sandbox_id`, with its peer
-/// endpoint, when that replica can take the session: this replica unless it
-/// is shutting down, or a live peer.
-fn pool_session_parent(
-    parents: &HashMap<String, String>,
-    peers: &HashMap<String, String>,
-    self_replica_id: &str,
-    sandbox_id: &str,
-    shutting_down: bool,
-) -> Option<(String, Option<String>)> {
-    let parent = parents.get(sandbox_id)?;
-    if parent == self_replica_id {
-        return (!shutting_down).then(|| (parent.clone(), None));
-    }
-    let peer_endpoint = peers.get(parent)?;
-    Some((parent.clone(), Some(peer_endpoint.clone())))
-}
-
-/// Where to move a live pool sandbox session that this replica serves but
-/// whose owning member's stream is served by another live replica.
-fn pool_relocation(state: &ServerState, sandbox_id: &str) -> Option<SessionRedirect> {
-    if state.store.is_single_replica() || state.gateway_shutting_down.load(Ordering::Acquire) {
-        return None;
-    }
-    let parents = state.pool_session_parents.read().ok()?;
-    let peers = state.gateway_peers.read().ok()?;
-    pool_relocation_target(&parents, &peers, &state.replica_id, sandbox_id)
-}
-
-fn pool_relocation_target(
-    parents: &HashMap<String, String>,
-    peers: &HashMap<String, String>,
-    self_replica_id: &str,
-    sandbox_id: &str,
-) -> Option<SessionRedirect> {
-    let (parent, peer_endpoint) =
-        pool_session_parent(parents, peers, self_replica_id, sandbox_id, false)?;
-    ring_redirect(self_replica_id, &parent, peer_endpoint)
 }
 
 /// Decide whether a preferred replica is worth redirecting to.
@@ -2615,7 +2555,7 @@ pub async fn handle_connect_supervisor(
     // Validate readiness identities before replacing a healthy session.
     let provider_readiness = ProviderReadinessEvidence::from_hello(&hello)?;
 
-    // If this sandbox belongs on a different live replica, send the
+    // If the ring places this sandbox on a different live replica, send the
     // supervisor there instead of claiming ownership here. Decided before the
     // session is tracked so a redirect never consumes a session slot. An
     // established session is only relocated when this replica shuts down.
@@ -2626,7 +2566,7 @@ pub async fn handle_connect_supervisor(
             sandbox_id = %sandbox_id,
             owner_replica_id = %redirect.owner_replica_id,
             replica_id = %state.replica_id,
-            "supervisor session: redirecting to preferred replica"
+            "supervisor session: redirecting to ring-preferred replica"
         );
         if state.supervisor_sessions.has_session(&sandbox_id) {
             let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
@@ -2810,8 +2750,6 @@ enum SessionLoopExit {
     /// This gateway is shutting down. `redirected` records whether a
     /// `SessionRedirect` was queued for the supervisor.
     GatewayShutdown { redirected: bool },
-    /// The supervisor was redirected to the replica serving its pool member.
-    Relocated,
     /// The session ended for any other reason.
     Other,
 }
@@ -2834,10 +2772,8 @@ async fn finish_supervisor_session(
     // owner and the sandbox stays Ready through the handoff. Without a
     // redirect the supervisor reconnects with backoff through the Service, so
     // waiting would only delay the demotion.
-    if matches!(
-        exit,
-        SessionLoopExit::GatewayShutdown { redirected: true } | SessionLoopExit::Relocated
-    ) && terminal_finalized == Some(false)
+    if exit == (SessionLoopExit::GatewayShutdown { redirected: true })
+        && terminal_finalized == Some(false)
         && sandbox_may_be_ready(state, sandbox_id).await
         && wait_for_replacement_owner(
             &owner_index,
@@ -3050,21 +2986,6 @@ async fn run_session_loop(
                 }
             }
             _ = heartbeat_timer.tick() => {
-                if *supports_session_redirect
-                    && bootstrap_complete
-                    && let Some(redirect) = pool_relocation(state, sandbox_id)
-                {
-                    let owner_replica_id = redirect.owner_replica_id.clone();
-                    if tx
-                        .try_send(GatewayMessage {
-                            payload: Some(gateway_message::Payload::SessionRedirect(redirect)),
-                        })
-                        .is_ok()
-                    {
-                        info!(sandbox_id = %sandbox_id, session_id = %session_id, owner_replica_id, "supervisor session: moving to its supervisor's replica");
-                        return SessionLoopExit::Relocated;
-                    }
-                }
                 let hb = GatewayMessage {
                     payload: Some(gateway_message::Payload::Heartbeat(
                         openshell_core::proto::GatewayHeartbeat {},
@@ -5661,68 +5582,6 @@ mod tests {
     fn ring_redirect_serves_locally_for_placeholder_endpoints() {
         assert!(ring_redirect("gw-0", "gw-1", Some(String::new())).is_none());
         assert!(ring_redirect("gw-0", "gw-1", Some("local://gw-1".to_string())).is_none());
-    }
-
-    fn pool_maps() -> (HashMap<String, String>, HashMap<String, String>) {
-        let parents = HashMap::from([
-            ("sb-a".to_string(), "gw-0".to_string()),
-            ("sb-b".to_string(), "gw-1".to_string()),
-            ("sb-gone".to_string(), "gw-9".to_string()),
-        ]);
-        let peers = HashMap::from([("gw-1".to_string(), "https://gw-1:8443".to_string())]);
-        (parents, peers)
-    }
-
-    #[test]
-    fn pool_session_follows_its_members_replica() {
-        let (parents, peers) = pool_maps();
-        assert_eq!(
-            pool_session_parent(&parents, &peers, "gw-0", "sb-b", false),
-            Some(("gw-1".to_string(), Some("https://gw-1:8443".to_string())))
-        );
-        assert_eq!(
-            pool_session_parent(&parents, &peers, "gw-0", "sb-a", false),
-            Some(("gw-0".to_string(), None))
-        );
-    }
-
-    #[test]
-    fn pool_session_falls_back_to_the_ring_without_a_live_parent() {
-        let (parents, peers) = pool_maps();
-        // Not a pool sandbox.
-        assert_eq!(
-            pool_session_parent(&parents, &peers, "gw-0", "sb-dedicated", false),
-            None
-        );
-        // Parent replica is not a live peer.
-        assert_eq!(
-            pool_session_parent(&parents, &peers, "gw-0", "sb-gone", false),
-            None
-        );
-        // This replica is the parent but is shutting down.
-        assert_eq!(
-            pool_session_parent(&parents, &peers, "gw-0", "sb-a", true),
-            None
-        );
-    }
-
-    #[test]
-    fn a_live_pool_session_moves_only_to_its_parents_live_peer() {
-        let (parents, peers) = pool_maps();
-        assert_eq!(
-            pool_relocation_target(&parents, &peers, "gw-0", "sb-b"),
-            Some(SessionRedirect {
-                peer_endpoint: "https://gw-1:8443".to_string(),
-                owner_replica_id: "gw-1".to_string(),
-            })
-        );
-        for sandbox_id in ["sb-a", "sb-gone", "sb-dedicated"] {
-            assert_eq!(
-                pool_relocation_target(&parents, &peers, "gw-0", sandbox_id),
-                None,
-                "{sandbox_id}"
-            );
-        }
     }
 
     // ---- ownership terms ----

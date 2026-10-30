@@ -181,13 +181,7 @@ pub struct LiveMember {
     pub process_id: String,
     pub runtime_address: String,
     pub leaving: bool,
-    /// The gateway replica serving the member's stream.
-    pub gateway_replica: String,
 }
-
-/// The gateway replica serving the member that owns each pool sandbox, keyed
-/// by sandbox ID.
-pub type SessionParents = Arc<std::sync::RwLock<HashMap<String, String>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -415,8 +409,6 @@ pub struct SupervisorPool {
     withdrawn_since: Mutex<HashMap<String, tokio::time::Instant>>,
     /// Where the next pass resumes checking records for ended generations.
     sweep_from: Mutex<usize>,
-    /// Published after every pass for session placement.
-    session_parents: SessionParents,
     /// See [`MATERIAL_CANDIDATE_GRACE`].
     candidate_grace: Duration,
     /// See [`RESERVATION_GRACE`].
@@ -574,30 +566,6 @@ fn recharge(
 }
 
 /// Whether the process that owns `owner` still serves its member.
-/// The replica serving each granted, live owner's member, by sandbox.
-fn session_parents_of(
-    owners: &BTreeMap<String, OwnerRecord>,
-    members: &[LiveMember],
-) -> HashMap<String, String> {
-    owners
-        .values()
-        .filter(|owner| {
-            owner.payload.phase == OwnerPhase::Granted && owner_alive(&owner.payload, members)
-        })
-        .filter_map(|owner| {
-            let member = members
-                .iter()
-                .find(|member| member.member_id == owner.payload.member_id)?;
-            (!member.gateway_replica.is_empty()).then(|| {
-                (
-                    owner.payload.sandbox_id.clone(),
-                    member.gateway_replica.clone(),
-                )
-            })
-        })
-        .collect()
-}
-
 fn owner_alive(owner: &OwnerPayload, members: &[LiveMember]) -> bool {
     members.iter().any(|member| {
         member.member_id == owner.member_id
@@ -713,7 +681,6 @@ impl SupervisorPool {
         authority: Arc<SandboxSessionJwtAuthority>,
         credentials: CredentialRuntime,
         replica_id: String,
-        session_parents: SessionParents,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -730,7 +697,6 @@ impl SupervisorPool {
             materials: Mutex::new(HashMap::new()),
             withdrawn_since: Mutex::new(HashMap::new()),
             sweep_from: Mutex::new(0),
-            session_parents,
             candidate_grace: MATERIAL_CANDIDATE_GRACE,
             reservation_grace: RESERVATION_GRACE,
             #[cfg(test)]
@@ -1113,7 +1079,6 @@ impl SupervisorPool {
                 process_id: payload.process_id,
                 runtime_address: payload.runtime_address,
                 leaving: payload.leaving,
-                gateway_replica: payload.gateway_replica,
             });
         }
         members.sort_by(|left, right| left.member_id.cmp(&right.member_id));
@@ -2187,9 +2152,6 @@ impl SupervisorPool {
             }
         }
         self.remove_withdrawn_owners(&desired, &mut owners).await;
-        if let Ok(mut parents) = self.session_parents.write() {
-            *parents = session_parents_of(&owners, &members);
-        }
         self.sweep_ended_instances(&desired).await;
         self.record_reports(&owners, &report_rows).await;
         self.remove_stale_reports(&owners, &report_rows).await;
@@ -2598,7 +2560,6 @@ impl SupervisorPool {
                 process_id: payload.process_id,
                 runtime_address: payload.runtime_address,
                 leaving: payload.leaving,
-                gateway_replica: payload.gateway_replica,
             });
         Ok(takeover_cause(owner, member.as_ref()))
     }
@@ -2965,7 +2926,6 @@ mod tests {
                 self.authority.clone(),
                 self.credentials.clone(),
                 replica_id.to_string(),
-                SessionParents::default(),
             );
             let unique = Arc::get_mut(&mut pool).expect("unique");
             unique.unowned_grace = Duration::ZERO;
@@ -2998,7 +2958,6 @@ mod tests {
                 self.authority.clone(),
                 self.credentials.clone(),
                 replica_id.to_string(),
-                SessionParents::default(),
             )
         }
 
@@ -5290,57 +5249,6 @@ mod tests {
     }
 
     #[test]
-    fn session_parents_name_the_replica_serving_each_live_owner() {
-        let owner = |sandbox: &str, member: &str, phase| OwnerRecord {
-            payload: OwnerPayload {
-                route: format!("rt-{sandbox}"),
-                sandbox_id: sandbox.to_string(),
-                generation: "generation-1".to_string(),
-                member_id: member.to_string(),
-                process_id: format!("p-{member}"),
-                auth_epoch: 1,
-                supervisor_instance_id: None,
-                gateway_token_id: None,
-                phase,
-                previous_member_id: None,
-            },
-            resource_version: 1,
-        };
-        let member = |id: &str, gateway: &str, leaving| LiveMember {
-            member_id: id.to_string(),
-            process_id: format!("p-{id}"),
-            runtime_address: "10.0.0.1:5500".to_string(),
-            leaving,
-            gateway_replica: gateway.to_string(),
-        };
-        let owners = [
-            owner("sb-1", "m1", OwnerPhase::Granted),
-            owner("sb-2", "m2", OwnerPhase::Granted),
-            owner("sb-3", "m3", OwnerPhase::Granted),
-            owner("sb-4", "m1", OwnerPhase::Granting),
-            owner("sb-5", "m-dead", OwnerPhase::Granted),
-        ]
-        .into_iter()
-        .map(|record| (record.payload.route.clone(), record))
-        .collect::<BTreeMap<_, _>>();
-        let members = vec![
-            member("m1", "gw-0", false),
-            member("m2", "gw-1", false),
-            member("m3", "gw-1", true),
-        ];
-
-        let parents = session_parents_of(&owners, &members);
-
-        assert_eq!(
-            parents,
-            HashMap::from([
-                ("sb-1".to_string(), "gw-0".to_string()),
-                ("sb-2".to_string(), "gw-1".to_string()),
-            ])
-        );
-    }
-
-    #[test]
     fn a_takeover_names_why_the_owner_lost_its_instance() {
         let owner = OwnerPayload {
             route: "rt-a".to_string(),
@@ -5359,7 +5267,6 @@ mod tests {
             process_id: process_id.to_string(),
             runtime_address: "10.0.0.1:5500".to_string(),
             leaving,
-            gateway_replica: "gw-a".to_string(),
         };
         assert_eq!(takeover_cause(&owner, None), Some("expired"));
         assert_eq!(
@@ -5384,7 +5291,6 @@ mod tests {
             process_id: format!("p-{id}"),
             runtime_address: "10.0.0.1:5500".to_string(),
             leaving,
-            gateway_replica: "gw-a".to_string(),
         };
         let members = vec![member("m1", false), member("m2", false), member("m3", true)];
         let ring = ring_of(&members);
