@@ -83,15 +83,16 @@ jobs:
         with:
           path: ~/.cache/tmachine
           # tmachine keys its disk layers on a hash of the Ansible tree, the
-          # environments' setup inputs (such as the Keycloak realm file) and
-          # the cache versions in setup.rs and install.rs. actions/cache
-          # doesn't save after an exact key hit, so a key that misses one of
-          # those would rebuild the changed layers on every run. Environments
-          # share no layers, and only the first job to save a key gets its
-          # disks in, so each environment and installer needs its own key. No
-          # restore-keys fallback: restoring an older entry would carry its
-          # stale disks into the new one, which then only grows.
-          key: tmachine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.environment }}-${{ matrix.installer }}-${{ hashFiles('tests/tmachine/ansible/**', 'tests/tmachine/images.nix', 'tests/tmachine/src/qemu/setup.rs', 'tests/tmachine/src/qemu/install.rs', 'scripts/keycloak-realm.json') }}
+          # environments' playbook lists and setup inputs (config.nix, and
+          # files such as the Keycloak realm file) and the cache versions in
+          # setup.rs and install.rs. actions/cache doesn't save after an
+          # exact key hit, so a key that misses one of those would rebuild the
+          # changed layers on every run. Environments share no layers, and
+          # only the first job to save a key gets its disks in, so each
+          # environment and installer needs its own key. No restore-keys
+          # fallback: restoring an older entry would carry its stale disks
+          # into the new one, which then only grows.
+          key: tmachine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.environment }}-${{ matrix.installer }}-${{ hashFiles('tests/tmachine/ansible/**', 'tests/tmachine/config.nix', 'tests/tmachine/images.nix', 'tests/tmachine/src/qemu/setup.rs', 'tests/tmachine/src/qemu/install.rs', 'scripts/keycloak-realm.json') }}
 
       - name: Download integration inputs
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
