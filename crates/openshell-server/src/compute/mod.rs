@@ -6556,6 +6556,14 @@ impl ComputeRuntime {
         snapshot: DriverSandbox,
         sweep_started_at_ms: i64,
     ) -> Result<(), String> {
+        // A start can commit Starting before the driver replaces the stopped
+        // runtime. Do not apply that previous run's state during the operation.
+        // Skip instead of waiting so one slow lifecycle RPC cannot stall the
+        // sweep for unrelated sandboxes. Refresh the driver while holding the
+        // gate so a new local lifecycle operation cannot race that observation.
+        let Some(_lifecycle_guard) = self.lifecycle_gates.try_lock_for(&snapshot.id) else {
+            return Ok(());
+        };
         let expected_resource_version = {
             let _guard = self.lock_sandbox_local(&snapshot.id).await;
             let Some(existing) = self
@@ -6568,6 +6576,11 @@ impl ComputeRuntime {
             };
 
             if existing.updated_at_ms > sweep_started_at_ms {
+                return Ok(());
+            }
+            // Another gateway replica has independent local gates, but its
+            // submitted driver work remains durably owned until settlement.
+            if provisioning_deadline::driver_operation_pending(&decode_sandbox_record(&existing)?) {
                 return Ok(());
             }
             existing.resource_version
@@ -13845,6 +13858,136 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_defers_container_exit_during_start_without_blocking_other_sandboxes() {
+        for remote_start in [false, true] {
+            let driver = ControlledDriver::new();
+            driver.block_start();
+            let sandbox = sandbox_record(
+                "sb-reconcile-start",
+                "reconcile-start",
+                SandboxPhase::Stopped,
+            );
+            let mut exited = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            exited.status = Some(make_driver_status(make_driver_condition(
+                "ContainerExited",
+                "previous run is stopped",
+            )));
+            driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(exited.clone())));
+            let runtime = test_runtime(driver.clone()).await;
+            runtime.store.put_message(&sandbox).await.unwrap();
+
+            let start_runtime = runtime.clone();
+            let start = tokio::spawn(async move {
+                start_runtime
+                    .start_sandbox("default", "reconcile-start")
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
+                .await
+                .expect("start did not reach the driver");
+
+            let mut observer = runtime.clone();
+            if remote_start {
+                // An HA replica shares durable operation ownership but not local gates.
+                observer.lifecycle_gates = Arc::new(LifecycleGateRegistry::default());
+            }
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                observer.reconcile_snapshot_sandbox(exited.clone(), i64::MAX),
+            )
+            .await
+            .expect("reconciliation must skip an active start without waiting")
+            .unwrap();
+            let during_start = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+
+            let other = sandbox_record("sb-other", "other", SandboxPhase::Ready);
+            observer.store.put_message(&other).await.unwrap();
+            let mut other_exited = exited.clone();
+            other_exited.id = other.object_id().to_string();
+            other_exited.name = other.object_name().to_string();
+            driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+                other_exited.clone(),
+            )));
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                observer.reconcile_snapshot_sandbox(other_exited, i64::MAX),
+            )
+            .await
+            .expect("an active start must not block unrelated reconciliation")
+            .unwrap();
+            let other = observer
+                .store
+                .get_message::<Sandbox>(other.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+
+            let ready = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(ready.clone())));
+            driver.release_start();
+            tokio::time::timeout(Duration::from_secs(1), start)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                during_start.phase(),
+                SandboxPhase::Starting as i32,
+                "reconciliation must not fail the new start with the previous run's exit (remote={remote_start})"
+            );
+            assert_eq!(other.phase(), SandboxPhase::Error as i32);
+
+            // Model the replacement supervisor accepting its configuration.
+            observer
+                .store
+                .update_message_cas::<Sandbox, _>(sandbox.object_id(), 0, |sandbox| {
+                    let status = sandbox.status.as_mut().unwrap();
+                    provisioning_deadline::record_admission_start(
+                        status.provisioning.as_mut().unwrap(),
+                        openshell_core::time::now_ms(),
+                    )
+                    .unwrap();
+                    status.configuration_admission.as_mut().unwrap().state =
+                        openshell_core::proto::ConfigurationAdmissionState::Accepted.into();
+                })
+                .await
+                .unwrap();
+            register_test_supervisor_session(&observer, sandbox.object_id());
+            observer
+                .reconcile_snapshot_sandbox(ready, i64::MAX)
+                .await
+                .unwrap();
+            let started = observer
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(started.phase(), SandboxPhase::Ready as i32);
+
+            // A new, genuine exit after start settles must remain observable.
+            driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(exited.clone())));
+            observer
+                .reconcile_snapshot_sandbox(exited, i64::MAX)
+                .await
+                .unwrap();
+            let failed = observer
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(failed.phase(), SandboxPhase::Error as i32);
+            assert_eq!(ready_condition(&failed).unwrap().reason, "ContainerExited");
+        }
     }
 
     #[tokio::test]
