@@ -607,6 +607,7 @@ fn main() -> Result<()> {
                     sandbox: args.sandbox,
                     container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
                     openshell_endpoint: args.openshell_endpoint,
+                    gateway_home: None,
                     policy_rules: args.policy_rules,
                     policy_data: args.policy_data,
                     ssh_socket_path: args.ssh_socket_path,

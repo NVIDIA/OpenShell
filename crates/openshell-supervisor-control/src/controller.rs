@@ -356,6 +356,8 @@ struct Inner {
     /// stream attached or ended, or a member announced leaving.
     membership: watch::Sender<u64>,
     observed: Mutex<Observed>,
+    /// This replica's peer endpoint, sent in every `HostAccepted`.
+    peer_endpoint: Mutex<String>,
 }
 
 /// Gateway-owned desired assignments and observed status of the shared
@@ -406,8 +408,15 @@ impl SupervisorHostController {
                 revision: watch::Sender::new(0),
                 membership: watch::Sender::new(0),
                 observed: Mutex::new(Observed::default()),
+                peer_endpoint: Mutex::new(String::new()),
             }),
         }
+    }
+
+    /// Tell attaching hosts to dial their sandbox sessions to `peer_endpoint`.
+    /// Call it before any host attaches.
+    pub fn set_peer_endpoint(&self, peer_endpoint: String) {
+        *lock(&self.inner.peer_endpoint) = peer_endpoint;
     }
 
     /// Offer every instance's runtime `recovery_timeout_secs` instead of
@@ -843,6 +852,7 @@ impl SupervisorHostController {
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
         let expires_at = identity.expires_at;
         let (session_id, superseded) = self.begin_session(identity, &hello)?;
+        let peer_endpoint = lock(&self.inner.peer_endpoint).clone();
         tx.send(Ok(HostGatewayMessage {
             payload: Some(host_gateway_message::Payload::Accepted(HostAccepted {
                 session_id: session_id.to_string(),
@@ -850,6 +860,7 @@ impl SupervisorHostController {
                     seconds: i64::try_from(heartbeat.as_secs()).unwrap_or(15),
                     nanos: 0,
                 }),
+                peer_endpoint,
             })),
         }))
         .await

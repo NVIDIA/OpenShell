@@ -896,6 +896,9 @@ pub struct SandboxInstanceConfig {
     /// Workload image recorded in this instance's OCSF events.
     pub container_image: String,
     pub openshell_endpoint: Option<String>,
+    /// Peer endpoint of the gateway replica serving the shared host, which
+    /// the session dials instead of `openshell_endpoint` when set.
+    pub gateway_home: Option<tokio::sync::watch::Receiver<Option<String>>>,
     pub policy_rules: Option<String>,
     pub policy_data: Option<String>,
     pub ssh_socket_path: Option<String>,
@@ -1060,6 +1063,7 @@ pub async fn run_sandbox_instance(
         sandbox,
         container_image: _,
         openshell_endpoint,
+        gateway_home,
         policy_rules,
         policy_data,
         ssh_socket_path,
@@ -1704,6 +1708,7 @@ pub async fn run_sandbox_instance(
             config_apply_tx,
             config_push_updates,
             ssh_host_key,
+            gateway_home,
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.access.start"))
         .await?;
@@ -4628,6 +4633,7 @@ mod tests {
             sandbox: None,
             container_image: String::new(),
             openshell_endpoint: None,
+            gateway_home: None,
             policy_rules: None,
             policy_data: None,
             ssh_socket_path: None,
