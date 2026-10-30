@@ -6,6 +6,7 @@ use futures::Stream;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_core::sandbox_env::{OtlpExport, OtlpProtocol, SupervisorOtlp};
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{
@@ -100,18 +101,30 @@ struct Args {
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
 
-    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
+    /// Transport to the trace collector: `grpc` or `http/protobuf`.
+    #[arg(long, env = "OPENSHELL_OTLP_PROTOCOL", default_value_t)]
+    otlp_protocol: OtlpProtocol,
+
+    /// OTLP collector endpoint for supervisor OCSF event export.
     #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
     otlp_ocsf_endpoint: Option<String>,
+
+    /// Transport to the OCSF collector: `grpc` or `http/protobuf`.
+    #[arg(long, env = "OPENSHELL_OTLP_OCSF_PROTOCOL", default_value_t)]
+    otlp_ocsf_protocol: OtlpProtocol,
 
     /// Deprecated and ignored: `OpenShell` emits OCSF 1.8.0 only.
     #[arg(long, env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION", hide = true)]
     otlp_ocsf_schema_version: Option<String>,
 
-    /// OTLP/gRPC collector endpoint that supervisors relay workload traces
-    /// to. Absent keeps the agent trace relay off.
+    /// OTLP collector endpoint that supervisors relay workload traces to.
+    /// Absent keeps the agent trace relay off.
     #[arg(long, env = "OPENSHELL_OTLP_AGENT_ENDPOINT")]
     otlp_agent_endpoint: Option<String>,
+
+    /// Transport to the agent trace relay's collector: `grpc` or `http/protobuf`.
+    #[arg(long, env = "OPENSHELL_OTLP_AGENT_PROTOCOL", default_value_t)]
+    otlp_agent_protocol: OtlpProtocol,
 
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
@@ -287,6 +300,21 @@ struct Args {
     vm_mount: Vec<String>,
 }
 
+impl Args {
+    fn supervisor_otlp(&self) -> SupervisorOtlp {
+        let export = |endpoint: &Option<String>, protocol| {
+            endpoint
+                .clone()
+                .map(|endpoint| OtlpExport { endpoint, protocol })
+        };
+        SupervisorOtlp {
+            traces: export(&self.otlp_endpoint, self.otlp_protocol),
+            ocsf: export(&self.otlp_ocsf_endpoint, self.otlp_ocsf_protocol),
+            agent: export(&self.otlp_agent_endpoint, self.otlp_agent_protocol),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -309,6 +337,7 @@ async fn main() -> Result<()> {
         openshell_driver_vm::otel_tracing::TRACING,
         openshell_otel::DriverTracingConfig {
             endpoint: args.otlp_endpoint.as_deref(),
+            protocol: args.otlp_protocol.into(),
             gateway_name: args.gateway_name.as_deref(),
             service_version: VERSION,
             log_level: &args.log_level,
@@ -334,19 +363,15 @@ async fn main() -> Result<()> {
         );
     }
 
+    let supervisor_otlp = args.supervisor_otlp();
     let driver = VmDriver::new(VmDriverConfig {
         allow_driver_config: args.admission_config_json.allow_driver_config,
         resource_admission: args.admission_config_json.resource_admission.clone(),
         grpc_endpoint: args
             .grpc_endpoint
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
-        supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
-        supervisor_otlp_agent_endpoint: args.otlp_agent_endpoint.clone(),
+        supervisor_otlp,
         supervisor_gateway_name: args.gateway_name.clone(),
-        supervisor_ocsf_export: args
-            .otlp_ocsf_endpoint
-            .clone()
-            .map(|endpoint| openshell_core::sandbox_env::OcsfOtlpExport { endpoint }),
         state_dir: args.state_dir.clone(),
         launcher_bin: None,
         default_image: args.default_image.clone(),
@@ -803,6 +828,7 @@ mod tests {
         compute_driver_listen_mode, parse_vm_mount_arg,
     };
     use clap::Parser;
+    use openshell_core::sandbox_env::{OtlpExport, OtlpProtocol, SupervisorOtlp};
     use std::path::PathBuf;
 
     #[test]
@@ -994,12 +1020,36 @@ mod tests {
             "openshell-driver-vm",
             "--otlp-endpoint",
             "http://127.0.0.1:4317",
+            "--otlp-ocsf-endpoint",
+            "http://127.0.0.1:4318",
+            "--otlp-ocsf-protocol",
+            "http/protobuf",
+            "--otlp-ocsf-schema-version",
+            "2.0",
+            "--otlp-agent-endpoint",
+            "http://127.0.0.1:4319",
+            "--otlp-agent-protocol",
+            "http/protobuf",
             "--gateway-name",
             "production-us-west",
-        ]);
-        assert!(
-            args.is_ok(),
-            "VM driver should accept the gateway OTLP endpoint"
+        ])
+        .expect("VM driver should accept the gateway OTLP configuration");
+        assert_eq!(
+            args.supervisor_otlp(),
+            SupervisorOtlp {
+                traces: Some(OtlpExport {
+                    endpoint: "http://127.0.0.1:4317".into(),
+                    protocol: OtlpProtocol::Grpc,
+                }),
+                ocsf: Some(OtlpExport {
+                    endpoint: "http://127.0.0.1:4318".into(),
+                    protocol: OtlpProtocol::HttpProtobuf,
+                }),
+                agent: Some(OtlpExport {
+                    endpoint: "http://127.0.0.1:4319".into(),
+                    protocol: OtlpProtocol::HttpProtobuf,
+                }),
+            }
         );
     }
 

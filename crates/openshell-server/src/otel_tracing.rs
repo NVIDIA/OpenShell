@@ -24,6 +24,7 @@
 //! surfaces (the gateway log stream and the Prometheus `/metrics` endpoint).
 
 use openshell_core::jwt::SecretOtlpHeaders;
+use openshell_core::sandbox_env::OtlpProtocol;
 use openshell_otel::{OcsfOtlp, OtlpExportConfig, OtlpTarget, ServiceName};
 pub use openshell_otel::{SetupError, TraceContextInterceptor, mark_error};
 #[cfg(test)]
@@ -32,7 +33,7 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::Subscriber;
 use tracing_subscriber::registry::LookupSpan;
 
-use crate::config_file::OtlpConfig;
+use crate::config_file::{OtlpCollectorConfig, OtlpConfig};
 
 /// `service.name` reported when the config file does not override it.
 const DEFAULT_SERVICE_NAME: &str = "openshell-gateway";
@@ -120,12 +121,13 @@ pub struct OtlpExport {
     ocsf: Option<Signal<OcsfOtlp>>,
     /// Validated collector that supervisors relay workload traces to. The
     /// gateway itself exports nothing for this signal.
-    agent_endpoint: Option<String>,
+    agent: Option<Signal<()>>,
 }
 
 /// One signal's exporter and the endpoint it sends to.
 struct Signal<E> {
     endpoint: String,
+    protocol: OtlpProtocol,
     exporter: E,
 }
 
@@ -152,14 +154,18 @@ impl OtlpExport {
         cfg: &OtlpConfig,
         gateway: GatewayResourceAttributes<'_>,
     ) -> Result<Self, SetupError> {
-        let target = |endpoint| OtlpTarget::new(&export_config(cfg, endpoint, gateway));
+        let target = |collector: &OtlpCollectorConfig| {
+            OtlpTarget::new(&export_config(cfg, &collector.endpoint, gateway))
+                .map(|target| target.with_protocol(collector.protocol.into()))
+        };
         let traces = cfg
             .traces
             .as_ref()
             .map(|traces| {
-                let target = target(&traces.endpoint)?;
+                let target = target(&traces.collector)?;
                 Ok::<_, SetupError>(Signal {
                     endpoint: target.endpoint().to_string(),
+                    protocol: traces.collector.protocol,
                     exporter: target.tracer_provider()?,
                 })
             })
@@ -168,33 +174,58 @@ impl OtlpExport {
             .ocsf
             .as_ref()
             .map(|ocsf| {
-                let target = target(&ocsf.endpoint)?;
+                let target = target(&ocsf.collector)?;
                 Ok::<_, SetupError>(Signal {
                     endpoint: target.endpoint().to_string(),
+                    protocol: ocsf.collector.protocol,
                     exporter: OcsfOtlp::start(target.log_exporter()?, target.resource().clone()),
                 })
             })
             .transpose()?;
-        let agent_endpoint = cfg
-            .agent_endpoint()
-            .map(|endpoint| target(endpoint).map(|target| target.endpoint().to_string()))
+        let agent = cfg
+            .agent
+            .as_ref()
+            .map(|agent| {
+                target(&agent.collector).map(|target| Signal {
+                    endpoint: target.endpoint().to_string(),
+                    protocol: agent.collector.protocol,
+                    exporter: (),
+                })
+            })
             .transpose()?;
         Ok(Self {
             traces,
             ocsf,
-            agent_endpoint,
+            agent,
         })
     }
 
     /// The collector that supervisors relay workload traces to, when the
     /// agent trace relay is enabled.
     pub fn agent_endpoint(&self) -> Option<&str> {
-        self.agent_endpoint.as_deref()
+        self.agent.as_ref().map(|agent| agent.endpoint.as_str())
+    }
+
+    /// The transport of each enabled signal: traces, OCSF, and the agent
+    /// relay.
+    pub fn protocols(&self) -> [Option<OtlpProtocol>; 3] {
+        [
+            self.traces.as_ref().map(|signal| signal.protocol),
+            self.ocsf.as_ref().map(|signal| signal.protocol),
+            self.agent.as_ref().map(|signal| signal.protocol),
+        ]
     }
 
     /// The collector receiving traces, when trace export is enabled.
     pub fn traces_endpoint(&self) -> Option<&str> {
         self.traces.as_ref().map(|traces| traces.endpoint.as_str())
+    }
+
+    /// The transport to the trace collector.
+    pub fn traces_protocol(&self) -> OtlpProtocol {
+        self.traces
+            .as_ref()
+            .map_or(OtlpProtocol::Grpc, |traces| traces.protocol)
     }
 
     /// The trace provider, when trace export is enabled.
@@ -584,7 +615,10 @@ mod tests {
         OtlpConfig {
             service_name: None,
             traces: Some(OtlpTracesConfig {
-                endpoint: endpoint.into(),
+                collector: OtlpCollectorConfig {
+                    endpoint: endpoint.into(),
+                    protocol: OtlpProtocol::Grpc,
+                },
             }),
             ocsf: None,
             agent: None,
@@ -593,7 +627,10 @@ mod tests {
 
     fn ocsf_config(endpoint: &str) -> OcsfOtlpConfig {
         OcsfOtlpConfig {
-            endpoint: endpoint.into(),
+            collector: OtlpCollectorConfig {
+                endpoint: endpoint.into(),
+                protocol: OtlpProtocol::Grpc,
+            },
             schema_version: None,
         }
     }
@@ -701,6 +738,57 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&received.log_bodies[0]).unwrap(),
             expected
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gateway_signals_export_over_their_configured_protocol() {
+        use openshell_ocsf::{ConfigStateChangeBuilder, ocsf_emit};
+        use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+        use tracing_subscriber::prelude::*;
+
+        let mut collector = openshell_otel_test_support::OtlpHttpTestServer::start().await;
+        let http = |endpoint: &str| OtlpCollectorConfig {
+            endpoint: endpoint.into(),
+            protocol: OtlpProtocol::HttpProtobuf,
+        };
+        let mut cfg = config();
+        cfg.traces = Some(OtlpTracesConfig {
+            collector: http(collector.endpoint()),
+        });
+        cfg.ocsf = Some(OcsfOtlpConfig {
+            collector: http(collector.endpoint()),
+            schema_version: None,
+        });
+        let (export, error) = OtlpExport::start(Some(&cfg), GatewayResourceAttributes::default());
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        let export = export.expect("OTLP export");
+        assert_eq!(export.traces_protocol(), OtlpProtocol::HttpProtobuf);
+        assert_eq!(
+            export.protocols(),
+            [
+                Some(OtlpProtocol::HttpProtobuf),
+                Some(OtlpProtocol::HttpProtobuf),
+                None
+            ]
+        );
+
+        let provider = export.tracer_provider().expect("trace export").clone();
+        provider.tracer("test").in_span("gateway-span", |_| {});
+        let event =
+            ConfigStateChangeBuilder::new(&crate::gateway_ocsf::context("sandbox-1", "sandbox"))
+                .message("policy approved")
+                .build();
+        let subscriber =
+            tracing_subscriber::registry().with(export.ocsf().expect("OCSF log export").layer());
+        tracing::subscriber::with_default(subscriber, || ocsf_emit!(event));
+        export.shutdown().await;
+
+        let mut paths = vec![
+            collector.next_export().await.path,
+            collector.next_export().await.path,
+        ];
+        paths.sort();
+        assert_eq!(paths, ["/v1/logs", "/v1/traces"]);
     }
 
     /// Supervisors authenticate to the collector with the headers from their
@@ -902,7 +990,10 @@ mod tests {
         bad_ocsf.ocsf = Some(ocsf_config("definitely not a url"));
         let mut bad_agent = config();
         bad_agent.agent = Some(crate::config_file::AgentOtlpConfig {
-            endpoint: "definitely not a url".into(),
+            collector: OtlpCollectorConfig {
+                endpoint: "definitely not a url".into(),
+                protocol: OtlpProtocol::Grpc,
+            },
         });
         for cfg in [
             with_traces_endpoint("definitely not a url"),

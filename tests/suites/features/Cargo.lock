@@ -2043,7 +2043,6 @@ dependencies = [
  "reqwest",
  "rustix",
  "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2140,11 +2139,16 @@ dependencies = [
 name = "openshell-otel"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "futures",
  "http",
+ "http-body-util",
+ "hyper-util",
  "metrics",
  "openshell-ocsf",
  "opentelemetry",
+ "opentelemetry-http",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "serde_json",
@@ -2161,6 +2165,11 @@ dependencies = [
 name = "openshell-otel-test-support"
 version = "0.0.0"
 dependencies = [
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "openshell-otel",
  "opentelemetry-proto",
  "prost",
@@ -2286,13 +2295,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry-http"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "302249bd8ee804789faaa7b5b2cbf79bc61cb864714079c644e3828af5b7e811"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http",
+ "opentelemetry",
+]
+
+[[package]]
 name = "opentelemetry-otlp"
 version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0756af24841e367128ef31c831999937b8b5c5197d47914590d8f4e2e88c2e1a"
 dependencies = [
+ "flate2",
  "http",
+ "httpdate",
  "opentelemetry",
+ "opentelemetry-http",
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",

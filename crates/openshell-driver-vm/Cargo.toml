@@ -80,6 +80,7 @@ compute-driver = [
     "dep:nix",
     "dep:oci-client",
     "dep:openshell-otel",
+    "openshell-core/otel",
     "dep:openshell-policy",
     "dep:openshell-driver-podman",
     "dep:openshell-vfio",

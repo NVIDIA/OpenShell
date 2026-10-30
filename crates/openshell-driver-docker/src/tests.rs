@@ -324,13 +324,11 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         sandbox_binary: Arc::new(b"\x7fELFtest".to_vec()),
         supervisor_image_id: "sha256:supervisor-test".to_string(),
         supervisor_grpc_endpoint: "https://host.openshell.internal:8443".to_string(),
-        supervisor_otlp_endpoint: None,
         supervisor_network_mode: DockerSupervisorNetworkMode::Host,
         supervisor_endpoint_explicit: true,
         bridge_default_endpoint: Some("https://host.docker.internal:8443".to_string()),
         host_gateway_ip: None,
-        supervisor_ocsf_export: None,
-        supervisor_otlp_agent_endpoint: None,
+        supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp::default(),
         supervisor_gateway_name: None,
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
@@ -1517,32 +1515,64 @@ fn docker_child_environment_strips_supervisor_control_keys() {
 #[test]
 fn supervisor_otlp_environment_carries_only_configured_signals() {
     use openshell_core::sandbox_env::{
-        GATEWAY_NAME, OTLP_AGENT_ENDPOINT, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OcsfOtlpExport,
+        GATEWAY_NAME, OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT,
+        OTLP_OCSF_PROTOCOL, OTLP_PROTOCOL, OtlpExport, OtlpProtocol,
+    };
+    let export = |endpoint: &str, protocol| {
+        Some(OtlpExport {
+            endpoint: endpoint.to_string(),
+            protocol,
+        })
     };
 
     let mut config = runtime_config();
     assert!(supervisor_otlp_environment(&config).is_empty());
 
-    config.supervisor_otlp_endpoint = Some("http://127.0.0.1:4317".to_string());
+    config.supervisor_otlp.traces = export("http://127.0.0.1:4317", OtlpProtocol::Grpc);
     assert_eq!(
         supervisor_otlp_environment(&config),
         [format!("{OTLP_ENDPOINT}=http://127.0.0.1:4317")]
     );
 
-    config.supervisor_otlp_endpoint = None;
-    config.supervisor_ocsf_export = Some(OcsfOtlpExport {
-        endpoint: "http://siem:4317".to_string(),
-    });
+    config.supervisor_otlp.traces = export("http://127.0.0.1:4318", OtlpProtocol::HttpProtobuf);
+    assert_eq!(
+        supervisor_otlp_environment(&config),
+        [
+            format!("{OTLP_ENDPOINT}=http://127.0.0.1:4318"),
+            format!("{OTLP_PROTOCOL}=http/protobuf"),
+        ]
+    );
+
+    config.supervisor_otlp.traces = None;
+    config.supervisor_otlp.ocsf = export("http://siem:4317", OtlpProtocol::Grpc);
     assert_eq!(
         supervisor_otlp_environment(&config),
         [format!("{OTLP_OCSF_ENDPOINT}=http://siem:4317")]
     );
 
-    config.supervisor_ocsf_export = None;
-    config.supervisor_otlp_agent_endpoint = Some("http://agents:4317".to_string());
+    config.supervisor_otlp.ocsf = export("http://siem:4318", OtlpProtocol::HttpProtobuf);
+    assert_eq!(
+        supervisor_otlp_environment(&config),
+        [
+            format!("{OTLP_OCSF_ENDPOINT}=http://siem:4318"),
+            format!("{OTLP_OCSF_PROTOCOL}=http/protobuf"),
+        ]
+    );
+
+    config.supervisor_otlp.ocsf = None;
+    config.supervisor_otlp.agent = export("http://agents:4317", OtlpProtocol::Grpc);
     assert_eq!(
         supervisor_otlp_environment(&config),
         [format!("{OTLP_AGENT_ENDPOINT}=http://agents:4317")]
+    );
+
+    config.supervisor_otlp.agent = export("http://agents:4318", OtlpProtocol::HttpProtobuf);
+    assert_eq!(
+        supervisor_otlp_environment(&config),
+        [
+            format!("{OTLP_AGENT_ENDPOINT}=http://agents:4318"),
+            format!("{OTLP_AGENT_PROTOCOL}=http/protobuf"),
+        ]
     );
 
     config.supervisor_gateway_name = Some("prod-west".to_string());

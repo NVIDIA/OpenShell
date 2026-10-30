@@ -157,6 +157,7 @@ authenticated health signal.
 Gateway OTLP configuration continues to export compute-driver spans under the
 `openshell-driver-podman` service, preserving gateway trace context.
 When `[openshell.gateway.otlp.agent]` is enabled, the driver sets
-`OPENSHELL_OTLP_AGENT_ENDPOINT` on the supervisor container, which starts the
+`OPENSHELL_OTLP_AGENT_ENDPOINT` on the supervisor container, plus
+`OPENSHELL_OTLP_AGENT_PROTOCOL` for a non-gRPC collector, which starts the
 agent trace relay. On Podman Machine it rewrites a loopback agent endpoint to
 the desktop host, as it does for the supervisor's trace endpoint.

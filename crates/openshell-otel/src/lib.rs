@@ -8,6 +8,7 @@ mod grpc;
 mod logs;
 mod ocsf;
 mod propagation;
+mod transport;
 
 pub use driver::{
     BoxGrpcStream, ComputeDriverTracing, DriverTracingConfig, DriverTracingHandle,
@@ -25,12 +26,13 @@ pub use propagation::{
     TraceContextInterceptor, current_trace_context_carrier, current_trace_context_environment,
     set_parent_from_environment, set_parent_from_trace_context, trace_context_environment,
 };
+pub use transport::{OtlpHttpClient, signal_url};
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 pub use opentelemetry_otlp::LogExporter;
 use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
-use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithTonicConfig};
+use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig, WithTonicConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracer;
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -123,7 +125,15 @@ pub enum ServiceName<'a> {
     EnvironmentOr(&'a str),
 }
 
-/// Inputs for OTLP/gRPC export.
+/// OTLP transport to a collector.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Protocol {
+    #[default]
+    Grpc,
+    HttpProtobuf,
+}
+
+/// Inputs for OTLP export.
 #[derive(Debug, Clone)]
 pub struct OtlpExportConfig<'a> {
     pub endpoint: &'a str,
@@ -146,6 +156,18 @@ pub enum SetupError {
 
     #[error("failed to build the OTLP exporter: {0}")]
     Exporter(#[from] opentelemetry_otlp::ExporterBuildError),
+
+    #[error("invalid OTLP endpoint {endpoint:?}: {source}")]
+    InvalidSignalUrl {
+        endpoint: String,
+        source: http::Error,
+    },
+
+    #[error("OTLP/HTTP export over https is not supported")]
+    HttpsUnsupported,
+
+    #[error("OTLP/HTTP export needs a tokio runtime")]
+    NoRuntime,
 }
 
 fn resource_attributes(config: &OtlpExportConfig<'_>) -> Vec<KeyValue> {
@@ -206,12 +228,13 @@ pub fn validated_endpoint(endpoint: &str) -> Result<(&str, http::Uri), SetupErro
     Ok((endpoint, uri))
 }
 
-/// A validated OTLP/gRPC collector endpoint and the resource that every
-/// signal exported to it describes.
+/// A validated OTLP collector endpoint and the resource that every signal
+/// exported to it describes.
 #[derive(Debug, Clone)]
 pub struct OtlpTarget {
     endpoint: String,
     tls: bool,
+    protocol: Protocol,
     resource: Resource,
 }
 
@@ -222,8 +245,29 @@ impl OtlpTarget {
         Ok(Self {
             endpoint: endpoint.to_string(),
             tls: uri.scheme() == Some(&http::uri::Scheme::HTTPS),
+            protocol: Protocol::Grpc,
             resource: resource_for(config),
         })
+    }
+
+    /// Export over `protocol` instead of gRPC.
+    #[must_use]
+    pub fn with_protocol(mut self, protocol: Protocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    /// The URL of `signal_path` under the endpoint, for OTLP/HTTP export.
+    pub(crate) fn http_signal_url(&self, signal_path: &str) -> Result<String, SetupError> {
+        if self.tls {
+            return Err(SetupError::HttpsUnsupported);
+        }
+        signal_url(&self.endpoint, signal_path)
+            .map(|url| url.to_string())
+            .map_err(|source| SetupError::InvalidSignalUrl {
+                endpoint: self.endpoint.clone(),
+                source,
+            })
     }
 
     /// Point an exporter builder at this target, over TLS for `https://`.
@@ -252,9 +296,19 @@ impl OtlpTarget {
 
     /// Build a trace provider that exports spans to this target in batches.
     pub fn tracer_provider(&self) -> Result<SdkTracerProvider, SetupError> {
-        let exporter = self
-            .configure(SpanExporter::builder().with_tonic())
-            .build()?;
+        let exporter = match self.protocol {
+            Protocol::Grpc => self
+                .configure(SpanExporter::builder().with_tonic())
+                .build()?,
+            Protocol::HttpProtobuf => SpanExporter::builder()
+                .with_http()
+                .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+                .with_endpoint(self.http_signal_url("v1/traces")?)
+                .with_http_client(OtlpHttpClient::new(transport::export_timeout(
+                    "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+                ))?)
+                .build()?,
+        };
         Ok(SdkTracerProvider::builder()
             .with_batch_exporter(exporter)
             .with_resource(self.resource.clone())
@@ -262,7 +316,7 @@ impl OtlpTarget {
     }
 }
 
-/// Build an OTLP/gRPC trace provider.
+/// Build an OTLP trace provider.
 pub fn build_provider(config: &OtlpExportConfig<'_>) -> Result<SdkTracerProvider, SetupError> {
     OtlpTarget::new(config)?.tracer_provider()
 }

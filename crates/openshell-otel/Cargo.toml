@@ -11,13 +11,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait = "0.1"
+bytes = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
+http-body-util = { workspace = true }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
 metrics = { workspace = true }
 openshell-ocsf = { path = "../openshell-ocsf" }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["logs"] }
-opentelemetry-otlp = { workspace = true, features = ["logs"] }
+opentelemetry-http = { workspace = true }
+opentelemetry-otlp = { workspace = true, features = ["gzip-http", "http-proto", "logs"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -28,7 +33,10 @@ tonic = { workspace = true }
 tower-http = { workspace = true }
 
 [dev-dependencies]
+openshell-otel-test-support = { path = "../openshell-otel-test-support" }
+opentelemetry-proto = { workspace = true, features = ["logs"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+prost = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

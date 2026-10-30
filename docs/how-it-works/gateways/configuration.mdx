@@ -600,7 +600,7 @@ Allow enough retention and disk space for shipper outages. Graceful shutdown all
 
 ## OTLP Export
 
-`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP/gRPC. Omit the table to disable export. Its `endpoint` is the collector for every signal the gateway exports and, on its own, enables trace export. `[openshell.gateway.otlp.traces]` sends spans to a different collector. [OCSF log export](#ocsf-log-export) is off until `[openshell.gateway.otlp.ocsf]` sets `enabled = true`, and the [agent trace relay](#agent-trace-relay) is off until `[openshell.gateway.otlp.agent]` sets `enabled = true`. Each can use its own collector.
+`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP. Omit the table to disable export. Its `endpoint` is the collector for every signal the gateway exports and, on its own, enables trace export. `[openshell.gateway.otlp.traces]` sends spans to a different collector. [OCSF log export](#ocsf-log-export) is off until `[openshell.gateway.otlp.ocsf]` sets `enabled = true`, and the [agent trace relay](#agent-trace-relay) is off until `[openshell.gateway.otlp.agent]` sets `enabled = true`. Each can use its own collector.
 
 The gateway already uses the Rust `tracing` framework for structured logs sent to stdout and the sandbox log stream. Enabling this section adds an OpenTelemetry layer to the same tracing subscriber. It exports span trees to an OTLP collector without exporting, replacing, or redirecting the existing diagnostic log events.
 
@@ -609,16 +609,17 @@ The gateway already uses the Rust `tracing` framework for structured logs sent t
 endpoint     = "http://otel-collector.observability.svc:4317"
 service_name = "openshell-gateway"
 
-# Optional: send spans to a different collector.
+# Optional: send spans to a different collector, over OTLP/HTTP.
 [openshell.gateway.otlp.traces]
-endpoint = "http://traces.observability.svc:4317"
+endpoint = "http://traces.observability.svc:4318"
+protocol = "http/protobuf"
 ```
 
-Each enabled signal needs an endpoint, either in its own table or from `endpoint`. Endpoints must be valid URIs. If one is malformed, the gateway logs the configuration error and continues with all OTLP export disabled. It does not connect at startup: an unreachable collector produces export failures, never a failure to serve.
+Each enabled signal needs an endpoint, either in its own table or from `endpoint`. A table without its own `endpoint` uses the whole `[openshell.gateway.otlp]` collector, including its `protocol`. A table with its own `endpoint` takes nothing else from `[openshell.gateway.otlp]`, so settings for one collector never reach another, and setting `protocol` in a table without an `endpoint` is a configuration error. Endpoints must be valid URIs. If one is malformed, the gateway logs the configuration error and continues with all OTLP export disabled. It does not connect at startup: an unreachable collector produces export failures, never a failure to serve.
 
-The transport is **OTLP over gRPC only**. HTTP/protobuf and HTTP/JSON are not supported, and `OTEL_EXPORTER_OTLP_PROTOCOL` has no effect. Point each endpoint at a collector's gRPC receiver, conventionally port `4317`, not the HTTP receiver on `4318`. A URI alone cannot distinguish the two, so an HTTP endpoint is accepted at startup and then fails on export.
+`protocol` selects the transport to a collector: `grpc`, the default, or `http/protobuf`. With `http/protobuf`, the endpoint is a base URL and each signal is posted to its path under it, `/v1/traces` or `/v1/logs`, as with `OTEL_EXPORTER_OTLP_ENDPOINT`. HTTP/JSON is not supported. Point a `grpc` endpoint at a collector's gRPC receiver, conventionally port `4317`, and an `http/protobuf` endpoint at its HTTP receiver, conventionally port `4318`. A URI alone cannot distinguish the two, so a mismatched endpoint is accepted at startup and then fails on export. Sandbox supervisors and standalone compute drivers must come from the same release as the gateway to use `http/protobuf`: an older supervisor exports over gRPC, and an older driver rejects the protocol setting.
 
-Use an `https://` endpoint for TLS. The gateway verifies the collector certificate against the system trust roots.
+Use an `https://` endpoint for TLS over `grpc`. The gateway verifies the collector certificate against the system trust roots. An `https://` endpoint with `http/protobuf` is a configuration error.
 
 The OpenTelemetry SDK logs export failures after startup. Spans in a failed batch are dropped rather than retried.
 
@@ -663,7 +664,7 @@ In-process compute drivers read their backend-specific settings from `[openshell
 
 ### OCSF Log Export
 
-Set `enabled = true` in `[openshell.gateway.otlp.ocsf]` to export gateway OCSF events as OTLP log records. It defaults to `false`, so trace export alone never sends OCSF events. Records go to the table's `endpoint`, or to `[openshell.gateway.otlp]` `endpoint` when it is omitted, with the same resource attributes as spans, under the `openshell.ocsf` instrumentation scope. Use a separate endpoint to send OCSF events to a collector that feeds a SIEM while spans go elsewhere. Sandbox supervisors receive the same endpoint and export their own OCSF events there directly, so the endpoint must also be reachable from sandboxes. Supervisor records carry the supervisor's resource attributes, including `openshell.sandbox.id` and `openshell.gateway.name`. Supervisors also send the collector headers that the gateway uses for OCSF export, from `OTEL_EXPORTER_OTLP_LOGS_HEADERS` or else `OTEL_EXPORTER_OTLP_HEADERS`, so a collector that requires authentication accepts their records too. The gateway delivers the headers with each sandbox's launch credentials, never through the sandbox environment. Other `OTEL_*` variables do not reach supervisors.
+Set `enabled = true` in `[openshell.gateway.otlp.ocsf]` to export gateway OCSF events as OTLP log records. It defaults to `false`, so trace export alone never sends OCSF events. Records go to the table's `endpoint`, or to `[openshell.gateway.otlp]` `endpoint` when it is omitted, with the same resource attributes as spans, under the `openshell.ocsf` instrumentation scope. Use a separate endpoint to send OCSF events to a collector that feeds a SIEM while spans go elsewhere. Sandbox supervisors receive the same endpoint and protocol and export their own OCSF events there directly, so the endpoint must also be reachable from sandboxes. Supervisor records carry the supervisor's resource attributes, including `openshell.sandbox.id` and `openshell.gateway.name`. Supervisors also send the collector headers that the gateway uses for OCSF export, from `OTEL_EXPORTER_OTLP_LOGS_HEADERS` or else `OTEL_EXPORTER_OTLP_HEADERS`, so a collector that requires authentication accepts their records too. The gateway delivers the headers with each sandbox's launch credentials, never through the sandbox environment. Other `OTEL_*` variables do not reach supervisors.
 
 ```toml
 [openshell.gateway.otlp.ocsf]
@@ -692,7 +693,7 @@ Metrics include `openshell_ocsf_otlp_queued_total`, `openshell_ocsf_otlp_exporte
 
 ### Agent trace relay
 
-Set `enabled = true` in `[openshell.gateway.otlp.agent]` to have each sandbox forward the workload's own traces. It defaults to `false`, so trace export alone never changes the workload environment. Traces go to the table's `endpoint`, or to `[openshell.gateway.otlp]` `endpoint` when it is omitted, and that endpoint must be reachable from sandboxes.
+Set `enabled = true` in `[openshell.gateway.otlp.agent]` to have each sandbox forward the workload's own traces. It defaults to `false`, so trace export alone never changes the workload environment. Traces go to the table's collector, or to the `[openshell.gateway.otlp]` collector when it has no `endpoint`, and that collector must be reachable from sandboxes. Use `protocol = "http/protobuf"` for trace backends that accept only OTLP/HTTP.
 
 ```toml
 [openshell.gateway.otlp.agent]
@@ -700,7 +701,7 @@ enabled  = true
 endpoint = "http://agent-collector.observability.svc:4317" # optional
 ```
 
-While the relay is active, the sandbox runtime sets `OTEL_EXPORTER_OTLP_ENDPOINT=http://192.0.0.8:4318` and `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` in every workload process, and sets `OTEL_EXPORTER_OTLP_COMPRESSION` and `OTEL_EXPORTER_OTLP_TRACES_COMPRESSION` to `none`, so a standard OpenTelemetry SDK exports without configuration. These are lowest-precedence defaults. They are not set when the sandbox creation request or an environment passed to `openshell sandbox exec` names `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or when the image `ENV` names one for the main process, since `openshell sandbox exec` sessions do not inherit the image environment, and an endpoint the workload sets itself, for example with a shell `export`, takes precedence over them. A workload that exports elsewhere does so subject to the sandbox's network policy, and its traces carry no relay attribution. Provider credentials cannot redirect traces. While the relay is off, nothing is injected. Because the generic endpoint is set, an SDK that also exports metrics or logs sends them to the relay, which answers with an empty OTLP success and discards them. To keep metrics and logs, point those exporters elsewhere with `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` and `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`. The address is a reserved label rather than a network destination: the supervisor serves it inside the sandbox boundary and forwards accepted batches to the collector over OTLP/gRPC. The collector's address is never visible inside the sandbox.
+While the relay is active, the sandbox runtime sets `OTEL_EXPORTER_OTLP_ENDPOINT=http://192.0.0.8:4318` and `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` in every workload process, and sets `OTEL_EXPORTER_OTLP_COMPRESSION` and `OTEL_EXPORTER_OTLP_TRACES_COMPRESSION` to `none`, so a standard OpenTelemetry SDK exports without configuration. These are lowest-precedence defaults. They are not set when the sandbox creation request or an environment passed to `openshell sandbox exec` names `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or when the image `ENV` names one for the main process, since `openshell sandbox exec` sessions do not inherit the image environment, and an endpoint the workload sets itself, for example with a shell `export`, takes precedence over them. A workload that exports elsewhere does so subject to the sandbox's network policy, and its traces carry no relay attribution. Provider credentials cannot redirect traces. While the relay is off, nothing is injected. Because the generic endpoint is set, an SDK that also exports metrics or logs sends them to the relay, which answers with an empty OTLP success and discards them. To keep metrics and logs, point those exporters elsewhere with `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` and `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`. The address is a reserved label rather than a network destination: the supervisor serves it inside the sandbox boundary and forwards accepted batches to the collector over the configured `protocol`. The collector's address is never visible inside the sandbox.
 
 Every forwarded resource carries `openshell.sandbox.id`, with the same value as the supervisor's own spans, and `openshell.telemetry.source=agent`. Values the agent supplies for those two keys are replaced at the resource level; span and scope attributes pass through unchanged, so filter and join on the resource attributes. Filter on `openshell.telemetry.source` to separate agent traces from infrastructure traces, and join on `openshell.sandbox.id` to correlate them.
 
@@ -712,7 +713,7 @@ The relayed hop does not yet support TLS or authentication to the collector; an 
 
 ### Tuning
 
-`[openshell.gateway.otlp]` decides whether and where to export. How the SDK exports is controlled by the standard OpenTelemetry environment variables, which the gateway reads through the SDK rather than mirroring as TOML keys. They apply to the gateway and its in-process compute drivers. The gateway does not pass them to sandbox supervisors, which receive only the endpoints and the [OCSF collector headers](#ocsf-log-export).
+`[openshell.gateway.otlp]` decides whether and where to export. How the SDK exports is controlled by the standard OpenTelemetry environment variables, which the gateway reads through the SDK rather than mirroring as TOML keys. They apply to the gateway and its in-process compute drivers. The gateway does not pass them to sandbox supervisors, which receive only the endpoints, protocols, and the [OCSF collector headers](#ocsf-log-export).
 
 The gateway honors these variables:
 
@@ -750,7 +751,7 @@ These variables have no effect. Only `[openshell.gateway.otlp]` decides which si
 |---|---|
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Enablement has one source, `[openshell.gateway.otlp]`, so an environment variable cannot silently turn export on or redirect it. |
 | `OTEL_SDK_DISABLED`, `OTEL_TRACES_EXPORTER`, `OTEL_LOGS_EXPORTER`, `OTEL_METRICS_EXPORTER` | `[openshell.gateway.otlp]` decides which signals are exported. To disable export, omit it. |
-| `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | The gateway is built with the gRPC exporter only. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | `protocol` in each table selects the transport, and supervisors follow the same setting. |
 | `OTEL_EXPORTER_OTLP_INSECURE`, `OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_KEY`, and their per-signal forms | The endpoint scheme selects TLS, and collector certificates are verified against the system trust roots. Client certificates are not supported. |
 | `OTEL_PROPAGATORS` | The gateway always propagates W3C Trace Context. |
 | `OTEL_BLRP_SCHEDULE_DELAY`, `OTEL_BLRP_MAX_QUEUE_SIZE`, `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BLRP_EXPORT_TIMEOUT` | OCSF log export uses its own queue and batching, described in [OCSF Log Export](#ocsf-log-export). |

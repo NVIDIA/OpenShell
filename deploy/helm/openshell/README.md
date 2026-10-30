@@ -657,7 +657,7 @@ discovery endpoint or its TLS CA.
 | server.oidc.rolesClaim | string | `""` | Dot-separated path to the roles array in the JWT claims. Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups". |
 | server.oidc.scopesClaim | string | `""` | Dot-separated path to the scopes array in the JWT claims. |
 | server.oidc.userRole | string | `""` | Role name for standard user access. |
-| server.otlp.endpoint | string | `""` | OTLP/gRPC collector endpoint, conventionally using port 4317. |
+| server.otlp.endpoint | string | `""` | OTLP collector endpoint, conventionally port 4317 for gRPC or 4318 for `http/protobuf`. |
 | server.otlp.serviceName | string | `""` | Gateway OpenTelemetry service name. Empty uses openshell-gateway. |
 | server.policyValidationFailureMode | string | `"fail_closed"` | Posture when a candidate sandbox policy fails validation. `fail_closed` deactivates the previous policy; `retain_last_valid` keeps it active. |
 | server.providerTokenGrants.spiffe.enabled | bool | `false` | Mount the SPIFFE Workload API socket into gateway and sandbox pods for dynamic provider token grants. |

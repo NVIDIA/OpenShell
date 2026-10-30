@@ -8,6 +8,7 @@ use clap::Parser;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_core::sandbox_env::{OtlpExport, OtlpProtocol, SupervisorOtlp};
 use openshell_driver_docker::{ComputeDriverService, DockerComputeConfig, DockerComputeDriver};
 use tracing::info;
 
@@ -47,21 +48,48 @@ struct Args {
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
 
-    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
+    /// Transport to the trace collector: `grpc` or `http/protobuf`.
+    #[arg(long, env = "OPENSHELL_OTLP_PROTOCOL", default_value_t)]
+    otlp_protocol: OtlpProtocol,
+
+    /// OTLP collector endpoint for supervisor OCSF event export.
     #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
     otlp_ocsf_endpoint: Option<String>,
+
+    /// Transport to the OCSF collector: `grpc` or `http/protobuf`.
+    #[arg(long, env = "OPENSHELL_OTLP_OCSF_PROTOCOL", default_value_t)]
+    otlp_ocsf_protocol: OtlpProtocol,
 
     /// Deprecated and ignored: `OpenShell` emits OCSF 1.8.0 only.
     #[arg(long, env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION", hide = true)]
     otlp_ocsf_schema_version: Option<String>,
 
-    /// OTLP/gRPC collector endpoint that supervisors relay workload traces
-    /// to. Absent keeps the agent trace relay off.
+    /// OTLP collector endpoint that supervisors relay workload traces to.
+    /// Absent keeps the agent trace relay off.
     #[arg(long, env = "OPENSHELL_OTLP_AGENT_ENDPOINT")]
     otlp_agent_endpoint: Option<String>,
 
+    /// Transport to the agent trace relay's collector: `grpc` or `http/protobuf`.
+    #[arg(long, env = "OPENSHELL_OTLP_AGENT_PROTOCOL", default_value_t)]
+    otlp_agent_protocol: OtlpProtocol,
+
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
+}
+
+impl Args {
+    fn supervisor_otlp(&self) -> SupervisorOtlp {
+        let export = |endpoint: &Option<String>, protocol| {
+            endpoint
+                .clone()
+                .map(|endpoint| OtlpExport { endpoint, protocol })
+        };
+        SupervisorOtlp {
+            traces: export(&self.otlp_endpoint, self.otlp_protocol),
+            ocsf: export(&self.otlp_ocsf_endpoint, self.otlp_ocsf_protocol),
+            agent: export(&self.otlp_agent_endpoint, self.otlp_agent_protocol),
+        }
+    }
 }
 
 #[tokio::main]
@@ -71,6 +99,7 @@ async fn main() -> Result<()> {
         openshell_driver_docker::otel_tracing::TRACING,
         openshell_otel::DriverTracingConfig {
             endpoint: args.otlp_endpoint.as_deref(),
+            protocol: args.otlp_protocol.into(),
             gateway_name: args.gateway_name.as_deref(),
             service_version: VERSION,
             log_level: &args.log_level,
@@ -82,6 +111,7 @@ async fn main() -> Result<()> {
         );
     }
 
+    let supervisor_otlp = args.supervisor_otlp();
     let config_source = std::fs::read_to_string(&args.config).into_diagnostic()?;
     let mut docker_config: DockerComputeConfig =
         toml::from_str(&config_source).into_diagnostic()?;
@@ -95,13 +125,8 @@ async fn main() -> Result<()> {
     if let Some(image) = args.supervisor_image {
         docker_config.supervisor_image = Some(image);
     }
-    docker_config.supervisor_otlp_endpoint = args.otlp_endpoint.clone();
-    docker_config.supervisor_otlp_agent_endpoint = args.otlp_agent_endpoint.clone();
+    docker_config.supervisor_otlp = supervisor_otlp;
     docker_config.supervisor_gateway_name = args.gateway_name.clone();
-    docker_config.supervisor_ocsf_export = args
-        .otlp_ocsf_endpoint
-        .clone()
-        .map(|endpoint| openshell_core::sandbox_env::OcsfOtlpExport { endpoint });
     let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config, None)
         .await
         .into_diagnostic()?;
@@ -136,4 +161,51 @@ async fn shutdown_signal() {
         () = terminate => {}
     }
     info!("Received shutdown signal, draining in-flight requests");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_supervisor_otlp_from_lane_args() {
+        let args = Args::try_parse_from([
+            "openshell-driver-docker",
+            "--bind-socket",
+            "/tmp/driver.sock",
+            "--config",
+            "/tmp/driver.toml",
+            "--otlp-endpoint",
+            "http://traces:4317",
+            "--otlp-ocsf-endpoint",
+            "http://siem:4318",
+            "--otlp-ocsf-protocol",
+            "http/protobuf",
+            "--otlp-ocsf-schema-version",
+            "2.0",
+            "--otlp-agent-endpoint",
+            "http://agents:4318",
+            "--otlp-agent-protocol",
+            "http/protobuf",
+        ])
+        .expect("OTLP lanes should parse");
+
+        assert_eq!(
+            args.supervisor_otlp(),
+            SupervisorOtlp {
+                traces: Some(OtlpExport {
+                    endpoint: "http://traces:4317".into(),
+                    protocol: OtlpProtocol::Grpc,
+                }),
+                ocsf: Some(OtlpExport {
+                    endpoint: "http://siem:4318".into(),
+                    protocol: OtlpProtocol::HttpProtobuf,
+                }),
+                agent: Some(OtlpExport {
+                    endpoint: "http://agents:4318".into(),
+                    protocol: OtlpProtocol::HttpProtobuf,
+                }),
+            }
+        );
+    }
 }
