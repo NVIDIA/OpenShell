@@ -635,6 +635,19 @@ fn prepare_server_config_with_drivers(
         config = config.with_ssh_session_ttl_secs(ttl);
     }
 
+    if let Some(gateway_file) = file.as_ref().map(|f| &f.openshell.gateway) {
+        apply_connection_cap(
+            "max_ssh_connections_per_sandbox",
+            gateway_file.max_ssh_connections_per_sandbox,
+            &mut config.max_ssh_connections_per_sandbox,
+        )?;
+        apply_connection_cap(
+            "max_service_connections_per_sandbox",
+            gateway_file.max_service_connections_per_sandbox,
+            &mut config.max_service_connections_per_sandbox,
+        )?;
+    }
+
     if let Some(mode) = file
         .as_ref()
         .and_then(|f| f.openshell.gateway.policy_validation_failure_mode)
@@ -1499,6 +1512,17 @@ fn validate_grpc_rate_limit_args(requests: Option<u64>, window_seconds: Option<u
         return Err(miette::miette!(
             "gRPC rate limiting requires both --grpc-rate-limit-requests and --grpc-rate-limit-window-seconds (TOML keys grpc_rate_limit_requests and grpc_rate_limit_window_seconds) to be positive; set either value to 0 to disable"
         ));
+    }
+    Ok(())
+}
+
+/// Apply an optional per-sandbox relay cap from the gateway config file.
+fn apply_connection_cap(name: &str, value: Option<u32>, cap: &mut u32) -> Result<()> {
+    if let Some(value) = value {
+        if value == 0 {
+            return Err(miette::miette!("{name} must be at least 1"));
+        }
+        *cap = value;
     }
     Ok(())
 }
@@ -4414,6 +4438,63 @@ mem_mib = "not-a-number"
                     .contains("image_preparation_timeout_seconds must be between 1 and 86400")
             );
         }
+            });
+    }
+
+    #[test]
+    fn server_config_sets_and_validates_per_sandbox_connection_caps() {
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .run(|| {
+                let state = std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                let prepare = |gateway: &str| {
+                    std::fs::write(
+                        &config_path,
+                        format!("[openshell]\nversion = 2\n[openshell.gateway]\n{gateway}\n"),
+                    )
+                    .unwrap();
+                    let (mut args, matches) = parse_with_args(&[
+                        "openshell-gateway",
+                        "--config",
+                        config_path.to_str().unwrap(),
+                        "--db-url",
+                        "sqlite::memory:",
+                        "--compute-driver",
+                        "docker",
+                        "--disable-tls",
+                    ]);
+                    super::prepare_server_config(&mut args, &matches)
+                };
+
+                let defaults = prepare("").expect("defaults");
+                assert_eq!(defaults.config.max_ssh_connections_per_sandbox, 20);
+                assert_eq!(defaults.config.max_service_connections_per_sandbox, 20);
+
+                let set = prepare(
+                    "max_ssh_connections_per_sandbox = 5\nmax_service_connections_per_sandbox = 50",
+                )
+                .expect("caps are applied");
+                assert_eq!(set.config.max_ssh_connections_per_sandbox, 5);
+                assert_eq!(set.config.max_service_connections_per_sandbox, 50);
+
+                for key in [
+                    "max_ssh_connections_per_sandbox",
+                    "max_service_connections_per_sandbox",
+                ] {
+                    let Err(error) = prepare(&format!("{key} = 0")) else {
+                        panic!("a zero cap must be rejected");
+                    };
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(&format!("{key} must be at least 1")),
+                        "{error}"
+                    );
+                }
             });
     }
 
