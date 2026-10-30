@@ -340,6 +340,9 @@ pub struct ServerState {
     /// Active SSH tunnel connection counts per sandbox id.
     pub ssh_connections_by_sandbox: Mutex<HashMap<String, u32>>,
 
+    /// Active service forward connection counts per sandbox id.
+    pub service_connections_by_sandbox: Mutex<HashMap<String, u32>>,
+
     /// Registry of active supervisor sessions and pending relay channels.
     ///
     /// Stored as `Arc` so compiled compute drivers can be constructed before
@@ -508,6 +511,7 @@ impl ServerState {
             telemetry: telemetry::TelemetryState::new(),
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
+            service_connections_by_sandbox: Mutex::new(HashMap::new()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
             config_delivery,

@@ -272,6 +272,11 @@ credential_drivers        = ["kubernetes-secrets"]
 
 ssh_session_ttl_secs  = 3600
 
+# Per-sandbox caps on concurrent relays. SSH sessions and service forwards
+# have separate budgets. Each defaults to 20 and must be at least 1.
+max_ssh_connections_per_sandbox     = 20
+max_service_connections_per_sandbox = 20
+
 # Absolute image preparation and initial supervisor startup budget.
 # Applies to new attempts only; allowed values are 1 through 86400 seconds.
 image_preparation_timeout_seconds = 1800

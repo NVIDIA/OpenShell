@@ -46,6 +46,9 @@ pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 /// Default domain used for browser-facing sandbox service URLs.
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
+/// Default per-sandbox cap for each relay budget (SSH and service forwards).
+pub const DEFAULT_MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
+
 /// Gateway delivery path for supervisor configuration.
 ///
 /// `Push` sends configuration over the supervisor session to supervisors that
@@ -311,6 +314,14 @@ pub struct Config {
 
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     pub ssh_session_ttl_secs: u64,
+
+    /// Maximum concurrent SSH relays per sandbox. Must be at least 1.
+    pub max_ssh_connections_per_sandbox: u32,
+
+    /// Maximum concurrent service forward relays per sandbox. Must be at
+    /// least 1. Kept apart from the SSH budget so open forwards cannot block
+    /// SSH access.
+    pub max_service_connections_per_sandbox: u32,
 
     /// Absolute image preparation and initial supervisor startup budget for new
     /// sandbox attempts, in seconds. Must be between 1 and 86400, inclusive.
@@ -1011,6 +1022,8 @@ impl Config {
             credential_drivers: Vec::new(),
             default_credential_driver: None,
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
+            max_ssh_connections_per_sandbox: DEFAULT_MAX_CONNECTIONS_PER_SANDBOX,
+            max_service_connections_per_sandbox: DEFAULT_MAX_CONNECTIONS_PER_SANDBOX,
             image_preparation_timeout_seconds: 1800,
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
