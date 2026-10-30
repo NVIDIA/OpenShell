@@ -13,10 +13,11 @@
 /// ```ignore
 /// impl_builder_setters!(MyBuilder);            // severity + status + message
 /// impl_builder_setters!(MyBuilder, no_status); // severity + message only
+/// impl_builder_setters!(MyBuilder<State>);     // for a type-state builder
 /// ```
 macro_rules! impl_builder_setters {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the event severity.
             #[must_use]
             pub fn severity(mut self, id: $crate::enums::SeverityId) -> Self {
@@ -37,8 +38,8 @@ macro_rules! impl_builder_setters {
             }
         }
     };
-    ($builder:ident, no_status) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?, no_status) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the event severity.
             #[must_use]
             pub fn severity(mut self, id: $crate::enums::SeverityId) -> Self {
@@ -58,8 +59,8 @@ macro_rules! impl_builder_setters {
 /// Generate the `activity` setter used by every event builder that carries an
 /// `activity` field.
 macro_rules! impl_activity_setter {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the event activity identifier.
             #[must_use]
             pub fn activity(mut self, id: $crate::enums::ActivityId) -> Self {
@@ -70,11 +71,11 @@ macro_rules! impl_activity_setter {
     };
 }
 
-/// Generate `action` and `disposition` setters shared by network, HTTP, SSH,
-/// process, and detection-finding builders.
+/// Generate `action` and `disposition` setters shared by every builder whose
+/// event records an action and its disposition.
 macro_rules! impl_action_disposition_setters {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the action taken.
             #[must_use]
             pub fn action(mut self, id: $crate::enums::ActionId) -> Self {
@@ -421,29 +422,16 @@ mod tests {
         assert_ne!(uid, "sandbox-abc123");
     }
 
-    #[test]
-    fn test_emitted_device_matches_vendored_schema() {
-        use crate::validation::schema::{
-            load_object_schema, validate_enum_value, validate_required_fields,
-        };
-
-        let device = serde_json::to_value(test_sandbox_context().device()).unwrap();
-        let schema = load_object_schema("device");
-        validate_required_fields(&device, &schema);
-        validate_enum_value(&device, "type_id", &schema);
-    }
-
     /// One event per builder, built with a production-like sandbox context
     /// (container image set), must validate against the vendored 1.8.0 schemas.
     #[test]
     fn every_builder_emits_schema_conformant_events() {
-        use crate::validation::schema::{load_class_schema, validate_required_fields};
-
         let ctx = test_sandbox_context();
         let events = sample_events(&ctx);
         for (class, event) in &events {
             let json = event.to_json().unwrap();
-            validate_required_fields(&json, &load_class_schema(class));
+            openshell_ocsf_validate::validate_event(&json)
+                .unwrap_or_else(|e| panic!("{class}: {e}"));
         }
     }
 

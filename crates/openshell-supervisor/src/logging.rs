@@ -6,7 +6,6 @@
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
 use openshell_ocsf::{OcsfJsonlLayer, OcsfShorthandLayer};
@@ -24,7 +23,6 @@ pub fn layers<S, W>(
     directory: &Path,
     console_filter: EnvFilter,
     enabled: Arc<AtomicBool>,
-    schema_version: Arc<Mutex<String>>,
 ) -> (impl Layer<S>, Vec<WorkerGuard>, bool)
 where
     S: Subscriber + for<'a> LookupSpan<'a> + 'static,
@@ -49,7 +47,6 @@ where
     let json_file = json_file.map(|writer| {
         OcsfJsonlLayer::new(writer)
             .with_enabled_flag(enabled.clone())
-            .with_target_version(schema_version.clone())
             .with_filter(LevelFilter::INFO)
     });
     // Keep per-destination filters independent: a diagnostic filter must not
@@ -61,7 +58,6 @@ where
         OcsfJsonlLayer::new(console)
             .with_console_format()
             .with_enabled_flag(enabled)
-            .with_target_version(schema_version)
             .with_filter(LevelFilter::INFO)
             .boxed(),
         shorthand_file.boxed(),
@@ -92,6 +88,7 @@ fn file_writer(
 mod tests {
     use super::*;
     use openshell_ocsf::{EventContext, NetworkActivityBuilder, ocsf_emit};
+    use std::sync::Mutex;
     use tracing_subscriber::layer::SubscriberExt;
 
     #[derive(Clone)]
@@ -132,7 +129,6 @@ mod tests {
             &invalid_directory,
             EnvFilter::new("off"),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(Mutex::new(String::new())),
         );
         assert!(!file_available);
         let subscriber = tracing_subscriber::registry().with(layers);
@@ -162,7 +158,6 @@ mod tests {
             directory.path(),
             EnvFilter::new("info"),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(Mutex::new(String::new())),
         );
         assert!(file_available);
         let subscriber = tracing_subscriber::registry().with(layers);
@@ -244,7 +239,6 @@ mod tests {
             &invalid_directory,
             EnvFilter::new("info"),
             Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(String::new())),
         );
         let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layers));
         tracing::dispatcher::with_default(&dispatch, || tracing::info!("occupy writer"));

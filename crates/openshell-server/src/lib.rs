@@ -482,6 +482,7 @@ impl ServerState {
         credentials: credentials::CredentialRuntime,
     ) -> Self {
         let replica_id = compute::lease::replica_id();
+        let compute = compute.with_sandbox_updates(config.enable_sandbox_updates);
         compute.configure_ssh_identities(credentials.clone());
         let service_route_index = Arc::new(service_routing::ServiceRouteIndex::new(
             config.service_routing_discriminator().map(str::to_string),
@@ -1387,6 +1388,7 @@ async fn terminate_signal() {
 
 pub use compute::{
     AcquiredRemoteDriverEndpoint, DriverWatchStream, ManagedDriverProcess, SharedComputeDriver,
+    SharedComputeDriverConfigurationUpdates,
 };
 
 /// Driver instance returned by a compiled compute-driver factory.
@@ -1462,6 +1464,23 @@ pub trait ComputeDriverFactory: Send + Sync {
     }
 
     async fn build(&self, context: ComputeDriverBuildContext<'_>) -> Result<ComputeDriverInstance>;
+
+    /// Build with a separately registered, optional in-process image updater.
+    ///
+    /// Existing factories only implement `build`; their baseline driver object
+    /// remains sufficient and this hook defaults to no configuration-update support.
+    /// Supporting factories return the same driver instance in both slots and
+    /// advertise the negotiated configuration-update capability. Remote drivers expose
+    /// their extension over the existing endpoint instead of using this hook.
+    async fn build_with_configuration_updates(
+        &self,
+        context: ComputeDriverBuildContext<'_>,
+    ) -> Result<(
+        ComputeDriverInstance,
+        Option<SharedComputeDriverConfigurationUpdates>,
+    )> {
+        self.build(context).await.map(|instance| (instance, None))
+    }
 }
 
 /// One named compiled-driver registration.
@@ -1912,7 +1931,10 @@ async fn build_compute_runtime(
                 supervisor_recovery_timeout_secs: supervisor_pool
                     .and_then(|pool| pool.recovery_timeout_secs),
             };
-            let instance = registration.factory.build(build_context).await?;
+            let (instance, image_updates) = registration
+                .factory
+                .build_with_configuration_updates(build_context)
+                .await?;
             let supervisor_host = shared_supervision
                 .into_inner()
                 .map(|supervision| supervision.controller().clone());
@@ -1934,7 +1956,8 @@ async fn build_compute_runtime(
                 .map_err(|error| {
                     Error::execution(format!("failed to create compute runtime: {error}"))
                 })?
-                .with_supervisor_host(supervisor_host),
+                .with_supervisor_host(supervisor_host)
+                .with_image_update_driver(image_updates),
                 ComputeDriverInstance::ManagedRemote(_) if supervisor_host.is_some() => {
                     return Err(Error::config(
                         "only an in-process compute driver can use the gateway's shared supervision",
@@ -2208,6 +2231,9 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
         ))),
     }
 }
+
+#[cfg(test)]
+mod compute_factory_compatibility;
 
 #[cfg(test)]
 mod tests {
@@ -2700,7 +2726,7 @@ mod tests {
                 .iter()
                 .map(|service| service.name.as_str())
                 .collect::<Vec<_>>(),
-            ["openshell.v1.OpenShell"]
+            ["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"]
         );
 
         stop_listener(shutdown, handle).await;

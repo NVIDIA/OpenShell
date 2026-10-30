@@ -164,6 +164,13 @@ not substitute the current `main` tip or the event's older PR base SHA. Merge
 groups and manual runs use their explicit baseline. Findings are reported by
 `Reject new high or critical findings`; distinguish those from scanner failures.
 
+For `Cargo Deny`, the metadata-only commands clear Rust compiler wrappers after
+entering mise; they do not require sccache. For OpenSSL backend and dynamic-linkage
+checks, use `nix develop .#crypto` from outside the default shell. The release
+toolchains in the default shell expose an unprefixed system AWS-LC that conflicts
+with OpenSSL. The crypto shell uses native OpenSSL and Cargo's symbol-prefixed
+AWS-LC build for dual-backend tests.
+
 For `Protobuf Compatibility`, check the logged train and comparison baseline.
 Branch Checks compares the prospective merge tree with its target; release qualification
 compares the tagged candidate with the previous stable release. Both use
@@ -171,8 +178,6 @@ the shared `check-protobuf-compatibility` action with `nix run .#check-protobuf-
 During `0.x`, a minor train permits compatibility findings
 as warnings; a patch train or no active train rejects them. Compare the current
 train's version with the latest stable release; commit messages are irrelevant.
-For the patch-train `v0.1.6-pre.N` exception, inspect the run summary and the
-qualification JSON's `exceptions` array; see `release-captain` for disposition.
 Compilation, baseline, and tool errors remain fatal. The `protobuf_compatibility` suite participates in
 the `release-tag-v1` qualification profile. Pre-release calls the reusable
 `release-qualification.yml` workflow after building, in parallel with publication. Release

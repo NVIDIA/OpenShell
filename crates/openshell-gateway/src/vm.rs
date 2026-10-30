@@ -696,11 +696,6 @@ fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>, gat
     }
     if let Some(ocsf) = ocsf {
         command.arg("--otlp-ocsf-endpoint").arg(&ocsf.endpoint);
-        if let Some(version) = ocsf.schema_version {
-            command
-                .arg("--otlp-ocsf-schema-version")
-                .arg(version.as_str());
-        }
     }
     let agent_endpoint = otlp_config.and_then(OtlpConfig::agent_endpoint);
     if let Some(endpoint) = agent_endpoint {
@@ -808,9 +803,7 @@ mod tests {
         validate_vm_sandbox_identity,
     };
     use openshell_core::{NetworkSupervisorTrustBundle, UpstreamProxyConfig};
-    use openshell_server::config_file::{
-        OcsfOtlpConfig, OcsfSchemaVersion, OtlpConfig, OtlpTracesConfig,
-    };
+    use openshell_server::config_file::{OcsfOtlpConfig, OtlpConfig, OtlpTracesConfig};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::PathBuf;
@@ -895,7 +888,7 @@ mod tests {
                 traces: None,
                 ocsf: Some(OcsfOtlpConfig {
                     endpoint: "http://siem.internal:4317".to_string(),
-                    schema_version: Some(OcsfSchemaVersion::V1_3),
+                    schema_version: None,
                 }),
                 metrics: None,
                 agent: None,
@@ -913,8 +906,6 @@ mod tests {
             [
                 "--otlp-ocsf-endpoint",
                 "http://siem.internal:4317",
-                "--otlp-ocsf-schema-version",
-                "1.3",
                 "--gateway-name",
                 "production-us-west"
             ]

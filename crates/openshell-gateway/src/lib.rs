@@ -58,9 +58,6 @@ fn supervisor_ocsf_export(
     let ocsf = otlp?.ocsf.as_ref()?;
     Some(openshell_core::sandbox_env::OcsfOtlpExport {
         endpoint: ocsf.endpoint.clone(),
-        schema_version: ocsf
-            .schema_version
-            .map(|version| version.as_str().to_string()),
     })
 }
 
@@ -289,6 +286,18 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
+        self.build_with_configuration_updates(context)
+            .await
+            .map(|(instance, _)| instance)
+    }
+
+    async fn build_with_configuration_updates(
+        &self,
+        context: openshell_server::ComputeDriverBuildContext<'_>,
+    ) -> openshell_core::Result<(
+        openshell_server::ComputeDriverInstance,
+        Option<openshell_server::SharedComputeDriverConfigurationUpdates>,
+    )> {
         let mut config = kubernetes_config(context.config_context())?;
         config.supervisor_otlp_endpoint = context
             .otlp_config()
@@ -330,9 +339,12 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
             .await
         }
         .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
-        let driver = openshell_driver_kubernetes::ComputeDriverService::new_in_process(driver);
-        Ok(openshell_server::ComputeDriverInstance::InProcess(
-            std::sync::Arc::new(driver),
+        let driver = std::sync::Arc::new(
+            openshell_driver_kubernetes::ComputeDriverService::new_in_process(driver),
+        );
+        Ok((
+            openshell_server::ComputeDriverInstance::InProcess(driver.clone()),
+            Some(driver),
         ))
     }
 }

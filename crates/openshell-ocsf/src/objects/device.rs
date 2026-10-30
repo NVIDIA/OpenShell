@@ -217,22 +217,19 @@ mod tests {
 
     #[test]
     fn device_os_matches_vendored_schema() {
-        use crate::validation::schema::{
-            load_object_schema, validate_enum_value, validate_known_fields,
-            validate_required_fields,
-        };
-
-        let schema = load_object_schema("os");
+        let mut event = crate::BaseEventBuilder::new(crate::ctx::ctx())
+            .build()
+            .to_json()
+            .unwrap();
         for device in [
             Device::linux("sandbox"),
             Device::windows("sandbox"),
             Device::for_current_os("sandbox"),
             Device::gateway("gateway-0", "production"),
         ] {
-            let os = serde_json::to_value(device.os).unwrap();
-            validate_required_fields(&os, &schema);
-            validate_known_fields(&os, &schema);
-            validate_enum_value(&os, "type_id", &schema);
+            event["device"] = serde_json::to_value(&device).unwrap();
+            openshell_ocsf_validate::validate_event(&event)
+                .unwrap_or_else(|e| panic!("{device:?}: {e}"));
         }
     }
 

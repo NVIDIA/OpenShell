@@ -302,6 +302,36 @@ storage. The driver confirms the stop from both the published `Suspended`
 condition and deletion of the backing pod. Legacy `v1alpha1` controllers omit
 a usable stopped condition, so pod deletion alone confirms their stop.
 
+The optional `openshell.compute.update-sandbox-configuration` capability supports
+image, command, and environment updates while stopped. External drivers serve
+`ComputeDriverConfigurationUpdates` separately from the baseline driver service;
+linked factories opt in through `build_with_configuration_updates`.
+The request identifies the sandbox, original resource UID, expected image,
+operation ID, and monotonic revision. The driver checks the suspended state,
+completed bootstrap, current resource UID, and absence of workload and supervisor
+Pods by directly reading the controller-recorded workload name, the Sandbox
+resource name, and the stable dedicated-supervisor name. Duplicate names are
+read once, and terminating Pods block updates. These checks make at most three
+Pod reads regardless of namespace size; they do not discover unexpectedly named
+Pods. The driver revalidates
+external-resource admission before patching the existing resource with a
+`resourceVersion` condition. The patch includes the verified UID; Kubernetes
+immutable-UID validation also rejects a same-name replacement. No resource or
+PVC is recreated. Existing workspace contents are not reseeded.
+
+A retry verifies durable operation evidence and the live selected targets before
+returning success without another patch. Different parameters or older revisions
+fail closed, including when later operations return to an earlier image.
+
+The service reconciles workload argv and effective user environment with the image
+in the same conditional patch. The
+main-process annotation and agent environment supply the next runtime generation;
+the trusted container launcher and runtime environment remain intact. Retry
+records identify selected fields and verify their live target values without
+copying environment values into operation evidence. Top-level public sandbox
+labels and annotations remain gateway metadata; this operation does not change
+Kubernetes pod metadata.
+
 The workspace PVC size defaults to `workspace_default_storage_size`. Set
 `workspace_storage_class` to pin the PVC to a specific `StorageClass`; an empty
 value omits `storageClassName` so the cluster's default `StorageClass` applies.

@@ -59,7 +59,6 @@ http-body-util = { workspace = true }
 # TLS
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 
 # CLI
 clap = { workspace = true }
@@ -140,6 +139,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # would; the feature is test-only and never reaches a release binary.
 openshell-providers = { path = "../openshell-providers", features = ["example-profiles"] }
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
+openshell-ocsf-validate = { path = "../openshell-ocsf-validate" }
 base64 = { workspace = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging"] }
 rcgen = { workspace = true }

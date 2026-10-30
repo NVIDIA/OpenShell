@@ -13,18 +13,15 @@ use tracing::Subscriber;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
-use crate::format::downgrade::downgrade_event;
 use crate::tracing_layers::event_bridge::{OCSF_TARGET, clone_current_event};
 
 /// OCSF JSON output settings owned by one hosted sandbox instance.
 ///
-/// Instances apply their own `ocsf_json_enabled` and schema-version settings
-/// to these values. Binding them to the instance's runtime threads makes every
+/// Instances apply their own `ocsf_json_enabled` setting to this value. Binding them to the instance's runtime threads makes every
 /// [`OcsfJsonlLayer`] use them for events those threads emit.
 #[derive(Clone, Debug, Default)]
 pub struct OcsfJsonSettings {
     pub enabled: Arc<AtomicBool>,
-    pub target_version: Arc<Mutex<String>>,
 }
 
 std::thread_local! {
@@ -47,15 +44,9 @@ pub fn bind_thread_json_settings(settings: Option<OcsfJsonSettings>) {
 /// `false`, the layer short-circuits without writing. This allows the sandbox
 /// to hot-toggle OCSF JSONL output at runtime via the `ocsf_json_enabled`
 /// setting without rebuilding the subscriber.
-///
-/// An optional target schema version can be set via
-/// [`with_target_version`](Self::with_target_version). When set, events are
-/// downgraded to the target version before writing (stripping fields and
-/// profiles that don't exist in older schema versions).
 pub struct OcsfJsonlLayer<W: Write + Send + 'static> {
     writer: Mutex<W>,
     enabled: Option<Arc<AtomicBool>>,
-    target_version: Option<Arc<Mutex<String>>>,
     console_format: bool,
 }
 
@@ -66,7 +57,6 @@ impl<W: Write + Send + 'static> OcsfJsonlLayer<W> {
         Self {
             writer: Mutex::new(writer),
             enabled: None,
-            target_version: None,
             console_format: false,
         }
     }
@@ -78,16 +68,6 @@ impl<W: Write + Send + 'static> OcsfJsonlLayer<W> {
     #[must_use]
     pub fn with_enabled_flag(mut self, flag: Arc<AtomicBool>) -> Self {
         self.enabled = Some(flag);
-        self
-    }
-
-    /// Attach a shared target schema version for downgrade filtering.
-    ///
-    /// When set, events are downgraded to the target version before writing.
-    /// The version can be changed at runtime via the shared mutex.
-    #[must_use]
-    pub fn with_target_version(mut self, version: Arc<Mutex<String>>) -> Self {
-        self.target_version = Some(version);
         self
     }
 
@@ -114,10 +94,9 @@ where
 
         // A hosted sandbox instance's settings replace the process-wide ones.
         let instance = THREAD_JSON_SETTINGS.with(|current| current.borrow().clone());
-        let (enabled, target_version) = instance.as_ref().map_or(
-            (self.enabled.as_ref(), self.target_version.as_ref()),
-            |settings| (Some(&settings.enabled), Some(&settings.target_version)),
-        );
+        let enabled = instance
+            .as_ref()
+            .map_or(self.enabled.as_ref(), |settings| Some(&settings.enabled));
 
         // If an enabled flag is set and it reads `false`, skip writing.
         if let Some(flag) = enabled
@@ -129,26 +108,8 @@ where
         if let Some(ocsf_event) = clone_current_event()
             && let Ok(mut w) = self.writer.lock()
         {
-            let line = if let Some(target) = target_version
-                && let Ok(version) = target.lock()
-                && !version.is_empty()
-            {
-                let Ok(mut json) = serde_json::to_value(&ocsf_event) else {
-                    return;
-                };
-                downgrade_event(&mut json, &version);
-                match serde_json::to_string(&json) {
-                    Ok(mut s) => {
-                        s.push('\n');
-                        s
-                    }
-                    Err(_) => return,
-                }
-            } else {
-                match ocsf_event.to_json_line() {
-                    Ok(l) => l,
-                    Err(_) => return,
-                }
+            let Ok(line) = ocsf_event.to_json_line() else {
+                return;
             };
             let line = if self.console_format {
                 let ts = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
