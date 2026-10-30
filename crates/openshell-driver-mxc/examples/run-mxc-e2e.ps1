@@ -38,6 +38,7 @@
 #   service-forwarding - named HTTP service routing and endpoint deletion.
 #   host-service     - workload reaches an HTTP service on host 127.0.0.1.
 #   https-ca         - opt-in outbound HTTPS using the injected proxy CA.
+#   socket-owner-normalized - child curl matches equivalent Windows policy paths.
 
 [CmdletBinding()]
 param(
@@ -806,14 +807,14 @@ try {
             Description = 'curl trusts the injected CA and observes the OpenShell HTTPS proxy certificate'
         }
     }
-    if ($Scenario -in @('socket-owner-allow', 'socket-owner-deny')) {
+    if ($Scenario -in @('socket-owner-allow', 'socket-owner-normalized', 'socket-owner-deny')) {
         $allScenarios += @{
             Name = $Scenario; PolicyFile = Join-Path $policyDir 'https-ca.yaml'
             SandboxId = 'own'; Backends = 'process_container'; Kind = 'socket-owner'
             PosTarget = Join-Path $DemoDir 'example.html'
             ControlTarget = Join-Path $DemoDir 'owner-launched.txt'
             ErrorTarget = Join-Path $DemoDir 'curl-stderr.txt'
-            ExpectAllowed = ($Scenario -eq 'socket-owner-allow')
+            ExpectAllowed = ($Scenario -ne 'socket-owner-deny')
             Description = 'network policy follows child curl rather than parent cmd'
         }
     }
@@ -890,9 +891,13 @@ try {
                 }
                 $policyText = $policyText.Replace('__HOST_SERVICE_PORT__', "$hostPort")
             }
-            # Preserve the exact Windows executable path used in the launch;
-            # network binary identities are compared as strings, not FS paths.
-            $policyText = $policyText.Replace('__CURL_EXE__', $curlExe.Replace("'", "''"))
+            # The normalization regression changes only the policy spelling;
+            # the launched executable and its hash retain their original path.
+            $policyCurlExe = $curlExe
+            if ($sc.Name -eq 'socket-owner-normalized') {
+                $policyCurlExe = $curlExe.Replace('\', '/').ToUpperInvariant()
+            }
+            $policyText = $policyText.Replace('__CURL_EXE__', $policyCurlExe.Replace("'", "''"))
             if ($sc.Kind -eq 'socket-owner' -and -not $sc.ExpectAllowed) {
                 $policyText = $policyText.Replace($curlExe, $cmdExe)
             }

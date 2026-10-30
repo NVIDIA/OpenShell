@@ -112,6 +112,7 @@ pub struct EgressAuthorization {
     pub matched_endpoints: Vec<MatchedEndpoint>,
     pub exact_declared_endpoint_host: bool,
     pub generation: u64,
+    pub(crate) binary_match_paths: Vec<NetworkBinaryPathEvidence>,
 }
 
 /// Input for a network access policy evaluation.
@@ -256,6 +257,7 @@ pub struct TunnelPolicyEngine {
     generation_guard: PolicyGenerationGuard,
     middleware_runner: ChainRunner,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
+    binary_match_paths: Vec<NetworkBinaryPathEvidence>,
 }
 
 impl TunnelPolicyEngine {
@@ -281,6 +283,10 @@ impl TunnelPolicyEngine {
 
     pub(crate) fn middleware_runner(&self) -> &ChainRunner {
         &self.middleware_runner
+    }
+
+    pub(crate) fn binary_match_paths(&self) -> &[NetworkBinaryPathEvidence] {
+        &self.binary_match_paths
     }
 
     pub(crate) fn websocket_assembly_budget(
@@ -499,6 +505,7 @@ impl OpaEngine {
         let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
             .map_err(|_| miette::miette!("internal: failed to parse proto JSON"))?;
         inject_runtime_policy_data(&mut data, require_binary_identity);
+        normalize_network_binary_paths(&mut data);
         normalize_endpoint_protocols(&mut data);
 
         // Validate BEFORE expanding presets
@@ -607,7 +614,8 @@ impl OpaEngine {
         #[cfg(test)]
         record_test_opa_query();
 
-        let input_json = network_input_json(input);
+        let binary_match_paths = network_binary_path_evidence_for_input(input);
+        let input_json = network_input_json_with_match_paths(input, &binary_match_paths);
 
         let mut engine = self
             .engine
@@ -627,6 +635,7 @@ impl OpaEngine {
                 matched_endpoints: Vec::new(),
                 exact_declared_endpoint_host: false,
                 generation,
+                binary_match_paths,
             });
         }
 
@@ -666,6 +675,7 @@ impl OpaEngine {
             matched_endpoints,
             exact_declared_endpoint_host,
             generation,
+            binary_match_paths,
         })
     }
 
@@ -1118,6 +1128,14 @@ impl OpaEngine {
     /// and only duplicates interpreter state (~microseconds). The cloned
     /// engine can be used without Mutex contention.
     pub fn clone_engine_for_tunnel(&self, expected_generation: u64) -> Result<TunnelPolicyEngine> {
+        self.clone_engine_for_tunnel_with_match_paths(expected_generation, Vec::new())
+    }
+
+    pub(crate) fn clone_engine_for_tunnel_with_match_paths(
+        &self,
+        expected_generation: u64,
+        binary_match_paths: Vec<NetworkBinaryPathEvidence>,
+    ) -> Result<TunnelPolicyEngine> {
         let engine = self
             .engine
             .lock()
@@ -1137,6 +1155,7 @@ impl OpaEngine {
             },
             middleware_runner: self.middleware_runner()?,
             websocket_assembly_budget: self.websocket_assembly_budget(),
+            binary_match_paths,
         })
     }
 }
@@ -1196,10 +1215,31 @@ fn get_str_array(val: &regorus::Value, key: &str) -> Vec<String> {
 }
 
 fn network_input_json(input: &NetworkInput) -> serde_json::Value {
-    let ancestor_strs: Vec<String> = input
-        .ancestors
+    let match_paths = network_binary_path_evidence_for_input(input);
+    network_input_json_with_match_paths(input, &match_paths)
+}
+
+fn network_binary_path_evidence_for_input(input: &NetworkInput) -> Vec<NetworkBinaryPathEvidence> {
+    let mut match_paths = Vec::with_capacity(input.ancestors.len() + 1);
+    match_paths.push(network_binary_path_evidence(&input.binary_path));
+    match_paths.extend(
+        input
+            .ancestors
+            .iter()
+            .map(|path| network_binary_path_evidence(path)),
+    );
+    match_paths
+}
+
+fn network_input_json_with_match_paths(
+    input: &NetworkInput,
+    match_paths: &[NetworkBinaryPathEvidence],
+) -> serde_json::Value {
+    let binary = &match_paths[0];
+    let ancestor_strs: Vec<&str> = match_paths
         .iter()
-        .map(|p| p.to_string_lossy().into_owned())
+        .skip(1)
+        .map(|path| path.path.as_str())
         .collect();
     let cmdline_strs: Vec<String> = input
         .cmdline_paths
@@ -1208,15 +1248,71 @@ fn network_input_json(input: &NetworkInput) -> serde_json::Value {
         .collect();
     serde_json::json!({
         "exec": {
-            "path": input.binary_path.to_string_lossy(),
+            "path": &binary.path,
             "ancestors": ancestor_strs,
             "cmdline_paths": cmdline_strs,
+            "match_paths": match_paths,
         },
         "network": {
             "host": input.host,
             "port": input.port,
         }
     })
+}
+
+/// Return the stable representation used only for network-policy path matching.
+///
+/// Windows paths accept either path separator. Namespace paths retain their exact
+/// spelling, and other platforms retain exact matching. This lexical operation
+/// never probes the filesystem, so it is also safe for policy-authored paths.
+pub(crate) fn network_binary_match_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    #[cfg(target_os = "windows")]
+    {
+        windows_network_binary_match_path(&path)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        path.into_owned()
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_network_binary_match_path(path: &str) -> String {
+    if is_windows_namespace_path(path) {
+        return path.to_owned();
+    }
+    path.replace('\\', "/")
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn is_windows_namespace_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && matches!(bytes[0], b'/' | b'\\') && matches!(bytes[1], b'/' | b'\\')
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct NetworkBinaryPathEvidence {
+    path: String,
+    /// Present only when trusted runtime evidence confirms that every parent
+    /// directory uses case-insensitive lookup.
+    ascii_case_folded: String,
+}
+
+fn network_binary_path_evidence(path: &Path) -> NetworkBinaryPathEvidence {
+    let normalized = network_binary_match_path(path);
+    #[cfg(target_os = "windows")]
+    let ascii_case_folded =
+        openshell_binary_identity::windows::path_components_case_insensitive(path)
+            .filter(|case_insensitive| *case_insensitive)
+            .map_or_else(String::new, |_| normalized.to_ascii_lowercase());
+    #[cfg(not(target_os = "windows"))]
+    let ascii_case_folded = String::new();
+
+    NetworkBinaryPathEvidence {
+        path: normalized,
+        ascii_case_folded,
+    }
 }
 
 /// Sets an already-built JSON value as Regorus input without encoding and reparsing JSON text.
@@ -1672,6 +1768,7 @@ fn preprocess_yaml_data(
     raw_schema::validate_network_settings(&data)?;
     validate_opa_static_settings(&mut data)?;
     inject_runtime_policy_data(&mut data, require_binary_identity);
+    normalize_network_binary_paths(&mut data);
     normalize_endpoint_protocols(&mut data);
 
     // Normalize port → ports for all endpoints so Rego always sees "ports" array.
@@ -1772,6 +1869,43 @@ fn normalize_endpoint_protocols(data: &mut serde_json::Value) {
                     serde_json::Value::String(canonical.to_string()),
                 );
             }
+        }
+    }
+}
+
+/// Normalize configured binary paths without accessing the filesystem.
+///
+/// Policy paths are untrusted input and may name remote shares or device
+/// namespaces. Case-insensitive matching is therefore decided later using only
+/// trusted runtime path evidence.
+fn normalize_network_binary_paths(data: &mut serde_json::Value) {
+    let Some(policies) = data
+        .get_mut("network_policies")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    for policy in policies.values_mut() {
+        let Some(binaries) = policy
+            .get_mut("binaries")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for binary in binaries {
+            let Some(binary) = binary.as_object_mut() else {
+                continue;
+            };
+            let Some(value) = binary.get("path").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let normalized = network_binary_match_path(Path::new(value));
+            binary.insert(
+                "ascii_case_folded_path".to_string(),
+                normalized.to_ascii_lowercase().into(),
+            );
+            binary.insert("path".to_string(), normalized.into());
         }
     }
 }
@@ -2663,6 +2797,127 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn windows_binary_match_path_normalizes_separators_preserving_case() {
+        let normalized = windows_network_binary_match_path(r"C:\WINDOWS\SYSTEM32\CURL.EXE");
+        assert_eq!(normalized, "C:/WINDOWS/SYSTEM32/CURL.EXE");
+        assert_ne!(
+            normalized,
+            windows_network_binary_match_path(r"C:\Windows\System32\powershell.exe")
+        );
+    }
+
+    #[test]
+    fn windows_binary_match_path_preserves_namespace_paths_without_probing() {
+        for namespace_path in [
+            r"\\?\C:\Windows\System32\CURL.EXE",
+            r"\\.\PhysicalDrive0",
+            r"\\server\share\tool.exe",
+        ] {
+            assert_eq!(
+                windows_network_binary_match_path(namespace_path),
+                namespace_path
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn set_windows_directory_case_sensitive(path: &Path, enabled: bool) {
+        let output = std::process::Command::new("fsutil.exe")
+            .args(["file", "setCaseSensitiveInfo"])
+            .arg(path)
+            .arg(if enabled { "enable" } else { "disable" })
+            .output()
+            .expect("run Windows case-sensitivity fixture setup");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_binary_matching_denies_case_mismatch_under_sensitive_ancestor() {
+        let root = tempfile::tempdir().expect("create temporary directory");
+        set_windows_directory_case_sensitive(root.path(), true);
+        let containing_directory = root.path().join("TrustedTools");
+        std::fs::create_dir(&containing_directory).expect("create binary directory");
+        set_windows_directory_case_sensitive(&containing_directory, false);
+        let runtime_binary = containing_directory.join("curl.exe");
+        std::fs::write(&runtime_binary, b"test executable").expect("create test executable");
+
+        assert_eq!(
+            openshell_binary_identity::windows::path_components_case_insensitive(&runtime_binary),
+            Some(false),
+            "a sensitive ancestor must keep the whole match case-exact"
+        );
+
+        let policy_binary = runtime_binary
+            .to_string_lossy()
+            .replace("TrustedTools", "trustedtools");
+        assert_ne!(policy_binary, runtime_binary.to_string_lossy());
+        let mut proto = openshell_policy::restrictive_default_policy();
+        proto.network_policies.insert(
+            "windows_sensitive_ancestor".to_string(),
+            NetworkPolicyRule {
+                name: "windows_sensitive_ancestor".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: policy_binary,
+                }],
+            },
+        );
+        let engine = OpaEngine::from_proto(&proto).expect("load Windows policy");
+        let decision = engine
+            .evaluate_network(&NetworkInput {
+                host: "example.com".to_string(),
+                port: 443,
+                binary_path: runtime_binary,
+                binary_sha256: "unused".to_string(),
+                ancestors: Vec::new(),
+                cmdline_paths: Vec::new(),
+            })
+            .expect("evaluate Windows policy");
+
+        assert!(
+            !decision.allowed,
+            "case-distinct paths under a sensitive ancestor must not share grants"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_binary_matching_keeps_case_exact_when_directory_query_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("absent-parent").join("Tool.exe");
+        let data = serde_json::json!({
+            "network_policies": {
+                "missing_directory": {
+                    "endpoints": [{"host": "example.com", "port": 443}],
+                    "binaries": [{"path": path.to_string_lossy().to_ascii_lowercase()}],
+                },
+            },
+        });
+        let engine = OpaEngine::from_strings(TEST_POLICY, &data.to_string()).unwrap();
+        let input = NetworkInput {
+            host: "example.com".into(),
+            port: 443,
+            binary_path: path,
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(
+            !engine.evaluate_network(&input).unwrap().allowed,
+            "an unverified directory must not enable case-insensitive grants"
+        );
     }
 
     #[test]
@@ -5113,6 +5368,146 @@ network_policies:
             decision.reason
         );
         assert_eq!(decision.matched_policy.as_deref(), Some("claude_code"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn from_proto_matches_windows_equivalent_binary_path() {
+        let mut proto = openshell_policy::restrictive_default_policy();
+        proto.network_policies.insert(
+            "windows_binary".to_string(),
+            NetworkPolicyRule {
+                name: "windows_binary".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: r"C:\WINDOWS\SYSTEM32\CURL.EXE".to_string(),
+                }],
+            },
+        );
+        let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
+
+        let equivalent = NetworkInput {
+            host: "example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("c:/windows/system32/curl.exe"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&equivalent).unwrap();
+        assert!(
+            decision.allowed,
+            "Windows-equivalent binary path should be allowed: {}",
+            decision.reason
+        );
+
+        let different_binary = NetworkInput {
+            binary_path: PathBuf::from("c:/windows/system32/powershell.exe"),
+            ..equivalent
+        };
+        let decision = engine.evaluate_network(&different_binary).unwrap();
+        assert!(
+            !decision.allowed,
+            "normalization must not allow a different binary"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn from_strings_matches_windows_equivalent_binary_path() {
+        let engine = OpaEngine::from_strings(
+            TEST_POLICY,
+            r#"
+network_policies:
+  windows_binary:
+    endpoints:
+      - { host: example.com, port: 443 }
+    binaries:
+      - { path: 'C:\WINDOWS\SYSTEM32\CURL.EXE' }
+"#,
+        )
+        .expect("Failed to create engine from YAML");
+        let input = NetworkInput {
+            host: "example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("c:/windows/system32/curl.exe"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "Windows-equivalent YAML binary path should be allowed: {}",
+            decision.reason
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_binary_matching_covers_ancestors_and_globs_without_cmdline_grants() {
+        for configured in [
+            r"C:\WINDOWS\SYSTEM32\CURL.EXE",
+            r"C:\WINDOWS\SYSTEM32\*.EXE",
+        ] {
+            let engine = OpaEngine::from_strings(
+                TEST_POLICY,
+                &format!(
+                    "network_policies:\n  windows_binary:\n    endpoints:\n      - {{host: example.com, port: 443}}\n    binaries:\n      - {{path: '{configured}'}}\n"
+                ),
+            )
+            .expect("load Windows policy");
+            let executable = PathBuf::from("c:/windows/system32/curl.exe");
+            let mut input = NetworkInput {
+                host: "example.com".into(),
+                port: 443,
+                binary_path: PathBuf::from("C:/unlisted/child.exe"),
+                binary_sha256: "unused".into(),
+                ancestors: vec![executable.clone()],
+                cmdline_paths: vec![],
+            };
+            assert!(engine.evaluate_network(&input).unwrap().allowed);
+            input.ancestors.clear();
+            input.cmdline_paths.push(executable);
+            assert!(
+                !engine.evaluate_network(&input).unwrap().allowed,
+                "command-line paths must not authorize a connection for {configured}"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn non_windows_binary_matching_preserves_case_and_separators() {
+        let engine = OpaEngine::from_strings(
+            TEST_POLICY,
+            "network_policies:\n  exact:\n    endpoints:\n      - {host: example.com, port: 443}\n    binaries:\n      - {path: '/opt/Tools/curl'}\n",
+        )
+        .unwrap();
+        for (path, allowed) in [
+            ("/opt/Tools/curl", true),
+            ("/opt/tools/curl", false),
+            (r"\opt\Tools\curl", false),
+        ] {
+            let input = NetworkInput {
+                host: "example.com".into(),
+                port: 443,
+                binary_path: PathBuf::from(path),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            assert_eq!(
+                engine.evaluate_network(&input).unwrap().allowed,
+                allowed,
+                "{path}"
+            );
+        }
     }
 
     #[test]
