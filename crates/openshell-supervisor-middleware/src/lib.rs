@@ -325,12 +325,12 @@ enum MiddlewareSessionAdmission {
 }
 
 pub use openshell_core::middleware::{
-    DEFAULT_MIDDLEWARE_TIMEOUT, MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES,
-    MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS, MAX_CONCURRENT_MIDDLEWARE_SESSIONS,
-    MAX_CONCURRENT_MIDDLEWARE_WORK, MAX_MIDDLEWARE_CHAIN_FINDINGS, MAX_MIDDLEWARE_CHAIN_STAGES,
-    MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_CONFIGS, MAX_MIDDLEWARE_FINDINGS_PER_STAGE,
-    MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT, MAX_MIDDLEWARE_SELECTOR_PATTERNS, MAX_MIDDLEWARE_TIMEOUT,
-    MIN_MIDDLEWARE_TIMEOUT, middleware_timeout_or_default, parse_middleware_timeout,
+    DEFAULT_MIDDLEWARE_TIMEOUT, MAX_CONCURRENT_MIDDLEWARE_SESSIONS, MAX_CONCURRENT_MIDDLEWARE_WORK,
+    MAX_HTTP_HOOK_BUFFERING_SLOTS, MAX_HTTP_HOOK_STREAMING_SLOTS, MAX_MIDDLEWARE_CHAIN_FINDINGS,
+    MAX_MIDDLEWARE_CHAIN_STAGES, MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_CONFIGS,
+    MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT,
+    MAX_MIDDLEWARE_SELECTOR_PATTERNS, MAX_MIDDLEWARE_TIMEOUT, MIN_MIDDLEWARE_TIMEOUT,
+    middleware_timeout_or_default, parse_middleware_timeout,
 };
 
 /// Largest logical payload or replacement accepted by the middleware platform.
@@ -955,8 +955,8 @@ pub struct MiddlewareRegistry {
     work_admission: Arc<Semaphore>,
     work_admission_waiters: Arc<Semaphore>,
     session_admission: Arc<Semaphore>,
-    http_hooks_admission: Arc<Semaphore>,
-    http_stream_admission: Arc<Semaphore>,
+    http_buffering_admission: Arc<Semaphore>,
+    http_streaming_admission: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for MiddlewareRegistry {
@@ -975,12 +975,12 @@ impl std::fmt::Debug for MiddlewareRegistry {
                 &self.session_admission.available_permits(),
             )
             .field(
-                "available_http_hooks_permits",
-                &self.http_hooks_admission.available_permits(),
+                "available_http_buffering_permits",
+                &self.http_buffering_admission.available_permits(),
             )
             .field(
-                "available_http_stream_permits",
-                &self.http_stream_admission.available_permits(),
+                "available_http_streaming_permits",
+                &self.http_streaming_admission.available_permits(),
             )
             .finish()
     }
@@ -1002,8 +1002,8 @@ impl Default for MiddlewareRegistry {
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
-            http_hooks_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES)),
-            http_stream_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS)),
+            http_buffering_admission: Arc::new(Semaphore::new(MAX_HTTP_HOOK_BUFFERING_SLOTS)),
+            http_streaming_admission: Arc::new(Semaphore::new(MAX_HTTP_HOOK_STREAMING_SLOTS)),
         }
     }
 }
@@ -1523,8 +1523,8 @@ impl MiddlewareRegistry {
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
-            http_hooks_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES)),
-            http_stream_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS)),
+            http_buffering_admission: Arc::new(Semaphore::new(MAX_HTTP_HOOK_BUFFERING_SLOTS)),
+            http_streaming_admission: Arc::new(Semaphore::new(MAX_HTTP_HOOK_STREAMING_SLOTS)),
         })
     }
 
@@ -1727,12 +1727,8 @@ impl ChainRunner {
                 work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
                 work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
                 session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
-                http_hooks_admission: Arc::new(Semaphore::new(
-                    MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES,
-                )),
-                http_stream_admission: Arc::new(Semaphore::new(
-                    MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS,
-                )),
+                http_buffering_admission: Arc::new(Semaphore::new(MAX_HTTP_HOOK_BUFFERING_SLOTS)),
+                http_streaming_admission: Arc::new(Semaphore::new(MAX_HTTP_HOOK_STREAMING_SLOTS)),
             }),
         }
     }
@@ -1759,8 +1755,8 @@ impl ChainRunner {
         registry.work_admission = Arc::clone(&self.registry.work_admission);
         registry.work_admission_waiters = Arc::clone(&self.registry.work_admission_waiters);
         registry.session_admission = Arc::clone(&self.registry.session_admission);
-        registry.http_hooks_admission = Arc::clone(&self.registry.http_hooks_admission);
-        registry.http_stream_admission = Arc::clone(&self.registry.http_stream_admission);
+        registry.http_buffering_admission = Arc::clone(&self.registry.http_buffering_admission);
+        registry.http_streaming_admission = Arc::clone(&self.registry.http_streaming_admission);
         Self::from_registry(registry)
     }
 
@@ -1815,29 +1811,29 @@ impl ChainRunner {
             })
     }
 
-    /// Wait until `deadline` for one HTTP hook slot, held through
+    /// Wait until `deadline` for one HTTP hook buffering slot, held through
     /// preflight and `WHOLE_BODY` stages. `None` when none freed up in time.
-    async fn reserve_http_hook(
+    async fn reserve_http_buffering_slot(
         &self,
         deadline: tokio::time::Instant,
     ) -> Option<MiddlewareSessionPermit> {
-        reserve_until(&self.registry.http_hooks_admission, deadline).await
+        reserve_until(&self.registry.http_buffering_admission, deadline).await
     }
 
-    /// Take one HTTP hook DUPLEX slot if one is free now.
-    fn try_reserve_http_stream(&self) -> Option<MiddlewareSessionPermit> {
-        Arc::clone(&self.registry.http_stream_admission)
+    /// Take one HTTP hook streaming slot if one is free now.
+    fn try_reserve_http_streaming_slot(&self) -> Option<MiddlewareSessionPermit> {
+        Arc::clone(&self.registry.http_streaming_admission)
             .try_acquire_owned()
             .ok()
             .map(|permit| MiddlewareSessionPermit { _session: permit })
     }
 
-    /// Wait until `deadline` for one HTTP hook DUPLEX slot.
-    async fn reserve_http_stream(
+    /// Wait until `deadline` for one HTTP hook streaming slot.
+    async fn reserve_http_streaming_slot(
         &self,
         deadline: tokio::time::Instant,
     ) -> Option<MiddlewareSessionPermit> {
-        reserve_until(&self.registry.http_stream_admission, deadline).await
+        reserve_until(&self.registry.http_streaming_admission, deadline).await
     }
 
     async fn manifests(&self) -> Result<Vec<(Arc<MiddlewareServiceState>, MiddlewareManifest)>> {
@@ -4130,8 +4126,8 @@ mod tests {
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
-            http_hooks_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES)),
-            http_stream_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS)),
+            http_buffering_admission: Arc::new(Semaphore::new(MAX_HTTP_HOOK_BUFFERING_SLOTS)),
+            http_streaming_admission: Arc::new(Semaphore::new(MAX_HTTP_HOOK_STREAMING_SLOTS)),
         }
     }
 

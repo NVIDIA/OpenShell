@@ -1022,7 +1022,7 @@ struct BodyAdmission {
     /// The first stage retains its preflight slot while it buffers.
     buffered: Option<Arc<MiddlewareSessionPermit>>,
     runner: Option<ChainRunner>,
-    /// A DUPLEX slot, kept until the pipeline ends.
+    /// A streaming slot, kept until the pipeline ends.
     stream: Option<MiddlewareSessionPermit>,
 }
 
@@ -1051,11 +1051,11 @@ impl ChainRunner {
             }
             return Some(pipeline);
         }
-        let (stream, slot) = if let Some(stream) = self.try_reserve_http_stream() {
+        let (stream, slot) = if let Some(stream) = self.try_reserve_http_streaming_slot() {
             (stream, Some(slot))
         } else {
             drop(slot);
-            let Some(stream) = self.reserve_http_stream(deadline).await else {
+            let Some(stream) = self.reserve_http_streaming_slot(deadline).await else {
                 pipeline.end(MiddlewareSessionEndReason::Cancellation).await;
                 return None;
             };
@@ -1066,7 +1066,7 @@ impl ChainRunner {
             let slot = if slot.is_some() {
                 slot
             } else {
-                self.reserve_http_hook(deadline).await
+                self.reserve_http_buffering_slot(deadline).await
             };
             let Some(slot) = slot else {
                 pipeline.end(MiddlewareSessionEndReason::Cancellation).await;
@@ -1366,7 +1366,7 @@ impl BufferAdmission {
         if let Some(permit) = active.upgrade() {
             return Some(permit);
         }
-        let permit = Arc::new(self.runner.reserve_http_hook(deadline).await?);
+        let permit = Arc::new(self.runner.reserve_http_buffering_slot(deadline).await?);
         *active = Arc::downgrade(&permit);
         Some(permit)
     }

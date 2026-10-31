@@ -242,7 +242,7 @@ The gateway also rejects a policy in which a `fail_closed` entry can select a `t
 | Limit | Applies to | Value |
 | --- | --- | --- |
 | Preflight | HTTP hooks | Binding timeout per stage. Initial preflights share a 30-second setup budget; each deferred preflight gets a new 30-second setup budget when its input headers arrive. Capacity waits use that budget. |
-| Concurrent messages | HTTP hooks | 64 messages in preflight or WHOLE_BODY processing, and 256 with DUPLEX or deferred stages, per sandbox. WHOLE_BODY stages of one message share a slot. A DUPLEX stage releases the buffering slot until another stage needs it. |
+| Concurrent HTTP requests and responses | HTTP hooks | 64 in preflight or WHOLE_BODY processing, and 256 with DUPLEX or deferred stages, per sandbox. WHOLE_BODY stages of one request or response share a slot. A DUPLEX stage releases the buffering slot until another stage needs it. |
 | Whole body | HTTP hooks | Stage payload limit, up to 4 MiB. Two minutes to receive, process, and deliver; individual exchanges also obey the binding timeout. |
 | Duplex body | HTTP hooks | No total duration limit. No total size limit unless the preflight sets `limits.max_output_body_bytes` for buffered request output. Chunks are at most 64 KiB or the stage payload limit, whichever is smaller. |
 | Middleware stall | HTTP DUPLEX | 30 seconds to accept the next input, or between results after `input_end`. Waiting for the sandbox or external service to produce input does not count. |

@@ -360,23 +360,26 @@ pub const MAX_CONCURRENT_MIDDLEWARE_WORK: usize = 32;
 /// A session consumes one permit regardless of its stage fan-out. These
 /// protocols acquire from this shared budget before opening streams and retain
 /// the permit while any stage remains active. HTTP hooks use
-/// [`MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES`] and
-/// [`MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS`] instead.
+/// [`MAX_HTTP_HOOK_BUFFERING_SLOTS`] and
+/// [`MAX_HTTP_HOOK_STREAMING_SLOTS`] instead.
 pub const MAX_CONCURRENT_MIDDLEWARE_SESSIONS: usize = 32;
-/// Process-wide bound on HTTP hook messages in preflight or in a
-/// `WHOLE_BODY` stage.
+/// Process-wide bound on HTTP requests and responses in HTTP hook preflight
+/// or in a `WHOLE_BODY` stage.
 ///
 /// A request and its response each hold one slot, and only while a stage
-/// inspects them: a message whose stages all continue at preflight releases
-/// its slot then. A message waits for a slot within its chain deadline.
-pub const MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES: usize = 64;
-/// Process-wide bound on HTTP hook messages with a DUPLEX stage.
+/// inspects them: one whose stages all continue at preflight releases its
+/// slot then. A request or response waits for a slot within its chain
+/// deadline.
+pub const MAX_HTTP_HOOK_BUFFERING_SLOTS: usize = 64;
+/// Process-wide bound on HTTP requests and responses whose HTTP hook chain
+/// has a DUPLEX stage or deferred stages.
 ///
-/// A DUPLEX body has no total deadline, so a server-sent events response can
+/// Such a body has no total deadline, so a server-sent events response can
 /// hold its slot indefinitely. This separate budget keeps such streams from
-/// starving short messages. It allows a request and a response stream for each
-/// of the 96 network streams the `OpenShell` sandbox runtime relays at once.
-pub const MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS: usize = 256;
+/// starving short requests and responses. It allows a request and a response
+/// stream for each of the 96 network streams the `OpenShell` sandbox runtime
+/// relays at once.
+pub const MAX_HTTP_HOOK_STREAMING_SLOTS: usize = 256;
 
 /// Largest number of middleware configurations accepted in one sandbox policy.
 pub const MAX_MIDDLEWARE_CONFIGS: usize = 10;

@@ -26,10 +26,9 @@ use crate::binding_policy::BindingPolicy;
 use crate::{
     ChainEntry, ChainRunner, DescribedChainEntry, HttpBodyInput, HttpBodyOutput, HttpFailureCode,
     HttpRequestHookResultStream, HttpRequestPreflightInput, HttpRequestView, HttpStageOutcome,
-    InProcessMiddleware, MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES,
-    MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS, MAX_MIDDLEWARE_CHAIN_TIMEOUT, MiddlewareFailureDetail,
-    MiddlewareRegistry, OnError, TransformedBodyPolicy, authorize_external_manifest,
-    validate_manifest_bindings,
+    InProcessMiddleware, MAX_HTTP_HOOK_BUFFERING_SLOTS, MAX_HTTP_HOOK_STREAMING_SLOTS,
+    MAX_MIDDLEWARE_CHAIN_TIMEOUT, MiddlewareFailureDetail, MiddlewareRegistry, OnError,
+    TransformedBodyPolicy, authorize_external_manifest, validate_manifest_bindings,
 };
 
 fn binding(operation: SupervisorMiddlewareOperation) -> MiddlewareBinding {
@@ -813,21 +812,18 @@ fn scripted(name: &'static str, preflight: Preflight, body: Body) -> Arc<Scripte
     Arc::new(ScriptedStage::new(name, preflight, body))
 }
 
-/// Free HTTP hook slots, then free DUPLEX slots.
+/// Free HTTP hook buffering slots, then free streaming slots.
 fn free_slots(runner: &ChainRunner) -> (usize, usize) {
     (
-        runner.registry.http_hooks_admission.available_permits(),
-        runner.registry.http_stream_admission.available_permits(),
+        runner.registry.http_buffering_admission.available_permits(),
+        runner.registry.http_streaming_admission.available_permits(),
     )
 }
 
 #[tokio::test]
 async fn a_message_holds_hook_slots_only_while_a_stage_inspects_it() {
     use HttpBodyMode::{Duplex, WholeBody};
-    let full = (
-        MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES,
-        MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS,
-    );
+    let full = (MAX_HTTP_HOOK_BUFFERING_SLOTS, MAX_HTTP_HOOK_STREAMING_SLOTS);
     for (case, stages, held) in [
         (
             "continue releases the slot after preflight",
@@ -916,10 +912,8 @@ async fn preflight_waits_for_a_hook_slot_within_the_chain_deadline() {
         Body::Unchanged,
     )])
     .await;
-    let mut held = Arc::clone(&runner.registry.http_hooks_admission)
-        .acquire_many_owned(
-            u32::try_from(MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES).expect("slot count"),
-        )
+    let mut held = Arc::clone(&runner.registry.http_buffering_admission)
+        .acquire_many_owned(u32::try_from(MAX_HTTP_HOOK_BUFFERING_SLOTS).expect("slot count"))
         .await
         .expect("hold every slot");
 
@@ -959,10 +953,8 @@ async fn waiting_for_a_stream_slot_does_not_hold_a_preflight_slot() {
     .await;
     let streaming = described[..1].to_vec();
     let buffered = described[1..].to_vec();
-    let mut held = Arc::clone(&runner.registry.http_stream_admission)
-        .acquire_many_owned(
-            u32::try_from(MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS).expect("slot count"),
-        )
+    let mut held = Arc::clone(&runner.registry.http_streaming_admission)
+        .acquire_many_owned(u32::try_from(MAX_HTTP_HOOK_STREAMING_SLOTS).expect("slot count"))
         .await
         .expect("hold every stream slot");
 
@@ -976,7 +968,7 @@ async fn waiting_for_a_stream_slot_does_not_hold_a_preflight_slot() {
                 .await
         })
     };
-    let waiting: Vec<_> = (0..MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES)
+    let waiting: Vec<_> = (0..MAX_HTTP_HOOK_BUFFERING_SLOTS)
         .map(|_| spawn(streaming.clone()))
         .collect();
     let mixed = spawn(described.clone());
@@ -985,7 +977,7 @@ async fn waiting_for_a_stream_slot_does_not_hold_a_preflight_slot() {
     assert!(!mixed.is_finished());
     assert_eq!(
         free_slots(&runner),
-        (MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES, 0),
+        (MAX_HTTP_HOOK_BUFFERING_SLOTS, 0),
         "waiting messages hold no preflight slot",
     );
 
@@ -1010,10 +1002,7 @@ async fn waiting_for_a_stream_slot_does_not_hold_a_preflight_slot() {
     let mixed = mixed.await.expect("task").expect("preflight");
     assert!(mixed.allowed, "{}", mixed.reason);
     assert!(mixed.pipeline.is_some());
-    assert_eq!(
-        free_slots(&runner),
-        (MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES, 0),
-    );
+    assert_eq!(free_slots(&runner), (MAX_HTTP_HOOK_BUFFERING_SLOTS, 0),);
 }
 
 #[tokio::test]
@@ -1490,8 +1479,8 @@ async fn adjacent_buffered_stages_share_capacity_instead_of_deadlocking() {
         .preflight_described_http_request(described, request_input(b"hello"))
         .await
         .unwrap();
-    let held = Arc::clone(&runner.registry.http_hooks_admission)
-        .acquire_many_owned(u32::try_from(MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES - 1).unwrap())
+    let held = Arc::clone(&runner.registry.http_buffering_admission)
+        .acquire_many_owned(u32::try_from(MAX_HTTP_HOOK_BUFFERING_SLOTS - 1).unwrap())
         .await
         .unwrap();
     let (input, inputs) = mpsc::channel(4);
@@ -1524,10 +1513,7 @@ async fn adjacent_buffered_stages_share_capacity_instead_of_deadlocking() {
     drop(held);
     assert_eq!(
         free_slots(&runner),
-        (
-            MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES,
-            MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS
-        )
+        (MAX_HTTP_HOOK_BUFFERING_SLOTS, MAX_HTTP_HOOK_STREAMING_SLOTS)
     );
 }
 
@@ -1548,8 +1534,8 @@ async fn deferred_preflight_capacity_wait_is_bounded_and_releases_the_stream_slo
         .preflight_described_http_request(described, request_input(b"hello"))
         .await
         .unwrap();
-    let held = Arc::clone(&runner.registry.http_hooks_admission)
-        .acquire_many_owned(u32::try_from(MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES).unwrap())
+    let held = Arc::clone(&runner.registry.http_buffering_admission)
+        .acquire_many_owned(u32::try_from(MAX_HTTP_HOOK_BUFFERING_SLOTS).unwrap())
         .await
         .unwrap();
     let (input, inputs) = mpsc::channel(4);
@@ -1579,10 +1565,7 @@ async fn deferred_preflight_capacity_wait_is_bounded_and_releases_the_stream_slo
     drop(held);
     assert_eq!(
         free_slots(&runner),
-        (
-            MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES,
-            MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS
-        )
+        (MAX_HTTP_HOOK_BUFFERING_SLOTS, MAX_HTTP_HOOK_STREAMING_SLOTS)
     );
 }
 
@@ -1622,10 +1605,7 @@ async fn cancellation_closes_only_opened_stages_and_releases_capacity() {
     assert!(second.ended.lock().unwrap().is_empty());
     assert_eq!(
         free_slots(&runner),
-        (
-            MAX_CONCURRENT_HTTP_MIDDLEWARE_MESSAGES,
-            MAX_CONCURRENT_HTTP_MIDDLEWARE_STREAMS
-        )
+        (MAX_HTTP_HOOK_BUFFERING_SLOTS, MAX_HTTP_HOOK_STREAMING_SLOTS)
     );
 }
 

@@ -69,7 +69,7 @@ pub struct HttpRequestPreflightOutcome {
     /// Present when a stage selected a body mode.
     pub pipeline: Option<HttpRequestPipeline>,
     pub diagnostics: HttpStageDiagnostics,
-    /// No HTTP hook slot freed up within the chain deadline. Platform
+    /// No HTTP hook buffering slot freed up within the chain deadline. Platform
     /// load shedding, not a stage failure.
     pub session_capacity_exhausted: bool,
 }
@@ -196,7 +196,7 @@ impl ChainRunner {
     /// Prepare a described chain through its first inspecting stage. Returns
     /// an error only for a chain over platform capacity.
     ///
-    /// Preflight waits for an HTTP hook slot within the chain
+    /// Preflight waits for an HTTP hook buffering slot within the chain
     /// deadline, and the slot is released once no stage inspects the body.
     pub async fn preflight_described_http_request(
         &self,
@@ -218,7 +218,7 @@ impl ChainRunner {
         }
         let chain_deadline = Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
         let slot = if described.iter().any(DescribedChainEntry::is_resolved) {
-            let Some(slot) = self.reserve_http_hook(chain_deadline).await else {
+            let Some(slot) = self.reserve_http_buffering_slot(chain_deadline).await else {
                 return Ok(capacity_exhausted(input.headers));
             };
             Some(slot)
@@ -261,7 +261,7 @@ impl ChainRunner {
     }
 }
 
-/// No HTTP hook slot freed up within the chain deadline.
+/// No HTTP hook buffering slot freed up within the chain deadline.
 fn capacity_exhausted(headers: Vec<HttpHeader>) -> HttpRequestPreflightOutcome {
     HttpRequestPreflightOutcome {
         allowed: false,
