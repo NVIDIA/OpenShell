@@ -266,7 +266,23 @@ fn linked_reftable_worktree_refreshes_shared_tags() {
 }
 
 fn assert_branch_and_tag_changes(fixture: Fixture) {
+    git(&fixture.repo, &["config", "core.logAllRefUpdates", "false"]);
+    let head_log = fixture.checkout.join(git(
+        &fixture.checkout,
+        &["rev-parse", "--git-path", "logs/HEAD"],
+    ));
+    if head_log.exists() {
+        fs::remove_file(&head_log).unwrap();
+    }
     git(&fixture.repo, &["pack-refs", "--all"]);
+    // The existing HEAD reflog must not mask creation of a previously packed
+    // branch. Neither file is present when Cargo first records its inputs.
+    assert!(!head_log.exists());
+    let branch_ref = fixture.checkout.join(git(
+        &fixture.checkout,
+        &["rev-parse", "--git-path", "refs/heads/linked"],
+    ));
+    assert!(!branch_ref.exists());
     let first = fixture.build();
     fixture.assert_fresh(&first);
     fixture.advance();
