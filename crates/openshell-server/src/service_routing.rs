@@ -28,6 +28,7 @@ use tracing::warn;
 
 use crate::ServerState;
 use crate::persistence::{ObjectListQuery, ObjectType, Store};
+use crate::sandbox_access::{self, AccessError, SandboxAccess};
 
 const ENDPOINT_OBJECT_TYPE: &str = "service_endpoint";
 const ROUTING_RULE_NAME: &str = "sandbox_service_routing";
@@ -727,13 +728,18 @@ async fn proxy_to_endpoint(
             return Err(route_err);
         }
     };
-    // Services follow the same access rule as exec, SSH, and port forwarding.
-    let reachable = match crate::supervisor_session::sandbox_relay_reachable(&state, &sandbox).await
-    {
-        Ok(reachable) => reachable,
+    // Every request passes the access gate, including ones served from a
+    // pooled upstream connection.
+    let access = match sandbox_access::acquire(&state, &sandbox).await {
+        Ok(access) => access,
         Err(err) => {
-            warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "sandbox service routing: failed to resolve supervisor owner");
-            let route_err = ServiceRouteError::internal_error();
+            let route_err = match err {
+                AccessError::NotReachable => ServiceRouteError::sandbox_not_ready(),
+                AccessError::Lookup(err) | AccessError::Relay(err) => {
+                    warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "sandbox service routing: failed to check sandbox access");
+                    ServiceRouteError::internal_error()
+                }
+            };
             emit_service_http_failure(
                 &state,
                 &req,
@@ -745,18 +751,6 @@ async fn proxy_to_endpoint(
             return Err(route_err);
         }
     };
-    if !reachable {
-        let err = ServiceRouteError::sandbox_not_ready();
-        emit_service_http_failure(
-            &state,
-            &req,
-            &sandbox_name,
-            &service_name,
-            Some(&endpoint),
-            &err,
-        );
-        return Err(err);
-    }
     let Ok(target_port) = u16::try_from(endpoint.target_port) else {
         let err = ServiceRouteError::endpoint_unavailable();
         emit_service_http_failure(
@@ -809,7 +803,7 @@ async fn proxy_to_endpoint(
     let reused = pooled.is_some();
     let mut sender = match pooled {
         Some(sender) => sender,
-        None => open_upstream(&state, &sandbox, &endpoint, target_port, websocket_upgrade).await?,
+        None => open_upstream(&access, &endpoint, target_port, websocket_upgrade).await?,
     };
 
     let upstream = build_upstream_request(req, target_port, websocket_upgrade, authorization_mode)?;
@@ -835,8 +829,7 @@ async fn proxy_to_endpoint(
                 emit_service_relay_failure(&endpoint, target_port, route_err.reason);
                 return Err(route_err);
             };
-            sender =
-                open_upstream(&state, &sandbox, &endpoint, target_port, websocket_upgrade).await?;
+            sender = open_upstream(&access, &endpoint, target_port, websocket_upgrade).await?;
             sender.send_request(retry_request).await.map_err(|err| {
                 warn!(error = %err, "sandbox service routing: upstream HTTP retry failed");
                 let route_err = ServiceRouteError::service_unreachable();
@@ -884,23 +877,20 @@ async fn proxy_to_endpoint(
 }
 
 async fn open_upstream(
-    state: &Arc<ServerState>,
-    sandbox: &Sandbox,
+    access: &SandboxAccess,
     endpoint: &ServiceEndpoint,
     target_port: u16,
     websocket_upgrade: bool,
 ) -> Result<UpstreamSender, ServiceRouteError> {
-    let (_channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
-        state,
-        sandbox.object_id(),
-        relay_open::Target::Tcp(TcpRelayTarget {
-            host: RELAY_TARGET_HOST.to_string(),
-            port: u32::from(target_port),
-        }),
-        endpoint.object_id().to_string(),
-        Duration::from_secs(15),
-    )
-    .await
+    let (_channel_id, relay_rx) = access
+        .open_relay(
+            relay_open::Target::Tcp(TcpRelayTarget {
+                host: RELAY_TARGET_HOST.to_string(),
+                port: u32::from(target_port),
+            }),
+            endpoint.object_id().to_string(),
+        )
+        .await
     .map_err(|err| {
         warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "sandbox service routing: supervisor relay unavailable");
         let route_err = ServiceRouteError::service_unreachable();
