@@ -393,6 +393,15 @@ fn write_tls_output(path: &Path, contents: &[u8]) -> Result<()> {
         Err(error) => return Err(error).into_diagnostic(),
     }
 
+    // `NamedTempFile::persist` passes the temporary file's path to
+    // `SetFileAttributesW` and both paths to `MoveFileExW` unchanged, and those
+    // calls fail for paths longer than `MAX_PATH` unless they carry the `\\?\`
+    // prefix. A sandbox's host state directory can be that deep.
+    #[cfg(windows)]
+    let extended = extended_length_path(path);
+    #[cfg(windows)]
+    let path = extended.as_path();
+
     let parent = path
         .parent()
         .ok_or_else(|| miette!("TLS output has no parent: {}", path.display()))?;
@@ -416,6 +425,19 @@ fn write_tls_output(path: &Path, contents: &[u8]) -> Result<()> {
         )
     })?;
     Ok(())
+}
+
+/// `path` with its directory in the extended-length (`\\?\`) form that
+/// `canonicalize` returns on Windows, or `path` unchanged if `canonicalize`
+/// fails. It can fail on volumes that the Mount Manager does not track, where
+/// paths shorter than `MAX_PATH` still work as given.
+#[cfg(windows)]
+fn extended_length_path(path: &Path) -> PathBuf {
+    let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
+        return path.to_path_buf();
+    };
+    std::fs::canonicalize(parent)
+        .map_or_else(|_| path.to_path_buf(), |parent| parent.join(file_name))
 }
 
 /// Load PEM-encoded certificates from a string into a root certificate store.
@@ -880,6 +902,47 @@ mod tests {
                 b"unchanged"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_ca_files_accepts_paths_longer_than_max_path() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let ca = SandboxCa::generate().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut output_dir = dir.path().to_path_buf();
+        // `MAX_PATH` counts UTF-16 code units.
+        while output_dir
+            .join("openshell-ca.pem")
+            .as_os_str()
+            .encode_wide()
+            .count()
+            <= 260
+        {
+            output_dir.push("0123456789abcdef0123456789abcdef");
+        }
+
+        let (ca_path, bundle_path) = write_ca_files(&ca, &output_dir, "").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&ca_path).unwrap(), ca.cert_pem());
+        assert!(
+            std::fs::read_to_string(&bundle_path)
+                .unwrap()
+                .contains(ca.cert_pem())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extended_length_path_keeps_the_path_when_canonicalize_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = extended_length_path(&dir.path().join("openshell-ca.pem"));
+        assert!(resolved.as_os_str().to_string_lossy().starts_with(r"\\?\"));
+
+        // The directory does not exist, so `canonicalize` fails.
+        let unresolved = dir.path().join("missing").join("openshell-ca.pem");
+        assert_eq!(extended_length_path(&unresolved), unresolved);
     }
 
     #[test]

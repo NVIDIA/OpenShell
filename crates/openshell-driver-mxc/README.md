@@ -127,6 +127,10 @@ etw_audit = false
 Only `process_container` supports this architecture. `isolation_session` is
 rejected during sandbox validation.
 
+The host supervisor writes its proxy CA certificate and trust bundle to
+`proxy-tls\` in the sandbox's host state directory,
+`<state_dir>\<sandbox-id>\<generation>`, and deleting the sandbox removes them.
+
 MXC 1.0.0 is required. Pre-1.0 executors and the retired
 `default_configuration_id` setting are not supported; remove that setting
 before upgrading. Both live launches and standalone mapper output use the
