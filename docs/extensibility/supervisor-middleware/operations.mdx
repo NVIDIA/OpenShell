@@ -14,13 +14,13 @@ A middleware service handles one or more operations, such as HTTP requests or We
 
 | Operation | Phase | When OpenShell calls your service | RPC |
 | --- | --- | --- | --- |
-| `HTTP_REQUEST` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `HttpSessionMiddleware.EvaluateRequest`, or v1 `EvaluateHttpRequest` |
-| `HTTP_RESPONSE` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `HttpSessionMiddleware.EvaluateResponse`, or v1 `HttpResponsePreReturn.Evaluate` |
+| `HTTP_REQUEST` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `HttpSessionMiddleware.EvaluateRequest`, or legacy `EvaluateHttpRequest` |
+| `HTTP_RESPONSE` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `HttpSessionMiddleware.EvaluateResponse`, or legacy `HttpResponsePreReturn.Evaluate` |
 | `WEBSOCKET_MESSAGE` | `PRE_CREDENTIALS` | When the sandbox opens a WebSocket connection, and for each text message it sends. | `EvaluateWebSocketSession` |
 
 Your service declares each operation it supports as a binding, an operation and its phase, in its `Describe` manifest. OpenShell calls your service only for the operations it declares.
 
-A service that requires the `openshell.supervisor-middleware.http-session` capability receives its HTTP bindings through the [HTTP session hooks](#http). Any other service receives them through the v1 HTTP hooks, which are deprecated for removal in 0.2.0.
+A service that requires the `openshell.supervisor-middleware.http-hooks` capability receives its HTTP bindings through the [HTTP hooks](#http). Any other service receives them through the legacy HTTP hooks, which are deprecated for removal in 0.2.0.
 
 When several middleware match the same traffic, OpenShell calls them in ascending `order`, and each middleware sees the changes that earlier middleware made.
 
@@ -46,7 +46,7 @@ HTTP middleware inspects requests before OpenShell injects provider credentials 
 
 Serve `HttpSessionMiddleware` on the same endpoint as `SupervisorMiddleware`, which handles discovery and configuration. Each RPC invocation serves one binding phase, identified by `phase` in its preflight. Requests currently use `PRE_CREDENTIALS`; responses use `PRE_RETURN`.
 
-In `Describe`, add `openshell.supervisor-middleware.http-session` to both `extension.supported_capabilities` and `extension.required_capabilities`. This selects the session RPCs for all HTTP bindings in your service. Older gateways and supervisors refuse the service because they do not support this capability.
+In `Describe`, add `openshell.supervisor-middleware.http-hooks` to both `extension.supported_capabilities` and `extension.required_capabilities`. This selects the session RPCs for all HTTP bindings in your service. Older gateways and supervisors refuse the service because they do not support this capability.
 
 ### Requests
 
@@ -125,7 +125,7 @@ OpenShell applies each stage's changes as a unit. If one change is invalid, it d
 
 ### Failures
 
-HTTP session hooks always fail closed. The gateway rejects `on_error: fail_open` for these services. Each request or response chain must use one HTTP hook version; see [Mix HTTP Hook Versions](/extensibility/supervisor-middleware/configure#mix-http-hook-versions).
+HTTP hooks always fail closed. The gateway rejects `on_error: fail_open` for these services. Each request or response chain must use one HTTP hook version; see [Mix HTTP Hook Versions](/extensibility/supervisor-middleware/configure#mix-http-hook-versions).
 
 | Result | Before forwarding starts | After forwarding starts |
 | --- | --- | --- |
@@ -241,10 +241,10 @@ The gateway also rejects a policy in which a `fail_closed` entry can select a `t
 
 | Limit | Applies to | Value |
 | --- | --- | --- |
-| Preflight | HTTP session hooks | Binding timeout per stage. Initial preflights share a 30-second setup budget; each deferred preflight gets a new 30-second setup budget when its input headers arrive. Capacity waits use that budget. |
-| Concurrent messages | HTTP session hooks | 64 messages in preflight or WHOLE_BODY processing, and 256 with DUPLEX or deferred stages, per sandbox. WHOLE_BODY stages of one message share a slot. A DUPLEX stage releases the buffering slot until another stage needs it. |
-| Whole body | HTTP session hooks | Stage payload limit, up to 4 MiB. Two minutes to receive, process, and deliver; individual exchanges also obey the binding timeout. |
-| Duplex body | HTTP session hooks | No total duration limit. No total size limit unless the preflight sets `limits.max_output_body_bytes` for buffered request output. Chunks are at most 64 KiB or the stage payload limit, whichever is smaller. |
+| Preflight | HTTP hooks | Binding timeout per stage. Initial preflights share a 30-second setup budget; each deferred preflight gets a new 30-second setup budget when its input headers arrive. Capacity waits use that budget. |
+| Concurrent messages | HTTP hooks | 64 messages in preflight or WHOLE_BODY processing, and 256 with DUPLEX or deferred stages, per sandbox. WHOLE_BODY stages of one message share a slot. A DUPLEX stage releases the buffering slot until another stage needs it. |
+| Whole body | HTTP hooks | Stage payload limit, up to 4 MiB. Two minutes to receive, process, and deliver; individual exchanges also obey the binding timeout. |
+| Duplex body | HTTP hooks | No total duration limit. No total size limit unless the preflight sets `limits.max_output_body_bytes` for buffered request output. Chunks are at most 64 KiB or the stage payload limit, whichever is smaller. |
 | Middleware stall | HTTP DUPLEX | 30 seconds to accept the next input, or between results after `input_end`. Waiting for the sandbox or external service to produce input does not count. |
 | Request upload stall | HTTP DUPLEX or deferred stages | 30 seconds without progress from the sandbox. |
 | Payload per middleware | Legacy HTTP hooks and WebSocket | Registration `max_payload_bytes`, up to 4 MiB, for each body, response piece, message, or replacement. |
