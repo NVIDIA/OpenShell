@@ -2,15 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use miette::{IntoDiagnostic, Result, WrapErr};
+pub use openshell_core::replica_routing::{
+    owner_replica, retry_unrouted, routed_to, with_owner_hint,
+};
 use openshell_sdk::{AuthConfig, ClientConfig, ClientIdentity, OpenShellClient};
 use rustls::{
     RootCertStore,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject},
 };
 use std::io::Cursor;
 use std::path::PathBuf;
-use tonic::metadata::AsciiMetadataValue;
 use tonic::transport::Channel;
 
 /// Concrete gRPC client type used by all commands.
@@ -183,7 +185,9 @@ pub fn require_tls_materials(server: &str, tls: &TlsOptions) -> Result<TlsMateri
 
 fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
     let mut cursor = Cursor::new(pem);
-    let key = rustls_pemfile::private_key(&mut cursor)
+    let key = PrivateKeyDer::pem_reader_iter(&mut cursor)
+        .next()
+        .transpose()
         .into_diagnostic()?
         .ok_or_else(|| miette::miette!("no private key found in TLS key PEM"))?;
     Ok(key)
@@ -192,7 +196,7 @@ fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
 pub fn build_rustls_config(materials: &TlsMaterials) -> Result<rustls::ClientConfig> {
     let mut roots = RootCertStore::empty();
     let mut ca_cursor = Cursor::new(&materials.ca);
-    let ca_certs = rustls_pemfile::certs(&mut ca_cursor)
+    let ca_certs = CertificateDer::pem_reader_iter(&mut ca_cursor)
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()
         .into_diagnostic()?;
     for cert in ca_certs {
@@ -200,12 +204,14 @@ pub fn build_rustls_config(materials: &TlsMaterials) -> Result<rustls::ClientCon
     }
 
     let mut cert_cursor = Cursor::new(&materials.cert);
-    let cert_chain = rustls_pemfile::certs(&mut cert_cursor)
+    let cert_chain = CertificateDer::pem_reader_iter(&mut cert_cursor)
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()
         .into_diagnostic()?;
     let key = load_private_key(&materials.key)?;
 
-    openshell_crypto::tls::client_builder()
+    openshell_crypto::tls::try_client_builder()
+        .into_diagnostic()
+        .wrap_err("configure gateway TLS client")?
         .with_root_certificates(roots)
         .with_client_auth_cert(cert_chain, key)
         .into_diagnostic()
@@ -252,7 +258,9 @@ impl ServerCertVerifier for InsecureServerCertVerifier {
 }
 
 pub fn build_insecure_rustls_config() -> Result<rustls::ClientConfig> {
-    let config = openshell_crypto::tls::client_builder()
+    let config = openshell_crypto::tls::try_client_builder()
+        .into_diagnostic()
+        .wrap_err("configure gateway TLS client")?
         .dangerous()
         .with_custom_certificate_verifier(std::sync::Arc::new(InsecureServerCertVerifier))
         .with_no_client_auth();
@@ -318,131 +326,11 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
     Ok(client.raw_grpc())
 }
 
-/// Gateway replica that owns the sandbox named in `response`, when it says.
-pub fn owner_replica<T>(response: &tonic::Response<T>) -> Option<AsciiMetadataValue> {
-    response
-        .metadata()
-        .get(openshell_core::replica_routing::OWNER_REPLICA_HEADER)
-        .cloned()
-}
-
-pub fn with_owner_hint<T>(message: T) -> tonic::Request<T> {
-    let mut request = tonic::Request::new(message);
-    request.metadata_mut().insert(
-        openshell_core::replica_routing::OWNER_REQUEST_HEADER,
-        AsciiMetadataValue::from_static("1"),
-    );
-    request
-}
-
-/// Wrap `message` so the edge proxy can route it straight to `replica`.
-pub fn routed_to<T>(message: T, replica: Option<&AsciiMetadataValue>) -> tonic::Request<T> {
-    let mut request = tonic::Request::new(message);
-    if let Some(replica) = replica {
-        request.metadata_mut().insert(
-            openshell_core::replica_routing::ROUTE_REPLICA_HEADER,
-            replica.clone(),
-        );
-    }
-    request
-}
-
-/// A routed call is retried once without routing only when no gateway
-/// received it.
-///
-/// Envoy Gateway answers a replica route whose Service has no ready endpoints
-/// with `grpc-status: 14` and no `grpc-message`, while gateway errors and
-/// mid-request resets always carry a message.
-pub fn retry_unrouted(replica: Option<&AsciiMetadataValue>, status: &tonic::Status) -> bool {
-    let message = status.message();
-    replica.is_some()
-        && status.code() == tonic::Code::Unavailable
-        && (message.is_empty()
-            || message.contains("no healthy upstream")
-            || message.contains("connection failure"))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        TlsOptions, owner_replica, retry_unrouted, routed_to, sdk_client_config, with_owner_hint,
-    };
-    use openshell_core::replica_routing::{
-        OWNER_REPLICA_HEADER, OWNER_REQUEST_HEADER, ROUTE_REPLICA_HEADER,
-    };
+    use super::{TlsOptions, sdk_client_config};
     use openshell_sdk::AuthConfig;
     use std::io::Write;
-
-    #[test]
-    fn owner_hint_is_requested_explicitly() {
-        assert!(
-            with_owner_hint(())
-                .metadata()
-                .contains_key(OWNER_REQUEST_HEADER)
-        );
-    }
-
-    #[test]
-    fn owner_replica_is_carried_to_the_routed_request() {
-        let mut response = tonic::Response::new(());
-        response
-            .metadata_mut()
-            .insert(OWNER_REPLICA_HEADER, "openshell-1".parse().unwrap());
-        let replica = owner_replica(&response);
-        let request = routed_to((), replica.as_ref());
-        assert_eq!(
-            request.metadata().get(ROUTE_REPLICA_HEADER).unwrap(),
-            "openshell-1"
-        );
-    }
-
-    #[test]
-    fn requests_without_a_known_owner_are_not_routed() {
-        let replica = owner_replica(&tonic::Response::new(()));
-        assert!(replica.is_none());
-        let request = routed_to((), replica.as_ref());
-        assert!(request.metadata().get(ROUTE_REPLICA_HEADER).is_none());
-    }
-
-    #[test]
-    fn only_unavailable_routed_calls_are_retried() {
-        let replica = "openshell-1".parse().unwrap();
-        let unavailable = tonic::Status::unavailable("no healthy upstream");
-        assert!(retry_unrouted(Some(&replica), &unavailable));
-        assert!(!retry_unrouted(None, &unavailable));
-        assert!(!retry_unrouted(
-            Some(&replica),
-            &tonic::Status::permission_denied("denied")
-        ));
-    }
-
-    #[test]
-    fn calls_are_retried_only_when_no_gateway_received_them() {
-        let replica = "openshell-1".parse().unwrap();
-        for never_arrived in [
-            "",
-            "no healthy upstream",
-            "upstream connect error or disconnect/reset before headers. reset reason: connection failure, transport failure reason: delayed connect error: Connection refused",
-        ] {
-            assert!(retry_unrouted(
-                Some(&replica),
-                &tonic::Status::unavailable(never_arrived)
-            ));
-        }
-        for may_have_started in [
-            "supervisor session not connected",
-            "upstream connect error or disconnect/reset before headers. reset reason: connection termination",
-        ] {
-            assert!(!retry_unrouted(
-                Some(&replica),
-                &tonic::Status::unavailable(may_have_started)
-            ));
-        }
-        assert!(!retry_unrouted(
-            None,
-            &tonic::Status::unavailable("no healthy upstream")
-        ));
-    }
 
     #[test]
     fn sdk_config_carries_cli_mtls_materials() {

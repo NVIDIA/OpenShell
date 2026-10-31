@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Go resolves submodule versions from directory-prefixed tags, so the SDK at
+# sdk/go needs its own sdk/go/vX.Y.Z tag to show up as a release on pkg.go.dev.
+name: Tag Go SDK
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      source-sha:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the v prefix, e.g. 0.1.6
+        required: true
+        type: string
+      source-sha:
+        description: Commit the stable tag points to
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    name: Tag Go SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: ${{ inputs.version }}
+      SOURCE_SHA: ${{ inputs.source-sha }}
+    steps:
+      - name: Create Go SDK tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="sdk/go/v${VERSION}"
+          # Lightweight tag, so the ref points at the commit directly.
+          if ! existing=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq .object.sha 2>/dev/null); then
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${tag}" -f sha="${SOURCE_SHA}"
+          elif [[ "${existing}" != "${SOURCE_SHA}" ]]; then
+            echo "${tag} already exists at ${existing}, expected ${SOURCE_SHA}" >&2
+            exit 1
+          fi
+
+      # pkg.go.dev picks up versions the Go module proxy has fetched.
+      - name: Request version from Go module proxy
+        continue-on-error: true
+        shell: bash
+        run: curl --fail --silent --show-error --max-time 60 "https://proxy.golang.org/github.com/!n!v!i!d!i!a/!open!shell/sdk/go/@v/v${VERSION}.info"

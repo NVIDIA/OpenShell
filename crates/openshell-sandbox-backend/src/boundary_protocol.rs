@@ -165,8 +165,10 @@ impl NativeLinuxSandboxAuditEvidence {
 ///
 /// The supervisor generates this value in memory and presents it on every
 /// attach, including transport reconnects. The sandbox pins the first value it
-/// accepts for its process lifetime, so a replacement supervisor cannot reuse
-/// launch credentials to take over an existing runtime generation.
+/// accepts, so a replacement supervisor cannot reuse launch credentials to
+/// take over an existing runtime generation. Only a gateway-signed takeover
+/// grant for a higher credential epoch, naming the replacement's identity,
+/// moves the pin (see [`crate::sandbox_auth`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SupervisorInstanceId(uuid::Uuid);
 
@@ -579,6 +581,25 @@ pub struct BoundaryConfig {
     pub child_env: std::collections::HashMap<String, String>,
 }
 
+/// Default time a runtime keeps a workload frozen, after losing its
+/// supervisor, for an authenticated supervisor to recover it.
+pub const DEFAULT_SUPERVISOR_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Accepted bounds, in seconds, of a recovery deadline a supervisor offers.
+///
+/// A supervisor offers it at attach (see [`Request::Attach`]). Recovery is
+/// always bounded: a workload never runs unsupervised, and a frozen workload
+/// is terminated once its deadline passes.
+pub const SUPERVISOR_RECOVERY_TIMEOUT_RANGE: std::ops::RangeInclusive<u32> = 10..=300;
+
+/// The recovery deadline of an offer of `seconds`, if
+/// [`SUPERVISOR_RECOVERY_TIMEOUT_RANGE`] allows it.
+#[must_use]
+pub fn supervisor_recovery_timeout(seconds: u32) -> Option<Duration> {
+    SUPERVISOR_RECOVERY_TIMEOUT_RANGE
+        .contains(&seconds)
+        .then(|| Duration::from_secs(u64::from(seconds)))
+}
+
 impl fmt::Debug for BoundaryConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -778,6 +799,16 @@ pub enum Request {
     Attach {
         supervisor_instance_id: SupervisorInstanceId,
         policy: Box<SandboxPolicyWire>,
+        /// Gateway-signed takeover grant, present only when this process
+        /// replaces the generation's current owner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supervisor_takeover: Option<String>,
+        /// Seconds the runtime should keep the workload frozen after losing
+        /// this connection's supervision, offered by the supervisor and
+        /// bounded by [`SUPERVISOR_RECOVERY_TIMEOUT_RANGE`]. Absent keeps
+        /// [`DEFAULT_SUPERVISOR_RECOVERY_TIMEOUT`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supervisor_recovery_timeout_secs: Option<u32>,
     },
     Confirm,
     StartAgent {
@@ -859,9 +890,16 @@ impl fmt::Debug for Request {
             Self::Attach {
                 supervisor_instance_id: _,
                 policy: _,
+                supervisor_takeover,
+                supervisor_recovery_timeout_secs,
             } => formatter
                 .debug_struct("Attach")
                 .field("policy", &"<redacted>")
+                .field("takeover", &supervisor_takeover.is_some())
+                .field(
+                    "supervisor_recovery_timeout_secs",
+                    supervisor_recovery_timeout_secs,
+                )
                 .finish(),
             Self::Confirm => formatter.write_str("Confirm"),
             Self::StartAgent {
@@ -1015,6 +1053,10 @@ pub struct MediationTimingWire {
 pub struct SessionSnapshotWire {
     pub generation: String,
     pub processes: Vec<ProcessSnapshotWire>,
+    /// Launch controls bound by the first attach, if any. A replacement
+    /// supervisor reattaches with exactly these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_policy: Option<Box<SandboxPolicyWire>>,
 }
 
 /// Stable generation-scoped process state available to a replacement supervisor.
@@ -1217,6 +1259,10 @@ pub struct AgentSpecWire {
     pub workdir: Option<String>,
     pub timeout_secs: u64,
     pub interactive: bool,
+    /// Omitted while false so the request digest of a sandbox without a
+    /// relay is unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub otlp_relay_active: bool,
 }
 
 impl From<AgentSpec> for AgentSpecWire {
@@ -1227,6 +1273,7 @@ impl From<AgentSpec> for AgentSpecWire {
             workdir: spec.workdir,
             timeout_secs: spec.timeout_secs,
             interactive: spec.interactive,
+            otlp_relay_active: spec.otlp_relay_active,
         }
     }
 }
@@ -1642,6 +1689,30 @@ mod tests {
     }
 
     #[test]
+    fn agent_spec_omits_an_inactive_relay_flag_on_the_wire() {
+        let mut spec = AgentSpecWire {
+            program: "/bin/true".to_string(),
+            args: Vec::new(),
+            workdir: None,
+            timeout_secs: 0,
+            interactive: false,
+            otlp_relay_active: false,
+        };
+        let encoded = serde_json::to_value(&spec).unwrap();
+        assert!(
+            encoded.get("otlp_relay_active").is_none(),
+            "a false flag keeps the encoding of earlier releases: {encoded}"
+        );
+        let decoded: AgentSpecWire = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, spec);
+
+        spec.otlp_relay_active = true;
+        let decoded: AgentSpecWire =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert!(decoded.otlp_relay_active);
+    }
+
+    #[test]
     fn request_round_trips_and_redacts_secrets() {
         let request = RequestEnvelope {
             request_id: "4e94636d-54f8-4d85-8e4e-58954fb5af0a".to_string(),
@@ -1656,6 +1727,7 @@ mod tests {
                     workdir: Some("/sandbox".to_string()),
                     timeout_secs: 5,
                     interactive: false,
+                    otlp_relay_active: false,
                 },
                 ca_cert: Some("test certificate".to_string()),
                 ca_bundle: Some("test bundle".to_string()),
@@ -1813,6 +1885,7 @@ mod tests {
                 workdir: None,
                 timeout_secs: 5,
                 interactive: false,
+                otlp_relay_active: false,
             },
             ca_cert: Some("A".repeat(16 * 1024)),
             ca_bundle: Some("B".repeat(400 * 1024)),

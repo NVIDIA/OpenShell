@@ -17,6 +17,9 @@ python/openshell/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
 e2e/rust/              # Rust CLI E2E tests
 tests/testkit/         # Support library for SDK-driven E2E suites
+tests/suites/          # E2E suites, grouped by test family
+tests/tmachine/        # QEMU test machines, Ansible playbooks, and the Session API
+tests/runner/          # openshell-test-runner: runs a test family in a tmachine environment
 ```
 
 ## Rust Tests
@@ -72,6 +75,44 @@ task skips them. Run them on an idle machine with
 `mise run test:rust:postgres:bench`.
 
 ### Native Windows validation
+
+Start with the [Windows build prerequisites](WINDOWS.md#build) in a checkout
+based on `windows`. Run the lane matching the native host:
+
+```powershell
+# Native x64 host
+mise run --skip-tools windows:lint:x64
+mise run --skip-tools windows:build:x64
+mise run --skip-tools windows:test:x64
+mise run --skip-tools windows:test:unsupported:x64
+
+# Native ARM64 host
+mise run --skip-tools windows:lint:arm64
+mise run --skip-tools windows:build:arm64
+mise run --skip-tools windows:test:arm64
+mise run --skip-tools windows:test:unsupported:arm64
+```
+
+The test tasks use the CI nextest profile and server test support. They reject
+a target that does not match the host architecture. `windows:ci` is the x64-host
+aggregate, including ARM64 cross-check/build unless explicitly skipped; it
+does not establish native ARM64 test coverage.
+
+For runtime validation, provision a capable MXC host and build its native
+release binaries first. On x64, run:
+
+```powershell
+mise run --skip-tools windows:test:mxc-real:x64
+mise run --skip-tools windows:e2e:mxc
+```
+
+Use `windows:test:mxc-real:arm64` on ARM64. The real-runtime unit tests can
+report `SKIP` when the executor or backend is absent; E2E returns nonzero
+when required runtime coverage is missing. Report passed, failed, and
+skipped/ignored executions separately, including why any probe gated coverage.
+Passing E2E does not qualify the [known Windows enforcement gaps](WINDOWS.md#runtime-and-current-limits).
+See the [Windows test task definitions](https://github.com/NVIDIA/OpenShell/blob/windows/tasks/windows.toml)
+for boundary, loopback, network, and audit suites.
 
 Use `mise run --skip-tools pre-commit` with the existing Rust/MSVC toolchain.
 Windows now checks tracked Cargo lockfiles through PowerShell rather than
@@ -139,6 +180,112 @@ gateway the same way the CLI does, through `OPENSHELL_GATEWAY_ENDPOINT`,
 by `OPENSHELL_BIN`. See
 [tests/testkit/README.md](tests/testkit/README.md) for how to write and run
 tests.
+
+Suites live under `tests/suites/<family>/`. Each family is a Cargo workspace
+with its own lockfile. Run the `conformance` suites against a local Docker
+gateway with:
+
+```shell
+mise run e2e:testkit
+```
+
+Workspaces that build root crates through path dependencies must lock shared
+crates at the versions in the root `Cargo.lock`; otherwise CI can build against
+dependencies the Nix toolchain doesn't support. `mise run rust:lockfiles:check`
+verifies this, and `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`
+re-locks a workspace from the root lockfile. Add new testkit workspaces to
+`ALIGNED_WORKSPACES` in that script.
+
+### Running suites in a tmachine environment (`tests/runner/`)
+
+`openshell-test-runner` runs a test family inside a tmachine VM, against the
+OpenShell that the VM's installer set up.
+
+```shell
+nix run .#openshell-test-runner -- \
+  --environment ubuntu-docker-rootful --installer deb \
+  --family conformance --package sandbox
+```
+
+It needs KVM, and tmachine only boots guests of the host's architecture. The
+runner points the tests at the installed CLI and the gateway the installer
+registered (`--gateway`, default `openshell`). A run passes if nextest
+succeeds; nextest fails a run with no tests. The runner exits with 1 when a
+test failed and 2 when the run could not complete, for example because the
+environment didn't come up. It writes `junit.xml`, `nextest.log` and, after a
+failure, the guest's diagnostics to `artifacts/test-results/` (`--results`),
+even when the run timed out.
+
+`--filter <filterset>` narrows the tests with a nextest filterset, and
+`--keep` leaves the VM running until you press Enter. Two runs on one host
+need different `TMACHINE_SSH_PORT` values (default 2222). The installer
+inputs, such as the Debian package and the images, come from `artifacts/`,
+built by `nix run .#build-artifacts` or downloaded by CI.
+
+A flaky or broken test is marked `#[ignore = "<issue link>"]`, which takes it
+out of every environment until it's fixed.
+
+**CI.** `.github/workflows/e2e-suites.yml` lists the environments and suites as
+an explicit matrix and runs the runner once per row. Branch E2E calls it when
+the `test:e2e` label is set, and a failure fails the Core E2E result. To run
+a suite in another environment on CI, add a row.
+
+### Adding a feature suite
+
+Feature suites live in the `tests/suites/features` workspace, one crate per
+suite, with a name that says what the suite tests.
+`tests/suites/features/keycloak-provider-refresh` is the example to copy.
+
+1. Add a crate under `tests/suites/features/<name>` that depends on
+   `openshell-testkit`, and add it to `members` in
+   `tests/suites/features/Cargo.toml`.
+2. Write the tests in `tests/*.rs` as `#[testkit::test]` functions.
+3. Re-lock the workspace: `cargo metadata --manifest-path
+   tests/suites/features/Cargo.toml`, then
+   `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`.
+4. Add `cargo fmt` and `cargo clippy` lines for the package (`-p <name>`) to
+   `tasks/rust.toml` and to the Format and Lint steps in
+   `.github/workflows/branch-checks.yml`.
+5. Add a row for the suite to the matrix in `.github/workflows/e2e-suites.yml`.
+
+If the feature only needs the gateway, run the suite in an existing
+environment such as `ubuntu-docker-rootful`, and skip the rest of this
+section.
+
+**Suites that need a service.** A feature that needs something besides the
+gateway, such as an OIDC issuer, runs in a tmachine environment that provides
+it. The environment and the suite share a contract: a set of
+`OPENSHELL_TEST_<SERVICE>_*` environment variables that say how to reach the
+service.
+
+- **Environment.** Add an environment to `tests/tmachine/config.nix` whose
+  setup playbook starts the service (with a restart policy, since setup is
+  cached as a disk) and writes the variables as `KEY=VALUE` lines to
+  `/etc/openshell-test/env.d/<service>.env`. Pass files the playbook needs
+  through the environment's setup `inputs`, and add them to the tmachine disk
+  cache key in `e2e-suites.yml`. The runner rejects names without the
+  `OPENSHELL_TEST_` prefix, and the tests get the variables in the guest, so
+  values never appear in a runner command. Values are taken literally, without
+  quoting.
+- **Fixture.** Put the service's fixture in a support crate under
+  `tests/support/<service>`, so any suite can depend on it, or reuse the
+  existing one. It defines the variable names as constants and a
+  `<Service>Context::new(cx)` that reads them, waits for the service, and
+  wraps the testkit `Context`. Each test calls it on its first line.
+  Nextest runs each test in its own process, so the fixture builds its
+  clients there from the variables. A missing variable fails the test; it
+  never skips it.
+- **Documentation.** Document the variables in the fixture's module docs, so
+  anyone can run the suite against their own deployment by setting them.
+
+The Keycloak fixture is `tests/support/keycloak`. Run the suite that uses it
+with:
+
+```shell
+nix run .#openshell-test-runner -- \
+  --environment ubuntu-docker-rootful-keycloak --installer deb \
+  --family features --package keycloak-provider-refresh
+```
 
 ### Python E2E (`e2e/python/`)
 
@@ -340,6 +487,9 @@ Run the Podman-backed Rust CLI e2e suite:
 ```shell
 mise run e2e:podman
 ```
+
+The `nix run` commands below need the local Nix setup in
+[CONTRIBUTING.md](CONTRIBUTING.md#nix-setup).
 
 `nix run .#build-artifacts` also builds
 `artifacts/packages/openshell.deb` for tmachine's `deb` installer, targeting the
@@ -578,6 +728,9 @@ Available task variants:
 | `e2e:kubernetes:workspace-operator` | Operator workspace mode (pre-provisioned namespaces) |
 | `e2e:kubernetes:v1alpha1` | Agent Sandbox v1alpha1 compatibility |
 | `e2e:kubernetes:external-driver` | External Kubernetes driver sidecar |
+| `e2e:kubernetes:shared-supervisor` | One-member shared supervisor pool for the gateway's sandboxes (gateway TLS through the port-forward) |
+| `e2e:kubernetes:shared-supervisor-ha` | Two-replica shared supervisor pool: kills the member that owns a sandbox and checks the sandbox is adopted, not restarted |
+| `e2e:kubernetes:shared-supervisor-scaling` | One-member shared supervisor pool: scales it to two members and back with `helm upgrade`, checking sandboxes stay running and the removed member hands its sandboxes off |
 
 Kubernetes e2e environment variables:
 
@@ -586,6 +739,8 @@ Kubernetes e2e environment variables:
 | `OPENSHELL_E2E_KUBE_CONTEXT` | kubectl context for an existing cluster (skips k3d creation) |
 | `OPENSHELL_E2E_KUBE_TEST` | Scope to a single test (e.g. `smoke`) |
 | `OPENSHELL_E2E_KUBE_EXTRA_VALUES` | Colon-separated additional Helm values files |
+| `OPENSHELL_E2E_KUBE_CHART`, `OPENSHELL_E2E_KUBECONFIG` | Set by the harness for tests that upgrade the release, such as the supervisor pool scaling test: the chart it installed, and the kubeconfig passed as `--kubeconfig` to kubectl and helm. Set them yourself when running such a test directly against an existing release |
+| `OPENSHELL_E2E_KUBE_TLS` | `1` reaches the gateway over mTLS through the port-forward; pair it with an overlay that keeps gateway TLS on, such as `ci/values-tls-port-forward.yaml` |
 | `OPENSHELL_E2E_KUBERNETES_FEATURES` | Cargo feature flags (default: `e2e,e2e-host-gateway,e2e-kubernetes`) |
 | `IMAGE_TAG` | Gateway/supervisor image tag (default: `latest` for existing clusters) |
 | `OPENSHELL_REGISTRY` | Image registry prefix (default: `ghcr.io/nvidia/openshell`) |

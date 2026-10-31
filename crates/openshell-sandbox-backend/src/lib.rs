@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! Concrete supervisor-side client for the Isolation Backend and Sandbox Protocol RPCs.
 //!
@@ -24,9 +24,10 @@ pub mod stream_adapter;
 
 pub use openshell_core::proto::sandbox::backend::v1 as backend_proto;
 pub use runtime::{
-    BoundBoundary, BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess, BoundaryTerminal,
-    ConfirmedBoundary, ExecSession, NetworkMediationSource, OpenShellRuntimeBackend,
-    ProcessAttachment, ReadyBoundary, RunningBoundary,
+    BoundBoundary, BoundaryExec, BoundaryLaunchOutcome, BoundaryLoopbackConnector, BoundaryProcess,
+    BoundaryTakeover, BoundaryTerminal, ConfirmedBoundary, ExecSession,
+    MAX_RESTORE_REFERENCE_BYTES, NetworkMediationSource, OpenShellRuntimeBackend,
+    ProcessAttachment, ReadyBoundary, ResumeLaunch, RunningBoundary,
 };
 pub use runtime::{BoundaryTransport, BoundaryTransportConnector, validate_runtime_coordinates};
 

@@ -136,12 +136,24 @@ pub enum SandboxInstanceHostError {
 /// Final status of one removal, shared by every remover.
 type RemovalReport = watch::Receiver<Option<SandboxInstanceStatusReport>>;
 
+/// How a sandbox instance leaves the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Departure {
+    /// Stop the instance, which terminates its workload.
+    Stop,
+    /// Stop supervising without terminating the workload: the instance is
+    /// cancelled, so its runtime loses this supervisor and keeps the workload
+    /// frozen until another supervisor takes the generation over.
+    Relinquish,
+}
+
 struct HostedSandboxInstance {
     /// Distinguishes this instance from a later one that reuses its key.
     serial: u64,
     fingerprint: [u8; 32],
     sandbox_id: String,
     stop: watch::Sender<bool>,
+    suspend: tokio::sync::mpsc::Sender<()>,
     abort: watch::Sender<bool>,
     phase: watch::Receiver<SandboxInstancePhaseReport>,
     ready: watch::Receiver<bool>,
@@ -302,6 +314,7 @@ impl SandboxInstanceHost {
                 fingerprint,
                 sandbox_id,
                 stop: running.stop,
+                suspend: running.suspend,
                 abort: running.abort,
                 phase: running.phase,
                 ready: running.ready,
@@ -311,6 +324,24 @@ impl SandboxInstanceHost {
         );
         self.changes.notify();
         Ok(SandboxInstanceAdmitted::Created)
+    }
+
+    /// Request suspension of one hosted instance. This only queues the request;
+    /// the backend still decides whether suspension succeeds. Repeated pending
+    /// requests coalesce. Returns false for missing, removing, or exited instances.
+    #[must_use]
+    pub fn request_suspend(&self, key: &str) -> bool {
+        let instances = lock(&self.instances);
+        let Some(instance) = instances
+            .get(key)
+            .filter(|instance| instance.removal.is_none())
+        else {
+            return false;
+        };
+        matches!(
+            instance.suspend.try_send(()),
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(()))
+        )
     }
 
     /// Status of a hosted sandbox instance, including one that ended but has
@@ -344,7 +375,29 @@ impl SandboxInstanceHost {
     /// removal tries again. Returns the final status, or `None` when `key` is
     /// not hosted.
     pub async fn remove(&self, key: &str, grace: Duration) -> Option<SandboxInstanceStatusReport> {
-        let (mut removed, sandbox_id) = self.begin_removal(key, grace)?;
+        self.depart(key, grace, Departure::Stop).await
+    }
+
+    /// Stop supervising one sandbox instance without stopping its workload,
+    /// delete its private files, and forget it, as when its ownership moved
+    /// to another supervisor. The instance is cancelled rather than asked to
+    /// stop, so it never terminates the workload; the runtime freezes the
+    /// workload until a supervisor granted the generation takes it over, and
+    /// terminates it if none does in time. A removal already in progress is
+    /// joined instead. Returns the final status, or `None` when `key` is not
+    /// hosted.
+    pub async fn relinquish(&self, key: &str) -> Option<SandboxInstanceStatusReport> {
+        self.depart(key, RUNTIME_SHUTDOWN_TIMEOUT, Departure::Relinquish)
+            .await
+    }
+
+    async fn depart(
+        &self,
+        key: &str,
+        grace: Duration,
+        departure: Departure,
+    ) -> Option<SandboxInstanceStatusReport> {
+        let (mut removed, sandbox_id) = self.begin_removal(key, grace, departure)?;
         // The removal task ends without a report only with its runtime.
         let reported = removed
             .wait_for(Option::is_some)
@@ -361,13 +414,19 @@ impl SandboxInstanceHost {
         }))
     }
 
-    /// Stop every sandbox instance, for process shutdown.
-    pub async fn remove_all(&self, grace: Duration) {
+    /// Relinquish every sandbox instance, for the shutdown of a supervisor
+    /// whose instances other supervisors take over.
+    pub async fn relinquish_all(&self) {
         let keys = lock(&self.instances).keys().cloned().collect::<Vec<_>>();
-        futures::future::join_all(keys.iter().map(|key| self.remove(key, grace))).await;
+        futures::future::join_all(keys.iter().map(|key| self.relinquish(key))).await;
     }
 
-    fn begin_removal(&self, key: &str, grace: Duration) -> Option<(RemovalReport, String)> {
+    fn begin_removal(
+        &self,
+        key: &str,
+        grace: Duration,
+        departure: Departure,
+    ) -> Option<(RemovalReport, String)> {
         let mut instances = lock(&self.instances);
         let instance = instances.get_mut(key)?;
         // Join a removal in progress; retry one that kept the key.
@@ -376,9 +435,16 @@ impl SandboxInstanceHost {
         {
             return Some((removed.clone(), instance.sandbox_id.clone()));
         }
-        instance.stop.send_replace(true);
-        if *instance.phase.borrow() == SandboxInstancePhaseReport::Starting {
-            instance.abort.send_replace(true);
+        match departure {
+            Departure::Stop => {
+                instance.stop.send_replace(true);
+                if *instance.phase.borrow() == SandboxInstancePhaseReport::Starting {
+                    instance.abort.send_replace(true);
+                }
+            }
+            Departure::Relinquish => {
+                instance.abort.send_replace(true);
+            }
         }
         let (report, removed) = watch::channel(None);
         instance.removal = Some(removed.clone());
@@ -469,6 +535,7 @@ impl Removal {
 /// Signals and thread of one started instance runtime.
 struct RunningInstance {
     stop: watch::Sender<bool>,
+    suspend: tokio::sync::mpsc::Sender<()>,
     abort: watch::Sender<bool>,
     phase: watch::Receiver<SandboxInstancePhaseReport>,
     ready: watch::Receiver<bool>,
@@ -481,6 +548,7 @@ fn spawn_instance(
     changes: ChangeNotifier,
 ) -> std::result::Result<RunningInstance, SandboxInstanceHostError> {
     let (stop, stop_requested) = watch::channel(false);
+    let (suspend, suspend_requested) = tokio::sync::mpsc::channel(1);
     let (abort, abort_requested) = watch::channel(false);
     let (phase_tx, phase) = watch::channel(SandboxInstancePhaseReport::Starting);
     let (ready_tx, ready) = watch::channel(false);
@@ -493,6 +561,7 @@ fn spawn_instance(
                 body,
                 SandboxInstanceSignals {
                     stop_requested,
+                    suspend_requested,
                     abort_requested,
                     phase: phase_tx,
                     ready: ready_tx,
@@ -506,6 +575,7 @@ fn spawn_instance(
         })?;
     Ok(RunningInstance {
         stop,
+        suspend,
         abort,
         phase,
         ready,
@@ -515,6 +585,7 @@ fn spawn_instance(
 
 struct SandboxInstanceSignals {
     stop_requested: watch::Receiver<bool>,
+    suspend_requested: tokio::sync::mpsc::Receiver<()>,
     abort_requested: watch::Receiver<bool>,
     phase: watch::Sender<SandboxInstancePhaseReport>,
     ready: watch::Sender<bool>,
@@ -554,6 +625,7 @@ fn run_hosted_sandbox_instance(
 ) {
     let SandboxInstanceSignals {
         stop_requested,
+        suspend_requested,
         mut abort_requested,
         phase,
         ready,
@@ -617,6 +689,7 @@ fn run_hosted_sandbox_instance(
                     });
                     let instance = body(SandboxInstanceControls {
                         shutdown,
+                        suspend: Box::pin(tokio_stream::wrappers::ReceiverStream::new(suspend_requested)),
                         readiness,
                     });
                     let outcome = tokio::select! {
@@ -852,6 +925,7 @@ mod tests {
                 let SandboxInstanceControls {
                     shutdown,
                     readiness,
+                    ..
                 } = controls;
                 // Nested tasks and the blocking pool inherit the instance identity.
                 let observed = tokio::spawn(async {
@@ -961,6 +1035,53 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let host = SandboxInstanceHost::new(root.path().join("instances")).unwrap();
         (root, Arc::new(host))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn suspend_requests_are_isolated_and_retryable_between_hosted_instances() {
+        let (_root, host) = private_host();
+        let (observed, mut requests) = mpsc::channel(8);
+        for key in ["alpha", "beta"] {
+            let observed = observed.clone();
+            let body: SandboxInstanceBody = Box::new(move |mut controls| {
+                Box::pin(async move {
+                    controls.readiness.send_replace(true);
+                    loop {
+                        tokio::select! {
+                            Some(()) = futures::StreamExt::next(&mut controls.suspend) => {
+                                // Leave this instance running, as after a failed
+                                // suspension, so a later request can retry it.
+                                observed.send(key).await.unwrap();
+                            }
+                            () = &mut controls.shutdown => return Ok(0),
+                        }
+                    }
+                })
+            });
+            admit(&host, key, key, 1, unbound(), body).unwrap();
+            wait_supervising(&host, key).await;
+        }
+        assert!(!host.request_suspend("missing"));
+        for key in ["alpha", "alpha", "beta"] {
+            assert!(host.request_suspend(key));
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), requests.recv())
+                    .await
+                    .unwrap(),
+                Some(key)
+            );
+        }
+        assert!(
+            requests.try_recv().is_err(),
+            "requests must never reach another instance"
+        );
+        for key in ["alpha", "beta"] {
+            assert!(host.status(key).unwrap().ready);
+        }
+        for key in ["alpha", "beta"] {
+            host.remove(key, Duration::from_secs(1)).await;
+        }
+        assert!(!host.request_suspend("alpha"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1074,7 +1195,72 @@ mod tests {
             Some(SandboxInstancePhaseReport::Exited { exit_code: 4 })
         );
         assert!(!dir.exists());
-        host.remove_all(Duration::from_secs(10)).await;
+        assert!(host.list().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relinquishing_ends_supervision_without_stopping_the_workload() {
+        let (root, host) = private_host();
+        let dir = root.path().join("instances").join("relinquished");
+        let credentials = GatewayCredentials::from_gateway_token("relinquished-token").unwrap();
+        // Only the stop path terminates the workload.
+        let (terminated_tx, mut terminated) = mpsc::channel::<()>(1);
+        let body: SandboxInstanceBody = Box::new(move |controls| {
+            Box::pin(async move {
+                controls.readiness.send_replace(true);
+                controls.shutdown.await;
+                let _ = terminated_tx.send(()).await;
+                Ok(0)
+            })
+        });
+        admit(
+            &host,
+            "relinquished",
+            "sandbox-relinquished",
+            1,
+            SandboxInstanceBindings {
+                gateway_credentials: credentials.clone(),
+                ..unbound()
+            },
+            body,
+        )
+        .unwrap();
+        wait_supervising(&host, "relinquished").await;
+
+        let status = host
+            .relinquish("relinquished")
+            .await
+            .expect("instance was hosted");
+        assert!(!status.ready);
+        assert!(status.phase.is_terminal(), "{status:?}");
+        assert_eq!(
+            terminated.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected),
+            "relinquishing must never run the workload's stop path"
+        );
+        assert!(host.status("relinquished").is_none());
+        assert!(!dir.exists());
+        let revoked = GatewayEndpoint::new("http://127.0.0.1:9", credentials);
+        let error = openshell_core::grpc_client::fetch_settings_snapshot(&revoked, "relinquished")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("revoked"), "{error}");
+        // The key is free for a later term of the same instance.
+        assert_eq!(
+            admit(
+                &host,
+                "relinquished",
+                "sandbox-relinquished",
+                2,
+                unbound(),
+                Box::new(|controls| Box::pin(async move {
+                    controls.shutdown.await;
+                    Ok(0)
+                })),
+            ),
+            Ok(SandboxInstanceAdmitted::Created)
+        );
+        host.relinquish_all().await;
         assert!(host.list().is_empty());
     }
 

@@ -3772,9 +3772,7 @@ network_policies:
                     seconds: 2,
                     nanos: 0,
                 }),
-                tls_ca_cert_pem: Vec::new(),
-                audience: String::new(),
-                allow_insecure_transport: false,
+                ..Default::default()
             }],
         )
         .await
@@ -3847,9 +3845,7 @@ network_policies:
                     seconds: 2,
                     nanos: 0,
                 }),
-                tls_ca_cert_pem: Vec::new(),
-                audience: String::new(),
-                allow_insecure_transport: false,
+                ..Default::default()
             }],
         )
         .await
@@ -4807,9 +4803,7 @@ network_policies:
                     seconds: 2,
                     nanos: 0,
                 }),
-                tls_ca_cert_pem: Vec::new(),
-                audience: String::new(),
-                allow_insecure_transport: false,
+                ..Default::default()
             }],
         )
         .await
@@ -4960,9 +4954,7 @@ network_policies:
                     seconds: 2,
                     nanos: 0,
                 }),
-                tls_ca_cert_pem: Vec::new(),
-                audience: String::new(),
-                allow_insecure_transport: false,
+                ..Default::default()
             }],
         )
         .await

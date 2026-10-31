@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Gateway-owned coordination of one shared supervisor host.
+//! Gateway-owned coordination of the shared supervisor pool.
 //!
 //! The gateway constructs a [`SharedSupervision`] and hands it to the compute
 //! driver that provisions the host's sandbox instances. The driver supplies
@@ -15,9 +15,11 @@
 //! host, and which of its own objects must exist for an instance to count as
 //! supervised.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::future::Future;
-use std::time::Duration;
+use std::pin::Pin;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 
@@ -30,6 +32,12 @@ use crate::status::SandboxInstanceStatusReport;
 /// Interval at which [`SharedSupervision::wait_for_ready`] re-reads the
 /// host's observations.
 const READINESS_POLL: Duration = Duration::from_secs(1);
+/// Age, before a driver recovery began listing, past which a pool record the
+/// listing omits is withdrawn.
+///
+/// Younger records may come from a launch the listing raced on another
+/// gateway replica, whose clock may also differ.
+const RECOVERY_PRUNE_MARGIN: Duration = Duration::from_mins(1);
 
 /// Why a launch was not assigned.
 #[derive(Debug, thiserror::Error)]
@@ -44,14 +52,72 @@ pub enum LaunchError<E> {
     /// the generation back before its workload runs.
     #[error("{0}")]
     Refused(AssignmentError),
+    /// The pool could not place the instance: it is not ready, no member is
+    /// attached or has room, or its records could not be read or written.
+    /// The material was persisted; the caller rolls the generation back
+    /// before its workload runs.
+    #[error("{0}")]
+    Unplaced(String),
 }
 
-/// Revision of the desired set read before the driver listed its durable
-/// records. Completing a recovery with it makes the replacement
-/// compare-and-replace against that revision.
+/// A new pool instance to record durably before it is assigned.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PlacementRequest {
+    /// The instance's assignment, launch material included.
+    pub assignment: crate::proto::SandboxInstanceAssignment,
+    /// Credential epoch of the launch credentials.
+    pub auth_epoch: u64,
+}
+
+impl std::fmt::Debug for PlacementRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PlacementRequest")
+            .field("route", &self.assignment.route)
+            .field("sandbox_id", &self.assignment.sandbox_id)
+            .field("generation", &self.assignment.generation)
+            .field("auth_epoch", &self.auth_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Outcome of one durable pool operation.
+pub type PlacementFuture<T = ()> = Pin<Box<dyn Future<Output = Result<T, String>> + Send>>;
+
+/// The gateway's durable records of a supervisor pool's instances.
+///
+/// Installed by the gateway before instances launch, they make the pool's
+/// desired set, ownership, and launch material available to every gateway
+/// replica, whichever replica launched an instance or runs the compute
+/// driver's watch.
+pub trait InstancePlacement: Send + Sync + std::fmt::Debug {
+    /// Durably record a new instance, launch material included, and the
+    /// owner of its launch term: the pool member the consistent-hash ring
+    /// prefers among live members with room, and its current process. Fails
+    /// when no live member has room.
+    fn place_launch(&self, request: PlacementRequest) -> PlacementFuture;
+
+    /// Routes of the durably recorded instances, with when each was
+    /// published (Unix milliseconds).
+    fn recorded(&self) -> PlacementFuture<BTreeMap<String, i64>>;
+
+    /// Durably record an instance a driver recovery found without a record,
+    /// such as one launched before the host became a pool; the pool places
+    /// it, fencing whichever process may supervise it.
+    fn record_recovered(
+        &self,
+        assignment: crate::proto::SandboxInstanceAssignment,
+    ) -> PlacementFuture;
+}
+
+/// When a recovery began, read before the driver listed its durable records.
+///
+/// A pool record published after it may come from a launch the listing raced,
+/// so it is never withdrawn for missing from the listing.
 #[must_use = "complete the recovery with the records listed after this baseline was read"]
 pub struct RecoveryBaseline {
-    revision: u64,
+    /// When the baseline was read (Unix milliseconds).
+    read_at_ms: i64,
 }
 
 /// A generation that may run on the shared supervisor, as the driver's
@@ -66,13 +132,11 @@ pub struct RecoverableInstance<R> {
 /// Result of a recovery pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryOutcome {
-    /// The desired set matches the records; carries the revision in force.
+    /// The records match the listing; carries the desired revision in force.
     Published(u64),
-    /// The desired set changed while the records were listed; the next pass
-    /// derives them again.
-    Conflict,
-    /// Launch material could not be read or does not match its record, or the
-    /// set exceeds the host's capacity; the previous set stays published.
+    /// The gateway has not installed its records yet, launch material could
+    /// not be read or does not match its record, or a record could not be
+    /// written; the next pass tries again.
     Kept,
 }
 
@@ -91,7 +155,7 @@ pub enum InstanceSupervision {
     Unknown,
 }
 
-/// The gateway's coordination of one shared supervisor host: the desired set
+/// The gateway's coordination of the shared supervisor pool: the desired set
 /// it publishes, the token it delivers, and the observations it reads back.
 ///
 /// Clones share one controller. The gateway keeps one for serving the host's
@@ -105,6 +169,16 @@ impl SharedSupervision {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Offer each instance's runtime `recovery_timeout_secs` instead of
+    /// [`POOL_RECOVERY_TIMEOUT_SECS`](crate::controller::POOL_RECOVERY_TIMEOUT_SECS).
+    /// The gateway also installs its durable records with
+    /// [`SupervisorHostController::install_placement`] before instances
+    /// launch.
+    pub fn set_recovery_timeout_secs(&self, recovery_timeout_secs: u32) {
+        self.controller
+            .set_recovery_timeout_secs(recovery_timeout_secs);
     }
 
     /// The controller the gateway serves to the host and publishes the
@@ -126,9 +200,11 @@ impl SharedSupervision {
     /// persist its encoded launch material through `persist`, and only then
     /// assign the instance so the host starts it. The launch material is
     /// persisted first so a restarted gateway recovers the assignment from the
-    /// generation's own records. An identical assignment changes nothing.
-    /// Capacity is refused as [`LaunchError::Refused`], so the caller fails
-    /// its create before the workload runs.
+    /// generation's own records. The pool records the instance durably for
+    /// every gateway replica, on a live member with room; without one the
+    /// launch fails as [`LaunchError::Unplaced`], and beyond the pool's
+    /// capacity as [`LaunchError::Refused`], so the caller fails its create
+    /// before the workload runs. An identical assignment changes nothing.
     pub async fn launch<E, F>(
         &self,
         registration: &SandboxInstanceRegistration,
@@ -143,13 +219,39 @@ impl SharedSupervision {
         persist(assignment.launch_material.clone())
             .await
             .map_err(LaunchError::Persist)?;
-        self.controller
-            .assign(assignment)
-            .map_err(LaunchError::Refused)
+        // The instance and the owner of its launch term are durable before
+        // any member is assigned it, so every gateway replica serves it and a
+        // later failure of that member is recovered by takeover.
+        let Some(placement) = self.controller.placement() else {
+            const NOT_READY: &str = "the supervisor pool is not ready to place sandbox instances";
+            tracing::warn!(route = %registration.route, "{NOT_READY}");
+            return Err(LaunchError::Unplaced(NOT_READY.to_string()));
+        };
+        if let Err(error) = placement
+            .place_launch(PlacementRequest {
+                assignment: assignment.clone(),
+                auth_epoch: registration.auth.auth_epoch.get(),
+            })
+            .await
+        {
+            tracing::warn!(
+                route = %registration.route,
+                sandbox_id = %registration.sandbox_id,
+                %error,
+                "could not place a shared sandbox instance in the supervisor pool"
+            );
+            return Err(LaunchError::Unplaced(error));
+        }
+        let route = assignment.route.clone();
+        self.controller.assign(assignment).map_err(|error| {
+            // A refused instance must not stay desired durably.
+            self.controller.unassign(&route);
+            LaunchError::Refused(error)
+        })
     }
 
-    /// Withdraw a generation's sandbox instance so the host stops it. Nothing
-    /// happens for a route that is not assigned.
+    /// Withdraw a generation's sandbox instance so its owner stops it. The
+    /// gateway removes the instance's durable record right after.
     pub fn withdraw(&self, route: &str) {
         self.controller.unassign(route);
     }
@@ -160,23 +262,20 @@ impl SharedSupervision {
     /// being undone.
     pub fn begin_recovery(&self) -> RecoveryBaseline {
         RecoveryBaseline {
-            revision: self.controller.revision(),
+            read_at_ms: unix_millis(),
         }
     }
 
-    /// Replace the desired set with `candidates`, the generations that may
-    /// run according to the records listed after `baseline` was read. Each
-    /// candidate's launch material comes from its current assignment or, for
-    /// a generation this gateway has not assigned since it started, from
-    /// `read` on the driver's record, which returns the persisted bytes or
-    /// `None` when they are gone. Material is decoded without quoting values,
-    /// bound to the recorded route and sandbox, and validated.
-    ///
-    /// The first completed pass initializes the desired set; until then
-    /// nothing is sent to the host. A failed or mismatched read keeps the
-    /// previous set, because an incomplete set would stop running instances.
-    /// A pass that raced a lifecycle edit is refused and derived again next
-    /// time.
+    /// Reconcile the pool's durable records, which are the desired set every
+    /// gateway replica serves, with `candidates`, the generations that may run
+    /// according to the records the driver listed after `baseline` was read.
+    /// A candidate without a record is recorded from its launch material,
+    /// read by `read` from the driver's record (`None` when it is gone);
+    /// material is decoded without quoting values, bound to the recorded route
+    /// and sandbox, and validated. A record the listing omits is withdrawn
+    /// when it was published before the listing. Until the gateway installs
+    /// its records, or when a read fails or material is unusable, the pass
+    /// reports [`RecoveryOutcome::Kept`].
     pub async fn complete_recovery<R, E, F>(
         &self,
         baseline: RecoveryBaseline,
@@ -188,62 +287,91 @@ impl SharedSupervision {
         E: Display,
         F: Future<Output = Result<Option<Vec<u8>>, E>> + Send,
     {
-        let mut assignments = Vec::with_capacity(candidates.len());
-        for candidate in &candidates {
-            if let Some(assignment) = self.controller.assignment(&candidate.route) {
-                assignments.push(assignment);
+        self.reconcile_pool(&baseline, &candidates, read).await
+    }
+
+    /// Reconcile a pool's durable records with the generations a driver
+    /// recovery listed after `baseline`.
+    async fn reconcile_pool<R, E, F>(
+        &self,
+        baseline: &RecoveryBaseline,
+        candidates: &[RecoverableInstance<R>],
+        read: impl Fn(&R) -> F + Send + Sync,
+    ) -> RecoveryOutcome
+    where
+        R: Send + Sync,
+        E: Display,
+        F: Future<Output = Result<Option<Vec<u8>>, E>> + Send,
+    {
+        let Some(placement) = self.controller.placement() else {
+            return RecoveryOutcome::Kept;
+        };
+        let recorded = match placement.recorded().await {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                tracing::warn!(%error, "could not list the supervisor pool's instances; recovery skipped");
+                return RecoveryOutcome::Kept;
+            }
+        };
+        let mut outcome = RecoveryOutcome::Published(self.controller.revision());
+        for candidate in candidates {
+            if recorded.contains_key(&candidate.route) {
                 continue;
             }
-            let material = match read(&candidate.record).await {
-                Ok(Some(material)) => material,
-                Ok(None) => {
+            let assignment = match read(&candidate.record).await {
+                Ok(Some(material)) => recovered_assignment(candidate, &material),
+                Ok(None) => continue,
+                Err(error) => {
                     tracing::warn!(
                         sandbox_id = %candidate.sandbox_id,
                         route = %candidate.route,
-                        "shared sandbox instance has no launch material; it stays unassigned"
+                        %error,
+                        "could not read shared sandbox instance launch material"
                     );
+                    outcome = RecoveryOutcome::Kept;
                     continue;
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        sandbox_id = %candidate.sandbox_id,
-                        route = %candidate.route,
-                        %error,
-                        "could not read shared sandbox instance launch material; keeping the previous assignments"
-                    );
-                    return RecoveryOutcome::Kept;
-                }
             };
-            match recovered_assignment(candidate, &material) {
-                Ok(assignment) => assignments.push(assignment),
-                Err(error) => {
-                    tracing::warn!(
-                        sandbox_id = %candidate.sandbox_id,
-                        route = %candidate.route,
-                        %error,
-                        "shared sandbox instance launch material is unusable; keeping the previous assignments"
-                    );
-                    return RecoveryOutcome::Kept;
-                }
+            let recorded = match assignment {
+                Ok(assignment) => placement.record_recovered(assignment).await,
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(error) = recorded {
+                tracing::warn!(
+                    sandbox_id = %candidate.sandbox_id,
+                    route = %candidate.route,
+                    %error,
+                    "could not record a recovered shared sandbox instance in the supervisor pool"
+                );
+                outcome = RecoveryOutcome::Kept;
             }
         }
-        match self
-            .controller
-            .replace_assignments(baseline.revision, assignments)
-        {
-            Ok(revision) => RecoveryOutcome::Published(revision),
-            Err(AssignmentError::Conflict { .. }) => RecoveryOutcome::Conflict,
-            Err(error) => {
-                tracing::warn!(%error, "could not publish the shared sandbox instances; keeping the previous assignments");
-                RecoveryOutcome::Kept
+        let listed = candidates
+            .iter()
+            .map(|candidate| candidate.route.as_str())
+            .collect::<BTreeSet<_>>();
+        let margin = i64::try_from(RECOVERY_PRUNE_MARGIN.as_millis()).unwrap_or(i64::MAX);
+        for (route, published_at_ms) in &recorded {
+            if !listed.contains(route.as_str())
+                && *published_at_ms < baseline.read_at_ms.saturating_sub(margin)
+            {
+                tracing::info!(
+                    route,
+                    "withdrawing a supervisor pool instance its driver no longer runs"
+                );
+                self.withdraw(route);
             }
         }
+        outcome
     }
 
     /// What the host's observations say about the instance of `sandbox_id`
     /// on `route`. Only a host that has reconciled to the assigning snapshot
     /// renders a verdict; a disconnected or still-reconciling host is not
-    /// evidence that a running instance is gone.
+    /// evidence that a running instance is gone. For a pool only the owning
+    /// process's host renders it, so an instance being taken over by another
+    /// member reads as degraded or unknown, never unavailable, until its new
+    /// owner has reconciled.
     #[must_use]
     pub fn supervision(&self, route: &str, sandbox_id: &str) -> InstanceSupervision {
         match self.controller.observed(route) {
@@ -281,6 +409,14 @@ impl SharedSupervision {
     }
 }
 
+fn unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
 /// Decode persisted launch material for `candidate`, binding it to the
 /// recorded route and sandbox before trusting it.
 fn recovered_assignment<R>(
@@ -301,90 +437,104 @@ fn recovered_assignment<R>(
 mod tests {
     use super::*;
     use crate::proto::SandboxInstanceAssignment;
+    use std::sync::Mutex;
+
+    /// Durable pool records kept in memory.
+    #[derive(Debug, Default)]
+    struct RecordedPool {
+        created_at_ms: Mutex<BTreeMap<String, i64>>,
+        recovered: Mutex<Vec<String>>,
+    }
+
+    impl InstancePlacement for std::sync::Arc<RecordedPool> {
+        fn place_launch(&self, request: PlacementRequest) -> PlacementFuture {
+            self.created_at_ms
+                .lock()
+                .unwrap()
+                .insert(request.assignment.route, unix_millis());
+            Box::pin(async { Ok(()) })
+        }
+
+        fn recorded(&self) -> PlacementFuture<BTreeMap<String, i64>> {
+            let recorded = self.created_at_ms.lock().unwrap().clone();
+            Box::pin(async move { Ok(recorded) })
+        }
+
+        fn record_recovered(&self, assignment: SandboxInstanceAssignment) -> PlacementFuture {
+            self.recovered.lock().unwrap().push(assignment.route);
+            Box::pin(async { Ok(()) })
+        }
+    }
 
     fn candidate(route: &str, sandbox_id: &str) -> RecoverableInstance<&'static str> {
         RecoverableInstance {
             route: route.to_string(),
             sandbox_id: sandbox_id.to_string(),
-            record: "record",
+            record: if route.starts_with("rt-unreadable") {
+                "unreadable"
+            } else {
+                "record"
+            },
         }
     }
 
     #[tokio::test]
-    async fn recovery_keeps_the_previous_set_unless_every_record_is_usable() {
+    async fn pool_recovery_reconciles_durable_records_with_the_drivers_listing() {
         let supervision = SharedSupervision::new();
-        let assigned = SandboxInstanceAssignment {
-            route: "rt-assigned-0123456789".to_string(),
-            sandbox_id: "sandbox-a".to_string(),
-            generation: "gen".to_string(),
-            launch_material: b"opaque".to_vec(),
-        };
-        // An assignment made before the first recovery is carried by it.
-        supervision.controller().assign(assigned.clone()).unwrap();
+        let records = std::sync::Arc::new(RecordedPool::default());
+        // A recovery before the gateway installed its records changes nothing.
+        let outcome = supervision
+            .complete_recovery(
+                supervision.begin_recovery(),
+                vec![candidate("rt-listed-0123456789", "sandbox-a")],
+                |_record| async { Ok::<Option<Vec<u8>>, &str>(None) },
+            )
+            .await;
+        assert_eq!(outcome, RecoveryOutcome::Kept);
+        supervision
+            .controller()
+            .install_placement(std::sync::Arc::new(records.clone()));
 
-        // A record whose material cannot be read keeps the set uninitialized.
+        let old = unix_millis() - 2 * 60 * 1000;
+        records.created_at_ms.lock().unwrap().extend([
+            ("rt-listed-0123456789".to_string(), old),
+            ("rt-stale-0123456789".to_string(), old),
+        ]);
         let baseline = supervision.begin_recovery();
+        // A launch the listing raced on another replica is younger than it.
+        records
+            .created_at_ms
+            .lock()
+            .unwrap()
+            .insert("rt-raced-0123456789".to_string(), unix_millis());
         let outcome = supervision
             .complete_recovery(
                 baseline,
                 vec![
-                    candidate(&assigned.route, &assigned.sandbox_id),
+                    candidate("rt-listed-0123456789", "sandbox-a"),
                     candidate("rt-unreadable-0123456789", "sandbox-b"),
+                    candidate("rt-gone-0123456789", "sandbox-c"),
                 ],
-                |_record| async { Err::<Option<Vec<u8>>, _>("boom") },
+                |record: &&str| {
+                    let unreadable = *record == "unreadable";
+                    async move {
+                        if unreadable {
+                            Ok::<_, &str>(Some(b"{\"secret\":1}".to_vec()))
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                },
             )
             .await;
+        // Unusable material keeps the pass from reporting success and is
+        // never recorded; a listed record is not read again.
         assert_eq!(outcome, RecoveryOutcome::Kept);
-        assert!(!supervision.controller().is_initialized());
-
-        // Material that is not a registration is refused without quoting it.
-        let baseline = supervision.begin_recovery();
-        let outcome = supervision
-            .complete_recovery(
-                baseline,
-                vec![candidate("rt-garbage-0123456789", "sandbox-c")],
-                |_record| async { Ok::<_, &str>(Some(b"{\"secret\":1}".to_vec())) },
-            )
-            .await;
-        assert_eq!(outcome, RecoveryOutcome::Kept);
-        assert!(!supervision.controller().is_initialized());
-
-        // A record without material is skipped; the current assignment is
-        // reused without a read; the pass initializes the set.
-        let baseline = supervision.begin_recovery();
-        let outcome = supervision
-            .complete_recovery(
-                baseline,
-                vec![
-                    candidate(&assigned.route, &assigned.sandbox_id),
-                    candidate("rt-gone-0123456789", "sandbox-d"),
-                ],
-                |_record| async { Ok::<Option<Vec<u8>>, &str>(None) },
-            )
-            .await;
-        assert_eq!(outcome, RecoveryOutcome::Published(1));
-        assert!(supervision.controller().is_initialized());
+        assert!(records.recovered.lock().unwrap().is_empty());
+        // Only the old record the listing omits is withdrawn.
         assert_eq!(
-            supervision.controller().assignment(&assigned.route),
-            Some(assigned.clone())
-        );
-
-        // A baseline read before a lifecycle edit is refused, and the edit stands.
-        let baseline = supervision.begin_recovery();
-        supervision.withdraw(&assigned.route);
-        let outcome = supervision
-            .complete_recovery(
-                baseline,
-                vec![candidate(&assigned.route, &assigned.sandbox_id)],
-                |_record| async { Ok::<Option<Vec<u8>>, &str>(None) },
-            )
-            .await;
-        assert_eq!(outcome, RecoveryOutcome::Conflict);
-        assert!(
-            supervision
-                .controller()
-                .assignment(&assigned.route)
-                .is_none()
+            supervision.controller().pool_withdrawals(),
+            ["rt-stale-0123456789"]
         );
     }
 }

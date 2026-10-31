@@ -18,6 +18,12 @@ import "options.proto";
 // instances and sends it as complete snapshots; the host reconciles its
 // registry to each snapshot and reports what it observes. Disconnecting
 // never stops hosted instances; only a later snapshot that omits them does.
+//
+// A host that names a pool member in its hello belongs to a supervisor pool
+// (high availability). The gateway places each instance on one member, sends
+// each member only the instances it owns, and moves an instance only when its
+// owner fails or leaves. A pool host releases an instance a snapshot omits
+// without stopping its workload; only `stop_routes` stops workloads.
 service SupervisorHost {
   // Supervisor-initiated assignment stream. Only the gateway-minted
   // supervisor token may call it.
@@ -55,6 +61,22 @@ message HostHello {
   // Counter the host increments for every connection of one instance_id, so
   // the gateway can order reconnects.
   uint64 connection_epoch = 2;
+  // Present when the host is a member of a supervisor pool.
+  PoolMember member = 3;
+}
+
+// One member of a supervisor pool.
+message PoolMember {
+  reserved 2;
+  reserved "member_uid";
+
+  // Opaque, stable logical member ID. One process serves a member at a time;
+  // HostHello.instance_id identifies that process.
+  string member_id = 1;
+  // Address (IP:port) of the member's routed runtime listener, reachable from
+  // sandbox runtimes. Other members redirect sandbox runtimes here for the
+  // instances this member owns.
+  string runtime_address = 3;
 }
 
 // The gateway accepted the host and will send assignment snapshots.
@@ -70,11 +92,38 @@ message HostRejected {
 }
 
 // Complete desired set of sandbox instances. Each snapshot replaces the
-// previous one; an instance absent from a snapshot must stop.
+// previous one; an instance absent from a snapshot must stop, except on a
+// pool host, which releases it without stopping its workload.
 message AssignmentSnapshot {
   // Monotonic within the session, starting at 1.
   uint64 revision = 1;
   repeated SandboxInstanceAssignment instances = 2;
+  // The host is a pool member: release omitted instances instead of
+  // stopping them, and stop only the routes listed in `stop_routes`.
+  bool pool = 3;
+  // Pool hosts only: routes whose sandbox is stopping or deleted; the host
+  // stops their workloads if it still hosts them.
+  repeated string stop_routes = 4;
+  // Pool hosts only: where each instance placed in the pool is supervised,
+  // so a sandbox runtime that reaches this host is redirected to its owner.
+  repeated RouteOwner route_directory = 5;
+  // Pool hosts only: routes this host's process owns whose launch material
+  // this gateway replica has not loaded yet. The host keeps supervising them
+  // unchanged; it neither releases nor stops them, and starts nothing for
+  // them.
+  repeated string keep_routes = 6;
+  // Pool hosts only: how long, in whole seconds, a sandbox runtime keeps its
+  // workload frozen after losing this host's supervision before terminating
+  // it. The host offers it to each instance's runtime when it attaches;
+  // absent keeps the runtime default.
+  google.protobuf.Duration recovery_timeout = 7;
+}
+
+// The pool member that supervises one route.
+message RouteOwner {
+  string route = 1;
+  // Runtime listener address (IP:port) of the owning member.
+  string runtime_address = 2;
 }
 
 // One running generation of a stable Sandbox resource, assigned to the host.
@@ -88,6 +137,30 @@ message SandboxInstanceAssignment {
   // instance registration (runtime descriptor, gateway-issued credentials,
   // proxy CA, main process). Never logged or forwarded.
   bytes launch_material = 4 [(openshell.options.v1.secret) = true];
+  // Present when the host supervises the instance under a later ownership
+  // term than its launch: it replaces the previous owner with these
+  // credentials and adopts the running workload.
+  SandboxInstanceTakeover takeover = 5;
+}
+
+// Credentials of one ownership term after the launch term. The gateway
+// advanced the sandbox's credential epoch to `auth_epoch` before granting it,
+// which revoked every credential of earlier terms. A term is identified by
+// `auth_epoch` and `supervisor_instance_id`: each gateway replica mints its
+// own credentials for it, and may mint them again, so a host that already
+// supervises the term keeps doing so whatever credentials arrive. A term sent
+// without credentials (empty `grant`) was minted by another gateway replica;
+// a host that does not supervise it yet waits for credentials.
+message SandboxInstanceTakeover {
+  uint64 auth_epoch = 1;
+  // Supervisor process identity the runtime pins for this term.
+  string supervisor_instance_id = 2;
+  // Gateway-signed takeover grant presented when attaching to the runtime.
+  string grant = 3 [(openshell.options.v1.secret) = true];
+  string gateway_token = 4 [(openshell.options.v1.secret) = true];
+  int64 gateway_expires_at = 5;
+  string sandbox_token = 6 [(openshell.options.v1.secret) = true];
+  int64 sandbox_expires_at = 7;
 }
 
 // Everything the host observes, sent after reconciling each snapshot and
@@ -99,6 +172,9 @@ message HostStatus {
   // Every hosted instance, including ones that ended but are still being
   // removed.
   repeated SandboxInstanceStatus instances = 2;
+  // A pool host is shutting down: the gateway moves its instances to other
+  // members at once. Its workloads keep running.
+  bool leaving = 3;
 }
 
 // Lifecycle phase of a hosted sandbox instance.

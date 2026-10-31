@@ -288,8 +288,8 @@
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": true,
       "serviceAccountsEnabled": false,
-      "redirectUris": ["http://127.0.0.1:*", "http://localhost:*"],
-      "webOrigins": ["http://127.0.0.1:*", "http://localhost:*"],
+      "redirectUris": ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"],
+      "webOrigins": ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"],
       "attributes": {
         "pkce.code.challenge.method": "S256"
       },

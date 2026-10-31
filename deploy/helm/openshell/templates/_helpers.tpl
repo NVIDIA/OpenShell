@@ -363,6 +363,16 @@ raw gateway configuration so openshell.effectiveKubernetesConfig can use it.
 {{- end }}
 
 {{/*
+Whether the shared supervisor PodDisruptionBudget renders. A missing
+podDisruptionBudget map or enabled value means enabled on older releases.
+*/}}
+{{- define "openshell.supervisorPodDisruptionBudgetEnabled" -}}
+{{- $pdb := get (.Values.supervisor | default dict) "podDisruptionBudget" | default dict -}}
+{{- $enabled := ternary (get $pdb "enabled") true (kindIs "map" $pdb) -}}
+{{- if not (and (kindIs "bool" $enabled) (not $enabled)) -}}true{{- end -}}
+{{- end }}
+
+{{/*
 Name of the shared supervisor Deployment and Service (and, with `-token`, its token Secret):
 the fullname with a fixed suffix, within the 63-character Service name limit.
 A fullname without room for the suffix keeps a prefix and a hash of the whole
@@ -385,6 +395,79 @@ Pod labels of the shared supervisor; its Service selects exactly these.
 app.kubernetes.io/name: openshell-supervisor
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: supervisor
+{{- end }}
+
+{{/*
+A chart value as a whole number, or nothing when it is not one. Helm parses
+YAML numbers as float64, so whole floats count; booleans, strings, and
+fractions do not.
+*/}}
+{{- define "openshell.wholeNumber" -}}
+{{- if has (kindOf .) (list "int" "int8" "int16" "int32" "int64" "uint" "uint8" "uint16" "uint32" "uint64" "float32" "float64") -}}
+{{- $whole := int64 . -}}
+{{- if eq (float64 .) (float64 $whole) -}}{{- $whole -}}{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Shared supervisor replica count. A missing value (for example after `helm
+upgrade --reuse-values` from a release that predates it) means 1.
+*/}}
+{{- define "openshell.supervisorReplicas" -}}
+{{- $supervisor := .Values.supervisor | default dict -}}
+{{- $value := get $supervisor "replicas" -}}
+{{- if or (not (hasKey $supervisor "replicas")) (kindIs "invalid" $value) -}}
+1
+{{- else -}}
+{{- $replicas := include "openshell.wholeNumber" $value -}}
+{{- if or (eq $replicas "") (lt (int64 $replicas) 1) -}}
+{{- fail "supervisor.replicas must be an integer of at least 1" -}}
+{{- end -}}
+{{- $replicas -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Seconds a sandbox runtime keeps its workload frozen after losing a pool
+member's supervision, or nothing when unset so the gateway applies its pool
+default.
+*/}}
+{{- define "openshell.supervisorRecoveryTimeoutSeconds" -}}
+{{- $supervisor := .Values.supervisor | default dict -}}
+{{- $value := get $supervisor "recoveryTimeoutSeconds" -}}
+{{- if and (hasKey $supervisor "recoveryTimeoutSeconds") (not (kindIs "invalid" $value)) (ne (toString $value) "") -}}
+{{- $timeout := include "openshell.wholeNumber" $value -}}
+{{- if or (eq $timeout "") (lt (int64 $timeout) 30) (gt (int64 $timeout) 300) -}}
+{{- fail "supervisor.recoveryTimeoutSeconds must be an integer between 30 and 300, or null for the default" -}}
+{{- end -}}
+{{- $timeout -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The gateway's [openshell.gateway.supervisor_pool] tuning table as YAML, or
+nothing. The shared supervisor always runs as a high-availability pool that
+the gateway coordinates; the chart owns the table only to set the recovery
+deadline (supervisor.recoveryTimeoutSeconds; none leaves the gateway default).
+It never depends on supervisor.replicas, so scaling never changes the gateway
+configuration. Renders nothing without the gateway topology. Validates the
+supervisor values whenever the topology is selected, and refuses a
+hand-written table in either TOML form.
+*/}}
+{{- define "openshell.supervisorPoolConfig" -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- if or (hasKey $gatewayConfig "openshell.gateway.supervisor_pool") (hasKey (get $gatewayConfig "openshell.gateway" | default dict) "supervisor_pool") -}}
+{{- fail "supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds" -}}
+{{- end -}}
+{{- if include "openshell.supervisorEnabled" . -}}
+{{- if ne (include "openshell.supervisorAutoscalingEnabled" .) "true" -}}
+{{- $_ := include "openshell.supervisorReplicas" . -}}
+{{- end -}}
+{{- $recoveryTimeout := include "openshell.supervisorRecoveryTimeoutSeconds" . -}}
+{{- if $recoveryTimeout -}}
+{{- toYaml (dict "recovery_timeout_secs" (int64 $recoveryTimeout)) -}}
+{{- end -}}
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -654,6 +737,15 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if hasKey (get (.Values.gatewayConfig | default dict) "openshell.drivers.kubernetes" | default dict) "shared_supervisor" -}}
 {{- fail "shared_supervisor is rendered by the chart; set only supervisor_topology" -}}
 {{- end -}}
+{{- include "openshell.validateSupervisorAutoscaling" . -}}
+{{- $pdb := get (.Values.supervisor | default dict) "podDisruptionBudget" | default dict -}}
+{{- if not (kindIs "map" $pdb) -}}
+{{- fail "supervisor.podDisruptionBudget must be a map" -}}
+{{- end -}}
+{{- if and (hasKey $pdb "enabled") (not (kindIs "invalid" (get $pdb "enabled"))) (not (kindIs "bool" (get $pdb "enabled"))) -}}
+{{- fail "supervisor.podDisruptionBudget.enabled must be a boolean" -}}
+{{- end -}}
+{{- $_ := include "openshell.supervisorPoolConfig" . -}}
 {{- $workloadKind := include "openshell.workloadKind" . -}}
 {{- $workload := .Values.workload | default dict -}}
 {{- $maxReplicas := int (include "openshell.maxReplicas" .) -}}

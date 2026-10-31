@@ -41,6 +41,7 @@ rustix = { workspace = true, features = ["termios"] }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
 
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
+openshell-ocsf-validate = { path = "../openshell-ocsf-validate" }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 

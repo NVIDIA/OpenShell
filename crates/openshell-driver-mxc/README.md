@@ -1,5 +1,15 @@
 # openshell-driver-mxc
 
+Native Windows implementation and releases are maintained on the
+[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+For current setup, capabilities, and limitations, use the
+[Windows driver README](https://github.com/NVIDIA/OpenShell/blob/windows/crates/openshell-driver-mxc/README.md)
+and [Windows guide](../../WINDOWS.md). The implementation notes below describe
+the older source snapshot on `main`, not the current Windows release branch.
+In particular, current Windows uses a separate host supervisor and Windows
+sandbox boundary; do not use this snapshot's relay, readiness, or configuration
+instructions to operate a `windows` build.
+
 OpenShell compute driver backed by **Microsoft MXC** (`wxc-exec`) on Windows.
 
 ## Design

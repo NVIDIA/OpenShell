@@ -67,6 +67,7 @@ struct SandboxState {
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
     expose_service_requests: Arc<Mutex<Vec<openshell_core::proto::ExposeServiceRequest>>>,
     fail_delete_sandbox_message: Arc<Mutex<Option<String>>>,
+    stop_response: Arc<Mutex<Option<Sandbox>>>,
     vm_error_after_started: Arc<AtomicBool>,
     vm_error_with_observed_exit: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
@@ -231,12 +232,36 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::StopSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        Err(Status::unimplemented("unused"))
+        let sandbox = self
+            .state
+            .stop_response
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| Status::unimplemented("unused"))?;
+        Ok(Response::new(SandboxResponse {
+            sandbox: Some(sandbox),
+            ..Default::default()
+        }))
     }
 
     async fn start_sandbox(
         &self,
         _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::SuspendSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ResumeSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
@@ -1692,6 +1717,57 @@ fn test_config() -> run::SandboxCreateConfig<'static> {
         tty_override: Some(false),
         auto_providers_override: Some(false),
         ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn sandbox_stop_accepts_terminal_results_without_waiting_for_stopped() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+    let config_dir = helpers::tempdir().unwrap();
+    for (phase, exit_code, reason, succeeds) in [
+        (
+            SandboxPhase::Completed,
+            Some(0),
+            "MainProcessCompleted",
+            true,
+        ),
+        (SandboxPhase::Error, Some(17), "MainProcessFailed", true),
+        (SandboxPhase::Stopped, None, "Stopped", true),
+        (
+            SandboxPhase::Error,
+            Some(17),
+            "ComputeResourceMissing",
+            false,
+        ),
+    ] {
+        let sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                phase: phase as i32,
+                exit_code,
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".into(),
+                    status: "False".into(),
+                    reason: reason.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        *server.openshell.state.stop_response.lock().await = Some(sandbox);
+        Environment::new()
+            .set("XDG_CONFIG_HOME", config_dir.path())
+            .run_async(async {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    run::sandbox_stop(&server.endpoint, "terminal-stop-test", "default", &tls),
+                )
+                .await
+                .expect("stop must finish without watching for another phase");
+                assert_eq!(result.is_ok(), succeeds, "{reason}: {result:?}");
+            })
+            .await;
     }
 }
 
@@ -4158,4 +4234,46 @@ async fn service_forward_falls_back_to_session_tokens_once_for_a_legacy_gateway(
             .all(|init| matches!(init.target, Some(tcp_forward_init::Target::Tcp(_))))
     );
     forward.abort();
+}
+
+#[tokio::test]
+async fn rejected_suspend_preserves_active_forwards() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let mut forward = tokio::process::Command::new("sleep")
+                .arg("60")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let directory = xdg_dir.path().join("openshell/forwards/default");
+            fs::create_dir_all(&directory).unwrap();
+            let pid_file = directory.join("suspend-rejected-8080.pid");
+            fs::write(
+                &pid_file,
+                format!("{}\tsb-forward\t127.0.0.1", forward.id().unwrap()),
+            )
+            .unwrap();
+            let error = run::sandbox_suspend(
+                &server.endpoint,
+                "suspend-rejected",
+                "default",
+                &test_tls(&server),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("unused"), "{error:?}");
+            assert!(
+                pid_file.exists(),
+                "rejected suspension must preserve forward registration"
+            );
+            assert!(
+                forward.try_wait().unwrap().is_none(),
+                "rejected suspension must keep the forward process alive"
+            );
+            forward.kill().await.unwrap();
+        })
+        .await;
 }

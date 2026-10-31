@@ -69,6 +69,51 @@ supervisor:
     tag: ""
     # -- Supervisor image digest. When set, this takes precedence over tag.
     digest: ""
+  # -- Shared supervisor pool members, used only when gatewayConfig selects
+  # supervisor_topology = "gateway". The gateway always coordinates the shared
+  # supervisor as a high-availability pool: when a member fails or leaves,
+  # another member takes over its sandboxes without restarting their
+  # workloads. 1 has no failover; use 2 or more to survive losing a member.
+  # Only the supervisor Deployment's replica count depends on this value, so
+  # changing it neither restarts the gateway nor replaces running members.
+  # Ignored when supervisor.autoscaling.enabled is true.
+  replicas: 1
+  autoscaling:
+    # -- Enable memory-based autoscaling of the shared supervisor Deployment.
+    # Requires supervisor_topology = "gateway" and the Kubernetes resource
+    # metrics API (usually Metrics Server). When enabled, the HPA owns the
+    # replica count and supervisor.replicas is ignored.
+    enabled: false
+    # -- Minimum supervisor replicas. Keep at least 2 for failover capacity.
+    minReplicas: 2
+    # -- Maximum supervisor replicas.
+    maxReplicas: 4
+    # -- Target average memory working set per supervisor Pod, as a positive
+    # Kubernetes quantity. This is an absolute value, not a percentage of
+    # requests. Scaling up adds capacity for new sandboxes; it does not move
+    # existing sandboxes away from a busy member.
+    targetMemoryAverageValue: 512Mi
+    # -- HPA scaling behavior. Remove at most one member every two minutes,
+    # after a five-minute stabilization window, to allow ownership handoff.
+    behavior:
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        policies:
+          - type: Pods
+            value: 1
+            periodSeconds: 120
+  podDisruptionBudget:
+    # -- Render a PodDisruptionBudget with maxUnavailable 1 for the shared
+    # supervisor, used only when gatewayConfig selects supervisor_topology =
+    # "gateway". Disable it only when maintenance must evict more than one
+    # supervisor Pod at a time, or evict a member while another is unavailable.
+    enabled: true
+  # -- Seconds a sandbox workload stays frozen after losing its pool member's
+  # supervision before the sandbox runtime terminates it, rendered as
+  # [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an
+  # integer from 30 to 300. Null leaves the gateway's pool default of 60
+  # seconds.
+  recoveryTimeoutSeconds: 60
   # Pod security context for the shared supervisor Deployment, rendered only
   # when gatewayConfig selects supervisor_topology = "gateway". On OpenShift,
   # set the user and group IDs to null so the restricted-v2 SCC can assign the
@@ -85,6 +130,13 @@ supervisor:
     seccompProfile:
       # -- Seccomp profile applied to the shared supervisor pod.
       type: RuntimeDefault
+  # -- Affinity rules for the shared supervisor pod, rendered only when
+  # gatewayConfig selects supervisor_topology = "gateway". Top-level affinity
+  # applies only to the gateway pod.
+  affinity: {}
+  network:
+    # -- Name of an operator-owned ConfigMap with a `ca.crt` key containing additional destination CA certificates for sandbox supervisors. Empty disables additional destination trust.
+    additionalCaConfigMapName: ""
   sandboxRuntime:
     # -- Workload boundary TLS listener port.
     boundaryPort: 5500
@@ -354,8 +406,8 @@ server:
     # When replicas share the volume, set subPathExpr: $(OPENSHELL_POD_NAME)
     # on the mount so each replica writes its own file.
     path: /tmp/gateway-ocsf.jsonl
-    # -- Optional OCSF downgrade target. Empty emits native OCSF 1.8.0.
-    # Supported values: "1.1", "1.3".
+    # -- Deprecated and ignored: the gateway emits native OCSF 1.8.0 and logs
+    # a warning at startup when this is set.
     schemaVersion: ""
     # -- Rotate the active file daily in UTC, or never.
     rotation: daily
@@ -470,6 +522,13 @@ server:
   # -- Enable plaintext HTTP routing for loopback sandbox service URLs on
   # TLS-enabled gateways.
   enableLoopbackServiceHttp: true
+  # -- Hostname format for exposed sandbox services. Empty or "readable"
+  # keeps readable `<workspace>--<sandbox>[--<service>]` hostnames; "hashed"
+  # mints opaque one-label hostnames discriminated by the gateway
+  # installation name (server.name, defaulting to the release name). The
+  # name must be unique among all gateways sharing the service base domain,
+  # and renaming the installation changes every minted hostname.
+  serviceHostnameFormat: ""
   # -- Enable the WebSocket tunnel used by CLI/SDK clients behind an
   # authenticated edge proxy. Leave disabled for direct gateway installs.
   enableWebsocketTunnel: false

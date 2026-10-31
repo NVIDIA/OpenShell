@@ -60,14 +60,14 @@ use openshell_core::proto::{
     RemoveWorkspaceMemberResponse, ReportEndpointStatusRequest, ReportEndpointStatusResponse,
     ReportMainProcessExitRequest, ReportMainProcessExitResponse, ReportPolicyStatusRequest,
     ReportPolicyStatusResponse, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
-    ResourceCapabilities, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    ResourceCapabilities, ResumeSandboxRequest, RevokeSshSessionRequest, RevokeSshSessionResponse,
     RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
     SandboxTemplateResponse, ServiceEndpointResponse, ServiceStatus, StartSandboxRequest,
     StopSandboxRequest, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
-    UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesRequest,
-    UpdateProviderProfilesResponse, UpdateProviderRequest, WatchSandboxRequest,
-    open_shell_server::OpenShell,
+    SupervisorMessage, SuspendSandboxRequest, TcpForwardFrame, UndoDraftChunkRequest,
+    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
+    WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -241,6 +241,16 @@ impl OpenShellService {
 // ---------------------------------------------------------------------------
 // Trait impl — thin delegation to submodules
 // ---------------------------------------------------------------------------
+
+#[tonic::async_trait]
+impl openshell_core::proto::sandbox_updates_server::SandboxUpdates for OpenShellService {
+    async fn update_sandbox(
+        &self,
+        request: Request<openshell_core::proto::UpdateSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        mutation_replay::run(&self.state, request).await
+    }
+}
 
 #[tonic::async_trait]
 impl OpenShell for OpenShellService {
@@ -434,6 +444,20 @@ impl OpenShell for OpenShellService {
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         mutation_replay::run(&self.state, request).await
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        sandbox::handle_suspend_sandbox(&self.state, request).await
+    }
+
+    async fn resume_sandbox(
+        &self,
+        request: Request<ResumeSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        sandbox::handle_resume_sandbox(&self.state, request).await
     }
 
     // --- Exec ---
@@ -1058,6 +1082,7 @@ pub mod test_support {
             sandbox_id: sandbox_id.to_string(),
             source: SandboxIdentitySource::BootstrapJwt {
                 issuer: "openshell-gateway:test".to_string(),
+                auth_epoch: None,
             },
             trust_domain: Some("openshell".to_string()),
         });

@@ -3,4 +3,4 @@
 
 [workspace]
 resolver = "2"
-members = ["cli"]
+members = ["cli", "sandbox"]
