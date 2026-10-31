@@ -10,7 +10,11 @@ on:
   workflow_call:
     inputs:
       candidate_ref:
-        description: Optional pre-release tag to scan instead of the triggering revision
+        description: Optional release tag to scan instead of the triggering revision
+        default: ""
+        type: string
+      release-lane:
+        description: Stable image alert lane (latest; support reserved for future use)
         default: ""
         type: string
       images:
@@ -87,14 +91,43 @@ jobs:
     outputs:
       sarif-batches: ${{ steps.sarif.outputs.batches }}
       artifact-id: ${{ steps.reports.outputs.artifact-id }}
+      source-sha: ${{ steps.source.outputs.commit }}
+    env:
+      TRIVY_SOURCE_ROOT: ${{ github.workspace }}
+      TRIVY_IGNORE_FILE: ${{ github.workspace }}/.trivyignore.yaml
+      TRIVY_REPORT_DIR: ${{ github.workspace }}/reports/trivy
     permissions:
       contents: read
       packages: read
     steps:
+      - name: Require a stable tag for image alert lanes
+        shell: bash
+        env:
+          RELEASE_LANE: ${{ inputs.release-lane }}
+          RELEASE_TAG: ${{ inputs.candidate_ref }}
+        run: |
+          if [[ -n "$RELEASE_LANE" && ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Image alert lanes require a stable release tag."
+            exit 1
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: source
         with:
           ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}
           persist-credentials: false
+
+      # Old release commits may predate support for stable alert identities.
+      - name: Check out scanner from the workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          path: scan-workflow
+          sparse-checkout: |
+            tasks/scripts
+            deploy/helm
+            .trivyignore.yaml
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -109,7 +142,10 @@ jobs:
           cachix-auth-token: ${{ github.event_name != 'pull_request' && secrets.CACHIX_AUTH_TOKEN || '' }}
 
       - name: Test scan reporting
-        run: tasks/scripts/trivy-scan-test.sh
+        env:
+          TRIVY_SOURCE_ROOT: ""
+          TRIVY_IGNORE_FILE: ""
+        run: scan-workflow/tasks/scripts/trivy-scan-test.sh
 
       - name: Scan configuration
         id: config
@@ -121,7 +157,7 @@ jobs:
             [ -n "$ref" ] || continue
             args+=(--chart-ref "$ref")
           done <<<"$CHARTS"
-          tasks/scripts/trivy-scan.sh config "${args[@]}"
+          scan-workflow/tasks/scripts/trivy-scan.sh config "${args[@]}"
 
       - name: Scan images
         id: images
@@ -136,7 +172,7 @@ jobs:
             refs+=("$ref")
           done <<<"$IMAGES"
           if [ "${#refs[@]}" -gt 0 ]; then
-            tasks/scripts/trivy-scan.sh images "${refs[@]}"
+            scan-workflow/tasks/scripts/trivy-scan.sh images "${refs[@]}"
           fi
 
       - name: Prepare consolidated SARIF uploads
@@ -148,7 +184,10 @@ jobs:
             && steps.images.conclusion == 'success'
             && inputs.upload-sarif
           }}
-        run: tasks/scripts/trivy-scan.sh prepare-sarif
+        env:
+          TRIVY_RELEASE_LANE: ${{ inputs.release-lane }}
+          TRIVY_SARIF_IMAGES: ${{ inputs.release-lane != '' }}
+        run: scan-workflow/tasks/scripts/trivy-scan.sh prepare-sarif
 
       - name: Upload reports
         id: reports
@@ -171,7 +210,7 @@ jobs:
           FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
         run: |
           set +e
-          tasks/scripts/trivy-scan.sh gate
+          scan-workflow/tasks/scripts/trivy-scan.sh gate
           status=$?
           set -e
           case "$status" in
@@ -209,10 +248,18 @@ jobs:
         batch: ${{ fromJSON(needs.scan.outputs.sarif-batches) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        id: checkout
         with:
           ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}
           persist-credentials: false
+
+      - name: Check out latest-release guard from the workflow revision
+        if: ${{ inputs.release-lane == 'latest' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          path: scan-workflow
+          sparse-checkout: .github/actions/check-latest-release
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -220,10 +267,18 @@ jobs:
           merge-multiple: true
           path: reports/trivy
 
+      - name: Preserve latest results when rerunning an older release
+        id: latest
+        if: ${{ inputs.release-lane == 'latest' }}
+        uses: ./scan-workflow/.github/actions/check-latest-release
+        with:
+          release-tag: ${{ inputs.candidate_ref }}
+
       # One configuration run, plus one run per image/platform or packaged
       # chart. Each batch holds at most GitHub's limit of 20 SARIF runs.
       - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: ${{ inputs.release-lane != 'latest' || steps.latest.outputs.make-latest == 'true' }}
         with:
           sarif_file: reports/trivy/code-scanning/uploads/${{ matrix.batch }}
-          ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}
-          sha: ${{ inputs.candidate_ref && steps.checkout.outputs.commit || '' }}
+          ref: ${{ inputs.release-lane != '' && 'refs/heads/main' || (inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '') }}
+          sha: ${{ inputs.candidate_ref && needs.scan.outputs.source-sha || '' }}
