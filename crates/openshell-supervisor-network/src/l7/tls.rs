@@ -22,6 +22,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 const MAX_CACHED_CERTS: usize = 256;
 
 /// System CA bundle search paths (common Linux locations).
+#[cfg(not(windows))]
 const SYSTEM_CA_PATHS: &[&str] = &[
     "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
     "/etc/pki/tls/certs/ca-bundle.crt",   // RHEL/CentOS/Fedora
@@ -447,6 +448,7 @@ fn load_pem_certs_into_store(
 /// Returns the PEM contents of the first non-empty bundle found, or an empty
 /// string if none of the well-known paths exist. Call once and pass the result
 /// to [`write_ca_files`].
+#[cfg(not(windows))]
 pub fn read_system_ca_bundle() -> String {
     for path in SYSTEM_CA_PATHS {
         if let Ok(contents) = std::fs::read_to_string(path)
@@ -457,6 +459,74 @@ pub fn read_system_ca_bundle() -> String {
     }
     // No system bundle found — combined file will contain only the sandbox CA.
     String::new()
+}
+
+/// Largest system CA bundle, in bytes of PEM, that Windows sandboxes receive.
+///
+/// On Windows the combined bundle reaches the sandbox boundary inside the
+/// `StartAgent` control frame, which is limited to 1 MiB and also carries the
+/// agent spec, the policy and the provider environment. The currently valid
+/// roots of Microsoft's trusted root program encode to about 800 KiB of PEM,
+/// and hosts that preinstall the whole program hold all of them. A larger
+/// system bundle is left out so that it cannot fail every sandbox start.
+#[cfg(windows)]
+const MAX_WINDOWS_SYSTEM_CA_BUNDLE_BYTES: usize = 896 * 1024;
+
+/// Read the system CA bundle from the Windows certificate store.
+///
+/// Windows keeps its trust anchors in the certificate store rather than in a
+/// PEM file. Returns the roots that `rustls-native-certs` loads, PEM-encoded:
+/// the current user's `ROOT` store, which also holds the machine, Group
+/// Policy, enterprise and third-party roots, limited to certificates that are
+/// currently valid and usable for server authentication. As in
+/// `rustls-native-certs`, `SSL_CERT_FILE` or `SSL_CERT_DIR` in the
+/// supervisor's environment replaces the store, and the certificates found
+/// there are used without that filter. Returns an empty string if no
+/// certificate is found or the bundle is larger than
+/// `MAX_WINDOWS_SYSTEM_CA_BUNDLE_BYTES`. Call once and pass the result to
+/// [`write_ca_files`].
+#[cfg(windows)]
+pub fn read_system_ca_bundle() -> String {
+    let native = rustls_native_certs::load_native_certs();
+    for error in &native.errors {
+        tracing::warn!(%error, "failed to load root certificates for the system CA bundle");
+    }
+    encode_system_ca_bundle(&native.certs, MAX_WINDOWS_SYSTEM_CA_BUNDLE_BYTES)
+}
+
+/// PEM-encode the system CA bundle, or return an empty string if the encoding
+/// is larger than `max_bytes`.
+#[cfg(any(windows, test))]
+fn encode_system_ca_bundle(certificates: &[CertificateDer<'_>], max_bytes: usize) -> String {
+    let pem = pem_encode_certificates(certificates);
+    if pem.len() > max_bytes {
+        tracing::warn!(
+            certificates = certificates.len(),
+            bytes = pem.len(),
+            max_bytes,
+            "system root certificates exceed the CA bundle size limit and were left out"
+        );
+        return String::new();
+    }
+    pem
+}
+
+/// Encode DER certificates as concatenated PEM `CERTIFICATE` blocks.
+#[cfg(any(windows, test))]
+fn pem_encode_certificates(certificates: &[CertificateDer<'_>]) -> String {
+    use base64::Engine as _;
+
+    let mut pem = String::new();
+    for certificate in certificates {
+        pem.push_str("-----BEGIN CERTIFICATE-----\n");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(certificate);
+        for line in encoded.as_bytes().chunks(64) {
+            pem.extend(line.iter().copied().map(char::from));
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+    }
+    pem
 }
 
 /// Parse PEM certificates from a file into DER-encoded certificates.
@@ -672,6 +742,121 @@ mod tests {
         assert!(
             rustls_pemfile::certs(&mut reader).any(|r| r.is_ok()),
             "bundle should contain at least one cert",
+        );
+    }
+
+    /// Helper: generate `count` self-signed CAs and return their DER encodings.
+    fn generate_ca_ders(count: usize) -> Vec<CertificateDer<'static>> {
+        (0..count)
+            .map(|_| {
+                rustls_pemfile::certs(&mut generate_ca_pem().as_bytes())
+                    .next()
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pem_encode_certificates_round_trips_der() {
+        let certificates = generate_ca_ders(3);
+
+        let pem = pem_encode_certificates(&certificates);
+
+        assert!(pem.lines().all(|line| line.len() <= 64));
+        let decoded = rustls_pemfile::certs(&mut pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(decoded, certificates);
+        assert_eq!(pem_encode_certificates(&[]), "");
+    }
+
+    #[test]
+    fn encode_system_ca_bundle_leaves_out_bundles_over_the_limit() {
+        let certificates = generate_ca_ders(2);
+        let pem = pem_encode_certificates(&certificates);
+
+        assert_eq!(encode_system_ca_bundle(&certificates, pem.len()), pem);
+        assert_eq!(encode_system_ca_bundle(&certificates, pem.len() - 1), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sandbox_bundle_includes_certificate_store_roots() {
+        // The bundle variables replace a client's own trust, so connections the
+        // proxy does not terminate verify only if the bundle holds these roots.
+        // Clearing the overrides makes both reads use the store.
+        temp_env::with_vars_unset(["SSL_CERT_FILE", "SSL_CERT_DIR"], || {
+            let roots = rustls_native_certs::load_native_certs().certs;
+            assert!(
+                !roots.is_empty(),
+                "the Windows certificate store has no roots"
+            );
+            let ca = SandboxCa::generate().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+
+            let (_, bundle_path) =
+                write_ca_files(&ca, dir.path(), &read_system_ca_bundle()).unwrap();
+
+            let bundle = std::fs::read(bundle_path).unwrap();
+            let mut bundled = rustls_pemfile::certs(&mut bundle.as_slice())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            let sandbox_ca = rustls_pemfile::certs(&mut ca.cert_pem().as_bytes())
+                .next()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                bundled.pop(),
+                Some(sandbox_ca),
+                "the sandbox CA must come last"
+            );
+            assert!(
+                bundled == roots,
+                "the bundle holds {} certificates before the sandbox CA; the store has {} roots",
+                bundled.len(),
+                roots.len()
+            );
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_ca_bundle_over_the_limit_is_left_out() {
+        // SSL_CERT_FILE replaces the store, and its loader does not parse the
+        // certificates, so distinct opaque blocks are enough to pass the limit.
+        let block_len = 64 * 1024;
+        let block_count = MAX_WINDOWS_SYSTEM_CA_BUNDLE_BYTES / block_len + 1;
+        let blocks: Vec<CertificateDer<'static>> = (0..block_count)
+            .map(|index| CertificateDer::from(vec![u8::try_from(index).unwrap(); block_len]))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let within_limit = dir.path().join("within-limit.pem");
+        let over_limit = dir.path().join("over-limit.pem");
+        std::fs::write(&within_limit, pem_encode_certificates(&blocks[..1])).unwrap();
+        std::fs::write(&over_limit, pem_encode_certificates(&blocks)).unwrap();
+        let read_with_cert_file = |path: &Path| {
+            temp_env::with_vars(
+                [
+                    ("SSL_CERT_FILE", Some(path.as_os_str())),
+                    ("SSL_CERT_DIR", None),
+                ],
+                read_system_ca_bundle,
+            )
+        };
+
+        let within = read_with_cert_file(&within_limit);
+        let over = read_with_cert_file(&over_limit);
+
+        assert!(
+            within == pem_encode_certificates(&blocks[..1]),
+            "the {}-byte bundle under the limit was changed",
+            within.len()
+        );
+        assert!(
+            over.is_empty(),
+            "the {}-byte bundle over the limit was kept",
+            over.len()
         );
     }
 
