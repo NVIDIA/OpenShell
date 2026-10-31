@@ -183,7 +183,11 @@ pub fn endpoint_url(
 fn endpoint_scheme(config: &openshell_core::Config) -> &'static str {
     if config.tls.is_none()
         || (config.bind_address.ip().is_loopback()
-            && config.service_routing.enable_loopback_service_http)
+            && config.service_routing.enable_loopback_service_http
+            && !config.mtls_auth.enabled
+            && !config.mtls_auth.operator_enabled
+            && config.oidc.is_none()
+            && !config.supervisor_app_listener.enabled)
     {
         "http"
     } else {
@@ -508,7 +512,7 @@ pub async fn is_sandbox_service_request_with_state(
 
 pub async fn proxy_sandbox_service_request(
     state: Arc<ServerState>,
-    req: Request<Body>,
+    mut req: Request<Body>,
 ) -> impl IntoResponse {
     let Some(host) = request_host(&req).map(str::to_string) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -522,6 +526,22 @@ pub async fn proxy_sandbox_service_request(
         service,
     } = target;
     let service_name = service.unwrap_or_default();
+
+    if req
+        .uri()
+        .path()
+        .starts_with(crate::auth::service_session::PREFIX)
+    {
+        return match crate::auth::service_session::handle(&state, &mut req, &workspace).await {
+            Ok(response) => response,
+            Err(error) => crate::auth::service_session::error(&error),
+        };
+    }
+    if let Err(error) =
+        crate::auth::service_session::authorize_request(&state, &mut req, &workspace).await
+    {
+        return crate::auth::service_session::error(&error);
+    }
 
     match proxy_to_endpoint(state, req, &workspace, sandbox_name, service_name).await {
         Ok(response) => response.into_response(),
@@ -799,11 +819,13 @@ async fn proxy_to_endpoint(
             }
         });
 
-        let (parts, _) = response.into_parts();
+        let (mut parts, _) = response.into_parts();
+        crate::auth::service_session::strip_response_cookies(&mut parts.headers);
         return Ok(Response::from_parts(parts, Body::empty()));
     }
 
-    let (parts, body) = response.into_parts();
+    let (mut parts, body) = response.into_parts();
+    crate::auth::service_session::strip_response_cookies(&mut parts.headers);
     Ok(Response::from_parts(parts, Body::new(body)))
 }
 
@@ -1082,7 +1104,13 @@ fn is_gateway_auth_header(
 ) -> bool {
     match name.as_str() {
         "authorization" => authorization_mode != ServiceAuthorizationMode::BearerPassthrough,
-        "cf-access-jwt-assertion"
+        "x-openshell-authorization"
+        | "x-openshell-auth-source"
+        | "x-openshell-principal"
+        | "x-openshell-user"
+        | "x-openshell-roles"
+        | "cf-access-authenticated-user-email"
+        | "cf-access-jwt-assertion"
         | "x-forwarded-client-cert"
         | "x-ssl-client-cert"
         | "x-client-cert" => true,
@@ -1109,7 +1137,8 @@ fn sanitize_cookie_header(value: &HeaderValue) -> Option<HeaderValue> {
 }
 
 fn is_gateway_auth_cookie(name: &str) -> bool {
-    name.eq_ignore_ascii_case("CF_Authorization") || name.eq_ignore_ascii_case("cf-authorization")
+    name.eq_ignore_ascii_case("CF_Authorization")
+        || name.to_ascii_lowercase().starts_with("__host-openshell-")
 }
 
 pub fn emit_service_endpoint_config_event(endpoint: &ServiceEndpoint, url: &str, created: bool) {
@@ -1366,6 +1395,475 @@ mod tests {
     use super::*;
     use openshell_core::config::ServiceHostnameFormat;
 
+    #[tokio::test]
+    async fn gateway_application_auth_gates_http_and_websocket_on_both_routers() {
+        use crate::auth::{
+            identity::{Identity, IdentityProvider},
+            service_access::ServicePeer,
+        };
+        use crate::grpc::test_support::test_server_state;
+        use tower::ServiceExt;
+
+        let mut state = test_server_state().await;
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.config.supervisor_app_listener.enabled = true;
+        inner.config.mtls_auth.enabled = true;
+        inner.config.auth.allow_unauthenticated_users = false;
+        inner.config.service_routing = config();
+        let peer = ServicePeer {
+            identity: Some(Identity {
+                subject: "verified-user".into(),
+                display_name: None,
+                roles: vec![],
+                scopes: vec![],
+                provider: IdentityProvider::Mtls,
+            }),
+            ..Default::default()
+        };
+        for router in [
+            crate::http::http_router(state.clone()),
+            crate::http::service_http_router(state.clone()),
+        ] {
+            for path in ["/", "/auth/login", "/grpc.health.v1.Health/Check"] {
+                for websocket in [false, true] {
+                    let mut request = Request::builder()
+                        .uri(path)
+                        .header(header::HOST, "default--unknown.dev.openshell.localhost")
+                        .header("x-forwarded-client-cert", "forged-user");
+                    if websocket {
+                        request = request
+                            .header(header::CONNECTION, "upgrade")
+                            .header(header::UPGRADE, "websocket");
+                    }
+                    let response = router
+                        .clone()
+                        .oneshot(request.body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                    assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
+                }
+            }
+            let request = || {
+                Request::builder()
+                    .uri("/")
+                    .header(header::HOST, "default--unknown.dev.openshell.localhost")
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            // A verified peer passes the auth gate and reaches endpoint lookup.
+            let response = router
+                .clone()
+                .layer(axum::Extension(peer.clone()))
+                .oneshot(request())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".into();
+        let response = crate::http::http_router(state.clone())
+            .layer(axum::Extension(peer))
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::HOST, "default--unknown.dev.openshell.localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "workspace authorization precedes endpoint lookup"
+        );
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .supervisor_app_listener
+            .enabled = false;
+        let response = crate::http::http_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::HOST, "default--unknown.dev.openshell.localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "listener-disabled gateways enforce configured authentication"
+        );
+    }
+
+    #[test]
+    fn authenticated_gateway_never_forwards_gateway_credentials() {
+        let request = || {
+            Request::builder()
+                .uri("/")
+                .header(header::AUTHORIZATION, "Bearer gateway-secret")
+                .header("cf-access-jwt-assertion", "edge-secret")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let mode = effective_authorization_mode(ServiceAuthorizationMode::Strip as i32);
+        let upstream = build_upstream_request(request(), 8080, false, mode).unwrap();
+        assert!(!upstream.headers().contains_key(header::AUTHORIZATION));
+        assert!(!upstream.headers().contains_key("cf-access-jwt-assertion"));
+        let mode = effective_authorization_mode(ServiceAuthorizationMode::BearerPassthrough as i32);
+        let upstream = build_upstream_request(request(), 8080, false, mode).unwrap();
+        assert_eq!(
+            upstream.headers()[header::AUTHORIZATION],
+            "Bearer gateway-secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_gateway_forwards_application_request_without_gateway_identity() {
+        use crate::auth::{
+            identity::{Identity, IdentityProvider},
+            service_access::ServicePeer,
+        };
+        use crate::grpc::test_support::test_server_state;
+        use http_body_util::BodyExt;
+        use hyper::service::service_fn;
+        use tower::ServiceExt;
+
+        let mut state = test_server_state().await;
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.config.supervisor_app_listener.enabled = true;
+        inner.config.mtls_auth.enabled = true;
+        inner.config.auth.allow_unauthenticated_users = false;
+        inner.config.service_routing = config();
+        let mut endpoint = endpoint();
+        endpoint.authorization_mode = ServiceAuthorizationMode::BearerPassthrough as i32;
+        state.store.put_message(&endpoint).await.unwrap();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sandbox-id".into(),
+                name: "my-sandbox".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    TokioIo::new(server_io),
+                    service_fn(|request: Request<hyper::body::Incoming>| async move {
+                        assert_eq!(request.method(), Method::POST);
+                        assert_eq!(request.uri().path(), "/app");
+                        assert!(!request.headers().contains_key(header::AUTHORIZATION));
+                        assert!(!request.headers().contains_key("x-forwarded-client-cert"));
+                        assert!(!request.headers().contains_key("cf-access-jwt-assertion"));
+                        let body = request.into_body().collect().await.unwrap().to_bytes();
+                        Ok::<_, std::convert::Infallible>(Response::new(Body::from(body)))
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+                .await
+                .unwrap();
+        let connection = tokio::spawn(connection);
+        sender.ready().await.unwrap();
+        state
+            .service_upstreams
+            .put(&upstream_pool_key("endpoint-id", 8080), sender);
+        let peer = ServicePeer {
+            identity: Some(Identity {
+                subject: "verified-user".into(),
+                display_name: None,
+                roles: vec![],
+                scopes: vec![],
+                provider: IdentityProvider::Mtls,
+            }),
+            ..Default::default()
+        };
+        let response = crate::http::http_router(state)
+            .layer(axum::Extension(peer))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/app")
+                    .header(
+                        header::ORIGIN,
+                        "https://default--my-sandbox--web.dev.openshell.localhost",
+                    )
+                    .header(
+                        header::HOST,
+                        "default--my-sandbox--web.dev.openshell.localhost",
+                    )
+                    .header("x-forwarded-client-cert", "forged-user")
+                    .header("cf-access-jwt-assertion", "edge-token")
+                    .body(Body::from("application-payload"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "application-payload"
+        );
+        connection.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gateway_bearer_and_browser_sessions_forward_only_application_credentials() {
+        use crate::auth::service_session::{
+            COOKIE, GATEWAY_AUTH,
+            tests::{browser_login, fixture},
+        };
+        use http_body_util::BodyExt;
+        use hyper::service::service_fn;
+        use tower::ServiceExt;
+        let (_issuer, state, token) = fixture().await;
+        let cookie = browser_login(&state, &token).await;
+        let mut endpoint = endpoint();
+        endpoint.sandbox = "demo".into();
+        endpoint.metadata.as_mut().unwrap().name = "demo--web".into();
+        endpoint.authorization_mode = ServiceAuthorizationMode::BearerPassthrough.into();
+        state.store.put_message(&endpoint).await.unwrap();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sandbox-id".into(),
+                name: "demo".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready.into());
+        state.store.put_message(&sandbox).await.unwrap();
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    TokioIo::new(server_io),
+                    service_fn(|request: Request<hyper::body::Incoming>| async move {
+                        assert_eq!(request.method(), Method::POST);
+                        assert_eq!(
+                            request.headers()[header::COOKIE],
+                            "application_session=app-cookie"
+                        );
+                        assert!(!request.headers().contains_key(GATEWAY_AUTH));
+                        assert!(!request.headers().contains_key("x-openshell-auth-source"));
+                        assert!(
+                            request
+                                .headers()
+                                .get(header::AUTHORIZATION)
+                                .is_none_or(|v| v == "Bearer application-token")
+                        );
+                        let body = request.into_body().collect().await.unwrap().to_bytes();
+                        let mut response = Response::new(Body::from(body));
+                        response.headers_mut().append(
+                            header::SET_COOKIE,
+                            "application_session=updated; HttpOnly".parse().unwrap(),
+                        );
+                        response.headers_mut().append(
+                            header::SET_COOKIE,
+                            format!("{COOKIE}=forged; Secure; HttpOnly; Path=/")
+                                .parse()
+                                .unwrap(),
+                        );
+                        Ok::<_, std::convert::Infallible>(response)
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+                .await
+                .unwrap();
+        let connection = tokio::spawn(connection);
+        sender.ready().await.unwrap();
+        state
+            .service_upstreams
+            .put(&upstream_pool_key("endpoint-id", 8080), sender);
+        for method in ["session", "separate-header", "authorization"] {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/application")
+                .header(header::HOST, "default--demo--web.services.example.com")
+                .header(
+                    header::ORIGIN,
+                    "https://default--demo--web.services.example.com",
+                )
+                .header("x-openshell-auth-source", "forged");
+            if method == "session" {
+                request = request
+                    .header(
+                        header::COOKIE,
+                        format!("{cookie}; application_session=app-cookie"),
+                    )
+                    .header(header::AUTHORIZATION, "Bearer application-token");
+            } else {
+                request = request.header(header::COOKIE, "application_session=app-cookie");
+                request = if method == "separate-header" {
+                    request
+                        .header(GATEWAY_AUTH, format!("Bearer {token}"))
+                        .header(header::AUTHORIZATION, "Bearer application-token")
+                } else {
+                    request.header(header::AUTHORIZATION, format!("Bearer {token}"))
+                };
+            }
+            let mut request = request.body(Body::from("payload")).unwrap();
+            request
+                .extensions_mut()
+                .insert(crate::auth::service_access::ServicePeer {
+                    secure: true,
+                    ..Default::default()
+                });
+            let response = crate::http::http_router(state.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{method}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .count(),
+                1
+            );
+            assert!(
+                response.headers()[header::SET_COOKIE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("application_session=")
+            );
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                "payload"
+            );
+        }
+        connection.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires OPENSHELL_BROWSER_E2E_CHROME and Node.js"]
+    async fn gateway_service_auth_real_browser_cross_site_login() {
+        use crate::auth::service_session::tests::fixture;
+        use http_body_util::BodyExt;
+        use hyper::service::service_fn;
+        let (_issuer, mut state, token) = fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        crate::tls_test_utils::generate_test_certs_with_ca(dir.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.config.bind_address = addr;
+        inner.config.tls = Some(openshell_core::TlsConfig {
+            cert_path: dir.path().join("server-cert.pem"),
+            key_path: dir.path().join("server-key.pem"),
+            client_ca_path: None,
+            require_client_auth: false,
+            external_cert_path: None,
+            external_key_path: None,
+            external_server_names: vec![],
+        });
+        let mut endpoint = endpoint();
+        endpoint.sandbox = "demo".into();
+        endpoint.metadata.as_mut().unwrap().name = "demo--web".into();
+        state.store.put_message(&endpoint).await.unwrap();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sandbox-id".into(),
+                name: "demo".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready.into());
+        state.store.put_message(&sandbox).await.unwrap();
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let application = tokio::spawn(async move {
+            hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(server_io),service_fn(|request:Request<hyper::body::Incoming>|async move {
+                assert!(!request.headers().contains_key(header::AUTHORIZATION));
+                assert!(request.headers().get(header::COOKIE).is_none_or(|v|!v.to_str().unwrap().contains("__Host-openshell-")));
+                let _=request.into_body().collect().await.unwrap();
+                let mut response=Response::new(Body::from("<!doctype html><title>Sandbox application</title><link rel=\"icon\" href=\"data:,\"><p id=\"application\">Application reached</p>"));
+                response.headers_mut().insert(header::CONTENT_TYPE,"text/html".parse().unwrap());
+                response.headers_mut().insert(header::SET_COOKIE,"application_session=app-cookie; Secure; HttpOnly; SameSite=Strict".parse().unwrap());
+                Ok::<_,std::convert::Infallible>(response)
+            })).await.unwrap();
+        });
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+                .await
+                .unwrap();
+        let connection = tokio::spawn(connection);
+        sender.ready().await.unwrap();
+        state
+            .service_upstreams
+            .put(&upstream_pool_key("endpoint-id", 8080), sender);
+        let acceptor = crate::TlsAcceptor::from_files(
+            &dir.path().join("server-cert.pem"),
+            &dir.path().join("server-key.pem"),
+            None,
+            false,
+            None,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let (shutdown, rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(crate::serve_gateway_listener(
+            crate::BoundGatewayListener {
+                listener,
+                address: addr,
+            },
+            crate::multiplex::MultiplexService::new(state),
+            Some(acceptor),
+            false,
+            rx,
+        ));
+        let mut child = tokio::process::Command::new("node")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/browser-service-auth.cjs"
+            ))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(&serde_json::to_vec(&serde_json::json!({"gateway":format!("https://gateway.example.test:{}",addr.port()),"application":format!("https://default--demo--web.services.example.com:{}",addr.port()),"token":token})).unwrap()).await.unwrap();
+        drop(stdin);
+        let output = tokio::time::timeout(Duration::from_secs(75), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = shutdown.send(true);
+        server.await.unwrap();
+        connection.abort();
+        application.abort();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("PASS browser cross-site login"));
+    }
+
     fn endpoint() -> ServiceEndpoint {
         ServiceEndpoint {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -1418,6 +1916,18 @@ mod tests {
         assert_eq!(
             endpoint_url(&cfg, "default", "my-sandbox", "web").as_deref(),
             Some("http://default--my-sandbox--web.dev.openshell.localhost:8080/")
+        );
+    }
+
+    #[test]
+    fn authenticated_gateway_url_preserves_tls_on_loopback() {
+        let mut cfg = openshell_core::Config::new(Some(tls_config()))
+            .with_bind_address("127.0.0.1:8080".parse().unwrap())
+            .with_server_sans(["*.dev.openshell.localhost"]);
+        cfg.supervisor_app_listener.enabled = true;
+        assert_eq!(
+            endpoint_url(&cfg, "default", "my-sandbox", "web").as_deref(),
+            Some("https://default--my-sandbox--web.dev.openshell.localhost:8080/")
         );
     }
 

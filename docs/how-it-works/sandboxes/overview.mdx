@@ -579,9 +579,15 @@ Pass an optional service name to create a named service URL:
 openshell service expose my-sandbox 8080 web
 ```
 
-OpenShell strips the incoming `Authorization` header by default. Opt a service
-into forwarding one valid bearer credential unchanged when the application
-performs its own authentication:
+Gateway-mediated requests require configured gateway authentication and workspace
+access whether the app listener is enabled or disabled. Gateway credentials are
+consumed before forwarding. Use a browser session, mTLS identity, or separate
+`X-OpenShell-Authorization` gateway header when the application also needs an
+`Authorization` header. See [sandbox service authentication](/how-it-works/gateways/authentication#sandbox-service-requests).
+Direct app-listener authentication belongs to the ingress provider.
+
+OpenShell strips application `Authorization` headers by default. Opt a service
+into forwarding one valid application bearer credential unchanged:
 
 ```shell
 openshell service expose my-sandbox 4500 \

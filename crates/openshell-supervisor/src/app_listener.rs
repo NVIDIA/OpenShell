@@ -805,6 +805,8 @@ fn gateway_header(name: &str) -> bool {
     matches!(
         name,
         "proxy-authorization"
+            | "x-openshell-authorization"
+            | "x-openshell-auth-source"
             | "cf-access-jwt-assertion"
             | "cf-access-authenticated-user-email"
             | "x-openshell-principal"
@@ -887,6 +889,10 @@ fn sanitize_headers(headers: &mut http::HeaderMap, passthrough: bool, websocket:
             cookie.split_once('=').is_some_and(|(name, _)| {
                 !name.trim().eq_ignore_ascii_case("CF_Authorization")
                     && !name.trim().eq_ignore_ascii_case("cf-authorization")
+                    && !name
+                        .trim()
+                        .to_ascii_lowercase()
+                        .starts_with("__host-openshell-")
             })
         })
         .map(str::trim)
@@ -1668,14 +1674,34 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert(
             header::COOKIE,
-            "app=session; CF_Authorization=secret".parse().unwrap(),
+            "app=session; CF_Authorization=secret; __Host-openshell-service-session=secret; __Host-openshell-service-login=secret".parse().unwrap(),
         );
         headers.insert("x-forwarded-client-cert", "secret".parse().unwrap());
+        headers.insert(
+            "x-openshell-authorization",
+            "Bearer secret".parse().unwrap(),
+        );
+        headers.insert("x-openshell-auth-source", "forged".parse().unwrap());
         headers.insert(header::CONNECTION, "x-internal".parse().unwrap());
         headers.insert("x-internal", "secret".parse().unwrap());
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer application-token".parse().unwrap(),
+        );
+        let mut passthrough = headers.clone();
+        assert!(sanitize_headers(&mut passthrough, true, false));
+        assert_eq!(
+            passthrough[header::AUTHORIZATION],
+            "Bearer application-token"
+        );
+        assert_eq!(passthrough[header::COOKIE], "app=session");
+        assert!(!passthrough.contains_key("x-openshell-authorization"));
         assert!(sanitize_headers(&mut headers, false, false));
+        assert!(!headers.contains_key(header::AUTHORIZATION));
         assert_eq!(headers[header::COOKIE], "app=session");
         assert!(!headers.contains_key("x-forwarded-client-cert"));
+        assert!(!headers.contains_key("x-openshell-authorization"));
+        assert!(!headers.contains_key("x-openshell-auth-source"));
         assert!(!headers.contains_key("x-internal"));
     }
     #[tokio::test]
