@@ -111,6 +111,7 @@ use provisioning_operation::ProvisioningOperationError;
 /// creation without expanding the public compute-driver protobuf contract.
 #[derive(Clone, Default)]
 pub struct SandboxCreateRuntimeInputs {
+    pub freeze_policy: bool,
     pub effective_policy: Option<ProtoSandboxPolicy>,
     pub launch_authentication: Option<Vec<u8>>,
 }
@@ -121,6 +122,7 @@ impl SandboxCreateRuntimeInputs {
         Self {
             effective_policy: Some(effective_policy),
             launch_authentication: None,
+            freeze_policy: false,
         }
     }
 }
@@ -1652,31 +1654,34 @@ impl ComputeRuntime {
                     .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
             )
         };
-        let result = self
-            .store
-            .put_if(
-                Sandbox::object_type(),
-                &sandbox_id,
-                sandbox.object_name(),
-                sandbox.object_workspace(),
-                &sandbox.encode_to_vec(),
-                labels_json.as_deref(),
-                WriteCondition::MustCreate,
-            )
-            .await
-            .map_err(|e| {
-                if matches!(
-                    e,
-                    crate::persistence::PersistenceError::UniqueViolation { .. }
-                ) {
-                    Status::already_exists(format!(
-                        "sandbox '{}' already exists",
-                        sandbox.object_name()
-                    ))
-                } else {
-                    Status::internal(format!("persist sandbox failed: {e}"))
-                }
-            })?;
+        let result = if runtime_inputs.freeze_policy {
+            self.store.create_frozen_sandbox(&sandbox).await
+        } else {
+            self.store
+                .put_if(
+                    Sandbox::object_type(),
+                    &sandbox_id,
+                    sandbox.object_name(),
+                    sandbox.object_workspace(),
+                    &sandbox.encode_to_vec(),
+                    labels_json.as_deref(),
+                    WriteCondition::MustCreate,
+                )
+                .await
+        }
+        .map_err(|e| {
+            if matches!(
+                e,
+                crate::persistence::PersistenceError::UniqueViolation { .. }
+            ) {
+                Status::already_exists(format!(
+                    "sandbox '{}' already exists",
+                    sandbox.object_name()
+                ))
+            } else {
+                Status::internal(format!("persist sandbox failed: {e}"))
+            }
+        })?;
         if let Some(metadata) = sandbox.metadata.as_mut() {
             metadata.resource_version = result.resource_version;
         }
@@ -5859,6 +5864,21 @@ impl ComputeRuntime {
                     terminal_delivery_finalized,
                 } => (false, None, None, terminal_delivery_finalized, false),
             };
+        // Frozen mode is creation-only and capture is monotone. A streamed
+        // acceptance may confirm a captured policy, but first acceptance must
+        // use the unary path that atomically captures its effective inputs.
+        if admission.is_some_and(|admission| {
+            admission.state
+                == i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
+        }) && self
+            .store
+            .get_sandbox_frozen_policy(sandbox_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some_and(|state| state.policy.is_none())
+        {
+            return Err("frozen sandbox must first accept configuration through ReportSandboxConfiguration before session acceptance".into());
+        }
         for attempt in 1..=SUPERVISOR_SESSION_CAS_RETRY_LIMIT {
             let Some(current) = existing else {
                 return Ok(());

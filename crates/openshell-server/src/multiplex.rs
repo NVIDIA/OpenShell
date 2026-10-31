@@ -17,6 +17,7 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use metrics::{counter, histogram};
+use openshell_core::proto::frozen_sandbox_policies_server::FrozenSandboxPoliciesServer;
 use openshell_core::proto::open_shell_server::OpenShellServer;
 use openshell_core::proto::sandbox_updates_server::SandboxUpdatesServer;
 use openshell_core::proto::supervisor_host::v1::supervisor_host_server::SupervisorHostServer;
@@ -313,6 +314,14 @@ impl MultiplexService {
             self.state.gateway_interceptors.clone(),
             Some(self.state.clone()),
         );
+        let frozen_policies =
+            FrozenSandboxPoliciesServer::new(OpenShellService::new(self.state.clone()))
+                .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+        let frozen_policies = GatewayInterceptorGrpcService::new(
+            frozen_policies,
+            self.state.gateway_interceptors.clone(),
+            Some(self.state.clone()),
+        );
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
@@ -320,7 +329,9 @@ impl MultiplexService {
         });
         let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
-            GrpcRouter::new(openshell, reflection).with_sandbox_updates(sandbox_updates),
+            GrpcRouter::new(openshell, reflection)
+                .with_sandbox_updates(sandbox_updates)
+                .with_frozen_policies(frozen_policies),
             authenticator_chain,
             authz_policy,
             self.state
@@ -997,10 +1008,11 @@ where
 
 /// Combined gRPC service for public gateway services and reflection.
 #[derive(Clone)]
-pub struct GrpcRouter<N, R, U = N> {
+pub struct GrpcRouter<N, R, U = N, F = N> {
     openshell: N,
     reflection: R,
     sandbox_updates: Option<U>,
+    frozen_policies: Option<F>,
 }
 
 impl<N, R> GrpcRouter<N, R> {
@@ -1009,6 +1021,7 @@ impl<N, R> GrpcRouter<N, R> {
             openshell,
             reflection,
             sandbox_updates: None,
+            frozen_policies: None,
         }
     }
 
@@ -1017,13 +1030,25 @@ impl<N, R> GrpcRouter<N, R> {
             openshell: self.openshell,
             reflection: self.reflection,
             sandbox_updates: Some(sandbox_updates),
+            frozen_policies: None,
+        }
+    }
+}
+
+impl<N, R, U> GrpcRouter<N, R, U> {
+    fn with_frozen_policies<F>(self, frozen_policies: F) -> GrpcRouter<N, R, U, F> {
+        GrpcRouter {
+            openshell: self.openshell,
+            reflection: self.reflection,
+            sandbox_updates: self.sandbox_updates,
+            frozen_policies: Some(frozen_policies),
         }
     }
 }
 
 pub const REFLECTION_PATH_PREFIX: &str = "/grpc.reflection.v1.";
 
-impl<N, R, U, B> tower::Service<Request<B>> for GrpcRouter<N, R, U>
+impl<N, R, U, F, B> tower::Service<Request<B>> for GrpcRouter<N, R, U, F>
 where
     N: tower::Service<Request<B>> + Clone + Send + 'static,
     N::Response: Send,
@@ -1039,6 +1064,11 @@ where
         + Send
         + 'static,
     U::Future: Send,
+    F: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
+        + Clone
+        + Send
+        + 'static,
+    F::Future: Send,
     B: Send + 'static,
 {
     type Response = N::Response;
@@ -1058,6 +1088,13 @@ where
             .path()
             .starts_with("/openshell.v1.SandboxUpdates/")
             && let Some(mut svc) = self.sandbox_updates.clone()
+        {
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        } else if req
+            .uri()
+            .path()
+            .starts_with("/openshell.v1.FrozenSandboxPolicies/")
+            && let Some(mut svc) = self.frozen_policies.clone()
         {
             Box::pin(async move { svc.ready().await?.call(req).await })
         } else {
@@ -2943,11 +2980,13 @@ mod tests {
             calls: calls.clone(),
         };
         let mut router = GrpcRouter::new(service("openshell"), service("reflection"))
-            .with_sandbox_updates(service("sandbox_updates"));
+            .with_sandbox_updates(service("sandbox_updates"))
+            .with_frozen_policies(service("frozen_policies"));
 
         for path in [
             "/openshell.v1.OpenShell/Health",
             "/openshell.v1.SandboxUpdates/UpdateSandbox",
+            "/openshell.v1.FrozenSandboxPolicies/GetConfig",
             "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
         ] {
             router
@@ -2963,7 +3002,12 @@ mod tests {
 
         assert_eq!(
             *calls.lock().unwrap(),
-            vec!["openshell", "sandbox_updates", "reflection"]
+            vec![
+                "openshell",
+                "sandbox_updates",
+                "frozen_policies",
+                "reflection"
+            ]
         );
     }
 
@@ -3062,7 +3106,11 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"]
+            vec![
+                "openshell.v1.OpenShell",
+                "openshell.v1.SandboxUpdates",
+                "openshell.v1.FrozenSandboxPolicies"
+            ]
         );
 
         let descriptor_response = responses.message().await.unwrap().unwrap();

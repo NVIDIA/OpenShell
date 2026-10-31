@@ -2727,7 +2727,11 @@ mod tests {
                 .iter()
                 .map(|service| service.name.as_str())
                 .collect::<Vec<_>>(),
-            ["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"]
+            [
+                "openshell.v1.OpenShell",
+                "openshell.v1.SandboxUpdates",
+                "openshell.v1.FrozenSandboxPolicies"
+            ]
         );
 
         stop_listener(shutdown, handle).await;

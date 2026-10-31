@@ -3751,3 +3751,237 @@ var SandboxUpdates_ServiceDesc = grpc.ServiceDesc{
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "openshell.proto",
 }
+
+const (
+	FrozenSandboxPolicies_CreateSandbox_FullMethodName      = "/openshell.v1.FrozenSandboxPolicies/CreateSandbox"
+	FrozenSandboxPolicies_GetPolicy_FullMethodName          = "/openshell.v1.FrozenSandboxPolicies/GetPolicy"
+	FrozenSandboxPolicies_GetConfig_FullMethodName          = "/openshell.v1.FrozenSandboxPolicies/GetConfig"
+	FrozenSandboxPolicies_UpdateGlobalConfig_FullMethodName = "/openshell.v1.FrozenSandboxPolicies/UpdateGlobalConfig"
+)
+
+// FrozenSandboxPoliciesClient is the client API for FrozenSandboxPolicies service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Opt-in frozen policy operations. Existing sandbox messages and the OpenShell
+// service retain their source shape on the 0.1.x release train.
+type FrozenSandboxPoliciesClient interface {
+	// Atomically choose frozen mode when creating a sandbox, including from a template.
+	CreateSandbox(ctx context.Context, in *CreateFrozenSandboxRequest, opts ...grpc.CallOption) (*FrozenSandboxResponse, error)
+	// Read the creation mode and first-accepted snapshot. An absent policy is pending.
+	GetPolicy(ctx context.Context, in *GetFrozenSandboxPolicyRequest, opts ...grpc.CallOption) (*FrozenSandboxPolicyState, error)
+	// Runtime delivery includes an explicit captured-policy signal without extending
+	// the stable PolicySource enum. Uncaptured policies retain normal startup behavior.
+	GetConfig(ctx context.Context, in *GetFrozenSandboxConfigRequest, opts ...grpc.CallOption) (*FrozenSandboxConfigResponse, error)
+	// Update gateway-global policy and report sandboxes retaining captured policy.
+	// global must be true; the ordinary UpdateConfig response remains unchanged.
+	UpdateGlobalConfig(ctx context.Context, in *UpdateFrozenGlobalConfigRequest, opts ...grpc.CallOption) (*UpdateFrozenGlobalConfigResponse, error)
+}
+
+type frozenSandboxPoliciesClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewFrozenSandboxPoliciesClient(cc grpc.ClientConnInterface) FrozenSandboxPoliciesClient {
+	return &frozenSandboxPoliciesClient{cc}
+}
+
+func (c *frozenSandboxPoliciesClient) CreateSandbox(ctx context.Context, in *CreateFrozenSandboxRequest, opts ...grpc.CallOption) (*FrozenSandboxResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FrozenSandboxResponse)
+	err := c.cc.Invoke(ctx, FrozenSandboxPolicies_CreateSandbox_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *frozenSandboxPoliciesClient) GetPolicy(ctx context.Context, in *GetFrozenSandboxPolicyRequest, opts ...grpc.CallOption) (*FrozenSandboxPolicyState, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FrozenSandboxPolicyState)
+	err := c.cc.Invoke(ctx, FrozenSandboxPolicies_GetPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *frozenSandboxPoliciesClient) GetConfig(ctx context.Context, in *GetFrozenSandboxConfigRequest, opts ...grpc.CallOption) (*FrozenSandboxConfigResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FrozenSandboxConfigResponse)
+	err := c.cc.Invoke(ctx, FrozenSandboxPolicies_GetConfig_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *frozenSandboxPoliciesClient) UpdateGlobalConfig(ctx context.Context, in *UpdateFrozenGlobalConfigRequest, opts ...grpc.CallOption) (*UpdateFrozenGlobalConfigResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateFrozenGlobalConfigResponse)
+	err := c.cc.Invoke(ctx, FrozenSandboxPolicies_UpdateGlobalConfig_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// FrozenSandboxPoliciesServer is the server API for FrozenSandboxPolicies service.
+// All implementations must embed UnimplementedFrozenSandboxPoliciesServer
+// for forward compatibility.
+//
+// Opt-in frozen policy operations. Existing sandbox messages and the OpenShell
+// service retain their source shape on the 0.1.x release train.
+type FrozenSandboxPoliciesServer interface {
+	// Atomically choose frozen mode when creating a sandbox, including from a template.
+	CreateSandbox(context.Context, *CreateFrozenSandboxRequest) (*FrozenSandboxResponse, error)
+	// Read the creation mode and first-accepted snapshot. An absent policy is pending.
+	GetPolicy(context.Context, *GetFrozenSandboxPolicyRequest) (*FrozenSandboxPolicyState, error)
+	// Runtime delivery includes an explicit captured-policy signal without extending
+	// the stable PolicySource enum. Uncaptured policies retain normal startup behavior.
+	GetConfig(context.Context, *GetFrozenSandboxConfigRequest) (*FrozenSandboxConfigResponse, error)
+	// Update gateway-global policy and report sandboxes retaining captured policy.
+	// global must be true; the ordinary UpdateConfig response remains unchanged.
+	UpdateGlobalConfig(context.Context, *UpdateFrozenGlobalConfigRequest) (*UpdateFrozenGlobalConfigResponse, error)
+	mustEmbedUnimplementedFrozenSandboxPoliciesServer()
+}
+
+// UnimplementedFrozenSandboxPoliciesServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedFrozenSandboxPoliciesServer struct{}
+
+func (UnimplementedFrozenSandboxPoliciesServer) CreateSandbox(context.Context, *CreateFrozenSandboxRequest) (*FrozenSandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateSandbox not implemented")
+}
+func (UnimplementedFrozenSandboxPoliciesServer) GetPolicy(context.Context, *GetFrozenSandboxPolicyRequest) (*FrozenSandboxPolicyState, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetPolicy not implemented")
+}
+func (UnimplementedFrozenSandboxPoliciesServer) GetConfig(context.Context, *GetFrozenSandboxConfigRequest) (*FrozenSandboxConfigResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetConfig not implemented")
+}
+func (UnimplementedFrozenSandboxPoliciesServer) UpdateGlobalConfig(context.Context, *UpdateFrozenGlobalConfigRequest) (*UpdateFrozenGlobalConfigResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateGlobalConfig not implemented")
+}
+func (UnimplementedFrozenSandboxPoliciesServer) mustEmbedUnimplementedFrozenSandboxPoliciesServer() {}
+func (UnimplementedFrozenSandboxPoliciesServer) testEmbeddedByValue()                               {}
+
+// UnsafeFrozenSandboxPoliciesServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to FrozenSandboxPoliciesServer will
+// result in compilation errors.
+type UnsafeFrozenSandboxPoliciesServer interface {
+	mustEmbedUnimplementedFrozenSandboxPoliciesServer()
+}
+
+func RegisterFrozenSandboxPoliciesServer(s grpc.ServiceRegistrar, srv FrozenSandboxPoliciesServer) {
+	// If the following call panics, it indicates UnimplementedFrozenSandboxPoliciesServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&FrozenSandboxPolicies_ServiceDesc, srv)
+}
+
+func _FrozenSandboxPolicies_CreateSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateFrozenSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FrozenSandboxPoliciesServer).CreateSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FrozenSandboxPolicies_CreateSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FrozenSandboxPoliciesServer).CreateSandbox(ctx, req.(*CreateFrozenSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FrozenSandboxPolicies_GetPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetFrozenSandboxPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FrozenSandboxPoliciesServer).GetPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FrozenSandboxPolicies_GetPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FrozenSandboxPoliciesServer).GetPolicy(ctx, req.(*GetFrozenSandboxPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FrozenSandboxPolicies_GetConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetFrozenSandboxConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FrozenSandboxPoliciesServer).GetConfig(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FrozenSandboxPolicies_GetConfig_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FrozenSandboxPoliciesServer).GetConfig(ctx, req.(*GetFrozenSandboxConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FrozenSandboxPolicies_UpdateGlobalConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateFrozenGlobalConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FrozenSandboxPoliciesServer).UpdateGlobalConfig(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FrozenSandboxPolicies_UpdateGlobalConfig_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FrozenSandboxPoliciesServer).UpdateGlobalConfig(ctx, req.(*UpdateFrozenGlobalConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// FrozenSandboxPolicies_ServiceDesc is the grpc.ServiceDesc for FrozenSandboxPolicies service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var FrozenSandboxPolicies_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "openshell.v1.FrozenSandboxPolicies",
+	HandlerType: (*FrozenSandboxPoliciesServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "CreateSandbox",
+			Handler:    _FrozenSandboxPolicies_CreateSandbox_Handler,
+		},
+		{
+			MethodName: "GetPolicy",
+			Handler:    _FrozenSandboxPolicies_GetPolicy_Handler,
+		},
+		{
+			MethodName: "GetConfig",
+			Handler:    _FrozenSandboxPolicies_GetConfig_Handler,
+		},
+		{
+			MethodName: "UpdateGlobalConfig",
+			Handler:    _FrozenSandboxPolicies_UpdateGlobalConfig_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "openshell.proto",
+}

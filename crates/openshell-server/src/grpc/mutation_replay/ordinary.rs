@@ -197,6 +197,13 @@ pub(in crate::grpc) enum Outcome {
         skipped: u32,
         cleared: u32,
     },
+    FrozenGlobalConfig {
+        version: u32,
+        policy_hash: String,
+        settings_revision: u64,
+        deleted: bool,
+        frozen_sandboxes: Vec<String>,
+    },
     Refresh(Refresh),
 }
 
@@ -473,6 +480,95 @@ scoped_mutation!(
             service_urls,
         })
     }
+);
+mutation!(
+    openshell_core::proto::CreateFrozenSandboxRequest,
+    openshell_core::proto::FrozenSandboxResponse,
+    "CreateFrozenSandbox",
+    crate::grpc::frozen_policy::handle_create,
+    async |req: &openshell_core::proto::CreateFrozenSandboxRequest,
+           state: &ServerState,
+           principal: &Principal| {
+        selected_scope(
+            state,
+            principal,
+            req.workspace_scope.as_ref(),
+            MinWorkspaceRole::User,
+        )
+        .await
+    },
+    |response: &Response<openshell_core::proto::FrozenSandboxResponse>| sandbox_receipt(
+        response.get_ref().sandbox.as_ref(),
+        false,
+        response.get_ref().service_urls.clone(),
+    ),
+    async |store: &Store, outcome: Outcome| {
+        let Outcome::Sandbox {
+            id, service_urls, ..
+        } = outcome
+        else {
+            return Err(replay_unavailable());
+        };
+        let sandbox: Sandbox = live(store, &id).await?;
+        let frozen_policy = crate::grpc::frozen_policy::state_for(store, &id).await?;
+        if !frozen_policy.requested {
+            return Err(replay_unavailable());
+        }
+        Ok(openshell_core::proto::FrozenSandboxResponse {
+            sandbox: Some(sandbox),
+            frozen_policy: Some(frozen_policy),
+            service_urls,
+        })
+    },
+    "/openshell.v1.FrozenSandboxPolicies/CreateSandbox"
+);
+mutation!(
+    openshell_core::proto::UpdateFrozenGlobalConfigRequest,
+    openshell_core::proto::UpdateFrozenGlobalConfigResponse,
+    "UpdateFrozenGlobalConfig",
+    crate::grpc::frozen_policy::handle_update_global,
+    async |req: &openshell_core::proto::UpdateFrozenGlobalConfigRequest,
+           state: &ServerState,
+           principal: &Principal| {
+        crate::grpc::frozen_policy::validate_global_request(req)?;
+        global_scope(state, principal)
+    },
+    |response: &Response<openshell_core::proto::UpdateFrozenGlobalConfigResponse>| {
+        if !facts(response)?.global {
+            return Err(uncertain());
+        }
+        let update = response.get_ref().update.as_ref().ok_or_else(uncertain)?;
+        Ok(Outcome::FrozenGlobalConfig {
+            version: update.version,
+            policy_hash: update.policy_hash.clone(),
+            settings_revision: update.settings_revision,
+            deleted: update.deleted,
+            frozen_sandboxes: response.get_ref().frozen_sandboxes.clone(),
+        })
+    },
+    async |_store: &Store, outcome: Outcome| {
+        let Outcome::FrozenGlobalConfig {
+            version,
+            policy_hash,
+            settings_revision,
+            deleted,
+            frozen_sandboxes,
+        } = outcome
+        else {
+            return Err(replay_unavailable());
+        };
+        Ok(openshell_core::proto::UpdateFrozenGlobalConfigResponse {
+            update: Some(UpdateConfigResponse {
+                version,
+                policy_hash,
+                settings_revision,
+                deleted,
+                annotations: HashMap::new(),
+            }),
+            frozen_sandboxes,
+        })
+    },
+    "/openshell.v1.FrozenSandboxPolicies/UpdateGlobalConfig"
 );
 sandbox_mutation!(
     openshell_core::proto::UpdateSandboxRequest,

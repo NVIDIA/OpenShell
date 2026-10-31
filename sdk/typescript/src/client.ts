@@ -19,6 +19,8 @@ import { type CallOptions, type Client, Code, createClient, type Transport } fro
 import { errorCode, fromConnect, SdkError } from './errors.js';
 import type { Provider, WorkspaceSelectorSchema } from './gen/datamodel_pb.js';
 import type {
+  FrozenSandboxPolicyState,
+  FrozenSandboxResponse,
   Sandbox,
   SandboxLogLine,
   SandboxStreamEvent,
@@ -28,6 +30,7 @@ import type {
 } from './gen/openshell_pb.js';
 import {
   type ExecSandboxInputSchema,
+  FrozenSandboxPolicies,
   OpenShell,
   ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
   SandboxPhase,
@@ -564,6 +567,36 @@ export interface UpdateConfigResult {
   deleted: boolean;
 }
 
+/** Immutable accepted policy, exposed without changing ordinary sandbox references. */
+export interface FrozenSandboxPolicy {
+  policy?: SandboxPolicy;
+  version: number;
+  policyHash: string;
+  frozenAtMs?: number;
+  policySource: PolicySourceName;
+  globalPolicyVersion: number;
+}
+
+/** A requested freeze is pending until policy is present. */
+export interface FrozenPolicyState {
+  requested: boolean;
+  policy?: FrozenSandboxPolicy;
+}
+
+export interface FrozenGlobalConfigUpdateSpec {
+  policy?: MessageInitShape<typeof SandboxPolicySchema>;
+  settingKey?: string;
+  settingValue?: MessageInitShape<typeof SettingValueSchema>;
+  deleteSetting?: boolean;
+  requestId?: string;
+}
+
+/** Result of the optional global update operation, including frozen exceptions. */
+export interface FrozenGlobalConfigUpdate {
+  update: UpdateConfigResult;
+  frozenSandboxes: string[];
+}
+
 // ---- enum → lowercase string -----------------------------------------------
 
 // Exported for the enum-name drift test only; not re-exported from index.ts, so
@@ -699,6 +732,86 @@ function updateConfigResult(resp: UpdateConfigResponse): UpdateConfigResult {
     policyHash: resp.policyHash,
     settingsRevision: resp.settingsRevision.toString(),
     deleted: resp.deleted,
+  };
+}
+
+function frozenPolicyState(state: FrozenSandboxPolicyState): FrozenPolicyState {
+  const policy = state.policy;
+  return {
+    requested: state.requested,
+    policy: policy
+      ? {
+          policy: policy.policy,
+          version: policy.version,
+          policyHash: policy.policyHash,
+          frozenAtMs: timestampEpochMs(policy.frozenTime),
+          policySource: POLICY_SOURCE_NAMES[policy.policySource] ?? 'unspecified',
+          globalPolicyVersion: policy.globalPolicyVersion,
+        }
+      : undefined,
+  };
+}
+
+function frozenSandboxFromResponse(response: FrozenSandboxResponse): SandboxRef {
+  const sandbox = sandboxRef(response.sandbox, response.serviceUrls);
+  if (!response.frozenPolicy?.requested) {
+    throw new SdkError(
+      'invalid_config',
+      `gateway did not acknowledge frozen creation for sandbox '${sandbox.name}' (ID '${sandbox.id}', workspace '${sandbox.workspace}'); remove the sandbox before retrying`,
+    );
+  }
+  return sandbox;
+}
+
+function createSandboxRequest(
+  spec: SandboxSpec,
+): Omit<MessageInitShape<typeof OpenShell.method.createSandbox.input>, '$typeName'> {
+  const specInit: MessageInitShape<typeof SandboxSpecSchema> = {
+    environment: spec.environment ?? {},
+    providers: spec.providers ?? [],
+    template: spec.image ? { image: spec.image } : undefined,
+    resourceRequirements: spec.gpu ? { gpu: {} } : undefined,
+    policy: spec.policy,
+    command: spec.command ?? [],
+    tty: spec.tty ?? false,
+    restartPolicy: restartPolicyValue(spec.restartPolicy),
+  };
+  if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
+  return {
+    workspaceScope: workspaceScope(spec),
+    name: spec.name ?? '',
+    labels: spec.labels ?? {},
+    spec: specInit,
+    serviceExposures:
+      spec.serviceExposures?.map((exposure) => ({
+        service: exposure.service ?? '',
+        targetPort: exposure.targetPort,
+        authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
+      })) ?? [],
+  };
+}
+
+function createSandboxTemplateRequest(
+  spec: SandboxFromTemplateSpec,
+): Omit<MessageInitShape<typeof OpenShell.method.createSandbox.input>, '$typeName'> {
+  if (spec.workloadTemplate.trim() === '') throw new SdkError('invalid_config', 'workloadTemplate is required');
+  return {
+    workspaceScope: workspaceScope(spec),
+    name: spec.name ?? '',
+    labels: spec.labels ?? {},
+    spec: {
+      providers: spec.providers ?? [],
+      command: spec.command ?? [],
+      tty: spec.tty ?? false,
+      policy: spec.policy,
+    },
+    workloadTemplate: spec.workloadTemplate,
+    serviceExposures:
+      spec.serviceExposures?.map((exposure) => ({
+        service: exposure.service ?? '',
+        targetPort: exposure.targetPort,
+        authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
+      })) ?? [],
   };
 }
 
@@ -1183,6 +1296,7 @@ export class SandboxTemplateClient {
 // transport (one connection) across all of its scoped clients.
 export class SandboxClient {
   private readonly grpc: Client<typeof OpenShell>;
+  private readonly frozenGrpc: Client<typeof FrozenSandboxPolicies>;
 
   /**
    * Advanced escape hatch: a generated client for every gateway RPC, including
@@ -1200,6 +1314,44 @@ export class SandboxClient {
     this.transport = transport;
     this.grpc = grpc;
     this.raw = this.grpc;
+    this.frozenGrpc = createClient(FrozenSandboxPolicies, transport);
+  }
+
+  /** Create through the optional frozen-policy service; never fall back to ordinary creation. */
+  async createFrozen(spec: SandboxSpec): Promise<SandboxRef> {
+    try {
+      return frozenSandboxFromResponse(await this.frozenGrpc.createSandbox(createSandboxRequest(spec)));
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
+  }
+
+  async createFrozenFromTemplate(spec: SandboxFromTemplateSpec): Promise<SandboxRef> {
+    try {
+      return frozenSandboxFromResponse(await this.frozenGrpc.createSandbox(createSandboxTemplateRequest(spec)));
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
+  }
+
+  async getFrozenPolicy(name: string, options?: SandboxCallOptions | null): Promise<FrozenPolicyState> {
+    try {
+      return frozenPolicyState(
+        await this.frozenGrpc.getPolicy(namedTarget(name, options), requestCallOptions(options)),
+      );
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
+  }
+
+  async updateGlobalConfig(update: FrozenGlobalConfigUpdateSpec): Promise<FrozenGlobalConfigUpdate> {
+    try {
+      const response = await this.frozenGrpc.updateGlobalConfig({ ...update, global: true });
+      if (!response.update) throw new SdkError('invalid_config', 'global update result missing from gateway response');
+      return { update: updateConfigResult(response.update), frozenSandboxes: [...response.frozenSandboxes] };
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
   }
 
   /**
@@ -1212,62 +1364,18 @@ export class SandboxClient {
 
   async create(spec: SandboxSpec): Promise<SandboxRef> {
     try {
-      // Curated fields build the base spec; rawSpec then shallow-overrides at
-      // the top spec level (Object.assign, so any field it sets wins). The
-      // runtime assign avoids the generated $typeName upgrading the literal and
-      // rejecting the curated `template: { image }` init shorthand.
-      const specInit: MessageInitShape<typeof SandboxSpecSchema> = {
-        environment: spec.environment ?? {},
-        providers: spec.providers ?? [],
-        template: spec.image ? { image: spec.image } : undefined,
-        resourceRequirements: spec.gpu ? { gpu: {} } : undefined,
-        policy: spec.policy,
-        command: spec.command ?? [],
-        tty: spec.tty ?? false,
-        restartPolicy: restartPolicyValue(spec.restartPolicy),
-      };
-      if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
-
-      const resp = await this.grpc.createSandbox({
-        workspaceScope: workspaceScope(spec),
-        name: spec.name ?? '',
-        labels: spec.labels ?? {},
-        spec: specInit,
-        serviceExposures:
-          spec.serviceExposures?.map((exposure) => ({
-            service: exposure.service ?? '',
-            targetPort: exposure.targetPort,
-            authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
-          })) ?? [],
-      });
-      return sandboxRef(resp.sandbox, resp.serviceUrls);
+      const response = await this.grpc.createSandbox(createSandboxRequest(spec));
+      return sandboxRef(response.sandbox, response.serviceUrls);
     } catch (e) {
       throw fromConnect(e);
     }
   }
 
   async createFromTemplate(spec: SandboxFromTemplateSpec): Promise<SandboxRef> {
-    if (spec.workloadTemplate.trim() === '') throw new SdkError('invalid_config', 'workloadTemplate is required');
+    const request = createSandboxTemplateRequest(spec);
     try {
-      const resp = await this.grpc.createSandbox({
-        workspaceScope: workspaceScope(spec),
-        name: spec.name ?? '',
-        labels: spec.labels ?? {},
-        spec: {
-          providers: spec.providers ?? [],
-          command: spec.command ?? [],
-          tty: spec.tty ?? false,
-          policy: spec.policy,
-        },
-        workloadTemplate: spec.workloadTemplate,
-        serviceExposures:
-          spec.serviceExposures?.map((exposure) => ({
-            service: exposure.service ?? '',
-            targetPort: exposure.targetPort,
-            authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
-          })) ?? [],
-      });
-      return sandboxRef(resp.sandbox, resp.serviceUrls);
+      const response = await this.grpc.createSandbox(request);
+      return sandboxRef(response.sandbox, response.serviceUrls);
     } catch (e) {
       throw fromConnect(e);
     }

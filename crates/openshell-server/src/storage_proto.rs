@@ -20,6 +20,11 @@ mod sandbox_image {
 }
 pub(crate) use sandbox_image::{StoredSandboxImageState, StoredSandboxImageUpdate};
 
+mod frozen_policy {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.frozen.v1.rs"));
+}
+pub(crate) use frozen_policy::StoredFrozenSandboxPolicy;
+
 pub(crate) const STORAGE_FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/storage_descriptor.bin"));
 
@@ -161,6 +166,9 @@ mod tests {
     // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
     // closures and TokenGrantStatus to public reports. Older rows have no grant
     // record; absent report extensions retain compatibility without a rewrite.
+    // Frozen mode and first-accepted policy live in a separate private record;
+    // existing public SandboxSpec/Status and storage.v1 retain their source shape.
+    // The private snapshot holds no credential values or handles.
     // Supervisor middleware binding policy and selectors are public-only. An
     // absent policy preserves dynamic discovery; older supervisors ignore both fields.
     // Suspend/resume adds two public request messages without durable request
@@ -178,11 +186,11 @@ mod tests {
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "be99bb3fcc7894eb85d774f54b642173e70dd37bc8e5fcaf3fdff2454ae689e1";
+        "50685228fd583a635c7372c56c461ea592d47fcd9679f93462b30287b6f36888";
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "c7a86a700ab2beb5479b769fbe3b154f5dbbcc7bf6a7ca22845d4730bd18147c";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
+        "53f3864940fe0e829a1ae129fb35e379d5ab7010b738169f617a990c678bca51";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -230,6 +238,12 @@ mod tests {
     const PEER_CONFIG_RPC_SIGNATURES: [&str; 1] = [
         "openshell.v1.OpenShell/PeerNotifyConfigUpdate|.openshell.v1.PeerNotifyConfigUpdateRequest|.openshell.v1.PeerNotifyConfigUpdateResponse|false|false",
     ];
+    const FROZEN_POLICY_RPC_SIGNATURES: &[&str] = &[
+        "openshell.v1.FrozenSandboxPolicies/CreateSandbox|.openshell.v1.CreateFrozenSandboxRequest|.openshell.v1.FrozenSandboxResponse|false|false",
+        "openshell.v1.FrozenSandboxPolicies/GetPolicy|.openshell.v1.GetFrozenSandboxPolicyRequest|.openshell.v1.FrozenSandboxPolicyState|false|false",
+        "openshell.v1.FrozenSandboxPolicies/GetConfig|.openshell.v1.GetFrozenSandboxConfigRequest|.openshell.v1.FrozenSandboxConfigResponse|false|false",
+        "openshell.v1.FrozenSandboxPolicies/UpdateGlobalConfig|.openshell.v1.UpdateFrozenGlobalConfigRequest|.openshell.v1.UpdateFrozenGlobalConfigResponse|false|false",
+    ];
     // Synthetic SandboxSpec bytes with log level, provider, and command fields,
     // emitted before the gateway-owned attachment epoch field was introduced.
     const PRE_READINESS_SANDBOX_SPEC: &str =
@@ -244,6 +258,7 @@ mod tests {
         ".openshell.storage.v1.StoredProviderCredentialRefreshStateV2",
         ".openshell.storage.v1.StoredProviderProfile",
         ".openshell.storage.image.v1.StoredSandboxImageState",
+        ".openshell.storage.frozen.v1.StoredFrozenSandboxPolicy",
         ".openshell.v1.Sandbox",
         ".openshell.v1.SandboxWorkloadTemplate",
         ".openshell.v1.ServiceEndpoint",
@@ -596,8 +611,10 @@ mod tests {
                 }
                 if !matches!(
                     (package, service_name),
-                    ("openshell.v1", "OpenShell" | "SandboxUpdates")
-                        | ("openshell.inference.v1", "Inference")
+                    (
+                        "openshell.v1",
+                        "OpenShell" | "SandboxUpdates" | "FrozenSandboxPolicies"
+                    ) | ("openshell.inference.v1", "Inference")
                 ) {
                     continue;
                 }
@@ -650,6 +667,12 @@ mod tests {
                 "peer config RPC is missing or changed: {signature}"
             );
         }
+        for signature in FROZEN_POLICY_RPC_SIGNATURES {
+            assert!(
+                methods.iter().any(|method| method == signature),
+                "frozen policy RPC is missing or changed: {signature}"
+            );
+        }
         assert_eq!(
             compiled_method_count,
             108 + PROVIDER_READINESS_RPC_SIGNATURES.len()
@@ -657,14 +680,16 @@ mod tests {
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
                 + sandbox_protocol_methods.len()
-                + supervisor_host_methods.len(),
+                + supervisor_host_methods.len()
+                + FROZEN_POLICY_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
             81 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
-                + PEER_CONFIG_RPC_SIGNATURES.len(),
+                + PEER_CONFIG_RPC_SIGNATURES.len()
+                + FROZEN_POLICY_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -723,9 +748,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (334, 31),
-                (100, 22),
-                (86, 22),
+                (350, 31),
+                (105, 22),
+                (90, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256

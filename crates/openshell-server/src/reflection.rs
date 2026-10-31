@@ -28,7 +28,11 @@ use openshell_core::Config;
 use crate::multiplex::GrpcRateLimiter;
 
 const REFLECTED_PROTO_ROOTS: &[&str] = &["openshell.proto"];
-const ADVERTISED_SERVICES: &[&str] = &["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"];
+const ADVERTISED_SERVICES: &[&str] = &[
+    "openshell.v1.OpenShell",
+    "openshell.v1.SandboxUpdates",
+    "openshell.v1.FrozenSandboxPolicies",
+];
 
 pub type GatewayReflectionServer = ServerReflectionServer<GatewayReflectionService>;
 

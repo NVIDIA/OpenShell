@@ -1260,6 +1260,110 @@ async fn fetch_settings_snapshot_with_client(
     Ok(settings_poll_result(response.into_inner()))
 }
 
+/// Runtime configuration paired with its authoritative frozen-policy state.
+/// Existing polling results retain their source-compatible shape.
+#[derive(Clone, Debug)]
+pub struct FrozenSettingsPollResult {
+    pub snapshot: SettingsPollResult,
+    pub frozen: bool,
+    pub frozen_requested: bool,
+}
+
+impl From<SettingsPollResult> for FrozenSettingsPollResult {
+    fn from(snapshot: SettingsPollResult) -> Self {
+        Self {
+            snapshot,
+            frozen: false,
+            frozen_requested: false,
+        }
+    }
+}
+
+impl std::ops::Deref for FrozenSettingsPollResult {
+    type Target = SettingsPollResult;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+impl std::ops::DerefMut for FrozenSettingsPollResult {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.snapshot
+    }
+}
+
+async fn fetch_frozen_snapshot_on_channel(
+    channel: AuthedChannel,
+    sandbox: &str,
+    workspace: Option<&str>,
+) -> Result<FrozenSettingsPollResult> {
+    use crate::proto::frozen_sandbox_policies_client::FrozenSandboxPoliciesClient;
+
+    let response = FrozenSandboxPoliciesClient::new(channel.clone())
+        .get_config(crate::proto::GetFrozenSandboxConfigRequest {
+            workspace_scope: workspace.map(crate::proto::workspace_selector),
+            name: sandbox.to_string(),
+        })
+        .await;
+    match response {
+        Ok(response) => {
+            let response = response.into_inner();
+            let config = response.config.ok_or_else(|| {
+                miette::miette!("gateway returned no frozen-policy configuration snapshot")
+            })?;
+            if response.frozen && !response.frozen_requested {
+                return Err(miette::miette!(
+                    "gateway returned inconsistent frozen-policy state"
+                ));
+            }
+            Ok(FrozenSettingsPollResult {
+                snapshot: settings_poll_result(config),
+                frozen: response.frozen,
+                frozen_requested: response.frozen_requested,
+            })
+        }
+        Err(status) if status.code() == tonic::Code::Unimplemented => {
+            // Older gateways cannot create frozen sandboxes. Preserve ordinary
+            // startup against them; errors from a supporting gateway fail closed.
+            fetch_settings_snapshot_with_client(
+                &mut OpenShellClient::new(channel),
+                sandbox,
+                workspace,
+            )
+            .await
+            .map(Into::into)
+        }
+        Err(status) => Err(grpc_status_error(status)),
+    }
+}
+
+/// Fetch runtime configuration and freeze state without extending old messages.
+pub async fn fetch_frozen_settings_snapshot(
+    gateway: &GatewayEndpoint,
+    sandbox: &str,
+) -> Result<FrozenSettingsPollResult> {
+    fetch_frozen_snapshot_on_channel(connect_channel(gateway).await?, sandbox, None).await
+}
+
+/// Sync an initialization policy and retain the freeze signal on the same channel.
+pub async fn sync_policy_and_fetch_frozen_snapshot(
+    gateway: &GatewayEndpoint,
+    sandbox: &str,
+    policy: &ProtoSandboxPolicy,
+    workspace: &str,
+) -> Result<FrozenSettingsPollResult> {
+    let channel = connect_channel(gateway).await?;
+    sync_policy_with_client(
+        &mut OpenShellClient::new(channel.clone()),
+        sandbox,
+        policy,
+        workspace,
+    )
+    .await?;
+    fetch_frozen_snapshot_on_channel(channel, sandbox, Some(workspace)).await
+}
+
 fn learned_workspace_selector(workspace: Option<&str>) -> Option<crate::proto::WorkspaceSelector> {
     workspace.map(crate::proto::workspace_selector)
 }
@@ -2441,5 +2545,207 @@ impl CachedOpenShellClient {
             .into_diagnostic()?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod frozen_snapshot_tests {
+    use super::*;
+    use crate::proto::frozen_sandbox_policies_server::{
+        FrozenSandboxPolicies, FrozenSandboxPoliciesServer,
+    };
+    use crate::proto::{
+        CreateFrozenSandboxRequest, FrozenSandboxConfigResponse, FrozenSandboxPolicyState,
+        FrozenSandboxResponse, GetFrozenSandboxConfigRequest, GetFrozenSandboxPolicyRequest,
+        UpdateFrozenGlobalConfigRequest, UpdateFrozenGlobalConfigResponse,
+    };
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::codegen::http;
+    use tonic::{Request, Response, Status};
+
+    #[derive(Clone)]
+    struct FrozenConfigService {
+        response: std::result::Result<FrozenSandboxConfigResponse, Status>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl FrozenSandboxPolicies for FrozenConfigService {
+        async fn create_sandbox(
+            &self,
+            _: Request<CreateFrozenSandboxRequest>,
+        ) -> std::result::Result<Response<FrozenSandboxResponse>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+        async fn get_policy(
+            &self,
+            _: Request<GetFrozenSandboxPolicyRequest>,
+        ) -> std::result::Result<Response<FrozenSandboxPolicyState>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+        async fn update_global_config(
+            &self,
+            _: Request<UpdateFrozenGlobalConfigRequest>,
+        ) -> std::result::Result<Response<UpdateFrozenGlobalConfigResponse>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+        async fn get_config(
+            &self,
+            request: Request<GetFrozenSandboxConfigRequest>,
+        ) -> std::result::Result<Response<FrozenSandboxConfigResponse>, Status> {
+            assert_eq!(
+                request.metadata().get("authorization").unwrap(),
+                "Bearer test-token"
+            );
+            assert_eq!(request.get_ref().name, "sandbox");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.response.clone().map(Response::new)
+        }
+    }
+
+    // A real tonic unary endpoint for the one legacy method this projection
+    // uses, without implementing unrelated OpenShell operations in the fixture.
+    #[derive(Clone)]
+    struct LegacyConfigService(Arc<AtomicUsize>);
+    impl tonic::server::NamedService for LegacyConfigService {
+        const NAME: &'static str = "openshell.v1.OpenShell";
+    }
+    impl tonic::codegen::Service<http::Request<tonic::body::Body>> for LegacyConfigService {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = Infallible;
+        type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<std::result::Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+            let calls = self.0.clone();
+            Box::pin(async move {
+                struct GetConfig(Arc<AtomicUsize>);
+                impl tonic::server::UnaryService<GetSandboxConfigRequest> for GetConfig {
+                    type Response = crate::proto::GetSandboxConfigResponse;
+                    type Future =
+                        std::future::Ready<std::result::Result<Response<Self::Response>, Status>>;
+                    fn call(&mut self, request: Request<GetSandboxConfigRequest>) -> Self::Future {
+                        assert_eq!(
+                            request.metadata().get("authorization").unwrap(),
+                            "Bearer test-token"
+                        );
+                        assert_eq!(request.get_ref().name, "sandbox");
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Ok(Response::new(
+                            crate::proto::GetSandboxConfigResponse {
+                                version: 3,
+                                policy_hash: "legacy".into(),
+                                workspace: "default".into(),
+                                ..Default::default()
+                            },
+                        )))
+                    }
+                }
+                assert_eq!(
+                    request.uri().path(),
+                    "/openshell.v1.OpenShell/GetSandboxConfig"
+                );
+                Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                    .unary(GetConfig(calls), request)
+                    .await)
+            })
+        }
+    }
+
+    async fn gateway(
+        response: Option<std::result::Result<FrozenSandboxConfigResponse, Status>>,
+    ) -> (GatewayEndpoint, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let legacy = Arc::new(AtomicUsize::new(0));
+        let frozen = Arc::new(AtomicUsize::new(0));
+        let router = tonic::transport::Server::builder()
+            .tcp_nodelay(true)
+            .add_service(LegacyConfigService(legacy.clone()));
+        if let Some(response) = response {
+            tokio::spawn(
+                router
+                    .add_service(FrozenSandboxPoliciesServer::new(FrozenConfigService {
+                        response,
+                        calls: frozen.clone(),
+                    }))
+                    .serve_with_incoming(TcpListenerStream::new(listener)),
+            );
+        } else {
+            tokio::spawn(router.serve_with_incoming(TcpListenerStream::new(listener)));
+        }
+        (
+            GatewayEndpoint::new(
+                endpoint,
+                GatewayCredentials::from_gateway_token("test-token").unwrap(),
+            ),
+            legacy,
+            frozen,
+        )
+    }
+
+    #[tokio::test]
+    async fn frozen_snapshot_preserves_mode_and_supports_legacy_gateways() {
+        for captured in [false, true] {
+            let (gateway, legacy, frozen) = gateway(Some(Ok(FrozenSandboxConfigResponse {
+                config: Some(crate::proto::GetSandboxConfigResponse {
+                    version: 7,
+                    policy_hash: "captured".into(),
+                    workspace: "default".into(),
+                    ..Default::default()
+                }),
+                frozen: captured,
+                frozen_requested: true,
+            })))
+            .await;
+            let snapshot = fetch_frozen_settings_snapshot(&gateway, "sandbox")
+                .await
+                .unwrap();
+            assert_eq!(snapshot.version, 7);
+            assert_eq!(snapshot.policy_hash, "captured");
+            assert_eq!(snapshot.frozen, captured);
+            assert!(snapshot.frozen_requested);
+            assert_eq!(frozen.load(Ordering::SeqCst), 1);
+            assert_eq!(legacy.load(Ordering::SeqCst), 0);
+        }
+        let (gateway, legacy, frozen) = gateway(None).await;
+        let snapshot = fetch_frozen_settings_snapshot(&gateway, "sandbox")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.version, 3);
+        assert!(!snapshot.frozen);
+        assert!(!snapshot.frozen_requested);
+        assert_eq!(legacy.load(Ordering::SeqCst), 1);
+        assert_eq!(frozen.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn frozen_snapshot_denials_and_inconsistent_state_never_use_legacy_fallback() {
+        for response in [
+            Err(Status::permission_denied("denied")),
+            Ok(FrozenSandboxConfigResponse {
+                config: Some(crate::proto::GetSandboxConfigResponse::default()),
+                frozen: true,
+                frozen_requested: false,
+            }),
+            Ok(FrozenSandboxConfigResponse {
+                config: None,
+                frozen: true,
+                frozen_requested: true,
+            }),
+        ] {
+            let (gateway, legacy, frozen) = gateway(Some(response)).await;
+            assert!(
+                fetch_frozen_settings_snapshot(&gateway, "sandbox")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(frozen.load(Ordering::SeqCst), 1);
+            assert_eq!(legacy.load(Ordering::SeqCst), 0);
+        }
     }
 }

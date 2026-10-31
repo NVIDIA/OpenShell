@@ -9,6 +9,9 @@
 //! `mtls_integration` and OIDC tests.
 
 use openshell_core::proto;
+use openshell_core::proto::frozen_sandbox_policies_server::{
+    FrozenSandboxPolicies, FrozenSandboxPoliciesServer,
+};
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::sandbox_updates_server::{SandboxUpdates, SandboxUpdatesServer};
 use openshell_core::replica_routing;
@@ -48,6 +51,12 @@ fn selects_all_workspaces(scope: &Option<proto::datamodel::v1::WorkspaceSelector
 /// returned. One per test so assertions are scoped.
 #[derive(Default)]
 struct MockState {
+    omit_frozen_service: bool,
+    last_frozen_create: Mutex<Option<proto::CreateFrozenSandboxRequest>>,
+    frozen_create_response: Option<proto::FrozenSandboxPolicyState>,
+    frozen_policy: Option<proto::FrozenSandboxPolicy>,
+    last_frozen_get: Mutex<Option<proto::GetFrozenSandboxPolicyRequest>>,
+    last_frozen_global_update: Mutex<Option<proto::UpdateFrozenGlobalConfigRequest>>,
     last_get_name: Mutex<Option<String>>,
     last_get_workspace: Mutex<Option<String>>,
     last_create: Mutex<Option<proto::CreateSandboxRequest>>,
@@ -1195,6 +1204,88 @@ impl SandboxUpdates for TestOpenShell {
     }
 }
 
+#[tonic::async_trait]
+impl FrozenSandboxPolicies for TestOpenShell {
+    async fn create_sandbox(
+        &self,
+        request: tonic::Request<proto::CreateFrozenSandboxRequest>,
+    ) -> Result<Response<proto::FrozenSandboxResponse>, Status> {
+        self.check_frozen_auth(&request)?;
+        let request = request.into_inner();
+        let response = proto::FrozenSandboxResponse {
+            sandbox: Some(sandbox_with_phase_ws(
+                &request.name,
+                proto::SandboxPhase::Provisioning,
+                selected_workspace(&request.workspace_scope).unwrap_or("default"),
+            )),
+            frozen_policy: self.state.frozen_create_response.clone(),
+            service_urls: request
+                .service_exposures
+                .iter()
+                .map(|exposure| {
+                    (
+                        exposure.service.clone(),
+                        format!("https://{}.example.test/", exposure.service),
+                    )
+                })
+                .collect(),
+        };
+        *self.state.last_frozen_create.lock().await = Some(request);
+        Ok(Response::new(response))
+    }
+
+    async fn get_policy(
+        &self,
+        request: tonic::Request<proto::GetFrozenSandboxPolicyRequest>,
+    ) -> Result<Response<proto::FrozenSandboxPolicyState>, Status> {
+        self.check_frozen_auth(&request)?;
+        *self.state.last_frozen_get.lock().await = Some(request.into_inner());
+        Ok(Response::new(proto::FrozenSandboxPolicyState {
+            requested: true,
+            policy: self.state.frozen_policy.clone(),
+        }))
+    }
+
+    async fn get_config(
+        &self,
+        _request: tonic::Request<proto::GetFrozenSandboxConfigRequest>,
+    ) -> Result<Response<proto::FrozenSandboxConfigResponse>, Status> {
+        Err(Status::unimplemented(
+            "runtime config is not used by the curated SDK",
+        ))
+    }
+
+    async fn update_global_config(
+        &self,
+        request: tonic::Request<proto::UpdateFrozenGlobalConfigRequest>,
+    ) -> Result<Response<proto::UpdateFrozenGlobalConfigResponse>, Status> {
+        self.check_frozen_auth(&request)?;
+        *self.state.last_frozen_global_update.lock().await = Some(request.into_inner());
+        Ok(Response::new(proto::UpdateFrozenGlobalConfigResponse {
+            update: Some(proto::UpdateConfigResponse {
+                version: 7,
+                ..Default::default()
+            }),
+            frozen_sandboxes: vec!["staging/frozen".into()],
+        }))
+    }
+}
+
+impl TestOpenShell {
+    fn check_frozen_auth<T>(&self, request: &tonic::Request<T>) -> Result<(), Status> {
+        if let Some(expected) = &self.state.require_bearer {
+            let got = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok());
+            if got != Some(expected.as_str()) {
+                return Err(Status::unauthenticated("invalid or missing bearer token"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Spin up the mock gateway, return its endpoint URL.
 async fn start_mock(state: Arc<MockState>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1204,11 +1295,17 @@ async fn start_mock(state: Arc<MockState>) -> String {
     let updates = SandboxUpdatesServer::new(TestOpenShell {
         state: state.clone(),
     });
+    let frozen = (!state.omit_frozen_service).then(|| {
+        FrozenSandboxPoliciesServer::new(TestOpenShell {
+            state: state.clone(),
+        })
+    });
     let svc = OpenShellServer::new(TestOpenShell { state });
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(svc)
             .add_service(updates)
+            .add_optional_service(frozen)
             .serve_with_incoming(stream)
             .await;
     });
@@ -2739,4 +2836,200 @@ async fn watch_logs_addresses_the_sandbox_by_canonical_name() {
             Some(workspace)
         );
     }
+}
+
+#[tokio::test]
+async fn frozen_creation_preserves_request_and_requires_acknowledgement() {
+    use openshell_sdk::FrozenSandboxCreateSpec;
+    for acknowledged in [None, Some(false), Some(true)] {
+        let state = Arc::new(MockState {
+            frozen_create_response: acknowledged.map(|requested| proto::FrozenSandboxPolicyState {
+                requested,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let endpoint = start_mock(state.clone()).await;
+        let client = connect(&endpoint).await;
+        for (workspace, template) in [
+            ("default", false),
+            ("default", true),
+            ("staging", false),
+            ("staging", true),
+        ] {
+            let policy = proto::SandboxPolicy {
+                version: 1,
+                ..Default::default()
+            };
+            let spec = SandboxSpec {
+                name: Some("frozen".into()),
+                providers: vec!["github".into()],
+                service_exposures: vec![ServiceExposure {
+                    service: "web".into(),
+                    target_port: 8080,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let template_spec = SandboxTemplateCreateSpec {
+                name: Some("frozen".into()),
+                template_name: "agent".into(),
+                policy: Some(policy.clone()),
+                providers: spec.providers.clone(),
+                service_exposures: spec.service_exposures.clone(),
+                ..Default::default()
+            };
+            let frozen_spec = FrozenSandboxCreateSpec {
+                sandbox: spec,
+                policy: Some(policy),
+            };
+            let created = match (workspace, template) {
+                ("default", false) => client.create_frozen_sandbox(frozen_spec).await,
+                ("default", true) => {
+                    client
+                        .create_frozen_sandbox_from_template(template_spec)
+                        .await
+                }
+                (_, false) => {
+                    client
+                        .workspace(workspace)
+                        .create_frozen_sandbox(frozen_spec)
+                        .await
+                }
+                (_, true) => {
+                    client
+                        .workspace(workspace)
+                        .create_frozen_sandbox_from_template(template_spec)
+                        .await
+                }
+            };
+            if acknowledged == Some(true) {
+                assert_eq!(
+                    created
+                        .expect("acknowledged freeze may be pending")
+                        .service_urls
+                        .get("web")
+                        .map(String::as_str),
+                    Some("https://web.example.test/")
+                );
+            } else {
+                let error = created.expect_err("missing acknowledgement must fail");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("did not acknowledge frozen creation")
+                );
+                assert!(error.to_string().contains("frozen"));
+            }
+            let request = state.last_frozen_create.lock().await.clone().unwrap();
+            assert_eq!(
+                selected_workspace(&request.workspace_scope),
+                Some(workspace)
+            );
+            assert_eq!(
+                request.workload_template,
+                if template { "agent" } else { "" }
+            );
+            let spec = request.spec.unwrap();
+            assert_eq!(spec.policy.unwrap().version, 1);
+            assert_eq!(spec.providers, ["github"]);
+            assert!(state.last_create.lock().await.is_none());
+            assert!(state.last_delete_name.lock().await.is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn frozen_creation_on_older_gateway_never_uses_ordinary_create() {
+    let state = Arc::new(MockState {
+        omit_frozen_service: true,
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let error = connect(&endpoint)
+        .await
+        .create_frozen_sandbox(openshell_sdk::FrozenSandboxCreateSpec::default())
+        .await
+        .expect_err("old gateway lacks service");
+    assert_eq!(
+        error.grpc_status().map(Status::code),
+        Some(tonic::Code::Unimplemented)
+    );
+    assert!(state.last_create.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn frozen_policy_reads_and_global_updates_share_authentication() {
+    let state = Arc::new(MockState {
+        require_bearer: Some("Bearer test-token".into()),
+        frozen_policy: Some(proto::FrozenSandboxPolicy {
+            policy: Some(proto::SandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            version: 3,
+            policy_hash: "accepted-hash".into(),
+            frozen_time: openshell_core::time::timestamp_from_millis(600_000).ok(),
+            policy_source: proto::PolicySource::Global as i32,
+            global_policy_version: 7,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let mut config = ClientConfig::new(endpoint);
+    config.auth = Some(AuthConfig::oidc("test-token"));
+    let client = OpenShellClient::connect(config).await.unwrap();
+    let captured = client
+        .workspace("staging")
+        .get_frozen_policy("frozen")
+        .await
+        .unwrap();
+    assert!(captured.requested);
+    let policy = captured.policy.unwrap();
+    assert_eq!(policy.policy_hash, "accepted-hash");
+    assert_eq!(policy.frozen_at_ms, Some(600_000));
+    assert_eq!(policy.policy.unwrap().version, 1);
+    assert_eq!(policy.policy_source, proto::PolicySource::Global);
+    assert_eq!(
+        selected_workspace(
+            &state
+                .last_frozen_get
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .workspace_scope
+        ),
+        Some("staging")
+    );
+    let result = client
+        .update_global_config(proto::UpdateConfigRequest {
+            policy: Some(proto::SandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.update.version, 7);
+    assert_eq!(result.frozen_sandboxes, ["staging/frozen"]);
+    assert!(
+        state
+            .last_frozen_global_update
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .global
+    );
+    let pending_state = Arc::new(MockState::default());
+    let endpoint = start_mock(pending_state).await;
+    let pending = connect(&endpoint)
+        .await
+        .get_frozen_policy("pending")
+        .await
+        .unwrap();
+    assert!(pending.requested && pending.policy.is_none());
 }

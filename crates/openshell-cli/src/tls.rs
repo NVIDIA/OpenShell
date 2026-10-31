@@ -317,13 +317,22 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
 /// interceptor that injects authentication headers on every request.
 /// Otherwise, standard mTLS is used (interceptor is a no-op).
 pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
+    Ok(sdk_client(server, tls).await?.raw_grpc())
+}
+
+pub(crate) async fn frozen_policies_client(
+    server: &str,
+    tls: &TlsOptions,
+) -> Result<openshell_sdk::raw::AuthedFrozenSandboxPoliciesClient> {
+    Ok(sdk_client(server, tls).await?.raw_frozen_policies())
+}
+
+async fn sdk_client(server: &str, tls: &TlsOptions) -> Result<OpenShellClient> {
     let config = sdk_client_config(server, tls)?;
     // Keep the SDK's transport state machine out of every command future.
-    // Most CLI commands compose this helper into larger async operations.
-    let client = Box::pin(OpenShellClient::connect(config))
+    Box::pin(OpenShellClient::connect(config))
         .await
-        .into_diagnostic()?;
-    Ok(client.raw_grpc())
+        .into_diagnostic()
 }
 
 #[cfg(test)]

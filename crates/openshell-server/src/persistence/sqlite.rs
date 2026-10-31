@@ -1454,6 +1454,23 @@ WHERE "object_type" = 'sandbox' AND "id" = ?1
         let sandbox_payload: Vec<u8> = row.get("payload");
         let current_version: i64 = row.try_get("resource_version").unwrap_or(1);
         let current_version = current_version.max(1).cast_unsigned();
+        // Locking the sandbox first serializes this check with first acceptance.
+        let frozen_payload: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT payload FROM objects WHERE object_type = ?1 AND id = ?2")
+                .bind(super::frozen_policy::FROZEN_POLICY_OBJECT_TYPE)
+                .bind(super::frozen_policy::frozen_policy_id(&write.sandbox_id))
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| map_db_error(&error))?;
+        if let Some(payload) = frozen_payload
+            && super::frozen_policy::decode_frozen_policy(&write.sandbox_id, &payload)?
+                .policy
+                .is_some()
+        {
+            return Err(PersistenceError::Conflict {
+                current_resource_version: Some(current_version),
+            });
+        }
         let (mut sandbox, sandbox_changed) =
             project_policy_revision_onto_sandbox(write, &sandbox_payload, current_version)?;
 

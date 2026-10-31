@@ -298,10 +298,18 @@ pub(super) async fn handle_create_sandbox(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
+    handle_create_sandbox_with_mode(state, request, false).await
+}
+
+pub(super) async fn handle_create_sandbox_with_mode(
+    state: &Arc<ServerState>,
+    request: Request<CreateSandboxRequest>,
+    frozen: bool,
+) -> Result<Response<SandboxResponse>, Status> {
     let create_request = request.get_ref().clone();
     // Sandbox creation retains large configuration values across awaits.
     // Box the inner future to keep this wrapper small for every caller.
-    let result = Box::pin(handle_create_sandbox_inner(state, request)).await;
+    let result = Box::pin(handle_create_sandbox_inner(state, request, frozen)).await;
     let created_sandbox = result
         .as_ref()
         .ok()
@@ -556,6 +564,7 @@ fn sandbox_create_telemetry_attrs(
 async fn handle_create_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
+    frozen: bool,
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
@@ -769,6 +778,7 @@ async fn handle_create_sandbox_inner(
     // their revisions cannot change before the sandbox's launch is committed.
     let mut runtime_inputs =
         super::policy::resolve_sandbox_create_runtime_inputs(state.as_ref(), &sandbox).await?;
+    runtime_inputs.freeze_policy = frozen;
 
     state
         .compute
@@ -1506,6 +1516,7 @@ pub(super) async fn handle_attach_sandbox_provider(
                 err
             }
         })?;
+    super::policy::frozen::ensure_mutable_by_id(state.store.as_ref(), sandbox.object_id()).await?;
     let sandbox_name = sandbox.object_name().to_string();
     let sandbox_id = sandbox
         .metadata
@@ -1678,6 +1689,7 @@ pub(super) async fn handle_detach_sandbox_provider(
         .await
         .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
     let sandbox_name = sandbox.object_name().to_string();
+    super::policy::frozen::ensure_mutable_by_id(state.store.as_ref(), sandbox.object_id()).await?;
     let sandbox_id = sandbox
         .metadata
         .as_ref()

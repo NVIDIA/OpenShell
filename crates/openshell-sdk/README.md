@@ -15,6 +15,25 @@ gateway-name resolution.
   surface doesn't yet cover (providers, policy, logs, settings, SSH,
   forwarding).
 
+## Frozen sandbox policies
+
+`create_frozen_sandbox(FrozenSandboxCreateSpec { sandbox, policy })` creates a
+sandbox through the optional frozen-policy service. The template equivalent is
+`create_frozen_sandbox_from_template(SandboxTemplateCreateSpec)`. Both are also
+available on a workspace-scoped client. Existing create specs and sandbox
+references retain their ordinary shape.
+
+Use `get_frozen_policy(name)` to distinguish a requested, pending freeze from
+the captured policy, hash and timestamp. Once initialization accepts the first
+configuration, subsequent reads return that snapshot. Changing its access
+requires recreating the sandbox. `update_global_config(UpdateConfigRequest)`
+returns the mutation result and names of sandboxes retaining a frozen policy.
+
+Older gateways return `Unimplemented` before creation; the SDK never retries
+through ordinary creation. `raw_frozen_policies` and
+`raw_frozen_policies_fresh` share the client's transport and live bearer slot,
+with the same refresh distinction as the main raw client.
+
 ## Auth and refresh
 
 The curated surface drives OIDC refresh automatically: proactively before a
