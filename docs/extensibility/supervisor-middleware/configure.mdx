@@ -41,7 +41,7 @@ timeout = "500ms"
 </ParamField>
 
 <ParamField path="max_payload_bytes" type="integer" required={true}>
-  Largest request body, response body, or WebSocket message the service inspects. Must be at most 4 MiB and no larger than the service advertises. Can be `0` for an [HTTP hooks](/extensibility/supervisor-middleware/operations#http) service that does not inspect bodies.
+  Largest request body, response body, or WebSocket message the service inspects. Must be at most 4 MiB and no larger than the service advertises.
 </ParamField>
 
 <ParamField path="binding_policy" type="'dynamic' | 'allowlist' | 'exact'" default="dynamic">
