@@ -1238,7 +1238,9 @@ process has exited.
 
 An `Error` caused by an infrastructure failure, such as
 `ImagePreparationTimedOut`, usually has no supervisor left, so these
-operations fail with `sandbox is not ready`.
+operations fail with `sandbox is not ready`. If the supervisor survived, exec,
+file transfer, and port forwarding still work for debugging, but exposed
+services stay unavailable.
 
 ## Sandbox Runtimes
 

@@ -1702,7 +1702,9 @@ export class SandboxClient {
   }
 
   // Bind a local TCP listener that tunnels each accepted connection into the
-  // sandbox. Mirrors the CLI service forward: READY check, then per socket mint
+  // sandbox. Mirrors the CLI service forward: refuse a sandbox that is stopping,
+  // stopped, or being deleted and leave every other phase to the gateway, which
+  // checks each connection. Then per socket mint
   // a short-lived SSH session token, open a forwardTcp bidi whose first frame is
   // the `init` (TCP target + token), relay bytes both ways in ~64 KiB chunks,
   // and revoke the token on close. Process-lifetime only.
@@ -1715,8 +1717,8 @@ export class SandboxClient {
     let sandboxId: string;
     try {
       const ref = await this.get(name, { workspace: opts.workspace, ...(opts.signal ? { signal: opts.signal } : {}) });
-      if (ref.phase !== 'ready') {
-        throw new SdkError('connect', `sandbox '${name}' is not ready (phase: ${ref.phase})`);
+      if (ref.phase === 'stopping' || ref.phase === 'stopped' || ref.phase === 'deleting') {
+        throw new SdkError('connect', `sandbox '${name}' is not available (phase: ${ref.phase})`);
       }
       sandboxId = ref.id;
     } catch (e) {
