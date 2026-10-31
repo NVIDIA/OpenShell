@@ -1730,6 +1730,9 @@ pub async fn run_sandbox_instance(
             config_apply_tx,
             config_push_updates,
             ssh_host_key,
+            app_routes
+                .as_ref()
+                .map(app_listener::Routes::installation_source),
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.access.start"))
         .await?;

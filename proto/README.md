@@ -86,6 +86,18 @@ identifies the service being exposed.
   Run `mise run pre-commit`, the affected SDK checks, and relevant server tests
   before submitting the change.
 
+## Compute-driver application endpoints
+
+`compute_driver.proto` is the internal gateway/driver contract. Ordinary
+`GetSandbox` observation does not resolve application routing endpoints.
+The optional `ComputeDriverAppEndpoints.ResolveSupervisorAppEndpoint` service
+returns the current trusted supervisor listener
+and its runtime/ownership binding for advertisement validation. Drivers without
+support return `UNIMPLEMENTED`; a successful response with no endpoint means no
+safe endpoint is currently available. Neither result authorizes publication.
+The gateway owns installation validation and the public discovery API.
+The baseline `ComputeDriver` service and generated server trait stay unchanged.
+
 ## Supervisor host protocol
 
 [`supervisor_host.proto`](supervisor_host.proto) is the private stream between

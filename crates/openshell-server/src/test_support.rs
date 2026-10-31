@@ -282,6 +282,7 @@ impl FakeComputeDriver {
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(ComputeDriverServer::new(driver.clone()))
+                .add_service(openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpointsServer::new(driver.clone()))
                 .add_service(openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdatesServer::new(driver.clone()))
                 .serve_with_incoming(UnixIncoming { listener })
                 .await
@@ -590,5 +591,21 @@ impl ComputeDriver for FakeComputeDriver {
         _request: Request<DeleteWorkspaceRequest>,
     ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
         Ok(Response::new(DeleteWorkspaceResponse {}))
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpoints for FakeComputeDriver {
+    async fn resolve_supervisor_app_endpoint(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest>,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse>,
+        Status,
+    > {
+        self.record_traceparent(request.metadata());
+        Err(Status::unimplemented(
+            "supervisor application endpoint resolution is not supported",
+        ))
     }
 }

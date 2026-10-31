@@ -290,3 +290,26 @@ URL selection. Dedicated and shared supervisors expose the app listener on their
 Pod IPs without app Services. Clients must select the member owning their
 sandbox. HA takeover may preserve the workload generation; existing ingress streams
 are not migrated. Runtime ownership fencing must reject stale connectors.
+
+### Installed-route evidence
+
+An enabled listener offers an installation view to the existing authenticated
+sandbox supervisor session. The gateway issues a single-use lease challenge
+every five seconds. The instance reports the complete installed allowlist only
+when its remaining serving freshness covers the challenge's fifteen-second
+lease. Expiry starts at gateway challenge issuance, so transport delay cannot
+extend publication past confirmed listener freshness. Empty reports withdraw
+installation evidence; suspended, expired, stopped, or not-yet-serving instances
+cannot report live routes.
+
+Reports contain declaration identities/revisions and configuration identity,
+not backend addresses. The gateway obtains endpoints from the compute driver
+and validates runtime identity, declarations, and session ownership before
+persisting ephemeral records. Shared Kubernetes pools resolve the acknowledged
+owner's Pod IP and app port. Durable pool ownership, credential epoch, membership,
+and acknowledged reports fence installation acceptance and discovery. Shared
+listeners additionally require a gateway-issued serving lease, capped at fifteen
+seconds from issuance, independently of configuration freshness. Expiry closes
+streams; later renewal cannot revive them. Takeover preserves the workload and
+public hostname while replacing the app endpoint. Clients reconnect after an
+interruption; sockets are not migrated.

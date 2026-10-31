@@ -2205,6 +2205,7 @@ struct ConfigPushSetup {
 /// publication cannot strand the record; the lifetime guard moves into the
 /// session task or drops with early cleanup.
 struct SessionSetup {
+    advertises_services: bool,
     state: Arc<ServerState>,
     sandbox_id: String,
     instance_id: String,
@@ -2223,6 +2224,7 @@ struct SessionSetup {
 
 async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
     let SessionSetup {
+        advertises_services,
         state,
         sandbox_id,
         instance_id,
@@ -2488,6 +2490,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         tx: session_tx,
         supports_session_redirect,
         pushes_config,
+        advertises_services,
     };
     tokio::spawn(async move {
         let _session_lifetime = session_lifetime;
@@ -2623,6 +2626,8 @@ pub async fn handle_connect_supervisor(
     > = Box::pin(tokio_stream::StreamExt::map(ReceiverStream::new(rx), Ok));
 
     let setup = SessionSetup {
+        advertises_services: state.config.supervisor_app_listener.enabled
+            && hello.supports_service_advertisements,
         state: Arc::clone(state),
         sandbox_id,
         instance_id: hello.instance_id,
@@ -2897,6 +2902,7 @@ pub(crate) struct AcceptedSession {
     /// bootstrap it was accepted with. False for a supervisor that keeps
     /// polling.
     pub(crate) pushes_config: bool,
+    pub(crate) advertises_services: bool,
 }
 
 async fn run_session_loop(
@@ -2921,6 +2927,9 @@ async fn run_session_loop(
     let bootstrap_timeout = tokio::time::sleep(Duration::from_mins(2));
     tokio::pin!(bootstrap_timeout);
     let mut bootstrap_complete = !session.pushes_config;
+    let mut app_timer = tokio::time::interval(crate::grpc::service_advertisement::REPORT_INTERVAL);
+    app_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut app_lease = crate::grpc::service_advertisement::LeaseWindow::default();
 
     loop {
         tokio::select! {
@@ -2955,6 +2964,13 @@ async fn run_session_loop(
                         if matches!(msg.payload.as_ref(), Some(supervisor_message::Payload::ConfigUpdateResult(_))) {
                             bootstrap_complete = true;
                         }
+                        if let Some(supervisor_message::Payload::ServiceAdvertisement(report)) = &msg.payload {
+                            if let Some(app_expiry) = app_lease.claim(report.lease_sequence)
+                                && !matches!(tokio::time::timeout(Duration::from_secs(2), crate::grpc::service_advertisement::accept(state, owner_guard, report, app_expiry)).await, Ok(Ok(()))) {
+                                debug!(sandbox_id, "service installation report rejected or unavailable");
+                            }
+                            continue;
+                        }
                         if !handle_supervisor_message(session, msg.payload).await {
                             break;
                         }
@@ -2984,6 +3000,14 @@ async fn run_session_loop(
                         break;
                     }
                 }
+            }
+            _ = app_timer.tick(), if session.advertises_services => {
+                if !matches!(tokio::time::timeout(Duration::from_secs(2),
+                    crate::grpc::service_advertisement::may_lease(state, owner_guard)).await,
+                    Ok(Ok(true))) { continue; }
+                let Some(lease) = app_lease.issue() else { break; };
+                let message = GatewayMessage { payload: Some(gateway_message::Payload::ServiceRouteLease(lease)) };
+                if tx.try_send(message).is_err() { break; }
             }
             _ = heartbeat_timer.tick() => {
                 let hb = GatewayMessage {
@@ -3235,6 +3259,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let mut inbound = futures::stream::pending::<Result<SupervisorMessage, Status>>();
         let session = AcceptedSession {
+            advertises_services: false,
             state: Arc::clone(&state),
             sandbox_id: "sb-no-peer".into(),
             session_id: "session-no-peer".into(),
@@ -5747,6 +5772,7 @@ mod tests {
         };
         let mut inbound = futures::stream::iter([Ok(failure)]).chain(futures::stream::pending());
         let session = AcceptedSession {
+            advertises_services: false,
             state: Arc::clone(&state),
             sandbox_id: "sb-replaced".into(),
             session_id: "session-a".into(),
@@ -5837,6 +5863,7 @@ mod tests {
         };
         let mut inbound = futures::stream::iter([Ok(heartbeat)]).chain(futures::stream::pending());
         let session = AcceptedSession {
+            advertises_services: false,
             state: Arc::clone(&state),
             sandbox_id: "sb-moved".into(),
             session_id: "session-replaced".into(),
