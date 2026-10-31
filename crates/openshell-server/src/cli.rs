@@ -107,6 +107,29 @@ struct RunArgs {
     #[arg(long, default_value_t = 0, env = "OPENSHELL_METRICS_PORT")]
     metrics_port: u16,
 
+    /// Path to the TLS certificate served by the metrics listener.
+    #[arg(long, env = "OPENSHELL_METRICS_TLS_CERT")]
+    metrics_tls_cert: Option<PathBuf>,
+
+    /// Path to the TLS private key served by the metrics listener.
+    #[arg(long, env = "OPENSHELL_METRICS_TLS_KEY")]
+    metrics_tls_key: Option<PathBuf>,
+
+    /// Path to the CA certificate used to verify metrics clients.
+    #[arg(long, env = "OPENSHELL_METRICS_TLS_CLIENT_CA")]
+    metrics_tls_client_ca: Option<PathBuf>,
+
+    /// Require metrics clients to present a certificate trusted by the metrics client CA.
+    #[arg(
+        long,
+        env = "OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        value_parser = clap::value_parser!(bool)
+    )]
+    metrics_require_client_auth: Option<bool>,
+
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info", env = "OPENSHELL_LOG_LEVEL")]
     log_level: String,
@@ -545,6 +568,12 @@ fn prepare_server_config_with_drivers(
         "metrics_port",
         || file_gateway.and_then(|g| g.metrics_bind_address),
     );
+    let metrics_tls = resolve_metrics_tls(args)?;
+    if metrics_tls.is_some() && metrics_bind.is_none() {
+        return Err(miette::miette!(
+            "metrics TLS requires an enabled metrics listener; set --metrics-port or metrics_bind_address"
+        ));
+    }
 
     if let Some(addr) = health_bind {
         if args.port == addr.port() {
@@ -572,6 +601,9 @@ fn prepare_server_config_with_drivers(
             ));
         }
         config = config.with_metrics_bind_address(addr);
+    }
+    if let Some(tls) = metrics_tls {
+        config = config.with_metrics_tls(tls);
     }
 
     config = config
@@ -1202,6 +1234,7 @@ fn validate_preflight_semantics(
             "an explicit --tls-client-ca requires --tls-cert and --tls-key"
         ));
     }
+    let metrics_tls = resolve_metrics_tls(args)?;
     if !args.disable_tls
         && let Some(tls) = gateway.tls.as_ref()
     {
@@ -1243,6 +1276,11 @@ fn validate_preflight_semantics(
         "metrics_port",
         || gateway.metrics_bind_address,
     );
+    if metrics_tls.is_some() && metrics_bind.is_none() {
+        return Err(miette::miette!(
+            "metrics TLS requires an enabled metrics listener"
+        ));
+    }
     if health_bind.is_some_and(|address| address.port() == args.port)
         || metrics_bind.is_some_and(|address| address.port() == args.port)
         || health_bind
@@ -1337,6 +1375,43 @@ fn resolve_aux_listener(
     }
 }
 
+/// Resolve the optional TLS configuration for the dedicated metrics listener.
+///
+/// A metrics TLS configuration is activated by any metrics TLS input. It is
+/// deliberately independent from the gateway listener TLS settings so the
+/// metrics client CA remains a separate trust boundary.
+fn resolve_metrics_tls(args: &RunArgs) -> Result<Option<openshell_core::MetricsTlsConfig>> {
+    let configured = args.metrics_tls_cert.is_some()
+        || args.metrics_tls_key.is_some()
+        || args.metrics_tls_client_ca.is_some()
+        || args.metrics_require_client_auth == Some(true);
+    if !configured {
+        return Ok(None);
+    }
+
+    let cert_path = args
+        .metrics_tls_cert
+        .clone()
+        .ok_or_else(|| miette::miette!("metrics TLS requires --metrics-tls-cert"))?;
+    let key_path = args
+        .metrics_tls_key
+        .clone()
+        .ok_or_else(|| miette::miette!("metrics TLS requires --metrics-tls-key"))?;
+    let require_client_auth = args.metrics_require_client_auth.unwrap_or(false);
+    if require_client_auth && args.metrics_tls_client_ca.is_none() {
+        return Err(miette::miette!(
+            "--metrics-require-client-auth requires --metrics-tls-client-ca"
+        ));
+    }
+
+    Ok(Some(openshell_core::MetricsTlsConfig {
+        cert_path,
+        key_path,
+        client_ca_path: args.metrics_tls_client_ca.clone(),
+        require_client_auth,
+    }))
+}
+
 /// Apply gateway-wide values from `[openshell.gateway]` onto `RunArgs` for
 /// every argument that is still sourced from clap's built-in default.
 ///
@@ -1423,6 +1498,21 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         }
         if args.tls_client_ca.is_none() && arg_defaulted(matches, "tls_client_ca") {
             args.tls_client_ca.clone_from(&tls.client_ca_path);
+        }
+    }
+    // Dedicated metrics listener TLS fields.
+    if let Some(tls) = &file.metrics_tls {
+        if args.metrics_tls_cert.is_none() && arg_defaulted(matches, "metrics_tls_cert") {
+            args.metrics_tls_cert = Some(tls.cert_path.clone());
+        }
+        if args.metrics_tls_key.is_none() && arg_defaulted(matches, "metrics_tls_key") {
+            args.metrics_tls_key = Some(tls.key_path.clone());
+        }
+        if args.metrics_tls_client_ca.is_none() && arg_defaulted(matches, "metrics_tls_client_ca") {
+            args.metrics_tls_client_ca.clone_from(&tls.client_ca_path);
+        }
+        if arg_defaulted(matches, "metrics_require_client_auth") {
+            args.metrics_require_client_auth = Some(tls.require_client_auth);
         }
     }
     // OIDC fields
@@ -1555,6 +1645,7 @@ mod tests {
     use clap::Parser;
     use openshell_core::config::ServiceHostnameFormat;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -3101,7 +3192,7 @@ mod tests {
     //
     // by exercising each combination on representative gateway fields.
 
-    use super::{ConfigFile, merge_file_into_args};
+    use super::{ConfigFile, merge_file_into_args, resolve_metrics_tls};
     use clap::FromArgMatches;
 
     fn parse_with_args(argv: &[&str]) -> (super::RunArgs, clap::ArgMatches) {
@@ -3149,6 +3240,245 @@ mod tests {
     }
 
     #[test]
+    fn metrics_tls_file_values_merge_into_runtime_configuration() {
+        Environment::new()
+            .remove("OPENSHELL_METRICS_TLS_CERT")
+            .remove("OPENSHELL_METRICS_TLS_KEY")
+            .remove("OPENSHELL_METRICS_TLS_CLIENT_CA")
+            .remove("OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH")
+            .run(|| {
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-port",
+                    "9090",
+                ]);
+                let file = config_file_from_toml(
+                    r#"
+[openshell.gateway.metrics_tls]
+cert_path = "/metrics/tls.crt"
+key_path = "/metrics/tls.key"
+client_ca_path = "/metrics/ca.crt"
+require_client_auth = true
+"#,
+                );
+
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                let tls = resolve_metrics_tls(&args)
+                    .expect("valid metrics TLS configuration")
+                    .expect("metrics TLS is configured");
+
+                assert_eq!(tls.cert_path, PathBuf::from("/metrics/tls.crt"));
+                assert_eq!(tls.key_path, PathBuf::from("/metrics/tls.key"));
+                assert_eq!(tls.client_ca_path, Some(PathBuf::from("/metrics/ca.crt")));
+                assert!(tls.require_client_auth);
+            });
+    }
+
+    #[test]
+    fn metrics_require_client_auth_matches_documented_forms() {
+        Environment::new()
+            .remove("OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH")
+            .run(|| {
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-require-client-auth",
+                ]);
+                assert_eq!(args.metrics_require_client_auth, Some(true));
+
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-require-client-auth=true",
+                ]);
+                assert_eq!(args.metrics_require_client_auth, Some(true));
+
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-require-client-auth=false",
+                ]);
+                assert_eq!(args.metrics_require_client_auth, Some(false));
+
+                // The man page documents the flag as [--metrics-require-client-auth[=BOOL]]:
+                // the value, when given, must use an equals sign.
+                command()
+                    .try_get_matches_from([
+                        "openshell-gateway",
+                        "--db-url",
+                        "sqlite::memory:",
+                        "--metrics-require-client-auth",
+                        "false",
+                    ])
+                    .expect_err("space-separated value must be rejected");
+            });
+    }
+
+    #[test]
+    fn partial_metrics_tls_flags_are_rejected_with_actionable_errors() {
+        Environment::new()
+            .remove("OPENSHELL_METRICS_TLS_CERT")
+            .remove("OPENSHELL_METRICS_TLS_KEY")
+            .remove("OPENSHELL_METRICS_TLS_CLIENT_CA")
+            .remove("OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH")
+            .run(|| {
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-tls-key",
+                    "/metrics/tls.key",
+                ]);
+                let error = resolve_metrics_tls(&args).expect_err("cert is required");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("metrics TLS requires --metrics-tls-cert"),
+                    "error: {error}"
+                );
+
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-tls-cert",
+                    "/metrics/tls.crt",
+                ]);
+                let error = resolve_metrics_tls(&args).expect_err("key is required");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("metrics TLS requires --metrics-tls-key"),
+                    "error: {error}"
+                );
+
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-tls-client-ca",
+                    "/metrics/ca.crt",
+                ]);
+                let error = resolve_metrics_tls(&args).expect_err("cert and key are required");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("metrics TLS requires --metrics-tls-cert"),
+                    "error: {error}"
+                );
+            });
+    }
+
+    #[test]
+    fn metrics_tls_without_an_enabled_metrics_listener_is_rejected() {
+        let config_home = tempfile::tempdir().unwrap();
+
+        Environment::new()
+            .set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap())
+            .remove("OPENSHELL_GATEWAY_CONFIG")
+            .remove("OPENSHELL_METRICS_PORT")
+            .remove("OPENSHELL_METRICS_TLS_CERT")
+            .remove("OPENSHELL_METRICS_TLS_KEY")
+            .remove("OPENSHELL_METRICS_TLS_CLIENT_CA")
+            .remove("OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH")
+            .run(|| {
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--disable-tls",
+                    "--compute-driver",
+                    "podman",
+                    "--metrics-tls-cert",
+                    "/metrics/tls.crt",
+                    "--metrics-tls-key",
+                    "/metrics/tls.key",
+                ]);
+                let registry = test_registry("podman", true);
+
+                let error =
+                    match super::prepare_server_config_with_drivers(&mut args, &matches, &registry)
+                    {
+                        Err(error) => error,
+                        Ok(_) => panic!("metrics TLS without a listener must be rejected"),
+                    };
+                assert!(
+                    error
+                        .to_string()
+                        .contains("metrics TLS requires an enabled metrics listener"),
+                    "error: {error}"
+                );
+            });
+    }
+
+    #[test]
+    fn explicit_metrics_client_auth_value_overrides_file_value() {
+        Environment::new()
+            .remove("OPENSHELL_METRICS_TLS_CERT")
+            .remove("OPENSHELL_METRICS_TLS_KEY")
+            .remove("OPENSHELL_METRICS_TLS_CLIENT_CA")
+            .remove("OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH")
+            .run(|| {
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-port",
+                    "9090",
+                    "--metrics-require-client-auth=false",
+                ]);
+                let file = config_file_from_toml(
+                    r#"
+[openshell.gateway.metrics_tls]
+cert_path = "/metrics/tls.crt"
+key_path = "/metrics/tls.key"
+client_ca_path = "/metrics/ca.crt"
+require_client_auth = true
+"#,
+                );
+
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                let tls = resolve_metrics_tls(&args)
+                    .expect("valid metrics TLS configuration")
+                    .expect("metrics TLS is configured");
+
+                assert!(!tls.require_client_auth);
+            });
+    }
+
+    #[test]
+    fn metrics_client_auth_requires_a_metrics_client_ca() {
+        Environment::new()
+            .remove("OPENSHELL_METRICS_TLS_CERT")
+            .remove("OPENSHELL_METRICS_TLS_KEY")
+            .remove("OPENSHELL_METRICS_TLS_CLIENT_CA")
+            .remove("OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH")
+            .run(|| {
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--metrics-tls-cert",
+                    "/metrics/tls.crt",
+                    "--metrics-tls-key",
+                    "/metrics/tls.key",
+                    "--metrics-require-client-auth",
+                ]);
+
+                let error =
+                    resolve_metrics_tls(&args).expect_err("client auth without a CA must fail");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("--metrics-require-client-auth requires --metrics-tls-client-ca")
+                );
+            });
+    }
+
+    #[test]
     fn rejects_legacy_drivers_flag() {
         let error = command()
             .try_get_matches_from(["openshell-gateway", "--drivers", "docker"])
@@ -3187,7 +3517,7 @@ mod tests {
 
                 assert_eq!(
                     super::resolve_config_path(&args).unwrap(),
-                    Some(std::path::PathBuf::from("/tmp/missing.toml"))
+                    Some(PathBuf::from("/tmp/missing.toml"))
                 );
             });
     }

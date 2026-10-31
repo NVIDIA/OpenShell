@@ -510,7 +510,7 @@ mod tests {
         let event: serde_json::Value = serde_json::from_str(&contents).unwrap();
         assert_eq!(
             event["message"],
-            "TLS certificate config reloaded successfully"
+            "gateway TLS certificate config reloaded successfully"
         );
         assert_eq!(event["metadata"]["product"]["name"], "OpenShell Gateway");
         assert!(event.get("container").is_none());
