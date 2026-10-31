@@ -40,6 +40,7 @@ mod provider_profile_sources;
 mod provider_refresh;
 mod readiness;
 mod reflection;
+mod sandbox_access;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;

@@ -2537,20 +2537,10 @@ pub(super) async fn handle_exec_sandbox(
         completion.ensure_target(sandbox.object_id())?;
     }
 
-    require_relay_reachable(state, &sandbox).await?;
-
-    // Open a relay channel through the supervisor session. Use a 15s
-    // session-wait timeout, enough to cover a transient supervisor reconnect
-    // while still failing quickly during normal operation.
-    let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
-        state,
-        sandbox.object_id(),
-        relay_open::Target::Ssh(SshRelayTarget {}),
-        String::new(),
-        std::time::Duration::from_secs(15),
-    )
-    .await
-    .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+    let (channel_id, relay_rx) = crate::sandbox_access::acquire(state, &sandbox)
+        .await?
+        .open_relay(relay_open::Target::Ssh(SshRelayTarget {}), String::new())
+        .await?;
 
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
@@ -2671,19 +2661,11 @@ pub(super) async fn handle_forward_tcp(
     // The main process may finish between minting the SSH token and opening
     // its transport. Keep the relay reachable until terminal delivery is
     // finalized so fast commands can attach without a readiness race.
-    require_relay_reachable(state, &sandbox).await?;
+    let access = crate::sandbox_access::acquire(state, &sandbox).await?;
 
     let connection_guard =
         acquire_forward_connection_guard(state, &principal, &init, &sandbox).await?;
-    let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
-        state,
-        sandbox.object_id(),
-        target,
-        init.service_id.clone(),
-        std::time::Duration::from_secs(15),
-    )
-    .await
-    .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+    let (channel_id, relay_rx) = access.open_relay(target, init.service_id.clone()).await?;
 
     let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
     let sandbox_id = sandbox.object_id().to_string();
@@ -3114,17 +3096,10 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
         completion.ensure_target(sandbox.object_id())?;
     }
 
-    require_relay_reachable(state, &sandbox).await?;
-
-    let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
-        state,
-        sandbox.object_id(),
-        relay_open::Target::Ssh(SshRelayTarget {}),
-        String::new(),
-        std::time::Duration::from_secs(15),
-    )
-    .await
-    .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+    let (channel_id, relay_rx) = crate::sandbox_access::acquire(state, &sandbox)
+        .await?
+        .open_relay(relay_open::Target::Ssh(SshRelayTarget {}), String::new())
+        .await?;
 
     let command_str = build_remote_exec_command(req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
@@ -3182,19 +3157,6 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
 // SSH session handlers
 // ---------------------------------------------------------------------------
 
-/// Exec, SSH, and port forwarding share one access rule: a Completed or
-/// Error sandbox stays reachable while its supervisor retains the access plane.
-async fn require_relay_reachable(
-    state: &Arc<ServerState>,
-    sandbox: &Sandbox,
-) -> Result<(), Status> {
-    if crate::supervisor_session::sandbox_relay_reachable(state, sandbox).await? {
-        Ok(())
-    } else {
-        Err(Status::failed_precondition("sandbox is not ready"))
-    }
-}
-
 pub(super) async fn handle_create_ssh_session(
     state: &Arc<ServerState>,
     request: Request<CreateSshSessionRequest>,
@@ -3211,7 +3173,9 @@ pub(super) async fn handle_create_ssh_session(
     .await?;
     let sandbox_id = sandbox.object_id().to_string();
 
-    require_relay_reachable(state, &sandbox).await?;
+    // The session's transport opens its relay through ForwardTcp, which
+    // checks access again; checking here refuses tokens that could never work.
+    crate::sandbox_access::acquire(state, &sandbox).await?;
 
     let token = uuid::Uuid::new_v4().to_string();
     let now_ms = current_time_ms();
@@ -9269,17 +9233,16 @@ mod tests {
                 .finalize_main_process_exit("sandbox-work")
         );
         assert!(
-            crate::supervisor_session::sandbox_relay_reachable(&state, &sandbox)
+            crate::sandbox_access::acquire(&state, &sandbox)
                 .await
-                .unwrap()
+                .is_ok()
         );
 
         assert!(state.supervisor_sessions.disconnect("sandbox-work"));
-        assert!(
-            !crate::supervisor_session::sandbox_relay_reachable(&state, &sandbox)
-                .await
-                .unwrap()
-        );
+        assert!(matches!(
+            crate::sandbox_access::acquire(&state, &sandbox).await,
+            Err(crate::sandbox_access::AccessError::NotReachable)
+        ));
     }
 
     #[tokio::test]
