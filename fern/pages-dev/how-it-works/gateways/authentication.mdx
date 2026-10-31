@@ -326,6 +326,31 @@ This is transparent to the user. All CLI commands work the same regardless of wh
 
 **Re-authentication**: If the token expires, run `openshell gateway login` to open the browser flow again and update the stored token.
 
+### Browser Login Callbacks
+
+Both browser login flows (OIDC Authorization Code + PKCE and edge JWT) receive their result on a short-lived local HTTP server. By default the CLI binds this listener to an ephemeral port on `127.0.0.1`, which requires no configuration on a normal host machine.
+
+When the CLI runs inside a container, the wrapper cannot know a randomly chosen port in advance, so it cannot publish the port to the host and the browser cannot reach the callback. Two environment variables make browser login work in that setting:
+
+| Environment variable | Purpose | Default |
+|---|---|---|
+| `OPENSHELL_CALLBACK_PORT` | Pin the callback listener to a fixed TCP port (an integer from 1 to 65535) so a container wrapper can publish `-p 127.0.0.1:<port>:<port>` before login starts. | Unset (ephemeral port) |
+| `OPENSHELL_CALLBACK_BIND_ADDRESS` | Override the listener bind address (an IP address). Container runtimes with user-mode networking (pasta, slirp4netns) can only reach listeners bound to `0.0.0.0`, so a wrapper sets this to `0.0.0.0` inside the container. IPv6 addresses such as `::1` or `::` are also accepted. | `127.0.0.1` |
+
+For example, a wrapper running the CLI in a container sets both variables and publishes the fixed port to host loopback only:
+
+```shell
+OPENSHELL_CALLBACK_PORT=18080 OPENSHELL_CALLBACK_BIND_ADDRESS=0.0.0.0 openshell gateway login
+```
+
+The browser-facing callback URL derives from the bound address, so the callback matches the listener: IPv4 binds (including the default and `0.0.0.0`) use `http://127.0.0.1:<port>/callback`, and IPv6 binds use the bracketed RFC 8252 loopback form `http://[::1]:<port>/callback`. Identity providers that allowlist loopback redirects for native apps must include the `[::1]` form for IPv6 binds. The bundled Keycloak realm allows only `http://127.0.0.1:*` and `http://localhost:*`, because Keycloak rejects a port wildcard on an IPv6 literal, so IPv6 binds against it need an exact `http://[::1]:<port>/callback` redirect URI added to the `openshell-cli` client.
+
+**IPv6 limitation for edge login:** IPv6 callback binds are fully supported for OIDC login, but the edge browser flow has a known browser limitation. The gateway's connect page enforces a Content-Security-Policy that must allow the callback target, and Chrome does not currently support IPv6 literals in CSP `connect-src` source expressions. An IPv6-bound CLI (`OPENSHELL_CALLBACK_BIND_ADDRESS=::1` or `::`) therefore cannot complete edge login in Chrome: the page's POST to the callback is blocked by CSP and the page reports that it could not reach the CLI. This is a browser limitation, not a CLI or gateway defect; IPv6 edge login is best-effort until browsers implement IPv6 CSP source expressions. The IPv4 paths, including the container use case, are unaffected.
+
+Binding `0.0.0.0` on a host machine would expose the callback server to the local network, so the CLI never does it by default: the bind address only changes when `OPENSHELL_CALLBACK_BIND_ADDRESS` is set explicitly. With both variables unset, the listener binds `127.0.0.1` on an ephemeral port exactly as before. An invalid port or address value, or a fixed port that is already in use, fails the login command with a clear error instead of falling back silently.
+
+`--network=host` is an alternative on Linux, but it does not work with a podman machine VM on macOS, which is why the fixed callback port is the portable approach.
+
 ### Plaintext
 
 When a gateway is deployed with `disable_tls = true` (set through Helm as
