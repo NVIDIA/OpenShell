@@ -953,13 +953,33 @@ _policy_endpoint_configs(policy) := [ep |
 	endpoint_has_extended_config(ep)
 ]
 
+# An endpoint that names a host takes precedence over a hostless
+# `allowed_ips` endpoint. When any host-naming endpoint in a binary-matched
+# policy matches the request, hostless configs are dropped, even if the
+# hosted endpoint has no extended config. Otherwise a plain `host:port`
+# endpoint would inherit the hostless endpoint's SSRF allowlist. Allow and
+# deny decisions still union over every matching policy.
+_hosted_endpoint_matches if {
+	some pname
+	_matching_policy_names[pname]
+	ep := data.network_policies[pname].endpoints[_]
+	object.get(ep, "host", "") != ""
+	endpoint_matches_request(ep, input.network)
+}
+
 _matching_endpoint_configs := [cfg |
 	some pname
 	_matching_policy_names[pname]
 	cfgs := _policy_endpoint_configs(data.network_policies[pname])
 	cfg := cfgs[_]
 	endpoint_has_extended_config(cfg)
+	not _hostless_config_shadowed(cfg)
 ]
+
+_hostless_config_shadowed(cfg) if {
+	object.get(cfg, "host", "") == ""
+	_hosted_endpoint_matches
+}
 
 # Full matched endpoint records are kept separate from the legacy
 # endpoint-config list, which intentionally contains only connection/L7

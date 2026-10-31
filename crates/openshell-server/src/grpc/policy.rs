@@ -12958,6 +12958,64 @@ mod tests {
         assert!(error.message().contains("tls"));
     }
 
+    #[test]
+    fn candidate_effective_policy_accepts_pinned_provider_beside_hostless_web_rule() {
+        let open_web = || NetworkPolicyRule {
+            name: "open_web".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                port: 443,
+                allowed_ips: vec!["172.0.0.0/6".to_string(), "192.0.0.0/2".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let pinned = || {
+            let mut rule = test_policy_with_credential_binding("pinned", "example.com", "example")
+                .network_policies
+                .remove("pinned")
+                .unwrap();
+            rule.endpoints[0].allowed_ips = vec!["172.66.147.243".to_string()];
+            rule
+        };
+
+        let mut hostless_base = ProtoSandboxPolicy::default();
+        hostless_base
+            .network_policies
+            .insert("open_web".to_string(), open_web());
+        validate_candidate_effective_policy(
+            &hostless_base,
+            &[ProviderPolicyLayer {
+                rule_name: "_provider_example".to_string(),
+                rule: pinned(),
+            }],
+        )
+        .expect("a pinned provider endpoint takes precedence over a hostless rule");
+
+        let mut pinned_base = ProtoSandboxPolicy::default();
+        pinned_base
+            .network_policies
+            .insert("pinned".to_string(), pinned());
+        validate_candidate_effective_policy(
+            &pinned_base,
+            &[ProviderPolicyLayer {
+                rule_name: "_provider_open_web".to_string(),
+                rule: open_web(),
+            }],
+        )
+        .expect("a hostless layer does not compete with a pinned endpoint");
+
+        let mut outside = pinned();
+        outside.endpoints[0].allowed_ips = vec!["10.0.0.5".to_string()];
+        validate_candidate_effective_policy(
+            &hostless_base,
+            &[ProviderPolicyLayer {
+                rule_name: "_provider_example".to_string(),
+                rule: outside,
+            }],
+        )
+        .expect_err("a pinned address outside the hostless allowed_ips is looser");
+    }
+
     #[tokio::test]
     async fn update_config_rejects_ambiguous_policy_before_persisting_revision() {
         let state = test_server_state().await;

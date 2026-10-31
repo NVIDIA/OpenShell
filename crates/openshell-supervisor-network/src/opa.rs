@@ -9749,6 +9749,117 @@ process:
         );
     }
 
+    /// `a_open_web` sorts before `pinned_provider`, so these tests fail if
+    /// endpoint-config order rather than host precedence picks the metadata.
+    const HOST_PRECEDENCE_DATA: &str = r#"
+network_policies:
+  a_open_web:
+    name: a_open_web
+    endpoints:
+      - port: 443
+        allowed_ips: ["172.0.0.0/6", "192.0.0.0/2"]
+    binaries:
+      - { path: "/**" }
+  pinned_provider:
+    name: pinned_provider
+    endpoints:
+      - host: example.com
+        port: 443
+        protocol: rest
+        path: "/v1/**"
+        access: full
+        allowed_ips: ["172.66.147.243"]
+    binaries:
+      - { path: /usr/bin/agent }
+  plain_host:
+    name: plain_host
+    endpoints:
+      - host: github.com
+        port: 443
+    binaries:
+      - { path: /usr/bin/agent }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+
+    fn host_precedence_authorization(host: &str, binary: &str) -> EgressAuthorization {
+        let engine = OpaEngine::from_strings(TEST_POLICY, HOST_PRECEDENCE_DATA)
+            .expect("hosted and hostless endpoints on one port should load");
+        engine
+            .authorize_egress(&NetworkInput {
+                host: host.into(),
+                port: 443,
+                binary_path: PathBuf::from(binary),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn hosted_endpoint_config_takes_precedence_over_hostless_endpoint() {
+        let authorization = host_precedence_authorization("example.com", "/usr/bin/agent");
+
+        assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        assert_eq!(
+            get_str(&authorization.endpoint_configs[0], "host").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            get_str_array(&authorization.endpoint_configs[0], "allowed_ips"),
+            vec!["172.66.147.243"]
+        );
+    }
+
+    #[test]
+    fn hostless_endpoint_applies_when_hosted_endpoint_binary_does_not_match() {
+        let authorization = host_precedence_authorization("example.com", "/usr/bin/curl");
+
+        assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        assert_eq!(get_str(&authorization.endpoint_configs[0], "host"), None);
+        assert_eq!(
+            get_str_array(&authorization.endpoint_configs[0], "allowed_ips"),
+            vec!["172.0.0.0/6", "192.0.0.0/2"]
+        );
+    }
+
+    #[test]
+    fn hostless_endpoint_applies_to_undeclared_hosts() {
+        let authorization = host_precedence_authorization("other.example.net", "/usr/bin/agent");
+
+        assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        assert_eq!(get_str(&authorization.endpoint_configs[0], "host"), None);
+    }
+
+    #[test]
+    fn host_precedence_keys_on_hostname_not_pinned_ip() {
+        let authorization = host_precedence_authorization("172.66.147.243", "/usr/bin/agent");
+
+        assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        assert_eq!(get_str(&authorization.endpoint_configs[0], "host"), None);
+    }
+
+    #[test]
+    fn plain_hosted_endpoint_drops_hostless_allowed_ips() {
+        let authorization = host_precedence_authorization("github.com", "/usr/bin/agent");
+
+        assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
+        assert!(authorization.exact_declared_endpoint_host);
+        assert!(authorization.endpoint_configs.is_empty());
+    }
+
     #[test]
     fn egress_authorization_preserves_explicit_tcp_endpoint_identity() {
         let engine = OpaEngine::from_strings(
