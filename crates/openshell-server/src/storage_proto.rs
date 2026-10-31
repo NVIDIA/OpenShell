@@ -177,8 +177,10 @@ mod tests {
     // selections absent; storage.v1 remains frozen. Public field 3 retains its
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
+    // ReportSandboxConfigurationRequest field 4 adds a public-only refusal
+    // flag. Older supervisors omit it; durable schemas remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "be99bb3fcc7894eb85d774f54b642173e70dd37bc8e5fcaf3fdff2454ae689e1";
+        "e11259fbb0044206b457f34e03efad720354c74cd2938e86aa6b26d100df7fc1";
     const DURABLE_SCHEMA_SHA256: &str =
         "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =

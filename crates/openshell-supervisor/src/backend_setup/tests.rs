@@ -578,6 +578,23 @@ async fn attachment_receives_live_supervisor_services() {
 }
 
 #[tokio::test]
+async fn attach_refusal_is_marked_as_a_refusal() {
+    let setup = TestSetup::new();
+    setup.observed.active.store(true, Ordering::SeqCst);
+    let error = setup
+        .select()
+        .attach(setup.services(), policy(), agent())
+        .await
+        .err()
+        .expect("an already attached boundary refuses attachment");
+    assert_eq!(
+        error.code().map(|code| code.to_string()).as_deref(),
+        Some(ATTACH_REFUSED)
+    );
+    assert!(error.to_string().contains("already attached"));
+}
+
+#[tokio::test]
 async fn restored_boundary_attaches_with_retained_processes_and_starts_agent() {
     let setup = TestSetup::new();
     setup.observed.suspendable.store(true, Ordering::SeqCst);

@@ -1367,11 +1367,6 @@ pub async fn sync_policy_and_fetch_snapshot(
 
 /// Report an exact runtime configuration generation. Pending registration uses
 /// the snapshot's instance fence; retain that snapshot across registration retries.
-#[tracing::instrument(
-    name = "supervisor.gateway.report_sandbox_configuration",
-    skip_all,
-    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
-)]
 pub async fn report_sandbox_configuration(
     gateway: &GatewayEndpoint,
     sandbox_id: &str,
@@ -1380,10 +1375,9 @@ pub async fn report_sandbox_configuration(
     state: crate::proto::ConfigurationAdmissionState,
     error: &str,
 ) -> Result<()> {
-    let status = ClientSpanStatus::current();
-    let mut client = connect(gateway).await?;
-    client
-        .report_sandbox_configuration(crate::proto::ReportSandboxConfigurationRequest {
+    report_sandbox_configuration_request(
+        gateway,
+        crate::proto::ReportSandboxConfigurationRequest {
             sandbox_id: sandbox_id.to_string(),
             expected_instance_id: snapshot.map_or_else(String::new, |snapshot| {
                 snapshot.configuration_instance_id.clone()
@@ -1399,7 +1393,27 @@ pub async fn report_sandbox_configuration(
                     .map_or(0, |snapshot| snapshot.provider_env_revision),
                 error: error.to_string(),
             }),
-        })
+            refused_before_start: false,
+        },
+    )
+    .await
+}
+
+/// Send a configuration report the caller built itself, such as a refusal of
+/// the generation this instance already accepted.
+#[tracing::instrument(
+    name = "supervisor.gateway.report_sandbox_configuration",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
+pub async fn report_sandbox_configuration_request(
+    gateway: &GatewayEndpoint,
+    request: crate::proto::ReportSandboxConfigurationRequest,
+) -> Result<()> {
+    let status = ClientSpanStatus::current();
+    let mut client = connect(gateway).await?;
+    client
+        .report_sandbox_configuration(request)
         .await
         .map_err(grpc_status_error)?;
     status.finish(Ok(()))
