@@ -72,6 +72,17 @@ impl Context {
         self.cli.run_in(Some(dir), args).await
     }
 
+    /// Like [`Context::cli`], with extra environment variables for the CLI.
+    /// Pass secrets this way rather than as arguments: values are not
+    /// included in the reported command or in errors.
+    pub async fn cli_with_env<I, S>(&self, env: &[(&str, &str)], args: I) -> Result<CliOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.cli.run_with_env(None, env, args).await
+    }
+
     /// The ID unique to this test run, used in resource names.
     pub fn run_id(&self) -> &str {
         &self.run_id
