@@ -94,8 +94,22 @@ CLI:
 mkdir -p ~/.config/openshell/gateways/openshell/mtls/
 cp ca.crt tls.crt tls.key ~/.config/openshell/gateways/openshell/mtls/
 
-openshell gateway add --local https://<gateway-hostname>:17670
+openshell gateway add --local --name openshell --preserve-mtls-bundle https://<gateway-hostname>:17670
 ```
+
+`--name openshell` matters: without it the CLI derives the gateway name from
+the endpoint hostname, looks for the bundle under
+`~/.config/openshell/gateways/<gateway-hostname>/mtls/`, and never sees the
+`openshell` bundle copied above.
+
+`--preserve-mtls-bundle` matters: without it, `gateway add --local`
+refreshes the gateway's bundle from the package-managed TLS directory,
+replacing the externally-managed certificates copied above. With the flag
+the pre-provisioned bundle is kept as-is. A bundle whose files are present
+but unusable (for example an empty or truncated key from a failed copy)
+fails registration with an error naming the file instead of connecting with
+broken credentials — a broken bundle is never silently repaired or
+discarded.
 
 ### Firewall
 

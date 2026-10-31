@@ -4,7 +4,7 @@
 use crate::color::Colorize;
 use crate::tls::{
     TlsOptions, build_insecure_rustls_config, build_rustls_config, grpc_client,
-    require_tls_materials,
+    require_tls_materials, validate_rustls_materials,
 };
 use bytes::Bytes;
 use dialoguer::{Select, theme::ColorfulTheme};
@@ -21,6 +21,7 @@ use openshell_bootstrap::{
 };
 use openshell_bootstrap::{GatewayMetadataSource, ListedGateway};
 use openshell_core::proto::{ExtensionKind, GetGatewayInfoRequest, HealthRequest, ServiceStatus};
+use rustls::{RootCertStore, pki_types::CertificateDer};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use tonic::{Code, Status};
@@ -686,6 +687,126 @@ fn mtls_certs_exist_for_gateway(name: &str) -> bool {
     })
 }
 
+/// What the CLI can do with the mTLS files a gateway name has on disk.
+#[derive(Debug)]
+enum GatewayMtlsBundle {
+    /// No expected files are present. The package-managed fallback may
+    /// still import, matching the historical first-setup behavior.
+    Absent,
+    /// Some but not all expected files are present: external provisioning
+    /// was likely interrupted. Registration must fail and leave the
+    /// present files untouched.
+    Partial { missing: Vec<PathBuf> },
+    /// All three files are present and usable: preserved as-is.
+    Usable,
+    /// All three files are present but at least one cannot be used.
+    Unusable { path: PathBuf, reason: String },
+}
+
+fn gateway_mtls_bundle_state(name: &str) -> GatewayMtlsBundle {
+    let Ok(config_dir) = openshell_core::paths::xdg_config_dir() else {
+        return GatewayMtlsBundle::Absent;
+    };
+    let mtls = config_dir
+        .join("openshell")
+        .join("gateways")
+        .join(name)
+        .join("mtls");
+    let files = [
+        mtls.join("ca.crt"),
+        mtls.join("tls.crt"),
+        mtls.join("tls.key"),
+    ];
+    // Use symlink_metadata rather than is_file/metadata here. A dangling
+    // symlink is still an existing caller-owned entry and must never be
+    // mistaken for an absent bundle that can be replaced by package files.
+    let mut present = Vec::with_capacity(files.len());
+    for path in &files {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => present.push(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => present.push(false),
+            Err(error) => {
+                return GatewayMtlsBundle::Unusable {
+                    path: path.clone(),
+                    reason: format!("cannot inspect entry: {error}"),
+                };
+            }
+        }
+    }
+    let present_count = present.iter().filter(|present| **present).count();
+    if present_count == 0 {
+        return GatewayMtlsBundle::Absent;
+    }
+    if present_count < files.len() {
+        let missing: Vec<PathBuf> = files
+            .iter()
+            .zip(&present)
+            .filter(|(_, present)| !**present)
+            .map(|(path, _)| path.clone())
+            .collect();
+        return GatewayMtlsBundle::Partial { missing };
+    }
+    if let Err((path, reason)) = validate_mtls_bundle(&files) {
+        return GatewayMtlsBundle::Unusable { path, reason };
+    }
+    GatewayMtlsBundle::Usable
+}
+
+/// Validate the same decoded CA, certificate and private-key material that
+/// the CLI's TLS client will use. PEM framing alone is insufficient: a PEM
+/// block can contain malformed DER or a key that does not match the client
+/// certificate while still being accepted by `rustls_pemfile`.
+fn validate_mtls_bundle(files: &[PathBuf; 3]) -> std::result::Result<(), (PathBuf, String)> {
+    let read = |path: &PathBuf| {
+        std::fs::read(path).map_err(|error| (path.clone(), format!("cannot be read: {error}")))
+    };
+    let ca = read(&files[0])?;
+    let cert = read(&files[1])?;
+    let key = read(&files[2])?;
+
+    let mut ca_cursor = std::io::Cursor::new(&ca);
+    let ca_certs = rustls_pemfile::certs(&mut ca_cursor)
+        .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
+        .map_err(|error| {
+            (
+                files[0].clone(),
+                format!("is not a valid CA certificate: {error}"),
+            )
+        })?;
+    if ca_certs.is_empty() {
+        return Err((files[0].clone(), "contains no PEM certificate".to_string()));
+    }
+    let mut roots = RootCertStore::empty();
+    for certificate in ca_certs {
+        roots.add(certificate).map_err(|error| {
+            (
+                files[0].clone(),
+                format!("contains an unusable CA certificate: {error}"),
+            )
+        })?;
+    }
+
+    let mut cert_cursor = std::io::Cursor::new(&cert);
+    let cert_chain = rustls_pemfile::certs(&mut cert_cursor)
+        .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
+        .map_err(|error| {
+            (
+                files[1].clone(),
+                format!("is not a valid client certificate: {error}"),
+            )
+        })?;
+    if cert_chain.is_empty() {
+        return Err((files[1].clone(), "contains no PEM certificate".to_string()));
+    }
+
+    validate_rustls_materials(&ca, &cert, &key).map_err(|error| {
+        (
+            files[2].clone(),
+            format!("TLS material is unusable: {error}"),
+        )
+    })
+}
+
 fn package_managed_tls_dirs() -> Vec<PathBuf> {
     if let Some(path) = std::env::var_os("OPENSHELL_LOCAL_TLS_DIR") {
         return vec![PathBuf::from(path)];
@@ -841,6 +962,7 @@ pub async fn gateway_add(
     name: Option<&str>,
     remote: Option<&str>,
     local: bool,
+    preserve_mtls_bundle: bool,
     oidc_issuer: Option<&str>,
     oidc_client_id: &str,
     oidc_audience: Option<&str>,
@@ -1084,12 +1206,51 @@ pub async fn gateway_add(
 
     if remote.is_some() || local {
         // mTLS gateway (remote or local).
-        let imported_mtls_dir = if local {
+        // A present-but-unusable or partial bundle fails loudly: silently
+        // keeping a broken key would report success without connecting, and
+        // silently importing package credentials over it would swap identity
+        // material the caller provisioned explicitly.
+        let bundle_state = gateway_mtls_bundle_state(name);
+        match &bundle_state {
+            GatewayMtlsBundle::Unusable { path, reason } => {
+                return Err(miette::miette!(
+                    "mTLS bundle for gateway '{name}' is unusable: {} {reason}.\n\
+                     Fix or remove the file and register again — present files are never \
+                     silently replaced with package-managed credentials.",
+                    path.display(),
+                ));
+            }
+            GatewayMtlsBundle::Partial { missing } => {
+                let missing_list = missing
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(miette::miette!(
+                    "mTLS bundle for gateway '{name}' is incomplete: {missing_list}.\n\
+                     External provisioning may have been interrupted — complete or remove \
+                     the bundle and register again. Present files are never silently \
+                     replaced with package-managed credentials.",
+                ));
+            }
+            _ => {}
+        }
+        // Refresh by default: `gateway add --local` re-imports the
+        // package-managed bundle over a complete existing one, preserving
+        // the documented remove/add refresh flow (see
+        // docs/how-it-works/gateways/authentication.mdx). A caller such as
+        // a deploy helper that wrote a gateway-specific bundle immediately
+        // before registration (see "Externally-managed certificates" in
+        // deploy/rpm/TROUBLESHOOTING.md) opts out of the refresh with
+        // --preserve-mtls-bundle to keep its externally managed bundle.
+        let has_mtls_certs = matches!(bundle_state, GatewayMtlsBundle::Usable);
+        let import_mtls = local && (!has_mtls_certs || !preserve_mtls_bundle);
+        let imported_mtls_dir = if import_mtls {
             import_local_package_mtls_bundle(name)?
         } else {
             None
         };
-        let certs_on_disk = imported_mtls_dir.is_some() || mtls_certs_exist_for_gateway(name);
+        let certs_on_disk = has_mtls_certs || imported_mtls_dir.is_some();
         if !certs_on_disk {
             return Err(miette::miette!(
                 "mTLS certificates for gateway '{name}' were not found.\n\
@@ -1140,7 +1301,15 @@ pub async fn gateway_add(
             "Type:".dimmed(),
             if local { "local" } else { "remote" },
         );
-        eprintln!("{} TLS certificates present", "✓".green().bold());
+        if let Some(dir) = &imported_mtls_dir {
+            eprintln!(
+                "{} mTLS bundle imported from {}",
+                "✓".green().bold(),
+                dir.display(),
+            );
+        } else {
+            eprintln!("{} Using existing mTLS certificates", "✓".green().bold());
+        }
     } else {
         // Cloud (edge-authenticated) gateway.
         let previous_active = load_user_active_gateway();
@@ -1606,6 +1775,9 @@ mod tests {
     use std::thread;
     use tonic::Status;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
     fn with_tmp_xdg_and_system(
         tmp: &Path,
         system: &Path,
@@ -2019,6 +2191,531 @@ mod tests {
         );
     }
 
+    /// Writes a parseable mTLS bundle so tests exercise the real
+    /// registration path: files that exist but are not valid PEM are
+    /// rejected, so fixtures must be behaviorally usable.
+    fn write_valid_mtls_bundle(mtls: &Path) {
+        let bundle = openshell_bootstrap::pki::generate_pki(&[]).expect("generate test PKI");
+        fs::write(mtls.join("ca.crt"), &bundle.ca_cert_pem).expect("write gateway CA");
+        fs::write(mtls.join("tls.crt"), &bundle.client_cert_pem).expect("write gateway cert");
+        fs::write(mtls.join("tls.key"), &bundle.client_key_pem).expect("write gateway key");
+    }
+
+    #[test]
+    fn gateway_add_local_preserve_flag_keeps_an_existing_gateway_specific_bundle() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let package_tls = tmpdir.path().join("package-tls");
+        fs::create_dir_all(package_tls.join("client")).expect("create package tls dir");
+        fs::write(package_tls.join("ca.crt"), "package ca").expect("write package CA");
+        fs::write(package_tls.join("client/tls.crt"), "package cert").expect("write package cert");
+        fs::write(package_tls.join("client/tls.key"), "package key").expect("write package key");
+
+        with_tmp_xdg_env(
+            tmpdir.path(),
+            Environment::new().set("OPENSHELL_LOCAL_TLS_DIR", &package_tls),
+            |tmpdir| {
+                let mtls = tmpdir.join("openshell/gateways/ocp/mtls");
+                fs::create_dir_all(&mtls).expect("create gateway TLS dir");
+                write_valid_mtls_bundle(&mtls);
+                let snapshot = [
+                    fs::read_to_string(mtls.join("ca.crt")).expect("read gateway CA"),
+                    fs::read_to_string(mtls.join("tls.crt")).expect("read gateway cert"),
+                    fs::read_to_string(mtls.join("tls.key")).expect("read gateway key"),
+                ];
+
+                let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+                runtime.block_on(async {
+                    gateway_add(
+                        "https://127.0.0.1:17670",
+                        Some("ocp"),
+                        None,
+                        true,
+                        true,
+                        None,
+                        "openshell-cli",
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect("register local mTLS gateway");
+                });
+
+                // With --preserve-mtls-bundle the explicitly provisioned
+                // bundle survives registration even though a package-managed
+                // bundle is available.
+                assert_eq!(
+                    fs::read_to_string(mtls.join("ca.crt")).unwrap(),
+                    snapshot[0],
+                    "gateway CA must not be replaced by the package CA",
+                );
+                assert_eq!(
+                    fs::read_to_string(mtls.join("tls.crt")).unwrap(),
+                    snapshot[1],
+                    "gateway cert must not be replaced by the package cert",
+                );
+                assert_eq!(
+                    fs::read_to_string(mtls.join("tls.key")).unwrap(),
+                    snapshot[2],
+                    "gateway key must not be replaced by the package key",
+                );
+
+                let metadata = load_gateway_metadata("ocp").expect("load stored gateway");
+                assert_eq!(metadata.auth_mode.as_deref(), Some("mtls"));
+            },
+        );
+    }
+
+    #[test]
+    fn gateway_add_local_refreshes_package_credentials_by_default() {
+        // Stable v0.1.5 contract: `gateway add --local` imports the
+        // package-managed bundle over a complete existing one, so the
+        // documented remove/add flow refreshes rotated package credentials
+        // without deleting the mtls/ directory manually.
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let package_tls = tmpdir.path().join("package-tls");
+        fs::create_dir_all(package_tls.join("client")).expect("create package tls dir");
+        fs::write(package_tls.join("ca.crt"), "package ca").expect("write package CA");
+        fs::write(package_tls.join("client/tls.crt"), "package cert").expect("write package cert");
+        fs::write(package_tls.join("client/tls.key"), "package key").expect("write package key");
+
+        with_tmp_xdg_env(
+            tmpdir.path(),
+            Environment::new().set("OPENSHELL_LOCAL_TLS_DIR", &package_tls),
+            |tmpdir| {
+                // A complete bundle from a previous registration is present;
+                // the default add must refresh it from the package directory.
+                let mtls = tmpdir.join("openshell/gateways/openshell/mtls");
+                fs::create_dir_all(&mtls).expect("create gateway TLS dir");
+                write_valid_mtls_bundle(&mtls);
+
+                let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+                runtime.block_on(async {
+                    gateway_add(
+                        "https://127.0.0.1:17670",
+                        Some("openshell"),
+                        None,
+                        true,
+                        false,
+                        None,
+                        "openshell-cli",
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect("register local mTLS gateway");
+                });
+
+                assert_eq!(
+                    fs::read_to_string(mtls.join("ca.crt")).unwrap(),
+                    "package ca",
+                    "the default add must refresh the CA from the package directory",
+                );
+                assert_eq!(
+                    fs::read_to_string(mtls.join("tls.crt")).unwrap(),
+                    "package cert",
+                    "the default add must refresh the client cert from the package directory",
+                );
+                assert_eq!(
+                    fs::read_to_string(mtls.join("tls.key")).unwrap(),
+                    "package key",
+                    "the default add must refresh the client key from the package directory",
+                );
+
+                let metadata = load_gateway_metadata("openshell").expect("load stored gateway");
+                assert_eq!(metadata.auth_mode.as_deref(), Some("mtls"));
+            },
+        );
+    }
+
+    #[test]
+    fn gateway_add_local_rejects_an_unusable_mtls_bundle() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let package_tls = tmpdir.path().join("package-tls");
+        fs::create_dir_all(package_tls.join("client")).expect("create package tls dir");
+        fs::write(package_tls.join("ca.crt"), "package ca").expect("write package CA");
+        fs::write(package_tls.join("client/tls.crt"), "package cert").expect("write package cert");
+        fs::write(package_tls.join("client/tls.key"), "package key").expect("write package key");
+
+        with_tmp_xdg_env(
+            tmpdir.path(),
+            Environment::new().set("OPENSHELL_LOCAL_TLS_DIR", &package_tls),
+            |tmpdir| {
+                let mtls = tmpdir.join("openshell/gateways/ocp/mtls");
+                fs::create_dir_all(&mtls).expect("create gateway TLS dir");
+                write_valid_mtls_bundle(&mtls);
+                // A partially copied key: present, but empty.
+                fs::write(mtls.join("tls.key"), "").expect("truncate gateway key");
+
+                let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+                let error = runtime.block_on(async {
+                    gateway_add(
+                        "https://127.0.0.1:17670",
+                        Some("ocp"),
+                        None,
+                        true,
+                        false,
+                        None,
+                        "openshell-cli",
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect_err("an empty key must fail registration")
+                });
+                let message = error.to_string();
+                assert!(
+                    message.contains("unusable"),
+                    "error must say the bundle is unusable: {message}"
+                );
+                assert!(
+                    message.contains("tls.key"),
+                    "error must name the broken file: {message}"
+                );
+
+                // The broken bundle must not be silently replaced with the
+                // package-managed one, and nothing must be registered.
+                assert_eq!(
+                    fs::read_to_string(mtls.join("tls.key")).unwrap(),
+                    "",
+                    "the empty key must not be overwritten by the package import"
+                );
+                assert!(
+                    load_gateway_metadata("ocp").is_err(),
+                    "no registration may remain for a rejected bundle"
+                );
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gateway_add_local_rejects_dangling_mtls_symlinks_without_replacing_them() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let package_tls = tmpdir.path().join("package-tls");
+        fs::create_dir_all(package_tls.join("client")).expect("create package tls dir");
+        fs::write(package_tls.join("ca.crt"), "package ca").expect("write package CA");
+        fs::write(package_tls.join("client/tls.crt"), "package cert").expect("write package cert");
+        fs::write(package_tls.join("client/tls.key"), "package key").expect("write package key");
+
+        with_tmp_xdg_env(
+            tmpdir.path(),
+            Environment::new().set("OPENSHELL_LOCAL_TLS_DIR", &package_tls),
+            |tmpdir| {
+                let mtls = tmpdir.join("openshell/gateways/ocp/mtls");
+                fs::create_dir_all(&mtls).expect("create gateway TLS dir");
+                let missing_dir = tmpdir.join("provisioning-not-available");
+                for filename in ["ca.crt", "tls.crt", "tls.key"] {
+                    symlink(missing_dir.join(filename), mtls.join(filename))
+                        .expect("create dangling mTLS symlink");
+                }
+
+                let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+                let error = runtime.block_on(async {
+                    gateway_add(
+                        "https://127.0.0.1:17670",
+                        Some("ocp"),
+                        None,
+                        true,
+                        true,
+                        None,
+                        "openshell-cli",
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect_err("dangling symlinks must fail registration")
+                });
+                let message = error.to_string();
+                assert!(
+                    message.contains("unusable"),
+                    "error must identify the bundle as unusable: {message}"
+                );
+                assert!(
+                    load_gateway_metadata("ocp").is_err(),
+                    "no registration may remain for dangling links"
+                );
+                for filename in ["ca.crt", "tls.crt", "tls.key"] {
+                    let metadata = fs::symlink_metadata(mtls.join(filename))
+                        .expect("original symlink must remain");
+                    assert!(
+                        metadata.file_type().is_symlink(),
+                        "{filename} must not be replaced by a regular package file"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn gateway_add_local_rejects_a_pem_wrapped_invalid_private_key() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let package_tls = tmpdir.path().join("package-tls");
+        fs::create_dir_all(package_tls.join("client")).expect("create package tls dir");
+        fs::write(package_tls.join("ca.crt"), "package ca").expect("write package CA");
+        fs::write(package_tls.join("client/tls.crt"), "package cert").expect("write package cert");
+        fs::write(package_tls.join("client/tls.key"), "package key").expect("write package key");
+
+        with_tmp_xdg_env(
+            tmpdir.path(),
+            Environment::new().set("OPENSHELL_LOCAL_TLS_DIR", &package_tls),
+            |tmpdir| {
+                let mtls = tmpdir.join("openshell/gateways/ocp/mtls");
+                fs::create_dir_all(&mtls).expect("create gateway TLS dir");
+                write_valid_mtls_bundle(&mtls);
+                let invalid_key = "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n";
+                fs::write(mtls.join("tls.key"), invalid_key).expect("write malformed key");
+
+                let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+                let error = runtime.block_on(async {
+                    gateway_add(
+                        "https://127.0.0.1:17670",
+                        Some("ocp"),
+                        None,
+                        true,
+                        true,
+                        None,
+                        "openshell-cli",
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect_err("a malformed decoded key must fail registration")
+                });
+                let message = error.to_string();
+                assert!(
+                    message.contains("unusable") && message.contains("tls.key"),
+                    "error must identify the invalid key: {message}"
+                );
+                assert!(
+                    load_gateway_metadata("ocp").is_err(),
+                    "no registration may remain for an invalid key"
+                );
+                assert_eq!(
+                    fs::read_to_string(mtls.join("tls.key")).unwrap(),
+                    invalid_key,
+                    "the invalid external key must not be replaced by package credentials"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn gateway_add_local_rejects_a_non_pem_mtls_bundle() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        with_tmp_xdg_env(tmpdir.path(), Environment::new(), |tmpdir| {
+            let mtls = tmpdir.join("openshell/gateways/ocp/mtls");
+            fs::create_dir_all(&mtls).expect("create gateway TLS dir");
+            write_valid_mtls_bundle(&mtls);
+            // Present and non-empty, but not a certificate.
+            fs::write(mtls.join("ca.crt"), "not a certificate").expect("write garbage CA");
+
+            let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+            let error = runtime.block_on(async {
+                gateway_add(
+                    "https://127.0.0.1:17670",
+                    Some("ocp"),
+                    None,
+                    true,
+                    false,
+                    None,
+                    "openshell-cli",
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect_err("a non-PEM CA must fail registration")
+            });
+            assert!(
+                error.to_string().contains("ca.crt"),
+                "error must name the broken file: {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn gateway_add_local_registers_the_documented_external_bundle_with_preserve_flag() {
+        // The documented flow in deploy/rpm/TROUBLESHOOTING.md ("Option 2:
+        // Externally-managed certificates") copies the bundle under the
+        // "openshell" gateway name and registers a non-loopback endpoint
+        // with an explicit --name and --preserve-mtls-bundle. Without the
+        // explicit name the CLI would derive the gateway name from the
+        // endpoint hostname and never see this bundle; without the flag the
+        // documented default refreshes the package-managed bundle over it.
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let package_tls = tmpdir.path().join("package-tls");
+        fs::create_dir_all(package_tls.join("client")).expect("create package tls dir");
+        fs::write(package_tls.join("ca.crt"), "package ca").expect("write package CA");
+        fs::write(package_tls.join("client/tls.crt"), "package cert").expect("write package cert");
+        fs::write(package_tls.join("client/tls.key"), "package key").expect("write package key");
+
+        with_tmp_xdg_env(
+            tmpdir.path(),
+            Environment::new().set("OPENSHELL_LOCAL_TLS_DIR", &package_tls),
+            |tmpdir| {
+                let mtls = tmpdir.join("openshell/gateways/openshell/mtls");
+                fs::create_dir_all(&mtls).expect("create gateway TLS dir");
+                write_valid_mtls_bundle(&mtls);
+                let snapshot = fs::read_to_string(mtls.join("ca.crt")).expect("read gateway CA");
+
+                let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+                runtime.block_on(async {
+                    gateway_add(
+                        "https://gw.example.com:17670",
+                        Some("openshell"),
+                        None,
+                        true,
+                        true,
+                        None,
+                        "openshell-cli",
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect("register the documented external bundle");
+                });
+
+                assert_eq!(
+                    fs::read_to_string(mtls.join("ca.crt")).unwrap(),
+                    snapshot,
+                    "the documented bundle must be preserved, not replaced"
+                );
+                let metadata = load_gateway_metadata("openshell").expect("load stored gateway");
+                assert_eq!(metadata.auth_mode.as_deref(), Some("mtls"));
+            },
+        );
+    }
+
+    #[test]
+    fn gateway_add_local_rejects_partial_bundle_and_leaves_files_untouched() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let package_tls = tmpdir.path().join("package-tls");
+        fs::create_dir_all(package_tls.join("client")).expect("create package tls dir");
+        fs::write(package_tls.join("ca.crt"), "package ca").expect("write package CA");
+        fs::write(package_tls.join("client/tls.crt"), "package cert").expect("write package cert");
+        fs::write(package_tls.join("client/tls.key"), "package key").expect("write package key");
+
+        with_tmp_xdg_env(
+            tmpdir.path(),
+            Environment::new().set("OPENSHELL_LOCAL_TLS_DIR", &package_tls),
+            |tmpdir| {
+                // External provisioning wrote ca.crt and tls.crt but was
+                // interrupted before tls.key: the partial bundle must be
+                // rejected, not silently replaced with package credentials.
+                let mtls = tmpdir.join("openshell/gateways/ocp/mtls");
+                fs::create_dir_all(&mtls).expect("create gateway TLS dir");
+                fs::write(mtls.join("ca.crt"), "gateway ca").expect("write gateway CA");
+                fs::write(mtls.join("tls.crt"), "gateway cert").expect("write gateway cert");
+
+                let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+                let error = runtime.block_on(async {
+                    gateway_add(
+                        "https://127.0.0.1:17670",
+                        Some("ocp"),
+                        None,
+                        true,
+                        false,
+                        None,
+                        "openshell-cli",
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect_err("a partial bundle must fail registration")
+                });
+                let message = error.to_string();
+                assert!(
+                    message.contains("incomplete"),
+                    "error must say the bundle is incomplete: {message}"
+                );
+                assert!(
+                    message.contains("tls.key"),
+                    "error must name the missing file: {message}"
+                );
+
+                // The present files must remain untouched.
+                assert_eq!(
+                    fs::read_to_string(mtls.join("ca.crt")).unwrap(),
+                    "gateway ca",
+                    "partial bundle CA must not be replaced by the package CA",
+                );
+                assert_eq!(
+                    fs::read_to_string(mtls.join("tls.crt")).unwrap(),
+                    "gateway cert",
+                    "partial bundle cert must not be replaced by the package cert",
+                );
+                assert!(
+                    !mtls.join("tls.key").is_file(),
+                    "the package key must not be imported over a partial bundle",
+                );
+
+                assert!(
+                    load_gateway_metadata("ocp").is_err(),
+                    "no registration may remain for a rejected partial bundle",
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn gateway_add_local_imports_package_bundle_when_no_files_exist() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let package_tls = tmpdir.path().join("package-tls");
+        fs::create_dir_all(package_tls.join("client")).expect("create package tls dir");
+        fs::write(package_tls.join("ca.crt"), "package ca").expect("write package CA");
+        fs::write(package_tls.join("client/tls.crt"), "package cert").expect("write package cert");
+        fs::write(package_tls.join("client/tls.key"), "package key").expect("write package key");
+
+        with_tmp_xdg_env(
+            tmpdir.path(),
+            Environment::new().set("OPENSHELL_LOCAL_TLS_DIR", &package_tls),
+            |tmpdir| {
+                // No expected files at all: package fallback is appropriate
+                // (historical first-setup behavior).
+                let mtls = tmpdir.join("openshell/gateways/ocp/mtls");
+                fs::create_dir_all(&mtls).expect("create gateway TLS dir");
+
+                let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+                runtime.block_on(async {
+                    gateway_add(
+                        "https://127.0.0.1:17670",
+                        Some("ocp"),
+                        None,
+                        true,
+                        false,
+                        None,
+                        "openshell-cli",
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect("register local mTLS gateway with package fallback");
+                });
+
+                assert_eq!(
+                    fs::read_to_string(mtls.join("ca.crt")).unwrap(),
+                    "package ca",
+                );
+                assert_eq!(
+                    fs::read_to_string(mtls.join("tls.crt")).unwrap(),
+                    "package cert",
+                );
+                assert_eq!(
+                    fs::read_to_string(mtls.join("tls.key")).unwrap(),
+                    "package key",
+                );
+            },
+        );
+    }
+
     #[test]
     fn mtls_certs_exist_for_gateway_uses_explicit_name_for_loopback_endpoint() {
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
@@ -2078,6 +2775,7 @@ mod tests {
                     None,
                     None,
                     false,
+                    false,
                     None,
                     "openshell-cli",
                     None,
@@ -2109,6 +2807,7 @@ mod tests {
                     Some("dev-http"),
                     None,
                     true,
+                    false,
                     None,
                     "openshell-cli",
                     None,
@@ -2169,6 +2868,7 @@ mod tests {
                     Some("existing-gw"),
                     None,
                     false,
+                    false,
                     None,
                     "openshell-cli",
                     None,
@@ -2187,6 +2887,7 @@ mod tests {
                     "https://gateway.example.com",
                     Some("oidc-fail"),
                     None,
+                    false,
                     false,
                     Some("http://127.0.0.1:1/realms/nonexistent"),
                     "openshell-cli",
@@ -2232,6 +2933,7 @@ mod tests {
                         Some("oidc-fail"),
                         None,
                         false,
+                        false,
                         Some("http://127.0.0.1:1/realms/nonexistent"),
                         "openshell-cli",
                         None,
@@ -2274,6 +2976,7 @@ mod tests {
                         Some("existing-gw"),
                         None,
                         false,
+                        false,
                         None,
                         "openshell-cli",
                         None,
@@ -2293,6 +2996,7 @@ mod tests {
                         "https://127.0.0.1:1",
                         Some("cloud-fail"),
                         None,
+                        false,
                         false,
                         None,
                         "openshell-cli",
@@ -2339,6 +3043,7 @@ mod tests {
                         "https://127.0.0.1:1",
                         Some("cloud-fail"),
                         None,
+                        false,
                         false,
                         None,
                         "openshell-cli",
