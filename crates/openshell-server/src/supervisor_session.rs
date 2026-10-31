@@ -1608,7 +1608,11 @@ pub(crate) async fn forward_provider_status_query_to_owner(
     })
 }
 
-pub async fn open_routed_relay_with_target(
+/// Open a relay into a sandbox wherever its supervisor is connected.
+///
+/// Entry points open relays through `sandbox_access::SandboxAccess`, which
+/// applies the access rules first.
+pub(crate) async fn open_routed_relay_with_target(
     state: &Arc<ServerState>,
     sandbox_id: &str,
     target: relay_open::Target,
@@ -1818,6 +1822,33 @@ async fn resolve_owner(
 
 fn owner_is_fresh(owner: &crate::supervisor_owner::OwnerRecord) -> bool {
     owner.is_fresh(OWNER_TTL)
+}
+
+/// Whether this sandbox's supervisor is connected to any replica.
+///
+/// A peer replica counts only through a fresh owner record. An owner record
+/// naming this replica without a local session is a leftover from a lost
+/// session.
+pub async fn supervisor_connected(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+) -> Result<bool, Status> {
+    if state.supervisor_sessions.has_session(sandbox_id) {
+        return Ok(true);
+    }
+    if state.store.is_single_replica() {
+        return Ok(false);
+    }
+    let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+    let owner = resolve_owner(state, &owner_index, sandbox_id).await?;
+    Ok(peer_holds_session(&state.replica_id, owner.as_ref()))
+}
+
+fn peer_holds_session(
+    self_replica_id: &str,
+    owner: Option<&crate::supervisor_owner::OwnerRecord>,
+) -> bool {
+    owner.is_some_and(|owner| owner_is_fresh(owner) && owner.owner_replica_id != self_replica_id)
 }
 
 /// The replica currently holding this sandbox's supervisor session, if known.
@@ -3603,6 +3634,59 @@ mod tests {
         config
             .load()
             .expect("complete chart peer TLS materials should configure tonic");
+    }
+
+    #[tokio::test]
+    async fn supervisor_connected_follows_the_local_session() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let connected = |sandbox_id: &'static str| {
+            let state = state.clone();
+            async move { supervisor_connected(&state, sandbox_id).await.unwrap() }
+        };
+
+        assert!(!connected("relay-none").await);
+
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        state.supervisor_sessions.register(
+            "relay-local".to_string(),
+            "session".to_string(),
+            tx,
+            shutdown_tx,
+        );
+        assert!(connected("relay-local").await);
+        assert!(state.supervisor_sessions.disconnect("relay-local"));
+        assert!(!connected("relay-local").await);
+
+        // A single replica holds every session itself, so an owner record
+        // naming a peer is a leftover and is not read.
+        assert!(state.store.is_single_replica());
+        SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+            .publish(
+                "relay-peer",
+                "session",
+                "supervisor",
+                1,
+                "peer-replica",
+                "https://peer",
+            )
+            .await
+            .unwrap();
+        assert!(!connected("relay-peer").await);
+    }
+
+    #[test]
+    fn peer_holds_session_only_through_a_fresh_peer_owner_record() {
+        assert!(peer_holds_session("gw-0", Some(&owner_record("gw-1"))));
+        assert!(!peer_holds_session("gw-0", None));
+
+        let mut stale = owner_record("gw-1");
+        stale.updated_at_ms = 0;
+        assert!(!peer_holds_session("gw-0", Some(&stale)));
+
+        // An owner record naming this replica without a local session is a
+        // leftover from a lost session, not a live supervisor.
+        assert!(!peer_holds_session("gw-0", Some(&owner_record("gw-0"))));
     }
 
     fn sandbox_record(id: &str, name: &str) -> Sandbox {

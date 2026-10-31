@@ -20,6 +20,8 @@ struct SandboxState {
     id: String,
     name: String,
     phase: String,
+    #[serde(default)]
+    exit_code: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +43,124 @@ fn run_sandbox_lifecycle(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     })
 }
 
+/// Certify what happens to a sandbox after its main process exits.
+///
+/// An ephemeral sandbox is deleted whether the main process succeeds or
+/// fails. A retained sandbox records the result and stays reachable through
+/// exec, because the supervisor keeps its access plane after the exit.
+pub const SANDBOX_RETENTION_SCENARIO: Scenario = Scenario {
+    name: "sandbox-retention",
+    run: run_sandbox_retention,
+};
+
+fn run_sandbox_retention(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
+    Box::pin(async move {
+        for exit_code in [0, 3] {
+            ephemeral_is_deleted_after_exit(runner, exit_code).await?;
+            retained_accepts_exec_after_exit(runner, exit_code).await?;
+        }
+        Ok(())
+    })
+}
+
+async fn ephemeral_is_deleted_after_exit(
+    runner: &mut OpenShellRunner,
+    exit_code: i32,
+) -> Result<(), String> {
+    let sandbox_name = format!("ct-{}-e{exit_code}", runner.id());
+    let step = format!("ephemeral-exit-{exit_code}");
+    runner.track_sandbox(&sandbox_name);
+    let create = runner
+        .step(format!("{step}/create"))
+        .description(format!(
+            "ephemeral sandbox '{sandbox_name}' runs its main process and returns exit code {exit_code}"
+        ))
+        .with_timeout(CREATE_TIMEOUT)
+        .run(&[
+            "sandbox",
+            "create",
+            "--name",
+            &sandbox_name,
+            "--no-keep",
+            "--no-tty",
+            "--",
+            "sh",
+            "-c",
+            &format!("echo ephemeral-done; exit {exit_code}"),
+        ])
+        .await
+        .map_err(|error| error.to_string())?;
+    if create.exit_code() != Some(exit_code) {
+        return Err(create.failure_diagnostic(&format!("create exits with code {exit_code}")));
+    }
+    if !create.stdout().contains("ephemeral-done") {
+        return Err(create.failure_diagnostic("main process stdout is streamed to the caller"));
+    }
+
+    wait_for_name_absence(runner, &sandbox_name, &format!("{step}/deleted")).await?;
+    runner.forget_sandbox(&sandbox_name);
+    Ok(())
+}
+
+async fn retained_accepts_exec_after_exit(
+    runner: &mut OpenShellRunner,
+    exit_code: i32,
+) -> Result<(), String> {
+    let sandbox_name = format!("ct-{}-r{exit_code}", runner.id());
+    let step = format!("retained-exit-{exit_code}");
+    let result_path = "/sandbox/.openshell-retained-result";
+    let result = format!("openshell-retained-{}-{exit_code}", runner.id());
+    runner.track_sandbox(&sandbox_name);
+    let create = runner
+        .step(format!("{step}/create"))
+        .description(format!("retained sandbox '{sandbox_name}' is created"))
+        .with_timeout(CREATE_TIMEOUT)
+        .run(&[
+            "sandbox",
+            "create",
+            "--name",
+            &sandbox_name,
+            "--detach",
+            "--no-tty",
+            "--",
+            "sh",
+            "-c",
+            &format!("printf '%s\\n' '{result}' > '{result_path}' && sync; exit {exit_code}"),
+        ])
+        .await
+        .map_err(|error| error.to_string())?;
+    create.require_success()?;
+
+    let expected_phase = if exit_code == 0 { "Completed" } else { "Error" };
+    let state = wait_for_phase(
+        runner,
+        &sandbox_name,
+        expected_phase,
+        &format!("{step}/{}", expected_phase.to_lowercase()),
+    )
+    .await?;
+    if state.exit_code != Some(exit_code) {
+        return Err(format!(
+            "sandbox '{sandbox_name}' recorded exit code {:?}; expected {exit_code}",
+            state.exit_code
+        ));
+    }
+
+    exec_expect_exact(
+        runner,
+        &sandbox_name,
+        &format!("{step}/exec-after-exit"),
+        &["cat", result_path],
+        &format!("{result}\n"),
+    )
+    .await?;
+
+    run_lifecycle_command(runner, "delete", &sandbox_name, &format!("{step}/delete")).await?;
+    wait_for_absence(runner, &state.id, &sandbox_name, &format!("{step}/deleted")).await?;
+    runner.forget_sandbox(&sandbox_name);
+    Ok(())
+}
+
 async fn stop_start_preserves_workspace(runner: &mut OpenShellRunner) -> Result<(), String> {
     let sandbox_name = format!("ct-{}-ss", runner.id());
     let sentinel = format!("openshell-stop-start-{}", runner.id());
@@ -56,7 +176,7 @@ async fn stop_start_preserves_workspace(runner: &mut OpenShellRunner) -> Result<
     exec_expect_exact(
         runner,
         &sandbox_name,
-        "write-sentinel",
+        "stop-start/write-sentinel",
         &[
             "sh",
             "-lc",
@@ -99,7 +219,7 @@ async fn stop_start_preserves_workspace(runner: &mut OpenShellRunner) -> Result<
     exec_expect_exact(
         runner,
         &sandbox_name,
-        "read-sentinel",
+        "stop-start/read-sentinel",
         &["cat", sentinel_path],
         &format!("{sentinel}\n"),
     )
@@ -107,7 +227,7 @@ async fn stop_start_preserves_workspace(runner: &mut OpenShellRunner) -> Result<
     exec_expect_exact(
         runner,
         &sandbox_name,
-        "read-main-run-count",
+        "stop-start/read-main-run-count",
         &["cat", run_count_path],
         "2\n",
     )
@@ -190,7 +310,7 @@ async fn exec_expect_exact(
     let mut args = vec!["sandbox", "exec", "--name", sandbox_name, "--no-tty", "--"];
     args.extend_from_slice(command);
     let result = runner
-        .step(format!("stop-start/{step}"))
+        .step(step)
         .description(format!("sandbox '{sandbox_name}' exec {step} succeeds"))
         .with_timeout(COMMAND_TIMEOUT)
         .run(&args)
@@ -277,6 +397,51 @@ async fn wait_for_absence(
                     "sandbox '{sandbox_name}' with ID '{sandbox_id}' is still listed"
                 )),
                 Err(error) => Poll::Pending(error),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Wait until `sandbox get` reports that the name no longer exists. Used
+/// when the gateway deletes the sandbox on its own, so the caller may never
+/// observe its ID.
+async fn wait_for_name_absence(
+    runner: &mut OpenShellRunner,
+    sandbox_name: &str,
+    step: &str,
+) -> Result<(), String> {
+    let sandbox_name = sandbox_name.to_string();
+    let step = step.to_string();
+    let poll_step = step.clone();
+    runner
+        .poll_until(
+            &poll_step,
+            TRANSITION_TIMEOUT,
+            TRANSITION_INTERVAL,
+            async move |runner| {
+                let result = runner
+                    .step(format!("{step}/get"))
+                    .description(format!("sandbox '{sandbox_name}' no longer exists"))
+                    .with_timeout(COMMAND_TIMEOUT)
+                    .run(&["sandbox", "get", &sandbox_name, "--output", "json"])
+                    .await;
+                match result {
+                    Ok(result) if result.success() => match result.json::<SandboxState>() {
+                        Ok(state) => Poll::Pending(format!(
+                            "sandbox '{sandbox_name}' still exists in phase {:?}",
+                            state.phase
+                        )),
+                        Err(error) => Poll::Failed(error.to_string()),
+                    },
+                    Ok(result) if result.stderr().to_lowercase().contains("not found") => {
+                        Poll::Ready(())
+                    }
+                    Ok(result) => Poll::Pending(result.failure_diagnostic(&format!(
+                        "sandbox get reports that '{sandbox_name}' was not found"
+                    ))),
+                    Err(error) => Poll::Pending(error.to_string()),
+                }
             },
         )
         .await

@@ -1213,6 +1213,35 @@ show the attempt number and next deadline. Inspect them with
 an explicit later start resets the restart count. Compute runtimes do not
 apply their own restart policy.
 
+### After the main process exits
+
+Whether a sandbox outlives its main process depends on how you created it:
+
+- With `--no-keep`, the sandbox's lifecycle is tied to the main process. The
+  gateway deletes the sandbox after the main process exits, whatever the exit
+  code, once its output has been delivered.
+- By default, the sandbox is retained. It moves to `Completed` or `Error`, and
+  its compute keeps running: the workload with its filesystem, and the
+  supervisor. It stays that way until you delete the sandbox or start it again.
+
+In a retained `Completed` or `Error` sandbox, these keep working while its
+supervisor stays connected:
+
+- `sandbox exec`, including `sandbox exec --tty -- /bin/bash -l` for an
+  interactive shell
+- `sandbox upload` and `sandbox download`
+- port forwarding
+- exposed services
+
+`sandbox connect` fails, because it attaches to the main process and that
+process has exited.
+
+An `Error` caused by an infrastructure failure, such as
+`ImagePreparationTimedOut`, usually has no supervisor left, so these
+operations fail with `sandbox is not ready`. If the supervisor survived, exec,
+file transfer, and port forwarding still work for debugging, but exposed
+services stay unavailable.
+
 ## Sandbox Runtimes
 
 The gateway's configured compute driver determines how OpenShell creates each sandbox. The CLI workflow stays the same across drivers: you create, connect to, inspect, and delete sandboxes through the gateway API.

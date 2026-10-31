@@ -6879,7 +6879,7 @@ fn terminal_stop_exit_code(sandbox: &Sandbox) -> Option<i32> {
     sandbox.status.as_ref()?.exit_code
 }
 
-fn is_failed_main_process_result(sandbox: &Sandbox) -> bool {
+pub fn is_failed_main_process_result(sandbox: &Sandbox) -> bool {
     sandbox.phase() == SandboxPhase::Error as i32
         && sandbox.status.as_ref().is_some_and(|status| {
             status.exit_code.is_some()
