@@ -11,7 +11,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-openshell-core = { path = "../openshell-core" }
+openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
+openshell-core = { path = "../openshell-core", features = ["jwt"] }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 
@@ -21,9 +22,8 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 hex = "0.4"
 miette = { workspace = true }
-nix = { workspace = true }
 rand = "0.10"
-russh = "0.62"
+russh = "0.64.1"
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
@@ -35,10 +35,15 @@ uuid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix = { workspace = true, features = ["termios"] }
 
 [dev-dependencies]
+openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
+
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
+openshell-ocsf-validate = { path = "../openshell-ocsf-validate" }
 tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

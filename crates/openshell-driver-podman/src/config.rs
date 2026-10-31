@@ -43,6 +43,23 @@ pub struct PodmanComputeConfig {
     /// When empty, the driver selects loopback on Linux or
     /// `host.containers.internal` with Podman Machine, using `gateway_port`.
     pub grpc_endpoint: String,
+    /// OTLP/gRPC collector endpoint passed to supervisors. The gateway
+    /// supplies its own export endpoint; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_otlp_endpoint: Option<String>,
+    /// OCSF event export passed to supervisors. The gateway supplies its own
+    /// export; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+    /// OTLP/gRPC collector that supervisors relay workload traces to. The
+    /// gateway supplies it from `[otlp.agent]`; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_otlp_agent_endpoint: Option<String>,
+
+    /// Gateway name passed to supervisors for their telemetry. The gateway
+    /// supplies its own name; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_gateway_name: Option<String>,
     /// Port the gateway server is actually listening on.
     ///
     /// Used by the driver's auto-detection fallback when `grpc_endpoint`
@@ -69,16 +86,14 @@ pub struct PodmanComputeConfig {
     pub sandbox_runtime_image: String,
     /// OCI image containing the dynamically linked `openshell-supervisor` binary.
     pub supervisor_image: String,
-    /// Host path to the CA certificate for sandbox mTLS.
+    /// Host path to the CA certificate for sandbox-to-gateway TLS.
     ///
-    /// When all three TLS paths (`guest_tls_ca`, `guest_tls_cert`,
-    /// `guest_tls_key`) are set, the driver bind-mounts them into sandbox
-    /// containers and switches the auto-detected endpoint from `http://`
-    /// to `https://`.
+    /// When set, the driver mounts the CA into supervisor containers and
+    /// switches the auto-detected endpoint from `http://` to `https://`.
     pub guest_tls_ca: Option<PathBuf>,
-    /// Host path to the client certificate for sandbox mTLS.
+    /// Deprecated. Sandboxes authenticate with bearer tokens.
     pub guest_tls_cert: Option<PathBuf>,
-    /// Host path to the client private key for sandbox mTLS.
+    /// Deprecated. Sandboxes authenticate with bearer tokens.
     pub guest_tls_key: Option<PathBuf>,
     /// Container cgroup PID limit for Podman-managed sandboxes.
     ///
@@ -176,6 +191,32 @@ pub struct PodmanComputeConfig {
     /// and upstream verification. Only meaningful with `https_proxy` set; the
     /// bundle must exist and contain at least one certificate.
     pub proxy_ca_bundle: Option<String>,
+    /// Path (on the gateway host) to a PEM CA bundle trusted for direct
+    /// (non-proxied), policy-inspected HTTPS egress to destinations signed by
+    /// a private CA.
+    ///
+    /// Unlike [`proxy_ca_bundle`](Self::proxy_ca_bundle), this applies
+    /// regardless of whether `https_proxy` is configured: it addresses
+    /// supervisors that run as their own container, separate from the
+    /// workload image, and therefore cannot inherit a private CA baked into
+    /// the workload's system trust store. The gateway bind-mounts this file
+    /// read-only into the supervisor container (at
+    /// [`ADDITIONAL_CA_MOUNT_PATH`](openshell_core::driver_utils::ADDITIONAL_CA_MOUNT_PATH))
+    /// and passes its path via `--additional-ca-bundle`. The supervisor folds
+    /// it into its upstream TLS trust store alongside (not instead of) the
+    /// system CA bundle. The bundle must exist and contain at least one
+    /// certificate; this is validated on the gateway host at sandbox-create
+    /// time, not deferred until the supervisor container starts.
+    ///
+    /// Populated only from the `--sandbox-additional-ca-bundle` CLI argument
+    /// (or `OPENSHELL_SANDBOX_ADDITIONAL_CA_BUNDLE`) for standalone drivers.
+    /// Deliberately excluded from driver JSON config (`#[serde(skip)]` +
+    /// `deny_unknown_fields`): gateway-managed deployments must use the
+    /// global `[openshell.supervisor.network]` setting so every driver
+    /// receives the same staged bundle, and a per-driver path in operator
+    /// JSON is rejected instead of silently diverging from it.
+    #[serde(skip)]
+    pub additional_ca_bundle: Option<String>,
     /// User namespace mode for sandbox containers (e.g. `auto`, `private`).
     /// When unset, containers use the default user namespace.
     pub userns: Option<String>,
@@ -253,43 +294,33 @@ impl PodmanComputeConfig {
         self.validate_userns_mappings()
     }
 
-    /// Returns `true` when all three TLS paths are configured.
+    /// Returns `true` when the gateway CA is configured.
     #[must_use]
     pub fn tls_enabled(&self) -> bool {
-        self.guest_tls_ca.is_some() && self.guest_tls_cert.is_some() && self.guest_tls_key.is_some()
+        self.guest_tls_ca.is_some()
     }
 
     /// Validate TLS configuration consistency.
     ///
-    /// Returns `Ok(())` when either all three TLS paths are set (full mTLS)
-    /// or none are set (plaintext).  Returns an error naming the missing
-    /// fields when only a subset is provided — this prevents silent
-    /// fallback to plaintext when an operator partially configures mTLS.
+    /// Client certificates are rejected because sandbox identity is carried
+    /// by bearer tokens rather than the gateway user's mTLS identity.
     pub fn validate_tls_config(&self) -> Result<(), crate::client::PodmanApiError> {
-        let has_ca = self.guest_tls_ca.is_some();
         let has_cert = self.guest_tls_cert.is_some();
         let has_key = self.guest_tls_key.is_some();
 
-        // All set or none set — both are valid.
-        if (has_ca && has_cert && has_key) || (!has_ca && !has_cert && !has_key) {
+        if !has_cert && !has_key {
             return Ok(());
         }
-
-        let mut missing = Vec::new();
-        if !has_ca {
-            missing.push("--podman-tls-ca / OPENSHELL_PODMAN_TLS_CA");
-        }
-        if !has_cert {
-            missing.push("--podman-tls-cert / OPENSHELL_PODMAN_TLS_CERT");
-        }
-        if !has_key {
-            missing.push("--podman-tls-key / OPENSHELL_PODMAN_TLS_KEY");
-        }
-
         Err(crate::client::PodmanApiError::InvalidInput(format!(
-            "Partial TLS configuration: all three TLS paths must be provided together. \
-             Missing: {}",
-            missing.join(", ")
+            "Sandbox client certificates are no longer supported; remove {}",
+            [
+                has_cert.then_some("--podman-tls-cert / OPENSHELL_PODMAN_TLS_CERT"),
+                has_key.then_some("--podman-tls-key / OPENSHELL_PODMAN_TLS_KEY"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" and ")
         )))
     }
 
@@ -339,6 +370,21 @@ impl PodmanComputeConfig {
                     "proxy_ca_bundle is set but no https_proxy is configured".to_string(),
                 ));
             }
+        }
+        // additional_ca_bundle is independent of the corporate proxy setting
+        // above: it applies to direct, inspected egress and has no
+        // https_proxy dependency. Read and validate the actual host file
+        // here (this path is not yet mounted into any container), rather
+        // than only checking it is non-empty: an operator with a mistyped
+        // path or a certificate-free bundle should see a config-validation
+        // error when the driver starts, not a failed/crash-looping sandbox
+        // once the supervisor container starts and tries to read it.
+        if let Some(path) = self.additional_ca_bundle.as_deref() {
+            openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(
+                path,
+                "additional_ca_bundle",
+            )
+            .map_err(crate::client::PodmanApiError::InvalidInput)?;
         }
         Ok(())
     }
@@ -505,6 +551,10 @@ impl Default for PodmanComputeConfig {
             default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),
+            supervisor_otlp_endpoint: None,
+            supervisor_ocsf_export: None,
+            supervisor_otlp_agent_endpoint: None,
+            supervisor_gateway_name: None,
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             network_name: DEFAULT_NETWORK_NAME.to_string(),
@@ -526,6 +576,7 @@ impl Default for PodmanComputeConfig {
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
             proxy_ca_bundle: None,
+            additional_ca_bundle: None,
             userns: None,
             uidmap: Vec::new(),
             gidmap: Vec::new(),
@@ -610,6 +661,15 @@ mod tests {
         }))
         .expect_err("legacy sandbox_ssh_socket_path must be rejected");
         assert!(error.to_string().contains("sandbox_ssh_socket_path"));
+    }
+
+    #[test]
+    fn config_rejects_driver_specific_destination_ca_setting() {
+        let error = serde_json::from_value::<PodmanComputeConfig>(serde_json::json!({
+            "additional_ca_bundle": ["/operator/ca.crt"]
+        }))
+        .expect_err("destination trust is global, not a Podman driver setting");
+        assert!(error.to_string().contains("additional_ca_bundle"));
     }
 
     #[test]
@@ -840,6 +900,67 @@ mod tests {
     }
 
     #[test]
+    fn validate_configuration_accepts_additional_ca_bundle_without_proxy() {
+        // #3781: unlike proxy_ca_bundle, this must work with no corporate
+        // proxy configured at all.
+        let directory = tempfile::tempdir().unwrap();
+        let ca_path = directory.path().join("additional-ca.pem");
+        std::fs::write(&ca_path, generate_test_ca_pem()).unwrap();
+
+        let cfg = PodmanComputeConfig {
+            additional_ca_bundle: Some(ca_path.to_str().unwrap().to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.validate_proxy_config().is_ok());
+        assert!(cfg.https_proxy.is_none());
+    }
+
+    #[test]
+    fn validate_configuration_rejects_empty_additional_ca_bundle() {
+        let cfg = PodmanComputeConfig {
+            additional_ca_bundle: Some("  ".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("additional_ca_bundle"), "{err}");
+    }
+
+    #[test]
+    fn validate_configuration_rejects_nonexistent_additional_ca_bundle() {
+        // #3781 fix requirement: an operator with a mistyped path must see
+        // this at config-validation time, not a failed sandbox later.
+        let cfg = PodmanComputeConfig {
+            additional_ca_bundle: Some("/nonexistent/additional-ca.pem".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("additional_ca_bundle"), "{err}");
+    }
+
+    #[test]
+    fn validate_configuration_rejects_certificate_free_additional_ca_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let ca_path = directory.path().join("not-a-cert.pem");
+        std::fs::write(&ca_path, "not a certificate\n").unwrap();
+
+        let cfg = PodmanComputeConfig {
+            additional_ca_bundle: Some(ca_path.to_str().unwrap().to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("additional_ca_bundle"), "{err}");
+    }
+
+    /// Generate a real, valid self-signed CA certificate PEM for tests.
+    fn generate_test_ca_pem() -> String {
+        let key_pair = openshell_crypto::pki::generate_keypair().unwrap();
+        let params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        openshell_crypto::pki::self_signed(params, &key_pair)
+            .unwrap()
+            .pem()
+    }
+
+    #[test]
     fn validate_proxy_config_rejects_url_components() {
         for url in [
             "http://proxy.corp.com:8080/path",
@@ -1030,107 +1151,39 @@ mod tests {
     }
 
     #[test]
-    fn validate_tls_config_all_set_is_ok() {
+    fn validate_tls_config_ca_only_is_ok() {
         let cfg = PodmanComputeConfig {
             guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
-            guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
-            guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
             ..PodmanComputeConfig::default()
         };
         assert!(cfg.validate_tls_config().is_ok());
+        assert!(cfg.tls_enabled());
     }
 
     #[test]
-    fn validate_tls_config_only_ca_is_error() {
-        let cfg = PodmanComputeConfig {
-            guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
-            ..PodmanComputeConfig::default()
-        };
-        let err = cfg
-            .validate_tls_config()
-            .expect_err("only CA should be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-    }
-
-    #[test]
-    fn validate_tls_config_only_cert_is_error() {
+    fn validate_tls_config_rejects_client_certificate() {
         let cfg = PodmanComputeConfig {
             guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
             ..PodmanComputeConfig::default()
         };
         let err = cfg
             .validate_tls_config()
-            .expect_err("only cert should be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-    }
-
-    #[test]
-    fn validate_tls_config_only_key_is_error() {
-        let cfg = PodmanComputeConfig {
-            guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
-            ..PodmanComputeConfig::default()
-        };
-        let err = cfg
-            .validate_tls_config()
-            .expect_err("only key should be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
-    }
-
-    #[test]
-    fn validate_tls_config_ca_and_cert_missing_key_is_error() {
-        let cfg = PodmanComputeConfig {
-            guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
-            guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
-            ..PodmanComputeConfig::default()
-        };
-        let err = cfg
-            .validate_tls_config()
-            .expect_err("missing key should be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-    }
-
-    #[test]
-    fn validate_tls_config_ca_and_key_missing_cert_is_error() {
-        let cfg = PodmanComputeConfig {
-            guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
-            guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
-            ..PodmanComputeConfig::default()
-        };
-        let err = cfg
-            .validate_tls_config()
-            .expect_err("missing cert should be rejected");
+            .expect_err("sandbox client certificate should be rejected");
         let msg = err.to_string();
         assert!(msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
     }
 
     #[test]
-    fn validate_tls_config_cert_and_key_missing_ca_is_error() {
+    fn validate_tls_config_rejects_client_private_key() {
         let cfg = PodmanComputeConfig {
-            guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
             guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
             ..PodmanComputeConfig::default()
         };
         let err = cfg
             .validate_tls_config()
-            .expect_err("missing CA should be rejected");
+            .expect_err("sandbox client private key should be rejected");
         let msg = err.to_string();
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
+        assert!(msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
     }
 
     #[test]

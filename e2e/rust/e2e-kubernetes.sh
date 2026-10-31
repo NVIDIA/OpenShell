@@ -10,10 +10,11 @@
 #
 # Features: the default set includes `e2e-host-gateway` so tests that rely on
 # the sandbox-side `host.openshell.internal` alias compile and run. The
-# wrapper detects the cluster's host-routable IP and wires it into the chart
-# via `server.hostGatewayIP`. Targeting a cluster where the test host is
-# unreachable from pods? Set OPENSHELL_E2E_KUBERNETES_FEATURES=e2e to drop the
-# alias-dependent tests entirely.
+# wrapper detects the cluster's host-routable IP and passes it through the
+# chart-owned server.hostGatewayIP input, which derives the runtime field.
+# Targeting a
+# cluster where the test host is unreachable from pods? Set
+# OPENSHELL_E2E_KUBERNETES_FEATURES=e2e to drop the alias-dependent tests.
 #
 # Results: `run_suite` writes a JUnit + HTML report under `results/`. Set
 # `OPENSHELL_E2E_REPORT_NAME` to name it per run when invoking this script repeatedly.
@@ -25,7 +26,16 @@ RUN_WITH_GATEWAY_COMMAND="__openshell_run_kubernetes_e2e"
 # shellcheck source=e2e/support/conformance.sh
 source "${ROOT}/e2e/support/conformance.sh"
 
-E2E_FEATURES="${OPENSHELL_E2E_KUBERNETES_FEATURES-e2e,e2e-host-gateway,e2e-kubernetes}"
+# Unset or empty selects Rust defaults; e2e-conformance-only skips Rust tests.
+# Reusable-workflow inputs are exported as an explicitly empty environment
+# variable when the caller uses their default. Treat that the same as unset so
+# the focused additional-CA row retains the upstream Kubernetes feature set.
+E2E_FEATURES="${OPENSHELL_E2E_KUBERNETES_FEATURES:-e2e,e2e-host-gateway,e2e-kubernetes}"
+
+if [ "${OPENSHELL_E2E_KUBE_TEST:-}" = "additional_ca" ]; then
+  export OPENSHELL_E2E_ADDITIONAL_CA=1
+  E2E_FEATURES="${E2E_FEATURES},e2e-additional-ca"
+fi
 
 # Fixed output path of the `e2e-kubernetes` nextest profile (`.config/nextest.toml`).
 JUNIT_XML="${ROOT}/results/e2e-kubernetes.xml"
@@ -65,7 +75,7 @@ is_operator_workspace_mode() {
 
 run_conformance() {
   if is_operator_workspace_mode; then
-    echo "note: skipping standalone CLI conformance in Kubernetes operator workspace mode; default workspace is not operator-allowlisted (see #2971)."
+    echo "note: skipping conformance suites in Kubernetes operator workspace mode; default workspace is not operator-allowlisted (see #2971)."
     return 0
   fi
 
@@ -88,9 +98,20 @@ run_suite() {
 }
 
 run_e2e() {
+  if [ "${OPENSHELL_E2E_KUBE_TEST:-}" = "kubernetes_image_update" ]; then
+    cargo test --locked --manifest-path "${ROOT}/tests/suites/features/Cargo.toml" \
+      -p openshell-test-feature-kubernetes-updates -- --nocapture
+    return
+  fi
   run_conformance
-  if [ -z "${E2E_FEATURES}" ]; then
+  if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
+    echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
     return 0
+  fi
+
+  if [ -z "${OPENSHELL_E2E_KUBE_TEST:-}" ]; then
+    cargo test --locked --manifest-path "${ROOT}/tests/suites/features/Cargo.toml" \
+      -p openshell-test-feature-kubernetes-updates -- --nocapture
   fi
 
   # Pin `--target-dir` so the profile `junit.path` resolves regardless of `CARGO_TARGET_DIR`.

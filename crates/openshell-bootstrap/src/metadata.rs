@@ -498,36 +498,21 @@ mod tests {
 
     // ── last-sandbox persistence ──────────────────────────────────────
 
-    /// Helper: hold the shared XDG test lock, set `XDG_CONFIG_HOME` to a
-    /// tempdir, run `f`, then restore the original value.
-    #[allow(unsafe_code)]
-    fn with_tmp_xdg<F: FnOnce()>(tmp: &Path, f: F) {
-        let _guard = crate::XDG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let orig_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        let orig_sys = std::env::var(crate::paths::SYSTEM_GATEWAY_DIR_ENV).ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp);
-            std::env::remove_var(crate::paths::SYSTEM_GATEWAY_DIR_ENV);
-        }
-        f();
-        unsafe {
-            match orig_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-            match orig_sys {
-                Some(v) => std::env::set_var(crate::paths::SYSTEM_GATEWAY_DIR_ENV, v),
-                None => std::env::remove_var(crate::paths::SYSTEM_GATEWAY_DIR_ENV),
-            }
-        }
+    /// Run the assertions in a child with an isolated configuration root.
+    fn with_tmp_xdg(tmp: &Path, f: impl FnOnce(&Path)) {
+        crate::test_environment::Environment::new()
+            .set("XDG_CONFIG_HOME", tmp)
+            .remove(crate::paths::SYSTEM_GATEWAY_DIR_ENV)
+            .run(|| {
+                let root = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+                f(&root);
+            });
     }
 
     #[test]
     fn save_and_load_last_sandbox_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             save_last_sandbox("mygateway", "default", "dev-box").unwrap();
             assert_eq!(
                 load_last_sandbox("mygateway", "default"),
@@ -539,7 +524,7 @@ mod tests {
     #[test]
     fn load_last_sandbox_returns_none_when_not_set() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             assert_eq!(load_last_sandbox("no-such-gateway", "default"), None);
         });
     }
@@ -547,7 +532,7 @@ mod tests {
     #[test]
     fn save_last_sandbox_overwrites_previous() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             save_last_sandbox("g1", "default", "first").unwrap();
             save_last_sandbox("g1", "default", "second").unwrap();
             assert_eq!(
@@ -560,7 +545,7 @@ mod tests {
     #[test]
     fn save_last_sandbox_creates_parent_dirs() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             save_last_sandbox("brand-new-gateway", "default", "sb1").unwrap();
             assert_eq!(
                 load_last_sandbox("brand-new-gateway", "default"),
@@ -572,7 +557,7 @@ mod tests {
     #[test]
     fn load_last_sandbox_returns_none_for_legacy_single_line_file() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             let path = last_sandbox_path("ws-gateway").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "  my-sb \n").unwrap();
@@ -583,7 +568,7 @@ mod tests {
     #[test]
     fn load_last_sandbox_returns_none_for_empty_file() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             let path = last_sandbox_path("empty-gateway").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "   \n").unwrap();
@@ -594,7 +579,7 @@ mod tests {
     #[test]
     fn last_sandbox_is_per_gateway() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             save_last_sandbox("gateway-a", "default", "sandbox-a").unwrap();
             save_last_sandbox("gateway-b", "default", "sandbox-b").unwrap();
             assert_eq!(
@@ -611,7 +596,7 @@ mod tests {
     #[test]
     fn last_sandbox_is_workspace_scoped() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             save_last_sandbox("gw", "alpha", "sb-alpha").unwrap();
             assert_eq!(
                 load_last_sandbox("gw", "alpha"),
@@ -623,31 +608,18 @@ mod tests {
 
     // ── system gateway dir fallback ───────────────────────────────────
 
-    /// Helper: hold the shared XDG test lock, point `XDG_CONFIG_HOME` at
+    /// Run the assertions in a child with isolated user and system roots.
     /// `user` and `OPENSHELL_SYSTEM_GATEWAY_DIR` at the system config root,
-    /// run `f`, then restore both env vars.
-    #[allow(unsafe_code)]
-    fn with_tmp_xdg_and_system<F: FnOnce()>(user: &Path, system: &Path, f: F) {
-        let _guard = crate::XDG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let orig_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        let orig_sys = std::env::var(crate::paths::SYSTEM_GATEWAY_DIR_ENV).ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", user);
-            std::env::set_var(crate::paths::SYSTEM_GATEWAY_DIR_ENV, system);
-        }
-        f();
-        unsafe {
-            match orig_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-            match orig_sys {
-                Some(v) => std::env::set_var(crate::paths::SYSTEM_GATEWAY_DIR_ENV, v),
-                None => std::env::remove_var(crate::paths::SYSTEM_GATEWAY_DIR_ENV),
-            }
-        }
+    fn with_tmp_xdg_and_system(user: &Path, system: &Path, f: impl FnOnce(&Path, &Path)) {
+        crate::test_environment::Environment::new()
+            .set("XDG_CONFIG_HOME", user)
+            .set(crate::paths::SYSTEM_GATEWAY_DIR_ENV, system)
+            .run(|| {
+                let user = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+                let system =
+                    PathBuf::from(std::env::var_os(crate::paths::SYSTEM_GATEWAY_DIR_ENV).unwrap());
+                f(&user, &system);
+            });
     }
 
     /// Write a `<gateways-dir>/<name>/metadata.json` file for the given endpoint.
@@ -670,8 +642,8 @@ mod tests {
     fn system_gateway_last_sandbox_persists_in_user_config_without_shadowing() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
-            write_system_metadata(&system.path().join("gateways"), "shared", "https://system");
+        with_tmp_xdg_and_system(user.path(), system.path(), |_, system| {
+            write_system_metadata(&system.join("gateways"), "shared", "https://system");
 
             save_last_sandbox("shared", "default", "sb-123").unwrap();
 
@@ -702,8 +674,8 @@ mod tests {
     fn system_gateway_last_sandbox_creates_user_parent_dir_without_metadata() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
-            write_system_metadata(&system.path().join("gateways"), "shared", "https://system");
+        with_tmp_xdg_and_system(user.path(), system.path(), |_, system| {
+            write_system_metadata(&system.join("gateways"), "shared", "https://system");
 
             let user_gateway_dir = user_gateway_metadata_path("shared")
                 .unwrap()
@@ -731,8 +703,8 @@ mod tests {
     fn clearing_system_gateway_last_sandbox_keeps_system_metadata_visible() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
-            write_system_metadata(&system.path().join("gateways"), "shared", "https://system");
+        with_tmp_xdg_and_system(user.path(), system.path(), |_, system| {
+            write_system_metadata(&system.join("gateways"), "shared", "https://system");
             save_last_sandbox("shared", "default", "sb-123").unwrap();
 
             clear_last_sandbox_if_matches("shared", "default", "sb-123");
@@ -749,8 +721,8 @@ mod tests {
     fn load_user_active_gateway_does_not_fall_back_to_system_dir() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
-            std::fs::write(system.path().join("active_gateway"), "from-system").unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), |_, system| {
+            std::fs::write(system.join("active_gateway"), "from-system").unwrap();
             assert_eq!(load_user_active_gateway(), None);
         });
     }
@@ -758,8 +730,8 @@ mod tests {
     fn load_active_gateway_falls_back_to_system_dir() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
-            std::fs::write(system.path().join("active_gateway"), "from-system").unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), |_, system| {
+            std::fs::write(system.join("active_gateway"), "from-system").unwrap();
             assert_eq!(load_active_gateway(), Some("from-system".to_string()));
         });
     }
@@ -768,9 +740,9 @@ mod tests {
     fn load_active_gateway_prefers_user_over_system() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
+        with_tmp_xdg_and_system(user.path(), system.path(), |_, system| {
             save_active_gateway("from-user").unwrap();
-            std::fs::write(system.path().join("active_gateway"), "from-system").unwrap();
+            std::fs::write(system.join("active_gateway"), "from-system").unwrap();
             assert_eq!(load_active_gateway(), Some("from-user".to_string()));
         });
     }
@@ -779,12 +751,8 @@ mod tests {
     fn load_gateway_metadata_falls_back_to_system_dir() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
-            write_system_metadata(
-                &system.path().join("gateways"),
-                "sys-gw",
-                "unix:///tmp/sys.sock",
-            );
+        with_tmp_xdg_and_system(user.path(), system.path(), |_, system| {
+            write_system_metadata(&system.join("gateways"), "sys-gw", "unix:///tmp/sys.sock");
             let meta = load_gateway_metadata("sys-gw").unwrap();
             assert_eq!(meta.name, "sys-gw");
             assert_eq!(meta.gateway_endpoint, "unix:///tmp/sys.sock");
@@ -795,12 +763,8 @@ mod tests {
     fn gateway_metadata_source_reports_user_system_and_missing() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
-            write_system_metadata(
-                &system.path().join("gateways"),
-                "sys-gw",
-                "unix:///tmp/sys.sock",
-            );
+        with_tmp_xdg_and_system(user.path(), system.path(), |_, system| {
+            write_system_metadata(&system.join("gateways"), "sys-gw", "unix:///tmp/sys.sock");
             assert_eq!(
                 gateway_metadata_source("sys-gw").unwrap(),
                 Some(GatewayMetadataSource::System)
@@ -825,16 +789,16 @@ mod tests {
     fn load_gateway_metadata_error_mentions_both_search_paths() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
+        with_tmp_xdg_and_system(user.path(), system.path(), |user, system| {
             let err = load_gateway_metadata("missing").unwrap_err();
             let msg = err.to_string();
             assert!(msg.contains("missing"), "expected name in error: {msg}");
             assert!(
-                msg.contains(user.path().to_str().unwrap()),
+                msg.contains(user.to_str().unwrap()),
                 "expected user path in error: {msg}"
             );
             assert!(
-                msg.contains(system.path().to_str().unwrap()),
+                msg.contains(system.to_str().unwrap()),
                 "expected system path in error: {msg}"
             );
         });
@@ -844,7 +808,7 @@ mod tests {
     fn load_gateway_metadata_prefers_user_over_system() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
+        with_tmp_xdg_and_system(user.path(), system.path(), |_, system| {
             let user_meta = GatewayMetadata {
                 name: "shared".to_string(),
                 gateway_endpoint: "https://user-endpoint".to_string(),
@@ -852,7 +816,7 @@ mod tests {
             };
             store_gateway_metadata("shared", &user_meta).unwrap();
             write_system_metadata(
-                &system.path().join("gateways"),
+                &system.join("gateways"),
                 "shared",
                 "https://system-endpoint",
             );
@@ -865,14 +829,14 @@ mod tests {
     fn list_gateways_merges_user_and_system() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
+        with_tmp_xdg_and_system(user.path(), system.path(), |_, system| {
             let user_meta = GatewayMetadata {
                 name: "alpha".to_string(),
                 gateway_endpoint: "https://alpha".to_string(),
                 ..Default::default()
             };
             store_gateway_metadata("alpha", &user_meta).unwrap();
-            write_system_metadata(&system.path().join("gateways"), "beta", "https://beta");
+            write_system_metadata(&system.join("gateways"), "beta", "https://beta");
             let gateways = list_gateways_with_source().unwrap();
             assert_eq!(gateways.len(), 2);
             assert_eq!(gateways[0].metadata.name, "alpha");
@@ -886,18 +850,14 @@ mod tests {
     fn list_gateways_user_shadows_system_on_collision() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
+        with_tmp_xdg_and_system(user.path(), system.path(), |_, system| {
             let user_meta = GatewayMetadata {
                 name: "local-vm".to_string(),
                 gateway_endpoint: "https://user-override".to_string(),
                 ..Default::default()
             };
             store_gateway_metadata("local-vm", &user_meta).unwrap();
-            write_system_metadata(
-                &system.path().join("gateways"),
-                "local-vm",
-                "unix:///tmp/sys.sock",
-            );
+            write_system_metadata(&system.join("gateways"), "local-vm", "unix:///tmp/sys.sock");
             let gateways = list_gateways_with_source().unwrap();
             assert_eq!(gateways.len(), 1);
             assert_eq!(
@@ -912,12 +872,12 @@ mod tests {
     fn list_gateways_invalid_user_entry_still_shadows_system() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
+        with_tmp_xdg_and_system(user.path(), system.path(), |_, system| {
             let user_metadata_path = user_gateway_metadata_path("shared").unwrap();
             std::fs::create_dir_all(user_metadata_path.parent().unwrap()).unwrap();
             std::fs::write(&user_metadata_path, "{not-json").unwrap();
 
-            write_system_metadata(&system.path().join("gateways"), "shared", "https://system");
+            write_system_metadata(&system.join("gateways"), "shared", "https://system");
 
             let gateways = list_gateways_with_source().unwrap();
             assert!(gateways.is_empty());
@@ -927,7 +887,7 @@ mod tests {
     fn list_gateways_empty_user_dir_does_not_hide_system() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
+        with_tmp_xdg_and_system(user.path(), system.path(), |_, system| {
             let user_meta = GatewayMetadata {
                 name: "shared".to_string(),
                 gateway_endpoint: "https://user".to_string(),
@@ -944,7 +904,7 @@ mod tests {
             assert!(user_gateway_dir.is_dir());
             assert!(!user_gateway_dir.join("metadata.json").exists());
 
-            write_system_metadata(&system.path().join("gateways"), "shared", "https://system");
+            write_system_metadata(&system.join("gateways"), "shared", "https://system");
 
             let gateways = list_gateways_with_source().unwrap();
             assert_eq!(gateways.len(), 1);
@@ -957,7 +917,7 @@ mod tests {
     fn gateway_names_must_be_single_path_components() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
+        with_tmp_xdg_and_system(user.path(), system.path(), |_, _| {
             let meta = GatewayMetadata {
                 name: "shared".to_string(),
                 gateway_endpoint: "https://example.com".to_string(),
@@ -974,9 +934,9 @@ mod tests {
     fn load_active_gateway_ignores_invalid_user_name_and_falls_back_to_system() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
-            std::fs::write(user.path().join("active_gateway"), "../escape").unwrap();
-            std::fs::write(system.path().join("active_gateway"), "system-default").unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), |user, system| {
+            std::fs::write(user.join("active_gateway"), "../escape").unwrap();
+            std::fs::write(system.join("active_gateway"), "system-default").unwrap();
 
             assert_eq!(load_user_active_gateway(), None);
             assert_eq!(load_active_gateway(), Some("system-default".to_string()));

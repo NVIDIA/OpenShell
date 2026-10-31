@@ -3,26 +3,34 @@
 
 //! Capability-free in-workload sandbox boundary.
 
+pub mod binary_pins;
 #[cfg(target_os = "linux")]
-mod accept_interrupt;
 pub mod boundary_exec;
+#[cfg(target_os = "linux")]
 pub mod boundary_io;
 mod boundary_server;
+#[cfg(target_os = "linux")]
 pub mod child_env;
+pub mod container_log;
 #[cfg(target_os = "linux")]
 pub(crate) mod delegated;
-#[cfg(unix)]
-pub mod identity;
+#[cfg(target_os = "linux")]
+pub mod linux;
 #[cfg(target_os = "linux")]
 pub mod main_session;
+#[cfg(target_os = "linux")]
 pub mod managed_children;
 #[cfg(target_os = "linux")]
 mod network_broker;
 #[cfg(all(target_os = "linux", feature = "perf-harness"))]
 pub mod perf;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub mod process;
+#[cfg(target_os = "linux")]
+mod provider_files;
+#[cfg(target_os = "linux")]
 mod pty;
+#[cfg(target_os = "linux")]
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod sftp;
@@ -43,6 +51,7 @@ pub struct RuntimeQualification {
     pub tcp_dns_round_trip: bool,
     pub tcp_allow_round_trip: bool,
     pub tcp_deny_round_trip: bool,
+    pub socket_loopback_confinement: bool,
 }
 
 /// Placeholder used when compiling the package on a non-Linux host.
@@ -67,3 +76,6 @@ pub fn run(
     boundary_server::run_boundary(config_path, qualification)
         .map_err(|error| miette::miette!(error))
 }
+
+#[cfg(target_os = "linux")]
+mod native_api;

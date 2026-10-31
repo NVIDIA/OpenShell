@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Negative test: an unsatisfiable property query, not a FIPS configuration.
+openssl_conf = openshell_init
+
+[openshell_init]
+alg_section = algorithm_properties
+
+[algorithm_properties]
+default_properties = provider=openshell_nonexistent_provider

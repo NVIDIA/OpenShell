@@ -978,9 +978,13 @@ async fn handle_shell_connect(
     // Step 3: Resolve gateway address (handle loopback override).
     #[allow(clippy::cast_possible_truncation)]
     let gateway_port_u16 = session.gateway_port as u16;
-    let (gateway_host, gateway_port) =
-        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
-    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
+    let (gateway_scheme, gateway_host, gateway_port) = resolve_ssh_gateway(
+        &session.gateway_scheme,
+        &session.gateway_host,
+        gateway_port_u16,
+        &app.endpoint,
+    );
+    let gateway_url = format_gateway_url(&gateway_scheme, &gateway_host, gateway_port);
 
     // Step 4: Build the ProxyCommand using our own binary.
     let exe = match std::env::current_exe() {
@@ -1001,16 +1005,7 @@ async fn handle_shell_connect(
     // Step 5: Build the SSH command.
     let mut command = std::process::Command::new("ssh");
     command
-        .arg("-o")
-        .arg(format!("ProxyCommand={proxy_command}"))
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("GlobalKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("LogLevel=ERROR")
+        .args(sandbox_ssh_args(&proxy_command, "ERROR"))
         .arg("-tt")
         .arg("-o")
         .arg("RequestTTY=force")
@@ -1083,7 +1078,7 @@ async fn handle_exec_command(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     events: &mut EventHandler,
     sandbox_name: &str,
-    command: &str,
+    command: &[String],
     workspace: &str,
 ) -> Result<()> {
     let session = {
@@ -1114,9 +1109,13 @@ async fn handle_exec_command(
     // Step 2: Resolve gateway and build ProxyCommand (same as handle_shell_connect).
     #[allow(clippy::cast_possible_truncation)]
     let gateway_port_u16 = session.gateway_port as u16;
-    let (gateway_host, gateway_port) =
-        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
-    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
+    let (gateway_scheme, gateway_host, gateway_port) = resolve_ssh_gateway(
+        &session.gateway_scheme,
+        &session.gateway_host,
+        gateway_port_u16,
+        &app.endpoint,
+    );
+    let gateway_url = format_gateway_url(&gateway_scheme, &gateway_host, gateway_port);
 
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -1135,24 +1134,11 @@ async fn handle_exec_command(
     );
 
     // Step 3: Build SSH command — same flags as handle_shell_connect but with
-    // the user's command appended.  Each word is escaped individually so the
+    // the parsed command appended. Each argument is escaped individually so the
     // remote shell parses it correctly.
-    let command_str = command
-        .split_whitespace()
-        .map(shell_escape)
-        .collect::<Vec<_>>()
-        .join(" ");
+    let command_str = build_exec_command(command);
     let mut ssh = std::process::Command::new("ssh");
-    ssh.arg("-o")
-        .arg(format!("ProxyCommand={proxy_command}"))
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("GlobalKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("LogLevel=ERROR")
+    ssh.args(sandbox_ssh_args(&proxy_command, "ERROR"))
         .arg("-tt")
         .arg("-o")
         .arg("RequestTTY=force")
@@ -1213,9 +1199,17 @@ async fn handle_exec_command(
 
 // SSH utility functions are shared via openshell_core::forward.
 use openshell_core::forward::{
-    build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
+    build_proxy_command, format_gateway_url, resolve_ssh_gateway, sandbox_ssh_args, shell_escape,
     validate_ssh_session_response,
 };
+
+fn build_exec_command(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|arg| shell_escape(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Convert a `SandboxPolicy` proto into styled ratatui lines for the policy viewer.
 fn render_policy_lines(
@@ -1400,12 +1394,10 @@ fn start_anim_ticker(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 
 fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     let mut client = app.client.clone();
-    let Some((name, image, command, selected_providers, ports)) = app.create_form_data() else {
+    let Some((name, image, selected_providers, ports)) = app.create_form_data() else {
         return;
     };
 
-    // Stash command so we can exec after sandbox creation + Ready.
-    app.pending_exec_command = command;
     // Stash ports so we can include them in the status text.
     app.pending_forward_ports.clone_from(&ports);
 
@@ -1575,9 +1567,13 @@ async fn start_port_forwards(
     // Resolve gateway address.
     #[allow(clippy::cast_possible_truncation)]
     let gateway_port_u16 = session.gateway_port as u16;
-    let (gateway_host, gateway_port) =
-        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, endpoint);
-    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
+    let (gateway_scheme, gateway_host, gateway_port) = resolve_ssh_gateway(
+        &session.gateway_scheme,
+        &session.gateway_host,
+        gateway_port_u16,
+        endpoint,
+    );
+    let gateway_url = format_gateway_url(&gateway_scheme, &gateway_host, gateway_port);
 
     // Build ProxyCommand.
     let exe = match std::env::current_exe() {
@@ -1604,16 +1600,7 @@ async fn start_port_forwards(
 
         let mut command = std::process::Command::new("ssh");
         command
-            .arg("-o")
-            .arg(format!("ProxyCommand={proxy_command}"))
-            .arg("-o")
-            .arg("StrictHostKeyChecking=no")
-            .arg("-o")
-            .arg("UserKnownHostsFile=/dev/null")
-            .arg("-o")
-            .arg("GlobalKnownHostsFile=/dev/null")
-            .arg("-o")
-            .arg("LogLevel=ERROR")
+            .args(sandbox_ssh_args(&proxy_command, "ERROR"))
             .arg("-o")
             .arg("ConnectTimeout=15")
             .arg("-N")
@@ -2240,6 +2227,7 @@ async fn fetch_providers(
     let mut page_token = String::new();
     loop {
         let req = openshell_core::proto::ListProvidersRequest {
+            label_selector: String::new(),
             page_size: 100,
             page_token,
             workspace_scope: Some(list_workspace_scope(&current_workspace, all_workspaces)),
@@ -2720,7 +2708,12 @@ fn sandbox_notes_for_view(
         } else {
             "compute cleanup pending"
         };
-        let mut notes = format!("Provisioning timed out; {cleanup}");
+        let mut notes =
+            if record.preparation_deadline.is_some() && record.admission_start_time.is_none() {
+                format!("Image preparation timed out; {cleanup}")
+            } else {
+                format!("Provisioning timed out; {cleanup}")
+            };
         if !forwards.is_empty() {
             notes.push_str("; ");
             notes.push_str(&forwards);
@@ -3101,6 +3094,8 @@ fn phase_label(phase: i32) -> String {
         x if x == SandboxPhase::Stopped as i32 => "Stopped",
         x if x == SandboxPhase::Starting as i32 => "Starting",
         x if x == SandboxPhase::Completed as i32 => "Completed",
+        x if x == SandboxPhase::Suspending as i32 => "Suspending",
+        x if x == SandboxPhase::Suspended as i32 => "Suspended",
         _ => "Unknown",
     }
     .to_string()
@@ -3127,6 +3122,46 @@ fn format_age(epoch_ms: i64) -> String {
         format!("{}h {}m", diff / 3600, (diff % 3600) / 60)
     } else {
         format!("{}d {}h", diff / 86400, (diff % 86400) / 3600)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod exec_command_tests {
+    use super::build_exec_command;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    fn run_command(command: &str, stdin: &[u8]) -> std::process::Output {
+        let args = shell_words::split(command).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &build_exec_command(&args)])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    #[test]
+    fn quoted_script_runs_and_reads_stdin() {
+        let output = run_command(r#"/bin/sh -c "echo GOOD; read x; echo $x""#, b"entered\n");
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"GOOD\nentered\n");
+    }
+
+    #[test]
+    fn arguments_remain_literal_at_remote_shell_boundary() {
+        let output = run_command(
+            r#"printf '%s\n' 'hello world' "" "it's" a\ b $HOME '$(echo BAD)' ';' '|' '>' '*.txt'"#,
+            b"",
+        );
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(
+            output.stdout,
+            b"hello world\n\nit's\na b\n$HOME\n$(echo BAD)\n;\n|\n>\n*.txt\n"
+        );
     }
 }
 
@@ -3163,6 +3198,12 @@ mod phase_label_tests {
         assert_eq!(phase_label(SandboxPhase::Stopped as i32), "Stopped");
         assert_eq!(phase_label(SandboxPhase::Starting as i32), "Starting");
         assert_eq!(phase_label(SandboxPhase::Completed as i32), "Completed");
+    }
+
+    #[test]
+    fn phase_label_covers_suspend_and_resume_lifecycle() {
+        assert_eq!(phase_label(SandboxPhase::Suspending as i32), "Suspending");
+        assert_eq!(phase_label(SandboxPhase::Suspended as i32), "Suspended");
     }
 }
 
@@ -3337,6 +3378,26 @@ mod sandbox_notes_tests {
         assert_eq!(
             sandbox_notes(&sandbox, String::new()),
             "Provisioning timed out; compute reclaimed"
+        );
+    }
+
+    #[test]
+    fn preparation_timeout_notes_identify_the_expired_phase() {
+        let sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                provisioning: Some(openshell_core::proto::SandboxProvisioning {
+                    preparation_deadline: openshell_core::time::timestamp_from_millis(1_800_000)
+                        .ok(),
+                    timeout_time: openshell_core::time::timestamp_from_millis(1_800_000).ok(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            sandbox_notes(&sandbox, String::new()),
+            "Image preparation timed out; compute cleanup pending"
         );
     }
 

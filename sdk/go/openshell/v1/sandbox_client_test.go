@@ -42,6 +42,7 @@ type mockSandboxServer struct {
 	detachErr            error
 	listProvErr          error
 	createRequest        *pb.CreateSandboxRequest
+	resumeRequest        *pb.ResumeSandboxRequest
 	watchEvents          []*pb.SandboxStreamEvent
 	watchErr             error
 	watchPostEventsErr   error
@@ -172,6 +173,31 @@ func (s *mockSandboxServer) StopSandbox(_ context.Context, req *pb.StopSandboxRe
 func (s *mockSandboxServer) StartSandbox(_ context.Context, req *pb.StartSandboxRequest) (*pb.SandboxResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	name := req.GetName()
+	sb, ok := s.sandboxes[name]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
+	}
+	sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_STARTING
+	return &pb.SandboxResponse{Sandbox: proto.Clone(sb).(*pb.Sandbox)}, nil
+}
+
+func (s *mockSandboxServer) SuspendSandbox(_ context.Context, req *pb.SuspendSandboxRequest) (*pb.SandboxResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	name := req.GetName()
+	sb, ok := s.sandboxes[name]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
+	}
+	sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_SUSPENDED
+	return &pb.SandboxResponse{Sandbox: proto.Clone(sb).(*pb.Sandbox)}, nil
+}
+
+func (s *mockSandboxServer) ResumeSandbox(_ context.Context, req *pb.ResumeSandboxRequest) (*pb.SandboxResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resumeRequest = req
 	name := req.GetName()
 	sb, ok := s.sandboxes[name]
 	if !ok {
@@ -315,11 +341,15 @@ func TestSandboxCreate(t *testing.T) {
 		"default",
 		"my-sandbox",
 		spec,
-		labels,
-		CreateOptions{ServiceExposures: []ServiceExposure{
-			{TargetPort: 4500},
-			{Service: "metrics", TargetPort: 9090},
-		}},
+		WithLabels(labels),
+		WithServiceExposures(
+			ServiceExposure{TargetPort: 4500},
+			ServiceExposure{
+				Service:           "metrics",
+				TargetPort:        9090,
+				AuthorizationMode: ServiceAuthorizationModeBearerPassthrough,
+			},
+		),
 	)
 
 	require.NoError(t, err)
@@ -334,7 +364,66 @@ func TestSandboxCreate(t *testing.T) {
 	}, result.ServiceURLs)
 	require.Len(t, mock.createRequest.GetServiceExposures(), 2)
 	assert.Equal(t, uint32(4500), mock.createRequest.GetServiceExposures()[0].GetTargetPort())
+	assert.Equal(t, pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_STRIP, mock.createRequest.GetServiceExposures()[0].GetAuthorizationMode())
 	assert.Equal(t, "metrics", mock.createRequest.GetServiceExposures()[1].GetService())
+	assert.Equal(t, pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH, mock.createRequest.GetServiceExposures()[1].GetAuthorizationMode())
+}
+
+// Callers that passed nil for the old positional labels parameter still compile
+// against the variadic signature, so the nil option must be ignored rather than
+// invoked.
+func TestSandboxCreate_LegacyTrailingNil(t *testing.T) {
+	mock := newMockSandboxServer()
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	result, err := client.Create(context.Background(), "default", "legacy-sandbox", &SandboxSpec{}, nil)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	require.NotNil(t, mock.createRequest)
+	assert.Empty(t, mock.createRequest.Labels)
+	assert.Empty(t, mock.createRequest.Annotations)
+}
+
+func TestSandboxCreate_WithAnnotations(t *testing.T) {
+	mock := newMockSandboxServer()
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	annotations := map[string]string{"purpose": "ci-test"}
+	result, err := client.Create(context.Background(), "default", "ann-sandbox", &SandboxSpec{}, WithAnnotations(annotations))
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	require.NotNil(t, mock.createRequest)
+	assert.Equal(t, map[string]string{"purpose": "ci-test"}, mock.createRequest.Annotations)
+}
+
+func TestSandboxCreate_WithLabelsAndAnnotations(t *testing.T) {
+	mock := newMockSandboxServer()
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	labels := map[string]string{"env": "staging"}
+	annotations := map[string]string{"owner": "team-a"}
+	result, err := client.Create(context.Background(), "default", "both-sandbox", &SandboxSpec{},
+		WithLabels(labels), WithAnnotations(annotations))
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	require.NotNil(t, mock.createRequest)
+	assert.Equal(t, map[string]string{"env": "staging"}, mock.createRequest.Labels)
+	assert.Equal(t, map[string]string{"owner": "team-a"}, mock.createRequest.Annotations)
 }
 
 func TestSandboxCreate_DefaultGPURequest(t *testing.T) {
@@ -344,7 +433,7 @@ func TestSandboxCreate_DefaultGPURequest(t *testing.T) {
 
 	result, err := client.Create(context.Background(), "default", "gpu-sandbox", &SandboxSpec{
 		GPU: true,
-	}, nil)
+	})
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -367,7 +456,7 @@ func TestSandboxCreate_RejectsUnrepresentableResourcesBeforeRPC(t *testing.T) {
 
 	_, err := client.Create(context.Background(), "default", "bad", &SandboxSpec{
 		Template: &SandboxTemplate{Resources: map[string]any{"invalid": make(chan int)}},
-	}, nil)
+	})
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
 	mock.mu.Lock()
@@ -382,7 +471,7 @@ func TestSandboxCreateFromTemplateRejectsGPUOverrideBeforeRPC(t *testing.T) {
 
 	_, err := client.CreateFromTemplate(context.Background(), "default", "bad", "gpu-kata", &SandboxSpec{
 		GPU: true,
-	}, nil)
+	})
 
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
@@ -400,7 +489,7 @@ func TestSandboxCreateFromTemplateSendsCommandAndTTY(t *testing.T) {
 		Providers: []string{"github"},
 		Command:   []string{"/opt/worker", "--serve"},
 		TTY:       true,
-	}, map[string]string{"team": "runtime"})
+	}, WithLabels(map[string]string{"team": "runtime"}))
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -422,7 +511,7 @@ func TestSandboxCreate_AlreadyExists(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	_, err := client.Create(context.Background(), "default", "dup", &SandboxSpec{}, nil)
+	_, err := client.Create(context.Background(), "default", "dup", &SandboxSpec{})
 
 	require.Error(t, err)
 	assert.True(t, IsAlreadyExists(err))
@@ -602,6 +691,36 @@ func TestSandboxStopAndStart(t *testing.T) {
 	starting, err := client.Start(context.Background(), "team-a", "lifecycle")
 	require.NoError(t, err)
 	assert.Equal(t, SandboxStarting, starting.Status.Phase)
+}
+
+func TestSandboxSuspendAndResume(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.sandboxes["frozen"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Name: "frozen", Workspace: "team-a"},
+		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_READY},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	suspended, err := client.Suspend(context.Background(), "team-a", "frozen")
+	require.NoError(t, err)
+	assert.Equal(t, SandboxSuspended, suspended.Status.Phase)
+
+	waited, err := client.WaitSuspended(context.Background(), "team-a", "frozen")
+	require.NoError(t, err)
+	assert.Equal(t, SandboxSuspended, waited.Status.Phase)
+
+	_, err = client.WaitReady(context.Background(), "team-a", "frozen")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "suspended")
+
+	resumed, err := client.Resume(context.Background(), "team-a", "frozen", ResumeOptions{RestartIfRestoreFails: true})
+	require.NoError(t, err)
+	assert.Equal(t, SandboxStarting, resumed.Status.Phase)
+	mock.mu.Lock()
+	assert.True(t, mock.resumeRequest.GetRestartIfRestoreFails())
+	assert.Equal(t, "frozen", mock.resumeRequest.GetName())
+	mock.mu.Unlock()
 }
 
 // --- T030: AttachProvider, DetachProvider, ListProviders tests ---

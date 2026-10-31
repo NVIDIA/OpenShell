@@ -23,6 +23,14 @@ pub struct DeleteOptions {
     pub allow_missing: bool,
 }
 
+/// Options for resuming a suspended sandbox.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResumeOptions {
+    /// Boot the workload cleanly when the retained memory state cannot be
+    /// restored. When false, resume fails instead.
+    pub restart_if_restore_fails: bool,
+}
+
 /// A deletion acknowledgement is not necessarily completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -215,6 +223,8 @@ pub enum SandboxPhase {
     Stopped,
     Starting,
     Completed,
+    Suspending,
+    Suspended,
 }
 
 impl From<proto::SandboxPhase> for SandboxPhase {
@@ -230,6 +240,8 @@ impl From<proto::SandboxPhase> for SandboxPhase {
             proto::SandboxPhase::Stopped => Self::Stopped,
             proto::SandboxPhase::Starting => Self::Starting,
             proto::SandboxPhase::Completed => Self::Completed,
+            proto::SandboxPhase::Suspending => Self::Suspending,
+            proto::SandboxPhase::Suspended => Self::Suspended,
         }
     }
 }
@@ -296,6 +308,27 @@ pub struct ServiceExposure {
     pub service: String,
     /// Loopback TCP port inside the sandbox.
     pub target_port: u16,
+    /// Whether the gateway strips or forwards an application bearer credential.
+    pub authorization_mode: ServiceAuthorizationMode,
+}
+
+/// Handling for an incoming application `Authorization` header.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ServiceAuthorizationMode {
+    /// Remove the header before proxying to the sandbox service.
+    #[default]
+    Strip,
+    /// Forward one syntactically valid bearer credential unchanged.
+    BearerPassthrough,
+}
+
+impl From<ServiceAuthorizationMode> for proto::ServiceAuthorizationMode {
+    fn from(value: ServiceAuthorizationMode) -> Self {
+        match value {
+            ServiceAuthorizationMode::Strip => Self::Strip,
+            ServiceAuthorizationMode::BearerPassthrough => Self::BearerPassthrough,
+        }
+    }
 }
 
 /// Caller intent for creating a sandbox from a named workload template.
@@ -363,6 +396,8 @@ pub struct SandboxRef {
     pub labels: HashMap<String, String>,
     pub resource_version: u64,
     pub exit_code: Option<i32>,
+    /// Public OpenSSH SHA256 host identity; absent on older gateways.
+    pub host_key_fingerprint: Option<String>,
     pub created_from_workload_template: Option<SandboxWorkloadTemplateProvenance>,
     /// Service URLs returned by sandbox creation, keyed by service name. The
     /// empty key identifies the unnamed service. Non-create reads leave this empty.
@@ -416,6 +451,8 @@ impl SandboxRef {
             labels: meta.labels,
             resource_version: meta.resource_version,
             exit_code,
+            host_key_fingerprint: (!sandbox.host_key_fingerprint.is_empty())
+                .then_some(sandbox.host_key_fingerprint),
             created_from_workload_template,
             service_urls: HashMap::new(),
             restart_count,

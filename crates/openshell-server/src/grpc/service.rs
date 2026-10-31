@@ -7,7 +7,8 @@ use std::sync::Arc;
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::{
     DeleteServiceRequest, DeleteServiceResponse, ExposeServiceRequest, GetServiceRequest,
-    ListServicesRequest, ListServicesResponse, Sandbox, ServiceEndpoint, ServiceEndpointResponse,
+    ListServicesRequest, ListServicesResponse, Sandbox, ServiceAuthorizationMode, ServiceEndpoint,
+    ServiceEndpointResponse,
 };
 use openshell_core::{GetResourceVersion, ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message as _;
@@ -49,19 +50,37 @@ pub(super) async fn handle_expose_service(
         super::workspace::resolve_workspace(state.store.as_ref(), sandbox.object_workspace())
             .await?
             .ensure_active()?;
-    validate_service_exposure_request(&req.name, req.target_port)?;
-    expose_service_endpoint(state, &workspace, &sandbox, &req.name, req.target_port).await
+    let authorization_mode =
+        validate_service_exposure_request(&req.name, req.target_port, req.authorization_mode)?;
+    expose_service_endpoint(
+        state,
+        &workspace,
+        &sandbox,
+        &req.name,
+        req.target_port,
+        authorization_mode,
+    )
+    .await
 }
 
 pub(super) fn validate_service_exposure_request(
     service: &str,
     target_port: u32,
-) -> Result<(), Status> {
+    authorization_mode: i32,
+) -> Result<ServiceAuthorizationMode, Status> {
     validate_optional_endpoint_name("service", service, MAX_SERVICE_NAME_LEN)?;
     if target_port == 0 || target_port > u32::from(u16::MAX) {
         return Err(Status::invalid_argument("target_port must be in 1..=65535"));
     }
-    Ok(())
+    match ServiceAuthorizationMode::try_from(authorization_mode) {
+        Ok(ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip) => {
+            Ok(ServiceAuthorizationMode::Strip)
+        }
+        Ok(ServiceAuthorizationMode::BearerPassthrough) => {
+            Ok(ServiceAuthorizationMode::BearerPassthrough)
+        }
+        Err(_) => Err(Status::invalid_argument("authorization_mode is invalid")),
+    }
 }
 
 pub(super) async fn expose_service_endpoint(
@@ -70,6 +89,7 @@ pub(super) async fn expose_service_endpoint(
     sandbox: &Sandbox,
     service: &str,
     target_port: u32,
+    authorization_mode: ServiceAuthorizationMode,
 ) -> Result<Response<ServiceEndpointResponse>, Status> {
     let sandbox_name = sandbox.object_name();
 
@@ -132,10 +152,17 @@ pub(super) async fn expose_service_endpoint(
         name: service.to_string(),
         target_port,
         domain: true,
+        authorization_mode: authorization_mode as i32,
     };
 
-    // Single-attempt CAS write: fails with ABORTED on concurrent modification
-    let result = state
+    let route_reserved = state
+        .service_route_index
+        .reserve(workspace, sandbox_name, service)
+        .map_err(|_| Status::already_exists("service routing hostname hash collision"))?;
+
+    // Single-attempt CAS write: fails with ABORTED on concurrent modification.
+    // Release a newly reserved route if the durable write did not succeed.
+    let result = match state
         .store
         .put_if(
             ServiceEndpoint::object_type(),
@@ -147,7 +174,17 @@ pub(super) async fn expose_service_endpoint(
             condition,
         )
         .await
-        .map_err(|e| super::persistence_error_to_status(e, "expose service"))?;
+    {
+        Ok(result) => result,
+        Err(error) => {
+            if route_reserved {
+                state
+                    .service_route_index
+                    .remove(workspace, sandbox_name, service);
+            }
+            return Err(super::persistence_error_to_status(error, "expose service"));
+        }
+    };
 
     let mut endpoint = endpoint;
     if let Some(ref mut meta) = endpoint.metadata {
@@ -320,6 +357,9 @@ pub(super) async fn handle_delete_service(
         .map_err(|e| super::persistence_error_to_status(e, "delete endpoint"))?;
 
     if deleted {
+        state
+            .service_route_index
+            .remove(workspace, sandbox_name, &req.name);
         service_routing::emit_service_endpoint_delete_event(&endpoint);
     }
 
@@ -344,8 +384,16 @@ async fn get_service_endpoint(
 
 fn service_endpoint_response(
     state: &Arc<ServerState>,
-    endpoint: ServiceEndpoint,
+    mut endpoint: ServiceEndpoint,
 ) -> ServiceEndpointResponse {
+    endpoint.authorization_mode =
+        match ServiceAuthorizationMode::try_from(endpoint.authorization_mode) {
+            Ok(ServiceAuthorizationMode::BearerPassthrough) => {
+                ServiceAuthorizationMode::BearerPassthrough as i32
+            }
+            Ok(ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip)
+            | Err(_) => ServiceAuthorizationMode::Strip as i32,
+        };
     let workspace = endpoint.object_workspace();
     let url =
         service_routing::endpoint_url(&state.config, workspace, &endpoint.sandbox, &endpoint.name)
@@ -410,6 +458,7 @@ fn is_dns_label(value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::grpc::test_support::{authed_request, test_server_state};
+    use openshell_core::config::ServiceHostnameFormat;
     use openshell_core::proto::{Sandbox, SandboxPhase};
 
     async fn seed_sandbox(state: &Arc<ServerState>, name: &str) {
@@ -456,6 +505,151 @@ mod tests {
         assert!(validate_endpoint_name("service", "Web", 28).is_err());
     }
 
+    #[test]
+    fn authorization_mode_defaults_to_strip_and_rejects_unknown_values() {
+        assert_eq!(
+            validate_service_exposure_request("web", 8080, 0).unwrap(),
+            ServiceAuthorizationMode::Strip
+        );
+        assert_eq!(
+            validate_service_exposure_request(
+                "web",
+                8080,
+                ServiceAuthorizationMode::BearerPassthrough as i32,
+            )
+            .unwrap(),
+            ServiceAuthorizationMode::BearerPassthrough
+        );
+        assert_eq!(
+            validate_service_exposure_request("web", 8080, 99)
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[tokio::test]
+    async fn expose_service_rejects_route_hash_collision_before_persistence() {
+        let mut state = test_server_state().await;
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.config = state_mut
+            .config
+            .clone()
+            .with_name("gateway-a")
+            .with_service_hostname_format(ServiceHostnameFormat::Hashed);
+        state_mut.service_route_index = Arc::new(service_routing::ServiceRouteIndex::new(Some(
+            "gateway-a".to_string(),
+        )));
+        seed_sandbox(&state, "my-sandbox").await;
+
+        let label = service_routing::service_route_hash_label(
+            "gateway-a",
+            "default",
+            "my-sandbox",
+            Some("web"),
+        );
+        state.service_route_index.seed_for_test(
+            label,
+            service_routing::ServiceRouteTarget {
+                workspace: "other".to_string(),
+                sandbox: "sandbox".to_string(),
+                service: Some("web".to_string()),
+            },
+        );
+
+        let error = handle_expose_service(
+            &state,
+            authed_request(ExposeServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: "web".to_string(),
+                target_port: 8080,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::AlreadyExists);
+        assert!(
+            get_service_endpoint(&state, "default", "my-sandbox", "web")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_authorization_mode_is_rejected_before_persistence() {
+        let state = test_server_state().await;
+        seed_sandbox(&state, "my-sandbox").await;
+
+        let error = handle_expose_service(
+            &state,
+            authed_request(ExposeServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: "web".to_string(),
+                target_port: 8080,
+                authorization_mode: 99,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            get_service_endpoint(&state, "default", "my-sandbox", "web")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_unspecified_authorization_mode_is_reported_as_strip() {
+        let state = test_server_state().await;
+        seed_sandbox(&state, "my-sandbox").await;
+
+        handle_expose_service(
+            &state,
+            authed_request(ExposeServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: "web".to_string(),
+                target_port: 8080,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stored = get_service_endpoint(&state, "default", "my-sandbox", "web")
+            .await
+            .unwrap()
+            .unwrap();
+        stored.authorization_mode = ServiceAuthorizationMode::Unspecified as i32;
+        state.store.put_message(&stored).await.unwrap();
+
+        let response = handle_get_service(
+            &state,
+            authed_request(GetServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: "web".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            response.endpoint.unwrap().authorization_mode(),
+            ServiceAuthorizationMode::Strip
+        );
+    }
+
     #[tokio::test]
     async fn endpoint_lifecycle_round_trip() {
         let state = test_server_state().await;
@@ -472,12 +666,17 @@ mod tests {
                 name: "web".to_string(),
                 target_port: 8080,
                 domain: true,
+                authorization_mode: ServiceAuthorizationMode::Unspecified as i32,
             }),
         )
         .await
         .unwrap()
         .into_inner();
         assert_eq!(exposed.endpoint.as_ref().unwrap().target_port, 8080);
+        assert_eq!(
+            exposed.endpoint.as_ref().unwrap().authorization_mode(),
+            ServiceAuthorizationMode::Strip
+        );
 
         let listed = handle_list_services(
             &state,
@@ -510,6 +709,26 @@ mod tests {
         .unwrap()
         .into_inner();
         assert_eq!(fetched.endpoint.as_ref().unwrap().target_port, 8080);
+
+        let updated = handle_expose_service(
+            &state,
+            authed_request(ExposeServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: "web".to_string(),
+                target_port: 9090,
+                authorization_mode: ServiceAuthorizationMode::BearerPassthrough as i32,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(updated.endpoint.as_ref().unwrap().target_port, 9090);
+        assert_eq!(
+            updated.endpoint.as_ref().unwrap().authorization_mode(),
+            ServiceAuthorizationMode::BearerPassthrough
+        );
 
         let deleted = handle_delete_service(
             &state,
@@ -643,6 +862,7 @@ mod tests {
                     name: "web".to_string(),
                     target_port: 8080,
                     domain: true,
+                    authorization_mode: ServiceAuthorizationMode::Strip as i32,
                 }),
             )
             .await
@@ -661,6 +881,7 @@ mod tests {
                     name: "web".to_string(),
                     target_port: 9090,
                     domain: true,
+                    authorization_mode: ServiceAuthorizationMode::Strip as i32,
                 }),
             )
             .await
@@ -713,6 +934,7 @@ mod tests {
                 name: "web".to_string(),
                 target_port: 7070,
                 domain: true,
+                authorization_mode: ServiceAuthorizationMode::Strip as i32,
             }),
         )
         .await
@@ -732,6 +954,7 @@ mod tests {
                     name: "web".to_string(),
                     target_port: 8080,
                     domain: true,
+                    authorization_mode: ServiceAuthorizationMode::Strip as i32,
                 }),
             )
             .await
@@ -750,6 +973,7 @@ mod tests {
                     name: "web".to_string(),
                     target_port: 9090,
                     domain: true,
+                    authorization_mode: ServiceAuthorizationMode::Strip as i32,
                 }),
             )
             .await
@@ -840,6 +1064,7 @@ mod tests {
                 name: "web".to_string(),
                 target_port: 8080,
                 domain: true,
+                authorization_mode: ServiceAuthorizationMode::Strip as i32,
             }),
         )
         .await
@@ -856,6 +1081,7 @@ mod tests {
                 name: "web".to_string(),
                 target_port: 9090,
                 domain: true,
+                authorization_mode: ServiceAuthorizationMode::Strip as i32,
             }),
         )
         .await
@@ -999,6 +1225,7 @@ mod tests {
                 name: "api".to_string(),
                 target_port: 3000,
                 domain: true,
+                authorization_mode: ServiceAuthorizationMode::Strip as i32,
             }),
         )
         .await

@@ -1,7 +1,10 @@
 # Reference: Windows MSVC maintenance lane
 
 Companion to [SKILL.md](SKILL.md). Use this file for quick lookup while
-maintaining the existing build-only Windows MSVC lane.
+maintaining the native Windows MSVC and MXC runtime lane on the
+[`windows` development and release branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Run the commands below from that branch or a branch based on it, including
+when reading this reference on `main`.
 
 ## Lane Files
 
@@ -10,7 +13,6 @@ maintaining the existing build-only Windows MSVC lane.
 | `tasks/windows.toml` | Mise task definitions for `windows:*`. |
 | `tasks/scripts/windows-msvc.ps1` | Visual Studio environment discovery, rustup target setup, Cargo invocation, logs, artifact report. |
 | `.github/workflows/windows-msvc.yml` | Opt-in PR lint and test plus `windows` branch cache seeding and dependent binary builds on native x64 and ARM64 runners. |
-| `architecture/windows-msvc-build.md` | Human-readable design contract. |
 
 ## Commands
 
@@ -34,14 +36,34 @@ For host-native full validation, detect architecture first:
 $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
 if ($arch -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
     mise run --skip-tools windows:check:arm64
+    if ($LASTEXITCODE -ne 0) { throw "windows:check:arm64 failed." }
     mise run --skip-tools windows:build:arm64
+    if ($LASTEXITCODE -ne 0) { throw "windows:build:arm64 failed." }
     mise run --skip-tools windows:test:arm64
+    if ($LASTEXITCODE -ne 0) { throw "windows:test:arm64 failed." }
     mise run --skip-tools windows:test:unsupported:arm64
+    if ($LASTEXITCODE -ne 0) { throw "windows:test:unsupported:arm64 failed." }
+    mise run --skip-tools windows:test:mxc-real:arm64
+    if ($LASTEXITCODE -ne 0) { throw "windows:test:mxc-real:arm64 failed." }
     mise run --skip-tools windows:artifacts
+    if ($LASTEXITCODE -ne 0) { throw "windows:artifacts failed." }
+    mise run --skip-tools windows:e2e:mxc
+    if ($LASTEXITCODE -ne 0) { throw "MXC E2E validation failed or was incomplete." }
 } else {
     mise run --skip-tools windows:ci
+    if ($LASTEXITCODE -ne 0) { throw "windows:ci failed." }
+    mise run --skip-tools windows:test:mxc-real:x64
+    if ($LASTEXITCODE -ne 0) { throw "windows:test:mxc-real:x64 failed." }
+    mise run --skip-tools windows:e2e:mxc
+    if ($LASTEXITCODE -ne 0) { throw "MXC E2E validation failed or was incomplete." }
 }
 ```
+
+`windows:ci` does not include the real MXC runtime tests or E2E. Run the matching
+`windows:test:mxc-real:*` task and `windows:e2e:mxc` explicitly.
+These tasks can report `SKIP` when the executor or backend is unavailable;
+full validation requires an MXC-capable host. E2E exits nonzero when any
+required runtime scenario fails or skips.
 
 The native test tasks reject a target that does not match the host architecture.
 Do not report x64 compatibility-under-emulation coverage from an ARM64 run.
@@ -76,7 +98,7 @@ Ninja to `PATH`, while the crypto crates select `clang-cl`. Use a short
 
 ## Unsupported Driver Rules
 
-Windows is a build target only. These runtimes remain unsupported:
+These Windows runtimes remain unsupported:
 
 - Docker
 - Kubernetes
@@ -112,18 +134,19 @@ top-level workspace targets for check/test:
 --exclude openshell-driver-vault
 --exclude openshell-driver-vm
 --exclude openshell-sandbox
---exclude openshell-supervisor
---exclude openshell-supervisor-process
 --exclude openshell-vfio
 ```
 
 The gateway keeps platform configuration and unsupported-operation contracts
-without depending on the Docker, Kubernetes, Podman, sandbox runtime,
-standalone supervisor, supervisor process runtime, VM, or VFIO crates. The MXC
-driver does depend on the cross-platform supervisor network library for its host
-egress proxy. The Kubernetes Secrets and Vault libraries still compile as
-gateway dependencies; only their standalone Unix-socket binaries and
+without depending on the Docker, Kubernetes, Podman, VM, or VFIO runtime crates.
+The MXC runtime compiles the supervisor, supervisor-process library, and sandbox
+boundary on Windows. The Kubernetes Secrets and Vault libraries still compile
+as gateway dependencies; only their standalone Unix-socket binaries and
 package-level tests are excluded as top-level targets.
+
+The supervisor and supervisor-process packages now participate as top-level
+native check/test targets. Their portable session, attachment, and TCP readiness
+coverage does not enable a Windows isolation runtime.
 
 ## Common Errors
 

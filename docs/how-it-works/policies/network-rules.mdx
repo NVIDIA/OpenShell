@@ -490,6 +490,8 @@ are application-specific, so review them against the service's schema before
 you rely on them. For deny rules, persisted queries, and GraphQL over WebSocket,
 refer to [GraphQL Rules](/how-it-works/policies/schema#graphql-rules).
 
+GraphQL endpoints refuse requests that carry an `Upgrade` header with `403 Forbidden` in both `enforce` and `audit` mode. Serve GraphQL over WebSocket from a separate `protocol: websocket` endpoint on another path or port, with GraphQL operation rules. One path on a host and port can use only one of the two protocols.
+
 With a GitHub provider attached, verify a REST read with `gh api zen` and a
 query with `gh api graphql -f query='{ viewer { login } }'`, then confirm that a
 mutation other than `createIssue` returns an OpenShell denial.

@@ -24,7 +24,7 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 const BOOTSTRAP_SUBCOMMAND: &str = "bootstrap";
 const SEED_WORKSPACE_SUBCOMMAND: &str = "seed-workspace";
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 const KUBERNETES_BOOTSTRAP_SECRET_FILES: [&str; 3] = ["boundary.json", "tls.crt", "tls.key"];
 #[cfg(target_os = "linux")]
 const BOOTSTRAP_INPUT_ROOT: &str = "/.openshell/bootstrap-input";
@@ -33,7 +33,6 @@ const SANDBOX_RUNTIME_ROOT: &str = "/.openshell/runtime";
 #[cfg(target_os = "linux")]
 const SANDBOX_STATE_ROOT: &str = "/.openshell/state";
 
-const VALIDATE_WORKSPACE_SUBCOMMAND: &str = "validate-workspace";
 const CAPABILITY_PROBE_SUBCOMMAND: &str = "capability-probe";
 const CAPABILITY_PROBE_LAUNCH_SUBCOMMAND: &str = "capability-probe-launch";
 const CAPABILITY_SOCKET_CHILD_SUBCOMMAND: &str = "capability-socket-child";
@@ -58,50 +57,6 @@ struct BoundaryArgs {
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
     log_level: String,
-}
-
-/// Internal one-shot command used by trusted driver bootstrap to validate an
-/// image-provided workdir as the final sandbox identity.
-#[derive(Parser, Debug)]
-#[command(name = "validate-workspace", hide = true)]
-struct ValidateWorkspaceArgs {
-    #[arg(long)]
-    workdir: String,
-    #[arg(long)]
-    expected_uid: u32,
-    #[arg(long)]
-    expected_gid: u32,
-}
-
-#[cfg(target_os = "linux")]
-fn validate_workspace(args: &[String]) -> Result<()> {
-    let args = ValidateWorkspaceArgs::try_parse_from(
-        std::iter::once(VALIDATE_WORKSPACE_SUBCOMMAND.to_string()).chain(args.iter().cloned()),
-    )
-    .into_diagnostic()?;
-    let actual = (
-        nix::unistd::geteuid().as_raw(),
-        nix::unistd::getegid().as_raw(),
-    );
-    if actual != (args.expected_uid, args.expected_gid) {
-        return Err(miette::miette!(
-            "workspace validator privilege drop failed: expected {}:{}, got {}:{}",
-            args.expected_uid,
-            args.expected_gid,
-            actual.0,
-            actual.1
-        ));
-    }
-    openshell_sandbox::process::validate_oci_workspace_as_effective_identity(Path::new(
-        &args.workdir,
-    ))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn validate_workspace(_args: &[String]) -> Result<()> {
-    Err(miette::miette!(
-        "workspace validation is only supported on Unix"
-    ))
 }
 
 /// Run the active Phase 0 probe inside the exact workload runtime profile.
@@ -140,17 +95,14 @@ struct QualificationReport {
     task_memory_copy: bool,
     connected_send_fast_path: bool,
     socket_virtualization: bool,
+    /// Workload INET sockets are bound to loopback, the binding cannot be
+    /// changed from sandbox credentials, and accepted sockets inherit it.
+    socket_loopback_confinement: bool,
     dns_relay_bind: bool,
     udp_dns_round_trip: bool,
     tcp_dns_round_trip: bool,
     tcp_allow_round_trip: bool,
     tcp_deny_round_trip: bool,
-    wait_killable_recv: bool,
-    /// Selected seccomp listener cancellation mode: `killable` (>= 5.19) or
-    /// `legacy_read_only` (< 5.19, broker output writes disabled).
-    seccomp_listener_mode: &'static str,
-    /// Whether the broker disables task-memory output writes (legacy mode).
-    task_memory_writes_disabled: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -194,7 +146,7 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
             std::io::Error::last_os_error()
         ));
     }
-    openshell_isolation_interface::linux::task_memory::probe_child_access()
+    openshell_sandbox::linux::task_memory::probe_child_access()
         .into_diagnostic()
         .wrap_err("same-UID task-memory probe")?;
     // The successful production-shaped parent-to-child round trip above is
@@ -202,21 +154,19 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
     // broker is intentionally nondumpable, so that fallback is inaccessible
     // even though /proc/<dumpable-child>/mem remains available to mediation.
     let task_memory_copy = true;
+    // Check the ABI first: on an older kernel the allow/deny probe would fail
+    // with an opaque ruleset error instead of naming the ABI it needs.
+    let landlock_abi =
+        openshell_sandbox::sandbox::linux::require_landlock_abi().wrap_err("Landlock ABI probe")?;
     probe_landlock_allow_deny().wrap_err("Landlock allow/deny probe")?;
-    let notification =
-        openshell_isolation_interface::linux::seccomp_notify::probe_notification_api()
-            .into_diagnostic()
-            .wrap_err("seccomp notification probe")?;
-    probe_socket_virtualization().wrap_err("socket virtualization probe")?;
-    probe_dns_relay_bind().wrap_err("DNS relay bind probe")?;
-    let landlock_abi = openshell_isolation_interface::linux::landlock::abi_version()
+    let notification = openshell_sandbox::linux::seccomp_notify::probe_notification_api()
         .into_diagnostic()
-        .wrap_err("Landlock ABI probe")?;
-    if landlock_abi < 3 {
-        return Err(miette::miette!(
-            "sandbox self-protection requires Landlock ABI v3 or newer (including truncation), found v{landlock_abi}"
-        ));
-    }
+        .wrap_err("seccomp notification probe")?;
+    probe_socket_virtualization().wrap_err("socket virtualization probe")?;
+    openshell_sandbox::linux::socket_confinement::probe_loopback_confinement()
+        .into_diagnostic()
+        .wrap_err("socket loopback confinement probe")?;
+    probe_dns_relay_bind().wrap_err("DNS relay bind probe")?;
 
     let groups = nix::unistd::getgroups()
         .into_diagnostic()?
@@ -241,18 +191,12 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         task_memory_copy,
         connected_send_fast_path: notification.connected_send_fast_path(),
         socket_virtualization: true,
+        socket_loopback_confinement: true,
         dns_relay_bind: true,
         udp_dns_round_trip: true,
         tcp_dns_round_trip: true,
         tcp_allow_round_trip: true,
         tcp_deny_round_trip: true,
-        wait_killable_recv: notification.wait_killable_recv,
-        seccomp_listener_mode: if notification.wait_killable_recv {
-            "killable"
-        } else {
-            "legacy_read_only"
-        },
-        task_memory_writes_disabled: !notification.wait_killable_recv,
     };
     let qualification = openshell_sandbox::RuntimeQualification {
         seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence {
@@ -263,11 +207,6 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
             retained_socket_operation: true,
             proc_fd_identity: true,
             task_memory_read: task_memory_copy,
-            task_memory_write: task_memory_copy,
-            cancellation: notification.wait_killable_recv,
-            // Legacy plain listener (< 5.19) disables broker output writes;
-            // satisfies the `cancellation || writes_disabled` launch invariant.
-            task_memory_writes_disabled: !notification.wait_killable_recv,
         },
         landlock_abi,
         landlock_allow_deny: true,
@@ -275,6 +214,7 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         tcp_dns_round_trip: true,
         tcp_allow_round_trip: true,
         tcp_deny_round_trip: true,
+        socket_loopback_confinement: true,
     };
     Ok((qualification, report))
 }
@@ -401,8 +341,8 @@ fn run_capability_landlock_child(_args: &[String]) -> Result<()> {
 /// One dedicated launcher thread installs the non-TSYNC listener, moves the
 /// listener FD to this unfiltered broker through an in-process channel, then
 /// execs the child. The child proves that the injected open-file description
-/// survives dup and epoll registration before connect and that the broker can
-/// return the original peer rather than the local relay endpoint.
+/// survives dup and epoll registration before connect and that native
+/// getpeername reports the endpoint used by the probe connection.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn probe_socket_virtualization() -> Result<()> {
@@ -413,8 +353,8 @@ fn probe_socket_virtualization() -> Result<()> {
     use std::sync::mpsc;
 
     use miette::Context as _;
-    use openshell_isolation_interface::linux::seccomp_notify::NotificationListener;
-    use openshell_isolation_interface::linux::socket_registry::{
+    use openshell_sandbox::linux::seccomp_notify::NotificationListener;
+    use openshell_sandbox::linux::socket_registry::{
         InetFamily, InetKind, SocketMetadata, SocketRegistry, SocketState,
     };
 
@@ -489,10 +429,9 @@ fn probe_socket_virtualization() -> Result<()> {
         .into_diagnostic()
         .wrap_err("resolve socket probe executable")?;
     let sandbox_tgid = std::process::id();
-    let mut child_hardening =
-        openshell_isolation_interface::linux::child_seccomp::prepare(sandbox_tgid)
-            .into_diagnostic()
-            .wrap_err("prepare socket probe child hardening")?;
+    let mut child_hardening = openshell_sandbox::linux::child_seccomp::prepare(sandbox_tgid)
+        .into_diagnostic()
+        .wrap_err("prepare socket probe child hardening")?;
     let (listener_tx, listener_rx) = mpsc::sync_channel::<std::io::Result<NotificationListener>>(1);
     let (child_tx, child_rx) = mpsc::sync_channel::<std::io::Result<std::process::Child>>(1);
     let launcher = std::thread::Builder::new()
@@ -502,13 +441,11 @@ fn probe_socket_virtualization() -> Result<()> {
                 let _ = listener_tx.send(Err(error));
                 return;
             }
-            let listener =
-                openshell_isolation_interface::linux::seccomp_notify::install_listener(&[
-                    libc::SYS_socket,
-                    libc::SYS_connect,
-                    libc::SYS_getpeername,
-                    libc::SYS_sendto,
-                ]);
+            let listener = openshell_sandbox::linux::seccomp_notify::install_listener(&[
+                libc::SYS_socket,
+                libc::SYS_connect,
+                libc::SYS_sendto,
+            ]);
             let Ok(listener) = listener else {
                 let _ = listener_tx.send(listener);
                 return;
@@ -561,7 +498,6 @@ fn probe_socket_virtualization() -> Result<()> {
     let mut observed_connect = false;
     let mut observed_dns_tcp_connect = false;
     let mut observed_denied_connect = false;
-    let mut observed_peer = false;
     let mut observed_dns_send = false;
 
     while !(observed_tcp_sockets == 3
@@ -569,7 +505,6 @@ fn probe_socket_virtualization() -> Result<()> {
         && observed_connect
         && observed_dns_tcp_connect
         && observed_denied_connect
-        && observed_peer
         && observed_dns_send)
     {
         let notification = listener
@@ -695,27 +630,6 @@ fn probe_socket_virtualization() -> Result<()> {
                     .respond_value(notification.id, 0)
                     .into_diagnostic()?;
             }
-            libc::SYS_getpeername => {
-                let fd = i32::try_from(notification.args[0])
-                    .map_err(|_| miette::miette!("peer FD does not fit i32"))?;
-                let entry = registry.resolve(notification.tid, fd).into_diagnostic()?;
-                let SocketState::Connected { original_peer } = entry.state() else {
-                    listener
-                        .respond_errno(notification.id, libc::ENOTCONN)
-                        .into_diagnostic()?;
-                    return Err(miette::miette!("peer query preceded mediated connect"));
-                };
-                write_probe_sockaddr(
-                    notification.tid,
-                    notification.args[1],
-                    notification.args[2],
-                    *original_peer,
-                )?;
-                listener
-                    .respond_value(notification.id, 0)
-                    .into_diagnostic()?;
-                observed_peer = true;
-            }
             libc::SYS_sendto => {
                 let fd = i32::try_from(notification.args[0])
                     .map_err(|_| miette::miette!("sendto FD does not fit i32"))?;
@@ -739,7 +653,7 @@ fn probe_socket_virtualization() -> Result<()> {
                     return Err(miette::miette!("unexpected DNS probe destination"));
                 }
                 let mut payload = vec![0_u8; length];
-                openshell_isolation_interface::linux::task_memory::read_exact(
+                openshell_sandbox::linux::task_memory::read_exact(
                     notification.tid,
                     notification.args[1],
                     &mut payload,
@@ -874,19 +788,9 @@ fn block_launcher_signals() -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-unsafe fn set_child_core_limit() -> std::io::Result<()> {
-    let limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `limit` is a live fixed-size rlimit and this child-only update
-    // permanently disables core dumps before any untrusted instruction.
-    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const limit) } < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+fn set_child_core_limit() -> std::io::Result<()> {
+    nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0)
+        .map_err(std::io::Error::from)
 }
 
 #[cfg(target_os = "linux")]
@@ -947,7 +851,7 @@ fn read_probe_sockaddr(tid: u32, address: u64, length: u64) -> Result<std::net::
         return Err(miette::miette!("socket probe requires an IPv4 sockaddr"));
     }
     let mut bytes = vec![0_u8; length];
-    openshell_isolation_interface::linux::task_memory::read_exact(tid, address, &mut bytes)
+    openshell_sandbox::linux::task_memory::read_exact(tid, address, &mut bytes)
         .into_diagnostic()?;
     decode_probe_sockaddr(&bytes)
 }
@@ -987,38 +891,6 @@ fn decode_probe_sockaddr(bytes: &[u8]) -> Result<std::net::SocketAddr> {
         std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]),
         u16::from_be_bytes([bytes[2], bytes[3]]),
     )))
-}
-
-#[cfg(target_os = "linux")]
-fn write_probe_sockaddr(
-    tid: u32,
-    address: u64,
-    length_address: u64,
-    peer: std::net::SocketAddr,
-) -> Result<()> {
-    use std::mem::size_of;
-
-    let (sockaddr, sockaddr_length) = encode_probe_sockaddr(peer)?;
-    let mut requested_length = [0_u8; size_of::<libc::socklen_t>()];
-    openshell_isolation_interface::linux::task_memory::read_exact(
-        tid,
-        length_address,
-        &mut requested_length,
-    )
-    .into_diagnostic()?;
-    let requested_length = libc::socklen_t::from_ne_bytes(requested_length);
-    if requested_length < sockaddr_length {
-        return Err(miette::miette!("peer sockaddr buffer is too small"));
-    }
-    openshell_isolation_interface::linux::task_memory::write_exact(tid, address, &sockaddr)
-        .into_diagnostic()?;
-    openshell_isolation_interface::linux::task_memory::write_exact(
-        tid,
-        length_address,
-        &sockaddr_length.to_ne_bytes(),
-    )
-    .into_diagnostic()?;
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1308,15 +1180,11 @@ fn probe_child_self_protection(sandbox_tgid: libc::pid_t, socket: libc::c_int) -
     if unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } != 1 {
         return Err(miette::miette!("workload child is not dumpable after exec"));
     }
-    let mut core_limit = libc::rlimit {
-        rlim_cur: libc::rlim_t::MAX,
-        rlim_max: libc::rlim_t::MAX,
-    };
-    // SAFETY: `core_limit` is writable storage for the current limit.
-    if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &raw mut core_limit) } < 0 {
-        return Err(std::io::Error::last_os_error()).into_diagnostic();
-    }
-    if core_limit.rlim_cur != 0 || core_limit.rlim_max != 0 {
+    let (current, maximum) =
+        nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_CORE)
+            .map_err(std::io::Error::from)
+            .into_diagnostic()?;
+    if current != 0 || maximum != 0 {
         return Err(miette::miette!("workload child core limit is not zero"));
     }
     let mut local = 0_u8;
@@ -1667,7 +1535,7 @@ fn run_kubernetes_bootstrap() -> Result<()> {
     ))
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) -> Result<()> {
     use std::fs::{self, OpenOptions};
     use std::os::unix::fs::PermissionsExt as _;
@@ -1724,7 +1592,7 @@ fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) ->
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn copy_projected_secret_file(
     source_root: &Path,
     name: &str,
@@ -1742,7 +1610,7 @@ fn copy_projected_secret_file(
     copy_regular_file(&canonical_source, destination, mode)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn copy_regular_file(source: &Path, destination: &Path, mode: u32) -> Result<()> {
     use std::fs::{self, OpenOptions};
     use std::io::{Read as _, Write as _};
@@ -1779,10 +1647,12 @@ fn copy_regular_file(source: &Path, destination: &Path, mode: u32) -> Result<()>
 
 /// Seed the persistent workspace from the agent image as the final workload
 /// identity. This replaces the former root shell/tar init container.
+#[cfg(target_os = "linux")]
 fn seed_kubernetes_workspace() -> Result<()> {
     seed_kubernetes_workspace_at(Path::new("/sandbox"), Path::new("/mnt/openshell-workspace"))
 }
 
+#[cfg(target_os = "linux")]
 fn copy_workspace_tree(source: &Path, destination: &Path) -> Result<()> {
     use std::fs::{self, OpenOptions};
     use std::io::{Read as _, Write as _};
@@ -1835,6 +1705,7 @@ fn copy_workspace_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn seed_kubernetes_workspace_at(source: &Path, destination: &Path) -> Result<()> {
     use std::fs::{self, OpenOptions};
     use std::io::Write as _;
@@ -1879,15 +1750,24 @@ fn seed_kubernetes_workspace_at(source: &Path, destination: &Path) -> Result<()>
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+fn seed_kubernetes_workspace() -> Result<()> {
+    Err(miette::miette!(
+        "Kubernetes workspace seeding is supported only on Linux"
+    ))
+}
+
 #[cfg(target_os = "linux")]
 fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
     let console_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
     let _ = tracing_subscriber::registry()
         .with(
-            OcsfShorthandLayer::new(std::io::stderr())
-                .with_non_ocsf(true)
-                .with_filter(console_filter),
+            OcsfShorthandLayer::new(
+                openshell_sandbox::container_log::ContainerLog::process().launcher_writer(),
+            )
+            .with_non_ocsf(true)
+            .with_filter(console_filter),
         )
         .try_init();
     let (qualification, _) = qualify_runtime()?;
@@ -1923,9 +1803,6 @@ fn main() -> Result<()> {
         }
         return seed_kubernetes_workspace();
     }
-    if raw_args.get(1).map(String::as_str) == Some(VALIDATE_WORKSPACE_SUBCOMMAND) {
-        return validate_workspace(&raw_args[2..]);
-    }
     if raw_args.get(1).map(String::as_str) == Some(CAPABILITY_PROBE_SUBCOMMAND) {
         return run_capability_probe();
     }
@@ -1946,7 +1823,7 @@ fn main() -> Result<()> {
     run_boundary(&args.bootstrap, &args.log_level)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -2029,31 +1906,6 @@ mod tests {
             0
         );
         assert!(destination.join(".openshell-initialized").is_file());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn workspace_validation_subcommand_uses_final_policy_identity() {
-        let uid = nix::unistd::geteuid().as_raw();
-        let gid = nix::unistd::getegid().as_raw();
-        if uid < 1000 || gid < 1000 {
-            return;
-        }
-        let dir = tempfile::tempdir_in("/tmp").unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
-        let root = dir.path().canonicalize().unwrap().join("workspace");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let args = vec![
-            "--workdir".to_string(),
-            root.display().to_string(),
-            "--expected-uid".to_string(),
-            uid.to_string(),
-            "--expected-gid".to_string(),
-            gid.to_string(),
-        ];
-
-        validate_workspace(&args).expect("current identity should retain workspace authority");
     }
 
     /// Drives `copy_self`'s file-copy logic against an arbitrary source path

@@ -35,6 +35,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=tasks/scripts/gateway-toml.sh
 source "${ROOT}/tasks/scripts/gateway-toml.sh"
+# shellcheck source=tasks/scripts/build-env.sh
+source "${ROOT}/tasks/scripts/build-env.sh"
+ensure_build_nofile_limit
 PORT="${OPENSHELL_SERVER_PORT:-18081}"
 GATEWAY_NAME="${OPENSHELL_VM_GATEWAY_NAME:-vm-dev}"
 STATE_DIR="${OPENSHELL_VM_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-vm}"
@@ -90,7 +93,7 @@ port_is_in_use() {
 append_local_otlp_config_if_available() {
   local config_path=$1
   if ! port_is_in_use 4317; then
-    echo "OTLP collector not detected on 127.0.0.1:4317; trace export disabled."
+    echo "OTLP collector not detected on 127.0.0.1:4317; trace export, OCSF log export, and the agent trace relay disabled."
     return
   fi
 
@@ -98,8 +101,14 @@ append_local_otlp_config_if_available() {
 
 [openshell.gateway.otlp]
 endpoint = "http://127.0.0.1:4317"
+
+[openshell.gateway.otlp.ocsf]
+enabled = true
+
+[openshell.gateway.otlp.agent]
+enabled = true
 EOF
-  echo "OTLP trace export enabled for http://127.0.0.1:4317."
+  echo "OTLP trace export, OCSF log export, and the agent trace relay enabled for http://127.0.0.1:4317."
 }
 
 invoking_user() {

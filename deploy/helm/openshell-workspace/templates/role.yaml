@@ -42,7 +42,20 @@ rules:
     resources:
       - pods
     verbs:
+      - create
+      - delete
       - get
+      # Updates must rule out every remaining workload Pod, including Pods
+      # identified only by owner UID or the controller's recorded name.
+      - list
+      - patch
+      - watch
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get"]
   # Generation-scoped sandbox bootstrap Secrets.
   - apiGroups:
       - ""

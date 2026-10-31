@@ -5,15 +5,16 @@
 //!
 //! Drivers choose and provision the transport, but they do not redefine the
 //! process lifecycle, streaming, identity, or authentication messages.  The
-//! supervisor and sandbox exchange these length-delimited JSON frames inside
-//! gRPC streams on one mutually authenticated connection. The driver chooses
-//! the underlying private Unix socket, TCP connection, or virtio-vsock stream.
+//! supervisor and sandbox exchange typed protobuf messages over gRPC. The
+//! length-delimited helpers below adapt only private, in-process Rust streams.
+//! The driver chooses the underlying private Unix socket, TCP connection, or virtio-vsock stream.
 
 use std::fmt;
 use std::io;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use openshell_core::SandboxSessionId;
 use openshell_core::policy::{
@@ -24,16 +25,15 @@ use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::Sha256Digest;
 use openshell_isolation_interface::contract::{
     BackendDescriptor, BackendError, BinaryIdentity, BoundaryConfirmation, BoundaryExitStatus,
-    BoundaryProperties, BoundarySignal, EnforcedProperty, ExecSpec, ExecutableIdentity,
-    OuterFenceGuarantees, ResolveError, ShellSpec,
+    BoundarySignal, ExecSpec, ExecutableIdentity, ProvisioningEvidence, ResolveError, ShellSpec,
 };
-use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
-use serde::de::DeserializeOwned;
+use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
+/// Exec admission and recovery share one deadline; it never limits process runtime.
+pub const EXEC_REQUEST_RETRY_WINDOW: Duration = Duration::from_secs(30);
 pub const STREAM_STDIN: u8 = 0;
 pub const STREAM_STDOUT: u8 = 1;
 pub const STREAM_STDERR: u8 = 2;
@@ -94,9 +94,6 @@ pub struct SeccompEvidence {
     pub retained_socket_operation: bool,
     pub proc_fd_identity: bool,
     pub task_memory_read: bool,
-    pub task_memory_write: bool,
-    pub cancellation: bool,
-    pub task_memory_writes_disabled: bool,
 }
 
 /// Mechanism-specific audit evidence for the native Linux sandbox adapter.
@@ -124,6 +121,10 @@ pub struct NativeLinuxSandboxAuditEvidence {
     pub tcp_dns_round_trip: bool,
     pub tcp_allow_round_trip: bool,
     pub tcp_deny_round_trip: bool,
+    /// Workload INET sockets are bound to loopback before injection, the
+    /// binding cannot be changed from sandbox credentials, and accepted
+    /// sockets inherit it. Native local `accept` depends on this property.
+    pub socket_loopback_confinement: bool,
 }
 
 impl NativeLinuxSandboxAuditEvidence {
@@ -143,14 +144,13 @@ impl NativeLinuxSandboxAuditEvidence {
             && self.seccomp.retained_socket_operation
             && self.seccomp.proc_fd_identity
             && self.seccomp.task_memory_read
-            && self.seccomp.task_memory_write
-            && (self.seccomp.cancellation || self.seccomp.task_memory_writes_disabled)
             && self.landlock_abi >= 3
             && self.landlock_allow_deny
             && self.udp_dns_round_trip
             && self.tcp_dns_round_trip
             && self.tcp_allow_round_trip
-            && self.tcp_deny_round_trip;
+            && self.tcp_deny_round_trip
+            && self.socket_loopback_confinement;
         if complete {
             Ok(())
         } else {
@@ -159,50 +159,16 @@ impl NativeLinuxSandboxAuditEvidence {
             ))
         }
     }
-
-    /// Project backend measurements into the common property contract.
-    #[must_use]
-    pub fn properties(&self) -> BoundaryProperties {
-        BoundaryProperties {
-            filesystem_confinement: EnforcedProperty::new(
-                self.landlock_abi >= 3 && self.landlock_allow_deny,
-                format!("landlock-v{}", self.landlock_abi),
-            ),
-            egress_interception: EnforcedProperty::new(
-                self.seccomp.new_listener
-                    && self.seccomp.notification_round_trip
-                    && self.seccomp.addfd_send
-                    && self.udp_dns_round_trip
-                    && self.tcp_dns_round_trip
-                    && self.tcp_allow_round_trip
-                    && self.tcp_deny_round_trip,
-                "seccomp-notify",
-            ),
-            request_attribution: EnforcedProperty::new(
-                self.seccomp.id_validation
-                    && self.seccomp.proc_fd_identity
-                    && self.seccomp.task_memory_read
-                    && self.seccomp.task_memory_write,
-                "seccomp-notify-procfs",
-            ),
-            privilege_floor: EnforcedProperty::new(
-                self.capabilities.is_empty()
-                    && self.no_new_privileges
-                    && !self.sandbox_dumpable
-                    && self.child_dumpable
-                    && self.core_limit_zero,
-                "linux-capability-free",
-            ),
-        }
-    }
 }
 
 /// Ephemeral identity of the supervisor process that owns one sandbox runtime.
 ///
 /// The supervisor generates this value in memory and presents it on every
 /// attach, including transport reconnects. The sandbox pins the first value it
-/// accepts for its process lifetime, so a replacement supervisor cannot reuse
-/// launch credentials to take over an existing runtime generation.
+/// accepts, so a replacement supervisor cannot reuse launch credentials to
+/// take over an existing runtime generation. Only a gateway-signed takeover
+/// grant for a higher credential epoch, naming the replacement's identity,
+/// moves the pin (see [`crate::sandbox_auth`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SupervisorInstanceId(uuid::Uuid);
 
@@ -273,8 +239,9 @@ impl<'de> Deserialize<'de> for SupervisorInstanceId {
 #[error("supervisor instance ID must be a non-nil canonical lowercase UUID")]
 pub struct SupervisorInstanceIdError;
 
-/// Driver-selected byte-stream transport for the `OpenShell` Sandbox Protocol.
-/// Authentication is configured separately and is identical for every variant.
+/// Backend-owned transport for a driver-provisioned runtime. The serialized
+/// variants preserve existing runtime descriptors independently of operator
+/// endpoint registration in core.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum SandboxTransport {
@@ -282,15 +249,88 @@ pub enum SandboxTransport {
         socket_path: PathBuf,
     },
     Tcp {
-        /// Stable logical Kubernetes Service authority used for diagnostics.
+        /// Logical HTTP authority used for routing.
         authority: String,
-        /// Explicit connection candidates resolved by the compute driver.
+        /// Concrete connection candidates pinned by the operator or driver.
         addresses: Vec<std::net::SocketAddr>,
     },
     Vsock {
         guest_cid: u32,
         port: u32,
     },
+    /// The supervisor accepts a connection from its sandbox runtime. TLS and
+    /// gRPC roles stay unchanged.
+    RuntimeInitiatedTcp {
+        authority: String,
+        listen_address: std::net::SocketAddr,
+    },
+    RuntimeInitiatedUnix {
+        socket_path: PathBuf,
+    },
+    RuntimeInitiatedVsock {
+        guest_cid: u32,
+        port: u32,
+    },
+    /// The runtime dials a supervisor shared by several sandbox instances and
+    /// names this instance's opaque route handle before the pinned TLS
+    /// handshake.
+    /// Only a host that owns the shared listener can serve this transport.
+    RuntimeInitiatedRouted {
+        authority: String,
+        route: String,
+    },
+}
+
+impl SandboxTransport {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let valid = match self {
+            Self::Unix { socket_path } | Self::RuntimeInitiatedUnix { socket_path } => {
+                openshell_core::paths::is_posix_absolute(socket_path)
+            }
+            Self::Tcp {
+                authority,
+                addresses,
+            } => {
+                !authority.is_empty()
+                    && !addresses.is_empty()
+                    && addresses
+                        .iter()
+                        .all(|address| address.port() != 0 && !address.ip().is_unspecified())
+            }
+            Self::RuntimeInitiatedTcp {
+                authority,
+                listen_address,
+            } => !authority.is_empty() && listen_address.port() != 0,
+            Self::Vsock { guest_cid, port } | Self::RuntimeInitiatedVsock { guest_cid, port } => {
+                *guest_cid >= 3 && *guest_cid != u32::MAX && *port != 0 && *port != u32::MAX
+            }
+            Self::RuntimeInitiatedRouted { authority, route } => {
+                !authority.is_empty() && crate::runtime_routed::validate_route_handle(route).is_ok()
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err("invalid boundary control transport endpoint")
+        }
+    }
+}
+
+impl From<openshell_core::isolation_registration::SandboxTransport> for SandboxTransport {
+    fn from(endpoint: openshell_core::isolation_registration::SandboxTransport) -> Self {
+        use openshell_core::isolation_registration::SandboxTransport as RegisteredEndpoint;
+        match endpoint {
+            RegisteredEndpoint::Unix { socket_path } => Self::Unix { socket_path },
+            RegisteredEndpoint::Tcp {
+                authority,
+                addresses,
+            } => Self::Tcp {
+                authority,
+                addresses,
+            },
+            RegisteredEndpoint::Vsock { guest_cid, port } => Self::Vsock { guest_cid, port },
+        }
+    }
 }
 
 /// Supervisor-side, generation-pinned TLS server authentication.
@@ -349,7 +389,7 @@ pub fn generate_sandbox_tls_material(
     session_id: SandboxSessionId,
 ) -> Result<SandboxTlsMaterial, BackendError> {
     let server_name = format!("sandbox.{session_id}.openshell.internal");
-    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ED25519)
+    let ca_key = openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_ED25519)
         .map_err(|error| BackendError::Descriptor(format!("generate sandbox CA key: {error}")))?;
     let mut ca_params = CertificateParams::default();
     ca_params.not_before = rcgen::date_time_ymd(1975, 1, 1);
@@ -359,13 +399,14 @@ pub fn generate_sandbox_tls_material(
         .distinguished_name
         .push(DnType::CommonName, "OpenShell sandbox session CA");
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca = ca_params.self_signed(&ca_key).map_err(|error| {
+    let ca = openshell_crypto::pki::self_signed(ca_params, &ca_key).map_err(|error| {
         BackendError::Descriptor(format!("generate sandbox CA certificate: {error}"))
     })?;
 
-    let sandbox_key = KeyPair::generate_for(&rcgen::PKCS_ED25519).map_err(|error| {
-        BackendError::Descriptor(format!("generate sandbox TLS server key: {error}"))
-    })?;
+    let sandbox_key =
+        openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_ED25519).map_err(|error| {
+            BackendError::Descriptor(format!("generate sandbox TLS server key: {error}"))
+        })?;
     let mut sandbox_params = CertificateParams::new(vec![server_name.clone()])
         .map_err(|error| BackendError::Descriptor(format!("build sandbox certificate: {error}")))?;
     sandbox_params.not_before = rcgen::date_time_ymd(1975, 1, 1);
@@ -374,8 +415,7 @@ pub fn generate_sandbox_tls_material(
         .distinguished_name
         .push(DnType::CommonName, "OpenShell sandbox runtime");
     sandbox_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let sandbox = sandbox_params
-        .signed_by(&sandbox_key, &ca, &ca_key)
+    let sandbox = openshell_crypto::pki::signed_by(sandbox_params, &sandbox_key, &ca, &ca_key)
         .map_err(|error| {
             BackendError::Descriptor(format!("sign sandbox TLS server certificate: {error}"))
         })?;
@@ -384,7 +424,9 @@ pub fn generate_sandbox_tls_material(
         server_name,
         trust_anchor_pem: ca.pem(),
         certificate_chain_pem: sandbox.pem(),
-        private_key_pem: sandbox_key.serialize_pem(),
+        private_key_pem: sandbox_key
+            .serialize_pem()
+            .map_err(|error| BackendError::Descriptor(format!("export sandbox key: {error}")))?,
     })
 }
 
@@ -405,6 +447,29 @@ pub enum BoundaryListener {
     /// TLS over guest `AF_VSOCK`.
     Vsock {
         control_port: u32,
+        tls: SandboxTlsServerConfig,
+    },
+    /// The boundary dials the supervisor's listener and serves TLS and gRPC
+    /// over that outbound connection. Only driver-resolved addresses are used.
+    RuntimeInitiatedTlsTcp {
+        /// Stable logical Service authority, for diagnostics.
+        authority: String,
+        /// Driver-resolved supervisor endpoints, tried in order.
+        addresses: Vec<std::net::SocketAddr>,
+        tls: SandboxTlsServerConfig,
+        /// Route handle sent before TLS to a supervisor shared by several
+        /// sandbox instances. Absent for a dedicated supervisor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<String>,
+    },
+    /// Dial the supervisor over the driver's protected shared Unix socket.
+    RuntimeInitiatedUnix {
+        socket_path: PathBuf,
+        tls: SandboxTlsServerConfig,
+    },
+    /// Dial the host supervisor through the VM's vsock device.
+    RuntimeInitiatedVsock {
+        host_port: u32,
         tls: SandboxTlsServerConfig,
     },
 }
@@ -442,7 +507,7 @@ pub struct SandboxRuntimeDescriptor {
     #[serde(default)]
     pub resource_claims: std::collections::BTreeMap<String, String>,
     /// Backend-neutral projection of the validated outer network fence.
-    pub outer_fence: OuterFenceGuarantees,
+    pub provisioning_evidence: ProvisioningEvidence,
 }
 
 impl fmt::Debug for SandboxRuntimeDescriptor {
@@ -456,7 +521,7 @@ impl fmt::Debug for SandboxRuntimeDescriptor {
             .field("tls", &self.tls)
             .field("host_gateway_ip", &self.host_gateway_ip)
             .field("resource_claims", &self.resource_claims)
-            .field("outer_fence", &self.outer_fence)
+            .field("provisioning_evidence", &self.provisioning_evidence)
             .finish()
     }
 }
@@ -510,10 +575,29 @@ pub struct BoundaryConfig {
     /// Exact identity already applied by the runtime to the sandbox process.
     pub workload_identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
     /// Backend-neutral projection of the validated outer network fence.
-    pub outer_fence: OuterFenceGuarantees,
+    pub provisioning_evidence: ProvisioningEvidence,
     /// Driver-resolved environment exposed only to workload processes.
     #[serde(default)]
     pub child_env: std::collections::HashMap<String, String>,
+}
+
+/// Default time a runtime keeps a workload frozen, after losing its
+/// supervisor, for an authenticated supervisor to recover it.
+pub const DEFAULT_SUPERVISOR_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Accepted bounds, in seconds, of a recovery deadline a supervisor offers.
+///
+/// A supervisor offers it at attach (see [`Request::Attach`]). Recovery is
+/// always bounded: a workload never runs unsupervised, and a frozen workload
+/// is terminated once its deadline passes.
+pub const SUPERVISOR_RECOVERY_TIMEOUT_RANGE: std::ops::RangeInclusive<u32> = 10..=300;
+
+/// The recovery deadline of an offer of `seconds`, if
+/// [`SUPERVISOR_RECOVERY_TIMEOUT_RANGE`] allows it.
+#[must_use]
+pub fn supervisor_recovery_timeout(seconds: u32) -> Option<Duration> {
+    SUPERVISOR_RECOVERY_TIMEOUT_RANGE
+        .contains(&seconds)
+        .then(|| Duration::from_secs(u64::from(seconds)))
 }
 
 impl fmt::Debug for BoundaryConfig {
@@ -538,7 +622,7 @@ impl fmt::Debug for BoundaryConfig {
             .field("resource_claims", &self.resource_claims)
             .field("resource_claim_files", &self.resource_claim_files)
             .field("workload_identity", &self.workload_identity)
-            .field("outer_fence", &self.outer_fence)
+            .field("provisioning_evidence", &self.provisioning_evidence)
             .field("child_env_keys", &self.child_env.keys().collect::<Vec<_>>())
             .finish()
     }
@@ -623,8 +707,12 @@ pub async fn read_stream_frame(
 pub struct RequestEnvelope {
     /// Cryptographically random idempotency key scoped to one sandbox generation.
     pub request_id: String,
-    /// SHA-256 of the canonically serialized request payload.
+    /// Local replay fingerprint of decoded protobuf fields; never transmitted.
     pub payload_digest: String,
+    /// Absolute exec admission deadline, preserved across retries and bound to
+    /// the payload digest. Other request kinds do not expire through this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_admission_deadline_unix_ms: Option<u64>,
     pub request: Request,
 }
 
@@ -632,10 +720,20 @@ impl RequestEnvelope {
     /// Build a request envelope with a fresh idempotency key and normalized
     /// payload digest.
     pub fn new(request: Request) -> Result<Self, FrameError> {
-        let payload_digest = request_payload_digest(&request)?;
+        let exec_admission_deadline_unix_ms = if matches!(request, Request::Exec { .. }) {
+            let window_ms =
+                u64::try_from(EXEC_REQUEST_RETRY_WINDOW.as_millis()).map_err(io::Error::other)?;
+            Some(unix_time_millis()?.saturating_add(window_ms))
+        } else {
+            None
+        };
+        let payload_digest = request_envelope_digest(&request, exec_admission_deadline_unix_ms)?;
         Ok(Self {
-            request_id: uuid::Uuid::new_v4().to_string(),
+            request_id: uuid::Builder::from_random_bytes(openshell_crypto::random_bytes::<16>()?)
+                .into_uuid()
+                .to_string(),
             payload_digest,
+            exec_admission_deadline_unix_ms,
             request,
         })
     }
@@ -643,7 +741,7 @@ impl RequestEnvelope {
     /// Verify that the request body still matches the immutable digest bound
     /// to this idempotency key.
     pub fn validate_payload_digest(&self) -> Result<(), FrameError> {
-        let actual = request_payload_digest(&self.request)?;
+        let actual = request_envelope_digest(&self.request, self.exec_admission_deadline_unix_ms)?;
         if actual == self.payload_digest {
             Ok(())
         } else {
@@ -652,15 +750,35 @@ impl RequestEnvelope {
     }
 }
 
-fn request_payload_digest(request: &Request) -> Result<String, FrameError> {
-    // Sort every object explicitly: dependency features may make Value retain
-    // insertion order. Provider environments must hash identically after
-    // deserialization and across independently serialized retries.
-    let mut normalized = serde_json::to_value(request).map_err(FrameError::Serialize)?;
-    normalized.sort_all_objects();
-    let payload = serde_json::to_vec(&normalized).map_err(FrameError::Serialize)?;
-    let digest = Sha256::digest(payload);
-    Ok(format!("{digest:x}"))
+/// Shared wall clock for the host's deadline and the boundary's admission check.
+pub fn unix_time_millis() -> Result<u64, FrameError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+    u64::try_from(elapsed.as_millis()).map_err(|error| FrameError::Io(io::Error::other(error)))
+}
+
+pub(crate) fn request_envelope_digest(
+    request: &Request,
+    exec_admission_deadline_unix_ms: Option<u64>,
+) -> Result<String, FrameError> {
+    use std::fmt::Write as _;
+
+    // Stable local replay fingerprint of decoded protobuf fields. Maps use
+    // BTreeMap in generated messages; neither clients nor the wire carry this.
+    let envelope = RequestEnvelope {
+        request_id: String::new(),
+        payload_digest: String::new(),
+        exec_admission_deadline_unix_ms,
+        request: request.clone(),
+    };
+    let payload = crate::protobuf::encode(&envelope)?;
+    let digest = openshell_crypto::sha256(&payload)?;
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(encoded)
 }
 
 impl fmt::Debug for RequestEnvelope {
@@ -681,23 +799,35 @@ pub enum Request {
     Attach {
         supervisor_instance_id: SupervisorInstanceId,
         policy: Box<SandboxPolicyWire>,
-        resource_claims: std::collections::BTreeMap<String, String>,
+        /// Gateway-signed takeover grant, present only when this process
+        /// replaces the generation's current owner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supervisor_takeover: Option<String>,
+        /// Seconds the runtime should keep the workload frozen after losing
+        /// this connection's supervision, offered by the supervisor and
+        /// bounded by [`SUPERVISOR_RECOVERY_TIMEOUT_RANGE`]. Absent keeps
+        /// [`DEFAULT_SUPERVISOR_RECOVERY_TIMEOUT`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supervisor_recovery_timeout_secs: Option<u32>,
     },
     Confirm,
     StartAgent {
         sandbox_id: String,
         spec: AgentSpecWire,
-        policy: Box<SandboxPolicyWire>,
         ca_cert: Option<String>,
         ca_bundle: Option<String>,
         provider_env_revision: u64,
         provider_env: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        provider_files: std::collections::HashMap<String, String>,
     },
     UpdateProviderEnvironment {
         /// Ordered publication within this authenticated boundary session.
         generation: u64,
         revision: u64,
         provider_env: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        provider_files: std::collections::HashMap<String, String>,
     },
     AttachProcess {
         process_id: String,
@@ -717,10 +847,6 @@ pub enum Request {
     TerminateBoundary,
     Exec {
         spec: ExecSpecWire,
-    },
-    ExecSignal {
-        process_id: String,
-        signal: SignalWire,
     },
     Resize {
         process_id: String,
@@ -752,7 +878,6 @@ impl Request {
                 | Self::Signal { .. }
                 | Self::Terminate { .. }
                 | Self::TerminateBoundary
-                | Self::ExecSignal { .. }
                 | Self::Resize { .. }
         )
     }
@@ -765,29 +890,34 @@ impl fmt::Debug for Request {
             Self::Attach {
                 supervisor_instance_id: _,
                 policy: _,
-                resource_claims,
+                supervisor_takeover,
+                supervisor_recovery_timeout_secs,
             } => formatter
                 .debug_struct("Attach")
                 .field("policy", &"<redacted>")
-                .field("resource_claims", resource_claims)
+                .field("takeover", &supervisor_takeover.is_some())
+                .field(
+                    "supervisor_recovery_timeout_secs",
+                    supervisor_recovery_timeout_secs,
+                )
                 .finish(),
             Self::Confirm => formatter.write_str("Confirm"),
             Self::StartAgent {
                 sandbox_id,
                 spec,
-                policy: _,
                 ca_cert,
                 ca_bundle,
                 provider_env_revision,
                 provider_env,
+                provider_files,
             } => formatter
                 .debug_struct("StartAgent")
                 .field("sandbox_id", sandbox_id)
                 .field("spec", spec)
-                .field("policy", &"<redacted>")
                 .field("ca_cert_present", &ca_cert.is_some())
                 .field("ca_bundle_present", &ca_bundle.is_some())
                 .field("provider_env_revision", provider_env_revision)
+                .field("provider_file_count", &provider_files.len())
                 .field(
                     "provider_env_keys",
                     &provider_env.keys().collect::<Vec<_>>(),
@@ -797,10 +927,12 @@ impl fmt::Debug for Request {
                 generation,
                 revision,
                 provider_env,
+                provider_files,
             } => formatter
                 .debug_struct("UpdateProviderEnvironment")
                 .field("generation", generation)
                 .field("revision", revision)
+                .field("provider_file_count", &provider_files.len())
                 .field(
                     "provider_env_keys",
                     &provider_env.keys().collect::<Vec<_>>(),
@@ -825,11 +957,6 @@ impl fmt::Debug for Request {
                 .finish(),
             Self::TerminateBoundary => formatter.write_str("TerminateBoundary"),
             Self::Exec { spec } => formatter.debug_tuple("Exec").field(spec).finish(),
-            Self::ExecSignal { process_id, signal } => formatter
-                .debug_struct("ExecSignal")
-                .field("process_id", process_id)
-                .field("signal", signal)
-                .finish(),
             Self::Resize {
                 process_id,
                 cols,
@@ -897,12 +1024,14 @@ pub enum Response {
         pty: bool,
     },
     Resized,
-    PortConnected,
+    LoopbackConnected,
     MediationReady,
     NetworkConnected {
         identity: BinaryIdentityWire,
         destination: std::net::SocketAddr,
-        socket: openshell_isolation_interface::contract::NetworkSocketMetadata,
+        /// Native evidence is absent for guest host calls without kernel sockets.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        socket: Option<openshell_isolation_interface::contract::NetworkSocketMetadata>,
         policy_generation: u64,
         timing: MediationTimingWire,
     },
@@ -924,6 +1053,10 @@ pub struct MediationTimingWire {
 pub struct SessionSnapshotWire {
     pub generation: String,
     pub processes: Vec<ProcessSnapshotWire>,
+    /// Launch controls bound by the first attach, if any. A replacement
+    /// supervisor reattaches with exactly these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_policy: Option<Box<SandboxPolicyWire>>,
 }
 
 /// Stable generation-scoped process state available to a replacement supervisor.
@@ -967,6 +1100,7 @@ pub enum BoundaryErrorKind {
     Unavailable,
     Terminated,
     Process,
+    Unsupported,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1125,6 +1259,10 @@ pub struct AgentSpecWire {
     pub workdir: Option<String>,
     pub timeout_secs: u64,
     pub interactive: bool,
+    /// Omitted while false so the request digest of a sandbox without a
+    /// relay is unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub otlp_relay_active: bool,
 }
 
 impl From<AgentSpec> for AgentSpecWire {
@@ -1135,6 +1273,7 @@ impl From<AgentSpec> for AgentSpecWire {
             workdir: spec.workdir,
             timeout_secs: spec.timeout_secs,
             interactive: spec.interactive,
+            otlp_relay_active: spec.otlp_relay_active,
         }
     }
 }
@@ -1325,8 +1464,11 @@ impl From<BoundaryExitStatus> for ExitStatusWire {
     }
 }
 
-pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, FrameError> {
-    let payload = serde_json::to_vec(message).map_err(FrameError::Serialize)?;
+pub fn encode_frame<T: crate::protobuf::WireMessage>(message: &T) -> Result<Vec<u8>, FrameError>
+where
+    T::Proto: prost::Message + Default,
+{
+    let payload = crate::protobuf::encode(message)?;
     if payload.len() > MAX_CONTROL_FRAME_BYTES {
         return Err(FrameError::TooLarge(payload.len()));
     }
@@ -1337,7 +1479,10 @@ pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, FrameError> {
     Ok(frame)
 }
 
-pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, FrameError> {
+pub fn decode_frame<T: crate::protobuf::WireMessage>(frame: &[u8]) -> Result<T, FrameError>
+where
+    T::Proto: prost::Message + Default,
+{
     let header: [u8; 4] = frame
         .get(..4)
         .ok_or(FrameError::Truncated)?
@@ -1354,10 +1499,13 @@ pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, FrameError> 
             actual: payload.len(),
         });
     }
-    serde_json::from_slice(payload).map_err(FrameError::Deserialize)
+    crate::protobuf::decode(payload)
 }
 
-pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T, FrameError> {
+pub fn read_frame<T: crate::protobuf::WireMessage>(reader: &mut impl Read) -> Result<T, FrameError>
+where
+    T::Proto: prost::Message + Default,
+{
     let mut header = [0_u8; 4];
     reader.read_exact(&mut header)?;
     let declared = u32::from_be_bytes(header) as usize;
@@ -1374,7 +1522,8 @@ pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T, Fram
 pub async fn read_frame_async<R, T>(reader: &mut R) -> Result<T, FrameError>
 where
     R: AsyncRead + Unpin,
-    T: DeserializeOwned,
+    T: crate::protobuf::WireMessage,
+    T::Proto: prost::Message + Default,
 {
     use tokio::io::AsyncReadExt as _;
 
@@ -1391,7 +1540,13 @@ where
     decode_frame(&frame)
 }
 
-pub fn write_frame<T: Serialize>(writer: &mut impl Write, message: &T) -> Result<(), FrameError> {
+pub fn write_frame<T: crate::protobuf::WireMessage>(
+    writer: &mut impl Write,
+    message: &T,
+) -> Result<(), FrameError>
+where
+    T::Proto: prost::Message + Default,
+{
     let frame = encode_frame(message)?;
     writer.write_all(&frame)?;
     writer.flush()?;
@@ -1400,16 +1555,16 @@ pub fn write_frame<T: Serialize>(writer: &mut impl Write, message: &T) -> Result
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
+    #[error("control frame cryptography failed: {0}")]
+    Crypto(#[from] openshell_crypto::CryptoError),
+    #[error("invalid protobuf message: {0}")]
+    Protobuf(String),
     #[error("control frame is truncated")]
     Truncated,
     #[error("control frame is too large: {0} bytes")]
     TooLarge(usize),
     #[error("control frame declared {declared} bytes but contained {actual}")]
     LengthMismatch { declared: usize, actual: usize },
-    #[error("serialize control frame: {0}")]
-    Serialize(serde_json::Error),
-    #[error("deserialize control frame: {0}")]
-    Deserialize(serde_json::Error),
     #[error("control request payload digest does not match its envelope")]
     PayloadDigestMismatch,
     #[error("read or write control frame: {0}")]
@@ -1443,9 +1598,6 @@ mod tests {
                 retained_socket_operation: true,
                 proc_fd_identity: true,
                 task_memory_read: true,
-                task_memory_write: true,
-                cancellation: true,
-                task_memory_writes_disabled: false,
             },
             landlock_abi: 6,
             landlock_allow_deny: true,
@@ -1453,19 +1605,8 @@ mod tests {
             tcp_dns_round_trip: true,
             tcp_allow_round_trip: true,
             tcp_deny_round_trip: true,
+            socket_loopback_confinement: true,
         }
-    }
-
-    #[test]
-    fn native_linux_audit_evidence_projects_backend_neutral_properties() {
-        let audit = complete_audit_evidence();
-        audit.validate().unwrap();
-        let properties = audit.properties();
-        assert!(properties.filesystem_confinement.enforced);
-        assert_eq!(properties.filesystem_confinement.mechanism, "landlock-v6");
-        assert!(properties.egress_interception.enforced);
-        assert!(properties.request_attribution.enforced);
-        assert!(properties.privilege_floor.enforced);
     }
 
     #[test]
@@ -1473,22 +1614,12 @@ mod tests {
         let mut audit = complete_audit_evidence();
         audit.seccomp.addfd_send = false;
         assert!(audit.validate().is_err());
-        assert!(!audit.properties().egress_interception.enforced);
     }
 
     #[test]
-    fn audit_evidence_accepts_legacy_read_only_listener() {
+    fn audit_evidence_requires_socket_loopback_confinement() {
         let mut audit = complete_audit_evidence();
-        audit.seccomp.cancellation = false;
-        audit.seccomp.task_memory_writes_disabled = true;
-        assert!(audit.validate().is_ok());
-    }
-
-    #[test]
-    fn audit_evidence_rejects_plain_listener_with_writes_enabled() {
-        let mut audit = complete_audit_evidence();
-        audit.seccomp.cancellation = false;
-        audit.seccomp.task_memory_writes_disabled = false;
+        audit.socket_loopback_confinement = false;
         assert!(audit.validate().is_err());
     }
 
@@ -1558,11 +1689,37 @@ mod tests {
     }
 
     #[test]
+    fn agent_spec_omits_an_inactive_relay_flag_on_the_wire() {
+        let mut spec = AgentSpecWire {
+            program: "/bin/true".to_string(),
+            args: Vec::new(),
+            workdir: None,
+            timeout_secs: 0,
+            interactive: false,
+            otlp_relay_active: false,
+        };
+        let encoded = serde_json::to_value(&spec).unwrap();
+        assert!(
+            encoded.get("otlp_relay_active").is_none(),
+            "a false flag keeps the encoding of earlier releases: {encoded}"
+        );
+        let decoded: AgentSpecWire = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, spec);
+
+        spec.otlp_relay_active = true;
+        let decoded: AgentSpecWire =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert!(decoded.otlp_relay_active);
+    }
+
+    #[test]
     fn request_round_trips_and_redacts_secrets() {
         let request = RequestEnvelope {
             request_id: "4e94636d-54f8-4d85-8e4e-58954fb5af0a".to_string(),
             payload_digest: String::new(),
+            exec_admission_deadline_unix_ms: None,
             request: Request::StartAgent {
+                provider_files: std::collections::HashMap::new(),
                 sandbox_id: "sandbox-1".to_string(),
                 spec: AgentSpecWire {
                     program: "/bin/true".to_string(),
@@ -1570,14 +1727,8 @@ mod tests {
                     workdir: Some("/sandbox".to_string()),
                     timeout_secs: 5,
                     interactive: false,
+                    otlp_relay_active: false,
                 },
-                policy: Box::new(SandboxPolicyWire::from(SandboxPolicy {
-                    version: 1,
-                    filesystem: FilesystemPolicy::default(),
-                    network: NetworkPolicy::default(),
-                    landlock: LandlockPolicy::default(),
-                    process: ProcessPolicy::default(),
-                })),
                 ca_cert: Some("test certificate".to_string()),
                 ca_bundle: Some("test bundle".to_string()),
                 provider_env_revision: 7,
@@ -1588,19 +1739,61 @@ mod tests {
             },
         };
         let request = RequestEnvelope {
-            payload_digest: request_payload_digest(&request.request).expect("request digest"),
+            payload_digest: request_envelope_digest(&request.request, None)
+                .expect("request digest"),
             ..request
         };
         let frame = encode_frame(&request).expect("encode request");
         let decoded: RequestEnvelope = decode_frame(&frame).expect("decode request");
         assert_eq!(decoded, request);
         let debug = format!("{request:?}");
-        assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("test credential"));
         assert!(!debug.contains("test certificate"));
         assert!(!debug.contains("test bundle"));
         assert!(debug.contains("OPENAI_API_KEY"));
         assert!(request.validate_payload_digest().is_ok());
+    }
+
+    #[test]
+    fn exec_deadline_round_trips_and_cannot_be_extended_on_retry() {
+        let before = unix_time_millis().unwrap();
+        let request = RequestEnvelope::new(Request::Exec {
+            spec: ExecSpecWire {
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                shell: None,
+                runtime_helper: None,
+                env: Vec::new(),
+                workdir: None,
+                pty: false,
+            },
+        })
+        .unwrap();
+        let after = unix_time_millis().unwrap();
+        let window_ms = u64::try_from(EXEC_REQUEST_RETRY_WINDOW.as_millis()).unwrap();
+        let deadline = request.exec_admission_deadline_unix_ms.unwrap();
+        assert!((before + window_ms..=after + window_ms).contains(&deadline));
+        let frame = encode_frame(&request).unwrap();
+        let mut retry: RequestEnvelope = decode_frame(&frame).unwrap();
+        assert_eq!(retry, request);
+        retry.validate_payload_digest().unwrap();
+        retry.exec_admission_deadline_unix_ms = Some(deadline + 1);
+        assert!(matches!(
+            retry.validate_payload_digest(),
+            Err(FrameError::PayloadDigestMismatch)
+        ));
+        retry.exec_admission_deadline_unix_ms = None;
+        assert!(retry.validate_payload_digest().is_err());
+    }
+
+    #[test]
+    fn non_exec_requests_have_no_deadline() {
+        let envelope = RequestEnvelope::new(Request::Confirm).unwrap();
+        assert!(envelope.exec_admission_deadline_unix_ms.is_none());
+        let encoded = serde_json::to_value(&envelope).unwrap();
+        assert!(encoded.get("exec_admission_deadline_unix_ms").is_none());
+        let decoded: RequestEnvelope = serde_json::from_value(encoded).unwrap();
+        decoded.validate_payload_digest().unwrap();
     }
 
     #[test]
@@ -1612,22 +1805,20 @@ mod tests {
         second.insert("A".to_string(), "1".to_string());
         second.insert("B".to_string(), "2".to_string());
         let build = |provider_env| Request::UpdateProviderEnvironment {
+            provider_files: std::collections::HashMap::new(),
             generation: 1,
             revision: 2,
             provider_env,
         };
-        // Pin the canonical bytes, including the nested environment object.
-        // Two randomized HashMaps can otherwise happen to iterate identically
-        // and conceal a serializer that preserves insertion order.
-        let expected = format!(
-            "{:x}",
-            Sha256::digest(
-                br#"{"generation":1,"operation":"update_provider_environment","provider_env":{"A":"1","B":"2"},"revision":2}"#
-            )
-        );
+        // The fingerprint is local: independently ordered protobuf maps must
+        // compare equally, while changed decoded fields must not replay.
+        let expected = request_envelope_digest(&build(first.clone()), None).unwrap();
         for provider_env in [first, second] {
             let request = build(provider_env);
-            assert_eq!(request_payload_digest(&request).expect("digest"), expected);
+            assert_eq!(
+                request_envelope_digest(&request, None).expect("digest"),
+                expected
+            );
 
             // Deserialization reconstructs the map with an independent hash
             // seed; validation must retain the sender's canonical digest.
@@ -1659,11 +1850,34 @@ mod tests {
             envelope.validate_payload_digest(),
             Err(FrameError::PayloadDigestMismatch)
         ));
+
+        let mut request = build(std::collections::HashMap::new());
+        let Request::UpdateProviderEnvironment { provider_files, .. } = &mut request else {
+            unreachable!();
+        };
+        provider_files.insert(
+            "/run/openshell/providers/acme/client.toml".to_string(),
+            "version = 1".to_string(),
+        );
+        let mut envelope = RequestEnvelope::new(request).expect("file-bearing request envelope");
+        let Request::UpdateProviderEnvironment { provider_files, .. } = &mut envelope.request
+        else {
+            unreachable!();
+        };
+        provider_files.insert(
+            "/run/openshell/providers/acme/client.toml".to_string(),
+            "version = 2".to_string(),
+        );
+        assert!(matches!(
+            envelope.validate_payload_digest(),
+            Err(FrameError::PayloadDigestMismatch)
+        ));
     }
 
     #[test]
     fn start_agent_with_large_ca_bundle_fits_in_frame_limit() {
         let request = RequestEnvelope::new(Request::StartAgent {
+            provider_files: std::collections::HashMap::new(),
             sandbox_id: "sandbox-1".to_string(),
             spec: AgentSpecWire {
                 program: "/bin/true".to_string(),
@@ -1671,14 +1885,8 @@ mod tests {
                 workdir: None,
                 timeout_secs: 5,
                 interactive: false,
+                otlp_relay_active: false,
             },
-            policy: Box::new(SandboxPolicyWire::from(SandboxPolicy {
-                version: 1,
-                filesystem: FilesystemPolicy::default(),
-                network: NetworkPolicy::default(),
-                landlock: LandlockPolicy::default(),
-                process: ProcessPolicy::default(),
-            })),
             ca_cert: Some("A".repeat(16 * 1024)),
             ca_bundle: Some("B".repeat(400 * 1024)),
             provider_env_revision: 0,

@@ -76,6 +76,7 @@ def provider(
     provider_type: str,
     credentials: dict[str, str],
     profile_workspace: str = "",
+    config: dict[str, str] | None = None,
 ) -> Iterator[str]:
     """Create a provider for the duration of the block, then delete it."""
     _delete_provider(stub, name)
@@ -86,6 +87,7 @@ def provider(
                 metadata=datamodel_pb2.ObjectMeta(name=name),
                 type=provider_type,
                 credentials=credentials,
+                config=config or {},
                 profile_workspace=profile_workspace,
             ),
         )
@@ -365,6 +367,26 @@ def test_endpointless_profile_credentials_fail_closed_without_policy_binding(
             assert result.exit_code == 0, result.stderr
             assert result.stdout.strip() == "NOT_SET"
 
+            def read_metadata_token_status() -> int:
+                import os
+                import urllib.error
+                import urllib.request
+
+                request = urllib.request.Request(
+                    f"http://{os.environ['GCE_METADATA_HOST']}/computeMetadata/v1/instance/service-accounts/default/token",
+                    headers={"Metadata-Flavor": "Google"},
+                )
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                try:
+                    with opener.open(request, timeout=5) as response:
+                        return response.status
+                except urllib.error.HTTPError as error:
+                    return error.code
+
+            result = sb.exec_python(read_metadata_token_status)
+            assert result.exit_code == 0, result.stderr
+            assert result.stdout.strip() == "503"
+
 
 def test_endpointless_profile_credentials_use_explicit_policy_binding(
     sandbox: Callable[..., Sandbox],
@@ -410,6 +432,99 @@ def test_endpointless_profile_credentials_use_explicit_policy_binding(
             assert _is_placeholder_for_env_key(
                 result.stdout.strip(), "GCP_ADC_ACCESS_TOKEN"
             )
+
+
+@pytest.mark.parametrize(
+    ("service_account_email", "provider_suffix"),
+    [
+        (None, "no-email"),
+        ("", "empty-email"),
+        ("sdk@metadata-test-project.iam.gserviceaccount.com", "configured-email"),
+    ],
+    ids=["no-email", "empty-email", "configured-email"],
+)
+def test_google_metadata_sdk_discovery(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+    service_account_email: str | None,
+    provider_suffix: str,
+) -> None:
+    """Google's SDK discovers project/account metadata and refreshes a placeholder."""
+    config = {"project_id": "metadata-test-project"}
+    if service_account_email is not None:
+        config["service_account_email"] = service_account_email
+    with provider(
+        sandbox_client._stub,
+        name=f"e2e-google-metadata-sdk-{provider_suffix}",
+        provider_type="google-cloud",
+        credentials={"GCP_ADC_ACCESS_TOKEN": "gcp-metadata-real-secret"},
+        config=config,
+    ) as provider_name:
+        policy = _default_policy()
+        policy.network_policies["gcp_api"].CopyFrom(
+            sandbox_pb2.NetworkPolicyRule(
+                name="gcp_api",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host="storage.googleapis.com",
+                        port=443,
+                        protocol="rest",
+                        access=sandbox_pb2.NETWORK_ACCESS_PRESET_FULL,
+                        credential_binding=sandbox_pb2.NetworkCredentialBinding(
+                            provider=provider_name
+                        ),
+                    )
+                ],
+            )
+        )
+        spec = datamodel_pb2.SandboxSpec(policy=policy, providers=[provider_name])
+
+        def discover_metadata() -> str:
+            import json
+            import os
+
+            import google.auth
+            import requests
+            from google.auth.compute_engine import _metadata
+            from google.auth.transport.requests import Request
+
+            # Force ADC to use SDK metadata detection rather than a local key file.
+            for key in (
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "GOOGLE_CLOUD_PROJECT",
+                "GCLOUD_PROJECT",
+            ):
+                os.environ.pop(key, None)
+            session = requests.Session()
+            # Exercise the direct TCP path used by metadata clients.
+            session.trust_env = False
+            request = Request(session=session)
+            if not _metadata.ping(request):
+                raise RuntimeError("Google SDK could not detect the metadata endpoint")
+            credentials, project = google.auth.default(request=request)
+            credentials.refresh(request)
+            credentials.refresh(request)
+            return json.dumps(
+                {
+                    "project": project,
+                    "account": credentials.service_account_email,
+                    "token": credentials.token,
+                    "expiry_present": credentials.expiry is not None,
+                    "metadata_host": os.environ["GCE_METADATA_HOST"],
+                    "metadata_ip": os.environ["GCE_METADATA_IP"],
+                }
+            )
+
+        with sandbox(spec=spec, delete_on_exit=True) as sb:
+            result = sb.exec_python(discover_metadata)
+            assert result.exit_code == 0, result.stderr
+            data = json.loads(result.stdout)
+            assert data["project"] == "metadata-test-project"
+            assert data["account"] == (service_account_email or "default")
+            assert data["metadata_host"] == data["metadata_ip"] == "127.0.0.1:8174"
+            assert data["expiry_present"]
+            assert _is_placeholder_for_env_key(data["token"], "GCP_ADC_ACCESS_TOKEN")
+            assert "gcp-metadata-real-secret" not in result.stdout
 
 
 def test_nvidia_provider_injects_nvidia_api_key_env_var(

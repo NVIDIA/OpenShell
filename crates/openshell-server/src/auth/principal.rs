@@ -15,6 +15,7 @@
 //! to prevent cross-sandbox access (see issue #1354).
 
 use super::identity::Identity;
+use openshell_core::jwt::CredentialEpoch;
 
 /// Who is calling.
 ///
@@ -24,12 +25,18 @@ use super::identity::Identity;
 pub enum Principal {
     /// Human caller authenticated via OIDC (Keycloak, Entra ID, Okta, etc.).
     User(UserPrincipal),
+    /// Gateway-wide administrator authenticated only by a verified operator certificate.
+    Operator(OperatorPrincipal),
     /// Sandbox supervisor authenticated by an identity bound to a specific
     /// sandbox UUID. The wrapped `sandbox_id` MUST match any sandbox referenced
     /// in the request body for sandbox-class methods.
     Sandbox(#[allow(dead_code)] SandboxPrincipal),
     /// Gateway replica authenticated for internal peer RPCs.
     Peer(PeerPrincipal),
+    /// The gateway's shared supervisor, authenticated by a gateway-minted
+    /// supervisor token. It may call only the supervisor assignment stream
+    /// and never acts for a user or a sandbox.
+    Supervisor(SupervisorPrincipal),
     /// Truly unauthenticated caller (health probes, reflection). Sandbox-class
     /// and user-class methods reject this variant.
     #[allow(dead_code)]
@@ -41,6 +48,26 @@ pub enum Principal {
 pub struct UserPrincipal {
     /// The verified identity from the authentication provider.
     pub identity: Identity,
+}
+
+/// Certificate-authenticated gateway operator. Never constructed from bearer claims.
+#[derive(Debug, Clone)]
+pub struct OperatorPrincipal {
+    /// Verified mTLS certificate subject and roles.
+    pub identity: Identity,
+    /// SHA-256 fingerprint of the verified leaf certificate (not a private key).
+    pub certificate_sha256: String,
+}
+
+impl Principal {
+    /// Identity of a human/API caller, preserving its distinct principal variant.
+    pub fn user_identity(&self) -> Option<&Identity> {
+        match self {
+            Self::User(user) => Some(&user.identity),
+            Self::Operator(operator) => Some(&operator.identity),
+            _ => None,
+        }
+    }
 }
 
 /// Sandbox caller — bound to one specific sandbox UUID.
@@ -57,6 +84,24 @@ pub struct SandboxPrincipal {
     /// Optional namespace component parsed from sandbox identity credentials.
     /// Gateway-minted sandbox JWTs currently use an identity-shaped subject.
     pub trust_domain: Option<String>,
+}
+
+impl SandboxPrincipal {
+    /// The ownership term of a supervisor session this principal opens, when
+    /// its credential carries one.
+    pub fn auth_epoch(&self) -> Option<CredentialEpoch> {
+        match &self.source {
+            SandboxIdentitySource::BootstrapJwt { auth_epoch, .. } => *auth_epoch,
+            SandboxIdentitySource::ComputeDriver { .. } => None,
+        }
+    }
+}
+
+/// Shared supervisor caller.
+#[derive(Debug, Clone)]
+pub struct SupervisorPrincipal {
+    /// Claims of the verified supervisor token.
+    pub identity: openshell_supervisor_control::HostIdentity,
 }
 
 /// Gateway peer caller.
@@ -77,10 +122,12 @@ pub struct PeerPrincipal {
 pub enum SandboxIdentitySource {
     /// Generation-bound gateway JWT validated against the persisted runtime
     /// identity by [`super::sandbox_jwt::SandboxSessionJwtAuthenticator`].
-    BootstrapJwt { issuer: String },
-    /// Per-sandbox client certificate. Reserved for channel-bound sandbox
-    /// identity.
-    BootstrapCert { fingerprint: String },
+    BootstrapJwt {
+        issuer: String,
+        /// Credential epoch of the bearer: the supervisor ownership term it
+        /// belongs to. `None` only where no bearer was verified.
+        auth_epoch: Option<CredentialEpoch>,
+    },
     /// Driver-native credential used to bootstrap a gateway-minted JWT via
     /// `IssueSandboxToken`. The named compute driver authenticated only the
     /// sandbox identity and its concrete runtime binding; the gateway still
@@ -89,4 +136,90 @@ pub enum SandboxIdentitySource {
         driver_name: String,
         runtime_identity: String,
     },
+}
+
+impl Principal {
+    /// One-line caller label for audit records.
+    #[must_use]
+    pub fn audit_actor(&self) -> String {
+        match self {
+            Self::User(user) => format!("user:{}", user.identity.subject),
+            Self::Operator(operator) => format!("operator:{}", operator.identity.subject),
+            Self::Sandbox(sandbox) => format!("sandbox:{}", sandbox.sandbox_id),
+            Self::Peer(peer) => format!("peer:{}", peer.replica_id),
+            Self::Supervisor(supervisor) => format!("supervisor:{}", supervisor.identity.subject),
+            Self::Anonymous => "anonymous".to_string(),
+        }
+    }
+}
+
+/// Principals for tests.
+#[cfg(test)]
+pub mod test_support {
+    use super::{
+        CredentialEpoch, Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
+    };
+    use crate::auth::identity::{Identity, IdentityProvider};
+
+    /// An OIDC user with no roles or scopes.
+    pub fn user(subject: &str) -> Principal {
+        Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: subject.to_string(),
+                display_name: None,
+                roles: vec![],
+                scopes: vec![],
+                provider: IdentityProvider::Oidc,
+            },
+        })
+    }
+
+    /// A sandbox holding a gateway JWT.
+    pub fn sandbox(sandbox_id: &str) -> Principal {
+        sandbox_principal(sandbox_id, None)
+    }
+
+    /// A sandbox holding a gateway JWT of credential epoch `auth_epoch`.
+    pub fn sandbox_with_epoch(sandbox_id: &str, auth_epoch: u64) -> Principal {
+        sandbox_principal(
+            sandbox_id,
+            Some(CredentialEpoch::new(auth_epoch).expect("credential epoch")),
+        )
+    }
+
+    fn sandbox_principal(sandbox_id: &str, auth_epoch: Option<CredentialEpoch>) -> Principal {
+        Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: sandbox_id.to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+                auth_epoch,
+            },
+            trust_domain: Some("openshell".to_string()),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::identity::IdentityProvider;
+
+    #[test]
+    fn audit_actor_distinguishes_operator_from_user_with_same_subject() {
+        let identity = Identity {
+            subject: "reviewer".to_string(),
+            display_name: None,
+            roles: vec![],
+            scopes: vec![],
+            provider: IdentityProvider::Mtls,
+        };
+        let operator = Principal::Operator(OperatorPrincipal {
+            identity: identity.clone(),
+            certificate_sha256: "certificate-fingerprint".to_string(),
+        });
+        let user = Principal::User(UserPrincipal { identity });
+
+        assert_eq!(operator.audit_actor(), "operator:reviewer");
+        assert_eq!(user.audit_actor(), "user:reviewer");
+    }
 }

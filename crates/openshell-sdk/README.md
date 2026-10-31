@@ -34,11 +34,10 @@ for the refreshed access token.
 
 - Plaintext (local development)
 - Server-authenticated TLS (system roots, or a pinned private CA via `ca_cert`)
+- Mutual TLS via an in-memory `ClientIdentity`
 - OIDC bearer over HTTPS (gateways behind an OAuth2/OIDC IdP)
 - Cloudflare Access tunnel (hosted gateways)
 - Insecure TLS (development/debug; certificate verification disabled)
-
-mTLS (client certificates) is not supported.
 
 ## Public surface
 
@@ -56,9 +55,16 @@ portable workload shape and driver config. Failures map to a typed `SdkError`
 with a discriminable kind.
 
 Set `SandboxSpec::service_exposures` to register named or unnamed loopback HTTP
-services during creation. Each `ServiceExposure` contains a service name and a
-target port; an empty name selects the unnamed endpoint. The returned
+services during creation. Each `ServiceExposure` contains a service name, a
+target port, and an authorization mode; an empty name selects the unnamed
+endpoint. Authorization is stripped by default. Select `BearerPassthrough` only
+when the sandbox application validates its own bearer credential. The returned
 `SandboxRef::service_urls` map contains each routed URL under the same name.
+
+`exec` sends the sandbox's owner replica in the `x-openshell-replica` header so
+an edge proxy with replica routing can skip the peer relay. The owner is cached
+for 30 seconds, and a call is retried once without the header if the owner's
+route has no ready endpoints.
 
 Curated calls without a workspace argument explicitly select the `default`
 workspace. Cross-workspace listing uses the separate `*_all_workspaces`
@@ -176,7 +182,7 @@ These helpers use the raw client's authentication slot. They do not perform OIDC
 | Module | Purpose |
 |---|---|
 | `client` | High-level `OpenShellClient` and the curated sandbox surface. |
-| `config` | `ClientConfig`, `AuthConfig`. |
+| `config` | `ClientConfig`, `AuthConfig`, `ClientIdentity`. |
 | `transport` | Channel construction, TLS resolution, request interceptors. |
 | `auth` | `EdgeAuthInterceptor` for bearer-token attachment. |
 | `oidc` | OIDC token handling at the transport layer. |

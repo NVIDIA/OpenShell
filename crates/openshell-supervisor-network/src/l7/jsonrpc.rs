@@ -814,10 +814,7 @@ fn parse_mcp_payload(
             TowerMcpMethodClassification::Unavailable => {
                 return JsonRpcRequestInfo::rejected(
                     inspection.payload().is_batch(),
-                    JsonRpcInspectionError::mcp_profile_violation(format!(
-                        "MCP {revision} does not make `{}` available",
-                        method.method()
-                    )),
+                    unavailable_mcp_method_error(revision, method.method()),
                 );
             }
             _ => {
@@ -944,10 +941,7 @@ pub(crate) fn inspect_mcp_payload_for_revision(
     for method in inspection.methods() {
         match method.classification() {
             TowerMcpMethodClassification::Unavailable => {
-                return Err(JsonRpcInspectionError::mcp_profile_violation(format!(
-                    "MCP {revision} does not make `{}` available",
-                    method.method()
-                )));
+                return Err(unavailable_mcp_method_error(revision, method.method()));
             }
             TowerMcpMethodClassification::Available | TowerMcpMethodClassification::Extension => {}
             _ => {
@@ -960,6 +954,17 @@ pub(crate) fn inspect_mcp_payload_for_revision(
     }
 
     Ok(inspection)
+}
+
+// Only a method recognized by Tower's closed core-method registry reaches
+// this diagnostic. Policy permission cannot make it valid in another revision.
+fn unavailable_mcp_method_error(
+    revision: McpProtocolVersion,
+    method: &str,
+) -> JsonRpcInspectionError {
+    JsonRpcInspectionError::mcp_profile_violation(format!(
+        "MCP method `{method}` is unavailable in revision {revision}; use a method defined by this core revision, or check client/server support and mcp.versions before selecting another revision; allow rules and allow_all_known_mcp_methods cannot enable an unavailable method"
+    ))
 }
 
 fn parse_mcp_initialize(payload: JsonRpcPayload) -> JsonRpcRequestInfo {
@@ -1080,10 +1085,18 @@ fn mcp_named_request_for_inspected_method(
 
 fn map_mcp_inspection_error(error: McpInspectionError) -> JsonRpcInspectionError {
     match error.kind() {
-        McpInspectionErrorKind::BatchUnavailable
-        | McpInspectionErrorKind::DirectionMismatch
-        | McpInspectionErrorKind::UnsupportedProfile => {
-            JsonRpcInspectionError::mcp_profile_violation(error.to_string())
+        McpInspectionErrorKind::BatchUnavailable => JsonRpcInspectionError::mcp_profile_violation(
+            format!("{error}; send each JSON-RPC message in a separate request for this revision"),
+        ),
+        McpInspectionErrorKind::DirectionMismatch => {
+            JsonRpcInspectionError::mcp_profile_violation(format!(
+                "{error}; send the method from the peer role defined by this revision; an allow rule cannot change its direction"
+            ))
+        }
+        McpInspectionErrorKind::UnsupportedProfile => {
+            JsonRpcInspectionError::mcp_profile_violation(format!(
+                "{error}; use an MCP revision supported by this OpenShell build"
+            ))
         }
         McpInspectionErrorKind::InitializeInBatch => {
             JsonRpcInspectionError::mcp_lifecycle_violation(error.to_string())
@@ -1889,12 +1902,18 @@ mod tests {
             info.error.as_ref().map(JsonRpcInspectionError::kind),
             Some(JsonRpcInspectionErrorKind::McpProfileViolation)
         );
+        let detail = info.error.as_ref().expect("unavailable method").detail();
+        assert!(detail.contains("`tasks/get` is unavailable in revision 2025-06-18"));
+        assert!(detail.contains("check client/server support and mcp.versions"));
+        assert!(detail.contains("allow_all_known_mcp_methods cannot enable"));
         assert!(
-            info.error
-                .as_ref()
-                .is_some_and(|error| error.detail().contains("tasks/get")),
-            "expected unavailable-method evidence, got {info:?}"
+            !detail.contains("task-1"),
+            "task params must not be reflected"
         );
+
+        let november =
+            parse_jsonrpc_body_with_options(body, mcp_options(McpProtocolVersion::V2025_11_25));
+        assert!(november.error.is_none(), "November task remains valid");
     }
 
     #[test]
@@ -1919,6 +1938,11 @@ mod tests {
                 .is_some_and(|error| error.detail().contains("client-to-server")),
             "expected direction mismatch evidence, got {info:?}"
         );
+        assert!(info.error.as_ref().is_some_and(|error| {
+            error
+                .detail()
+                .contains("an allow rule cannot change its direction")
+        }));
     }
 
     #[test]

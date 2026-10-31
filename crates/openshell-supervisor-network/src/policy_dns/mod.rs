@@ -373,7 +373,10 @@ fn eligible_endpoints(
             continue;
         }
         let raw_allowed_ips = value_string_array(&endpoint.endpoint, "allowed_ips");
-        let exact_declared_host = !pattern.contains('*') && pattern == name.as_str();
+        let exact_declared_host = !pattern.contains('*')
+            && pattern == name.as_str()
+            && value_field(&endpoint.endpoint, "advisor_proposed")
+                != Some(&regorus::Value::Bool(true));
         let destination_plan = build_validation_plan(
             name.as_str(),
             name.as_str(),
@@ -484,6 +487,8 @@ fn dns_query_endpoint(name: &NormalizedName) -> Endpoint {
         domain: Some(name.as_str().to_string()),
         ip: None,
         port: None,
+        name: None,
+        svc_name: None,
     }
 }
 
@@ -1123,6 +1128,68 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .answer_query("db.example.com", AddressFamily::Ipv4, Instant::now())
             .await;
         assert!(matches!(result, Err(PolicyDnsError::NoValidAddress)));
+    }
+
+    #[tokio::test]
+    async fn advisor_endpoints_filter_private_answers_without_losing_public_or_explicit_ips() {
+        for protocol in [
+            "",
+            "tcp",
+            "rest, access: read-only",
+            "rest, access: read-only, tls: skip",
+        ] {
+            for (family, private, public) in [
+                (AddressFamily::Ipv4, "10.2.3.4", "8.8.8.8"),
+                (AddressFamily::Ipv6, "fd12::4", "2001:4860:4860::8888"),
+            ] {
+                let private = private.parse::<IpAddr>().unwrap();
+                let public = public.parse::<IpAddr>().unwrap();
+                let yaml = BASE_POLICY.replace(
+                    "protocol: tcp",
+                    &format!("protocol: {protocol}, advisor_proposed: true"),
+                );
+                let yaml = yaml.replace("protocol: , ", "");
+                let private_only = service(&yaml, vec![private]);
+                assert!(
+                    matches!(
+                        private_only
+                            .answer_query("db.example", family, Instant::now())
+                            .await,
+                        Err(PolicyDnsError::NoValidAddress)
+                    ),
+                    "{protocol}: {private}"
+                );
+                for addresses in [vec![public], vec![private, public]] {
+                    let service = service(&yaml, addresses);
+                    let now = Instant::now();
+                    let answer = service
+                        .answer_query("db.example", family, now)
+                        .await
+                        .unwrap();
+                    let mapping = service
+                        .store
+                        .lookup(answer.address, 5432, answer.policy_generation, now)
+                        .unwrap();
+                    assert_eq!(mapping.record.contracts[0].pinned_addresses, [public]);
+                }
+                // Explicit narrow address permission retains its usual precedence.
+                let yaml = yaml.replace(
+                    "advisor_proposed: true",
+                    &format!("advisor_proposed: true, allowed_ips: ['{private}']"),
+                );
+                let service = service(&yaml, vec![private, public]);
+                let now = Instant::now();
+                let answer = service
+                    .answer_query("db.example", family, now)
+                    .await
+                    .unwrap();
+                let mapping = service
+                    .store
+                    .lookup(answer.address, 5432, answer.policy_generation, now)
+                    .unwrap();
+                assert_eq!(mapping.record.contracts[0].pinned_addresses, [private]);
+            }
+        }
     }
 
     #[tokio::test]

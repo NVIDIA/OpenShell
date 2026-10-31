@@ -1,0 +1,93 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/oci-genai.yaml
+#   openshell provider profile import -f providers/oci-genai.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   curl. Add the interpreter or agent CLI that calls the
+#                    OpenAI-compatible endpoint (python, node, ...) before
+#                    relying on binary-scoped attribution for this profile.
+# Reference layout:  any image with curl or an OpenAI SDK. Point the SDK at
+#                    https://inference.generativeai.<region>.oci.oraclecloud.com/openai/v1
+#                    and pass OCI_GENAI_API_KEY as the API key; the sandbox
+#                    proxy resolves the placeholder only at the hosts below.
+# Credential scope:  one OCI Generative AI API key (sk-...). The key is scoped
+#                    to the compartment it was created in, so requests need no
+#                    opc-compartment-id header and the sandbox never learns a
+#                    compartment OCID.
+# Endpoint access:   the regional OCI Generative AI inference hosts in the
+#                    commercial realm (oraclecloud.com), TLS terminated, L7
+#                    enforced, limited to the OpenAI-compatible /openai/v1
+#                    surface with GET, POST, and DELETE. Generative AI API keys
+#                    are only valid there; the native /20231130 API needs OCI
+#                    request signing, which this profile does not grant.
+# Smoke test:        openshell sandbox create --provider <name> -- \
+#                      curl -sS --compressed \
+#                        https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/openai/v1/chat/completions \
+#                        -H "Authorization: Bearer $OCI_GENAI_API_KEY" \
+#                        -H 'Content-Type: application/json' \
+#                        -d '{"model":"meta.llama-3.3-70b-instruct","messages":[{"role":"user","content":"Reply with OK"}]}'
+#
+# OCI-side setup, in this order:
+#   1. Create the IAM policy BEFORE the key. A key minted before its policy can
+#      stay unauthorized long after the policy lands, and OCI returns the same
+#      401 for an unknown key and an unauthorized one. Least privilege:
+#        allow any-user to use generative-ai-family in compartment id <ocid>
+#          where ALL {request.principal.type='generativeaiapikey'}
+#      Pin it to one key later by adding request.principal.id='<api-key-ocid>'.
+#   2. Create the key in that compartment and region, with an expiry:
+#        oci generative-ai api-key create --compartment-id <ocid> \
+#          --region us-chicago-1 --display-name openshell-agents \
+#          --key-details '[{"keyName":"primary","timeExpiry":"2027-01-01T00:00:00Z"}]'
+#      The sk-... secret is returned once. Rotate with `api-key renew`,
+#      disable with `api-key set-api-key-state`; sandboxes are unaffected
+#      because the gateway, not the sandbox, holds the value.
+#   3. openshell provider create --name my-oci-genai --type oci-genai \
+#        --credential OCI_GENAI_API_KEY="$OCI_GENAI_API_KEY"
+#
+# Verified through the sandbox proxy with this profile: chat completions with
+# stream=true, tool calling, vision input via data: URLs (for example
+# meta.llama-4-maverick-17b-128e-instruct-fp8 and google.gemini-2.5-flash,
+# including a 263 KB request body), embeddings with openai.text-embedding-3-small,
+# and the Responses API with stream=true. Model ids use the OCI form, such as
+# meta.llama-3.3-70b-instruct or openai.gpt-oss-120b. Expect from OCI, not from
+# the proxy: 404 "Entity with key <model> not found" for models not served on
+# this endpoint, 404 on GET /openai/v1/models (not a health check), and
+# 400 "Unsupported OpenAI operation" for Cohere embeddings.
+#
+# Other realms use their realm domain instead of oraclecloud.com: copy the
+# profile and add a matching endpoint entry. Signed OCI transports (API key
+# signing, security token, instance/resource principal, OKE workload identity)
+# need proxy-side request signing; see https://github.com/NVIDIA/OpenShell/issues/3879.
+
+id: oci-genai
+display_name: OCI Generative AI
+description: OCI Generative AI inference through the OpenAI-compatible endpoint with a compartment-scoped Generative AI API key
+category: inference
+inference_capable: true
+credentials:
+  - name: api_key
+    description: OCI Generative AI API key (compartment-scoped, sent as a bearer token)
+    env_vars: [OCI_GENAI_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  # `*` matches exactly one DNS label, which is the region identifier, for
+  # example us-chicago-1, eu-frankfurt-1, or ap-osaka-1.
+  - host: "inference.generativeai.*.oci.oraclecloud.com"
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: POST, path: "/openai/v1/**" }
+      - allow: { method: GET, path: "/openai/v1/**" }
+      - allow: { method: DELETE, path: "/openai/v1/**" }
+binaries: [/usr/bin/curl, /usr/local/bin/curl]

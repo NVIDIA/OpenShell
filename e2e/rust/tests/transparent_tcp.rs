@@ -17,6 +17,7 @@ use tempfile::NamedTempFile;
 // Use a qualified policy hostname so runtime-provided resolver search domains
 // (for example Podman's `dns.podman`) cannot rewrite the policy identity.
 const FIXTURE_ALIAS: &str = "transparent-tcp-fixture.openshell.test";
+const UNLISTED_ALIAS: &str = "unlisted-exec-recovery.openshell.test";
 const MUSL_FIXTURE_ALIAS: &str = "transparent-tcp-musl.openshell.test";
 const FIXTURE_PORT: u16 = 5432;
 const TCP_DNS_PORT: u16 = 53;
@@ -249,6 +250,128 @@ async fn wait_for_sandbox_logs(
     }
 }
 
+fn private_fixture_probe(host: &str, marker: &str, should_connect: bool) -> String {
+    format!(
+        r"import socket
+answers = socket.getaddrinfo({host:?}, {FIXTURE_PORT}, type=socket.SOCK_STREAM)
+assert any(item[4][0].startswith(('198.18.', '198.19.')) for item in answers), answers
+reached = False
+try:
+    with socket.create_connection(({host:?}, {FIXTURE_PORT}), timeout=3) as conn:
+        conn.sendall({marker:?}.encode('ascii'))
+        reached = conn.recv(1024) == b'private-fixture-ok'
+except OSError:
+    pass
+assert reached == {expected}, reached
+print('private-pin-probe-ok')
+",
+        expected = if should_connect { "True" } else { "False" }
+    )
+}
+
+#[tokio::test]
+async fn rootless_podman_private_dns_pins_do_not_cross_binary_rules() {
+    if !is_e2e_driver("podman") {
+        return;
+    }
+    let host = "transparent-private.openshell.test";
+    let fixture = SupportContainer::start_python(
+        host,
+        &format!(
+            r"import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('0.0.0.0', {FIXTURE_PORT}))
+s.listen()
+while True:
+    c, _ = s.accept()
+    data = c.recv(1024)
+    if data:
+        print(data.decode('ascii'), flush=True)
+        c.sendall(b'private-fixture-ok')
+    c.close()
+"
+        ),
+        FIXTURE_PORT,
+    )
+    .await
+    .expect("start private-network fixture");
+    let fixture_ip = fixture
+        .ip()
+        .expect("fixture IP")
+        .parse::<std::net::Ipv4Addr>()
+        .expect("IPv4 fixture");
+    assert!(
+        fixture_ip.is_private(),
+        "fixture must exercise private address enforcement"
+    );
+    let mut policy = NamedTempFile::new().expect("create policy");
+    write!(
+        policy,
+        r"version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_write: [/sandbox, /tmp, /dev/null]
+landlock: {{ compatibility: best_effort }}
+process: {{ run_as_user: sandbox, run_as_group: sandbox }}
+network_policies:
+  declared:
+    name: declared
+    endpoints:
+      - {{ host: {host}, port: {FIXTURE_PORT}, protocol: tcp }}
+    binaries: [{{ path: /sandbox/declared-python }}]
+  wildcard:
+    name: wildcard
+    endpoints:
+      - {{ host: '*.openshell.test', port: {FIXTURE_PORT}, protocol: tcp }}
+    binaries: [{{ path: /sandbox/wildcard-python }}]
+"
+    )
+    .expect("write policy");
+    policy.flush().expect("flush policy");
+    let mut sandbox = SandboxGuard::create_keep_with_args(
+        &["--policy", &policy.path().to_string_lossy()],
+        &["sh", "-c", "set -e; cp $(command -v python3) /sandbox/declared-python; cp $(command -v python3) /sandbox/wildcard-python; echo Ready; sleep infinity"],
+        "Ready",
+    ).await.expect("create private DNS sandbox");
+    // Copied uv-managed executables still need their original standard library.
+    let python_prefix = sandbox
+        .exec(&["python3", "-c", "import sys; print(sys.base_prefix)"])
+        .await
+        .expect("find original Python installation prefix");
+    let python_home = format!("PYTHONHOME={}", python_prefix.trim());
+    let positive = sandbox
+        .exec(&[
+            "env",
+            &python_home,
+            "/sandbox/declared-python",
+            "-c",
+            &private_fixture_probe(host, "authorized-control", true),
+        ])
+        .await
+        .expect("exact-host binary reaches fixture");
+    assert!(positive.contains("private-pin-probe-ok"), "{positive}");
+    let negative = sandbox
+        .exec(&[
+            "env",
+            &python_home,
+            "/sandbox/wildcard-python",
+            "-c",
+            &private_fixture_probe(host, "blocked-probe", false),
+        ])
+        .await
+        .expect("wildcard binary cannot borrow private pins");
+    assert!(negative.contains("private-pin-probe-ok"), "{negative}");
+    let logs = fixture.logs().expect("private fixture logs");
+    assert!(logs.contains("authorized-control"), "{logs}");
+    assert!(
+        !logs.contains("blocked-probe"),
+        "denied probe reached private fixture: {logs}"
+    );
+    sandbox.cleanup().await;
+}
+
 #[tokio::test]
 async fn local_container_native_tcp_uses_policy_dns_and_fails_closed() {
     if !is_e2e_driver("docker") && !is_e2e_driver("podman") {
@@ -378,6 +501,7 @@ def denied(host, port):
 assert denied({host:?}, {wrong_port})
 assert denied({real_ip:?}, {port})
 assert denied({real_ip:?}, {transparent_port})
+assert denied({unlisted_host:?}, {port})
 print('transparent-tcp-e2e-ok')
 "#,
         host = policy_host,
@@ -386,6 +510,7 @@ print('transparent-tcp-e2e-ok')
         wrong_port = wrong_port,
         real_ip = real_ip,
         transparent_port = transparent_port,
+        unlisted_host = UNLISTED_ALIAS,
     );
     let output = match sandbox.exec(&["python3", "-c", &script]).await {
         Ok(output) => output,
@@ -407,9 +532,17 @@ print('transparent-tcp-e2e-ok')
     };
     assert!(output.contains("transparent-tcp-e2e-ok"), "{output}");
 
+    let recovery = sandbox
+        .exec(&["sh", "-c", "printf post-denial-exec-ok"])
+        .await
+        .expect("fresh exec should succeed after an unlisted-host denial");
+    assert_eq!(recovery, "post-denial-exec-ok");
+
     let logs = wait_for_sandbox_logs(&sandbox.name, |logs| {
         logs.contains(&format!("-> {policy_host}:{fixture_port}"))
             && logs.contains("Denied staged transparent connection")
+            && logs.contains(UNLISTED_ALIAS)
+            && logs.contains("policy_dns_ineligible")
     })
     .await
     .expect("wait for sandbox logs");
@@ -421,6 +554,8 @@ print('transparent-tcp-e2e-ok')
         logs.contains("Denied staged transparent connection"),
         "{logs}"
     );
+    assert!(logs.contains(UNLISTED_ALIAS), "{logs}");
+    assert!(logs.contains("policy_dns_ineligible"), "{logs}");
 
     sandbox.cleanup().await;
 }

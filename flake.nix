@@ -60,6 +60,13 @@
           pkg-config
           # Coverage.
           lcov
+          # mise dependencies
+          mise
+          cmakeMinimal
+          zlib
+          openssl_3_5
+          xz
+          gh
           kubernetes-helm
           syft
           trivy
@@ -119,15 +126,29 @@
           qemuPkgs = testGuestPkgs;
           firmwarePkgs = testGuestPkgs;
         };
-        testMachines = import ./tests/config.nix {
-          inherit pkgs toolchains;
+        testMachines = import ./tests/tmachine/config.nix {
+          inherit pkgs toolchains rustToolchain;
           qemuPkgs = tmachineRuntimePkgs;
           firmwarePkgs = tmachineRuntimePkgs;
         };
-        artifacts = pkgs.callPackage ./tests/artifacts.nix { inherit rustToolchain toolchains; };
+        artifacts = pkgs.callPackage ./tests/tmachine/artifacts.nix { inherit rustToolchain toolchains; };
+        checkProtobufCompatibility = pkgs.writeShellApplication {
+          name = "check-protobuf-compatibility";
+          runtimeInputs = [
+            pkgs.buf
+            pkgs.git
+          ];
+          text = ''
+            exec ${pkgs.python3}/bin/python3 ${./tasks/scripts}/check_proto_compatibility.py "$@"
+          '';
+        };
       in
       {
         apps = {
+          check-protobuf-compatibility = {
+            type = "app";
+            program = "${checkProtobufCompatibility}/bin/check-protobuf-compatibility";
+          };
           build-artifacts = {
             type = "app";
             program = "${artifacts.all}/bin/build-artifacts";
@@ -135,6 +156,18 @@
           build-artifacts-binaries = {
             type = "app";
             program = "${artifacts.binaries}/bin/build-artifacts-binaries";
+          };
+          build-artifacts-vm-driver = {
+            type = "app";
+            program = "${artifacts.vmDriver}/bin/build-artifacts-vm-driver";
+          };
+          build-artifacts-deb = {
+            type = "app";
+            program = "${artifacts.deb}/bin/build-artifacts-deb";
+          };
+          build-artifacts-rpm = {
+            type = "app";
+            program = "${artifacts.rpm}/bin/build-artifacts-rpm";
           };
           build-artifacts-test-archives = {
             type = "app";
@@ -161,14 +194,40 @@
         };
 
         packages = {
+          # Expose app derivations so CI can prepare them before executing once.
+          check-protobuf-compatibility = checkProtobufCompatibility;
+          build-artifacts-test-archives = artifacts.testArchives;
+          build-artifacts-test-images = artifacts.testImages;
+          build-artifacts-helm = artifacts.helm;
           vm-runtime = vmRuntime;
           tmachine = testMachines.package;
           tmachine-config = testMachines.config;
           tmachine-unwrapped = testMachines.unwrapped;
+          openshell-test-runner = testMachines.testRunner;
         };
 
         devShells = {
           default = pkgs.mkShellNoCC commonDevShell;
+
+          # Crypto backend tests need native OpenSSL and Cargo's symbol-prefixed
+          # AWS-LC build. The release toolchains expose an unprefixed system
+          # AWS-LC libcrypto/libssl that collides with OpenSSL when both link.
+          crypto = pkgs.mkShell {
+            packages = [
+              rustToolchain
+              pkgs.cmakeMinimal
+              pkgs.pkg-config
+              pkgs.uv
+            ];
+            buildInputs = [ pkgs.openssl_3_5 ];
+            env = {
+              OPENSSL_LIB_DIR = "${pkgs.lib.getLib pkgs.openssl_3_5}/lib";
+              OPENSSL_INCLUDE_DIR = "${pkgs.lib.getDev pkgs.openssl_3_5}/include";
+              OPENSSL_NO_VENDOR = "1";
+              OPENSSL_STATIC = "0";
+              AWS_LC_SYS_USE_SYSTEM = "0";
+            };
+          };
 
           testing = pkgs.mkShellNoCC (
             commonDevShell
@@ -181,7 +240,7 @@
               ];
 
               shellHook = ''
-                export ANSIBLE_CONFIG="$(git rev-parse --show-toplevel)/tests/ansible/ansible.cfg"
+                export ANSIBLE_CONFIG="$(git rev-parse --show-toplevel)/tests/tmachine/ansible/ansible.cfg"
               '';
             }
           );

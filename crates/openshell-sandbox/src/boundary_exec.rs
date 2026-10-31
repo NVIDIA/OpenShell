@@ -3,6 +3,8 @@
 
 //! Workload-side implementation of RFC 0012 sandbox exec.
 
+use crate::native_api::{BoundaryExec, BoundaryProcess, BoundaryTerminal, ExecSession};
+
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::io::Write as _;
@@ -21,8 +23,7 @@ use nix::unistd::Pid;
 use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_isolation_interface::contract::{
-    BackendError, BoundaryExec, BoundaryExitStatus, BoundaryInput, BoundaryOutput, BoundaryProcess,
-    BoundarySignal, BoundaryTerminal, ExecSession, ExecSpec,
+    BackendError, BoundaryExitStatus, BoundaryInput, BoundaryOutput, BoundarySignal, ExecSpec,
 };
 
 /// The sandbox executor. Every spawn reuses the same admitted policy and
@@ -36,13 +37,15 @@ pub struct LocalBoundaryExec {
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
     runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
+    otlp_relay_active: bool,
     #[cfg(target_os = "linux")]
-    launcher: openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+    launcher: crate::linux::workload_launcher::WorkloadLauncher,
 }
 
 impl LocalBoundaryExec {
     /// Construct the executor owned by an active sandbox boundary.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         policy: SandboxPolicy,
         base_workdir: Option<String>,
@@ -50,8 +53,8 @@ impl LocalBoundaryExec {
         provider_credentials: ProviderCredentialState,
         user_environment: HashMap<String, String>,
         runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
-        #[cfg(target_os = "linux")]
-        launcher: openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+        otlp_relay_active: bool,
+        #[cfg(target_os = "linux")] launcher: crate::linux::workload_launcher::WorkloadLauncher,
     ) -> Self {
         Self {
             policy,
@@ -60,6 +63,7 @@ impl LocalBoundaryExec {
             provider_credentials,
             user_environment,
             runtime,
+            otlp_relay_active,
             #[cfg(target_os = "linux")]
             launcher,
         }
@@ -117,7 +121,6 @@ impl LocalBoundaryExec {
             stdout: Box::new(stdout),
             stderr: Some(Box::new(stderr)),
             terminal: None,
-            output_status: None,
         })
     }
 
@@ -168,7 +171,7 @@ impl LocalBoundaryExec {
             command.env("SHELL", shell);
         }
         for (key, value) in &self.user_environment {
-            if !key.starts_with("OPENSHELL_") {
+            if !key.starts_with(crate::process::RESERVED_ENV_PREFIX) {
                 command.env(key, value);
             }
         }
@@ -183,8 +186,22 @@ impl LocalBoundaryExec {
             }
         }
         crate::process::strip_proxy_env_std(&mut command);
+        // Point OTel SDKs at the supervisor's trace relay after the creation
+        // request's environment and the provider variables, matching the main
+        // process. An endpoint in the creation request or this exec's
+        // `spec.env` suppresses it, and any other `spec.env` value applied
+        // below still wins for this exec only. The environment was cleared
+        // above, so an endpoint in the image `ENV` never reaches this child
+        // and does not suppress the default.
+        crate::child_env::apply_otlp_relay_env(
+            &mut command,
+            self.otlp_relay_active,
+            crate::child_env::ChildEnvironment::Cleared,
+            &self.user_environment,
+            &spec.env,
+        );
         for (key, value) in &spec.env {
-            if !key.starts_with("OPENSHELL_") {
+            if !key.starts_with(crate::process::RESERVED_ENV_PREFIX) {
                 command.env(key, value);
             }
         }
@@ -217,9 +234,8 @@ impl LocalBoundaryExec {
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
         #[cfg(target_os = "linux")]
-        let child_hardening =
-            openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
-                .map_err(|error| BackendError::Process(error.to_string()))?;
+        let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
+            .map_err(|error| BackendError::Process(error.to_string()))?;
         crate::pty::install_dedicated_process_group(&mut command);
         crate::pty::install_pre_exec_no_pty(
             &mut command,
@@ -291,7 +307,6 @@ impl LocalBoundaryExec {
                 stdout,
                 stderr,
                 terminal: None,
-                output_status: None,
             }),
             process,
             armed: true,
@@ -329,9 +344,8 @@ impl LocalBoundaryExec {
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
         #[cfg(target_os = "linux")]
-        let child_hardening =
-            openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
-                .map_err(|error| BackendError::Process(error.to_string()))?;
+        let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
+            .map_err(|error| BackendError::Process(error.to_string()))?;
         crate::pty::install_pre_exec(
             &mut command,
             self.policy.clone(),
@@ -388,7 +402,6 @@ impl LocalBoundaryExec {
                 stdout: Box::new(tokio::fs::File::from_std(output)),
                 stderr: None,
                 terminal: Some(terminal),
-                output_status: None,
             }),
             process,
             armed: true,
@@ -534,7 +547,7 @@ struct LocalTerminal {
 impl BoundaryTerminal for LocalTerminal {
     async fn resize(&self, cols: u16, rows: u16) -> Result<(), BackendError> {
         crate::pty::set_winsize(
-            self.master.as_raw_fd(),
+            &self.master,
             Winsize {
                 ws_row: rows.max(1),
                 ws_col: cols.max(1),
@@ -684,11 +697,25 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn executor() -> LocalBoundaryExec {
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start test workload launcher");
+        executor_with_relay(true)
+    }
+
+    fn executor_with_relay(otlp_relay_active: bool) -> LocalBoundaryExec {
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start test workload launcher");
         std::thread::spawn(move || {
             while let Ok(notification) = listener.receive() {
-                let _ = listener.respond_errno(notification.id, libc::EPERM);
+                let syscall = i64::from(notification.syscall);
+                if syscall == libc::SYS_openat || syscall == libc::SYS_openat2 {
+                    let _ = listener.respond_continue(notification.id);
+                } else {
+                    #[cfg(target_arch = "x86_64")]
+                    if syscall == libc::SYS_open {
+                        let _ = listener.respond_continue(notification.id);
+                        continue;
+                    }
+                    let _ = listener.respond_errno(notification.id, libc::EPERM);
+                }
             }
         });
         LocalBoundaryExec::new(
@@ -709,6 +736,7 @@ mod tests {
             ),
             HashMap::new(),
             crate::boundary_io::BoundaryRuntimeState::new(),
+            otlp_relay_active,
             launcher,
         )
     }
@@ -762,6 +790,105 @@ mod tests {
             .expect("resolve interactive workload shell");
 
         assert_eq!(command.get_args().collect::<Vec<_>>(), ["-i"]);
+    }
+
+    fn env_of(command: &Command, key: &str) -> Option<String> {
+        command
+            .get_envs()
+            .filter(|(name, _)| *name == std::ffi::OsStr::new(key))
+            .last()
+            .and_then(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn exec_children_see_the_relay_endpoint_unless_the_exec_overrides_it() {
+        let executor = executor();
+        let spec = |env: Vec<(String, String)>| ExecSpec {
+            program: "/bin/true".to_string(),
+            args: Vec::new(),
+            shell: None,
+            runtime_helper: None,
+            env,
+            workdir: None,
+            pty: false,
+        };
+
+        let command = executor.command(&spec(Vec::new())).expect("resolve exec");
+        assert_eq!(
+            env_of(
+                &command,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT
+            )
+            .as_deref(),
+            Some(openshell_core::sandbox_env::OTLP_RELAY_ENDPOINT)
+        );
+        assert_eq!(
+            env_of(
+                &command,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL
+            )
+            .as_deref(),
+            Some("http/protobuf")
+        );
+
+        assert_eq!(
+            env_of(
+                &command,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+            ),
+            None,
+            "only the generic default is injected"
+        );
+
+        // A per-exec environment is a developer's explicit instruction and
+        // is applied last (contracts/sandbox-environment.md). An endpoint in
+        // it suppresses the whole relay default, protocol included.
+        let command = executor
+            .command(&spec(vec![(
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT.to_string(),
+                "http://127.0.0.1:4317".to_string(),
+            )]))
+            .expect("resolve exec");
+        assert_eq!(
+            env_of(
+                &command,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:4317")
+        );
+        assert_eq!(
+            env_of(
+                &command,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn exec_children_get_no_relay_endpoint_while_the_relay_is_inactive() {
+        let command = executor_with_relay(false)
+            .command(&ExecSpec {
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                shell: None,
+                runtime_helper: None,
+                env: Vec::new(),
+                workdir: None,
+                pty: false,
+            })
+            .expect("resolve exec");
+        for key in [
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT,
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL,
+        ] {
+            assert_eq!(
+                env_of(&command, key),
+                None,
+                "{key} injected without a relay"
+            );
+        }
     }
 
     #[tokio::test]

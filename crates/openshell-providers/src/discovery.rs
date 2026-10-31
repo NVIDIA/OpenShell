@@ -92,6 +92,7 @@ mod tests {
 
     fn profile() -> ProviderTypeProfile {
         ProviderTypeProfile {
+            files: Vec::new(),
             id: "custom".to_string(),
             resource_version: 0,
             annotations: std::collections::HashMap::new(),
@@ -103,6 +104,7 @@ mod tests {
                     name: "api_key".to_string(),
                     env_vars: vec!["CUSTOM_API_KEY".to_string(), "CUSTOM_API_TOKEN".to_string()],
                     required: true,
+                    stable_placeholder: false,
                     description: String::new(),
                     auth_style: String::new(),
                     header_name: String::new(),
@@ -115,6 +117,7 @@ mod tests {
                     name: "secondary".to_string(),
                     env_vars: vec!["CUSTOM_API_KEY".to_string()],
                     required: false,
+                    stable_placeholder: false,
                     description: String::new(),
                     auth_style: String::new(),
                     header_name: String::new(),

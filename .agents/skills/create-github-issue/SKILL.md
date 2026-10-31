@@ -19,7 +19,7 @@ This project uses YAML form issue templates. When creating issues, match the tem
 
 ### Bug Reports
 
-Do not add a type label automatically. The body must include a **User Story**, **Problem Statement**, **Impact / Why This Matters**, and **Acceptance Criteria**, followed by bug-specific reproduction steps and environment details. Logs are optional and must be concise and redacted. Apply area or topic labels only when they are clearly known.
+Do not add a type label automatically. Confirm that the human operator personally uses OpenShell and directly encountered the problem or needs the feature for a specific use case. If that first-hand attestation or concrete use case is missing, ask for it before creating the issue. Frame the issue entirely in terms of OpenShell. The body must include a **User Story**, **Problem Statement**, **Impact / Why This Matters**, and **Acceptance Criteria**, followed by bug-specific reproduction steps using only OpenShell deployments and environment details. Do not install third-party tools to demonstrate reproducibility. Logs are optional and must be concise and redacted. If the issue suggests a change to configuration, CLI, SDK, or other user experience, include a notional example of the proposed interaction for human review. Inspect current repository labels before applying any; use only labels whose meaning is clear.
 
 ```bash
 gh issue create \
@@ -27,7 +27,7 @@ gh issue create \
   --body "$(cat <<'EOF'
 ## User Story
 
-As a <persona>, I want <capability or outcome>, so that <benefit or impact>.
+I use OpenShell for <specific use case>. I directly encountered or need <specific behavior> so that <outcome>.
 
 ## Problem Statement
 
@@ -52,18 +52,20 @@ As a <persona>, I want <capability or outcome>, so that <benefit or impact>.
 - OS: <os>
 - Runtime, deployment, or integration: <relevant details>
 
+## Suggested UX (if applicable)
+
+<Notional OpenShell CLI, configuration, SDK, or other interaction>
+
 ## Logs
 
-```
-<optional minimal, redacted output>
-```
+<Optional minimal, redacted output>
 EOF
 )"
 ```
 
 ### Feature Requests
 
-Do not add a type label automatically. The body must include a **User Story**, **Problem Statement**, **Impact / Why This Matters**, **Proposed Design**, **Acceptance Criteria**, and **Alternatives Considered**. The proposed design should define the user-facing workflow and externally observable behavior without prescribing internal implementation. Agent investigation is optional. Apply area or topic labels only when they are clearly known.
+Do not add a type label automatically. Confirm that the human operator personally uses OpenShell and directly encountered the problem or needs the feature for a specific use case. If that first-hand attestation or concrete use case is missing, ask for it before creating the issue. Frame the issue entirely in terms of OpenShell. The body must include a **User Story**, **Problem Statement**, **Impact / Why This Matters**, **Proposed Design**, **Acceptance Criteria**, and **Alternatives Considered**. The proposed design should define the user-facing workflow and externally observable behavior without prescribing internal implementation. Agent investigation is optional. If the issue suggests a change to configuration, CLI, SDK, or other user experience, include a notional example of the proposed interaction for human review. Inspect current repository labels before applying any; use only labels whose meaning is clear.
 
 ```bash
 gh issue create \
@@ -71,7 +73,7 @@ gh issue create \
   --body "$(cat <<'EOF'
 ## User Story
 
-As a <persona>, I want <capability or outcome>, so that <benefit or impact>.
+I use OpenShell for <specific use case>. I directly encountered or need <specific behavior> so that <outcome>.
 
 ## Problem Statement
 
@@ -85,13 +87,17 @@ As a <persona>, I want <capability or outcome>, so that <benefit or impact>.
 
 <The desired user-facing workflow and externally observable behavior, without prescribing internal implementation>
 
+## Suggested UX (if applicable)
+
+<Notional OpenShell CLI, configuration, SDK, or other interaction>
+
 ## Acceptance Criteria
 
 - [ ] <specific, observable outcome>
 
 ## Alternatives Considered
 
-<Other user-facing workflows or behaviors considered and why this approach best satisfies the user story>
+<Other OpenShell workflows considered, including relevant middleware, interceptors, providers, or other extension points, and why the proposal better serves the use case. Prefer an applicable extension when it satisfies the use case; running another service alone is not a reason to dismiss it.>
 
 ## Agent Investigation
 
@@ -102,12 +108,16 @@ EOF
 
 ### Tasks
 
-For internal tasks that don't fit bug/feature templates:
+For internal tasks that do not fit bug/feature templates, still obtain the operator's first-hand OpenShell use case before creating the issue:
 
 ```bash
 gh issue create \
   --title "<type>: <description>" \
   --body "$(cat <<'EOF'
+## User Story
+
+<I personally use OpenShell for this specific case and directly need this work because...>
+
 ## Description
 
 <Clear description of the work>
@@ -125,7 +135,7 @@ EOF
 
 GitHub built-in issue types (`Bug`, `Feature`, `Task`) should come from the matching issue template when possible, or be set manually afterward. Do not try to emulate them through labels.
 
-Creating an issue does not accept it or queue agent work. Agents never apply `state:accepted`, the `roadmap` label, add issues to the roadmap project, or apply `agent:plan-requested` or `agent:implementation-requested`. Community issues proceed through `triage-issue`; a human accepts technically validated work with `state:accepted` or roadmap placement. The request labels queue work for unattended agents. A user may instead direct an agent to a specific issue; the agent warns about missing expected workflow labels and continues with the requested phase without changing them.
+Creating an issue does not accept it. Follow Label Discovery in `CONTRIBUTING.md` to retrieve every page of current `state:*` label definitions and resolve unclear meanings, then follow its triage → validation → human acceptance process. Agents may assess facts, but only humans decide whether to accept work or place it on the roadmap. A direct user request authorizes the requested planning or implementation phase without changing issue disposition.
 
 ## Useful Options
 
@@ -150,5 +160,5 @@ Created issue [#123](https://github.com/OWNER/REPO/issues/123)
 
 Use the issue number to:
 
-- Reference in commits: `git commit -m "Fix validation error (fixes #123)"`
-- Create a branch following project convention: `<issue-number>-<description>/<username>`
+- Reference in signed-off Conventional Commits: `git commit --signoff -m "fix(cli): validate empty requests (fixes #123)"`
+- Create a branch following Branch Names in `CONTRIBUTING.md`.

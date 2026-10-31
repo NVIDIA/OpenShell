@@ -192,7 +192,7 @@ openshell logs demo --since 5m --source sandbox
 ```
 
 ```text
-[1775014140.412] [sandbox] [OCSF ] [ocsf] HTTP:POST [MED] DENIED POST http://api.github.com:443/repos/octocat/hello-world/issues [policy:github_api engine:l7] [reason:L7_REQUEST deny POST api.github.com:443/repos/octocat/hello-world/issues reason=POST /repos/octocat/hello-world/issues not permitted by policy]
+[1775014140.412] [sandbox] [OCSF ] [ocsf] HTTP:POST [MED] DENIED POST https://api.github.com/repos/octocat/hello-world/issues [policy:github_api engine:l7] [reason:L7_REQUEST deny POST api.github.com:443/repos/octocat/hello-world/issues reason=POST /repos/octocat/hello-world/issues not permitted by policy]
 ```
 
 The log captures the exact HTTP method, path, and matching rule. Policy
@@ -222,7 +222,7 @@ without `--dangerously-skip-permissions`.
 
 - **Customize the policy**: Change `access: read-only` to `read-write`
   or add explicit `rules` for specific paths. See the
-  [security policy reference](../../architecture/security-policy.md).
+  [policy schema reference](../../docs/how-it-works/policies/schema.mdx).
 - **Scope to an agent**: Replace the `binaries` section with your
   agent's binary (e.g., `/usr/local/bin/claude`) instead of `curl`.
 - **Add more endpoints**: Stack multiple policies in the same file

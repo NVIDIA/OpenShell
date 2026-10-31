@@ -13,7 +13,14 @@ from email.parser import Parser
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
-PROTO_STEMS = ("datamodel", "openshell", "options", "sandbox")
+PROTO_STEMS = (
+    "credential_driver",
+    "datamodel",
+    "extension",
+    "openshell",
+    "options",
+    "sandbox",
+)
 BYTECODE_SUFFIXES = (".pyc", ".pyo")
 NATIVE_SUFFIXES = (".dll", ".dylib", ".exe", ".pyd", ".so")
 
@@ -39,6 +46,7 @@ def _required_files() -> set[str]:
         files.add(f"openshell/_proto/{stem}_pb2.py")
         files.add(f"openshell/_proto/{stem}_pb2.pyi")
         files.add(f"openshell/_proto/{stem}_pb2_grpc.py")
+        files.add(f"openshell/_proto/{stem}_pb2_grpc.pyi")
     return files
 
 

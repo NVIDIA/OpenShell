@@ -1,12 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2e tests for server mTLS enforcement.
+"""E2e tests for gateway TLS and mTLS user authentication.
 
-These tests verify that the OpenShell server correctly requires valid client
-certificates signed by the cluster CA.  Only callers presenting the provisioned
-mTLS client cert should be able to reach the OpenShell gRPC API; all other
-connection attempts must be rejected.
+TLS accepts CA-only clients so supervisors can use sandbox bearer tokens.
+Health is public; user RPCs require an authenticated user. Presented client
+certificates must be signed by the gateway CA.
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ from urllib.parse import urlparse
 import grpc
 import pytest
 
-from openshell._proto import openshell_pb2, openshell_pb2_grpc
+from openshell._proto import datamodel_pb2, openshell_pb2, openshell_pb2_grpc
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -137,14 +136,14 @@ def mtls_certs(
 
 
 class TestServerMtlsEnforcement:
-    """Verify the server rejects callers without a valid client certificate."""
+    """Verify TLS trust and the mTLS user authorization boundary."""
 
     def test_authenticated_client_succeeds(
         self,
         server_endpoint: tuple[str, int, str],
         mtls_certs: tuple[bytes, bytes, bytes],
     ) -> None:
-        """A client presenting the correct mTLS cert can call Health."""
+        """A verified mTLS user can call Health and a protected user RPC."""
         host, port, _ = server_endpoint
         ca, cert, key = mtls_certs
 
@@ -158,15 +157,21 @@ class TestServerMtlsEnforcement:
             stub = openshell_pb2_grpc.OpenShellStub(channel)
             response = stub.Health(openshell_pb2.HealthRequest(), timeout=10)
             assert response.status == openshell_pb2.SERVICE_STATUS_HEALTHY
+            stub.ListSandboxes(
+                openshell_pb2.ListSandboxesRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
+                ),
+                timeout=10,
+            )
         finally:
             channel.close()
 
-    def test_no_client_cert_rejected(
+    def test_ca_only_client_health_succeeds_but_user_rpc_rejected(
         self,
         server_endpoint: tuple[str, int, str],
         mtls_certs: tuple[bytes, bytes, bytes],
     ) -> None:
-        """A client that trusts the CA but presents no client cert is rejected."""
+        """CA-only TLS reaches Health but cannot acquire mTLS user identity."""
         host, port, _ = server_endpoint
         ca, _, _ = mtls_certs
 
@@ -175,14 +180,32 @@ class TestServerMtlsEnforcement:
         channel = grpc.secure_channel(f"{host}:{port}", credentials)
         try:
             stub = openshell_pb2_grpc.OpenShellStub(channel)
+            response = stub.Health(openshell_pb2.HealthRequest(), timeout=10)
+            assert response.status == openshell_pb2.SERVICE_STATUS_HEALTHY
             with pytest.raises(grpc.RpcError) as exc_info:
-                stub.Health(openshell_pb2.HealthRequest(), timeout=10)
-            # The server should terminate the TLS handshake or return
-            # UNAVAILABLE because the client did not present a certificate.
-            assert exc_info.value.code() in (
-                grpc.StatusCode.UNAVAILABLE,
-                grpc.StatusCode.UNKNOWN,
-            ), f"expected UNAVAILABLE or UNKNOWN, got {exc_info.value.code()}"
+                stub.ListSandboxes(
+                    openshell_pb2.ListSandboxesRequest(
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        )
+                    ),
+                    timeout=10,
+                )
+            assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+            # An unverified bearer token must not promote the TLS connection
+            # to a user identity either.
+            with pytest.raises(grpc.RpcError) as exc_info:
+                stub.ListSandboxes(
+                    openshell_pb2.ListSandboxesRequest(
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        )
+                    ),
+                    metadata=(("authorization", "Bearer invalid-token"),),
+                    timeout=10,
+                )
+            assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
         finally:
             channel.close()
 

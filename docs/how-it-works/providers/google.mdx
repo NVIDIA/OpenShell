@@ -117,7 +117,10 @@ Set these with `--config key=value` during provider creation:
 |-----|-------------|---------|
 | `project_id` | GCP project ID | `my-project-123` |
 | `region` | GCP region | `us-central1` |
-| `service_account_email` | SA email for metadata endpoint | `sa@proj.iam.gserviceaccount.com` |
+| `service_account_email` | Optional SA email for metadata endpoint | `sa@proj.iam.gserviceaccount.com` |
+
+When `service_account_email` is omitted or empty, recursive metadata account
+discovery returns the `default` identifier so SDKs can refresh repeatedly.
 
 ## How It Works
 
@@ -125,9 +128,10 @@ When a sandbox starts with the `google-cloud` provider attached:
 
 1. The gateway mints a fresh GCP access token and stores it in the
    sandbox proxy's credential resolver.
-2. A loopback HTTP server on `127.0.0.1:8174` emulates the GCE instance
-   metadata API, serving **credential placeholders** (not real tokens) to
-   GCP SDKs. The sandbox process never holds a real GCP credential.
+2. The sandbox relays HTTP requests to the reserved `127.0.0.1:8174`
+   metadata endpoint over its authenticated supervisor connection. The
+   supervisor emulates the GCE instance metadata API and serves credential
+   placeholders to GCP SDKs. Real access tokens remain in the supervisor.
 3. When the SDK makes an API call, it sends the placeholder in the
    `Authorization` header. The sandbox proxy TLS-terminates the
    outbound connection, resolves the placeholder to the real token,
@@ -142,6 +146,18 @@ environment variables and are served by the metadata endpoint. These are
 non-secret identifiers, not credentials. Access tokens are never exposed;
 only placeholders reach the sandbox process.
 
+The emulator supports Linux sandboxes using the Docker, Podman, Kubernetes,
+and VM runtimes. Windows/MXC does not provide this metadata endpoint. SDKs must
+honor the injected metadata discovery variables below. Requests require the
+`Metadata-Flavor: Google` header; requests with `X-Forwarded-For` are rejected.
+The endpoint serves project ID, service-account email, scopes, and token
+placeholders, including recursive service-account discovery.
+
+OpenShell reserves `127.0.0.1:8174` for this service. Connections to this
+address reach the emulator even if a workload binds its own listener there.
+Requests to the host's cloud metadata service remain blocked; the emulator does not forward requests to
+`metadata.google.internal` or `169.254.169.254`.
+
 ### Injected Environment Variables
 
 The provider automatically injects these into the sandbox. Non-secret
@@ -150,7 +166,7 @@ as placeholders for proxy-time resolution.
 
 | Variable | Value | Purpose |
 |----------|-------|---------|
-| `GCE_METADATA_HOST` | `127.0.0.1:8174` | GCP SDK metadata discovery (loopback server) |
+| `GCE_METADATA_HOST` | `127.0.0.1:8174` | GCP SDK metadata discovery (supervisor emulator) |
 | `GCE_METADATA_IP` | `127.0.0.1:8174` | Python google-auth ping detection |
 | `METADATA_SERVER_DETECTION` | `assume-present` | Node.js gcp-metadata skip detection |
 | `GCP_PROJECT_ID` | from `project_id` config | GCP SDK project |
@@ -167,6 +183,10 @@ permissions for. Add the target API hosts to your sandbox network policy:
 Attach `my-gcp` to the sandbox first. Because the `google-cloud` profile has no
 endpoints, each API endpoint must bind to that provider instance. Without the
 binding, OpenShell withholds its access token from the sandbox.
+The metadata token endpoint returns HTTP `503` when no bound access token is
+available or the token has expired. Attach the provider, add a credential
+binding, and check `openshell provider refresh status my-gcp` before testing
+token discovery.
 
 ```yaml
 network_policies:

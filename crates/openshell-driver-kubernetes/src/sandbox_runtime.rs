@@ -8,8 +8,8 @@ use std::path::Path;
 
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::{
-    CSIVolumeSource, Capabilities, Container, EmptyDirVolumeSource, EnvVar, KeyToPath,
-    LocalObjectReference, Pod, PodSchedulingGate, PodSecurityContext, PodSpec, Probe,
+    CSIVolumeSource, Capabilities, ConfigMapVolumeSource, Container, EmptyDirVolumeSource, EnvVar,
+    KeyToPath, LocalObjectReference, Pod, PodSchedulingGate, PodSecurityContext, PodSpec, Probe,
     ProjectedVolumeSource, Secret, SecretVolumeSource, SecurityContext, Service,
     ServiceAccountTokenProjection, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
     VolumeProjection,
@@ -17,11 +17,16 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::ObjectMeta;
-use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{CertificateParams, DnType, IsCa, KeyUsagePurpose};
 
+use k8s_openapi::api::networking::v1::NetworkPolicy;
+
+use crate::config::KubernetesControlConnection;
+#[cfg(test)]
+use crate::isolation::BOUNDARY_ROLE_LABEL;
 use crate::isolation::{
-    BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesSandboxRuntimeNetworkFence,
-    KubernetesSandboxRuntimeNetworkFenceSpec,
+    KubernetesSandboxRuntimeNetworkFence, KubernetesSandboxRuntimeNetworkFenceSpec,
+    boundary_service_role, runtime_control_policy,
 };
 
 pub const SANDBOX_SECRET_COMPONENT: &str = "sandbox-bootstrap";
@@ -35,12 +40,14 @@ pub const SUPERVISOR_AUTH_BUNDLE_KEY: &str = "auth.json";
 pub const PROXY_CA_CERTIFICATE_KEY: &str = "proxy-ca.crt";
 pub const PROXY_CA_PRIVATE_KEY: &str = "proxy-ca.key";
 /// Optional bootstrap-Secret key holding the operator's corporate proxy CA
-/// bundle (`proxy_ca_bundle`). Distinct from [`PROXY_CA_CERTIFICATE_KEY`],
-/// which is the sandbox's own generated TLS-interception CA.
+/// bundle (`proxy_ca_bundle`).
+///
+/// Distinct from [`PROXY_CA_CERTIFICATE_KEY`], which is the sandbox's own
+/// generated TLS-interception CA.
 pub const UPSTREAM_PROXY_CA_BUNDLE_KEY: &str = "upstream-proxy-ca.pem";
+/// JSON sandbox instance registration of a generation on the shared supervisor.
+pub const SHARED_INSTANCE_KEY: &str = "instance.json";
 pub const CLIENT_TLS_CA_KEY: &str = "client-ca.crt";
-pub const CLIENT_TLS_CERTIFICATE_KEY: &str = "client-tls.crt";
-pub const CLIENT_TLS_PRIVATE_KEY: &str = "client-tls.key";
 pub const SANDBOX_BOOTSTRAP_INPUT_PATH: &str = "/.openshell/bootstrap-input";
 pub const BOUNDARY_CONFIG_PATH: &str = "/.openshell/state/bootstrap/boundary.json";
 pub const BOUNDARY_CERTIFICATE_PATH: &str = "/.openshell/state/bootstrap/tls.crt";
@@ -56,25 +63,27 @@ pub const PROXY_CA_PRIVATE_KEY_PATH: &str = "/.openshell/supervisor/proxy-ca.key
 /// without a dedicated volume or mount.
 pub const UPSTREAM_PROXY_CA_BUNDLE_PATH: &str = "/.openshell/supervisor/upstream-proxy-ca.pem";
 pub const CLIENT_TLS_CA_PATH: &str = "/.openshell/supervisor/client-ca.crt";
-pub const CLIENT_TLS_CERTIFICATE_PATH: &str = "/.openshell/supervisor/client-tls.crt";
-pub const CLIENT_TLS_PRIVATE_KEY_PATH: &str = "/.openshell/supervisor/client-tls.key";
 pub const CONTROL_HEALTH_SOCKET_PATH: &str = "/run/openshell/health.sock";
 /// Kubelet `tcpSocket` readiness port. An exec probe would start a supervisor
 /// process in every sandbox on every period.
 pub const CONTROL_HEALTH_PORT: u16 = 5501;
+
+/// `ConfigMap` volume name reserved for gateway-normalized destination trust.
+pub const ADDITIONAL_CA_VOLUME_NAME: &str = "openshell-additional-ca";
+/// The only destination-trust path exposed to the dedicated supervisor Pod.
+pub const ADDITIONAL_CA_MOUNT_PATH: &str = openshell_core::driver_utils::ADDITIONAL_CA_MOUNT_PATH;
+const ADDITIONAL_CA_KEY: &str = "ca.crt";
 pub const NAMESPACE_WORKLOAD_POLICY_NAME: &str = "openshell-sandbox-workloads";
 pub const NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME: &str = "openshell-sandbox-supervisors";
 pub const SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS: i64 = 30;
 
-/// Gateway client TLS material staged into the supervisor bootstrap Secret.
+/// Gateway CA material staged into the supervisor bootstrap Secret.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientTlsMaterial {
     pub ca_certificate: Vec<u8>,
-    pub certificate: Vec<u8>,
-    pub private_key: Vec<u8>,
 }
 
-/// Where the supervisor reads its gateway client TLS material.
+/// Where the supervisor reads the gateway CA.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SupervisorClientTls<'a> {
     Disabled,
@@ -90,7 +99,8 @@ pub struct ProxyCaMaterial {
 }
 
 pub fn generate_proxy_ca_material() -> Result<ProxyCaMaterial, String> {
-    let key = KeyPair::generate().map_err(|error| format!("generate proxy CA key: {error}"))?;
+    let key = openshell_crypto::pki::generate_keypair()
+        .map_err(|error| format!("generate proxy CA key: {error}"))?;
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params
@@ -100,12 +110,13 @@ pub fn generate_proxy_ca_material() -> Result<ProxyCaMaterial, String> {
         .distinguished_name
         .push(DnType::OrganizationName, "OpenShell");
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let certificate = params
-        .self_signed(&key)
+    let certificate = openshell_crypto::pki::self_signed(params, &key)
         .map_err(|error| format!("generate proxy CA certificate: {error}"))?;
     Ok(ProxyCaMaterial {
         certificate_pem: certificate.pem(),
-        private_key_pem: key.serialize_pem(),
+        private_key_pem: key
+            .serialize_pem()
+            .map_err(|error| format!("export proxy CA key: {error}"))?,
     })
 }
 
@@ -114,6 +125,11 @@ pub struct SandboxRuntimeNames {
     pub sandbox_secret: String,
     pub supervisor_secret: String,
     pub boundary_service: String,
+    pub supervisor_service: String,
+    /// Per-sandbox egress allowance used only by runtime-initiated control.
+    pub control_policy: String,
+    /// Per-sandbox egress allowance to the gateway's shared supervisor.
+    pub shared_control_policy: String,
     pub supervisor_pod: String,
     pub workload_policy: String,
     pub supervisor_policy: String,
@@ -128,10 +144,24 @@ impl SandboxRuntimeNames {
             sandbox_secret: format!("os-sandbox-{suffix}"),
             supervisor_secret: format!("os-supervisor-{suffix}"),
             boundary_service: format!("os-boundary-{suffix}"),
+            supervisor_service: format!("os-supervisor-{suffix}"),
+            control_policy: format!("os-control-{suffix}"),
+            shared_control_policy: format!("os-shared-control-{suffix}"),
             supervisor_pod: format!("os-supervisor-{suffix}"),
             workload_policy: NAMESPACE_WORKLOAD_POLICY_NAME.to_string(),
             supervisor_policy: NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME.to_string(),
             image_pull_secret_prefix: format!("os-pull-{suffix}"),
+        }
+    }
+
+    /// The legacy boundary Service always selects the workload. New runtimes
+    /// dial a separate supervisor Service, so old gateways can still restart
+    /// the pair without understanding runtime-initiated control.
+    #[must_use]
+    pub fn control_service(&self, mode: KubernetesControlConnection) -> &str {
+        match mode {
+            KubernetesControlConnection::SupervisorInitiated => &self.boundary_service,
+            KubernetesControlConnection::RuntimeInitiated => &self.supervisor_service,
         }
     }
 
@@ -182,24 +212,30 @@ pub fn workload_fence(
     .provision()
 }
 
+/// Per-sandbox Sandbox Protocol endpoint. Its stable `ClusterIP` is allocated
+/// before either Pod runs.
+///
+/// Each connection mode has a separate Service name and fixed selector, so
+/// legacy gateways keep their workload endpoint.
 #[must_use]
 pub fn boundary_service(
     namespace: &str,
     names: &SandboxRuntimeNames,
     sandbox_id: &str,
     boundary_port: u16,
+    mode: KubernetesControlConnection,
     owner: OwnerReference,
 ) -> Service {
     Service {
         metadata: ObjectMeta {
-            name: Some(names.boundary_service.clone()),
+            name: Some(names.control_service(mode).to_string()),
             namespace: Some(namespace.to_string()),
             owner_references: Some(vec![owner]),
             labels: Some(common_labels(sandbox_id, "boundary-service")),
             ..Default::default()
         },
         spec: Some(ServiceSpec {
-            selector: Some(pair_labels(sandbox_id, "workload")),
+            selector: Some(pair_labels(sandbox_id, boundary_service_role(mode))),
             ports: Some(vec![ServicePort {
                 name: Some("boundary".to_string()),
                 protocol: Some("TCP".to_string()),
@@ -207,10 +243,83 @@ pub fn boundary_service(
                 target_port: Some(IntOrString::Int(i32::from(boundary_port))),
                 ..Default::default()
             }]),
+            publish_not_ready_addresses: publishes_not_ready_supervisor(mode),
             ..Default::default()
         }),
         ..Default::default()
     }
+}
+
+/// A runtime-initiated supervisor becomes Ready only after the runtime has
+/// attached through this Service, so the Service must route to it before it is
+/// Ready. TLS and the Sandbox Protocol bearer, not readiness, authenticate the
+/// endpoint. Supervisor-initiated Services keep their original encoding.
+const fn publishes_not_ready_supervisor(mode: KubernetesControlConnection) -> Option<bool> {
+    match mode {
+        KubernetesControlConnection::RuntimeInitiated => Some(true),
+        KubernetesControlConnection::SupervisorInitiated => None,
+    }
+}
+
+/// Whether an existing boundary Service still selects the role required by
+/// `mode` for this sandbox's pair.
+#[must_use]
+pub fn boundary_service_matches_mode(
+    service: &Service,
+    sandbox_id: &str,
+    mode: KubernetesControlConnection,
+) -> bool {
+    let Some(spec) = service.spec.as_ref() else {
+        return false;
+    };
+    let publishes_not_ready = spec.publish_not_ready_addresses == Some(true);
+    spec.selector.as_ref() == Some(&pair_labels(sandbox_id, boundary_service_role(mode)))
+        && publishes_not_ready == (publishes_not_ready_supervisor(mode) == Some(true))
+}
+
+/// Per-sandbox control egress policy, owned by the Sandbox resource so it is
+/// garbage-collected with that sandbox only.
+#[must_use]
+pub fn control_policy(
+    namespace: &str,
+    names: &SandboxRuntimeNames,
+    sandbox_id: &str,
+    boundary_port: u16,
+    owner: OwnerReference,
+) -> NetworkPolicy {
+    let mut policy = runtime_control_policy(
+        namespace,
+        &names.control_policy,
+        &pair_label_value(sandbox_id),
+        boundary_port,
+    );
+    policy.metadata.owner_references = Some(vec![owner]);
+    policy.metadata.labels = Some(common_labels(sandbox_id, "sandbox-control-egress"));
+    policy
+}
+
+/// Egress allowance from this sandbox's workload Pod to the shared supervisor.
+#[must_use]
+pub fn shared_control_policy(
+    namespace: &str,
+    names: &SandboxRuntimeNames,
+    sandbox_id: &str,
+    supervisor_namespace: &str,
+    supervisor_selector: BTreeMap<String, String>,
+    runtime_port: u16,
+    owner: OwnerReference,
+) -> NetworkPolicy {
+    let mut policy = crate::isolation::shared_runtime_control_policy(
+        namespace,
+        &names.shared_control_policy,
+        &pair_label_value(sandbox_id),
+        supervisor_namespace,
+        supervisor_selector,
+        runtime_port,
+    );
+    policy.metadata.owner_references = Some(vec![owner]);
+    policy.metadata.labels = Some(common_labels(sandbox_id, "sandbox-shared-control-egress"));
+    policy
 }
 
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
@@ -238,7 +347,12 @@ pub fn supervisor_pod(
     proxy_connect_by_hostname: bool,
     upstream_proxy_ca_bundle_staged: bool,
     provider_spiffe_socket_path: Option<&str>,
+    // Name and expected full digest of a gateway-normalized destination trust
+    // generation. The ConfigMap is mounted only in this dedicated control Pod;
+    // it is deliberately absent from the workload Pod and its bootstrap Secret.
+    network_additional_ca: Option<(&str, &str)>,
     owner: OwnerReference,
+    tracing_environment: &[(&str, String)],
 ) -> Result<Pod, String> {
     let labels = control_labels(sandbox_id, gateway_id);
     let mut environment = vec![
@@ -275,6 +389,17 @@ pub fn supervisor_pod(
             "",
         ),
     ];
+    environment.extend(
+        tracing_environment
+            .iter()
+            .map(|(name, value)| env_var(name, value)),
+    );
+    if let Some(server_name) = gateway_tls_server_name(grpc_endpoint) {
+        environment.push(env_var(
+            openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
+            &server_name,
+        ));
+    }
     let mut volume_mounts = vec![
         volume_mount("bootstrap", "/.openshell/supervisor", true),
         volume_mount("sa-token", "/var/run/secrets/openshell", true),
@@ -304,29 +429,28 @@ pub fn supervisor_pod(
     match client_tls {
         SupervisorClientTls::Disabled => {}
         SupervisorClientTls::Secret(secret_name) => {
-            environment.extend([
-                env_var("OPENSHELL_TLS_CA", "/var/run/secrets/openshell-tls/ca.crt"),
-                env_var(
-                    "OPENSHELL_TLS_CERT",
-                    "/var/run/secrets/openshell-tls/tls.crt",
-                ),
-                env_var(
-                    "OPENSHELL_TLS_KEY",
-                    "/var/run/secrets/openshell-tls/tls.key",
-                ),
-            ]);
+            environment.push(env_var(
+                "OPENSHELL_TLS_CA",
+                "/var/run/secrets/openshell-tls/ca.crt",
+            ));
             volume_mounts.push(volume_mount(
                 "client-tls",
                 "/var/run/secrets/openshell-tls",
                 true,
             ));
-            volumes.push(secret_volume("client-tls", secret_name, None));
+            volumes.push(secret_volume(
+                "client-tls",
+                secret_name,
+                Some(KeyToPath {
+                    key: "ca.crt".to_string(),
+                    path: "ca.crt".to_string(),
+                    ..Default::default()
+                }),
+            ));
         }
-        SupervisorClientTls::Bootstrap => environment.extend([
-            env_var("OPENSHELL_TLS_CA", CLIENT_TLS_CA_PATH),
-            env_var("OPENSHELL_TLS_CERT", CLIENT_TLS_CERTIFICATE_PATH),
-            env_var("OPENSHELL_TLS_KEY", CLIENT_TLS_PRIVATE_KEY_PATH),
-        ]),
+        SupervisorClientTls::Bootstrap => {
+            environment.push(env_var("OPENSHELL_TLS_CA", CLIENT_TLS_CA_PATH));
+        }
     }
     let mut command = vec![
         "/openshell-supervisor".to_string(),
@@ -366,6 +490,22 @@ pub fn supervisor_pod(
             "--upstream-proxy-ca-bundle".to_string(),
             UPSTREAM_PROXY_CA_BUNDLE_PATH.to_string(),
         ]);
+    }
+    if let Some((config_map_name, _digest)) = network_additional_ca {
+        command.extend([
+            "--additional-ca-bundle".to_string(),
+            ADDITIONAL_CA_MOUNT_PATH.to_string(),
+        ]);
+        let mut mount = volume_mount(ADDITIONAL_CA_VOLUME_NAME, ADDITIONAL_CA_MOUNT_PATH, true);
+        // A subPath exposes `ca.crt` at the exact protected file path rather
+        // than mounting a ConfigMap directory over the supervisor's filesystem.
+        mount.sub_path = Some(ADDITIONAL_CA_KEY.to_string());
+        volume_mounts.push(mount);
+        volumes.push(config_map_volume(
+            ADDITIONAL_CA_VOLUME_NAME,
+            config_map_name,
+            ADDITIONAL_CA_KEY,
+        ));
     }
     if let Some((secret_name, secret_key)) = proxy_auth_secret {
         let auth_path = Path::new(openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH);
@@ -560,20 +700,10 @@ pub fn supervisor_bootstrap_secret(
         data.insert(UPSTREAM_PROXY_CA_BUNDLE_KEY.to_string(), ByteString(bundle));
     }
     if let Some(tls) = client_tls {
-        data.extend([
-            (
-                CLIENT_TLS_CA_KEY.to_string(),
-                ByteString(tls.ca_certificate),
-            ),
-            (
-                CLIENT_TLS_CERTIFICATE_KEY.to_string(),
-                ByteString(tls.certificate),
-            ),
-            (
-                CLIENT_TLS_PRIVATE_KEY.to_string(),
-                ByteString(tls.private_key),
-            ),
-        ]);
+        data.insert(
+            CLIENT_TLS_CA_KEY.to_string(),
+            ByteString(tls.ca_certificate),
+        );
     }
     Secret {
         metadata: ObjectMeta {
@@ -584,6 +714,37 @@ pub fn supervisor_bootstrap_secret(
             ..Default::default()
         },
         data: Some(data),
+        immutable: Some(true),
+        type_: Some("Opaque".to_string()),
+        ..Default::default()
+    }
+}
+
+/// Durable launch material of one shared-supervisor sandbox instance, under
+/// the generation's supervisor Secret name so the existing generation cleanup
+/// deletes it.
+///
+/// The gateway reads it back to rebuild the host's assignments.
+#[must_use]
+pub fn shared_instance_secret(
+    namespace: &str,
+    names: &SandboxRuntimeNames,
+    sandbox_id: &str,
+    registration: Vec<u8>,
+    owner: OwnerReference,
+) -> Secret {
+    Secret {
+        metadata: ObjectMeta {
+            name: Some(names.supervisor_secret.clone()),
+            namespace: Some(namespace.to_string()),
+            owner_references: Some(vec![owner]),
+            labels: Some(common_labels(sandbox_id, SUPERVISOR_SECRET_COMPONENT)),
+            ..Default::default()
+        },
+        data: Some(BTreeMap::from([(
+            SHARED_INSTANCE_KEY.to_string(),
+            ByteString(registration),
+        )])),
         immutable: Some(true),
         type_: Some("Opaque".to_string()),
         ..Default::default()
@@ -637,13 +798,7 @@ pub fn sandbox_owner_reference(
 }
 
 fn pair_labels(sandbox_id: &str, role: &str) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        (
-            BOUNDARY_PAIR_LABEL.to_string(),
-            pair_label_value(sandbox_id),
-        ),
-        (BOUNDARY_ROLE_LABEL.to_string(), role.to_string()),
-    ])
+    crate::isolation::pair_role_labels(&pair_label_value(sandbox_id), role)
 }
 
 fn common_labels(sandbox_id: &str, component: &str) -> BTreeMap<String, String> {
@@ -670,6 +825,18 @@ fn control_labels(sandbox_id: &str, gateway_id: &str) -> BTreeMap<String, String
     labels
 }
 
+/// The gateway may redirect the supervisor to a specific replica by pod
+/// address, which the server certificate does not name. Verifying every dial
+/// against the configured endpoint's host keeps those redirects valid.
+fn gateway_tls_server_name(grpc_endpoint: &str) -> Option<String> {
+    let uri = grpc_endpoint.parse::<tonic::transport::Uri>().ok()?;
+    if uri.scheme_str() != Some("https") {
+        return None;
+    }
+    let host = uri.host()?.trim_start_matches('[').trim_end_matches(']');
+    (!host.is_empty()).then(|| host.to_string())
+}
+
 fn env_var(name: &str, value: &str) -> EnvVar {
     EnvVar {
         name: name.to_string(),
@@ -683,6 +850,23 @@ fn volume_mount(name: &str, mount_path: &str, read_only: bool) -> VolumeMount {
         name: name.to_string(),
         mount_path: mount_path.to_string(),
         read_only: read_only.then_some(true),
+        ..Default::default()
+    }
+}
+
+fn config_map_volume(name: &str, config_map_name: &str, key: &str) -> Volume {
+    Volume {
+        name: name.to_string(),
+        config_map: Some(ConfigMapVolumeSource {
+            name: config_map_name.to_string(),
+            default_mode: Some(0o444),
+            items: Some(vec![KeyToPath {
+                key: key.to_string(),
+                path: key.to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -719,11 +903,42 @@ mod tests {
     #[test]
     fn service_selects_only_the_workload_boundary() {
         let names = SandboxRuntimeNames::new("4b67c0d0-1111-2222-3333-444444444444");
-        let service = boundary_service("sandbox", &names, "pair", 5500, owner());
+        let legacy = boundary_service(
+            "sandbox",
+            &names,
+            "pair",
+            5500,
+            KubernetesControlConnection::SupervisorInitiated,
+            owner(),
+        );
         assert_eq!(
-            service.spec.unwrap().selector.unwrap()[BOUNDARY_ROLE_LABEL],
+            legacy.spec.as_ref().unwrap().selector.as_ref().unwrap()[BOUNDARY_ROLE_LABEL],
             "workload"
         );
+        let runtime_initiated = boundary_service(
+            "sandbox",
+            &names,
+            "pair",
+            5500,
+            KubernetesControlConnection::RuntimeInitiated,
+            owner(),
+        );
+        assert_eq!(
+            legacy.metadata.name.as_deref(),
+            Some(names.boundary_service.as_str())
+        );
+        assert_eq!(
+            runtime_initiated.metadata.name.as_deref(),
+            Some(names.supervisor_service.as_str())
+        );
+        assert_ne!(legacy.metadata.name, runtime_initiated.metadata.name);
+        assert_ne!(
+            legacy.spec.as_ref().unwrap().publish_not_ready_addresses,
+            Some(true)
+        );
+        let spec = runtime_initiated.spec.unwrap();
+        assert_eq!(spec.selector.unwrap()[BOUNDARY_ROLE_LABEL], "supervisor");
+        assert_eq!(spec.publish_not_ready_addresses, Some(true));
     }
 
     #[test]
@@ -793,15 +1008,13 @@ mod tests {
             None,
             Some(ClientTlsMaterial {
                 ca_certificate: b"ca".to_vec(),
-                certificate: b"cert".to_vec(),
-                private_key: b"key".to_vec(),
             }),
             owner(),
         );
         let data = secret.data.expect("Secret data");
         assert_eq!(data[CLIENT_TLS_CA_KEY].0, b"ca");
-        assert_eq!(data[CLIENT_TLS_CERTIFICATE_KEY].0, b"cert");
-        assert_eq!(data[CLIENT_TLS_PRIVATE_KEY].0, b"key");
+        assert!(!data.contains_key("client-tls.crt"));
+        assert!(!data.contains_key("client-tls.key"));
     }
 
     fn supervisor_pod_with_client_tls(client_tls: SupervisorClientTls<'_>) -> Pod {
@@ -829,7 +1042,9 @@ mod tests {
             false,
             false,
             None,
+            None,
             owner(),
+            &[],
         )
         .expect("render supervisor Pod")
     }
@@ -860,13 +1075,66 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_pod_carries_tracing_environment() {
+        const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let client_tls = SupervisorClientTls::Disabled;
+        let pod = supervisor_pod(
+            "sandbox",
+            &SandboxRuntimeNames::new("pair"),
+            "pair",
+            "demo",
+            "gateway",
+            "supervisor:latest",
+            None,
+            "sandbox-sa",
+            1000,
+            1000,
+            &[],
+            "https://gateway:8080",
+            client_tls,
+            "{}",
+            "info",
+            600,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+            owner(),
+            &[
+                (
+                    "OPENSHELL_OTLP_ENDPOINT",
+                    "http://collector:4317".to_string(),
+                ),
+                ("TRACEPARENT", TRACEPARENT.to_string()),
+            ],
+        )
+        .expect("render supervisor Pod");
+        let environment = pod.spec.expect("Pod spec").containers[0]
+            .env
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|variable| (variable.name, variable.value.unwrap_or_default()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment["OPENSHELL_OTLP_ENDPOINT"],
+            "http://collector:4317"
+        );
+        assert_eq!(environment["TRACEPARENT"], TRACEPARENT);
+    }
+
+    #[test]
     fn supervisor_pod_reads_client_tls_from_the_bootstrap_secret() {
         let (env, volumes) = tls_env_and_volumes(&supervisor_pod_with_client_tls(
             SupervisorClientTls::Bootstrap,
         ));
         assert_eq!(env["OPENSHELL_TLS_CA"], CLIENT_TLS_CA_PATH);
-        assert_eq!(env["OPENSHELL_TLS_CERT"], CLIENT_TLS_CERTIFICATE_PATH);
-        assert_eq!(env["OPENSHELL_TLS_KEY"], CLIENT_TLS_PRIVATE_KEY_PATH);
+        assert!(!env.contains_key("OPENSHELL_TLS_CERT"));
+        assert!(!env.contains_key("OPENSHELL_TLS_KEY"));
         assert!(CLIENT_TLS_CA_PATH.starts_with("/.openshell/supervisor/"));
         assert!(!volumes.contains(&"client-tls".to_string()));
     }
@@ -879,6 +1147,21 @@ mod tests {
             env["OPENSHELL_TLS_CA"],
             "/var/run/secrets/openshell-tls/ca.crt"
         );
+        assert!(!env.contains_key("OPENSHELL_TLS_CERT"));
+        assert!(!env.contains_key("OPENSHELL_TLS_KEY"));
+        let tls_volume = pod
+            .spec
+            .as_ref()
+            .unwrap()
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|volume| volume.name == "client-tls")
+            .unwrap();
+        let items = tls_volume.secret.as_ref().unwrap().items.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key, "ca.crt");
         assert!(volumes.contains(&"client-tls".to_string()));
     }
 
@@ -889,6 +1172,29 @@ mod tests {
         ));
         assert!(env.is_empty());
         assert!(!volumes.contains(&"client-tls".to_string()));
+    }
+
+    #[test]
+    fn supervisor_verifies_redirected_dials_against_the_configured_host() {
+        let pod = supervisor_pod_with_client_tls(SupervisorClientTls::Disabled);
+        let env = pod.spec.unwrap().containers[0].env.clone().unwrap();
+        let server_name = env
+            .iter()
+            .find(|variable| variable.name == "OPENSHELL_GATEWAY_TLS_SERVER_NAME")
+            .and_then(|variable| variable.value.as_deref());
+        assert_eq!(server_name, Some("gateway"));
+
+        assert_eq!(
+            gateway_tls_server_name("https://openshell.openshell.svc.cluster.local:8080")
+                .as_deref(),
+            Some("openshell.openshell.svc.cluster.local")
+        );
+        assert_eq!(
+            gateway_tls_server_name("https://[fd00::1]:8080").as_deref(),
+            Some("fd00::1")
+        );
+        assert_eq!(gateway_tls_server_name("http://gateway:8080"), None);
+        assert_eq!(gateway_tls_server_name("not a uri"), None);
     }
 
     #[test]
@@ -923,7 +1229,9 @@ mod tests {
             false,
             false,
             None,
+            None,
             owner(),
+            &[],
         )
         .expect("render supervisor Pod");
         let pod_spec = pod.spec.as_ref().expect("Pod spec");
@@ -936,6 +1244,31 @@ mod tests {
             None
         );
         let container = &pod_spec.containers[0];
+        let environment = container.env.as_ref().expect("supervisor environment");
+        assert!(
+            environment
+                .iter()
+                .any(|entry| entry.name == "OPENSHELL_TLS_CA")
+        );
+        assert!(!environment.iter().any(|entry| matches!(
+            entry.name.as_str(),
+            "OPENSHELL_TLS_CERT" | "OPENSHELL_TLS_KEY"
+        )));
+        let gateway_tls = pod_spec
+            .volumes
+            .as_ref()
+            .expect("supervisor volumes")
+            .iter()
+            .find(|volume| volume.name == "client-tls")
+            .and_then(|volume| volume.secret.as_ref())
+            .expect("gateway CA secret");
+        let items = gateway_tls
+            .items
+            .as_ref()
+            .expect("CA-only secret projection");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key, "ca.crt");
+        assert_eq!(items[0].path, "ca.crt");
         assert_eq!(container.image_pull_policy.as_deref(), Some("IfNotPresent"));
         assert_eq!(pod_spec.automount_service_account_token, Some(false));
         assert_eq!(pod_spec.restart_policy.as_deref(), Some("Never"));
@@ -1034,6 +1367,88 @@ mod tests {
             .expect("durable supervisor material is mounted into supervisor");
         assert_eq!(mount.mount_path, "/.openshell/supervisor");
         assert_eq!(mount.read_only, Some(true));
+    }
+
+    #[test]
+    fn destination_trust_is_mounted_only_into_the_dedicated_supervisor_pod() {
+        let names = SandboxRuntimeNames::new("pair");
+        let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let pod = supervisor_pod(
+            "sandbox",
+            &names,
+            "pair",
+            "demo",
+            "gateway",
+            "supervisor:latest",
+            None,
+            "sandbox-sa",
+            1000,
+            1000,
+            &[],
+            "https://gateway:8080",
+            SupervisorClientTls::Disabled,
+            "{}",
+            "info",
+            600,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            Some(("openshell-additional-ca-gateway-generation", digest)),
+            owner(),
+            &[],
+        )
+        .expect("render supervisor Pod with destination trust");
+        let spec = pod.spec.expect("Pod spec");
+        let container = &spec.containers[0];
+        assert!(container.command.as_deref().is_some_and(|command| {
+            command
+                .windows(2)
+                .any(|args| args == ["--additional-ca-bundle", ADDITIONAL_CA_MOUNT_PATH])
+        }));
+        assert_eq!(
+            container
+                .volume_mounts
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter(|mount| mount.name == ADDITIONAL_CA_VOLUME_NAME)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            &[&VolumeMount {
+                name: ADDITIONAL_CA_VOLUME_NAME.to_string(),
+                mount_path: ADDITIONAL_CA_MOUNT_PATH.to_string(),
+                read_only: Some(true),
+                sub_path: Some(ADDITIONAL_CA_KEY.to_string()),
+                ..Default::default()
+            }]
+        );
+        let volume = spec
+            .volumes
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|volume| volume.name == ADDITIONAL_CA_VOLUME_NAME)
+            .expect("destination trust ConfigMap volume");
+        assert_eq!(
+            volume
+                .config_map
+                .as_ref()
+                .map(|source| source.name.as_str()),
+            Some("openshell-additional-ca-gateway-generation")
+        );
+        assert_eq!(
+            volume
+                .config_map
+                .as_ref()
+                .and_then(|source| source.items.as_deref())
+                .and_then(|items| items.first())
+                .map(|item| (item.key.as_str(), item.path.as_str())),
+            Some((ADDITIONAL_CA_KEY, ADDITIONAL_CA_KEY))
+        );
     }
 
     #[test]
@@ -1155,7 +1570,9 @@ mod tests {
             false,
             staged,
             None,
+            None,
             owner(),
+            &[],
         )
         .expect("render supervisor Pod")
     }

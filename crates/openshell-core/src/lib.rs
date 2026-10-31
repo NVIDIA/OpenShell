@@ -11,12 +11,17 @@
 
 pub mod activity;
 pub mod auth;
+pub mod compute;
 pub mod config;
 pub mod container_paths;
 pub mod denial;
 pub mod driver_mounts;
 pub mod driver_utils;
+pub mod dynamic_credential_key;
 pub mod dynamic_string_allowlist;
+#[cfg(unix)]
+pub mod e2fsprogs;
+pub mod endpoint_failure;
 pub mod endpoint_path;
 pub mod endpoint_status;
 pub mod error;
@@ -29,47 +34,55 @@ pub mod gpu;
 pub mod grpc_client;
 pub mod host_pattern;
 pub mod image;
+pub mod isolation_registration;
 pub mod jwt;
 pub mod local_api_socket;
 pub mod mcp;
 pub mod metadata;
 pub mod middleware;
 pub mod net;
+pub mod network_trust;
 #[cfg(feature = "oauth")]
 pub mod oauth;
 pub mod paths;
 pub mod policy;
+pub use openshell_policy_schema::yaml;
 pub mod policy_identity;
 pub mod progress;
 pub mod proposals;
 pub mod proto;
 pub mod proto_struct;
 pub mod provider_credentials;
+pub mod replica_routing;
 pub mod resource_admission;
 pub mod rpc_error;
 pub mod sandbox_env;
 pub mod sandbox_generation;
 pub mod sandbox_session;
+pub mod sandbox_update;
 pub mod secrets;
 pub mod settings;
 pub mod shell;
 pub mod spiffe;
 pub mod telemetry;
 pub mod time;
+pub mod token_grant_failure;
 pub mod transport_errors;
+pub mod upload;
 
 pub use config::{
-    AppArmorProfile, Config, GatewayAuthConfig, GatewayInterceptorBindingOverride,
-    GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
-    GatewayInterceptorPhaseConfig, GatewayJwtConfig, GatewayProviderProfileSourceConfig,
-    ImagePullPolicy, MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode, TlsConfig,
-    UpstreamProxyConfig,
+    AppArmorProfile, Config, ExtensionBindingPolicy, GatewayAuthConfig,
+    GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
+    GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig, GatewayJwtConfig,
+    GatewayProviderProfileSourceConfig, ImagePullPolicy, MtlsAuthConfig, OidcConfig,
+    PolicyValidationFailureMode, TlsConfig, UpstreamProxyConfig,
 };
 pub use dynamic_string_allowlist::DynamicStringAllowlist;
 pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{
     GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace, SetResourceVersion,
 };
+pub use network_trust::NetworkSupervisorTrustBundle;
 pub use sandbox_session::{SandboxSessionId, SandboxSessionIdError};
 
 /// Build version string derived from git metadata.
@@ -91,5 +104,9 @@ mod build_version;
 ///
 /// Emitted by `build.rs` via `tonic_build::configure().file_descriptor_set_path(...)`.
 /// Used by tests in `openshell-server` to enumerate every RPC and verify that
-/// each one has an `#[rpc_auth(...)]` declaration on its handler.
+/// each one declares the `openshell.options.v1.authorization` proto option.
 pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(env!("OPENSHELL_DESCRIPTOR_PATH"));
+
+#[cfg(test)]
+#[path = "../../../tests/support/environment.rs"]
+mod test_environment;

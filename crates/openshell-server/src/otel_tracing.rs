@@ -1,27 +1,30 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenTelemetry tracing integration for the gateway.
+//! OpenTelemetry export for the gateway.
 //!
 //! Converts selected Rust `tracing` spans into OpenTelemetry traces and
-//! exports them over OTLP/gRPC when configured.
+//! gateway OCSF events into log records, and exports each over OTLP/gRPC when
+//! configured.
 //!
 //! # Configuration split
 //!
-//! `[openshell.gateway.otlp]` decides **whether and where** to export: the
-//! table's presence is the on-switch, its `endpoint` the destination.
-//! `OTEL_EXPORTER_OTLP_ENDPOINT` is deliberately not read, so enablement has
-//! one source.
+//! `[openshell.gateway.otlp]` decides **whether and where** to export each
+//! signal: a shared `endpoint` enables traces, `[otlp.traces]` overrides
+//! their endpoint, and `[otlp.ocsf]` with `enabled = true` exports OCSF
+//! records, optionally to their own endpoint. `OTEL_EXPORTER_OTLP_*ENDPOINT` is deliberately not
+//! read, so enablement has one source.
 //!
 //! **How** to export — sampling, batching, span limits, transport headers —
 //! is the SDK's `OTEL_*` environment surface, read as the provider is built
 //! and mirrored nowhere here. `docs/how-it-works/gateways/configuration.mdx` documents
 //! the variables operators are likely to want.
 //!
-//! Only traces are exported. Logs and metrics have their own surfaces (OCSF
-//! JSONL and the Prometheus `/metrics` endpoint).
+//! Diagnostic logs and metrics are not exported over OTLP. They have their own
+//! surfaces (the gateway log stream and the Prometheus `/metrics` endpoint).
 
-use openshell_otel::{OtlpTraceConfig, ServiceName};
+use openshell_core::jwt::SecretOtlpHeaders;
+use openshell_otel::{OcsfOtlp, OtlpExportConfig, OtlpTarget, ServiceName};
 pub use openshell_otel::{SetupError, TraceContextInterceptor, mark_error};
 #[cfg(test)]
 use opentelemetry_sdk::Resource;
@@ -62,10 +65,11 @@ impl<'a> GatewayResourceAttributes<'a> {
     }
 }
 
-fn trace_config<'cfg>(
+fn export_config<'cfg>(
     cfg: &'cfg OtlpConfig,
+    endpoint: &'cfg str,
     gateway: GatewayResourceAttributes<'_>,
-) -> OtlpTraceConfig<'cfg> {
+) -> OtlpExportConfig<'cfg> {
     let service_name = cfg
         .service_name
         .as_deref()
@@ -76,8 +80,8 @@ fn trace_config<'cfg>(
             ServiceName::Fixed,
         );
 
-    OtlpTraceConfig {
-        endpoint: &cfg.endpoint,
+    OtlpExportConfig {
+        endpoint,
         service_name,
         service_version: Some(openshell_core::VERSION),
         resource_attributes: openshell_otel::gateway_resource_attributes(
@@ -89,7 +93,7 @@ fn trace_config<'cfg>(
 
 #[cfg(test)]
 fn build_resource(cfg: &OtlpConfig, gateway: GatewayResourceAttributes<'_>) -> Resource {
-    openshell_otel::resource_for(&trace_config(cfg, gateway))
+    openshell_otel::resource_for(&export_config(cfg, "", gateway))
 }
 
 /// Build a tracer provider exporting over OTLP/gRPC to the configured endpoint.
@@ -105,22 +109,140 @@ fn build_provider(
     cfg: &OtlpConfig,
     gateway: GatewayResourceAttributes<'_>,
 ) -> Result<SdkTracerProvider, SetupError> {
-    openshell_otel::build_provider(&trace_config(cfg, gateway))
+    let endpoint = cfg.traces_endpoint().expect("trace export is configured");
+    openshell_otel::build_provider(&export_config(cfg, endpoint, gateway))
 }
 
-/// Resolve the tracer provider for a gateway config file's optional
-/// `[openshell.gateway.otlp]` table.
-///
-/// `None` means export is off — not configured, or configured and unusable.
-/// Telemetry is diagnostic, so a broken exporter never stops the gateway.
-///
-/// The error is returned rather than logged because the provider is built
-/// before the subscriber it attaches to, so logging here would go nowhere.
-pub fn provider_for(
-    cfg: Option<&OtlpConfig>,
-    gateway: GatewayResourceAttributes<'_>,
-) -> (Option<SdkTracerProvider>, Option<SetupError>) {
-    openshell_otel::provider_for(cfg.map(|cfg| trace_config(cfg, gateway)))
+/// OTLP export configured by `[openshell.gateway.otlp]`: gateway spans and
+/// OCSF log records, each sent to its own configured collector.
+pub struct OtlpExport {
+    traces: Option<Signal<SdkTracerProvider>>,
+    ocsf: Option<Signal<OcsfOtlp>>,
+    /// Validated collector that supervisors relay workload traces to. The
+    /// gateway itself exports nothing for this signal.
+    agent_endpoint: Option<String>,
+}
+
+/// One signal's exporter and the endpoint it sends to.
+struct Signal<E> {
+    endpoint: String,
+    exporter: E,
+}
+
+impl OtlpExport {
+    /// Start export for the optional `[openshell.gateway.otlp]` table.
+    ///
+    /// `None` means export is off — not configured, or configured and unusable.
+    /// Telemetry is diagnostic, so a broken exporter never stops the gateway.
+    ///
+    /// The error is returned rather than logged because export starts before
+    /// the subscriber it attaches to, so logging here would go nowhere.
+    pub fn start(
+        cfg: Option<&OtlpConfig>,
+        gateway: GatewayResourceAttributes<'_>,
+    ) -> (Option<Self>, Option<SetupError>) {
+        match cfg.map(|cfg| Self::try_start(cfg, gateway)) {
+            None => (None, None),
+            Some(Ok(export)) => (Some(export), None),
+            Some(Err(error)) => (None, Some(error)),
+        }
+    }
+
+    fn try_start(
+        cfg: &OtlpConfig,
+        gateway: GatewayResourceAttributes<'_>,
+    ) -> Result<Self, SetupError> {
+        let target = |endpoint| OtlpTarget::new(&export_config(cfg, endpoint, gateway));
+        let traces = cfg
+            .traces
+            .as_ref()
+            .map(|traces| {
+                let target = target(&traces.endpoint)?;
+                Ok::<_, SetupError>(Signal {
+                    endpoint: target.endpoint().to_string(),
+                    exporter: target.tracer_provider()?,
+                })
+            })
+            .transpose()?;
+        let ocsf = cfg
+            .ocsf
+            .as_ref()
+            .map(|ocsf| {
+                let target = target(&ocsf.endpoint)?;
+                Ok::<_, SetupError>(Signal {
+                    endpoint: target.endpoint().to_string(),
+                    exporter: OcsfOtlp::start(target.log_exporter()?, target.resource().clone()),
+                })
+            })
+            .transpose()?;
+        let agent_endpoint = cfg
+            .agent_endpoint()
+            .map(|endpoint| target(endpoint).map(|target| target.endpoint().to_string()))
+            .transpose()?;
+        Ok(Self {
+            traces,
+            ocsf,
+            agent_endpoint,
+        })
+    }
+
+    /// The collector that supervisors relay workload traces to, when the
+    /// agent trace relay is enabled.
+    pub fn agent_endpoint(&self) -> Option<&str> {
+        self.agent_endpoint.as_deref()
+    }
+
+    /// The collector receiving traces, when trace export is enabled.
+    pub fn traces_endpoint(&self) -> Option<&str> {
+        self.traces.as_ref().map(|traces| traces.endpoint.as_str())
+    }
+
+    /// The trace provider, when trace export is enabled.
+    pub fn tracer_provider(&self) -> Option<&SdkTracerProvider> {
+        self.traces.as_ref().map(|traces| &traces.exporter)
+    }
+
+    /// The collector receiving OCSF log records, when OCSF export is enabled.
+    pub fn ocsf_endpoint(&self) -> Option<&str> {
+        self.ocsf.as_ref().map(|ocsf| ocsf.endpoint.as_str())
+    }
+
+    /// OCSF log export, when `[otlp.ocsf]` is configured.
+    pub fn ocsf(&self) -> Option<&OcsfOtlp> {
+        self.ocsf.as_ref().map(|ocsf| &ocsf.exporter)
+    }
+
+    /// Flush buffered spans, then export queued OCSF records within their
+    /// shutdown budget.
+    pub async fn shutdown(self) {
+        if let Some(traces) = self.traces
+            && let Err(err) = traces.exporter.shutdown()
+        {
+            tracing::warn!(error = %err, "OTLP tracer provider shutdown failed");
+        }
+        if let Some(ocsf) = self.ocsf {
+            ocsf.exporter.shutdown().await;
+        }
+    }
+}
+
+/// Collector headers for supervisors to send with their OCSF exports: the
+/// headers the gateway's own OCSF exporter reads from its environment, with the
+/// same precedence. Supervisors receive them in their launch bundle because
+/// they do not inherit the gateway's environment.
+pub fn supervisor_ocsf_headers(otlp: Option<&OtlpConfig>) -> Option<SecretOtlpHeaders> {
+    ocsf_headers_from(otlp, |name| std::env::var(name).ok())
+}
+
+fn ocsf_headers_from(
+    otlp: Option<&OtlpConfig>,
+    var: impl Fn(&str) -> Option<String>,
+) -> Option<SecretOtlpHeaders> {
+    otlp?.ocsf.as_ref()?;
+    var("OTEL_EXPORTER_OTLP_LOGS_HEADERS")
+        .or_else(|| var("OTEL_EXPORTER_OTLP_HEADERS"))
+        .filter(|headers| !headers.trim().is_empty())
+        .map(SecretOtlpHeaders::new)
 }
 
 /// Build the `tracing` layer that forwards spans to `provider`.
@@ -146,6 +268,113 @@ where
 /// Isolated in-memory span exporters for tracing tests.
 #[cfg(test)]
 pub mod test_exporter {
+    use std::sync::{Arc, OnceLock};
+
+    use tracing::{Dispatch, Subscriber, dispatcher::WeakDispatch};
+
+    /// Keep parent-span cleanup on the registry that created the span.
+    ///
+    /// `SQLx` moves spans onto its `SQLite` worker without installing the test's
+    /// thread-local dispatcher. `tracing-subscriber` closes a child's parent
+    /// through the current dispatcher, so the worker can otherwise look up the
+    /// parent in the unrelated global registry when it drops the last reference.
+    struct CloseWithDispatch<S> {
+        inner: S,
+        dispatch: OnceLock<WeakDispatch>,
+        closed: Arc<tokio::sync::Notify>,
+    }
+
+    impl<S: Subscriber> Subscriber for CloseWithDispatch<S> {
+        fn on_register_dispatch(&self, dispatch: &Dispatch) {
+            self.dispatch
+                .set(dispatch.downgrade())
+                .expect("test subscriber is registered once");
+            self.inner.on_register_dispatch(dispatch);
+        }
+
+        fn register_callsite(
+            &self,
+            metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            self.inner.register_callsite(metadata)
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            self.inner.enabled(metadata)
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            self.inner.max_level_hint()
+        }
+
+        fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            self.inner.new_span(attributes)
+        }
+
+        fn record(&self, id: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            self.inner.record(id, values);
+        }
+
+        fn record_follows_from(&self, id: &tracing::span::Id, follows: &tracing::span::Id) {
+            self.inner.record_follows_from(id, follows);
+        }
+
+        fn event_enabled(&self, event: &tracing::Event<'_>) -> bool {
+            self.inner.event_enabled(event)
+        }
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.inner.event(event);
+        }
+
+        fn enter(&self, id: &tracing::span::Id) {
+            self.inner.enter(id);
+        }
+
+        fn exit(&self, id: &tracing::span::Id) {
+            self.inner.exit(id);
+        }
+
+        fn clone_span(&self, id: &tracing::span::Id) -> tracing::span::Id {
+            self.inner.clone_span(id)
+        }
+
+        fn try_close(&self, id: tracing::span::Id) -> bool {
+            // The span being closed owns a strong dispatcher reference. Store
+            // only a weak reference here to avoid a subscriber/dispatcher cycle.
+            let dispatch = self
+                .dispatch
+                .get()
+                .and_then(WeakDispatch::upgrade)
+                .expect("a live span keeps its test dispatcher alive");
+            let closed = tracing::dispatcher::with_default(&dispatch, || self.inner.try_close(id));
+            if closed {
+                // The simple exporter has finished before try_close returns.
+                // Wake assertions only after the owning registry and layers
+                // have completed cleanup, including recursive parent closure.
+                self.closed.notify_waiters();
+            }
+            closed
+        }
+
+        fn current_span(&self) -> tracing_core::span::Current {
+            self.inner.current_span()
+        }
+
+        // OpenTelemetrySpanExt downcasts through the subscriber to its layer.
+        // SAFETY: Forward the unchanged TypeId to the inner subscriber, which
+        // owns the returned pointer for exactly as long as this wrapper lives.
+        #[allow(unsafe_code)]
+        unsafe fn downcast_raw(&self, id: std::any::TypeId) -> Option<*const ()> {
+            if id == std::any::TypeId::of::<Self>() {
+                Some(std::ptr::from_ref(self).cast())
+            } else {
+                // SAFETY: The inner subscriber owns and validates this downcast.
+                unsafe { self.inner.downcast_raw(id) }
+            }
+        }
+    }
+
     /// Installs a process-wide registry before any scoped test subscriber is
     /// used.
     ///
@@ -174,11 +403,17 @@ pub mod test_exporter {
             .with_simple_exporter(exporter.clone())
             .build();
         let subscriber = tracing_subscriber::registry().with(super::layer(&provider, None));
-        let dispatch = tracing::Dispatch::new(subscriber);
+        let closed = Arc::new(tokio::sync::Notify::new());
+        let dispatch = Dispatch::new(CloseWithDispatch {
+            inner: subscriber,
+            dispatch: OnceLock::new(),
+            closed: Arc::clone(&closed),
+        });
         TracingTestGuard {
             _default: tracing::dispatcher::set_default(&dispatch),
             _provider: provider,
             exporter,
+            closed,
             _lock: lock,
         }
     }
@@ -187,6 +422,52 @@ pub mod test_exporter {
         /// Every span recorded by this test's in-memory exporter.
         pub fn finished_spans(&self) -> Vec<opentelemetry_sdk::trace::SpanData> {
             self.exporter.get_finished_spans().expect("in-memory spans")
+        }
+
+        /// Wait for expected spans to finish before taking an assertion snapshot.
+        ///
+        /// A completed `SQLx` query may still have its span held by a `SQLite`
+        /// worker. Export is synchronous once the span closes, but flushing
+        /// cannot close that live span. Await closure notifications instead of
+        /// assuming the query result also means tracing cleanup has completed.
+        pub async fn wait_for_spans(
+            &self,
+            predicate: impl Fn(&[opentelemetry_sdk::trace::SpanData]) -> bool + Send + Sync,
+        ) -> Vec<opentelemetry_sdk::trace::SpanData> {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    // notify_waiters wakes futures created before notification,
+                    // even before polling. Subscribe before reading so closure
+                    // between the snapshot and await cannot lose a wakeup.
+                    let notified = self.closed.notified();
+                    let spans = self.finished_spans();
+                    if predicate(&spans) {
+                        return spans;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for expected spans, got {:?}",
+                    self.finished_spans()
+                        .iter()
+                        .map(|span| &span.name)
+                        .collect::<Vec<_>>()
+                )
+            })
+        }
+
+        /// Wait for the completed span named `name`.
+        pub async fn wait_for_span(&self, name: &str) -> opentelemetry_sdk::trace::SpanData {
+            let spans = self
+                .wait_for_spans(|spans| spans.iter().any(|span| span.name == name))
+                .await;
+            spans
+                .into_iter()
+                .find(|span| span.name == name)
+                .expect("the awaited snapshot contains the expected span")
         }
 
         /// Spans named `name`.
@@ -255,7 +536,7 @@ pub mod test_exporter {
     /// Forces the global subscriber up first so callsite interest is decided
     /// by a registry that records, not by the no-op default.
     #[must_use]
-    pub fn install_scoped(subscriber: impl Into<tracing::Dispatch>) -> ScopedTracingTestGuard {
+    pub fn install_scoped(subscriber: impl Into<Dispatch>) -> ScopedTracingTestGuard {
         let lock = crate::TEST_TRACING_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -276,6 +557,7 @@ pub mod test_exporter {
         _default: tracing::dispatcher::DefaultGuard,
         _provider: opentelemetry_sdk::trace::SdkTracerProvider,
         exporter: opentelemetry_sdk::trace::InMemorySpanExporter,
+        closed: Arc<tokio::sync::Notify>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -291,11 +573,28 @@ pub mod test_exporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_file::{OcsfOtlpConfig, OtlpTracesConfig};
+    use crate::test_environment::Environment;
 
     fn config() -> OtlpConfig {
+        with_traces_endpoint("http://127.0.0.1:4317")
+    }
+
+    fn with_traces_endpoint(endpoint: &str) -> OtlpConfig {
         OtlpConfig {
-            endpoint: "http://127.0.0.1:4317".into(),
             service_name: None,
+            traces: Some(OtlpTracesConfig {
+                endpoint: endpoint.into(),
+            }),
+            ocsf: None,
+            agent: None,
+        }
+    }
+
+    fn ocsf_config(endpoint: &str) -> OcsfOtlpConfig {
+        OcsfOtlpConfig {
+            endpoint: endpoint.into(),
+            schema_version: None,
         }
     }
 
@@ -304,16 +603,148 @@ mod tests {
     }
 
     #[test]
-    fn resource_defaults_the_service_name() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _env = EnvVarGuard::remove("OTEL_SERVICE_NAME");
+    fn supervisors_receive_the_gateway_ocsf_headers() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string())
+            }
+        };
+        let headers = |otlp: &OtlpConfig, vars| {
+            ocsf_headers_from(Some(otlp), env(vars)).map(|h| h.expose_secret().to_string())
+        };
+        let mut otlp = config();
+        let both: &[(&str, &str)] = &[
+            ("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "authorization=logs"),
+            ("OTEL_EXPORTER_OTLP_HEADERS", "authorization=all"),
+        ];
+        assert_eq!(headers(&otlp, both), None, "OCSF export is not enabled");
 
+        otlp.ocsf = Some(ocsf_config("http://127.0.0.1:4317"));
+        assert_eq!(headers(&otlp, both).as_deref(), Some("authorization=logs"));
         assert_eq!(
-            service_name_of(&build_test_resource(&config())),
-            Some(DEFAULT_SERVICE_NAME.to_string())
+            headers(
+                &otlp,
+                &[("OTEL_EXPORTER_OTLP_HEADERS", "authorization=all")]
+            )
+            .as_deref(),
+            Some("authorization=all")
         );
+        assert_eq!(
+            headers(&otlp, &[("OTEL_EXPORTER_OTLP_LOGS_HEADERS", " ")]),
+            None
+        );
+        assert_eq!(headers(&otlp, &[]), None);
+        assert!(ocsf_headers_from(None, env(both)).is_none());
+    }
+
+    #[tokio::test]
+    async fn each_signal_exports_only_when_configured() {
+        let (export, error) =
+            OtlpExport::start(Some(&config()), GatewayResourceAttributes::default());
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        let export = export.expect("trace export");
+        assert_eq!(export.traces_endpoint(), Some("http://127.0.0.1:4317"));
+        assert!(export.ocsf().is_none());
+        export.shutdown().await;
+
+        let mut cfg = config();
+        cfg.ocsf = Some(ocsf_config("http://siem:4317"));
+        let (export, error) = OtlpExport::start(Some(&cfg), GatewayResourceAttributes::default());
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        let export = export.expect("trace and OCSF log export");
+        assert_eq!(export.traces_endpoint(), Some("http://127.0.0.1:4317"));
+        assert_eq!(export.ocsf_endpoint(), Some("http://siem:4317"));
+        assert!(export.ocsf().is_some());
+        export.shutdown().await;
+
+        cfg.traces = None;
+        let (export, error) = OtlpExport::start(Some(&cfg), GatewayResourceAttributes::default());
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        let export = export.expect("OCSF log export");
+        assert!(export.tracer_provider().is_none());
+        assert!(export.ocsf().is_some());
+        export.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ocsf_records_reach_an_otlp_collector_over_grpc() {
+        use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, ocsf_emit};
+        use tracing_subscriber::prelude::*;
+
+        let collector = openshell_otel_test_support::OtlpTestServer::start().await;
+        let mut cfg = config();
+        cfg.traces = None;
+        cfg.ocsf = Some(ocsf_config(collector.endpoint()));
+        let (export, error) = OtlpExport::start(
+            Some(&cfg),
+            GatewayResourceAttributes::new(Some("test-gateway"), Some("docker")),
+        );
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        let export = export.expect("OTLP export");
+        let event =
+            ConfigStateChangeBuilder::new(&crate::gateway_ocsf::context("sandbox-1", "sandbox"))
+                .severity(SeverityId::Medium)
+                .message("policy approved")
+                .build();
+        let expected = serde_json::to_value(&event).unwrap();
+        let subscriber =
+            tracing_subscriber::registry().with(export.ocsf().expect("OCSF log export").layer());
+        tracing::subscriber::with_default(subscriber, || ocsf_emit!(event));
+        export.shutdown().await;
+        let received = collector.shutdown().await;
+
+        assert_eq!(received.gateway_names, ["test-gateway"]);
+        assert_eq!(received.log_bodies.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&received.log_bodies[0]).unwrap(),
+            expected
+        );
+    }
+
+    /// Supervisors authenticate to the collector with the headers from their
+    /// launch bundle.
+    #[tokio::test]
+    async fn ocsf_export_sends_explicit_collector_headers() {
+        use openshell_ocsf::{ConfigStateChangeBuilder, ocsf_emit};
+        use tracing_subscriber::prelude::*;
+
+        let collector = openshell_otel_test_support::OtlpTestServer::start().await;
+        let target = OtlpTarget::new(&OtlpExportConfig {
+            endpoint: collector.endpoint(),
+            service_name: ServiceName::Fixed("openshell-supervisor"),
+            service_version: None,
+            resource_attributes: Vec::new(),
+        })
+        .unwrap();
+        let export = OcsfOtlp::start(
+            target
+                .log_exporter_with_headers(Some("authorization=Bearer%20collector-token"))
+                .unwrap(),
+            target.resource().clone(),
+        );
+        let event =
+            ConfigStateChangeBuilder::new(&crate::gateway_ocsf::context("sandbox-1", "sandbox"))
+                .message("policy approved")
+                .build();
+        let subscriber = tracing_subscriber::registry().with(export.layer());
+        tracing::subscriber::with_default(subscriber, || ocsf_emit!(event));
+        export.shutdown().await;
+        let received = collector.shutdown().await;
+
+        assert_eq!(received.log_bodies.len(), 1);
+        assert_eq!(received.log_authorizations, ["Bearer collector-token"]);
+    }
+
+    #[test]
+    fn resource_defaults_the_service_name() {
+        Environment::new().remove("OTEL_SERVICE_NAME").run(|| {
+            assert_eq!(
+                service_name_of(&build_test_resource(&config())),
+                Some(DEFAULT_SERVICE_NAME.to_string())
+            );
+        });
     }
 
     #[test]
@@ -361,40 +792,6 @@ mod tests {
         );
     }
 
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        #[allow(unsafe_code)]
-        fn remove(key: &'static str) -> Self {
-            let original = std::env::var(key).ok();
-            // SAFETY: tests serialize environment mutation with TEST_ENV_LOCK.
-            unsafe { std::env::remove_var(key) };
-            Self { key, original }
-        }
-
-        #[allow(unsafe_code)]
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            // SAFETY: tests serialize environment mutation with TEST_ENV_LOCK.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        #[allow(unsafe_code)]
-        fn drop(&mut self) {
-            // SAFETY: tests serialize environment mutation with TEST_ENV_LOCK.
-            match self.original.as_deref() {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
     fn service_name_of(resource: &Resource) -> Option<String> {
         resource
             .get(&opentelemetry::Key::from_static_str("service.name"))
@@ -406,54 +803,48 @@ mod tests {
     /// when an operator has stated it explicitly.
     #[test]
     fn configured_service_name_wins_over_the_env_var() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _env = EnvVarGuard::set("OTEL_SERVICE_NAME", "from-env");
+        Environment::new()
+            .set("OTEL_SERVICE_NAME", "from-env")
+            .run(|| {
+                let mut cfg = config();
+                cfg.service_name = Some("from-config".into());
 
-        let mut cfg = config();
-        cfg.service_name = Some("from-config".into());
-
-        assert_eq!(
-            service_name_of(&build_test_resource(&cfg)),
-            Some("from-config".to_string())
-        );
+                assert_eq!(
+                    service_name_of(&build_test_resource(&cfg)),
+                    Some("from-config".to_string())
+                );
+            });
     }
 
     /// With no `service_name` in the config file, the SDK's env detector is
     /// the fallback rather than the built-in default.
     #[test]
     fn env_service_name_applies_when_config_omits_it() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _env = EnvVarGuard::set("OTEL_SERVICE_NAME", "from-env");
-
-        assert_eq!(
-            service_name_of(&build_test_resource(&config())),
-            Some("from-env".to_string())
-        );
+        Environment::new()
+            .set("OTEL_SERVICE_NAME", "from-env")
+            .run(|| {
+                assert_eq!(
+                    service_name_of(&build_test_resource(&config())),
+                    Some("from-env".to_string())
+                );
+            });
     }
 
     #[test]
     fn blank_service_name_falls_back_to_the_default() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _env = EnvVarGuard::remove("OTEL_SERVICE_NAME");
-
-        let mut cfg = config();
-        cfg.service_name = Some("   ".into());
-        assert_eq!(
-            service_name_of(&build_test_resource(&cfg)),
-            Some(DEFAULT_SERVICE_NAME.to_string())
-        );
+        Environment::new().remove("OTEL_SERVICE_NAME").run(|| {
+            let mut cfg = config();
+            cfg.service_name = Some("   ".into());
+            assert_eq!(
+                service_name_of(&build_test_resource(&cfg)),
+                Some(DEFAULT_SERVICE_NAME.to_string())
+            );
+        });
     }
 
     #[test]
     fn provider_rejects_a_malformed_endpoint() {
-        let mut cfg = config();
-        cfg.endpoint = "definitely not a url".into();
+        let cfg = with_traces_endpoint("definitely not a url");
         let err = build_provider(&cfg, GatewayResourceAttributes::default())
             .expect_err("malformed endpoint");
         assert!(
@@ -464,8 +855,7 @@ mod tests {
 
     #[test]
     fn provider_rejects_an_empty_endpoint() {
-        let mut cfg = config();
-        cfg.endpoint = "   ".into();
+        let cfg = with_traces_endpoint("   ");
         assert!(
             build_provider(&cfg, GatewayResourceAttributes::default()).is_err(),
             "empty endpoint is rejected"
@@ -487,8 +877,8 @@ mod tests {
     /// error for the caller to log — see the misconfigured-endpoint test.
     #[tokio::test]
     async fn absent_otlp_table_disables_export() {
-        let (provider, err) = provider_for(None, GatewayResourceAttributes::default());
-        assert!(provider.is_none(), "export is off");
+        let (export, err) = OtlpExport::start(None, GatewayResourceAttributes::default());
+        assert!(export.is_none(), "export is off");
         assert!(
             err.is_none(),
             "an absent table is a choice, not an error to report"
@@ -497,9 +887,10 @@ mod tests {
 
     #[tokio::test]
     async fn present_otlp_table_enables_export() {
-        let (provider, err) = provider_for(Some(&config()), GatewayResourceAttributes::default());
+        let (export, err) =
+            OtlpExport::start(Some(&config()), GatewayResourceAttributes::default());
         assert!(err.is_none());
-        provider.expect("provider is present").shutdown().ok();
+        export.expect("export is on").shutdown().await;
     }
 
     /// Telemetry must never be able to take the gateway down. A bad endpoint
@@ -507,15 +898,127 @@ mod tests {
     /// gateway from starting.
     #[tokio::test]
     async fn misconfigured_endpoint_disables_export_without_failing_startup() {
-        let mut cfg = config();
-        cfg.endpoint = "definitely not a url".into();
+        let mut bad_ocsf = config();
+        bad_ocsf.ocsf = Some(ocsf_config("definitely not a url"));
+        let mut bad_agent = config();
+        bad_agent.agent = Some(crate::config_file::AgentOtlpConfig {
+            endpoint: "definitely not a url".into(),
+        });
+        for cfg in [
+            with_traces_endpoint("definitely not a url"),
+            bad_ocsf,
+            bad_agent,
+        ] {
+            let (export, err) = OtlpExport::start(Some(&cfg), GatewayResourceAttributes::default());
+            assert!(
+                export.is_none(),
+                "a bad endpoint degrades to no export rather than failing startup"
+            );
+            assert!(err.is_some(), "the failure is reportable, not swallowed");
+        }
+    }
 
-        let (provider, err) = provider_for(Some(&cfg), GatewayResourceAttributes::default());
-        assert!(
-            provider.is_none(),
-            "a bad endpoint degrades to no export rather than failing startup"
+    #[tokio::test]
+    async fn tracing_child_closed_on_worker_keeps_its_parent_and_exporter() {
+        use opentelemetry::trace::TraceContextExt as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+        let traced = test_exporter::install_traced();
+        let parent = tracing::info_span!("worker_parent");
+        let child = tracing::info_span!(parent: &parent, "worker_child");
+        // Also exercise layer downcasting through the fixture's subscriber.
+        let parent_context = parent.context();
+        let child_context = child.context();
+        drop(parent);
+
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            released.recv().expect("test releases the worker's span");
+            // Like SQLx, enter the carried span without installing its dispatcher.
+            let entered = child.enter();
+            drop(entered);
+            // This is deliberately the child's last reference. Its parent has
+            // no remaining references either, so both must close on this worker.
+            drop(child);
+            // Closing the carried span must also restore the worker's default,
+            // so unrelated work cannot leak into this test's private exporter.
+            drop(tracing::info_span!("unrelated_worker_span"));
+        });
+
+        assert!(traced.finished_spans().is_empty());
+        let waiting = traced.wait_for_span("worker_parent");
+        tokio::pin!(waiting);
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+
+        release.send(()).unwrap();
+        let parent = waiting.await;
+        worker
+            .join()
+            .expect("worker closes spans without consulting the global registry");
+        let child = traced.span_named("worker_child");
+        test_exporter::assert_is_root(&parent);
+        assert_eq!(child.parent_span_id, parent.span_context.span_id());
+        assert_eq!(
+            child.span_context.trace_id(),
+            parent.span_context.trace_id()
         );
-        assert!(err.is_some(), "the failure is reportable, not swallowed");
+        assert_eq!(parent_context.span().span_context(), &parent.span_context);
+        assert_eq!(child_context.span().span_context(), &child.span_context);
+        assert_eq!(traced.finished_spans().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tracing_exporters_isolate_unrelated_threads_and_successive_tests() {
+        // Use the same callsite under all dispatchers to exercise the global
+        // interest cache without sharing their captured spans.
+        fn emit_span() {
+            drop(tracing::info_span!("isolated_test_span"));
+        }
+
+        let traced = test_exporter::install_traced();
+        emit_span();
+        std::thread::spawn(emit_span)
+            .join()
+            .expect("unrelated worker records only into the global registry");
+        let first = traced.span_named("isolated_test_span");
+        test_exporter::assert_is_root(&first);
+        assert_eq!(traced.finished_spans().len(), 1);
+        drop(traced);
+
+        let traced = test_exporter::install_traced();
+        assert!(traced.finished_spans().is_empty());
+        emit_span();
+        let second = traced.span_named("isolated_test_span");
+        test_exporter::assert_is_root(&second);
+        assert_eq!(traced.finished_spans().len(), 1);
+        assert_ne!(
+            first.span_context.trace_id(),
+            second.span_context.trace_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn tracing_wait_does_not_lose_closure_between_snapshot_and_await() {
+        let traced = test_exporter::install_traced();
+        let span = std::sync::Mutex::new(Some(tracing::info_span!("close_before_await")));
+        let spans = traced
+            .wait_for_spans(|spans| {
+                // The first snapshot is empty. Close its span before polling
+                // the notification future, as a worker could do concurrently.
+                drop(span.lock().unwrap().take());
+                spans.iter().any(|span| span.name == "close_before_await")
+            })
+            .await;
+        assert_eq!(spans.len(), 1);
+        test_exporter::assert_is_root(&spans[0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "timed out waiting for expected spans")]
+    async fn tracing_wait_times_out_when_a_span_never_closes() {
+        let traced = test_exporter::install_traced();
+        let _span = tracing::info_span!("still_open");
+        traced.wait_for_span("still_open").await;
     }
 
     #[tokio::test]

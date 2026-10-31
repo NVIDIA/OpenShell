@@ -13,10 +13,11 @@
 /// ```ignore
 /// impl_builder_setters!(MyBuilder);            // severity + status + message
 /// impl_builder_setters!(MyBuilder, no_status); // severity + message only
+/// impl_builder_setters!(MyBuilder<State>);     // for a type-state builder
 /// ```
 macro_rules! impl_builder_setters {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the event severity.
             #[must_use]
             pub fn severity(mut self, id: $crate::enums::SeverityId) -> Self {
@@ -37,8 +38,8 @@ macro_rules! impl_builder_setters {
             }
         }
     };
-    ($builder:ident, no_status) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?, no_status) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the event severity.
             #[must_use]
             pub fn severity(mut self, id: $crate::enums::SeverityId) -> Self {
@@ -58,8 +59,8 @@ macro_rules! impl_builder_setters {
 /// Generate the `activity` setter used by every event builder that carries an
 /// `activity` field.
 macro_rules! impl_activity_setter {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the event activity identifier.
             #[must_use]
             pub fn activity(mut self, id: $crate::enums::ActivityId) -> Self {
@@ -70,11 +71,11 @@ macro_rules! impl_activity_setter {
     };
 }
 
-/// Generate `action` and `disposition` setters shared by network, HTTP, SSH,
-/// process, and detection-finding builders.
+/// Generate `action` and `disposition` setters shared by every builder whose
+/// event records an action and its disposition.
 macro_rules! impl_action_disposition_setters {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
+    ($builder:ident $(<$state:ident>)?) => {
+        impl<'a $(, $state)?> $builder<'a $(, $state)?> {
             /// Set the action taken.
             #[must_use]
             pub fn action(mut self, id: $crate::enums::ActionId) -> Self {
@@ -91,50 +92,8 @@ macro_rules! impl_action_disposition_setters {
     };
 }
 
-/// Generate the `actor_process` setter shared by network, HTTP, SSH, and
-/// process-activity builders.
-macro_rules! impl_actor_process_setter {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
-            /// Set the acting process.
-            #[must_use]
-            pub fn actor_process(mut self, process: $crate::objects::Process) -> Self {
-                self.actor = Some($crate::objects::Actor { process });
-                self
-            }
-        }
-    };
-}
-
-/// Generate the `dst_endpoint` setter shared by network, HTTP, and SSH builders.
-macro_rules! impl_dst_endpoint_setter {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
-            /// Set the destination endpoint.
-            #[must_use]
-            pub fn dst_endpoint(mut self, endpoint: $crate::objects::Endpoint) -> Self {
-                self.dst_endpoint = Some(endpoint);
-                self
-            }
-        }
-    };
-}
-
-/// Generate the `src_endpoint_addr` setter shared by network and SSH builders.
-macro_rules! impl_src_endpoint_addr_setter {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
-            /// Set the source endpoint from a raw IP address and port.
-            #[must_use]
-            pub fn src_endpoint_addr(mut self, ip: std::net::IpAddr, port: u16) -> Self {
-                self.src_endpoint = Some($crate::objects::Endpoint::from_ip(ip, port));
-                self
-            }
-        }
-    };
-}
-
 mod api_activity;
+mod authentication;
 mod base;
 mod config;
 mod finding;
@@ -145,6 +104,7 @@ mod process;
 mod ssh;
 
 pub use api_activity::ApiActivityBuilder;
+pub use authentication::AuthenticationBuilder;
 pub use base::BaseEventBuilder;
 pub use config::ConfigStateChangeBuilder;
 pub use finding::DetectionFindingBuilder;
@@ -155,11 +115,24 @@ pub use process::ProcessActivityBuilder;
 pub use ssh::SshActivityBuilder;
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use crate::OCSF_VERSION;
 use crate::enums::StatusId;
 use crate::events::base_event::BaseEventData;
 use crate::objects::{Container, Device, Endpoint, Image, Metadata, Product};
+
+/// Which `OpenShell` component produced an event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventOrigin {
+    /// The supervisor process enforcing sandbox policy.
+    Supervisor,
+    /// The gateway process, which has no sandbox or container of its own.
+    Gateway {
+        /// Operator-assigned gateway name (`[openshell.gateway] name`).
+        name: String,
+    },
+}
 
 /// Immutable context created once at sandbox startup.
 ///
@@ -181,18 +154,65 @@ pub struct EventContext {
     pub proxy_ip: IpAddr,
     /// Proxy listen port.
     pub proxy_port: u16,
+    /// Which component is emitting.
+    pub origin: EventOrigin,
+}
+
+/// Event context borrowed from the caller or shared by a hosted sandbox
+/// instance.
+///
+/// Builders accept either form, so events attributed to a hosted sandbox
+/// instance need not leak a `'static` context for each instance.
+#[derive(Debug, Clone)]
+pub enum ContextRef<'a> {
+    Borrowed(&'a EventContext),
+    Shared(Arc<EventContext>),
+}
+
+impl std::ops::Deref for ContextRef<'_> {
+    type Target = EventContext;
+
+    fn deref(&self) -> &EventContext {
+        match self {
+            Self::Borrowed(context) => context,
+            Self::Shared(context) => context,
+        }
+    }
+}
+
+impl<'a> From<&'a EventContext> for ContextRef<'a> {
+    fn from(context: &'a EventContext) -> Self {
+        Self::Borrowed(context)
+    }
+}
+
+impl From<Arc<EventContext>> for ContextRef<'_> {
+    fn from(context: Arc<EventContext>) -> Self {
+        Self::Shared(context)
+    }
+}
+
+impl<'a> From<&'a ContextRef<'_>> for ContextRef<'a> {
+    fn from(context: &'a ContextRef<'_>) -> Self {
+        Self::Borrowed(context)
+    }
 }
 
 impl EventContext {
     /// Build the OCSF `Metadata` object for any event.
     #[must_use]
     pub fn metadata(&self, profiles: &[&str]) -> Metadata {
+        let product = match self.origin {
+            EventOrigin::Supervisor => Product::openshell_sandbox(&self.product_version),
+            EventOrigin::Gateway { .. } => Product::openshell_gateway(&self.product_version),
+        };
         Metadata {
             version: OCSF_VERSION.to_string(),
-            product: Product::openshell_sandbox(&self.product_version),
+            product,
             profiles: profiles.iter().map(|s| (*s).to_string()).collect(),
             uid: Some(uuid::Uuid::new_v4().to_string()),
             log_source: None,
+            correlation_uid: None,
         }
     }
 
@@ -215,7 +235,10 @@ impl EventContext {
     /// on (Linux for the in-sandbox supervisor, Windows for the MXC gateway).
     #[must_use]
     pub fn device(&self) -> Device {
-        Device::for_current_os(&self.hostname)
+        match &self.origin {
+            EventOrigin::Supervisor => Device::for_current_os(&self.hostname),
+            EventOrigin::Gateway { name } => Device::gateway(&self.hostname, name),
+        }
     }
 
     /// Build the `proxy_endpoint` object for the Network Proxy profile.
@@ -255,6 +278,131 @@ pub(crate) fn test_sandbox_context() -> EventContext {
         product_version: "0.1.0".to_string(),
         proxy_ip: "10.42.0.1".parse().unwrap(),
         proxy_port: 3128,
+        origin: EventOrigin::Supervisor,
+    }
+}
+
+/// One event per builder, as production emits them, for schema conformance tests.
+#[cfg(test)]
+pub(crate) fn sample_events(ctx: &EventContext) -> Vec<(&'static str, crate::OcsfEvent)> {
+    use crate::{
+        ActionId, ActivityId, AiModel, ConnectionInfo, DispositionId, Endpoint, FindingInfo,
+        HttpRequest, HttpResponse, Process, Service, SeverityId, StateId, Url, User,
+    };
+
+    let peer = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5));
+    vec![
+        (
+            "network_activity",
+            NetworkActivityBuilder::new(ctx)
+                .activity(ActivityId::Open)
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Allowed)
+                .src_endpoint_addr(peer, 51234)
+                .dst_endpoint(Endpoint::from_domain("api.example.com", 443))
+                .connection_info(ConnectionInfo::new("tcp"))
+                .actor_process(Process::new("curl", 42))
+                .firewall_rule("default", "opa")
+                .build(),
+        ),
+        (
+            "http_activity",
+            HttpActivityBuilder::new(ctx)
+                .activity(ActivityId::Reset)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .http_request(HttpRequest::new(
+                    "GET",
+                    Url::new("https", "api.example.com", "/v1", 443),
+                ))
+                .http_response(HttpResponse { code: 403 })
+                .src_endpoint(Endpoint::from_ip(peer, 51234))
+                .dst_endpoint(Endpoint::from_domain("api.example.com", 443))
+                .actor_process(Process::new("curl", 42))
+                .build(),
+        ),
+        (
+            "ssh_activity",
+            SshActivityBuilder::new(ctx)
+                .activity(ActivityId::Open)
+                .src_endpoint_addr(peer, 44321)
+                .dst_endpoint(Endpoint::from_domain("sandbox.local", 22))
+                .build(),
+        ),
+        (
+            "process_activity",
+            ProcessActivityBuilder::new(ctx)
+                .activity(ActivityId::Open)
+                .process(Process::new("python3", 4713))
+                .actor_process(Process::new("openshell-sandbox", 1))
+                .build(),
+        ),
+        (
+            "detection_finding",
+            DetectionFindingBuilder::new(ctx)
+                .activity(ActivityId::Open)
+                .severity(SeverityId::High)
+                .is_alert(true)
+                .confidence(crate::ConfidenceId::High)
+                .risk_level(crate::RiskLevelId::High)
+                .finding_info(FindingInfo::new("finding-1", "Nonce replay"))
+                .evidence_pairs(&[("nonce", "0xdeadbeef"), ("peer", "10.0.0.5")])
+                .remediation("Rotate the sandbox SSH keys.")
+                .attack(crate::Attack::mitre(
+                    "T1550",
+                    "Use Alternate Authentication Material",
+                    "TA0008",
+                    "Lateral Movement",
+                ))
+                .message("Nonce replay detected")
+                .build(),
+        ),
+        (
+            "application_lifecycle",
+            AppLifecycleBuilder::new(ctx)
+                .activity(ActivityId::Open)
+                .build(),
+        ),
+        (
+            "device_config_state_change",
+            ConfigStateChangeBuilder::new(ctx)
+                .state(StateId::Enabled, "loaded")
+                .build(),
+        ),
+        ("base_event", BaseEventBuilder::new(ctx).build()),
+        (
+            "api_activity",
+            ApiActivityBuilder::new(ctx, "chat.completions")
+                .dst_endpoint(Endpoint::from_domain("api.example.com", 443))
+                .ai_model(AiModel::new("model", "provider"))
+                .build(),
+        ),
+        (
+            "authentication",
+            AuthenticationBuilder::new(
+                ctx,
+                User::unidentified(),
+                Service::new("openshell-gateway"),
+            )
+            .src_endpoint(Endpoint::from_ip(peer, 51234))
+            .build(),
+        ),
+    ]
+}
+
+#[cfg(test)]
+pub(crate) fn test_gateway_context() -> EventContext {
+    EventContext {
+        sandbox_id: String::new(),
+        sandbox_name: String::new(),
+        container_image: String::new(),
+        hostname: "openshell-gateway-0".to_string(),
+        product_version: "0.1.0".to_string(),
+        proxy_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        proxy_port: 0,
+        origin: EventOrigin::Gateway {
+            name: "openshell".to_string(),
+        },
     }
 }
 
@@ -274,16 +422,17 @@ mod tests {
         assert_ne!(uid, "sandbox-abc123");
     }
 
+    /// One event per builder, built with a production-like sandbox context
+    /// (container image set), must validate against the vendored 1.8.0 schemas.
     #[test]
-    fn test_emitted_device_matches_vendored_schema() {
-        use crate::validation::schema::{
-            load_object_schema, validate_enum_value, validate_required_fields,
-        };
-
-        let device = serde_json::to_value(test_sandbox_context().device()).unwrap();
-        let schema = load_object_schema("device");
-        validate_required_fields(&device, &schema);
-        validate_enum_value(&device, "type_id", &schema);
+    fn every_builder_emits_schema_conformant_events() {
+        let ctx = test_sandbox_context();
+        let events = sample_events(&ctx);
+        for (class, event) in &events {
+            let json = event.to_json().unwrap();
+            openshell_ocsf_validate::validate_event(&json)
+                .unwrap_or_else(|e| panic!("{class}: {e}"));
+        }
     }
 
     #[test]

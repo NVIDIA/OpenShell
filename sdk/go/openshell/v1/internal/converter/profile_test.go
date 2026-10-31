@@ -139,14 +139,15 @@ func TestNetworkBinaryToProto_Nil(t *testing.T) {
 
 func TestProfileCredentialFromProto(t *testing.T) {
 	proto := &pb.ProviderProfileCredential{
-		Name:         "API_KEY",
-		Description:  "API key for auth",
-		EnvVars:      []string{"ANTHROPIC_API_KEY", "API_KEY"},
-		Required:     true,
-		AuthStyle:    "header",
-		HeaderName:   "X-API-Key",
-		QueryParam:   "api_key",
-		PathTemplate: "/v1/{credential}/chat",
+		Name:              "API_KEY",
+		Description:       "API key for auth",
+		EnvVars:           []string{"ANTHROPIC_API_KEY", "API_KEY"},
+		Required:          true,
+		StablePlaceholder: true,
+		AuthStyle:         "header",
+		HeaderName:        "X-API-Key",
+		QueryParam:        "api_key",
+		PathTemplate:      "/v1/{credential}/chat",
 		Refresh: &pb.ProviderCredentialRefresh{
 			Strategy: pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_REFRESH_TOKEN,
 		},
@@ -177,6 +178,7 @@ func TestProfileCredentialFromProto(t *testing.T) {
 	assert.Equal(t, "API key for auth", cred.Description)
 	assert.Equal(t, []string{"ANTHROPIC_API_KEY", "API_KEY"}, cred.EnvVars)
 	assert.True(t, cred.Required)
+	assert.True(t, cred.StablePlaceholder)
 	assert.True(t, cred.Secret, "credential with refresh config is secret")
 	assert.Equal(t, "header", cred.AuthStyle)
 	assert.Equal(t, "X-API-Key", cred.HeaderName)
@@ -319,11 +321,12 @@ func TestProfileCredentialFromProto_Nil(t *testing.T) {
 
 func TestProfileCredentialToProto(t *testing.T) {
 	cred := &v1.ProfileCredential{
-		Name:        "API_KEY",
-		Description: "API key",
-		EnvVars:     []string{"ANTHROPIC_API_KEY"},
-		Required:    true,
-		Secret:      true,
+		Name:              "API_KEY",
+		Description:       "API key",
+		EnvVars:           []string{"ANTHROPIC_API_KEY"},
+		Required:          true,
+		StablePlaceholder: true,
+		Secret:            true,
 		Refresh: &v1.ProfileCredentialRefresh{
 			Strategy:          v1.RefreshStrategyOAuth2RefreshToken,
 			TokenURL:          "https://auth.example.com/token",
@@ -364,6 +367,7 @@ func TestProfileCredentialToProto(t *testing.T) {
 	assert.Equal(t, "API key", proto.Description)
 	assert.Equal(t, []string{"ANTHROPIC_API_KEY"}, proto.EnvVars)
 	assert.True(t, proto.Required)
+	assert.True(t, proto.StablePlaceholder)
 	assert.Equal(t, "header", proto.AuthStyle)
 	assert.Equal(t, "X-API-Key", proto.HeaderName)
 	assert.Equal(t, "api_key", proto.QueryParam)
@@ -470,6 +474,9 @@ func TestProviderProfileFromProto(t *testing.T) {
 		Credentials: []*pb.ProviderProfileCredential{
 			{Name: "API_KEY", Description: "key", Required: true},
 		},
+		Files: []*pb.ProviderProfileFile{
+			{Path: "client.toml", Content: "project = \"{{config.project}}\"", EnvVar: "CLIENT_CONFIG"},
+		},
 		Endpoints: []*sbv1.NetworkEndpoint{
 			{Host: "api.anthropic.com", Port: 443, Protocol: "rest"},
 		},
@@ -502,6 +509,9 @@ func TestProviderProfileFromProto(t *testing.T) {
 	require.Len(t, profile.Credentials, 1)
 	assert.Equal(t, "API_KEY", profile.Credentials[0].Name)
 	assert.True(t, profile.Credentials[0].Required)
+	require.Len(t, profile.Files, 1)
+	assert.Equal(t, "client.toml", profile.Files[0].Path)
+	assert.Equal(t, "CLIENT_CONFIG", profile.Files[0].EnvVar)
 
 	require.Len(t, profile.Endpoints, 1)
 	assert.Equal(t, "api.anthropic.com", profile.Endpoints[0].Host)
@@ -514,6 +524,8 @@ func TestProviderProfileFromProto(t *testing.T) {
 
 	proto.Annotations["env"] = "MUTATED"
 	assert.Equal(t, "prod", profile.Annotations["env"], "annotations must be deep copied")
+	proto.Files[0].Content = "changed"
+	assert.Equal(t, "project = \"{{config.project}}\"", profile.Files[0].Content)
 }
 
 func TestProviderProfileFromProto_NilDiscovery(t *testing.T) {
@@ -540,6 +552,9 @@ func TestProviderProfileToProto(t *testing.T) {
 		Category:    v1.ProfileCategoryInference,
 		Credentials: []v1.ProfileCredential{
 			{Name: "API_KEY", Description: "key", Required: true, Secret: true},
+		},
+		Files: []v1.ProfileFile{
+			{Path: "client.toml", Content: "project = \"{{config.project}}\"", EnvVar: "CLIENT_CONFIG"},
 		},
 		Endpoints: []v1.NetworkEndpoint{
 			{Host: "api.anthropic.com", Port: 443, Protocol: "rest"},
@@ -572,6 +587,8 @@ func TestProviderProfileToProto(t *testing.T) {
 
 	require.Len(t, proto.Credentials, 1)
 	assert.Equal(t, "API_KEY", proto.Credentials[0].Name)
+	require.Len(t, proto.Files, 1)
+	assert.Equal(t, "client.toml", proto.Files[0].Path)
 
 	require.Len(t, proto.Endpoints, 1)
 	assert.Equal(t, "api.anthropic.com", proto.Endpoints[0].Host)
@@ -584,6 +601,8 @@ func TestProviderProfileToProto(t *testing.T) {
 
 	profile.Annotations["env"] = "MUTATED"
 	assert.Equal(t, "prod", proto.Annotations["env"], "annotations must be deep copied")
+	profile.Files[0].Content = "changed"
+	assert.Equal(t, "project = \"{{config.project}}\"", proto.Files[0].Content)
 }
 
 func TestProviderProfileToProto_Nil(t *testing.T) {
@@ -670,6 +689,9 @@ func TestProviderProfileRoundTrip(t *testing.T) {
 				},
 			},
 		},
+		Files: []v1.ProfileFile{
+			{Path: "client.toml", Content: "project = \"{{config.project}}\"", EnvVar: "CLIENT_CONFIG"},
+		},
 		Endpoints: []v1.NetworkEndpoint{
 			{Host: "agent.example.com", Port: 8080, Protocol: "websocket"},
 		},
@@ -699,6 +721,7 @@ func TestProviderProfileRoundTrip(t *testing.T) {
 	assert.Equal(t, original.Annotations, back.Annotations)
 	assert.Equal(t, original.Source, back.Source)
 	assert.Equal(t, original.Scope, back.Scope)
+	assert.Equal(t, original.Files, back.Files)
 
 	require.Len(t, back.Credentials, 1)
 	c := back.Credentials[0]

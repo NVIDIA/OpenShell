@@ -9,7 +9,7 @@ This prototype uses Nix, QEMU, and Ansible to boot and configure disposable Linu
 
 ## Requirements
 
-- Nix with flakes enabled.
+- Nix with flakes enabled, optionally with the OpenShell binary cache. See [Nix setup](../../CONTRIBUTING.md#nix-setup).
 - Apple Silicon macOS with HVF, or a native-architecture Linux host. Linux uses KVM when `/dev/kvm` is available and falls back to QEMU TCG otherwise.
 - Enough local capacity for a four-vCPU, 4 GiB guest and a disposable disk overlay.
 - Native-architecture artifacts. TCG emulates the guest CPU on Linux but does not enable cross-architecture guests.
@@ -78,7 +78,7 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 | Fedora 44 | No | Yes | Yes | Yes | `.rpm` |
 | Rocky Linux 9 | Yes | Yes | No | Yes | `.rpm` |
 
-The `snapd` configuration is available for Ubuntu and prepares snapd for Snap
+The `snapd` configuration is available for Ubuntu and prepares snapd for snap
 Store installation experiments. Combine it with `docker` to reproduce the
 system-Docker canary, or use it alone to verify that `install.sh` fails safely
 when Docker is absent.
@@ -175,19 +175,18 @@ prepared guest image to a particular build or driver configuration.
 Compose it with `gateway-podman` after either Podman configuration. The role
 uses the recorded mode to select the corresponding service account. It
 generates configuration only for development artifacts; RPM installations
-retain their packaged service and first-start configuration. For example, run
-conformance after the rootless provisioners complete:
+retain their packaged service and first-start configuration. For example,
+check the development gateway after the rootless provisioners complete:
 
 ```shell
 nix run .#test-guest -- \
   --distro fedora --with podman-rootless --with selinux \
   --copy ./openshell:/usr/local/bin/openshell \
-  --copy ./openshell-conformance:/usr/local/bin/openshell-conformance \
   --copy ./openshell-gateway:/usr/local/bin/openshell-gateway \
   --copy ./openshell-sandbox.tar:/usr/local/lib/openshell-sandbox.tar \
   --provision openshell-development \
   --provision gateway-podman \
-  -- /usr/local/bin/openshell-conformance run smoke
+  -- /usr/local/bin/openshell status
 ```
 
 `openshell-rpm` expects OpenShell to have been installed with `--install`. It
@@ -295,44 +294,6 @@ nix run .#test-guest -- \
   --copy ./openshell:/usr/local/bin/openshell:755 \
   -- openshell --version
 ```
-
-## Reproduce Snap installation
-
-Copy the repository installer and reproduction script into a prepared Ubuntu
-guest. The script follows both Release Canary Snap flows: it runs `install.sh`
-with `OPENSHELL_VERSION=dev`, checks the `latest/edge` channel and Docker
-interface, and exercises a sandbox. Repeated attempts also cover the installer's
-idempotent Snap refresh path. On each failure the script prints snapd, Docker,
-and gateway diagnostics.
-
-Reuse system Docker and verify that the Docker snap is not installed:
-
-```shell
-nix run .#test-guest -- \
-  --distro ubuntu-24-04 \
-  --with docker \
-  --with snapd \
-  --keep \
-  --copy ./install.sh:/tmp/install.sh \
-  --copy ./nix/test-guest/scripts/snap-gateway-repro.sh:/usr/local/bin/snap-gateway-repro \
-  -- /usr/local/bin/snap-gateway-repro /tmp/install.sh system-docker 10
-```
-
-Start without Docker and verify that `install.sh` rejects the Snap installation:
-
-```shell
-nix run .#test-guest -- \
-  --distro ubuntu-24-04 \
-  --with snapd \
-  --keep \
-  --copy ./install.sh:/tmp/install.sh \
-  --copy ./nix/test-guest/scripts/snap-gateway-repro.sh:/usr/local/bin/snap-gateway-repro \
-  -- /usr/local/bin/snap-gateway-repro /tmp/install.sh missing-docker 10
-```
-
-`--keep` retains the overlay and serial log when diagnosing a failure. The
-runner prints their location after shutdown.
-
 
 The destination must be an absolute guest path. Use bare octal permission bits
 from `000` through `777` for explicit modes.

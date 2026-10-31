@@ -31,4 +31,47 @@ CAPTURED_CONFIG="${WORK}/generated.toml" PATH="${WORK}/bin:${PATH}" KUBERNETES_S
 
 printf '%s\n' 'import sys, tomllib' 'from pathlib import Path' 'config = tomllib.loads(Path(sys.argv[1]).read_text())' 'gateway = config["openshell"]["gateway"]' 'driver = config["openshell"]["drivers"]["kubernetes"]' 'assert config["openshell"]["version"] == 2' 'assert gateway["compute_driver"] == "kubernetes"' 'assert "compute_drivers" not in gateway' 'assert driver["image_pull_policy"] == "if_not_present"' 'assert driver["grpc_endpoint"] == "https://callback.example.test:9443"' > "${WORK}/check_generated.py"
 "${UV}" run --no-project python "${WORK}/check_generated.py" "${CAPTURED_CONFIG}"
+
+# Keep the Podman E2E generator on the current gateway schema and preserve the
+# in-tree versus external-driver ownership boundary without starting Podman.
+# shellcheck source=e2e/support/gateway-common.sh
+source "${ROOT}/e2e/support/gateway-common.sh"
+# shellcheck source=e2e/support/podman-gateway-config.sh
+source "${ROOT}/e2e/support/podman-gateway-config.sh"
+
+mkdir -p "${WORK}/pki/client" "${WORK}/jwt"
+e2e_write_podman_gateway_config \
+  "${WORK}/podman.toml" "${ROOT}" "${WORK}/pki" "${WORK}/jwt" \
+  test-gateway 0 "${WORK}/driver.sock" test-network 18181 \
+  workload:test 15 supervisor:test sandbox:test "${WORK}/spiffe.sock" \
+  "${WORK}/podman.sock" 0 ""
+e2e_write_podman_gateway_config \
+  "${WORK}/podman-external.toml" "${ROOT}" "${WORK}/pki" "${WORK}/jwt" \
+  test-gateway 1 "${WORK}/driver.sock" test-network 18181 \
+  workload:test 15 supervisor:test sandbox:test "${WORK}/spiffe.sock" \
+  "${WORK}/podman.sock" 0 ""
+
+printf '%s\n' \
+  'import sys, tomllib' \
+  'from pathlib import Path' \
+  'internal = tomllib.loads(Path(sys.argv[1]).read_text())' \
+  'external = tomllib.loads(Path(sys.argv[2]).read_text())' \
+  'assert internal["openshell"]["version"] == 2' \
+  'gateway = internal["openshell"]["gateway"]' \
+  'driver = internal["openshell"]["drivers"]["podman"]' \
+  'assert gateway["compute_driver"] == "podman"' \
+  'assert gateway["guest_tls_ca"].endswith("/pki/ca.crt")' \
+  'assert driver["default_image"] == "workload:test"' \
+  'assert driver["image_pull_policy"] == "if_not_present"' \
+  'assert driver["supervisor_image"] == "supervisor:test"' \
+  'assert driver["sandbox_runtime_image"] == "sandbox:test"' \
+  'assert driver["provider_spiffe_workload_api_socket"].endswith("/spiffe.sock")' \
+  'assert driver["socket_path"].endswith("/podman.sock")' \
+  'assert driver["resource_admission"] == {"enabled": False}' \
+  'external_driver = external["openshell"]["drivers"]["podman"]' \
+  'assert external["openshell"]["gateway"]["guest_tls_ca"].endswith("/pki/ca.crt")' \
+  'assert external_driver == {"socket_path": sys.argv[3]}' \
+  >"${WORK}/check_podman_generated.py"
+"${UV}" run --no-project python "${WORK}/check_podman_generated.py" \
+  "${WORK}/podman.toml" "${WORK}/podman-external.toml" "${WORK}/driver.sock"
 echo "gateway generated-TOML tests passed"

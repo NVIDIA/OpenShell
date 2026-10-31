@@ -13,6 +13,10 @@ AGENT_ARG="${OPENSHELL_AGENT_DIR:-}"
 GATEWAY_OVERRIDE=""
 SANDBOX_NAME_OVERRIDE=""
 SANDBOX_FROM_OVERRIDE=""
+AGENT_IMAGE=""
+K3D_CLUSTER=""
+PUBLISH_IMAGE=""
+BUILD_ONLY=0
 HARNESS_OVERRIDE="${GATOR_HARNESS:-}"
 GITHUB_PROVIDER_OVERRIDE="${GATOR_GITHUB_PROVIDER:-}"
 CODEX_PROVIDER_OVERRIDE="${GATOR_CODEX_PROVIDER:-}"
@@ -32,8 +36,12 @@ usage() {
 Options:
   --agent NAME|PATH       Agent manifest directory or name under scripts/agents/
   --gateway NAME          Gateway name to use
-  --name NAME             Sandbox name
+  --name NAME             Sandbox name (DNS-1123 label, at most 19 characters)
   --from DOCKERFILE|DIR   Local Dockerfile source for the sandbox image
+  --image IMAGE@sha256:DIGEST  Reuse a compatible tooling image; skip local build
+  --k3d-cluster NAME      Build and import into this local cluster (Kubernetes only)
+  --publish-image REGISTRY/REPOSITORY:TAG  Build/push and launch by digest
+  --build-only           Build/deliver tooling without configuring or launching an agent
   --harness NAME          Agent harness to run
   --github-provider NAME  Override the github-gator provider instance name
   --codex-provider NAME   Override the codex-gator provider instance name
@@ -87,6 +95,28 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || fail "--harness requires a value"
             HARNESS_OVERRIDE="$2"
             shift 2
+            ;;
+        --image)
+            [[ $# -ge 2 ]] || fail "--image requires a value"
+            [[ -n "$2" ]] || fail "--image requires a non-empty value"
+            AGENT_IMAGE="$2"
+            shift 2
+            ;;
+        --k3d-cluster)
+            [[ $# -ge 2 ]] || fail "--k3d-cluster requires a value"
+            [[ -n "$2" ]] || fail "--k3d-cluster requires a non-empty value"
+            K3D_CLUSTER="$2"
+            shift 2
+            ;;
+        --publish-image)
+            [[ $# -ge 2 ]] || fail "--publish-image requires a value"
+            [[ -n "$2" ]] || fail "--publish-image requires a non-empty value"
+            PUBLISH_IMAGE="$2"
+            shift 2
+            ;;
+        --build-only)
+            BUILD_ONLY=1
+            shift
             ;;
         --github-provider)
             [[ $# -ge 2 ]] || fail "--github-provider requires a value"
@@ -147,8 +177,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$AGENT_ARG" ]] || { usage >&2; exit 2; }
-[[ $# -gt 0 ]] || { usage >&2; exit 2; }
+[[ $# -gt 0 || "$BUILD_ONLY" == 1 ]] || { usage >&2; exit 2; }
 USER_PROMPT="$*"
+if [[ -n "$AGENT_IMAGE" ]]; then
+    [[ -z "$SANDBOX_FROM_OVERRIDE${GATOR_SANDBOX_FROM:-}$CODEX_LOCAL_BIN" ]] || fail "--image cannot be combined with --from, GATOR_SANDBOX_FROM, or --codex-bin"
+    [[ "$BUILD_ONLY" != 1 ]] || fail "--image cannot be combined with --build-only"
+fi
 
 case "$AGENT_ARG" in
     /*|*/*)
@@ -513,6 +547,10 @@ configure_provider_refresh() {
 
 GATEWAY="${GATEWAY_OVERRIDE:-${GATOR_GATEWAY:-$GATEWAY_DEFAULT}}"
 SANDBOX_NAME="${SANDBOX_NAME_OVERRIDE:-${GATOR_SANDBOX_NAME:-$SANDBOX_NAME_PREFIX-$(date +%Y%m%d%H%M%S)}}"
+# Match the gateway's MAX_ROUTABLE_NAME_LEN: workspace, sandbox, and service
+# segments must fit together in one DNS label. Check before any build or writes.
+[[ ${#SANDBOX_NAME} -le 19 ]] || fail "invalid sandbox name '$SANDBOX_NAME': maximum length is 19 characters"
+[[ "$SANDBOX_NAME" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || fail "invalid sandbox name '$SANDBOX_NAME': expected a DNS-1123 label (lowercase letters, digits, internal hyphens)"
 SANDBOX_FROM="${SANDBOX_FROM_OVERRIDE:-${GATOR_SANDBOX_FROM:-$(resolve_manifest_path "$SANDBOX_FROM_DEFAULT")}}"
 RUN_MODE="${RUN_MODE_OVERRIDE:-$RUNTIME_MODE}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_OVERRIDE:-$RUNTIME_POLL_INTERVAL_SECONDS}"
@@ -551,8 +589,12 @@ cleanup_payload() {
 trap 'cleanup_config; cleanup_payload' EXIT
 
 log "Preparing $AGENT_DISPLAY_NAME with harness '$HARNESS' in '$RUN_MODE' mode on gateway '$GATEWAY'."
+source "$SCRIPT_DIR/image.sh"
+prepare_agent_image_transport
 
 mkdir -p "$PAYLOAD_DIR"
+ruby -rjson -e 'puts JSON.generate({protocol: 1, agent_id: ARGV[0], payload_version: ARGV[1].to_i})' \
+    "$AGENT_ID" "$AGENT_PAYLOAD_VERSION" > "$PAYLOAD_DIR/tooling.json"
 cp -R "$SCRIPT_DIR/runtime" "$PAYLOAD_DIR/runtime"
 chmod +x "$PAYLOAD_DIR/runtime"/*.sh
 chmod +x "$PAYLOAD_DIR/runtime/harnesses/$HARNESS"/*.sh
@@ -576,8 +618,10 @@ done
 
 PROMPT_TEMPLATE_PATH="$(resolve_manifest_path "$PROMPT_TEMPLATE")"
 [[ -f "$PROMPT_TEMPLATE_PATH" ]] || fail "missing prompt template: $PROMPT_TEMPLATE_PATH"
-ruby -ryaml -rshellwords - "$PROMPT_TEMPLATE_PATH" "$PAYLOAD_DIR/agent-prompt.md" "$MANIFEST_FILE" "$PAYLOAD_IMAGE_DIR" "$HARNESS" "$RUN_MODE" "$POLL_INTERVAL_SECONDS" "$USER_PROMPT" <<'RUBY'
-template_path, output_path, manifest_path, payload_image_dir, harness, run_mode, poll_interval_seconds, user_prompt = ARGV
+# Compile tooling references only. Task, harness, and supervision settings are
+# launch inputs, never image contents (including Docker build context/layers).
+ruby -ryaml -rshellwords - "$PROMPT_TEMPLATE_PATH" "$PAYLOAD_DIR/agent-prompt.md" "$MANIFEST_FILE" "$PAYLOAD_IMAGE_DIR" <<'RUBY'
+template_path, output_path, manifest_path, payload_image_dir = ARGV
 manifest = YAML.load_file(manifest_path) || {}
 subagents = manifest.fetch("subagents", [])
 
@@ -586,12 +630,9 @@ subagent_command = lambda do |id|
 end
 
 values = {
-  "HARNESS" => harness,
-  "RUN_MODE" => run_mode,
-  "POLL_INTERVAL_SECONDS" => poll_interval_seconds,
   "PAYLOAD_VERSION" => manifest.fetch("payload_version", 1).to_s,
-  "USER_PROMPT" => user_prompt,
 }
+runtime_variables = %w[HARNESS RUN_MODE POLL_INTERVAL_SECONDS USER_PROMPT]
 
 subagents.each do |subagent|
   next unless subagent.key?("expose_as")
@@ -600,14 +641,15 @@ subagents.each do |subagent|
   unless expose_as.match?(/\A[A-Z][A-Z0-9_]*\z/)
     abort "invalid subagent expose_as '#{expose_as}': expected [A-Z][A-Z0-9_]*"
   end
-  abort "prompt variable '#{expose_as}' is already defined" if values.key?(expose_as)
+  abort "prompt variable '#{expose_as}' is already defined" if values.key?(expose_as) || runtime_variables.include?(expose_as)
 
   values[expose_as] = subagent_command.call(subagent.fetch("id"))
 end
 
 template = File.read(template_path)
 rendered = template.gsub(/\{\{([A-Z0-9_]+)\}\}/) do
-  values.fetch(Regexp.last_match(1))
+  key = Regexp.last_match(1)
+  runtime_variables.include?(key) ? Regexp.last_match(0) : values.fetch(key)
 end
 File.write(output_path, rendered)
 RUBY
@@ -675,42 +717,23 @@ File.open(dockerfile_path, "a") do |file|
 end
 RUBY
 
-    # Build into the local engine selected by the gateway. Without this,
-    # auto-detection can choose Podman while the gateway uses Docker (or vice
-    # versa), leaving the image unavailable to the gateway.
-    local gateway_info
-    if ! gateway_info="$("$OPENSHELL_BIN" --gateway "$GATEWAY" gateway info --output json)"; then
-        fail "failed to determine compute driver for gateway '$GATEWAY'"
-    fi
-    local gateway_engine
-    if ! gateway_engine="$(printf '%s' "$gateway_info" | ruby -rjson -e '
-        drivers = JSON.parse(STDIN.read).fetch("compute_drivers", []).map { |driver| driver.fetch("name") }
-        abort "gateway must report exactly one compute driver" unless drivers.length == 1
-        puts drivers.first.downcase
-    ')"; then
-        fail "gateway '$GATEWAY' did not report exactly one compute driver"
-    fi
-    case "$gateway_engine" in
-        docker|podman) ;;
-        *) fail "gateway '$GATEWAY' uses compute driver '$gateway_engine'; agent launcher local image builds require Docker or Podman" ;;
-    esac
-    if [[ -n "${CONTAINER_ENGINE:-}" ]] && [[ "$(printf '%s' "$CONTAINER_ENGINE" | tr '[:upper:]' '[:lower:]')" != "$gateway_engine" ]]; then
-        fail "CONTAINER_ENGINE=$CONTAINER_ENGINE conflicts with gateway '$GATEWAY' compute driver '$gateway_engine'"
-    fi
-    CONTAINER_ENGINE="$gateway_engine"
-    export CONTAINER_ENGINE
-
-    # Source after setting CONTAINER_ENGINE so the helper validates the
-    # gateway-selected engine instead of auto-detecting another engine.
-    source "$ROOT_DIR/tasks/scripts/container-engine.sh"
-    local image_tag="openshell/agent-${AGENT_ID}:$(date +%s)"
+    local image_tag="${PUBLISH_IMAGE:-openshell/agent-${AGENT_ID}:$(date +%s)-$$}"
     log "Building sandbox image '$image_tag' with $CONTAINER_ENGINE."
     ce_build --load --file "$build_dockerfile" --tag "$image_tag" "$build_context"
-    SANDBOX_FROM="$image_tag"
+    deliver_agent_image "$image_tag"
 }
 
-log "Staging immutable sandbox payload from '$SANDBOX_FROM'."
-prepare_immutable_sandbox_source "$SANDBOX_FROM"
+if [[ "$IMAGE_MODE" == prebuilt ]]; then
+    SANDBOX_FROM="$AGENT_IMAGE"
+    log "Using prebuilt tooling image '$SANDBOX_FROM'."
+else
+    log "Staging immutable sandbox payload from '$SANDBOX_FROM'."
+    prepare_immutable_sandbox_source "$SANDBOX_FROM"
+fi
+log "Tooling image: $SANDBOX_FROM"
+if [[ "$BUILD_ONLY" == 1 ]]; then
+    exit 0
+fi
 
 log "Configuring gateway settings."
 for ((setting_index = 0; setting_index < SETTING_COUNT; setting_index++)); do
@@ -797,11 +820,17 @@ HARNESS_ENV_ARGS=(
     "OPENSHELL_AGENT_POLL_INTERVAL_SECONDS=$POLL_INTERVAL_SECONDS"
     "OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES=$MAX_TRANSIENT_FAILURES"
     "OPENSHELL_AGENT_PAYLOAD_VERSION=$AGENT_PAYLOAD_VERSION"
+    "OPENSHELL_AGENT_TASK=$USER_PROMPT"
 )
 
 case "$HARNESS" in
     codex)
+        # Codex compares account IDs locally during workspace discovery. Unlike
+        # bearer tokens, this non-secret identifier must not be a placeholder.
+        [[ -n "${CODEX_AUTH_ACCOUNT_ID:-}" ]] || fail "missing Codex account ID"
+        [[ "$CODEX_AUTH_ACCOUNT_ID" != openshell:resolve:* ]] || fail "Codex account ID must be a literal identifier"
         HARNESS_ENV_ARGS+=(
+            "CODEX_ACCOUNT_ID=$CODEX_AUTH_ACCOUNT_ID"
             "CODEX_MODEL=${CODEX_MODEL:-$HARNESS_MODEL}"
             "CODEX_REASONING=${CODEX_REASONING:-$HARNESS_REASONING}"
         )
@@ -826,7 +855,7 @@ SANDBOX_CREATE_CMD+=(
     --
     env
     "${HARNESS_ENV_ARGS[@]}"
-    bash "$PAYLOAD_IMAGE_DIR/runtime/entrypoint.sh"
+    bash "$PAYLOAD_IMAGE_DIR/runtime/launch.sh"
 )
 
 run_agent_sandbox() {

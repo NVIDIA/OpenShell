@@ -4,6 +4,14 @@
 
 Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) for OpenShell. The gateway spawns this binary as a subprocess and talks to it over the `openshell.compute.v1.ComputeDriver` Unix-socket surface. `openshell-supervisor` runs as a native host process, while `openshell-sandbox` runs as capability-free PID 1 inside each microVM and applies guest-local isolation over virtio-vsock.
 
+New VM generations initiate the control connection to host CID 2 over vsock.
+Libkrun forwards that guest connection to the supervisor's protected Unix
+socket; QEMU uses a host vsock listener on a per-guest port and checks the guest
+CID before TLS authentication. Existing protocol roles and authorization stay
+unchanged. Running legacy generations retain their original descriptors;
+newly booted generations require matching embedded runtime and supervisor
+binaries.
+
 The driver embeds libkrun, libkrunfw, the guest OCI unpacker, the portable guest sandbox, and the custom kernel runtime. Each sandbox boots from a cached immutable bootstrap ext4 root disk plus a per-sandbox writable overlay disk. When the requested sandbox image differs from the bootstrap image, the driver prepares a read-only image ext4 disk inside a bootstrap VM and mounts that unpacked rootfs as the sandbox lowerdir.
 
 ## How it fits together
@@ -62,7 +70,7 @@ By default `mise run gateway:vm`:
 - Persists the gateway SQLite DB under `.cache/gateway-vm/gateway.db`.
 - Places the VM driver state (per-sandbox `overlay.ext4`, image cache, and `run/compute-driver.sock`) under `/tmp/openshell-vm-driver-$USER-vm-dev/` so the AF_UNIX socket path stays under macOS `SUN_LEN`.
 - Writes `.cache/gateway-vm/gateway.toml` with `[openshell.drivers.vm].driver_dir = "$PWD/target/debug"` so the freshly built `openshell-driver-vm` is used instead of an older installed copy from `~/.local/libexec/openshell`, `/usr/libexec/openshell`, or `/usr/local/libexec`.
-- Enables OTLP trace export to `http://127.0.0.1:4317` only when a local collector is listening there. Otherwise, it omits the OTLP configuration to avoid repeated export failures.
+- Enables OTLP trace export, OCSF log export, and the agent trace relay to `http://127.0.0.1:4317` only when a local collector is listening there. Otherwise, it omits the OTLP configuration to avoid repeated export failures.
 
 For GPU passthrough (VFIO), pass `-- --gpu` and run with root privileges:
 
@@ -167,8 +175,6 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | `overlay_disk_mib` | `4096` | Sparse writable overlay disk size per sandbox, in MiB. |
 | `krun_log_level` | `1` | libkrun verbosity (0-5). |
 | `guest_tls_ca` | unset | Historical key name for the host supervisor's gateway CA certificate. Required when `grpc_endpoint` uses `https://`; never copied into the guest. |
-| `guest_tls_cert` | unset | Historical key name for the host supervisor's client certificate; never copied into the guest. |
-| `guest_tls_key` | unset | Historical key name for the host supervisor's client private key; never copied into the guest. |
 | `https_proxy` | unset | Corporate forward proxy (`http://host:port` or `https://host:port`) that host control chains policy-approved TLS CONNECT egress through. Host-loopback proxy URLs work because control runs on the gateway host. |
 | `no_proxy` | unset | Comma-separated bypass list for the corporate proxy only. OpenShell policy evaluation still applies. |
 | `proxy_auth_file` | unset | Gateway-host path to a validated `user:pass` credential file. Staged root-only into the per-sandbox overlay and removed with the sandbox; credentials never enter logs or process arguments. |
@@ -176,6 +182,7 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | `proxy_connect_by_hostname` | unset | Send hostnames rather than validated IPs in CONNECT. Last resort for proxies whose ACLs reject IP CONNECT targets. |
 | `proxy_ca_bundle` | unset | Gateway-host PEM CA bundle trusted for the corporate proxy and TLS-intercepted server certificates. The driver validates it and stages it at a fixed non-secret guest path in the protected overlay. Requires `https_proxy`. |
 | `provider_spiffe_workload_api_tcp_endpoint` | unset | Explicit guest-reachable `tcp:IP:port` SPIFFE Workload API listener for provider token exchange. It requires `provider_spiffe_allow_guest_tcp = true`; a host UNIX socket is never silently exposed to a VM guest. |
+| `enable_bind_mounts` | `false` | Allow per-sandbox `driver_config.vm.mounts` host directory shares (libkrun virtiofs only). The driver writes a `tag\ttarget\tmode` manifest to `/.openshell/mounts.manifest` in the overlay, and guest init mounts each share after `/sandbox` ownership fixups. Rejected while resource admission is enabled. |
 
 The proxy settings are operator-owned and deployment-level: they are not accepted through `template.driver_config.vm`, and the driver passes them only to native host control. Every present-but-invalid value is fatal at gateway or sandbox startup rather than degrading to a direct dial.
 
@@ -210,6 +217,13 @@ prepared inside the bootstrap VM. The driver checks that a prepared disk
 contains the unpacked rootfs before caching it; on failure it caches nothing
 and reports the image-prep console tail. Set `OPENSHELL_VM_IMAGE_PULL_CONCURRENCY` to
 tune registry layer download parallelism (default `4`, maximum `16`).
+Registry pulls in both caches use the resolved digest as an immutable reference.
+The driver verifies the downloaded manifest against that digest before downloading
+layers. For multi-platform images, it verifies the index and then the selected
+platform manifest. Digest-pinned requests retain the caller's digest.
+Cache keys hash source identities to keep cache and staging filenames bounded.
+Bootstrap cache layout v6 and prepared-image layout v4 rebuild older entries on
+first use; older cache files remain on disk but are not reused for registry images.
 Both caches are scoped by source image identity and OpenShell version, so an
 OpenShell upgrade builds a fresh guest rootfs instead of reusing one with an old
 embedded supervisor. Host-side bootstrap layer assembly preserves relative
@@ -220,6 +234,10 @@ and creates destination files without following symlinks.
 The requested sandbox image is never selected as the bootstrap image. Operators
 must configure either `bootstrap_image` or `default_image`; when both are empty,
 the driver fails during startup.
+
+Image and writable-overlay preparation run in owned worker processes. Stopping or deleting a sandbox cancels its worker and formatter processes, waits for them to exit, then removes the attempt's temporary files under `<state-dir>/images/preparations/`. New overlays, including retries after an interrupted first start, are built there and renamed into sandbox state only after completion. A file lock inherited by the worker's children keeps cleanup from deleting files that a process still owns. If cleanup cannot establish that the processes have stopped, the operation returns an error and retains both temporary files and sandbox state.
+
+At startup, the driver reclaims inactive attempts in this directory. It preserves active attempts, committed image caches, and unmarked staging from older releases. Concurrent preparations serialize image-cache publication; an interrupted attempt cannot publish a partial disk over an existing cache entry. Gateway upload slots for `rootfs_tar_path` keep their existing, separate lifecycle.
 
 Each sandbox gets its own sparse writable
 `<state-dir>/sandboxes/<id>/overlay.ext4`. Guest init mounts overlayfs as `/`

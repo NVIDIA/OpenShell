@@ -328,3 +328,15 @@ fn source_archive_reuses_build_without_git_metadata() {
     assert_eq!(first.version, "9.8.7");
     fixture.assert_fresh(&first);
 }
+
+#[test]
+fn archive_nested_in_a_repository_keeps_the_package_version() {
+    // The enclosing repository has a tagged commit. An archive inside it must
+    // not adopt that repository's version.
+    let mut fixture = Fixture::new(false);
+    fixture.checkout = fixture.repo.join("archive");
+    fixture.install_crate();
+    let first = fixture.build();
+    assert_eq!(first.version, "9.8.7");
+    fixture.assert_fresh(&first);
+}

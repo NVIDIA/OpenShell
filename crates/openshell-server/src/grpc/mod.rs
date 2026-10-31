@@ -7,8 +7,10 @@ mod auth_rpc;
 pub mod mutation_replay;
 pub mod policy;
 pub mod provider;
+mod provider_credentials;
 pub mod provider_readiness;
 mod sandbox;
+pub mod supervisor_host;
 pub use sandbox::mint_persisted_authentication;
 mod service;
 mod validation;
@@ -50,21 +52,22 @@ use openshell_core::proto::{
     ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
     ListSandboxesRequest, ListSandboxesResponse, ListServicesRequest, ListServicesResponse,
     ListWorkspaceMembersRequest, ListWorkspaceMembersResponse, ListWorkspacesRequest,
-    ListWorkspacesResponse, MemoryResourceCapabilities, NegotiatedExtensionInfo, PeerRelayFrame,
+    ListWorkspacesResponse, MemoryResourceCapabilities, NegotiatedExtensionInfo,
+    PeerNotifyConfigUpdateRequest, PeerNotifyConfigUpdateResponse, PeerRelayFrame,
     ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
     RemoveWorkspaceMemberResponse, ReportEndpointStatusRequest, ReportEndpointStatusResponse,
     ReportMainProcessExitRequest, ReportMainProcessExitResponse, ReportPolicyStatusRequest,
     ReportPolicyStatusResponse, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
-    ResourceCapabilities, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    ResourceCapabilities, ResumeSandboxRequest, RevokeSshSessionRequest, RevokeSshSessionResponse,
     RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
     SandboxTemplateResponse, ServiceEndpointResponse, ServiceStatus, StartSandboxRequest,
     StopSandboxRequest, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
-    UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesRequest,
-    UpdateProviderProfilesResponse, UpdateProviderRequest, WatchSandboxRequest,
-    open_shell_server::OpenShell,
+    SupervisorMessage, SuspendSandboxRequest, TcpForwardFrame, UndoDraftChunkRequest,
+    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
+    WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -78,8 +81,10 @@ use crate::ServerState;
 /// Map a `PersistenceError` to an appropriate gRPC `Status`.
 ///
 /// CAS conflicts (optimistic concurrency failures) are mapped to `ABORTED`
-/// to signal that the client should retry with fresh data. Other persistence
-/// errors are mapped to `INTERNAL`.
+/// to signal that the client should retry with fresh data. Mutation lock
+/// timeouts are mapped to `UNAVAILABLE` with a retry delay: the mutation lock
+/// was not acquired, so this request's guarded writes did not run. Other
+/// persistence errors are mapped to `INTERNAL`.
 pub fn persistence_error_to_status(
     err: crate::persistence::PersistenceError,
     operation: &str,
@@ -96,6 +101,11 @@ pub fn persistence_error_to_status(
                 current_resource_version.map_or_else(|| "unknown".to_string(), |v| v.to_string())
             ),
             current_resource_version,
+        ),
+        PersistenceError::LockTimeout(_) => openshell_core::rpc_error::unavailable(
+            "MUTATION_LOCK_TIMEOUT",
+            format!("{operation} timed out waiting for a concurrent mutation; retry the request"),
+            std::time::Duration::from_secs(1),
         ),
         other => Status::internal(format!("{operation} failed: {other}")),
     }
@@ -183,6 +193,10 @@ struct StoredSettings {
     /// loaded from `ObjectRecord` and used for optimistic concurrency control.
     #[serde(skip)]
     resource_version: u64,
+    /// Database id of the loaded row. Not persisted; a save aborts when the
+    /// row was deleted and recreated under the same name since the load.
+    #[serde(skip)]
+    record_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +241,16 @@ impl OpenShellService {
 // ---------------------------------------------------------------------------
 // Trait impl — thin delegation to submodules
 // ---------------------------------------------------------------------------
+
+#[tonic::async_trait]
+impl openshell_core::proto::sandbox_updates_server::SandboxUpdates for OpenShellService {
+    async fn update_sandbox(
+        &self,
+        request: Request<openshell_core::proto::UpdateSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        mutation_replay::run(&self.state, request).await
+    }
+}
 
 #[tonic::async_trait]
 impl OpenShell for OpenShellService {
@@ -422,6 +446,20 @@ impl OpenShell for OpenShellService {
         mutation_replay::run(&self.state, request).await
     }
 
+    async fn suspend_sandbox(
+        &self,
+        request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        sandbox::handle_suspend_sandbox(&self.state, request).await
+    }
+
+    async fn resume_sandbox(
+        &self,
+        request: Request<ResumeSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        sandbox::handle_resume_sandbox(&self.state, request).await
+    }
+
     // --- Exec ---
 
     type ExecSandboxStream = ReceiverStream<Result<ExecSandboxEvent, Status>>;
@@ -503,6 +541,13 @@ impl OpenShell for OpenShellService {
         request: Request<CreateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
         mutation_replay::run(&self.state, request).await
+    }
+
+    async fn get_provider_credentials(
+        &self,
+        request: Request<openshell_core::proto::GetProviderCredentialsRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderCredentialsResponse>, Status> {
+        provider_credentials::handle(&self.state, request).await
     }
 
     async fn get_provider(
@@ -725,7 +770,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ApproveAllDraftChunksRequest>,
     ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        Box::pin(mutation_replay::run(&self.state, request)).await
     }
 
     async fn edit_draft_chunk(
@@ -781,7 +826,11 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<tonic::Streaming<SupervisorMessage>>,
     ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
-        crate::supervisor_session::handle_connect_supervisor(&self.state, request).await
+        Box::pin(crate::supervisor_session::handle_connect_supervisor(
+            &self.state,
+            request,
+        ))
+        .await
     }
 
     async fn report_main_process_exit(
@@ -889,6 +938,13 @@ impl OpenShell for OpenShellService {
     ) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
         provider_readiness::handle_peer_get_sandbox_provider_status(&self.state, request).await
     }
+
+    async fn peer_notify_config_update(
+        &self,
+        request: Request<PeerNotifyConfigUpdateRequest>,
+    ) -> Result<Response<PeerNotifyConfigUpdateResponse>, Status> {
+        crate::config_delivery::handle_peer_notify_config_update(&self.state, request)
+    }
 }
 
 fn public_extension_info(extension: &NegotiatedExtension) -> NegotiatedExtensionInfo {
@@ -941,7 +997,9 @@ pub mod test_support {
 
     use crate::ServerState;
     use crate::auth::identity::{Identity, IdentityProvider};
-    use crate::auth::principal::{Principal, UserPrincipal};
+    use crate::auth::principal::{
+        Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
+    };
     use crate::compute::{
         NoopTestDriver, new_test_runtime, new_test_runtime_for_driver, new_test_runtime_with_driver,
     };
@@ -951,7 +1009,128 @@ pub mod test_support {
     use crate::supervisor_session::SupervisorSessionRegistry;
     use crate::tracing_bus::TracingLogBus;
     use openshell_core::Config;
+    use openshell_core::proto::open_shell_client::OpenShellClient;
+    use openshell_core::proto::open_shell_server::OpenShellServer;
+    use openshell_core::proto::{
+        GatewayMessage, SupervisorHello, SupervisorMessage, supervisor_message,
+    };
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
     use tonic::Request;
+
+    /// A live `ConnectSupervisor` stream against an in-process gateway.
+    pub struct SupervisorStreamHarness {
+        server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        /// Held so the supervisor side of the stream stays open.
+        pub outbound: mpsc::Sender<SupervisorMessage>,
+        pub inbound: tonic::Streaming<GatewayMessage>,
+    }
+
+    impl Drop for SupervisorStreamHarness {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    /// Switch a test state to push configuration delivery.
+    pub fn enable_push_delivery(state: &mut Arc<ServerState>) {
+        Arc::get_mut(state)
+            .expect("test state is not shared yet")
+            .config
+            .config_delivery_mode = openshell_core::config::ConfigDeliveryMode::Push;
+    }
+
+    /// Configuration stream features advertised by a test supervisor hello.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum StreamFeatures {
+        /// Predates streamed configuration and keeps polling.
+        Legacy,
+        /// Applies and acknowledges streamed configuration.
+        Apply,
+    }
+
+    /// Serve `state` on loopback and open a supervisor stream whose hello
+    /// advertises the given configuration stream features. Returns the gRPC
+    /// status when the gateway rejects the stream before accepting it.
+    pub async fn connect_supervisor_stream(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        features: StreamFeatures,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        connect_supervisor_stream_with_epoch(state, sandbox_id, features, 0).await
+    }
+
+    /// Model a stock supervisor reconnect, which advances its connection
+    /// epoch.
+    pub async fn reconnect_supervisor_stream(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        features: StreamFeatures,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        connect_supervisor_stream_with_epoch(state, sandbox_id, features, 1).await
+    }
+
+    async fn connect_supervisor_stream_with_epoch(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        features: StreamFeatures,
+        connection_epoch: u64,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let principal = Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: sandbox_id.to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+                auth_epoch: None,
+            },
+            trust_domain: Some("openshell".to_string()),
+        });
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(OpenShellServer::with_interceptor(
+                    super::OpenShellService::new(Arc::clone(state)),
+                    move |mut request: Request<()>| {
+                        request.extensions_mut().insert(principal.clone());
+                        Ok(request)
+                    },
+                ))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let mut client = OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap()
+            .max_decoding_message_size(
+                openshell_core::grpc_client::MAX_SUPERVISOR_STREAM_MESSAGE_BYTES,
+            );
+        let (outbound, rx) = mpsc::channel(4);
+        outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+                    sandbox_id: sandbox_id.into(),
+                    instance_id: "instance".into(),
+                    supports_config_push: features == StreamFeatures::Apply,
+                    connection_epoch,
+                    supports_provider_readiness: false,
+                    redirected: false,
+                    supports_session_redirect: false,
+                })),
+            })
+            .await
+            .unwrap();
+        let inbound = match client.connect_supervisor(ReceiverStream::new(rx)).await {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                server.abort();
+                return Err(status);
+            }
+        };
+        Ok(SupervisorStreamHarness {
+            server,
+            outbound,
+            inbound,
+        })
+    }
 
     /// Wrap a proto message in a `Request` with a dev principal injected.
     ///
@@ -996,6 +1175,7 @@ pub mod test_support {
     fn test_provider_profile_sources() -> crate::provider_profile_sources::ProviderProfileSources {
         crate::provider_profile_sources::ProviderProfileSources::from_config(
             &[openshell_core::GatewayProviderProfileSourceConfig::User],
+            None,
             None,
         )
         .expect("user-only provider profile source configuration should be valid")
@@ -1157,6 +1337,32 @@ mod tests {
         let gpu = capabilities.gpu.expect("GPU capabilities");
         assert!(gpu.default_selection_supported);
         assert!(gpu.count_selection_supported);
+    }
+
+    #[test]
+    fn persistence_error_to_status_maps_mutation_lock_timeout_to_unavailable() {
+        let status = persistence_error_to_status(
+            crate::persistence::PersistenceError::LockTimeout(
+                "waiting for a PostgreSQL advisory lock".into(),
+            ),
+            "acquire provider mutation lock",
+        );
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            status.message(),
+            "acquire provider mutation lock timed out waiting for a concurrent mutation; \
+             retry the request"
+        );
+        let details = openshell_core::rpc_error::decode_details(&status).expect("error details");
+        assert_eq!(
+            details.error_info().expect("error info").reason,
+            "MUTATION_LOCK_TIMEOUT"
+        );
+        assert_eq!(
+            details.retry_info().expect("retry info").retry_delay,
+            Some(std::time::Duration::from_secs(1))
+        );
     }
 
     #[test]

@@ -38,8 +38,8 @@ and preloads the default sandbox image into k3d so the first sandbox create
 does not wait on a large registry pull. Traefik is disabled at cluster creation time.
 
 **Multi-worktree support:** the cluster name is derived from the last component of the
-current git branch (e.g. branch `kube-support/local-dev/tmutch` → cluster
-`openshell-dev-tmutch`). Each worktree therefore gets its own isolated cluster and its
+current git branch (e.g. branch `chore/1234-local-dev/octocat` → cluster
+`openshell-dev-octocat`). Each worktree therefore gets its own isolated cluster and its
 own `kubeconfig` file. Override with `HELM_K3S_CLUSTER_NAME` to force a specific name
 or share one cluster across worktrees.
 
@@ -56,6 +56,144 @@ Override with env vars before running `helm:k3s:create`:
 - `HELM_K3S_COLLECTOR_IMAGE` (default:
   `mcr.microsoft.com/dotnet/aspire-dashboard:latest`)
 - `HELM_K3S_COLLECTOR_HEALTH_TIMEOUT` (default: `120` seconds)
+
+### Shared supervisor plumbing
+
+Set `gatewayConfig.openshell.drivers.kubernetes.supervisor_topology`
+using a values file (the table key is literally `openshell.drivers.kubernetes`):
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    supervisor_topology: gateway
+```
+
+The gateway chart creates a shared supervisor Deployment (`supervisor.replicas`,
+default one), Service, NetworkPolicy, and an empty
+`<release>-supervisor-token` Secret in
+the release namespace, regardless of shared/managed/operator workspace mode.
+The gateway mints a supervisor token from its sandbox-JWT signing key, writes
+it into that Secret (the gateway Role may `get`/`patch` only that Secret), and
+renews it at half its lifetime; the supervisor mounts the Secret and presents
+the token on the private `openshell.supervisor.host.v1` assignment stream,
+which accepts nothing else. The topology requires gateway TLS and the signing
+key (`server.disableTls` is rejected; the gateway refuses to start without
+`gateway_jwt`). New sandbox generations run as sandbox instances in that
+process. The chart starts `--mode=shared`, sets `--gateway-endpoint` to the
+gateway gRPC URL, mounts the token at `--token-file`, and binds `--address`
+(5501) to a plain TCP health listener for the `tcpSocket` probes; nothing
+dials the supervisor but sandbox runtimes (5500) and the kubelet. Build the gateway, supervisor, and sandbox
+images from the same branch: all three must support the routed runtime
+connection and the assignment stream. `workspace` is reserved and rejected.
+Omit the field to disable it. `mise run
+e2e:kubernetes:shared-supervisor` runs the focused e2e
+(`ci/values-supervisor.yaml`). The task prepends that overlay to any
+colon-separated `OPENSHELL_E2E_KUBE_EXTRA_VALUES` list, so layer a
+workspace-mode overlay to cover managed namespaces:
+
+```bash
+OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-workspace-managed.yaml \
+OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
+  mise run e2e:kubernetes:shared-supervisor
+```
+
+### Shared supervisor high availability
+
+The shared supervisor is always a pool of `supervisor.replicas` members
+(default 1), or an HPA-managed pool when `supervisor.autoscaling.enabled=true`.
+`ci/values-supervisor-autoscaling.yaml` enables the memory HPA (default `512Mi`
+average per Pod, two to four members, one removal every two minutes after five
+minutes of stabilization). It requires the resource metrics API, usually
+Metrics Server. The HPA omits the Deployment's fixed replica count and ignores
+`supervisor.replicas`; top-level `autoscaling` still controls only the gateway.
+Do not combine the HPA overlay with the manual 1→2→1 scaling E2E: that test
+expects Helm to own replicas. Changing HPA bounds or target must leave the
+gateway config and supervisor Pod template unchanged, as checked by
+`deploy/helm/test-supervisor-pool-scaling.sh`. With the gateway topology the
+chart renders the gateway's
+`[openshell.gateway.supervisor_pool]` tuning table (only
+`recovery_timeout_secs` from `supervisor.recoveryTimeoutSeconds`, default 60;
+the driver's `shared_supervisor` table stays unchanged), a
+RollingUpdate Deployment (`maxSurge: 1`, `maxUnavailable: 0`) with a 60-second
+grace period, no affinity unless `supervisor.affinity` is set (top-level
+`affinity` applies only to the gateway), the pool identity env vars
+(`OPENSHELL_SUPERVISOR_POOL_MEMBER_ID` and `_ADVERTISE_IP` from the Pod name
+and IP), and a `maxUnavailable: 1` PodDisruptionBudget unless
+`supervisor.podDisruptionBudget.enabled=false` (default `true`; toggling it
+changes only the PodDisruptionBudget). Each supervisor resource has its own
+template: `supervisor.yaml` (Deployment), `supervisor-service.yaml`,
+`supervisor-networkpolicy.yaml`, `supervisor-token-secret.yaml`,
+`supervisor-pdb.yaml`, and `supervisor-hpa.yaml`.
+`ci/values-supervisor-ha.yaml` selects two replicas and a 60-second recovery
+timeout. The topology needs gateway TLS: the e2e harness keeps it on with
+`ci/values-tls-port-forward.yaml` and `OPENSHELL_E2E_KUBE_TLS=1`, which reaches
+the gateway over mTLS through its port-forward. `mise run
+e2e:kubernetes:shared-supervisor-ha` sets both, creates a task-scoped k3d
+cluster, kills the supervisor Pod that owns a sandbox, and checks that the
+sandbox keeps its Pod, generation, main process, and in-memory state.
+
+The rendered gateway configuration and supervisor Pod template do not
+depend on `supervisor.replicas`; `deploy/helm/test-supervisor-pool-scaling.sh`
+(part of `mise run helm:test`) renders a pool at 1, 2, and 3 replicas and
+fails if anything but the replica count differs. `mise run
+e2e:kubernetes:shared-supervisor-scaling` installs a one-member pool
+(`ci/values-supervisor-ha-scaling.yaml`), then the test runs `helm upgrade
+--reuse-values --set supervisor.replicas=2` and back to 1 against the chart
+the harness installed (`OPENSHELL_E2E_KUBE_CHART`), probing exec and
+policy-mediated networking throughout. It checks that scaling up moves
+nothing, that the member removed by scaling down hands its sandboxes to the
+other (`cause=leaving`), that no workload, gateway Pod, or remaining member
+restarts, and that a new sandbox runs after each step. It upgrades its
+release, so it runs on a release of its own; the two pool tests also share a
+nextest test group that never runs them at once. Against an existing cluster
+whose kubeconfig the shell environment may override, set
+`OPENSHELL_E2E_KUBECONFIG` (passed as `--kubeconfig` to kubectl and helm).
+
+On k3d, deploy the pool with the Skaffold profile, which layers the overlay and
+turns gateway TLS back on over `ci/values-skaffold.yaml`:
+
+```bash
+cd deploy/helm/openshell
+KUBECONFIG=../../../kubeconfig skaffold run -p shared-supervisor-high-availability
+cd ../../..
+```
+
+The plaintext registration from `helm:skaffold:run` does not apply. Keep
+`mise run helm:k3s:forward` running and set up the client certificate as in
+"With mTLS enabled" under
+[Connecting through the forwarding task](#connecting-through-the-forwarding-task).
+Both members share the single k3d node, so exercise Pod failures:
+
+```bash
+export KUBECONFIG=kubeconfig OPENSHELL_GATEWAY_ENDPOINT=https://localhost:8090
+openshell sandbox create --detach --name ha-probe -- sh -c 'echo $$ > /sandbox/main.pid; exec sleep infinity'
+openshell sandbox exec --name ha-probe --no-tty -- cat /sandbox/main.pid
+openshell sandbox get ha-probe  # note the sandbox ID
+# Supervisor logs name the instance by its route, not its sandbox ID.
+kubectl get sandboxes.agents.x-k8s.io -A -l openshell.ai/sandbox-name=ha-probe \
+  -o jsonpath='{.items[0].metadata.annotations.openshell\.ai/sandbox-runtime-supervisor-session}'
+# The member whose latest admission, removal, or release line names the route owns it.
+kubectl -n openshell logs -l app.kubernetes.io/name=openshell-supervisor --prefix --tail=-1 \
+  | grep -E '(admitted assigned|removing withdrawn|relinquishing a) sandbox instance.* <route>$'
+# Force-delete the owner, the closest local stand-in for a crash.
+kubectl -n openshell delete pod <owner-pod> --grace-period=0 --force
+kubectl -n openshell logs -l app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell \
+  -c openshell-gateway --prefix --tail=200 | grep 'taking over a shared sandbox instance'
+kubectl -n openshell logs -l openshell.ai/sandbox-id=<sandbox-id>,openshell.ai/boundary-role=workload \
+  --tail=200 | grep -E 'sandbox-supervisor-|Supervisor takeover confirmed'
+openshell sandbox exec --name ha-probe --no-tty -- cat /sandbox/main.pid  # same PID
+```
+
+A plain `kubectl delete pod` exercises the graceful leave instead: the member
+announces it is leaving and the gateway hands its instances over at once. A
+member that stops without announcing it, as on node loss, is declared dead
+only after the 15-second membership TTL.
+`kubectl -n openshell rollout restart deployment/openshell-supervisor` replaces
+every member one at a time. The PID must survive each case, while an open
+`sandbox connect` or `exec` stream breaks and must reconnect. A
+`sandbox-supervisor-recovery-expired` finding in the workload log means no
+replacement confirmed within the recovery timeout, so the runtime terminated
+the workload.
 
 ### 2. Deploy OpenShell
 
@@ -81,9 +219,21 @@ The Skaffold flow builds distinct `gateway`, `sandbox`, and `supervisor` images
 and deploys the OpenShell Helm chart. The Kubernetes driver creates a
 capability-free workload Pod and a directly managed capability-free supervisor
 Pod. One namespace-wide NetworkPolicy denies direct egress from every OpenShell
-workload Pod. The
+workload Pod. New sandbox generations use `runtime-initiated` control: the sandbox
+runtime dials its supervisor through `os-supervisor-<id>`. The legacy
+`os-boundary-<id>` Service keeps selecting the workload for old gateways during
+rolling upgrades. New gateways create both Services and bind the control-mode
+annotation to its runtime generation. The driver adds a per-sandbox
+`os-control-<id>` NetworkPolicy for that path only. Existing running generations
+keep their connection until replaced; stop/start and gateway recovery that
+recreates both Pods upgrade legacy generations automatically. Use compatible
+gateway, supervisor, and sandbox runtime images together; there is no legacy
+rollout flag. The
 `pkiInitJob` hook (a pre-install Job that runs `openshell-gateway generate-certs`)
-generates mTLS secrets on first install. The default Skaffold values export
+generates gateway and CLI TLS secrets on first install. Supervisor Pods project
+only `ca.crt` and authenticate gateway RPCs with sandbox bearer tokens. User
+client certificates and private keys remain outside supervisor and workload Pods.
+The default Skaffold values export
 gateway and Kubernetes-driver traces to the collector service installed by
 `helm:k3s:create`. Envoy Gateway is opt-in; see the Optional Add-ons section.
 
@@ -119,7 +269,10 @@ trace-context annotation. The same command exposes OTLP/gRPC on
 `http://127.0.0.1:4317` and, when deployed, the Kubernetes gateway on
 `http://127.0.0.1:8090`. The local `gateway:docker`, `gateway:podman`, and
 `gateway:vm` tasks detect the collector listener at startup and enable trace
-export only while it is reachable.
+export, OCSF log export, and the agent trace relay only while it is reachable.
+Spans an agent exports from inside a sandbox arrive through the supervisor's
+relay with `openshell.telemetry.source=agent` and share `openshell.sandbox.id`
+with that sandbox's supervisor spans.
 
 The Skaffold profile for HA reverse-proxy development is available from
 `deploy/helm/openshell/`:
@@ -233,8 +386,9 @@ cd ../../..
 KUBECONFIG=kubeconfig mise run helm:gateway:apply
 ```
 
-`values-gateway.yaml` creates a `Gateway` (listener on port 80, class `eg`) and
-`GRPCRoute` in the `openshell` namespace. The `high-availability` profile
+`values-gateway.yaml` creates the `openshell` `Gateway` (listener on port 80,
+class `eg`) and an `openshell` `GRPCRoute` in the `openshell` namespace. The
+`high-availability` profile
 installs the Envoy Gateway Helm chart and layers both
 `values-high-availability.yaml` and `values-gateway.yaml` onto the OpenShell
 release.
@@ -267,6 +421,30 @@ above) instead of relying only on `OPENSHELL_GATEWAY_ENDPOINT`; some tests call
 ### Kubernetes E2E Notes
 
 Use `mise run e2e:kubernetes` for the standard Helm-backed Kubernetes suite.
+Set `OPENSHELL_E2E_KUBE_TEST=kubernetes_image_update` to scope the Rust suite to
+combined image, command, environment, and metadata updates with retained sandbox,
+SSH, and PVC identities. The next start verifies the new argv and environment. This target is
+included in both existing Agent Sandbox API-version lanes; unlike the Python
+Docker suite, it exercises the driver that supports image updates.
+
+Image updates default to disabled outside test fixtures. The e2e wrapper opts
+in only for a fresh gateway fixture that it owns; set
+`OPENSHELL_E2E_KUBE_IMAGE_UPDATES=0` to prevent that opt-in. Do not propagate
+activation to an existing shared gateway or enable it during a mixed-version
+rollout. For manual testing, follow the retirement and activation checklist in
+`docs/kubernetes/high-availability.mdx` before setting
+`gatewayConfig: {"openshell.gateway": {enable_sandbox_updates: true}}`.
+The gateway process equivalents are `--enable-sandbox-updates true` and
+`OPENSHELL_ENABLE_SANDBOX_UPDATES=true`. Retire every old process and Job,
+settle outstanding driver work, prevent old binaries returning, and do not
+treat PostgreSQL connection markers or membership TTL expiry as retirement
+proof. SQLite testing supports one gateway process only. Image-update clients
+must call the separate `SandboxUpdates` service on the existing gateway
+listener, not add a method to the baseline `OpenShell` service or inspect new
+public `SandboxStatus` image fields. Resume a pending operation with
+`SandboxUpdates.UpdateSandbox`, the current resource version, and no selected
+fields, following the documented request-ID semantics.
+
 The kube e2e wrapper creates only one port-forward, to `svc/openshell`; it no
 longer forwards the unauthenticated health listener or runs a `/readyz` e2e
 target. `/readyz` remains covered by server unit/integration tests.
@@ -446,6 +624,9 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; disables pkiInitJob) |
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
+| `deploy/helm/openshell/ci/values-supervisor.yaml`, `ci/values-supervisor-ha.yaml`, `ci/values-supervisor-ha-scaling.yaml` | Shared supervisor pool overlays: one member, two members (Skaffold profile `shared-supervisor-high-availability`), or one member to scale to two and back |
+| `deploy/helm/openshell/ci/values-tls-port-forward.yaml` | Keeps gateway TLS on over the Skaffold values for e2e topologies that need it (`OPENSHELL_E2E_KUBE_TLS=1`) |
+| `deploy/helm/openshell/ci/values-autoscaling.yaml` | Render-only overlay for the optional gateway HorizontalPodAutoscaler (helm lint and helm-unittest) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
 | `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
 | `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |
@@ -454,3 +635,13 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass and BackendTrafficPolicy for Envoy Gateway (`mise run helm:gateway:apply`) |
 | `tasks/scripts/helm-k3s-local.sh` | k3d cluster create/delete/start/stop/status |
 | `tasks/scripts/keycloak-k8s-setup.sh` | Keycloak deploy, realm import, and development TLS trust anchor |
+
+## Sandbox update regression lane
+
+Run `mise run e2e:kubernetes:updates` for the testkit update suite against both
+supported Agent Sandbox APIs with the combined Helm chart and its bundled
+workspace resources. It verifies stopped-only updates, retained CR/PVC
+identity and contents, command/environment changes, and request replay.
+`OPENSHELL_E2E_UPDATE_ORIGINAL_IMAGE` and `OPENSHELL_E2E_UPDATE_TARGET_IMAGE` can
+select mirrored Alpine 3.21 and 3.22 manifests. Defaults use the public registry
+cache; keep immutable digests when overriding them.
