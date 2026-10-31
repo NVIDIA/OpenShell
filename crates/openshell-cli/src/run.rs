@@ -2013,16 +2013,6 @@ pub async fn sandbox_exec_grpc(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
-    // Reject phases where the relay can never be open. The gateway decides
-    // whether a Completed or Error sandbox still has a reachable supervisor.
-    if !relay_phase_may_be_reachable(sandbox.phase()) {
-        return Err(miette::miette!(
-            "sandbox '{}' is not ready (phase: {}); wait for it to reach Ready state",
-            name,
-            phase_name(sandbox.phase())
-        ));
-    }
-
     // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
     let stdin_is_terminal = std::io::stdin().is_terminal();
     let tty = tty_override.unwrap_or_else(|| stdin_is_terminal && std::io::stdout().is_terminal());
@@ -2115,7 +2105,7 @@ pub async fn sandbox_exec_grpc(
         }
         (response, _) => response,
     }
-    .into_diagnostic()?
+    .map_err(|status| exec_start_error(status, &sandbox))?
     .into_inner();
 
     // Stream output to terminal in real-time.
@@ -2169,7 +2159,7 @@ pub async fn service_forward_tcp(
     let (bind_addr, bind_port) = parse_tcp_forward_spec(local, target_port)?;
     let mut client = grpc_client(server, tls).await?;
 
-    let mut replica = fetch_reachable_sandbox_for_forward(&mut client, name, workspace).await?;
+    let mut replica = fetch_sandbox_for_forward(&mut client, name, workspace).await?;
 
     let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), bind_port))
         .await
@@ -2203,7 +2193,7 @@ pub async fn service_forward_tcp(
             }
 
             _ = health_check.tick() => {
-                replica = fetch_reachable_sandbox_for_forward(&mut client, name, workspace).await?;
+                replica = fetch_sandbox_for_forward(&mut client, name, workspace).await?;
             }
 
             accepted = listener.accept() => {
@@ -2269,18 +2259,11 @@ fn forward_requires_session_token(status: &Status) -> bool {
         && status.message().contains("authorization_token is required")
 }
 
-/// Whether the gateway may still relay into a sandbox in this phase. A
-/// Completed or Error sandbox keeps its access plane while its supervisor
-/// stays connected; only the gateway can tell whether it still is.
-fn relay_phase_may_be_reachable(phase: i32) -> bool {
-    matches!(
-        SandboxPhase::try_from(phase),
-        Ok(SandboxPhase::Ready | SandboxPhase::Completed | SandboxPhase::Error)
-    )
-}
-
-/// Confirm the sandbox is still reachable, returning the replica that owns it.
-async fn fetch_reachable_sandbox_for_forward(
+/// Confirm the sandbox still exists, returning the replica that owns it.
+///
+/// The gateway decides whether each connection may reach the sandbox; this
+/// only stops a forward whose sandbox is gone or going away.
+async fn fetch_sandbox_for_forward(
     client: &mut crate::tls::GrpcClient,
     name: &str,
     workspace: &str,
@@ -2309,11 +2292,9 @@ async fn fetch_reachable_sandbox_for_forward(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox '{name}' not found"))?;
 
-    if !relay_phase_may_be_reachable(sandbox.phase()) {
+    if SandboxPhase::try_from(sandbox.phase()) == Ok(SandboxPhase::Deleting) {
         return Err(miette::miette!(
-            "sandbox '{}' is no longer ready (phase: {}); stopping service forward",
-            name,
-            phase_name(sandbox.phase())
+            "sandbox '{name}' is being deleted; stopping service forward"
         ));
     }
 
@@ -2586,6 +2567,19 @@ impl Drop for TaskGuard {
     }
 }
 
+/// The gateway decides whether a sandbox can be used. When it refuses, name the
+/// phase this command saw so the user knows what to wait for.
+fn exec_start_error(status: Status, sandbox: &Sandbox) -> miette::Report {
+    if status.code() == Code::FailedPrecondition && status.message() == "sandbox is not ready" {
+        return miette::miette!(
+            "sandbox '{}' is not ready (phase: {}); wait for it to reach Ready state",
+            sandbox.object_name(),
+            phase_name(sandbox.phase())
+        );
+    }
+    miette::Report::from_err(status)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn sandbox_exec_streaming_grpc(
     mut client: crate::tls::GrpcClient,
@@ -2648,7 +2642,7 @@ async fn sandbox_exec_streaming_grpc(
         }
         response => response,
     }
-    .into_diagnostic()?
+    .map_err(|status| exec_start_error(status, sandbox))?
     .into_inner();
 
     // Raw mode is only appropriate for an interactive terminal, not a pipe.

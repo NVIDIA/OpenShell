@@ -67,6 +67,20 @@ fn exit(code: i32) -> proto::ExecSandboxEvent {
 }
 
 impl MockGateway {
+    /// The gateway's access rule: only it decides whether a sandbox is usable.
+    fn require_reachable(&self) -> Result<(), Status> {
+        if matches!(
+            self.phase,
+            proto::SandboxPhase::Ready
+                | proto::SandboxPhase::Completed
+                | proto::SandboxPhase::Error
+        ) {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition("sandbox is not ready"))
+        }
+    }
+
     async fn exchange(
         self,
         mut input: tonic::Streaming<proto::ExecSandboxInput>,
@@ -201,12 +215,14 @@ macro_rules! mock_gateway {
 
             type ExecSandboxStream = EventStream;
             async fn exec_sandbox(&self, _: Request<proto::ExecSandboxRequest>) -> Result<Response<EventStream>, Status> {
+                self.require_reachable()?;
                 self.calls.lock().unwrap().unary += 1;
                 Err(Status::unimplemented("test requires streaming exec"))
             }
 
             type ExecSandboxInteractiveStream = EventStream;
             async fn exec_sandbox_interactive(&self, request: Request<tonic::Streaming<proto::ExecSandboxInput>>) -> Result<Response<EventStream>, Status> {
+                self.require_reachable()?;
                 let (sender, receiver) = mpsc::channel(1);
                 let service = self.clone();
                 tokio::spawn(async move {
@@ -503,7 +519,7 @@ async fn exec_reaches_gateway_for_completed_and_error_sandboxes() {
 }
 
 #[tokio::test]
-async fn exec_is_refused_before_starting_for_stopped_sandbox() {
+async fn exec_names_the_phase_when_the_gateway_refuses() {
     let gateway =
         TestGateway::start_in_phase(Scenario::EarlyExit, proto::SandboxPhase::Stopped).await;
     let mut child = gateway.spawn();
