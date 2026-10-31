@@ -94,7 +94,7 @@ pub trait PolicyMapper: Send + Sync {
 /// Normalize forward-slash paths to Windows backslash form. Path normalization
 /// lives here, in one place — the embedded mapper copies path strings through
 /// unchanged.
-fn normalize_path(p: &str) -> String {
+pub fn normalize_path(p: &str) -> String {
     p.replace('/', "\\")
 }
 
