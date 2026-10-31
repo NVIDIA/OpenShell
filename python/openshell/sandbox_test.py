@@ -2291,7 +2291,7 @@ def test_create_forwards_service_exposures() -> None:
     assert dict(ref.application_service_urls) == dict(ref.service_urls)
     assert ref.gateway_service_urls["metrics"] == "https://metrics.gateway.test:8080/"
     with pytest.raises(TypeError):
-        ref.application_service_urls["metrics"] = "changed"  # type: ignore[index]
+        ref.application_service_urls["metrics"] = "changed"  # ty: ignore[invalid-assignment]
 
 
 def test_application_addresses_preserve_existing_positional_sandbox_ref() -> None:
