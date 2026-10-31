@@ -187,6 +187,8 @@ impl OpenShell for TestOpenShell {
         let name = request.name.clone();
         *self.state.last_get_name.lock().await = Some(name.clone());
         Ok(Response::new(SandboxResponse {
+            application_service_urls: std::collections::HashMap::new(),
+            gateway_service_urls: std::collections::HashMap::new(),
             sandbox: Some(Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "test-id".to_string(),

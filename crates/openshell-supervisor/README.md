@@ -313,3 +313,9 @@ seconds from issuance, independently of configuration freshness. Expiry closes
 streams; later renewal cannot revive them. Takeover preserves the workload and
 public hostname while replacing the app endpoint. Clients reconnect after an
 interruption; sockets are not migrated.
+
+The gateway supplies a canonical `application_hostname` with each installed
+service route. The listener dispatches exact hashed or readable SNI names to
+the correct sandbox instance, validates HTTP Host against SNI, and fences old
+streams when a hostname changes. Readable aliases remain accepted during
+migration; an older gateway omitting the field retains readable routing.

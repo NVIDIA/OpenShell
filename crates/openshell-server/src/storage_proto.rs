@@ -178,7 +178,7 @@ mod tests {
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "1fce709ed9a1c91e307c46c5fe68be470cbe88ca70ea0087e771c973a9052308";
+        "724ac81b9c3071ecb67cb3ca1530f3c49820aa69acf3878778ecc06fa40f69a7";
     const DURABLE_SCHEMA_SHA256: &str =
         "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -723,7 +723,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (344, 31),
+                (346, 31),
                 (100, 22),
                 (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

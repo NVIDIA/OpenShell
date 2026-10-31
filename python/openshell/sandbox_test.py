@@ -2112,6 +2112,14 @@ class _FakeSandboxStub:
                 dict(request.labels),
                 workspace=_request_workspace(request) or "default",
             ),
+            application_service_urls={
+                exposure.service: f"https://{exposure.service}.example.test/"
+                for exposure in request.service_exposures
+            },
+            gateway_service_urls={
+                exposure.service: f"https://{exposure.service}.gateway.test:8080/"
+                for exposure in request.service_exposures
+            },
             service_urls={
                 exposure.service: f"https://{exposure.service}.example.test/"
                 for exposure in request.service_exposures
@@ -2280,6 +2288,27 @@ def test_create_forwards_service_exposures() -> None:
         "": "https://.example.test/",
         "metrics": "https://metrics.example.test/",
     }
+    assert dict(ref.application_service_urls) == dict(ref.service_urls)
+    assert ref.gateway_service_urls["metrics"] == "https://metrics.gateway.test:8080/"
+    with pytest.raises(TypeError):
+        ref.application_service_urls["metrics"] = "changed"  # ty: ignore[invalid-assignment]
+
+
+def test_application_addresses_preserve_existing_positional_sandbox_ref() -> None:
+    original = _sandbox_ref(_make_sandbox_proto("id", "demo"))
+    ref = SandboxRef(
+        original.id,
+        original.name,
+        original.workspace,
+        original.status,
+        {},
+        None,
+        {},
+        "SHA256:test-host-identity",
+    )
+    assert ref.host_key_fingerprint == "SHA256:test-host-identity"
+    assert dict(ref.application_service_urls) == {}
+    assert dict(ref.gateway_service_urls) == {}
 
 
 def test_create_from_template_forwards_workload_template() -> None:
