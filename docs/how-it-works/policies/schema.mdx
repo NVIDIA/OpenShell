@@ -548,8 +548,7 @@ network rules allow, in ascending `order`.
 
 Host patterns match the same way as endpoint hosts and cannot include a port,
 up to 32 patterns per configuration. An IPv6 host must be a complete address
-without brackets, such as `2001:db8::1`; IPv6 wildcard patterns are not
-supported. A `fail_closed` configuration
+without brackets, such as `2001:db8::1`. A `fail_closed` configuration
 cannot apply to an endpoint with `tls: skip`. Two configurations whose
 host patterns may overlap must use the same HTTP hook version for the operations
 both handle. Refer to [Supervisor Middleware
