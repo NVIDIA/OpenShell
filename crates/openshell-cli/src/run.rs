@@ -57,12 +57,13 @@ use openshell_core::proto::{
     GetSandboxTemplateRequest, GetServiceRequest, GpuResourceRequirements,
     ListSandboxPoliciesRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest, ResourceRequirements,
-    RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
-    SandboxResources, SandboxRestartPolicy, SandboxServiceExposure, SandboxServiceLevel,
-    SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate,
-    SandboxWorkloadTemplateSpec, ServiceAuthorizationMode, ServiceEndpointResponse, SettingScope,
-    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
+    ResumeSandboxRequest, RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase,
+    SandboxPolicy, SandboxResources, SandboxRestartPolicy, SandboxServiceExposure,
+    SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig,
+    SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
+    ServiceEndpointResponse, SettingScope, StartSandboxRequest, StopSandboxRequest,
+    SuspendSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
+    WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -444,7 +445,6 @@ pub struct SandboxCreateConfig<'a> {
     pub editor: Option<Editor>,
     pub providers: &'a [String],
     pub policy: Option<&'a str>,
-    pub frozen: bool,
     pub forward: Option<ForwardSpec>,
     pub expose: Option<u16>,
     pub expose_authorization_mode: ServiceAuthorizationMode,
@@ -476,7 +476,6 @@ impl Default for SandboxCreateConfig<'_> {
             editor: None,
             providers: &[],
             policy: None,
-            frozen: false,
             forward: None,
             expose: None,
             expose_authorization_mode: ServiceAuthorizationMode::Strip,
@@ -503,6 +502,44 @@ pub async fn sandbox_create(
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<i32> {
+    Box::pin(sandbox_create_with_mode(
+        server,
+        gateway_name,
+        config,
+        workspace,
+        tls,
+        false,
+    ))
+    .await
+}
+
+/// Create a sandbox whose first accepted effective policy is retained for its lifetime.
+pub async fn sandbox_create_frozen(
+    server: &str,
+    gateway_name: &str,
+    config: SandboxCreateConfig<'_>,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<i32> {
+    Box::pin(sandbox_create_with_mode(
+        server,
+        gateway_name,
+        config,
+        workspace,
+        tls,
+        true,
+    ))
+    .await
+}
+
+async fn sandbox_create_with_mode(
+    server: &str,
+    gateway_name: &str,
+    config: SandboxCreateConfig<'_>,
+    workspace: &str,
+    tls: &TlsOptions,
+    frozen: bool,
+) -> Result<i32> {
     let SandboxCreateConfig {
         name,
         template,
@@ -516,7 +553,6 @@ pub async fn sandbox_create(
         editor,
         providers,
         policy,
-        frozen,
         forward,
         expose,
         expose_authorization_mode,
@@ -685,7 +721,6 @@ pub async fn sandbox_create(
                 HashMap::new()
             },
             policy,
-            frozen,
             providers: configured_providers,
             template: inline_template,
             command: main_command,
@@ -716,7 +751,42 @@ pub async fn sandbox_create(
             .collect(),
     };
 
-    let response = match client.create_sandbox(request).await {
+    let created = if frozen {
+        let mut frozen_client =
+            crate::tls::frozen_policies_client(&effective_server, &effective_tls).await?;
+        frozen_client
+            .create_sandbox(openshell_core::proto::CreateFrozenSandboxRequest {
+                workspace_scope: request.workspace_scope,
+                spec: request.spec,
+                name: request.name,
+                labels: request.labels,
+                annotations: request.annotations,
+                await_main_process_attachment: request.await_main_process_attachment,
+                workload_template: request.workload_template,
+                request_id: request.request_id,
+                service_exposures: request.service_exposures,
+            })
+            .await
+            .and_then(|response| {
+                let response = response.into_inner();
+                if !response.frozen_policy.is_some_and(|state| state.requested) {
+                    let name = response.sandbox.as_ref().map_or("unknown", ObjectName::object_name);
+                    let id = response.sandbox.as_ref().map_or("unknown", ObjectId::object_id);
+                    return Err(Status::failed_precondition(format!(
+                        "gateway did not acknowledge frozen creation for sandbox '{name}' (id {id}, workspace {workspace}); inspect it before retrying and remove it with: openshell --workspace {workspace} sandbox delete {name}"
+                    )));
+                }
+                Ok(tonic::Response::new(
+                    openshell_core::proto::SandboxResponse {
+                        sandbox: response.sandbox,
+                        service_urls: response.service_urls,
+                    },
+                ))
+            })
+    } else {
+        client.create_sandbox(request).await
+    };
+    let response = match created {
         Ok(resp) => resp,
         Err(status) if status.code() == Code::AlreadyExists => {
             return Err(miette::miette!(
@@ -742,11 +812,6 @@ pub async fn sandbox_create(
     } else {
         sandbox.object_name().to_string()
     };
-    if frozen && !sandbox.spec.as_ref().is_some_and(|spec| spec.frozen) {
-        return Err(miette::miette!(
-            "gateway did not honor --frozen for sandbox '{sandbox_name}'; upgrade the gateway before retrying. The sandbox may already be running; remove it with: openshell --workspace {workspace} sandbox delete {sandbox_name}"
-        ));
-    }
 
     // Record this sandbox as the last-used for the active gateway only when it
     // is expected to persist beyond the initial session.
@@ -1133,6 +1198,16 @@ pub async fn sandbox_create(
 
             if structured_output {
                 let mut value = sandbox_to_json(&last_sandbox);
+                if frozen {
+                    let state = frozen_policy_state(
+                        &effective_server,
+                        &sandbox_name,
+                        workspace,
+                        &effective_tls,
+                    )
+                    .await?;
+                    append_frozen_policy_json(&mut value, &state);
+                }
                 if let Some(object) = value.as_object_mut() {
                     object.insert("service_urls".to_string(), serde_json::json!(service_urls));
                 }
@@ -1677,7 +1752,9 @@ where
         return Ok(());
     }
 
-    let detail_json = sandbox_detail_to_json(&sandbox, &config)?;
+    let frozen_state = frozen_policy_state(server, name, workspace, tls).await?;
+    let mut detail_json = sandbox_detail_to_json(&sandbox, &config)?;
+    append_frozen_policy_json(&mut detail_json, &frozen_state);
     if crate::output::print_output_single(output, &detail_json, Clone::clone)? {
         return Ok(());
     }
@@ -1697,17 +1774,13 @@ where
     println!("  {} {}", "Id:".dimmed(), id);
     println!("  {} {}", "Name:".dimmed(), name);
     println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase()));
-    if let Some(frozen) = sandbox
-        .status
-        .as_ref()
-        .and_then(|status| status.frozen_policy.as_ref())
-    {
+    if let Some(frozen) = frozen_state.policy.as_ref() {
         println!("  {} frozen", "Policy state:".dimmed());
         println!("  {} {}", "Frozen hash:".dimmed(), frozen.policy_hash);
         if let Some(time) = &frozen.frozen_time {
             println!("  {} {}", "Frozen at:".dimmed(), time);
         }
-    } else if sandbox.spec.as_ref().is_some_and(|spec| spec.frozen) {
+    } else if frozen_state.requested {
         println!("  {} pending freeze", "Policy state:".dimmed());
     }
     if let Some(status) = sandbox.status.as_ref() {
@@ -2989,8 +3062,8 @@ pub async fn sandbox_list(
             {
                 phase.red().to_string()
             }
-            Ok(SandboxPhase::Provisioning) => phase.yellow().to_string(),
-            Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
+            Ok(SandboxPhase::Provisioning | SandboxPhase::Suspending) => phase.yellow().to_string(),
+            Ok(SandboxPhase::Deleting | SandboxPhase::Suspended) => phase.dimmed().to_string(),
             _ => phase.to_string(),
         };
         let created = format_epoch_ms(
@@ -3022,7 +3095,6 @@ pub async fn sandbox_list(
 
 fn policy_source_name(source: i32) -> &'static str {
     match PolicySource::try_from(source) {
-        Ok(PolicySource::Frozen) => "frozen",
         Ok(PolicySource::Global) => "global",
         _ => "sandbox",
     }
@@ -3036,6 +3108,54 @@ fn configuration_failure_message(sandbox: &Sandbox) -> Option<&str> {
         .as_ref()
         .map(|admission| admission.error.as_str())
         .filter(|message| !message.is_empty())
+}
+
+async fn frozen_policy_state(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<openshell_core::proto::FrozenSandboxPolicyState> {
+    let mut client = crate::tls::frozen_policies_client(server, tls).await?;
+    match client
+        .get_policy(openshell_core::proto::GetFrozenSandboxPolicyRequest {
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            name: name.to_string(),
+        })
+        .await
+    {
+        Ok(response) => Ok(response.into_inner()),
+        Err(status) if status.code() == Code::Unimplemented => {
+            Ok(openshell_core::proto::FrozenSandboxPolicyState::default())
+        }
+        Err(error) => Err(error).into_diagnostic(),
+    }
+}
+
+fn append_frozen_policy_json(
+    value: &mut serde_json::Value,
+    state: &openshell_core::proto::FrozenSandboxPolicyState,
+) {
+    if !state.requested {
+        return;
+    }
+    let object = value.as_object_mut().expect("sandbox output is an object");
+    object.insert("frozen".into(), serde_json::json!(true));
+    object.insert(
+        "frozen_policy".into(),
+        state
+            .policy
+            .as_ref()
+            .map_or(serde_json::Value::Null, |policy| {
+                serde_json::json!({
+                    "version": policy.version,
+                    "policy_hash": policy.policy_hash,
+                    "frozen_time": policy.frozen_time.as_ref().map(ToString::to_string),
+                    "policy_source": policy_source_name(policy.policy_source),
+                    "global_policy_version": policy.global_policy_version,
+                })
+            }),
+    );
 }
 
 fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
@@ -3111,19 +3231,6 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
                 "provider_env_revision": admission.provider_env_revision,
             })
         });
-    let frozen_policy = sandbox
-        .status
-        .as_ref()
-        .and_then(|status| status.frozen_policy.as_ref())
-        .map(|frozen| {
-            serde_json::json!({
-                "version": frozen.version,
-                "policy_hash": frozen.policy_hash,
-                "frozen_time": frozen.frozen_time.as_ref().map(ToString::to_string),
-                "policy_source": policy_source_name(frozen.policy_source),
-                "global_policy_version": frozen.global_policy_version,
-            })
-        });
     let provisioning = sandbox.status.as_ref().and_then(|status| status.provisioning.as_ref())
         .map(|record| serde_json::json!({
             "attempt_id": record.attempt_id,
@@ -3163,8 +3270,6 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "endpoint_statuses": endpoint_statuses,
         "last_token_grant_failure": last_token_grant_failure,
         "configuration_admission": admission,
-        "frozen": sandbox.spec.as_ref().is_some_and(|spec| spec.frozen),
-        "frozen_policy": frozen_policy,
         "provisioning": provisioning,
         "created_from_workload_template": created_from_workload_template,
     })
@@ -4153,6 +4258,14 @@ pub async fn sandbox_stop(
         .into_inner()
         .sandbox
         .ok_or_else(|| miette!("gateway returned no sandbox after stop"))?;
+    // A successful stop can preserve a canonical result when the transient
+    // compute resource is already gone. There is no Stopped event to wait for.
+    if sandbox.phase() == SandboxPhase::Completed as i32
+        || (sandbox.phase() == SandboxPhase::Error as i32 && has_main_process_result(&sandbox))
+    {
+        println!("{} Sandbox {name} already finished", "✓".green().bold());
+        return Ok(());
+    }
     wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Stopped).await?;
     println!("{} Stopped sandbox {name}", "✓".green().bold());
     Ok(())
@@ -4184,6 +4297,110 @@ pub async fn sandbox_start(
     Ok(())
 }
 
+/// Suspend a ready sandbox, retaining its memory state, and wait until it is suspended.
+pub async fn sandbox_suspend(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .suspend_sandbox(SuspendSandboxRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("gateway returned no sandbox after suspend"))?;
+    wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Suspended).await?;
+    if let Ok(stopped) = stop_forwards_for_sandbox(workspace, name) {
+        for port in stopped {
+            eprintln!(
+                "{} Stopped forward of port {port} for sandbox {name}",
+                "✓".green().bold(),
+            );
+        }
+    }
+
+    println!("{} Suspended sandbox {name}", "✓".green().bold());
+    Ok(())
+}
+
+/// Resume a suspended sandbox and wait until it is ready.
+pub async fn sandbox_resume(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .resume_sandbox(ResumeSandboxRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+            restart_if_restore_fails: false,
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("gateway returned no sandbox after resume"))?;
+    wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Ready).await?;
+    println!("{} Resumed sandbox {name}", "✓".green().bold());
+    Ok(())
+}
+
+/// Whether `phase` means a lifecycle wait for `target` can no longer succeed
+/// without another lifecycle request.
+fn lifecycle_phase_blocks_target(target: SandboxPhase, phase: SandboxPhase) -> bool {
+    match target {
+        SandboxPhase::Ready => matches!(
+            phase,
+            SandboxPhase::Suspending | SandboxPhase::Suspended | SandboxPhase::Deleting
+        ),
+        SandboxPhase::Suspended => matches!(
+            phase,
+            SandboxPhase::Ready
+                | SandboxPhase::Starting
+                | SandboxPhase::Stopping
+                | SandboxPhase::Stopped
+                | SandboxPhase::Deleting
+        ),
+        SandboxPhase::Stopped => phase == SandboxPhase::Deleting,
+        _ => false,
+    }
+}
+
+fn lifecycle_phase_error(
+    sandbox: &Sandbox,
+    target: SandboxPhase,
+    phase: SandboxPhase,
+) -> Option<miette::Report> {
+    if phase == SandboxPhase::Error {
+        let detail = ready_false_condition_message(sandbox.status.as_ref())
+            .unwrap_or_else(|| "sandbox entered Error".to_string());
+        return Some(miette!(
+            "{detail} while waiting for {}",
+            phase_name(target as i32)
+        ));
+    }
+    if lifecycle_phase_blocks_target(target, phase) {
+        return Some(miette!(
+            "sandbox entered {} while waiting for {}",
+            phase_name(phase as i32),
+            phase_name(target as i32)
+        ));
+    }
+    None
+}
+
 async fn wait_for_lifecycle_phase(
     client: &mut crate::tls::GrpcClient,
     sandbox: Sandbox,
@@ -4193,10 +4410,8 @@ async fn wait_for_lifecycle_phase(
     if current == target {
         return Ok(sandbox);
     }
-    if current == SandboxPhase::Error {
-        let detail = ready_false_condition_message(sandbox.status.as_ref())
-            .unwrap_or_else(|| "sandbox entered Error".to_string());
-        return Err(miette!("{detail} while waiting for {target:?}"));
+    if let Some(err) = lifecycle_phase_error(&sandbox, target, current) {
+        return Err(err);
     }
 
     let timeout = Duration::from_secs(
@@ -4252,10 +4467,8 @@ async fn wait_for_lifecycle_phase(
             if phase == target {
                 return Ok(sandbox);
             }
-            if phase == SandboxPhase::Error {
-                let detail = ready_false_condition_message(sandbox.status.as_ref())
-                    .unwrap_or_else(|| "sandbox entered Error".to_string());
-                return Err(miette!(detail));
+            if let Some(err) = lifecycle_phase_error(&sandbox, target, phase) {
+                return Err(err);
             }
         }
     }
@@ -5337,6 +5550,50 @@ pub async fn sandbox_upload(
 // Sandbox policy commands
 // ---------------------------------------------------------------------------
 
+async fn update_global_config_with_frozen_report(
+    server: &str,
+    tls: &TlsOptions,
+    request: UpdateConfigRequest,
+) -> Result<(openshell_core::proto::UpdateConfigResponse, Vec<String>)> {
+    let mut client = crate::tls::frozen_policies_client(server, tls).await?;
+    let response = client
+        .update_global_config(openshell_core::proto::UpdateFrozenGlobalConfigRequest {
+            workspace_scope: request.workspace_scope.clone(),
+            policy: request.policy.clone(),
+            setting_key: request.setting_key.clone(),
+            setting_value: request.setting_value.clone(),
+            delete_setting: request.delete_setting,
+            global: request.global,
+            merge_operations: request.merge_operations.clone(),
+            expected_resource_version: request.expected_resource_version,
+            annotations: request.annotations.clone(),
+            sandbox: request.sandbox.clone(),
+            request_id: request.request_id.clone(),
+        })
+        .await;
+    match response {
+        Ok(response) => {
+            let response = response.into_inner();
+            let update = response
+                .update
+                .ok_or_else(|| miette!("gateway returned no global configuration result"))?;
+            Ok((update, response.frozen_sandboxes))
+        }
+        Err(status) if status.code() == Code::Unimplemented => {
+            // Ordinary global commands keep working with pre-feature gateways;
+            // explicit frozen creation has no such fallback.
+            let update = grpc_client(server, tls)
+                .await?
+                .update_config(request)
+                .await
+                .into_diagnostic()?
+                .into_inner();
+            Ok((update, Vec::new()))
+        }
+        Err(status) => Err(status).into_diagnostic(),
+    }
+}
+
 pub async fn sandbox_policy_set_global(
     server: &str,
     policy_path: &str,
@@ -5357,16 +5614,16 @@ pub async fn sandbox_policy_set_global(
     let policy = load_sandbox_policy(Some(policy_path))?
         .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
 
-    let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .update_config(UpdateConfigRequest {
+    let (response, frozen_sandboxes) = update_global_config_with_frozen_report(
+        server,
+        tls,
+        UpdateConfigRequest {
             policy: Some(policy),
             global: true,
             ..Default::default()
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner();
+        },
+    )
+    .await?;
 
     eprintln!(
         "{} Global policy configured (hash: {}, settings revision: {})",
@@ -5378,10 +5635,10 @@ pub async fn sandbox_policy_set_global(
         },
         response.settings_revision,
     );
-    if !response.frozen_sandboxes.is_empty() {
+    if !frozen_sandboxes.is_empty() {
         eprintln!(
             "Frozen sandboxes retain their policy: {}",
-            response.frozen_sandboxes.join(", ")
+            frozen_sandboxes.join(", ")
         );
     }
     Ok(())
@@ -5613,17 +5870,17 @@ pub async fn gateway_setting_delete(
 ) -> Result<()> {
     confirm_global_setting_delete(key, yes)?;
 
-    let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .update_config(UpdateConfigRequest {
+    let (response, frozen_sandboxes) = update_global_config_with_frozen_report(
+        server,
+        tls,
+        UpdateConfigRequest {
             setting_key: key.to_string(),
             delete_setting: true,
             global: true,
             ..Default::default()
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner();
+        },
+    )
+    .await?;
 
     if response.deleted {
         println!(
@@ -5635,10 +5892,10 @@ pub async fn gateway_setting_delete(
     } else {
         println!("{} Global setting {} not found", "!".yellow(), key);
     }
-    if !response.frozen_sandboxes.is_empty() {
+    if !frozen_sandboxes.is_empty() {
         println!(
             "Frozen sandboxes retain their policy: {}",
-            response.frozen_sandboxes.join(", ")
+            frozen_sandboxes.join(", ")
         );
     }
     Ok(())
@@ -6158,7 +6415,6 @@ where
         PolicySource::try_from(config.policy_source).unwrap_or(PolicySource::Sandbox);
     let policy_source_label = match policy_source {
         PolicySource::Global => "global",
-        PolicySource::Frozen => "frozen",
         PolicySource::Sandbox => "sandbox",
         PolicySource::Unspecified => "unspecified",
     };
@@ -7068,6 +7324,41 @@ mod tests {
         service_url_for_gateway, workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
+
+    #[test]
+    fn lifecycle_wait_fails_fast_on_phases_that_block_the_target() {
+        use super::lifecycle_phase_blocks_target;
+        use openshell_core::proto::SandboxPhase;
+
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Ready,
+            SandboxPhase::Suspended
+        ));
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Ready,
+            SandboxPhase::Suspending
+        ));
+        assert!(!lifecycle_phase_blocks_target(
+            SandboxPhase::Ready,
+            SandboxPhase::Starting
+        ));
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Suspended,
+            SandboxPhase::Stopped
+        ));
+        assert!(lifecycle_phase_blocks_target(
+            SandboxPhase::Suspended,
+            SandboxPhase::Ready
+        ));
+        assert!(!lifecycle_phase_blocks_target(
+            SandboxPhase::Suspended,
+            SandboxPhase::Suspending
+        ));
+        assert!(!lifecycle_phase_blocks_target(
+            SandboxPhase::Stopped,
+            SandboxPhase::Suspended
+        ));
+    }
 
     #[test]
     fn draft_approval_error_explains_refreshed_evaluation() {
@@ -8693,44 +8984,36 @@ mod tests {
 
     #[test]
     fn sandbox_json_distinguishes_pending_and_frozen_policy() {
-        let mut sandbox = Sandbox {
-            spec: Some(SandboxSpec {
-                frozen: true,
-                ..Default::default()
-            }),
-            status: Some(SandboxStatus::default()),
-            ..Default::default()
+        let sandbox = Sandbox::default();
+        let mut state = openshell_core::proto::FrozenSandboxPolicyState {
+            requested: true,
+            policy: None,
         };
-        let pending = super::sandbox_to_json(&sandbox);
+        let mut pending = super::sandbox_to_json(&sandbox);
+        super::append_frozen_policy_json(&mut pending, &state);
         assert_eq!(pending["frozen"], true);
         assert!(pending["frozen_policy"].is_null());
-        sandbox.status.as_mut().unwrap().frozen_policy = Some(
-            openshell_core::proto::FrozenSandboxPolicy {
-                version: 3,
-                policy_hash: "accepted-hash".into(),
-                frozen_time: openshell_core::time::timestamp_from_millis(600_000).ok(),
-                policy_source: PolicySource::Global as i32,
-                global_policy_version: 7,
-                ..Default::default()
-            }
-            .into(),
-        );
-        let frozen = super::sandbox_to_json(&sandbox);
-        assert_eq!(frozen["frozen_policy"]["policy_hash"], "accepted-hash");
+        state.policy = Some(openshell_core::proto::FrozenSandboxPolicy {
+            version: 3,
+            policy_hash: "accepted-hash".into(),
+            frozen_time: openshell_core::time::timestamp_from_millis(600_000).ok(),
+            policy_source: PolicySource::Global as i32,
+            global_policy_version: 7,
+            ..Default::default()
+        });
+        super::append_frozen_policy_json(&mut pending, &state);
+        assert_eq!(pending["frozen_policy"]["policy_hash"], "accepted-hash");
+        assert_eq!(pending["frozen_policy"]["policy_source"], "global");
         assert_eq!(
-            frozen["frozen_policy"]["frozen_time"],
+            pending["frozen_policy"]["frozen_time"],
             "1970-01-01T00:10:00Z"
         );
-        assert_eq!(frozen["frozen_policy"]["policy_source"], "global");
-        let detail = super::sandbox_detail_to_json(
-            &sandbox,
-            &GetSandboxConfigResponse {
-                policy_source: PolicySource::Frozen as i32,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(detail["policy_source"], "frozen");
+        let mut live = super::sandbox_to_json(&sandbox);
+        super::append_frozen_policy_json(
+            &mut live,
+            &openshell_core::proto::FrozenSandboxPolicyState::default(),
+        );
+        assert!(live.get("frozen").is_none());
     }
 
     #[test]

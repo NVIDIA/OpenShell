@@ -1,5 +1,22 @@
 # Sandboxes
 
+## Frozen policies
+
+The concrete `*v1.Client` exposes an optional `FrozenPolicies()` subclient with
+`Create`, `CreateFromTemplate`, `Get` and `UpdateGlobalConfig`. Existing client
+interfaces and sandbox structs retain their ordinary shapes. Use the normal
+`SandboxSpec` and create options with the new create methods; an older gateway
+returns `Unimplemented` without falling back to ordinary creation.
+
+`Get` returns `FrozenPolicyState`: `Requested` identifies the creation mode,
+and `Policy` is nil until initialization accepts and captures a configuration.
+The accepted snapshot exposes the full policy, hash, timestamp and original
+source. Changing its access requires recreating the sandbox.
+
+`UpdateGlobalConfig` accepts a `ConfigUpdate`, selects global scope, and returns
+a new `FrozenGlobalConfigUpdate` containing the ordinary mutation result plus
+workspace-qualified frozen sandbox names.
+
 Accessor: `client.Sandboxes()`
 
 Manage sandbox lifecycle: create, inspect, delete, attach/detach providers,

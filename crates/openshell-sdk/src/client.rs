@@ -12,20 +12,24 @@ use crate::auth::{BearerSlot, EdgeAuthInterceptor, bearer_metadata};
 use crate::config::{AuthConfig, ClientConfig};
 use crate::error::{Result, SdkError};
 use crate::pagination::{Page, Pager};
-use crate::raw::AuthedGrpcClient;
+use crate::raw::{AuthedFrozenSandboxPoliciesClient, AuthedGrpcClient, AuthedSandboxUpdatesClient};
 use crate::refresh::{RefreshedToken, TokenSource};
+use crate::routing::OwnerCache;
 use crate::types::{
-    DeleteOptions, DeletionResult, ExecOptions, ExecResult, Health, ListOptions, SandboxPhase,
+    DeleteOptions, DeletionResult, ExecOptions, ExecResult, FrozenGlobalConfigUpdate,
+    FrozenPolicyState, FrozenSandboxCreateSpec, Health, ListOptions, ResumeOptions, SandboxPhase,
     SandboxRef, SandboxSpec, SandboxTemplateCreateSpec, SandboxTemplateListOptions,
     SandboxWorkloadTemplate, WorkspaceRef,
 };
 use crate::{WatchEvent, WatchOptions, transport};
 use futures::{Stream, StreamExt};
 use openshell_core::proto;
+use openshell_core::replica_routing::{owner_replica, retry_unrouted, routed_to, with_owner_hint};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tonic::metadata::AsciiMetadataValue;
 use tonic::transport::Channel;
 
 /// Async client for a single `OpenShell` gateway.
@@ -43,9 +47,98 @@ pub struct OpenShellClient {
     /// Live bearer slot the interceptor reads; refreshed tokens are written
     /// here so rotation reaches in-flight requests. `None` for non-OIDC auth.
     bearer_slot: Option<BearerSlot>,
+    owners: OwnerCache,
 }
 
 impl OpenShellClient {
+    /// Authenticated optional frozen-policy service; no proactive OIDC refresh.
+    pub fn raw_frozen_policies(&self) -> AuthedFrozenSandboxPoliciesClient {
+        proto::frozen_sandbox_policies_client::FrozenSandboxPoliciesClient::with_interceptor(
+            self.channel.clone(),
+            self.interceptor.clone(),
+        )
+    }
+
+    /// Optional frozen-policy service after proactive OIDC refresh.
+    pub async fn raw_frozen_policies_fresh(&self) -> Result<AuthedFrozenSandboxPoliciesClient> {
+        self.ensure_fresh().await?;
+        Ok(self.raw_frozen_policies())
+    }
+
+    /// Create a frozen sandbox. Older gateways fail before creating a sandbox.
+    pub async fn create_frozen_sandbox(&self, spec: FrozenSandboxCreateSpec) -> Result<SandboxRef> {
+        self.workspace("default").create_frozen_sandbox(spec).await
+    }
+
+    /// Create a frozen sandbox from a workspace-scoped workload template.
+    pub async fn create_frozen_sandbox_from_template(
+        &self,
+        spec: SandboxTemplateCreateSpec,
+    ) -> Result<SandboxRef> {
+        self.workspace("default")
+            .create_frozen_sandbox_from_template(spec)
+            .await
+    }
+
+    /// Read the requested freeze and accepted policy in the default workspace.
+    pub async fn get_frozen_policy(&self, name: &str) -> Result<FrozenPolicyState> {
+        self.workspace("default").get_frozen_policy(name).await
+    }
+
+    /// Apply a global configuration update and report frozen-policy exceptions.
+    pub async fn update_global_config(
+        &self,
+        request: proto::UpdateConfigRequest,
+    ) -> Result<FrozenGlobalConfigUpdate> {
+        let request = proto::UpdateFrozenGlobalConfigRequest {
+            workspace_scope: request.workspace_scope,
+            sandbox: request.sandbox,
+            policy: request.policy,
+            setting_key: request.setting_key,
+            setting_value: request.setting_value,
+            delete_setting: request.delete_setting,
+            global: true,
+            merge_operations: request.merge_operations,
+            expected_resource_version: request.expected_resource_version,
+            annotations: request.annotations,
+            request_id: request.request_id,
+        };
+        let response = self
+            .frozen_unary(|mut grpc| {
+                let request = request.clone();
+                async move { grpc.update_global_config(request).await }
+            })
+            .await?;
+        Ok(FrozenGlobalConfigUpdate {
+            update: response.update.ok_or_else(|| {
+                SdkError::invalid_config("global update result missing from gateway response")
+            })?,
+            frozen_sandboxes: response.frozen_sandboxes,
+        })
+    }
+
+    async fn frozen_unary<T, F, Fut>(&self, call: F) -> Result<T>
+    where
+        F: Fn(AuthedFrozenSandboxPoliciesClient) -> Fut,
+        Fut: Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+    {
+        self.ensure_fresh().await?;
+        match call(self.raw_frozen_policies()).await {
+            Ok(response) => Ok(response.into_inner()),
+            Err(status) if status.code() == tonic::Code::Unauthenticated => {
+                if self.refresh_on_unauthorized().await? {
+                    call(self.raw_frozen_policies())
+                        .await
+                        .map(tonic::Response::into_inner)
+                        .map_err(map_status)
+                } else {
+                    Err(map_status(status))
+                }
+            }
+            Err(status) => Err(map_status(status)),
+        }
+    }
+
     /// Open a connection to the gateway described by `config`.
     ///
     /// Performs the gRPC channel handshake immediately; subsequent RPCs reuse
@@ -60,6 +153,7 @@ impl OpenShellClient {
             interceptor,
             token_source,
             bearer_slot,
+            owners: OwnerCache::default(),
         })
     }
 
@@ -75,6 +169,7 @@ impl OpenShellClient {
             interceptor,
             token_source: None,
             bearer_slot,
+            owners: OwnerCache::default(),
         }
     }
 
@@ -116,6 +211,23 @@ impl OpenShellClient {
         Ok(self.raw_grpc())
     }
 
+    /// Authenticated client for the optional `SandboxUpdates` service, sharing
+    /// this client's channel and live bearer slot. Like [`Self::raw_grpc`], this
+    /// does not refresh or retry OIDC credentials by itself.
+    pub fn raw_sandbox_updates(&self) -> AuthedSandboxUpdatesClient {
+        proto::sandbox_updates_client::SandboxUpdatesClient::with_interceptor(
+            self.channel.clone(),
+            self.interceptor.clone(),
+        )
+    }
+
+    /// Like [`Self::raw_sandbox_updates`], but refreshes the bearer token first
+    /// when needed. Reactive retry remains the raw caller's responsibility.
+    pub async fn raw_sandbox_updates_fresh(&self) -> Result<AuthedSandboxUpdatesClient> {
+        self.ensure_fresh().await?;
+        Ok(self.raw_sandbox_updates())
+    }
+
     /// Force an OIDC refresh and write the new token into the live bearer
     /// slot, regardless of expiry. Returns `true` when a refresher is wired
     /// and a fresh token was minted, `false` for static auth. Use after a
@@ -137,7 +249,6 @@ impl OpenShellClient {
 
     /// Create a new sandbox from a curated [`SandboxSpec`].
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
-        let frozen = spec.frozen;
         let request = create_sandbox_request(spec);
         let response = self
             .unary(|mut grpc| {
@@ -145,7 +256,7 @@ impl OpenShellClient {
                 async move { grpc.create_sandbox(request).await }
             })
             .await?;
-        sandbox_from_create_response(response, frozen)
+        sandbox_from_create_response(response)
     }
 
     /// Create a new sandbox from a workspace-scoped workload template name.
@@ -153,7 +264,6 @@ impl OpenShellClient {
         &self,
         spec: SandboxTemplateCreateSpec,
     ) -> Result<SandboxRef> {
-        let frozen = spec.frozen;
         let request = create_sandbox_from_template_request(spec);
         let response = self
             .unary(|mut grpc| {
@@ -161,7 +271,7 @@ impl OpenShellClient {
                 async move { grpc.create_sandbox(request).await }
             })
             .await?;
-        sandbox_from_create_response(response, frozen)
+        sandbox_from_create_response(response)
     }
 
     /// Create a reusable sandbox template in the default workspace.
@@ -301,16 +411,7 @@ impl OpenShellClient {
 
     /// Fetch a sandbox by name.
     pub async fn get_sandbox(&self, name: &str) -> Result<SandboxRef> {
-        let response = self
-            .unary(|mut grpc| {
-                let request = proto::GetSandboxRequest {
-                    name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector("default")),
-                };
-                async move { grpc.get_sandbox(request).await }
-            })
-            .await?;
-        sandbox_from_response(response.sandbox)
+        self.get_sandbox_in("default", name).await
     }
 
     /// List sandboxes.
@@ -402,6 +503,38 @@ impl OpenShellClient {
         sandbox_from_response(response.sandbox)
     }
 
+    /// Suspend a ready sandbox by name, retaining its memory state.
+    ///
+    /// Requires a compute driver and isolation backend that support suspend
+    /// and resume. The gateway returns `FAILED_PRECONDITION` otherwise.
+    pub async fn suspend_sandbox(&self, name: &str) -> Result<SandboxRef> {
+        let response = self
+            .unary(|mut grpc| {
+                let request = proto::SuspendSandboxRequest {
+                    name: name.to_string(),
+                    workspace_scope: Some(proto::workspace_selector("default")),
+                };
+                async move { grpc.suspend_sandbox(request).await }
+            })
+            .await?;
+        sandbox_from_response(response.sandbox)
+    }
+
+    /// Resume a suspended sandbox by name in a new runtime generation.
+    pub async fn resume_sandbox(&self, name: &str, opts: ResumeOptions) -> Result<SandboxRef> {
+        let response = self
+            .unary(|mut grpc| {
+                let request = proto::ResumeSandboxRequest {
+                    name: name.to_string(),
+                    workspace_scope: Some(proto::workspace_selector("default")),
+                    restart_if_restore_fails: opts.restart_if_restore_fails,
+                };
+                async move { grpc.resume_sandbox(request).await }
+            })
+            .await?;
+        sandbox_from_response(response.sandbox)
+    }
+
     /// Poll [`OpenShellClient::get_sandbox`] until the sandbox reaches
     /// [`SandboxPhase::Ready`] or successful [`SandboxPhase::Completed`], or
     /// until the `timeout` elapses.
@@ -409,7 +542,8 @@ impl OpenShellClient {
     /// Returns the terminal sandbox snapshot on success. Returns an
     /// [`SdkError::Connect`] when the timeout expires, or whatever error
     /// the gateway returns if the sandbox transitions into
-    /// [`SandboxPhase::Stopped`] or [`SandboxPhase::Error`].
+    /// [`SandboxPhase::Stopped`], [`SandboxPhase::Error`],
+    /// [`SandboxPhase::Suspending`], or [`SandboxPhase::Suspended`].
     pub async fn wait_ready(&self, name: &str, timeout: Duration) -> Result<SandboxRef> {
         self.wait_for(name, timeout, |phase| match phase {
             SandboxPhase::Ready | SandboxPhase::Completed => Some(Ok(())),
@@ -419,6 +553,9 @@ impl OpenShellClient {
             SandboxPhase::Error => Some(Err(SdkError::connect(format!(
                 "sandbox '{name}' entered error phase"
             )))),
+            SandboxPhase::Suspending | SandboxPhase::Suspended => Some(Err(SdkError::connect(
+                format!("sandbox '{name}' is suspended; resume it before waiting for ready"),
+            ))),
             _ => None,
         })
         .await
@@ -627,16 +764,7 @@ impl OpenShellClient {
             no_login_shell: opts.no_login_shell,
         };
 
-        // Open the stream under the same OIDC-aware auth policy as unary RPCs
-        // (proactive refresh, then one reactive retry on `Unauthenticated`).
-        // Mid-stream rotation is out of scope; streaming retry is tracked
-        // separately.
-        let mut stream = self
-            .unary(|mut grpc| {
-                let request = request.clone();
-                async move { grpc.exec_sandbox(request).await }
-            })
-            .await?;
+        let mut stream = self.open_exec("default", request).await?;
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -792,21 +920,101 @@ impl OpenShellClient {
         F: Fn(AuthedGrpcClient) -> Fut,
         Fut: Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
     {
+        self.unary_response(call)
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
+    /// [`OpenShellClient::unary`] that keeps the response metadata.
+    async fn unary_response<T, F, Fut>(&self, call: F) -> Result<tonic::Response<T>>
+    where
+        F: Fn(AuthedGrpcClient) -> Fut,
+        Fut: Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+    {
         self.ensure_fresh().await?;
         match call(self.raw_grpc()).await {
-            Ok(resp) => Ok(resp.into_inner()),
+            Ok(resp) => Ok(resp),
             Err(status) if status.code() == tonic::Code::Unauthenticated => {
                 if self.refresh_on_unauthorized().await? {
-                    call(self.raw_grpc())
-                        .await
-                        .map(tonic::Response::into_inner)
-                        .map_err(map_status)
+                    call(self.raw_grpc()).await.map_err(map_status)
                 } else {
                     Err(map_status(status))
                 }
             }
             Err(status) => Err(map_status(status)),
         }
+    }
+
+    /// Errors that exec would hit anyway are returned; any other failed lookup
+    /// leaves the call unrouted.
+    async fn owner_of(&self, workspace: &str, name: &str) -> Result<Option<AsciiMetadataValue>> {
+        if let Some(cached) = self.owners.get(workspace, name) {
+            return Ok(cached.0);
+        }
+        match self.get_sandbox_in(workspace, name).await {
+            Ok(_) => Ok(self.owners.get(workspace, name).and_then(|cached| cached.0)),
+            Err(err)
+                if matches!(
+                    err.grpc_status().map(tonic::Status::code),
+                    Some(tonic::Code::Unauthenticated | tonic::Code::Unavailable)
+                ) =>
+            {
+                Err(err)
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "sandbox owner lookup failed; exec is unrouted");
+                Ok(None)
+            }
+        }
+    }
+
+    /// `GetSandbox` that also caches the owner replica the gateway reports.
+    async fn get_sandbox_in(&self, workspace: &str, name: &str) -> Result<SandboxRef> {
+        let response = self
+            .unary_response(|mut grpc| {
+                let request = with_owner_hint(proto::GetSandboxRequest {
+                    name: name.to_string(),
+                    workspace_scope: Some(proto::workspace_selector(workspace)),
+                });
+                async move { grpc.get_sandbox(request).await }
+            })
+            .await?;
+        self.owners
+            .insert(workspace, name, owner_replica(&response));
+        sandbox_from_response(response.into_inner().sandbox)
+    }
+
+    /// Open `ExecSandbox` on the owner replica under the unary auth policy.
+    async fn open_exec(
+        &self,
+        workspace: &str,
+        request: proto::ExecSandboxRequest,
+    ) -> Result<tonic::Streaming<proto::ExecSandboxEvent>> {
+        let owner = self.owner_of(workspace, &request.sandbox).await?;
+        let owners = &self.owners;
+        self.unary(|mut grpc| {
+            let request = request.clone();
+            let owner = owner.clone();
+            async move {
+                match grpc
+                    .exec_sandbox(routed_to(request.clone(), owner.as_ref()))
+                    .await
+                {
+                    Err(status) if retry_unrouted(owner.as_ref(), &status) => {
+                        owners.forget(workspace, &request.sandbox);
+                        grpc.exec_sandbox(request).await
+                    }
+                    Err(status) => {
+                        if owner.is_some() && status.code() == tonic::Code::Unavailable {
+                            owners.forget(workspace, &request.sandbox);
+                        }
+                        Err(status)
+                    }
+                    response => response,
+                }
+            }
+        })
+        .await
     }
 
     /// Proactive refresh: if a token source is wired and the token is within
@@ -879,6 +1087,71 @@ pub struct WorkspaceScopedClient {
 }
 
 impl WorkspaceScopedClient {
+    /// Create a frozen sandbox in this workspace using a distinct optional RPC.
+    pub async fn create_frozen_sandbox(&self, spec: FrozenSandboxCreateSpec) -> Result<SandboxRef> {
+        let mut request = create_sandbox_request(spec.sandbox);
+        request
+            .spec
+            .as_mut()
+            .expect("create request has a spec")
+            .policy = spec.policy;
+        self.create_frozen(request).await
+    }
+
+    /// Create a frozen sandbox from a workload template in this workspace.
+    pub async fn create_frozen_sandbox_from_template(
+        &self,
+        spec: SandboxTemplateCreateSpec,
+    ) -> Result<SandboxRef> {
+        self.create_frozen(create_sandbox_from_template_request(spec))
+            .await
+    }
+
+    async fn create_frozen(&self, request: proto::CreateSandboxRequest) -> Result<SandboxRef> {
+        let request = proto::CreateFrozenSandboxRequest {
+            workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+            request_id: request.request_id,
+            spec: request.spec,
+            name: request.name,
+            labels: request.labels,
+            annotations: request.annotations,
+            await_main_process_attachment: request.await_main_process_attachment,
+            workload_template: request.workload_template,
+            service_exposures: request.service_exposures,
+        };
+        let response = self
+            .client
+            .frozen_unary(|mut grpc| {
+                let request = request.clone();
+                async move { grpc.create_sandbox(request).await }
+            })
+            .await?;
+        let mut sandbox = sandbox_from_response(response.sandbox)?;
+        if !response.frozen_policy.is_some_and(|state| state.requested) {
+            return Err(SdkError::invalid_config(format!(
+                "gateway did not acknowledge frozen creation for sandbox '{}' (ID '{}', workspace '{}'); remove the sandbox before retrying",
+                sandbox.name, sandbox.id, sandbox.workspace,
+            )));
+        }
+        sandbox.service_urls = response.service_urls;
+        Ok(sandbox)
+    }
+
+    /// Read a pending freeze or the immutable accepted snapshot in this workspace.
+    pub async fn get_frozen_policy(&self, name: &str) -> Result<FrozenPolicyState> {
+        let request = proto::GetFrozenSandboxPolicyRequest {
+            workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+            name: name.to_string(),
+        };
+        self.client
+            .frozen_unary(|mut grpc| {
+                let request = request.clone();
+                async move { grpc.get_policy(request).await }
+            })
+            .await
+            .map(Into::into)
+    }
+
     /// The workspace this client targets.
     pub fn workspace_name(&self) -> &str {
         &self.workspace
@@ -886,7 +1159,6 @@ impl WorkspaceScopedClient {
 
     /// Create a new sandbox in this workspace.
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
-        let frozen = spec.frozen;
         let mut request = create_sandbox_request(spec);
         request.workspace_scope = Some(proto::workspace_selector(&self.workspace));
         let response = self
@@ -896,7 +1168,7 @@ impl WorkspaceScopedClient {
                 async move { grpc.create_sandbox(request).await }
             })
             .await?;
-        sandbox_from_create_response(response, frozen)
+        sandbox_from_create_response(response)
     }
 
     /// Create a new sandbox from a template in this workspace.
@@ -904,7 +1176,6 @@ impl WorkspaceScopedClient {
         &self,
         spec: SandboxTemplateCreateSpec,
     ) -> Result<SandboxRef> {
-        let frozen = spec.frozen;
         let mut request = create_sandbox_from_template_request(spec);
         request.workspace_scope = Some(proto::workspace_selector(&self.workspace));
         let response = self
@@ -914,7 +1185,7 @@ impl WorkspaceScopedClient {
                 async move { grpc.create_sandbox(request).await }
             })
             .await?;
-        sandbox_from_create_response(response, frozen)
+        sandbox_from_create_response(response)
     }
 
     /// Create a reusable sandbox template in this workspace.
@@ -1018,17 +1289,7 @@ impl WorkspaceScopedClient {
 
     /// Fetch a sandbox by name in this workspace.
     pub async fn get_sandbox(&self, name: &str) -> Result<SandboxRef> {
-        let response = self
-            .client
-            .unary(|mut grpc| {
-                let request = proto::GetSandboxRequest {
-                    name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
-                };
-                async move { grpc.get_sandbox(request).await }
-            })
-            .await?;
-        sandbox_from_response(response.sandbox)
+        self.client.get_sandbox_in(&self.workspace, name).await
     }
 
     /// List sandboxes in this workspace.
@@ -1122,6 +1383,40 @@ impl WorkspaceScopedClient {
         sandbox_from_response(response.sandbox)
     }
 
+    /// Suspend a ready sandbox by name in this workspace, retaining its memory state.
+    ///
+    /// Requires a compute driver and isolation backend that support suspend
+    /// and resume. The gateway returns `FAILED_PRECONDITION` otherwise.
+    pub async fn suspend_sandbox(&self, name: &str) -> Result<SandboxRef> {
+        let response = self
+            .client
+            .unary(|mut grpc| {
+                let request = proto::SuspendSandboxRequest {
+                    name: name.to_string(),
+                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                };
+                async move { grpc.suspend_sandbox(request).await }
+            })
+            .await?;
+        sandbox_from_response(response.sandbox)
+    }
+
+    /// Resume a suspended sandbox by name in this workspace in a new runtime generation.
+    pub async fn resume_sandbox(&self, name: &str, opts: ResumeOptions) -> Result<SandboxRef> {
+        let response = self
+            .client
+            .unary(|mut grpc| {
+                let request = proto::ResumeSandboxRequest {
+                    name: name.to_string(),
+                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                    restart_if_restore_fails: opts.restart_if_restore_fails,
+                };
+                async move { grpc.resume_sandbox(request).await }
+            })
+            .await?;
+        sandbox_from_response(response.sandbox)
+    }
+
     /// Poll until the sandbox reaches [`SandboxPhase::Ready`] or successful
     /// [`SandboxPhase::Completed`], or the timeout elapses.
     pub async fn wait_ready(&self, name: &str, timeout: Duration) -> Result<SandboxRef> {
@@ -1141,6 +1436,11 @@ impl WorkspaceScopedClient {
                 SandboxPhase::Error => {
                     return Err(SdkError::connect(format!(
                         "sandbox '{name}' entered error phase"
+                    )));
+                }
+                SandboxPhase::Suspending | SandboxPhase::Suspended => {
+                    return Err(SdkError::connect(format!(
+                        "sandbox '{name}' is suspended; resume it before waiting for ready"
                     )));
                 }
                 _ => {}
@@ -1208,13 +1508,7 @@ impl WorkspaceScopedClient {
             no_login_shell: opts.no_login_shell,
         };
 
-        let mut stream = self
-            .client
-            .unary(|mut grpc| {
-                let request = request.clone();
-                async move { grpc.exec_sandbox(request).await }
-            })
-            .await?;
+        let mut stream = self.client.open_exec(&self.workspace, request).await?;
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1327,8 +1621,6 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         labels,
         environment,
         providers,
-        policy,
-        frozen,
         gpu,
         command,
         tty,
@@ -1348,8 +1640,6 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
             environment,
             template,
             providers,
-            policy,
-            frozen,
             resource_requirements,
             command,
             tty,
@@ -1386,7 +1676,6 @@ fn create_sandbox_from_template_request(
         command,
         tty,
         policy,
-        frozen,
         service_exposures,
     } = spec;
     proto::CreateSandboxRequest {
@@ -1396,7 +1685,6 @@ fn create_sandbox_from_template_request(
             command,
             tty,
             policy,
-            frozen,
             ..proto::SandboxSpec::default()
         }),
         name: name.unwrap_or_default(),
@@ -1424,17 +1712,8 @@ fn sandbox_from_response(sandbox: Option<proto::Sandbox>) -> Result<SandboxRef> 
         .ok_or_else(|| SdkError::invalid_config("sandbox missing from gateway response"))
 }
 
-fn sandbox_from_create_response(
-    response: proto::SandboxResponse,
-    frozen: bool,
-) -> Result<SandboxRef> {
+fn sandbox_from_create_response(response: proto::SandboxResponse) -> Result<SandboxRef> {
     let mut sandbox = sandbox_from_response(response.sandbox)?;
-    if frozen && !sandbox.frozen {
-        return Err(SdkError::invalid_config(format!(
-            "gateway did not honor frozen=true for sandbox '{}' (ID '{}', workspace '{}'); it may already be running. Upgrade the gateway and remove the sandbox before retrying",
-            sandbox.name, sandbox.id, sandbox.workspace,
-        )));
-    }
     sandbox.service_urls = response.service_urls;
     Ok(sandbox)
 }
@@ -1566,6 +1845,7 @@ mod tests {
             interceptor,
             token_source: Some(source),
             bearer_slot,
+            owners: OwnerCache::default(),
         }
     }
 

@@ -382,6 +382,8 @@ func TestSandboxPhaseFromProto(t *testing.T) {
 		{pb.SandboxPhase_SANDBOX_PHASE_STOPPED, v1.SandboxStopped},
 		{pb.SandboxPhase_SANDBOX_PHASE_COMPLETED, v1.SandboxCompleted},
 		{pb.SandboxPhase_SANDBOX_PHASE_STARTING, v1.SandboxStarting},
+		{pb.SandboxPhase_SANDBOX_PHASE_SUSPENDING, v1.SandboxSuspending},
+		{pb.SandboxPhase_SANDBOX_PHASE_SUSPENDED, v1.SandboxSuspended},
 		{pb.SandboxPhase_SANDBOX_PHASE_UNSPECIFIED, v1.SandboxUnknown},
 		{pb.SandboxPhase(999), v1.SandboxUnknown},
 	}
@@ -405,6 +407,8 @@ func TestSandboxPhaseToProto(t *testing.T) {
 		{v1.SandboxStopped, pb.SandboxPhase_SANDBOX_PHASE_STOPPED},
 		{v1.SandboxCompleted, pb.SandboxPhase_SANDBOX_PHASE_COMPLETED},
 		{v1.SandboxStarting, pb.SandboxPhase_SANDBOX_PHASE_STARTING},
+		{v1.SandboxSuspending, pb.SandboxPhase_SANDBOX_PHASE_SUSPENDING},
+		{v1.SandboxSuspended, pb.SandboxPhase_SANDBOX_PHASE_SUSPENDED},
 		{v1.SandboxPhase("bogus"), pb.SandboxPhase_SANDBOX_PHASE_UNKNOWN},
 	}
 
@@ -812,25 +816,3 @@ func TestSandboxSpecToProto_Nil(t *testing.T) {
 
 // Verify proto import is used (suppress unused import warning).
 var _ = proto.Marshal
-
-func TestFrozenSandboxPolicyFromProto(t *testing.T) {
-	spec := &v1.SandboxSpec{Frozen: true}
-	wireSpec := SandboxSpecToProto(spec)
-	assert.True(t, wireSpec.GetFrozen())
-	assert.True(t, sandboxSpecFromProto(wireSpec).Frozen)
-	assert.Nil(t, sandboxStatusFromProto(&pb.SandboxStatus{}).FrozenPolicy)
-	wire := &pb.SandboxStatus{FrozenPolicy: &pb.FrozenSandboxPolicy{
-		Policy:  &sandboxpb.SandboxPolicy{Version: 1, Filesystem: &sandboxpb.FilesystemPolicy{ReadOnly: []string{"/etc"}}},
-		Version: 3, PolicyHash: "accepted-hash", FrozenTime: TimestampFromMillis(600_000),
-		PolicySource: sandboxpb.PolicySource_POLICY_SOURCE_GLOBAL, GlobalPolicyVersion: 7,
-	}}
-	got := sandboxStatusFromProto(wire).FrozenPolicy
-	require.NotNil(t, got)
-	assert.Equal(t, uint32(3), got.Version)
-	assert.Equal(t, "accepted-hash", got.PolicyHash)
-	assert.Equal(t, time.UnixMilli(600_000).UTC(), got.FrozenAt)
-	assert.Equal(t, v1.PolicySourceGlobal, got.PolicySource)
-	assert.Equal(t, uint32(7), got.GlobalPolicyVersion)
-	wire.FrozenPolicy.Policy.Filesystem.ReadOnly[0] = "/changed"
-	assert.Equal(t, []string{"/etc"}, got.Policy.Filesystem.ReadOnly)
-}

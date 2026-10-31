@@ -450,6 +450,30 @@ impl ProviderProfileSources {
         })])
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_test_profiles_blocked(
+        profiles: Vec<ProviderProfile>,
+    ) -> (Self, Arc<TestSnapshotGate>) {
+        let gate = Arc::new(TestSnapshotGate::default());
+        let source = BlockingProviderProfileSource {
+            inner: StaticProviderProfileSource {
+                snapshot: ProviderProfileSnapshot {
+                    revision: profile_snapshot_revision(&profiles),
+                    profiles: profiles
+                        .into_iter()
+                        .map(|profile| ScopedSnapshotProfile {
+                            scope: ProfileScope::Static,
+                            profile,
+                        })
+                        .collect(),
+                },
+            },
+            first: std::sync::atomic::AtomicBool::new(true),
+            gate: Arc::clone(&gate),
+        };
+        (Self::uncached(vec![Arc::new(source)]), gate)
+    }
+
     /// A source-managed catalog composed with the user-managed source.
     ///
     /// Models the shape an operator gets from an interceptor-vended catalog:
@@ -1088,6 +1112,75 @@ impl ProviderProfileSource for StaticProviderProfileSource {
         _workspace: &str,
     ) -> Result<ProviderProfileSnapshot, Status> {
         Ok(self.snapshot.clone())
+    }
+}
+
+/// Pause the source's first poll before `try_join` polls later database reads.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct TestSnapshotGate {
+    entered: tokio::sync::Notify,
+    released: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl TestSnapshotGate {
+    pub(crate) async fn entered(&self) {
+        self.entered.notified().await;
+    }
+    pub(crate) fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct BlockingProviderProfileSource {
+    inner: StaticProviderProfileSource,
+    first: std::sync::atomic::AtomicBool,
+    gate: Arc<TestSnapshotGate>,
+}
+
+#[cfg(test)]
+#[async_trait]
+impl ProviderProfileSource for BlockingProviderProfileSource {
+    fn source_id(&self) -> &'static str {
+        "blocking-test"
+    }
+    fn user_managed(&self) -> bool {
+        false
+    }
+    fn allow_empty(&self) -> bool {
+        false
+    }
+    async fn snapshot(
+        &self,
+        store: &Store,
+        workspace: &str,
+    ) -> Result<ProviderProfileSnapshot, Status> {
+        if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            let released = tokio::task::block_in_place(|| {
+                self.gate.entered.notify_one();
+                let (released, _) = self
+                    .gate
+                    .wake
+                    .wait_timeout_while(
+                        self.gate.released.lock().unwrap(),
+                        Duration::from_secs(20),
+                        |released| !*released,
+                    )
+                    .unwrap();
+                *released
+            });
+            if !released {
+                return Err(Status::deadline_exceeded(
+                    "test profile source was not released",
+                ));
+            }
+        }
+        self.inner.snapshot(store, workspace).await
     }
 }
 

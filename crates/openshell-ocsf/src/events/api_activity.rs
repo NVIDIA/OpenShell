@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use super::base_event::BaseEventData;
 use crate::enums::{ActionId, DispositionId};
-use crate::objects::{Actor, Api, Endpoint, HttpRequest, HttpResponse};
+use crate::objects::{Actor, Api, Endpoint, HttpRequest, HttpResponse, ResourceDetails};
 
 /// API Activity event (`class_uid` 6003).
 ///
@@ -39,6 +39,10 @@ pub struct ApiActivityEvent {
     /// Destination endpoint (API provider).
     #[serde(default)]
     pub dst_endpoint: Option<Endpoint>,
+
+    /// Resources the call acted on.
+    #[serde(default)]
+    pub resources: Option<Vec<ResourceDetails>>,
 
     /// Action taken (allowed, denied, etc.).
     #[serde(default)]
@@ -73,6 +77,7 @@ impl serde::Serialize for ApiActivityEvent {
         insert_optional!(obj, "http_request", self.http_request);
         insert_optional!(obj, "http_response", self.http_response);
         insert_optional!(obj, "dst_endpoint", self.dst_endpoint);
+        insert_optional!(obj, "resources", self.resources);
         insert_enum_pair!(obj, "action", self.action);
         insert_enum_pair!(obj, "disposition", self.disposition);
 
@@ -108,13 +113,12 @@ mod tests {
         ApiActivityEvent {
             base,
             api: Api::new("POST /v1/messages"),
-            actor: Actor {
-                process: Process::new("supervisor", 1),
-            },
+            actor: Actor::process(Process::new("supervisor", 1)),
             src_endpoint: Endpoint::from_domain("api.anthropic.com", 443),
             http_request: None,
             http_response: None,
             dst_endpoint: None,
+            resources: None,
             action: None,
             disposition: None,
         }

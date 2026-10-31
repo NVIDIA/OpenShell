@@ -11,7 +11,11 @@ When the gateway configures `[openshell.gateway.otlp]`, the in-process driver
 exports spans to the same OTLP/gRPC collector as
 `openshell-driver-docker`. The standalone driver accepts
 `OPENSHELL_OTLP_ENDPOINT`, continues W3C trace context from gateway RPC
-metadata, and flushes spans during graceful shutdown.
+metadata, and flushes spans during graceful shutdown. When
+`[openshell.gateway.otlp.agent]` is enabled, the driver also sets
+`OPENSHELL_OTLP_AGENT_ENDPOINT` on the supervisor container, which starts the
+agent trace relay. The standalone driver takes that endpoint as
+`--otlp-agent-endpoint`.
 
 ## Runtime Model
 
@@ -108,9 +112,15 @@ LSM decisions remain authoritative.
 | `network_mode = host` on the supervisor | Lets the trusted supervisor reach the gateway's primary loopback listener and originate approved upstream connections. |
 | `restart_policy = no` | Keeps canonical main-process exit terminal. |
 | `PidsLimit` | Applies the configured sandbox PID budget. Omit `sandbox_pids_limit` to use OpenShell's default. Explicit zero is invalid. |
-| Private named volumes | One carries the authenticated sandbox/supervisor channel. The other is mounted only into the supervisor and contains its JWT and private gateway credentials. |
+| Private named volumes | Separate volumes carry sandbox bootstrap keys, the runtime-initiated Unix socket, and supervisor-only credentials. The supervisor mounts bootstrap keys read-only and only the socket volume writable. |
 | In-memory `/run/openshell-supervisor-ca` tmpfs | Holds only the public supervisor CA certificate and trust bundle without making all of `/run` writable. |
 | CDI GPU request | Assigns the exact validated CDI devices requested by driver config or count-based selection. |
+
+New containers dial the supervisor at `/.openshell/channel/control/supervisor/control.sock`.
+The runtime remains the TLS/gRPC server; the supervisor verifies its pinned
+identity and supplies the existing bearer credential. Saved descriptors retain
+the legacy Unix listener for existing containers, including across restart.
+New generations require matching supervisor and sandbox runtime binaries.
 
 ## Stop, Start, and Delete
 

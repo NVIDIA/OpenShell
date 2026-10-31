@@ -5,21 +5,23 @@
 //! `OpenShell` server.
 //!
 //! Every request carries a sandbox bearer credential in the `Authorization`
-//! header. The token is resolved at startup from one of three sources:
+//! header. Each sandbox instance owns its [`GatewayCredentials`], usually
+//! built from the trusted launch bundle with
+//! [`GatewayCredentials::from_auth_bundle`]. Diagnostic tools can instead
+//! resolve a token with [`GatewayCredentials::from_environment`] from one of:
 //!
 //! 1. `OPENSHELL_SANDBOX_TOKEN` — raw JWT in the env (test harness path).
-//! 2. `OPENSHELL_SANDBOX_TOKEN_FILE` — file containing the JWT (Docker /
-//!    Podman / VM drivers write this to a bundle file at sandbox-create
-//!    time).
+//! 2. `OPENSHELL_SANDBOX_TOKEN_FILE` — file containing the JWT.
 //! 3. `OPENSHELL_K8S_SA_TOKEN_FILE` — projected `ServiceAccount` JWT; the
-//!    supervisor exchanges it for a gateway JWT via `IssueSandboxToken`
-//!    once at startup.
+//!    caller exchanges it for a gateway JWT via `IssueSandboxToken`.
 //!
-//! The resolved bearer credential is held in process memory thereafter and
-//! injected on every outbound call by [`AuthInterceptor`].
+//! Callers reach the gateway through a [`GatewayEndpoint`], which pairs the
+//! URL with one sandbox instance's credentials. No credential is installed
+//! process-wide, so instances hosted by one supervisor process cannot use or
+//! rotate each other's identity.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::endpoint_status::{EndpointResult, EndpointStatusSnapshot};
@@ -63,8 +65,8 @@ pub const MAX_SUPERVISOR_STREAM_MESSAGE_BYTES: usize = 9 * 1024 * 1024;
 
 /// Shared, refreshable Bearer header. All [`AuthInterceptor`] clones read
 /// the same slot, so the renewal task can replace the token in place without
-/// rebuilding the channel.
-type TokenSlot = Arc<RwLock<AsciiMetadataValue>>;
+/// rebuilding the channel. `None` means the owning sandbox instance revoked it.
+type TokenSlot = Arc<RwLock<Option<AsciiMetadataValue>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TokenSource {
@@ -73,56 +75,230 @@ enum TokenSource {
     K8sServiceAccount,
 }
 
-/// Process-wide token slot. Initialized by the first [`connect_channel`]
-/// call and shared with every subsequent client and the renewal loop.
-static TOKEN_SLOT: OnceLock<TokenSlot> = OnceLock::new();
+/// Gateway credentials owned by one sandbox instance.
+///
+/// Clients built from a [`GatewayEndpoint`] read only these slots, and the
+/// renewal task started by the first connection updates only them. Dropping
+/// the last clone or calling [`GatewayCredentials::revoke`] stops renewal.
+#[derive(Clone)]
+pub struct GatewayCredentials {
+    inner: Arc<CredentialState>,
+}
 
-/// Refresh strategy used by the process-wide token slot.
-static TOKEN_REFRESH_MODE: OnceLock<RefreshMode> = OnceLock::new();
+struct CredentialState {
+    bearer: TokenSlot,
+    source: TokenSource,
+    #[cfg(feature = "jwt")]
+    sandbox_bearer: Option<crate::jwt::SessionBearerTokenSlot>,
+    renewal: std::sync::Mutex<Renewal>,
+}
 
-/// Serializes the first token acquisition. Several supervisor subsystems
-/// connect during startup; without this guard they can all observe an empty
-/// [`TOKEN_SLOT`] and perform duplicate K8s bootstrap exchanges.
-static TOKEN_INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+enum Renewal {
+    Idle,
+    Started(tokio::task::AbortHandle),
+    Revoked,
+}
 
-/// One-shot guard so the renewal loop spawns at most once per process.
-static REFRESH_SPAWNED: OnceLock<()> = OnceLock::new();
+impl Drop for CredentialState {
+    fn drop(&mut self) {
+        let renewal = self
+            .renewal
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Renewal::Started(task) = renewal {
+            task.abort();
+        }
+    }
+}
 
-#[cfg(feature = "jwt")]
-static SANDBOX_BEARER_SLOT: OnceLock<crate::jwt::SessionBearerTokenSlot> = OnceLock::new();
+impl std::fmt::Debug for GatewayCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewayCredentials")
+            .field("source", &self.inner.source)
+            .finish_non_exhaustive()
+    }
+}
 
-#[derive(Clone, Debug)]
-enum RefreshMode {
-    GatewayJwt(TokenSource),
+impl GatewayCredentials {
+    fn new(bearer: AsciiMetadataValue, source: TokenSource) -> Self {
+        Self {
+            inner: Arc::new(CredentialState {
+                bearer: Arc::new(RwLock::new(Some(bearer))),
+                source,
+                #[cfg(feature = "jwt")]
+                sandbox_bearer: None,
+                renewal: std::sync::Mutex::new(Renewal::Idle),
+            }),
+        }
+    }
+
+    /// Credentials issued for one exact sandbox launch. Renewal also rotates
+    /// the bundle's Sandbox Protocol credential, returned by
+    /// [`GatewayCredentials::sandbox_bearer`].
+    #[cfg(feature = "jwt")]
+    pub fn from_auth_bundle(bundle: &crate::jwt::SupervisorAuthBundle) -> Result<Self> {
+        let bearer = validate_gateway_bearer(bundle.gateway_token.expose_secret())?;
+        let sandbox_bearer = bundle
+            .sandbox_bearer_slot()
+            .into_diagnostic()
+            .wrap_err("invalid Sandbox Protocol credential")?;
+        Ok(Self {
+            inner: Arc::new(CredentialState {
+                bearer: Arc::new(RwLock::new(Some(bearer))),
+                source: TokenSource::File,
+                sandbox_bearer: Some(sandbox_bearer),
+                renewal: std::sync::Mutex::new(Renewal::Idle),
+            }),
+        })
+    }
+
+    /// Use a caller-supplied gateway JWT. Renewal cannot rebootstrap it.
+    pub fn from_gateway_token(token: &str) -> Result<Self> {
+        Ok(Self::new(validate_gateway_bearer(token)?, TokenSource::Env))
+    }
+
+    /// Resolve a token for diagnostic tools from the environment, exchanging a
+    /// projected `ServiceAccount` token when no gateway JWT is present.
+    pub async fn from_environment(endpoint: &str) -> Result<Self> {
+        let plain_channel = build_plain_channel(endpoint).await?;
+        let acquired = acquire_sandbox_token(endpoint, &plain_channel).await?;
+        Ok(Self::new(
+            validate_gateway_bearer(&acquired.token)?,
+            acquired.source,
+        ))
+    }
+
+    /// The Sandbox Protocol credential renewed with these gateway credentials.
+    #[cfg(feature = "jwt")]
+    #[must_use]
+    pub fn sandbox_bearer(&self) -> Option<crate::jwt::SessionBearerTokenSlot> {
+        self.inner.sandbox_bearer.clone()
+    }
+
+    /// Clear both credentials and stop renewal. Existing clients fail their
+    /// next request locally instead of presenting a revoked identity.
+    pub fn revoke(&self) {
+        let mut renewal = self
+            .inner
+            .renewal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Renewal::Started(task) = &*renewal {
+            task.abort();
+        }
+        *renewal = Renewal::Revoked;
+        *self
+            .inner
+            .bearer
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        #[cfg(feature = "jwt")]
+        if let Some(sandbox_bearer) = &self.inner.sandbox_bearer {
+            sandbox_bearer.clear();
+        }
+    }
+
+    /// Start the renewal task once for these credentials, on the caller's
+    /// runtime, so a hosted sandbox instance's renewal stops with that instance.
+    fn start_renewal(&self, channel: &AuthedChannel, plain_channel: &Channel, endpoint: &str) {
+        let mut renewal = self
+            .inner
+            .renewal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(*renewal, Renewal::Idle) {
+            return;
+        }
+        let task = tokio::spawn(refresh_token_loop(RenewalTarget {
+            channel: channel.clone(),
+            bearer: self.inner.bearer.clone(),
+            #[cfg(feature = "jwt")]
+            sandbox_bearer: self.inner.sandbox_bearer.clone(),
+            source: self.inner.source,
+            endpoint: endpoint.to_string(),
+            plain_channel: plain_channel.clone(),
+        }));
+        *renewal = Renewal::Started(task.abort_handle());
+    }
+
+    fn is_revoked(&self) -> bool {
+        matches!(
+            *self
+                .inner
+                .renewal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Renewal::Revoked
+        )
+    }
+
+    fn install_gateway_bearer(&self, bearer: AsciiMetadataValue) {
+        let mut slot = self
+            .inner
+            .bearer
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Revoked instance credentials must not be revived by an in-flight
+        // response.
+        if slot.is_some() {
+            *slot = Some(bearer);
+        }
+    }
+}
+
+/// The gateway URL a sandbox instance uses, paired with that instance's
+/// credentials.
+#[derive(Clone)]
+pub struct GatewayEndpoint {
+    url: Arc<str>,
+    credentials: GatewayCredentials,
+}
+
+impl GatewayEndpoint {
+    pub fn new(url: impl Into<Arc<str>>, credentials: GatewayCredentials) -> Self {
+        Self {
+            url: url.into(),
+            credentials,
+        }
+    }
+
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    #[must_use]
+    pub fn credentials(&self) -> &GatewayCredentials {
+        &self.credentials
+    }
+
+    /// Reach another gateway address with the same sandbox instance credentials.
+    #[must_use]
+    pub fn with_url(&self, url: impl Into<Arc<str>>) -> Self {
+        Self::new(url, self.credentials.clone())
+    }
+}
+
+impl std::fmt::Debug for GatewayEndpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewayEndpoint")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
 struct AcquiredToken {
     token: String,
-    refresh_mode: RefreshMode,
-}
-
-fn install_token_slot(token: &str) -> Result<TokenSlot> {
-    let bearer = validate_gateway_bearer(token)?;
-    Ok(install_validated_token_slot(bearer))
+    source: TokenSource,
 }
 
 fn validate_gateway_bearer(token: &str) -> Result<AsciiMetadataValue> {
     AsciiMetadataValue::try_from(format!("Bearer {token}"))
         .into_diagnostic()
         .wrap_err("sandbox JWT contained characters not valid for a header value")
-}
-
-fn install_validated_token_slot(bearer: AsciiMetadataValue) -> TokenSlot {
-    if let Some(existing) = TOKEN_SLOT.get() {
-        *existing
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = bearer;
-        return existing.clone();
-    }
-    let slot: TokenSlot = Arc::new(RwLock::new(bearer));
-    let _ = TOKEN_SLOT.set(slot.clone());
-    TOKEN_SLOT.get().cloned().unwrap_or(slot)
 }
 
 #[cfg(feature = "jwt")]
@@ -159,22 +335,6 @@ fn validate_sandbox_refresh(
     })
 }
 
-/// Install the gateway-session credential supplied in trusted supervisor
-/// launch state before any gateway client is constructed.
-#[cfg(feature = "jwt")]
-pub fn install_supervisor_auth_bundle(
-    bundle: &crate::jwt::SupervisorAuthBundle,
-) -> Result<crate::jwt::SessionBearerTokenSlot> {
-    install_token_slot(bundle.gateway_token.expose_secret())?;
-    let _ = TOKEN_REFRESH_MODE.set(RefreshMode::GatewayJwt(TokenSource::File));
-    let slot = bundle
-        .sandbox_bearer_slot()
-        .into_diagnostic()
-        .wrap_err("invalid Sandbox Protocol credential")?;
-    let _ = SANDBOX_BEARER_SLOT.set(slot.clone());
-    Ok(SANDBOX_BEARER_SLOT.get().cloned().unwrap_or(slot))
-}
-
 /// gRPC interceptor that injects `authorization: Bearer <token>` on every
 /// outbound request. The token lives in a shared [`TokenSlot`] so the renewal
 /// task can replace it without rebuilding clients.
@@ -197,14 +357,35 @@ impl tonic::service::Interceptor for AuthInterceptor {
         let bearer = self
             .bearer
             .read()
-            .expect("auth interceptor token slot poisoned")
-            .clone();
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                Status::unauthenticated("sandbox instance gateway credentials were revoked")
+            })?;
         req.metadata_mut().insert("authorization", bearer);
         #[cfg(feature = "trace-context")]
         let req =
             tonic::service::Interceptor::call(&mut openshell_otel::TraceContextInterceptor, req)?;
         Ok(req)
     }
+}
+
+/// Configure server-authenticated TLS for the gateway control-plane endpoint.
+///
+/// Trust only the configured gateway CA. Destination, system, and proxy
+/// trust are intentionally not parameters to this control-plane boundary.
+fn configure_gateway_tls(
+    ep: Endpoint,
+    ca_pem: Vec<u8>,
+    server_name: Option<&str>,
+) -> Result<Endpoint> {
+    let mut tls_config = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem));
+    if let Some(server_name) = server_name.filter(|name| !name.is_empty()) {
+        tls_config = tls_config.domain_name(server_name);
+    }
+    ep.tls_config(tls_config)
+        .into_diagnostic()
+        .wrap_err("failed to configure TLS")
 }
 
 /// Build the plain (un-intercepted) gRPC channel.
@@ -242,27 +423,12 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to read CA cert from {ca_path}"))?;
 
-        // Trust only the configured CA — this is the chart's internal CA
-        // that signs the gateway's internal server certificate. The gateway uses SNI-based
-        // certificate selection to present this internal cert to supervisor
-        // connections, so no public root trust is needed here.
-        //
-        // Do NOT add `.with_native_roots()` or `.with_webpki_roots()` here:
-        // the supervisor runs inside the user-selected sandbox image
-        // (Docker/Podman drivers), and broadening the trust store would let
-        // an attacker who controls the image + DNS present a publicly valid
-        // certificate and intercept the supervisor→gateway TLS connection.
-        let mut tls_config = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem));
-        if let Ok(server_name) = std::env::var(sandbox_env::GATEWAY_TLS_SERVER_NAME)
-            && !server_name.is_empty()
-        {
-            tls_config = tls_config.domain_name(server_name);
-        }
-
-        ep = ep
-            .tls_config(tls_config)
-            .into_diagnostic()
-            .wrap_err("failed to configure TLS")?;
+        // The gateway uses SNI-based certificate selection to present its
+        // internal cert to supervisor connections. Do not add native,
+        // webpki, destination, or child-process roots here: an image that can
+        // influence DNS must not broaden supervisor→gateway authentication.
+        let server_name = std::env::var(sandbox_env::GATEWAY_TLS_SERVER_NAME).ok();
+        ep = configure_gateway_tls(ep, ca_pem, server_name.as_deref())?;
     }
 
     ep.connect()
@@ -299,54 +465,145 @@ impl Drop for ClientSpanStatus {
     }
 }
 
-/// Build a Bearer-authenticated channel to the gateway.
-///
-/// First call per process resolves the sandbox JWT via the three-step
-/// lookup (env → file → K8s SA bootstrap exchange) and installs it into
-/// the process-wide [`TOKEN_SLOT`]. Subsequent calls reuse the cached
-/// slot — the renewal loop keeps the value fresh, so re-running the
-/// bootstrap is both unnecessary and (on the K8s SA path) expensive
-/// (one apiserver round-trip per call). The renewal loop itself is
-/// spawned once per process via [`REFRESH_SPAWNED`].
-async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
-    let channel = build_plain_channel(endpoint).await?;
-    let (slot, refresh_mode) = token_slot(endpoint, &channel).await?;
-    let plain_channel = channel.clone();
-    let intercepted = InterceptedService::new(channel, AuthInterceptor::new(slot.clone()));
-    if REFRESH_SPAWNED.set(()).is_ok() {
-        let RefreshMode::GatewayJwt(source) = refresh_mode;
-        let refresh_channel = intercepted.clone();
-        let endpoint = endpoint.to_string();
-        tokio::spawn(async move {
-            refresh_token_loop(refresh_channel, slot, source, endpoint, plain_channel).await;
-        });
+#[cfg(test)]
+mod gateway_tls_isolation_tests {
+    use super::*;
+    use rcgen::{CertificateParams, IsCa};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use std::io::Cursor;
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    #[allow(clippy::struct_field_names)]
+    struct TestPki {
+        ca_pem: Vec<u8>,
+        server_cert_pem: Vec<u8>,
+        server_key_pem: Vec<u8>,
     }
-    Ok(intercepted)
+
+    fn test_pki(server_name: &str) -> TestPki {
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let ca = openshell_crypto::pki::self_signed(ca_params, &ca_key).unwrap();
+
+        let server_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let server_params = CertificateParams::new(vec![server_name.to_string()]).unwrap();
+        let server =
+            openshell_crypto::pki::signed_by(server_params, &server_key, &ca, &ca_key).unwrap();
+        TestPki {
+            ca_pem: ca.pem().into_bytes(),
+            server_cert_pem: server.pem().into_bytes(),
+            server_key_pem: server_key.serialize_pem().unwrap().into_bytes(),
+        }
+    }
+
+    async fn start_h2_tls_server(pki: &TestPki) -> std::net::SocketAddr {
+        let certificates = CertificateDer::pem_reader_iter(&mut Cursor::new(&pki.server_cert_pem))
+            .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
+            .unwrap();
+        let key: PrivateKeyDer<'static> =
+            PrivateKeyDer::pem_reader_iter(&mut Cursor::new(&pki.server_key_pem))
+                .next()
+                .transpose()
+                .unwrap()
+                .unwrap();
+        let mut config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certificates, key)
+            .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            if let Ok(mut connection) = h2::server::handshake(stream).await {
+                while let Some(request) = connection.accept().await {
+                    if request.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        address
+    }
+
+    async fn connect_with_gateway_ca(
+        address: std::net::SocketAddr,
+        pki: &TestPki,
+        server_name: &str,
+    ) -> Result<Channel> {
+        let endpoint = Endpoint::from_shared(format!("https://{address}")).into_diagnostic()?;
+        configure_gateway_tls(endpoint, pki.ca_pem.clone(), Some(server_name))?
+            .connect()
+            .await
+            .into_diagnostic()
+    }
+
+    #[tokio::test]
+    async fn destination_ca_cannot_authenticate_gateway() {
+        const GATEWAY_NAME: &str = "gateway.internal.test";
+        let gateway = test_pki(GATEWAY_NAME);
+        let destination = test_pki(GATEWAY_NAME);
+
+        let real_address = start_h2_tls_server(&gateway).await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_with_gateway_ca(real_address, &gateway, GATEWAY_NAME),
+        )
+        .await
+        .expect("real gateway connection timed out")
+        .expect("configured gateway CA should authenticate the gateway");
+
+        let fake_address = start_h2_tls_server(&destination).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_with_gateway_ca(fake_address, &gateway, GATEWAY_NAME),
+        )
+        .await
+        .expect("fake gateway rejection timed out")
+        .expect_err("destination-signed fake gateway must be rejected");
+        assert!(format!("{error:?}").contains("certificate"), "{error:?}");
+
+        let mismatch_address = start_h2_tls_server(&gateway).await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_with_gateway_ca(mismatch_address, &gateway, "wrong.internal.test"),
+        )
+        .await
+        .expect("hostname mismatch rejection timed out")
+        .expect_err("normal server-name verification must remain enabled");
+    }
 }
 
-async fn token_slot(endpoint: &str, plain_channel: &Channel) -> Result<(TokenSlot, RefreshMode)> {
-    if let Some(existing) = TOKEN_SLOT.get() {
-        let refresh_mode = TOKEN_REFRESH_MODE
-            .get()
-            .cloned()
-            .unwrap_or(RefreshMode::GatewayJwt(TokenSource::Env));
-        return Ok((existing.clone(), refresh_mode));
+/// Build a Bearer-authenticated channel to the gateway with one sandbox
+/// instance's credentials. The first connection starts that instance's
+/// renewal task.
+async fn connect_channel(gateway: &GatewayEndpoint) -> Result<AuthedChannel> {
+    if gateway.credentials.is_revoked() {
+        return Err(miette::miette!(
+            "sandbox instance gateway credentials were revoked"
+        ));
     }
-
-    let _guard = TOKEN_INIT_LOCK.lock().await;
-
-    if let Some(existing) = TOKEN_SLOT.get() {
-        let refresh_mode = TOKEN_REFRESH_MODE
-            .get()
-            .cloned()
-            .unwrap_or(RefreshMode::GatewayJwt(TokenSource::Env));
-        return Ok((existing.clone(), refresh_mode));
-    }
-
-    let acquired = acquire_sandbox_token(endpoint, plain_channel).await?;
-    let slot = install_token_slot(&acquired.token)?;
-    let _ = TOKEN_REFRESH_MODE.set(acquired.refresh_mode.clone());
-    Ok((slot, acquired.refresh_mode))
+    let channel = build_plain_channel(gateway.url()).await?;
+    let intercepted = InterceptedService::new(
+        channel.clone(),
+        AuthInterceptor::new(gateway.credentials.inner.bearer.clone()),
+    );
+    gateway
+        .credentials
+        .start_renewal(&intercepted, &channel, gateway.url());
+    Ok(intercepted)
 }
 
 /// Resolve the sandbox JWT used to authenticate every outbound RPC.
@@ -362,7 +619,7 @@ async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Resul
         debug!(source = "env", "loaded sandbox token");
         return Ok(AcquiredToken {
             token: t,
-            refresh_mode: RefreshMode::GatewayJwt(TokenSource::Env),
+            source: TokenSource::Env,
         });
     }
 
@@ -375,7 +632,7 @@ async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Resul
         debug!(source = "file", path = %path, "loaded sandbox token");
         return Ok(AcquiredToken {
             token: contents.trim().to_string(),
-            refresh_mode: RefreshMode::GatewayJwt(TokenSource::File),
+            source: TokenSource::File,
         });
     }
 
@@ -384,7 +641,7 @@ async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Resul
     {
         return Ok(AcquiredToken {
             token: acquire_k8s_sandbox_token(endpoint, plain_channel, &sa_path).await?,
-            refresh_mode: RefreshMode::GatewayJwt(TokenSource::K8sServiceAccount),
+            source: TokenSource::K8sServiceAccount,
         });
     }
 
@@ -407,14 +664,13 @@ async fn acquire_k8s_sandbox_token(
         .trim()
         .to_string();
     info!(endpoint = %endpoint, "exchanging K8s ServiceAccount token for sandbox JWT");
-    // The bootstrap exchange uses a one-off interceptor pinned to the
-    // SA token; the resulting gateway JWT becomes the value in the
-    // shared `TOKEN_SLOT` once `connect_channel` returns.
-    let bootstrap_slot: TokenSlot = Arc::new(RwLock::new(
+    // The bootstrap exchange uses a one-off interceptor pinned to the SA
+    // token; the caller installs the resulting gateway JWT.
+    let bootstrap_slot: TokenSlot = Arc::new(RwLock::new(Some(
         AsciiMetadataValue::try_from(format!("Bearer {sa_token}"))
             .into_diagnostic()
             .wrap_err("SA token contained characters not valid for a header value")?,
-    ));
+    )));
     let interceptor = AuthInterceptor::new(bootstrap_slot);
     let bootstrap = InterceptedService::new(plain_channel.clone(), interceptor);
     let mut client = OpenShellClient::new(bootstrap);
@@ -428,8 +684,17 @@ async fn acquire_k8s_sandbox_token(
 
 /// Build an authenticated channel for direct external use (e.g. the
 /// long-lived `supervisor_session` control stream).
-pub async fn connect_channel_pub(endpoint: &str) -> Result<AuthedChannel> {
-    connect_channel(endpoint).await
+pub async fn connect_channel_pub(gateway: &GatewayEndpoint) -> Result<AuthedChannel> {
+    connect_channel(gateway).await
+}
+
+/// Build a credential-free gateway channel for callers that attach their own bearer.
+///
+/// Uses the supervisor-side transport settings: server-authenticated TLS from
+/// `OPENSHELL_TLS_CA` and `OPENSHELL_GATEWAY_TLS_SERVER_NAME` for `https`
+/// endpoints, plaintext for `http` ones.
+pub async fn connect_gateway_channel(endpoint: &str) -> Result<Channel> {
+    build_plain_channel(endpoint).await
 }
 
 /// Report installed provider state for the current authenticated supervisor session.
@@ -437,11 +702,11 @@ pub async fn connect_channel_pub(endpoint: &str) -> Result<AuthedChannel> {
 /// The observation must carry the session ID returned by `ConnectSupervisor`.
 /// Reconnects start a new report sequence; retries preserve the complete report.
 pub async fn report_provider_readiness(
-    endpoint: &str,
+    gateway: &GatewayEndpoint,
     sandbox_id: &str,
     observation: crate::proto::ProviderReadinessObservation,
 ) -> Result<crate::proto::ReportProviderReadinessResponse> {
-    let mut client = connect(endpoint).await?;
+    let mut client = connect(gateway).await?;
     client
         .report_provider_readiness(crate::proto::ReportProviderReadinessRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -452,18 +717,34 @@ pub async fn report_provider_readiness(
         .into_diagnostic()
 }
 
-/// Background task that renews the sandbox JWT at ~80% of its remaining
-/// lifetime. The new token replaces the value in [`TOKEN_SLOT`], so all
-/// in-flight and future clients pick it up on their next request. The
-/// loop never panics: every failure is logged and re-attempted after a
-/// bounded backoff.
-async fn refresh_token_loop(
+/// Slots and transport retained by one sandbox instance's renewal task. It
+/// holds no reference to [`GatewayCredentials`], so dropping them still stops
+/// it.
+struct RenewalTarget {
     channel: AuthedChannel,
-    slot: TokenSlot,
+    bearer: TokenSlot,
+    #[cfg(feature = "jwt")]
+    sandbox_bearer: Option<crate::jwt::SessionBearerTokenSlot>,
     source: TokenSource,
     endpoint: String,
     plain_channel: Channel,
-) {
+}
+
+/// Background task that renews the sandbox JWT at ~80% of its remaining
+/// lifetime. The new token replaces the value in the sandbox instance's slot,
+/// so all in-flight and future clients of that instance pick it up on their
+/// next request. The loop never panics: every failure is logged and
+/// re-attempted after a bounded backoff.
+async fn refresh_token_loop(target: RenewalTarget) {
+    let RenewalTarget {
+        channel,
+        bearer: slot,
+        #[cfg(feature = "jwt")]
+        sandbox_bearer,
+        source,
+        endpoint,
+        plain_channel,
+    } = target;
     let mut client = OpenShellClient::new(channel);
     loop {
         let Some(sleep) = compute_refresh_delay(&slot) else {
@@ -495,11 +776,17 @@ async fn refresh_token_loop(
                     }
                 };
 
-                *slot
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = gateway_bearer;
+                {
+                    let mut current = slot
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if current.is_none() {
+                        return;
+                    }
+                    *current = Some(gateway_bearer);
+                }
                 #[cfg(feature = "jwt")]
-                if let Some(sandbox_slot) = SANDBOX_BEARER_SLOT.get()
+                if let Some(sandbox_slot) = sandbox_bearer.as_ref()
                     && let Err(error) = sandbox_slot.update(
                         sandbox_refresh.token,
                         sandbox_refresh.expires_at,
@@ -523,8 +810,10 @@ async fn refresh_token_loop(
                             Ok(new_token) => {
                                 match AsciiMetadataValue::try_from(format!("Bearer {new_token}")) {
                                     Ok(value) => {
-                                        if let Ok(mut guard) = slot.write() {
-                                            *guard = value;
+                                        if let Ok(mut guard) = slot.write()
+                                            && guard.is_some()
+                                        {
+                                            *guard = Some(value);
                                             info!(
                                                 "rebootstrapped gateway sandbox JWT after refresh authentication failure"
                                             );
@@ -585,6 +874,7 @@ fn authenticated_service_names(
 
 async fn refresh_extension_credentials_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
+    credentials: &GatewayCredentials,
     store: &ExtensionCredentialStore,
     services: &[crate::proto::SupervisorMiddlewareService],
 ) -> Result<HashMap<String, BearerTokenSlot>> {
@@ -645,9 +935,9 @@ async fn refresh_extension_credentials_with_client(
     // Commit only after the gateway, Sandbox Protocol, and extension
     // credentials have all been parsed and validated. The remaining updates
     // repeat those validations but cannot fail for the validated inputs.
-    install_validated_token_slot(gateway_bearer);
+    credentials.install_gateway_bearer(gateway_bearer);
     #[cfg(feature = "jwt")]
-    if let Some(sandbox_slot) = SANDBOX_BEARER_SLOT.get() {
+    if let Some(sandbox_slot) = credentials.inner.sandbox_bearer.as_ref() {
         match sandbox_slot.update(
             sandbox_refresh.token,
             sandbox_refresh.expires_at,
@@ -679,11 +969,14 @@ async fn refresh_extension_credentials_with_client(
 /// non-expiring session credential and needs no periodic refresh. If the token
 /// can't be parsed (for example, an opaque bootstrap bearer), default to 6 h.
 fn compute_refresh_delay(slot: &TokenSlot) -> Option<Duration> {
-    let token = slot
-        .read()
-        .ok()
-        .and_then(|v| v.to_str().ok().map(str::to_string))
-        .unwrap_or_default();
+    let token = {
+        let current = slot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Revoked instance credentials have nothing to renew.
+        current.as_ref()?.to_str().ok().map(str::to_string)
+    }
+    .unwrap_or_default();
     let now_ms = i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -819,7 +1112,7 @@ mod auth_tests {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_json);
         let token = format!("h.{payload}.s");
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
-        let slot: TokenSlot = Arc::new(RwLock::new(bearer));
+        let slot: TokenSlot = Arc::new(RwLock::new(Some(bearer)));
         let delay = compute_refresh_delay(&slot).expect("expiring token needs refresh");
         // 800 s baseline + up to 10 % jitter → 800..=880 s, with some slack
         // for the 1-second resolution of the exp claim.
@@ -840,7 +1133,7 @@ mod auth_tests {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
         let token = format!("h.{payload}.s");
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
-        let slot: TokenSlot = Arc::new(RwLock::new(bearer));
+        let slot: TokenSlot = Arc::new(RwLock::new(Some(bearer)));
         let delay = compute_refresh_delay(&slot).expect("expired token needs refresh");
         assert!((1..60).contains(&delay.as_secs()));
     }
@@ -851,7 +1144,7 @@ mod auth_tests {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"exp":0}"#);
         let token = format!("h.{payload}.s");
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
-        let slot: TokenSlot = Arc::new(RwLock::new(bearer));
+        let slot: TokenSlot = Arc::new(RwLock::new(Some(bearer)));
         assert_eq!(compute_refresh_delay(&slot), None);
     }
 
@@ -867,7 +1160,7 @@ mod auth_tests {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_json);
         let token = format!("h.{payload}.s");
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
-        let slot: TokenSlot = Arc::new(RwLock::new(bearer));
+        let slot: TokenSlot = Arc::new(RwLock::new(Some(bearer)));
         let delay = compute_refresh_delay(&slot).expect("expiring token needs refresh");
         assert!(
             delay.as_secs() < 30,
@@ -906,9 +1199,9 @@ mod workspace_tests {
     }
 }
 
-/// Connect to the `OpenShell` server.
-async fn connect(endpoint: &str) -> Result<OpenShellClient<AuthedChannel>> {
-    let channel = connect_channel(endpoint).await?;
+/// Connect to the `OpenShell` server with one sandbox instance's credentials.
+async fn connect(gateway: &GatewayEndpoint) -> Result<OpenShellClient<AuthedChannel>> {
+    let channel = connect_channel(gateway).await?;
     Ok(OpenShellClient::new(channel))
 }
 
@@ -918,12 +1211,12 @@ async fn connect(endpoint: &str) -> Result<OpenShellClient<AuthedChannel>> {
 /// or `Ok(None)` when the sandbox was created without a policy (the sandbox
 /// should discover one from disk or use the restrictive default).
 pub async fn fetch_policy(
-    endpoint: &str,
+    gateway: &GatewayEndpoint,
     sandbox_name: &str,
 ) -> Result<Option<ProtoSandboxPolicy>> {
-    debug!(endpoint = %endpoint, sandbox_name = %sandbox_name, "Connecting to OpenShell server");
+    debug!(endpoint = %gateway.url(), sandbox_name = %sandbox_name, "Connecting to OpenShell server");
 
-    let mut client = connect(endpoint).await?;
+    let mut client = connect(gateway).await?;
 
     debug!("Connected, fetching sandbox policy");
 
@@ -942,12 +1235,12 @@ pub async fn fetch_policy(
     fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
 )]
 pub async fn fetch_settings_snapshot(
-    endpoint: &str,
+    gateway: &GatewayEndpoint,
     sandbox_name: &str,
 ) -> Result<SettingsPollResult> {
     let status = ClientSpanStatus::current();
-    debug!(endpoint = %endpoint, sandbox_name = %sandbox_name, "Connecting to fetch OpenShell settings snapshot");
-    let mut client = connect(endpoint).await?;
+    debug!(endpoint = %gateway.url(), sandbox_name = %sandbox_name, "Connecting to fetch OpenShell settings snapshot");
+    let mut client = connect(gateway).await?;
     status.finish(fetch_settings_snapshot_with_client(&mut client, sandbox_name, None).await)
 }
 
@@ -965,6 +1258,110 @@ async fn fetch_settings_snapshot_with_client(
         .map_err(grpc_status_error)?;
 
     Ok(settings_poll_result(response.into_inner()))
+}
+
+/// Runtime configuration paired with its authoritative frozen-policy state.
+/// Existing polling results retain their source-compatible shape.
+#[derive(Clone, Debug)]
+pub struct FrozenSettingsPollResult {
+    pub snapshot: SettingsPollResult,
+    pub frozen: bool,
+    pub frozen_requested: bool,
+}
+
+impl From<SettingsPollResult> for FrozenSettingsPollResult {
+    fn from(snapshot: SettingsPollResult) -> Self {
+        Self {
+            snapshot,
+            frozen: false,
+            frozen_requested: false,
+        }
+    }
+}
+
+impl std::ops::Deref for FrozenSettingsPollResult {
+    type Target = SettingsPollResult;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+impl std::ops::DerefMut for FrozenSettingsPollResult {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.snapshot
+    }
+}
+
+async fn fetch_frozen_snapshot_on_channel(
+    channel: AuthedChannel,
+    sandbox: &str,
+    workspace: Option<&str>,
+) -> Result<FrozenSettingsPollResult> {
+    use crate::proto::frozen_sandbox_policies_client::FrozenSandboxPoliciesClient;
+
+    let response = FrozenSandboxPoliciesClient::new(channel.clone())
+        .get_config(crate::proto::GetFrozenSandboxConfigRequest {
+            workspace_scope: workspace.map(crate::proto::workspace_selector),
+            name: sandbox.to_string(),
+        })
+        .await;
+    match response {
+        Ok(response) => {
+            let response = response.into_inner();
+            let config = response.config.ok_or_else(|| {
+                miette::miette!("gateway returned no frozen-policy configuration snapshot")
+            })?;
+            if response.frozen && !response.frozen_requested {
+                return Err(miette::miette!(
+                    "gateway returned inconsistent frozen-policy state"
+                ));
+            }
+            Ok(FrozenSettingsPollResult {
+                snapshot: settings_poll_result(config),
+                frozen: response.frozen,
+                frozen_requested: response.frozen_requested,
+            })
+        }
+        Err(status) if status.code() == tonic::Code::Unimplemented => {
+            // Older gateways cannot create frozen sandboxes. Preserve ordinary
+            // startup against them; errors from a supporting gateway fail closed.
+            fetch_settings_snapshot_with_client(
+                &mut OpenShellClient::new(channel),
+                sandbox,
+                workspace,
+            )
+            .await
+            .map(Into::into)
+        }
+        Err(status) => Err(grpc_status_error(status)),
+    }
+}
+
+/// Fetch runtime configuration and freeze state without extending old messages.
+pub async fn fetch_frozen_settings_snapshot(
+    gateway: &GatewayEndpoint,
+    sandbox: &str,
+) -> Result<FrozenSettingsPollResult> {
+    fetch_frozen_snapshot_on_channel(connect_channel(gateway).await?, sandbox, None).await
+}
+
+/// Sync an initialization policy and retain the freeze signal on the same channel.
+pub async fn sync_policy_and_fetch_frozen_snapshot(
+    gateway: &GatewayEndpoint,
+    sandbox: &str,
+    policy: &ProtoSandboxPolicy,
+    workspace: &str,
+) -> Result<FrozenSettingsPollResult> {
+    let channel = connect_channel(gateway).await?;
+    sync_policy_with_client(
+        &mut OpenShellClient::new(channel.clone()),
+        sandbox,
+        policy,
+        workspace,
+    )
+    .await?;
+    fetch_frozen_snapshot_on_channel(channel, sandbox, Some(workspace)).await
 }
 
 fn learned_workspace_selector(workspace: Option<&str>) -> Option<crate::proto::WorkspaceSelector> {
@@ -1014,18 +1411,18 @@ async fn sync_policy_with_client(
 /// Performs the full discovery flow (fetch → sync → re-fetch) over one
 /// channel instead of establishing three separate connections.
 pub async fn discover_and_sync_policy(
-    endpoint: &str,
+    gateway: &GatewayEndpoint,
     sandbox: &str,
     discovered_policy: &ProtoSandboxPolicy,
     workspace: &str,
 ) -> Result<ProtoSandboxPolicy> {
     debug!(
-        endpoint = %endpoint,
+        endpoint = %gateway.url(),
         sandbox = %sandbox,
         "Syncing discovered policy and re-fetching canonical version"
     );
 
-    let mut client = connect(endpoint).await?;
+    let mut client = connect(gateway).await?;
 
     // Sync the discovered policy to the gateway.
     sync_policy_with_client(&mut client, sandbox, discovered_policy, workspace).await?;
@@ -1044,13 +1441,13 @@ pub async fn discover_and_sync_policy(
 /// Used by the supervisor to push baseline-path-enriched policies so the
 /// gateway stores the effective policy users see via `openshell sandbox get`.
 pub async fn sync_policy(
-    endpoint: &str,
+    gateway: &GatewayEndpoint,
     sandbox: &str,
     policy: &ProtoSandboxPolicy,
     workspace: &str,
 ) -> Result<()> {
-    debug!(endpoint = %endpoint, sandbox = %sandbox, "Syncing enriched policy to gateway");
-    let mut client = connect(endpoint).await?;
+    debug!(endpoint = %gateway.url(), sandbox = %sandbox, "Syncing enriched policy to gateway");
+    let mut client = connect(gateway).await?;
     sync_policy_with_client(&mut client, sandbox, policy, workspace).await
 }
 
@@ -1061,13 +1458,13 @@ pub async fn sync_policy(
     fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
 )]
 pub async fn sync_policy_and_fetch_snapshot(
-    endpoint: &str,
+    gateway: &GatewayEndpoint,
     sandbox: &str,
     policy: &ProtoSandboxPolicy,
     workspace: &str,
 ) -> Result<SettingsPollResult> {
     let status = ClientSpanStatus::current();
-    let mut client = connect(endpoint).await?;
+    let mut client = connect(gateway).await?;
     sync_policy_with_client(&mut client, sandbox, policy, workspace).await?;
     status.finish(fetch_settings_snapshot_with_client(&mut client, sandbox, Some(workspace)).await)
 }
@@ -1080,7 +1477,7 @@ pub async fn sync_policy_and_fetch_snapshot(
     fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
 )]
 pub async fn report_sandbox_configuration(
-    endpoint: &str,
+    gateway: &GatewayEndpoint,
     sandbox_id: &str,
     instance_id: &str,
     snapshot: Option<&SettingsPollResult>,
@@ -1088,7 +1485,7 @@ pub async fn report_sandbox_configuration(
     error: &str,
 ) -> Result<()> {
     let status = ClientSpanStatus::current();
-    let mut client = connect(endpoint).await?;
+    let mut client = connect(gateway).await?;
     client
         .report_sandbox_configuration(crate::proto::ReportSandboxConfigurationRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -1118,10 +1515,10 @@ pub async fn report_sandbox_configuration(
 /// environment represents a sandbox without provider credentials. Transport
 /// failure returns an error so callers can revoke credentials and retry.
 pub async fn fetch_provider_environment(
-    endpoint: &str,
+    gateway: &GatewayEndpoint,
     sandbox_id: &str,
 ) -> Result<ProviderEnvironmentResult> {
-    fetch_provider_environment_with_stable_placeholders(endpoint, sandbox_id, false).await
+    fetch_provider_environment_with_stable_placeholders(gateway, sandbox_id, false).await
 }
 
 /// Fetch a snapshot without downgrading previously activated external stable credentials.
@@ -1135,14 +1532,14 @@ pub async fn fetch_provider_environment(
     fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
 )]
 pub async fn fetch_provider_environment_with_stable_placeholders(
-    endpoint: &str,
+    gateway: &GatewayEndpoint,
     sandbox_id: &str,
     requires_stable_placeholders: bool,
 ) -> Result<ProviderEnvironmentResult> {
     let status = ClientSpanStatus::current();
-    debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Fetching provider environment");
+    debug!(endpoint = %gateway.url(), sandbox_id = %sandbox_id, "Fetching provider environment");
 
-    let mut client = connect(endpoint).await?;
+    let mut client = connect(gateway).await?;
 
     let response = client
         .get_sandbox_provider_environment(GetSandboxProviderEnvironmentRequest {
@@ -1366,7 +1763,7 @@ mod provider_environment_tests {
     fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
 )]
 pub async fn exchange_provider_subject_token(
-    endpoint: &str,
+    gateway: &GatewayEndpoint,
     sandbox_id: &str,
     provider: &str,
     credential_key: &str,
@@ -1374,7 +1771,7 @@ pub async fn exchange_provider_subject_token(
     request_id: Option<&str>,
 ) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
     let status = ClientSpanStatus::current();
-    let endpoint = token_grant_gateway_endpoint(endpoint)?;
+    let endpoint = token_grant_gateway_endpoint(gateway.url())?;
     if sandbox_id.is_empty() || provider.is_empty() || credential_key.is_empty() {
         return Err(gateway_grant_failure(TokenGrantFailureKind::Configuration));
     }
@@ -1388,7 +1785,7 @@ pub async fn exchange_provider_subject_token(
     // Discard those sources at the grant boundary; never diagnose from prose.
     // The shared channel bounds the connection attempt; the gateway bounds its
     // token-service calls, and a gateway deadline arrives as DeadlineExceeded.
-    let mut client = connect(endpoint.as_str())
+    let mut client = connect(&gateway.with_url(endpoint.as_str()))
         .await
         .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Unclassified))?;
     let request = provider_subject_token_exchange_request(
@@ -1559,6 +1956,9 @@ mod token_grant_exchange_tests {
 #[derive(Clone)]
 pub struct CachedOpenShellClient {
     client: OpenShellClient<AuthedChannel>,
+    /// Sandbox instance gateway credentials rotated alongside extension
+    /// credentials.
+    credentials: GatewayCredentials,
     workspace: Arc<tokio::sync::OnceCell<String>>,
     /// Extension credentials for this supervisor. Cloning the client shares
     /// the store, so the middleware registry and the polling loop that rotates
@@ -1887,8 +2287,8 @@ pub struct ProviderSubjectTokenExchangeResult {
 }
 
 impl CachedOpenShellClient {
-    pub async fn connect(endpoint: &str) -> Result<Self> {
-        Self::connect_with_credentials(endpoint, ExtensionCredentialStore::new()).await
+    pub async fn connect(gateway: &GatewayEndpoint) -> Result<Self> {
+        Self::connect_with_credentials(gateway, ExtensionCredentialStore::new()).await
     }
 
     /// Connect while sharing an existing credential store.
@@ -1898,13 +2298,14 @@ impl CachedOpenShellClient {
     /// credentials handed to the middleware registry are not the ones the loop
     /// rotates.
     pub async fn connect_with_credentials(
-        endpoint: &str,
+        gateway: &GatewayEndpoint,
         extension_credentials: ExtensionCredentialStore,
     ) -> Result<Self> {
-        debug!(endpoint = %endpoint, "Connecting openshell gRPC client for policy polling");
-        let client = connect(endpoint).await?;
+        debug!(endpoint = %gateway.url(), "Connecting openshell gRPC client for policy polling");
+        let client = connect(gateway).await?;
         Ok(Self {
             client,
+            credentials: gateway.credentials.clone(),
             workspace: Arc::new(tokio::sync::OnceCell::new()),
             extension_credentials,
         })
@@ -1972,6 +2373,7 @@ impl CachedOpenShellClient {
         let mut client = self.client.clone();
         refresh_extension_credentials_with_client(
             &mut client,
+            &self.credentials,
             &self.extension_credentials,
             services,
         )
@@ -2143,5 +2545,207 @@ impl CachedOpenShellClient {
             .into_diagnostic()?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod frozen_snapshot_tests {
+    use super::*;
+    use crate::proto::frozen_sandbox_policies_server::{
+        FrozenSandboxPolicies, FrozenSandboxPoliciesServer,
+    };
+    use crate::proto::{
+        CreateFrozenSandboxRequest, FrozenSandboxConfigResponse, FrozenSandboxPolicyState,
+        FrozenSandboxResponse, GetFrozenSandboxConfigRequest, GetFrozenSandboxPolicyRequest,
+        UpdateFrozenGlobalConfigRequest, UpdateFrozenGlobalConfigResponse,
+    };
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::codegen::http;
+    use tonic::{Request, Response, Status};
+
+    #[derive(Clone)]
+    struct FrozenConfigService {
+        response: std::result::Result<FrozenSandboxConfigResponse, Status>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl FrozenSandboxPolicies for FrozenConfigService {
+        async fn create_sandbox(
+            &self,
+            _: Request<CreateFrozenSandboxRequest>,
+        ) -> std::result::Result<Response<FrozenSandboxResponse>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+        async fn get_policy(
+            &self,
+            _: Request<GetFrozenSandboxPolicyRequest>,
+        ) -> std::result::Result<Response<FrozenSandboxPolicyState>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+        async fn update_global_config(
+            &self,
+            _: Request<UpdateFrozenGlobalConfigRequest>,
+        ) -> std::result::Result<Response<UpdateFrozenGlobalConfigResponse>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+        async fn get_config(
+            &self,
+            request: Request<GetFrozenSandboxConfigRequest>,
+        ) -> std::result::Result<Response<FrozenSandboxConfigResponse>, Status> {
+            assert_eq!(
+                request.metadata().get("authorization").unwrap(),
+                "Bearer test-token"
+            );
+            assert_eq!(request.get_ref().name, "sandbox");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.response.clone().map(Response::new)
+        }
+    }
+
+    // A real tonic unary endpoint for the one legacy method this projection
+    // uses, without implementing unrelated OpenShell operations in the fixture.
+    #[derive(Clone)]
+    struct LegacyConfigService(Arc<AtomicUsize>);
+    impl tonic::server::NamedService for LegacyConfigService {
+        const NAME: &'static str = "openshell.v1.OpenShell";
+    }
+    impl tonic::codegen::Service<http::Request<tonic::body::Body>> for LegacyConfigService {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = Infallible;
+        type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<std::result::Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+            let calls = self.0.clone();
+            Box::pin(async move {
+                struct GetConfig(Arc<AtomicUsize>);
+                impl tonic::server::UnaryService<GetSandboxConfigRequest> for GetConfig {
+                    type Response = crate::proto::GetSandboxConfigResponse;
+                    type Future =
+                        std::future::Ready<std::result::Result<Response<Self::Response>, Status>>;
+                    fn call(&mut self, request: Request<GetSandboxConfigRequest>) -> Self::Future {
+                        assert_eq!(
+                            request.metadata().get("authorization").unwrap(),
+                            "Bearer test-token"
+                        );
+                        assert_eq!(request.get_ref().name, "sandbox");
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Ok(Response::new(
+                            crate::proto::GetSandboxConfigResponse {
+                                version: 3,
+                                policy_hash: "legacy".into(),
+                                workspace: "default".into(),
+                                ..Default::default()
+                            },
+                        )))
+                    }
+                }
+                assert_eq!(
+                    request.uri().path(),
+                    "/openshell.v1.OpenShell/GetSandboxConfig"
+                );
+                Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                    .unary(GetConfig(calls), request)
+                    .await)
+            })
+        }
+    }
+
+    async fn gateway(
+        response: Option<std::result::Result<FrozenSandboxConfigResponse, Status>>,
+    ) -> (GatewayEndpoint, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let legacy = Arc::new(AtomicUsize::new(0));
+        let frozen = Arc::new(AtomicUsize::new(0));
+        let router = tonic::transport::Server::builder()
+            .tcp_nodelay(true)
+            .add_service(LegacyConfigService(legacy.clone()));
+        if let Some(response) = response {
+            tokio::spawn(
+                router
+                    .add_service(FrozenSandboxPoliciesServer::new(FrozenConfigService {
+                        response,
+                        calls: frozen.clone(),
+                    }))
+                    .serve_with_incoming(TcpListenerStream::new(listener)),
+            );
+        } else {
+            tokio::spawn(router.serve_with_incoming(TcpListenerStream::new(listener)));
+        }
+        (
+            GatewayEndpoint::new(
+                endpoint,
+                GatewayCredentials::from_gateway_token("test-token").unwrap(),
+            ),
+            legacy,
+            frozen,
+        )
+    }
+
+    #[tokio::test]
+    async fn frozen_snapshot_preserves_mode_and_supports_legacy_gateways() {
+        for captured in [false, true] {
+            let (gateway, legacy, frozen) = gateway(Some(Ok(FrozenSandboxConfigResponse {
+                config: Some(crate::proto::GetSandboxConfigResponse {
+                    version: 7,
+                    policy_hash: "captured".into(),
+                    workspace: "default".into(),
+                    ..Default::default()
+                }),
+                frozen: captured,
+                frozen_requested: true,
+            })))
+            .await;
+            let snapshot = fetch_frozen_settings_snapshot(&gateway, "sandbox")
+                .await
+                .unwrap();
+            assert_eq!(snapshot.version, 7);
+            assert_eq!(snapshot.policy_hash, "captured");
+            assert_eq!(snapshot.frozen, captured);
+            assert!(snapshot.frozen_requested);
+            assert_eq!(frozen.load(Ordering::SeqCst), 1);
+            assert_eq!(legacy.load(Ordering::SeqCst), 0);
+        }
+        let (gateway, legacy, frozen) = gateway(None).await;
+        let snapshot = fetch_frozen_settings_snapshot(&gateway, "sandbox")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.version, 3);
+        assert!(!snapshot.frozen);
+        assert!(!snapshot.frozen_requested);
+        assert_eq!(legacy.load(Ordering::SeqCst), 1);
+        assert_eq!(frozen.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn frozen_snapshot_denials_and_inconsistent_state_never_use_legacy_fallback() {
+        for response in [
+            Err(Status::permission_denied("denied")),
+            Ok(FrozenSandboxConfigResponse {
+                config: Some(crate::proto::GetSandboxConfigResponse::default()),
+                frozen: true,
+                frozen_requested: false,
+            }),
+            Ok(FrozenSandboxConfigResponse {
+                config: None,
+                frozen: true,
+                frozen_requested: true,
+            }),
+        ] {
+            let (gateway, legacy, frozen) = gateway(Some(response)).await;
+            assert!(
+                fetch_frozen_settings_snapshot(&gateway, "sandbox")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(frozen.load(Ordering::SeqCst), 1);
+            assert_eq!(legacy.load(Ordering::SeqCst), 0);
+        }
     }
 }

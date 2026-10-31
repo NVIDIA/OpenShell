@@ -24,7 +24,9 @@ use openshell_core::proto::{
 };
 use sha2::{Digest, Sha256};
 
-use openshell_core::grpc_client::{AuthedChannel, connect_channel_pub};
+use openshell_core::grpc_client::{
+    AuthedChannel, GatewayCredentials, GatewayEndpoint, connect_channel_pub,
+};
 
 /// Entry point for the `debug-rpc` subcommand. Returns the process exit
 /// code; `main` propagates it.
@@ -66,7 +68,8 @@ async fn open_client() -> Result<OpenShellClient<AuthedChannel>> {
     let endpoint = std::env::var(openshell_core::sandbox_env::ENDPOINT)
         .into_diagnostic()
         .wrap_err("OPENSHELL_ENDPOINT must be set")?;
-    let channel = connect_channel_pub(&endpoint).await?;
+    let credentials = GatewayCredentials::from_environment(&endpoint).await?;
+    let channel = connect_channel_pub(&GatewayEndpoint::new(endpoint, credentials)).await?;
     Ok(OpenShellClient::new(channel))
 }
 

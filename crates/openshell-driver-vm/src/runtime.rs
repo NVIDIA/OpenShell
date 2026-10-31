@@ -345,7 +345,9 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
     vm.disable_implicit_vsock()?;
     vm.add_vsock(0)?;
     if let Some(port_map) = &config.vsock_port_map {
-        let _ = std::fs::remove_file(&port_map.host_socket);
+        if port_map.host_initiated {
+            let _ = std::fs::remove_file(&port_map.host_socket);
+        }
         vm.add_vsock_port(port_map)?;
     }
 

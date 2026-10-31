@@ -699,46 +699,6 @@ describe('watchLogs', () => {
 });
 
 describe('create', () => {
-  it.each(
-    [undefined, false, true].flatMap((echoed) =>
-      (['direct', 'template', 'raw-true', 'raw-false'] as const).map((mode) => ({ echoed, mode })),
-    ),
-  )('frozen creates require gateway acknowledgement ($mode, $echoed)', async ({ echoed, mode }) => {
-    let requested: boolean | undefined;
-    const sandbox = client({
-      createSandbox: (req) => {
-        requested = req.spec?.frozen;
-        return {
-          sandbox: {
-            metadata: { id: 'created-id', name: 'created-frozen', workspace: 'staging' },
-            spec: echoed === undefined ? undefined : { frozen: echoed },
-          },
-        };
-      },
-    });
-    const result =
-      mode === 'template'
-        ? sandbox.createFromTemplate({ workspace: 'staging', workloadTemplate: 'agent', frozen: true })
-        : sandbox.create({
-            workspace: 'staging',
-            frozen: mode === 'direct' || mode === 'raw-false',
-            rawSpec: mode === 'raw-true' ? { frozen: true } : mode === 'raw-false' ? { frozen: false } : undefined,
-          });
-    if (mode !== 'raw-false' && !echoed) {
-      await expect(result).rejects.toMatchObject({
-        code: 'invalid_config',
-        message: expect.stringContaining(
-          "gateway did not honor frozen=true for sandbox 'created-frozen' (ID 'created-id', workspace 'staging')",
-        ),
-      });
-    } else {
-      const ref = await result;
-      expect(ref.frozen).toBe(echoed ?? false);
-      expect(ref.frozenPolicy).toBeUndefined();
-    }
-    expect(requested).toBe(mode !== 'raw-false');
-  });
-
   it('sends create-time service exposures', async () => {
     let created: {
       serviceExposures?: Array<{ service?: string; targetPort?: number; authorizationMode?: number }>;
@@ -788,35 +748,16 @@ describe('create', () => {
     });
   });
 
-  it('sends a frozen policy through spec and exposes its accepted identity', async () => {
-    let created: { spec?: { frozen?: boolean; policy?: { version?: number } } } = {};
+  it('sends the curated policy through spec.policy', async () => {
+    let created: { spec?: { policy?: { version?: number } } } = {};
     const sandbox = client({
       createSandbox: (req) => {
         created = req;
-        return {
-          sandbox: { metadata: { id: 'sb-id', name: 'sb', workspace: 'default' }, spec: req.spec },
-        };
+        return readySandbox('sb', 'sb-id');
       },
     });
-    const pending = await sandbox.create({ image: 'img', frozen: true, policy: { version: 1, networkPolicies: {} } });
+    await sandbox.create({ image: 'img', policy: { version: 1, networkPolicies: {} } });
     expect(created.spec?.policy?.version).toBe(1);
-    expect(created.spec?.frozen).toBe(true);
-    expect(pending.frozen).toBe(true);
-    expect(pending.frozenPolicy).toBeUndefined();
-    const frozen = client({
-      getSandbox: () => ({
-        sandbox: {
-          metadata: { id: 'sb-id', name: 'sb', workspace: 'default' },
-          spec: { frozen: true },
-          status: {
-            frozenPolicy: { version: 3, policyHash: 'accepted-hash', frozenTime: { seconds: 600n, nanos: 0 } },
-          },
-        },
-      }),
-    });
-    const ref = await frozen.get('sb');
-    expect(ref.frozen).toBe(true);
-    expect(ref.frozenPolicy).toEqual({ version: 3, policyHash: 'accepted-hash', frozenAtMs: 600_000 });
   });
 
   it('sends canonical main process fields', async () => {
@@ -886,7 +827,6 @@ describe('create', () => {
       workspace?: string;
       labels?: Record<string, string>;
       spec?: {
-        frozen?: boolean;
         policy?: { version?: number };
         providers?: string[];
         command?: string[];
@@ -897,16 +837,13 @@ describe('create', () => {
     const sandbox = client({
       createSandbox: (req) => {
         created = req;
-        const response = readySandbox('job-1', 'sb-id', 7n, undefined, selectedWorkspace(req) ?? 'default');
-        if (response.sandbox) response.sandbox.spec = req.spec;
-        return response;
+        return readySandbox('job-1', 'sb-id', 7n, undefined, selectedWorkspace(req) ?? 'default');
       },
     });
     const ref = await sandbox.createFromTemplate({
       name: 'job-1',
       workspace: 'staging',
       workloadTemplate: 'gpu-kata',
-      frozen: true,
       labels: { team: 'runtime' },
       providers: ['github'],
       command: ['/opt/worker', '--serve'],
@@ -915,7 +852,6 @@ describe('create', () => {
     });
 
     expect(created.workloadTemplate).toBe('gpu-kata');
-    expect(created.spec?.frozen).toBe(true);
     expect(created.name).toBe('job-1');
     expect(selectedWorkspace(created)).toBe('staging');
     expect(created.labels).toEqual({ team: 'runtime' });
@@ -1411,6 +1347,21 @@ describe('waits', () => {
       }),
     });
     await expect(sandbox.waitReady('sb', 30)).rejects.toMatchObject({ code: 'connect' });
+  });
+
+  it('waitReady rejects suspended sandboxes without waiting for timeout', async () => {
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: {
+          metadata: { id: 'sb-id', name: 'sb' },
+          status: { phase: SandboxPhase.SUSPENDED },
+        },
+      }),
+    });
+    await expect(sandbox.waitReady('sb', 30)).rejects.toMatchObject({
+      code: 'connect',
+      message: expect.stringContaining('suspended'),
+    });
   });
 
   it('waitReady rejects rather than hanging when get() never resolves', async () => {

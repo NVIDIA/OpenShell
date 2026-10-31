@@ -33,7 +33,16 @@ fn reexec_as_ssh() -> ! {
 
 fn run_listener() {
     let port = forward_port().expect("fake forward must receive an SSH -L argument");
-    let listener = TcpListener::bind(("127.0.0.1", port)).expect("fake forward must bind");
+    // Like `ssh -o ExitOnForwardFailure=yes`, exit 255 when another process
+    // holds the forward port.
+    let listener = match TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!("bind [127.0.0.1]:{port}: Address already in use");
+            std::process::exit(255);
+        }
+        Err(error) => panic!("fake forward must bind: {error}"),
+    };
     for stream in listener.incoming() {
         let _ = stream;
     }

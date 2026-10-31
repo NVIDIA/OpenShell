@@ -60,7 +60,8 @@ OpenShell maps sandbox events to these OCSF classes:
 | `SSH:` | SSH Activity | 4007 | SSH handshakes, authentication, channel operations |
 | `PROC:` | Process Activity | 1007 | Process start, exit, timeout, signal failures |
 | `FINDING:` | Detection Finding | 2004 | Security findings (nonce replay, proxy bypass, unsafe policy) |
-| `AUTH:` | Authentication | 3002 | Gateway authentication failures |
+| `AUTH:` | Authentication | 3002 | Gateway authentication failures and credential logons |
+| `API:` | API Activity | 6003 | Inference calls, gateway authorization denials |
 | `CONFIG:` | Device Config State Change | 5019 | Policy load/reload, Landlock, TLS setup, provider and settings changes |
 | `LIFECYCLE:` | Application Lifecycle | 6002 | Sandbox supervisor start, SSH server ready |
 
@@ -99,6 +100,7 @@ endpoint, use `EVENT` rather than a network or lifecycle event.
 - HTTP: `METHOD url` with the HTTP method and target
 - SSH: peer address and authentication type
 - Authentication: the principal as `type:id`, or `unknown` when none was established, and the peer address when known
+- Authorization denial: the principal as `type:id` and the peer address when known, with the refused sandbox or workspace in the context
 - Process: `name(pid)` with exit code or command line
 - Config: description of what changed
 - Finding: quoted title with the stable finding type, optional confidence, and source-specific context attributes when available
@@ -111,6 +113,18 @@ A gateway request rejected because it presented no credential:
 
 ```text
 OCSF AUTH:LOGON [LOW] DENIED unknown [op:/openshell.v1.OpenShell/ListSandboxes reason:missing_credential]
+```
+
+The first request a gateway replica accepts with a user's OIDC token:
+
+```text
+OCSF AUTH:LOGON [INFO] ALLOWED user:8d2f6b1c-3e4a-4f5b-9c7d-0a1b2c3d4e5f from 203.0.113.7:51234 [protocol:OpenID op:/openshell.v1.OpenShell/ListSandboxes]
+```
+
+A sandbox credential used to read another sandbox's configuration:
+
+```text
+OCSF API:OTHER [MED] DENIED sandbox:5d1c2e7a-0b3f-4c8e-9a61-7f2d4b6e8c10 from 10.42.0.7:51234 [op:/openshell.v1.OpenShell/GetSandboxConfig sandbox:9a3e61b0-4c2d-4f7e-8b15-2d6c0e9f7a43 reason:cross_sandbox]
 ```
 
 An allowed HTTPS connection:

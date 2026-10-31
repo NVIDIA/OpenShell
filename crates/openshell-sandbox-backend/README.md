@@ -26,6 +26,46 @@ negotiator checks major versions and each peer's required capabilities. The
 built-in runtime does not advertise `openshell.sandbox.suspend-resume` and
 returns `UNIMPLEMENTED` for those optional RPCs.
 
+## Suspend and resume
+
+The supervisor's `Describe` metadata lists `openshell.sandbox.suspend-resume`
+as supported but not required. The client keeps the backend's negotiated
+metadata from each opening and exposes whether it advertised the capability.
+
+`RunningBoundary::suspend` sends one `SuspendBoundary` call with the boundary
+handle, session ID, and generation, and returns the restore reference. It
+fails with `Unsupported` when the backend did not advertise the capability and
+rejects empty references or references larger than
+`MAX_RESTORE_REFERENCE_BYTES` (64 KiB). The supervisor retries only when the
+driver signals it again.
+
+`DelegatedLaunch` contains identity and transport metadata only. A driver can
+provision a restored resource through its backend's native integration. For a
+backend advertising state retention, an ordinary `OpenBoundary` can report a
+restored or explicitly permitted cold-start outcome. The backend enforces the
+driver's restore policy; the supervisor does not manage the retained-state handle.
+
+`OpenShellRuntimeBackend::with_resume` and
+`discover_registered_policy_with_resume` take a `ResumeLaunch`. Every boundary
+opening for that launch, including policy discovery and transport recovery,
+sends `ResumeBoundary` with the same launch request instead of `OpenBoundary`.
+Opening fails with `Unsupported` when the backend lacks the capability. A
+resume accepts `RESTORED`, or `COLD_START_FALLBACK` only when fallback is
+allowed; a fresh launch accepts only `FRESH`. A replay that reports a different
+handle or outcome is denied. `BoundBoundary::launch_outcome` reports the
+selected launch path. It does not prove restoration has completed. A backend
+may retain only the snapshot through policy discovery, Attach, and Confirm,
+then perform its restore-and-run operation when StartAgent arrives. No workload
+instruction may execute before StartAgent has installed the admitted controls.
+Attach may therefore report no process yet, or an already restored frozen process.
+StartAgent returns the restored main process rather than launching a duplicate.
+
+A restore failure discovered at StartAgent fails that call. The backend must
+not silently switch the selected path from restoration to a cold start; a
+permitted cold-start fallback must be selected when opening the boundary.
+The supervisor reports a successful resumed launch only after StartAgent succeeds.
+`RunningBoundary::launch_outcome` then reports the completed launch path.
+
 `SandboxProtocol.Exchange` and `.Mediate` begin with the handle from
 `OpenBoundary`. The server authenticates the stream's bearer, checks the handle
 against its provisioned sandbox and generation, then accepts typed protobuf
@@ -39,6 +79,31 @@ Opening a boundary only validates and reserves a route. It neither attaches a
 supervisor nor runs workload code. Policy discovery is followed by the existing
 attach, mediation setup, confirm, and explicit start sequence. The existing
 connection registry continues to govern supervisor replacement and recovery.
+
+## Supervisor takeover
+
+`sandbox_auth::SandboxConnectionRegistry` pins the first supervisor process
+that attaches. Protocol 1.1 adds `openshell.sandbox.supervisor-takeover`: a
+supervisor holding a `BoundaryTakeover` (a gateway-signed grant for a later
+credential epoch naming the sandbox, generation, and its process identity)
+attaches with the grant, and the runtime stages it and promotes it at
+confirmation. A grant is never sent to a runtime that does not advertise the
+capability; that supervisor fails closed instead. The registry tracks the
+accepted epoch, the pinned process, and the highest epoch any granted attach
+reached, so a lower grant cannot promote after a higher one disconnected.
+Ordinary credential refresh never changes the epoch. The replacement adopts
+the main and exec processes from the attach snapshot instead of starting the
+agent, and the snapshot reports the policy the runtime bound at launch. Once
+confirmed, it forgets the grant and re-attaches without it to refresh the
+snapshot, so reconnects of the same process never depend on the grant's
+lifetime.
+
+Every attach also offers the runtime a recovery deadline
+(`supervisor_recovery_timeout_secs`, bounded by
+`SUPERVISOR_RECOVERY_TIMEOUT_RANGE`): how long the workload stays frozen after
+that supervisor's connection is lost. `OpenShellRuntimeBackend` sends the
+deadline it was built with on its first attach, a takeover attach, and every
+re-attach; without one the runtime uses `DEFAULT_SUPERVISOR_RECOVERY_TIMEOUT`.
 
 Sandbox and generation identity come from the verified bearer, rather than
 duplicate fields on `OpenBoundaryRequest`. Attach supplies policy; confirmation
@@ -102,6 +167,65 @@ retain generation, session, resource, identity, and provisioning evidence checks
 
 ## Boundary transport establishment
 
-The client connects to the configured Unix socket, TCP, or vsock endpoint. It
-owns TLS peer verification, session bearer authentication, generation checks,
-and reconnection handling for policy discovery and attachment.
+`SandboxTransport` belongs to this backend's runtime descriptor. Core retains
+only operator-registered endpoints; `DelegatedLaunch` converts those endpoints
+into the backend's transport without changing their serialized representation.
+
+The supervisor chooses one `BoundaryTransport` per runtime descriptor and uses
+clones of it for policy discovery and attachment. It dials the descriptor's
+endpoint, uses a backend-supplied `BoundaryTransportConnector` for raw stream
+establishment, or, for `SandboxTransport::RuntimeInitiatedTcp`, accepts the
+connections the sandbox runtime opens. Every stream from every source completes
+the same pinned TLS client handshake before it carries a request; the shared
+client also keeps session bearer authentication, generation checks, and
+reconnection handling.
+
+For runtime-initiated connections, the supervisor authenticates each accepted
+socket before queueing it. Concurrent unauthenticated handshakes are bounded in
+number and duration, and at most two authenticated spares wait for a client, so
+a new connection cannot displace a live channel. The runtime keeps one spare
+open, so reconnects and credential rotation never wait for a new dial.
+
+The new variants leave existing encodings unchanged. Binaries that predate them
+reject runtime-initiated descriptors instead of falling back to another mode.
+
+`SandboxTransport::RuntimeInitiatedRouted` serves the sandbox instances of a
+supervisor shared by many sandboxes from one listener
+(`runtime_routed::RuntimeRouter`). A sandbox instance is one running
+generation of a stable Sandbox resource. The runtime first sends a fixed
+preface: `OSRP`, version `1`, a length byte, and an opaque route handle of 16
+to 64 lowercase letters, digits, or hyphens. The handle is untrusted; it only
+selects which instance's generation-pinned TLS identity the supervisor then
+demands. Unknown, removed, and replaced handles are closed before any
+handshake. Handshakes are bounded globally and per route, and an
+authenticated connection only fills its own instance's spare queue. A routed
+instance waits up to five minutes for its first connection, since it is
+registered before its workload Pod is scheduled, and the usual connect window
+afterwards. The launch material and status of one hosted instance
+(`SandboxInstanceRegistration`, `SandboxInstanceStatusReport`) are defined by
+`openshell-supervisor-control`, which depends on this crate for the runtime
+descriptor and route validation.
+
+In a supervisor pool, one member hosts each route, but a runtime reaches an
+arbitrary member. A routed runtime therefore sends preface version `2` on every
+dial, which the supervisor answers before any TLS with a status byte, a
+length byte, and a runtime listener address as ASCII `ip:port` (IPv6
+bracketed): `1` accepts, naming the member itself (empty before it has a
+route directory), and the handshake proceeds as for version 1; `2` redirects
+to the owner; `3` reports the route unknown and carries no address. A member
+redirects routes it does not host according to the gateway's route directory
+(`RuntimeRouter::set_directory`), never to its own address, and the directory
+also wins over a local registration it no longer agrees with, which is being
+released. Replies are unauthenticated hints like the handle: the member must
+still complete the pinned TLS handshake, and every request still carries the
+bearer token. A lone shared supervisor accepts without naming itself, which
+tells the runtime there is no pool to probe. Version 1 prefaces, from runtimes
+that predate version 2, receive no reply. A supervisor that predates version 2
+closes a version 2 preface without replying (usually as a reset, since it
+reads only the header); the runtime then dials it again with version 1, so
+upgrades may roll the runtime and the supervisor in either order.
+
+Runtime-initiated transport supports TCP, protected Unix sockets, and host
+vsock listeners. These share bounded TLS handshakes, the authenticated spare
+queue, and the same generation-pinned runtime identity check. The legacy
+supervisor-dialed transports remain available for existing descriptors.

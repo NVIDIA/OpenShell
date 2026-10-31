@@ -2059,7 +2059,10 @@ pub async fn validate_provider_update_against_attached_sandboxes_with_catalog(
 ) -> Result<(), Status> {
     let provider_name = provider.object_name().to_string();
     for sandbox in sandboxes_using_provider_records(store, workspace, &provider_name).await? {
-        if super::policy::frozen::snapshot(&sandbox).is_some() {
+        if super::policy::frozen::snapshot(store, &sandbox)
+            .await?
+            .is_some()
+        {
             // Frozen readers use their captured catalog and withhold credentials
             // when this provider no longer matches their authorization.
             continue;
@@ -3853,7 +3856,7 @@ async fn profile_attached_sandbox_diagnostics(
     let validate_policy_composition =
         super::policy::provider_policy_composition_enabled(store).await?;
     for sandbox in sandboxes {
-        if let Some(frozen) = super::policy::frozen::snapshot(&sandbox) {
+        if let Some(frozen) = super::policy::frozen::snapshot(store, &sandbox).await? {
             for provider in &frozen.providers {
                 let same_scope = if is_platform_scope {
                     provider.profile_workspace.is_empty()
@@ -4312,43 +4315,58 @@ async fn load_provider_subject_token_context(
     sandbox: &Sandbox,
     provider_name: &str,
 ) -> Result<(Provider, ProviderProfile), Status> {
-    let (provider, catalog) = if super::policy::frozen::snapshot(sandbox).is_some() {
-        let context = super::policy::frozen::provider_context(state, sandbox)
-            .await
-            .map_err(token_grant_dependency_status)?;
-        if context.withheld_providers.contains(provider_name) {
-            return Err(token_grant_authorization_required_status());
-        }
-        let provider = context
-            .records
-            .into_iter()
-            .find(|record| record.name == provider_name)
-            .ok_or_else(|| token_grant_configuration_status(tonic::Code::PermissionDenied))?
-            .provider;
-        (provider, context.catalog)
-    } else {
-        let workspace = sandbox.object_workspace();
-        let provider = state
-            .store
-            .get_message_by_name::<Provider>(workspace, provider_name)
-            .await
-            .map_err(|_| token_grant_store_status())?
-            .ok_or_else(|| token_grant_configuration_status(tonic::Code::NotFound))?;
-        let catalog = state
-            .provider_profile_sources
-            .snapshot_catalog(state.store.as_ref(), workspace)
-            .await
-            .map_err(token_grant_dependency_status)?;
-        (provider, catalog)
-    };
-    let profile = get_provider_type_profile_for_scope(
-        &catalog,
-        &provider.r#type,
-        &provider.profile_workspace,
-    )
-    .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?
-    .to_proto();
-    Ok((provider, profile))
+    let mut captured = super::policy::frozen::snapshot(state.store.as_ref(), sandbox).await?;
+    for _ in 0..2 {
+        let (provider, catalog) = if let Some(snapshot) = captured.as_ref() {
+            let context =
+                super::policy::frozen::provider_context_from_snapshot(state, sandbox, snapshot)
+                    .await
+                    .map_err(token_grant_dependency_status)?;
+            if context.withheld_providers.contains(provider_name) {
+                return Err(token_grant_authorization_required_status());
+            }
+            let provider = context
+                .records
+                .into_iter()
+                .find(|record| record.name == provider_name)
+                .ok_or_else(|| token_grant_configuration_status(tonic::Code::PermissionDenied))?
+                .provider;
+            (provider, context.catalog)
+        } else {
+            let live = async {
+                let workspace = sandbox.object_workspace();
+                let provider = state
+                    .store
+                    .get_message_by_name::<Provider>(workspace, provider_name)
+                    .await
+                    .map_err(|_| token_grant_store_status())?
+                    .ok_or_else(|| token_grant_configuration_status(tonic::Code::NotFound))?;
+                let catalog = state
+                    .provider_profile_sources
+                    .snapshot_catalog(state.store.as_ref(), workspace)
+                    .await
+                    .map_err(token_grant_dependency_status)?;
+                Ok::<_, Status>((provider, catalog))
+            }
+            .await;
+            if let Some(snapshot) =
+                super::policy::frozen::snapshot(state.store.as_ref(), sandbox).await?
+            {
+                captured = Some(snapshot);
+                continue;
+            }
+            live?
+        };
+        let profile = get_provider_type_profile_for_scope(
+            &catalog,
+            &provider.r#type,
+            &provider.profile_workspace,
+        )
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?
+        .to_proto();
+        return Ok((provider, profile));
+    }
+    unreachable!("a captured frozen policy cannot transition again")
 }
 
 async fn exchange_provider_subject_token_inner(
@@ -4365,7 +4383,8 @@ async fn exchange_provider_subject_token_inner(
             Principal::Sandbox(_)
             | Principal::User(_)
             | Principal::Operator(_)
-            | Principal::Peer(_),
+            | Principal::Peer(_)
+            | Principal::Supervisor(_),
         ) => Some(tonic::Code::PermissionDenied),
         Some(Principal::Anonymous) | None => Some(tonic::Code::Unauthenticated),
     };
@@ -5731,6 +5750,7 @@ mod tests {
                     sandbox_id: "grant-sandbox".to_string(),
                     source: SandboxIdentitySource::BootstrapJwt {
                         issuer: SECRET.to_string(),
+                        auth_epoch: None,
                     },
                     trust_domain: None,
                 }));
@@ -5844,9 +5864,7 @@ mod tests {
             Provider,
             Arc<std::sync::atomic::AtomicUsize>,
         ) {
-            use openshell_core::proto::{
-                FrozenSandboxPolicy, FrozenSandboxProvider, SandboxStatus,
-            };
+            use openshell_core::proto::{FrozenSandboxPolicy, FrozenSandboxProvider};
             let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut state = test_server_state_without_provider_profiles().await;
             Arc::get_mut(&mut state).unwrap().provider_profile_sources =
@@ -5886,31 +5904,37 @@ mod tests {
                     ..Default::default()
                 }),
                 spec: Some(SandboxSpec {
-                    frozen: true,
                     providers: vec![provider.object_name().to_string()],
-                    ..Default::default()
-                }),
-                status: Some(SandboxStatus {
-                    frozen_policy: Some(
-                        FrozenSandboxPolicy {
-                            providers: vec![FrozenSandboxProvider {
-                                provider: provider.object_name().to_string(),
-                                provider_id: provider.object_id().to_string(),
-                                r#type: provider.r#type.clone(),
-                                config: provider.config.clone(),
-                                profile_workspace: provider.profile_workspace.clone(),
-                                profile: Some(captured_profile),
-                                ..Default::default()
-                            }],
-                            ..Default::default()
-                        }
-                        .into(),
-                    ),
                     ..Default::default()
                 }),
                 ..Default::default()
             };
-            state.store.put_message(&sandbox).await.unwrap();
+            state.store.create_frozen_sandbox(&sandbox).await.unwrap();
+            let stored = state
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            state
+                .store
+                .accept_frozen_sandbox_configuration(
+                    stored,
+                    FrozenSandboxPolicy {
+                        providers: vec![FrozenSandboxProvider {
+                            provider: provider.object_name().to_string(),
+                            provider_id: provider.object_id().to_string(),
+                            r#type: provider.r#type.clone(),
+                            config: provider.config.clone(),
+                            profile_workspace: provider.profile_workspace.clone(),
+                            profile: Some(captured_profile),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
             (state, sandbox, provider, fetches)
         }
 
@@ -5930,10 +5954,91 @@ mod tests {
                     sandbox_id: sandbox.object_id().to_string(),
                     source: SandboxIdentitySource::BootstrapJwt {
                         issuer: "test".to_string(),
+                        auth_epoch: None,
                     },
                     trust_domain: None,
                 }));
             request
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn frozen_exchange_capture_during_live_lookup_uses_captured_profile() {
+            use crate::persistence::frozen_policy::{FROZEN_POLICY_OBJECT_TYPE, frozen_policy_id};
+            let (state, sandbox, provider, _) = frozen_exchange_state(Vec::new()).await;
+            let snapshot = state
+                .store
+                .get_sandbox_frozen_policy(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .policy
+                .unwrap();
+            // Build the pending fixture from the same captured inputs; the
+            // production operation below performs the only transition under test.
+            let pending = crate::storage_proto::StoredFrozenSandboxPolicy {
+                sandbox_id: sandbox.object_id().into(),
+                policy: None,
+            };
+            let private_id = frozen_policy_id(sandbox.object_id());
+            let private = state
+                .store
+                .get(FROZEN_POLICY_OBJECT_TYPE, &private_id)
+                .await
+                .unwrap()
+                .unwrap();
+            state
+                .store
+                .write_atomically(&[crate::persistence::AtomicWrite::Update {
+                    object_type: FROZEN_POLICY_OBJECT_TYPE.into(),
+                    id: private_id,
+                    payload: pending.encode_to_vec(),
+                    expected_version: private.resource_version,
+                }])
+                .await
+                .unwrap();
+            let (sources, gate) =
+                ProviderProfileSources::from_test_profiles_blocked(vec![frozen_exchange_profile(
+                    "https://changed.example/token",
+                    "live_subject",
+                )]);
+            let mut server = Arc::try_unwrap(state).ok().unwrap();
+            server.provider_profile_sources = sources;
+            let state = Arc::new(server);
+            let reader = Arc::clone(&state);
+            let requested_sandbox = sandbox.clone();
+            let name = provider.object_name().to_string();
+            let read = tokio::spawn(async move {
+                load_provider_subject_token_context(&reader, &requested_sandbox, &name)
+                    .await
+                    .unwrap()
+            });
+            gate.entered().await;
+            let current = state
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            state
+                .store
+                .accept_frozen_sandbox_configuration(current, snapshot)
+                .await
+                .unwrap();
+            gate.release();
+            let (_, profile) = read.await.unwrap();
+            let grant = profile
+                .credentials
+                .iter()
+                .find(|credential| credential.name == "access_token")
+                .unwrap()
+                .token_grant
+                .as_ref()
+                .unwrap();
+            assert_eq!(grant.token_endpoint, "https://original.example/token");
+            assert_eq!(
+                grant.subject_token.as_ref().unwrap().credential,
+                "subject_token"
+            );
         }
 
         #[tokio::test]

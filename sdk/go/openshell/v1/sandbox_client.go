@@ -13,6 +13,7 @@ import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 const defaultPollInterval = 500 * time.Millisecond
@@ -23,6 +24,7 @@ type sandboxClient struct {
 
 var _ SandboxInterface = (*sandboxClient)(nil)
 var _ SandboxTemplateCreateInterface = (*sandboxClient)(nil)
+var _ SandboxSuspendResumeInterface = (*sandboxClient)(nil)
 
 func newSandboxClient(conn grpc.ClientConnInterface) *sandboxClient {
 	return &sandboxClient{client: pb.NewOpenShellClient(conn)}
@@ -46,7 +48,11 @@ func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
-	return sandboxFromCreateResponse(resp, req)
+	sandbox := converter.SandboxFromProto(resp.GetSandbox())
+	if sandbox != nil {
+		sandbox.ServiceURLs = converter.CopyStringMap(resp.GetServiceUrls())
+	}
+	return sandbox, nil
 }
 
 func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error) {
@@ -74,22 +80,7 @@ func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name,
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
-	return sandboxFromCreateResponse(resp, req)
-}
-
-func sandboxFromCreateResponse(resp *pb.SandboxResponse, req *pb.CreateSandboxRequest) (*Sandbox, error) {
 	sandbox := converter.SandboxFromProto(resp.GetSandbox())
-	if req.GetSpec().GetFrozen() && (sandbox == nil || !sandbox.Spec.Frozen) {
-		metadata := resp.GetSandbox().GetMetadata()
-		name := metadata.GetName()
-		if name == "" {
-			name = req.GetName()
-		}
-		return nil, &StatusError{Code: ErrorUnimplemented, Message: fmt.Sprintf(
-			"gateway did not honor frozen=true for sandbox %q (ID %q, workspace %q); it may already be running. Upgrade the gateway and remove the sandbox before retrying",
-			name, metadata.GetId(), req.GetWorkspaceScope().GetWorkspace(),
-		)}
-	}
 	if sandbox != nil {
 		sandbox.ServiceURLs = converter.CopyStringMap(resp.GetServiceUrls())
 	}
@@ -126,10 +117,28 @@ func validateTemplateCreateSpec(spec *SandboxSpec) error {
 }
 
 func (s *sandboxClient) Get(ctx context.Context, workspace, name string) (*Sandbox, error) {
+	return s.get(ctx, workspace, name)
+}
+
+// getWithOwner is Get that also asks the gateway for the owner replica.
+func (s *sandboxClient) getWithOwner(ctx context.Context, workspace, name string) (*Sandbox, string, error) {
+	var md metadata.MD
+	sb, err := s.get(metadata.AppendToOutgoingContext(ctx, ownerRequestHeader, "1"), workspace, name, grpc.Header(&md))
+	if err != nil {
+		return nil, "", err
+	}
+	var owner string
+	if v := md.Get(ownerReplicaHeader); len(v) > 0 {
+		owner = v[0]
+	}
+	return sb, owner, nil
+}
+
+func (s *sandboxClient) get(ctx context.Context, workspace, name string, opts ...grpc.CallOption) (*Sandbox, error) {
 	resp, err := s.client.GetSandbox(ctx, &pb.GetSandboxRequest{
 		Name:           name,
 		WorkspaceScope: namedWorkspaceScope(workspace),
-	})
+	}, opts...)
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
@@ -213,6 +222,33 @@ func (s *sandboxClient) Start(ctx context.Context, workspace, name string) (*San
 	return converter.SandboxFromProto(resp.GetSandbox()), nil
 }
 
+func (s *sandboxClient) Suspend(ctx context.Context, workspace, name string) (*Sandbox, error) {
+	resp, err := s.client.SuspendSandbox(ctx, &pb.SuspendSandboxRequest{
+		Name:           name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
+	})
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	return converter.SandboxFromProto(resp.GetSandbox()), nil
+}
+
+func (s *sandboxClient) Resume(ctx context.Context, workspace, name string, opts ...ResumeOptions) (*Sandbox, error) {
+	var options ResumeOptions
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	resp, err := s.client.ResumeSandbox(ctx, &pb.ResumeSandboxRequest{
+		Name:                  name,
+		WorkspaceScope:        namedWorkspaceScope(workspace),
+		RestartIfRestoreFails: options.RestartIfRestoreFails,
+	})
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	return converter.SandboxFromProto(resp.GetSandbox()), nil
+}
+
 func (s *sandboxClient) AttachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*AttachProviderResult, error) {
 	resp, err := s.client.AttachSandboxProvider(ctx, &pb.AttachSandboxProviderRequest{
 		Provider:                providerName,
@@ -288,6 +324,10 @@ func (s *sandboxClient) WaitStopped(ctx context.Context, workspace, name string,
 	return s.waitForPhase(ctx, workspace, name, SandboxStopped, opts...)
 }
 
+func (s *sandboxClient) WaitSuspended(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error) {
+	return s.waitForPhase(ctx, workspace, name, SandboxSuspended, opts...)
+}
+
 func (s *sandboxClient) waitForPhase(ctx context.Context, workspace, name string, target SandboxPhase, opts ...WaitOptions) (*Sandbox, error) {
 	interval := defaultPollInterval
 	if len(opts) > 0 && opts[0].PollInterval > 0 {
@@ -338,6 +378,11 @@ func checkTerminalPhase(sb *Sandbox, name string, target SandboxPhase) (*Sandbox
 		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is in error state", name)}
 	case SandboxDeleting:
 		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is being deleted", name)}
+	case SandboxSuspending, SandboxSuspended:
+		if target == SandboxSuspended {
+			return nil, nil
+		}
+		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is suspended; resume it before waiting for %s", name, target)}
 	default:
 		return nil, nil
 	}

@@ -7,11 +7,9 @@
 
 FROM python:3.13-slim
 
-# System tools useful for sandbox networking and debugging.
-# iproute2: required for network namespace management (ip netns, veth pairs)
-# nftables: optional, enables bypass detection (log + reject for direct connections)
+# curl is only for debugging. OpenShell needs no networking tools in the image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl iproute2 nftables \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --gid 1500 app \

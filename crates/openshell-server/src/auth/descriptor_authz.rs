@@ -17,7 +17,7 @@ use super::method_authz::{AuthMode, Role};
 const AUTHORIZATION_EXTENSION: &str = "openshell.options.v1.authorization";
 
 /// Gateway-served protobuf packages.
-const GATEWAY_PACKAGES: &[&str] = &["openshell.v1"];
+const GATEWAY_PACKAGES: &[&str] = &["openshell.v1", "openshell.supervisor.host.v1"];
 
 /// Bearer-authenticated methods that deliberately require no role or scope.
 ///
@@ -125,6 +125,7 @@ impl DescriptorAuthTable {
                     "dual" => AuthMode::Dual,
                     "peer" => AuthMode::Peer,
                     "operator" => AuthMode::Operator,
+                    "supervisor" => AuthMode::Supervisor,
                     other => {
                         return Err(format!("method {path}: unknown auth_mode '{other}'"));
                     }
@@ -295,6 +296,49 @@ mod tests {
             missing.is_empty(),
             "RPC methods missing (authorization) option: {missing:?}"
         );
+    }
+
+    #[test]
+    fn frozen_policy_methods_keep_distinct_user_and_sandbox_access() {
+        let table =
+            DescriptorAuthTable::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        for (method, mode, scope, workspace_role, global_role) in [
+            (
+                "CreateSandbox",
+                AuthMode::Bearer,
+                "sandbox:write",
+                Some("user"),
+                None,
+            ),
+            (
+                "GetPolicy",
+                AuthMode::Bearer,
+                "sandbox:read",
+                Some("user"),
+                None,
+            ),
+            (
+                "GetConfig",
+                AuthMode::Dual,
+                "config:read",
+                Some("user"),
+                None,
+            ),
+            (
+                "UpdateGlobalConfig",
+                AuthMode::Bearer,
+                "config:write",
+                None,
+                Some("platform_admin"),
+            ),
+        ] {
+            let path = format!("/openshell.v1.FrozenSandboxPolicies/{method}");
+            let entry = table.entries.get(&path).unwrap();
+            assert_eq!(entry.auth_mode, mode, "{path}");
+            assert_eq!(entry.scope.as_deref(), Some(scope), "{path}");
+            assert_eq!(entry.workspace_role.as_deref(), workspace_role, "{path}");
+            assert_eq!(entry.global_role.as_deref(), global_role, "{path}");
+        }
     }
 
     #[test]

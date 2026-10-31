@@ -32,7 +32,6 @@ func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 		"command":               true,
 		"tty":                   true,
 		"restart_policy":        true,
-		"frozen":                true,
 	}
 
 	// The gateway owns this identity. Provider status exposes it through the
@@ -127,7 +126,6 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 		"current_policy_version":    true,
 		"exit_code":                 true,
 		"configuration_admission":   true,
-		"frozen_policy":             true,
 		"restart_count":             true,
 		"next_restart_time":         true,
 		"main_process_started_time": true,
@@ -137,36 +135,11 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 	// Provisioning carries gateway-owned attempt, deadline, and cleanup state;
 	// the curated API exposes its outcome through phase and conditions. Detailed
 	// lifecycle bookkeeping remains available through the raw protobuf API.
-	skipped := fieldSet{"main_process_instance_id": true, "configuration_activated": true, "provisioning": true}
+	// Image updates are raw-only; their pending reconciliation intent and
+	// monotonic image revision bookkeeping are not part of the curated status model.
+	skipped := fieldSet{"main_process_instance_id": true, "configuration_activated": true, "provisioning": true, "image_update": true, "image_revision": true}
 
 	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, skipped)
-}
-
-func TestConverterCoversAllProtoFields_UpdateConfigResponse(t *testing.T) {
-	handled := fieldSet{
-		"version":           true,
-		"policy_hash":       true,
-		"settings_revision": true,
-		"deleted":           true,
-		"annotations":       true,
-		"frozen_sandboxes":  true,
-	}
-	assertAllFieldsCovered(t, (&pb.UpdateConfigResponse{}).ProtoReflect().Descriptor(), handled, nil)
-}
-
-func TestConverterCoversAllProtoFields_FrozenSandboxPolicy(t *testing.T) {
-	handled := fieldSet{
-		"policy":                true,
-		"version":               true,
-		"policy_hash":           true,
-		"frozen_time":           true,
-		"policy_source":         true,
-		"global_policy_version": true,
-	}
-	// Provider identities, profiles, and refresh epochs are gateway-owned
-	// authorization state. Callers inspect these only through the raw API.
-	skipped := fieldSet{"providers": true}
-	assertAllFieldsCovered(t, (&pb.FrozenSandboxPolicy{}).ProtoReflect().Descriptor(), handled, skipped)
 }
 
 func TestConverterCoversAllProtoFields_SandboxCondition(t *testing.T) {

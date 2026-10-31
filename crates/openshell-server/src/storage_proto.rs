@@ -15,6 +15,16 @@
 
 include!(concat!(env!("OUT_DIR"), "/openshell.storage.v1.rs"));
 
+mod sandbox_image {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.image.v1.rs"));
+}
+pub(crate) use sandbox_image::{StoredSandboxImageState, StoredSandboxImageUpdate};
+
+mod frozen_policy {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.frozen.v1.rs"));
+}
+pub(crate) use frozen_policy::StoredFrozenSandboxPolicy;
+
 pub(crate) const STORAGE_FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/storage_descriptor.bin"));
 
@@ -156,15 +166,31 @@ mod tests {
     // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
     // closures and TokenGrantStatus to public reports. Older rows have no grant
     // record; absent report extensions retain compatibility without a rewrite.
-    // Frozen creation defaults to false in legacy specs, with no status snapshot.
-    // Captured effective policy/provider authorization is durable; no secrets
-    // or credential handles are added to the persisted sandbox snapshot.
+    // Frozen mode and first-accepted policy live in a separate private record;
+    // existing public SandboxSpec/Status and storage.v1 retain their source shape.
+    // The private snapshot holds no credential values or handles.
+    // Supervisor middleware binding policy and selectors are public-only. An
+    // absent policy preserves dynamic discovery; older supervisors ignore both fields.
+    // Suspend/resume adds two public request messages without durable request
+    // admission, the restart_if_restore_fails resume option, and the SUSPENDING
+    // and SUSPENDED values to the shared
+    // SandboxPhase enum. Stored rows never carried those values, so prior
+    // payloads decode unchanged.
+
+    // Image updates add a separate public service/request and a new private
+    // image-state format. Existing public status and frozen storage.v1 stay
+    // unchanged; only the private durable closure grows.
+    // Configuration updates add presence-aware argv/map wrappers shared with
+    // private durable intent. Existing image-only payloads decode with all four
+    // selections absent; storage.v1 remains frozen. Public field 3 retains its
+    // image wire identity, now with explicit presence. Compute configuration
+    // updates use a separate capability/service and add one classified RPC.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "ea6706c72c7f342d76058912fafc8ac0b417794fec54a95aac34478c3f3c1313";
+        "50685228fd583a635c7372c56c461ea592d47fcd9679f93462b30287b6f36888";
     const DURABLE_SCHEMA_SHA256: &str =
-        "be37396a265cf0fe478fcd6247092562c39bb59ee897e497c845d63cce96f156";
+        "c7a86a700ab2beb5479b769fbe3b154f5dbbcc7bf6a7ca22845d4730bd18147c";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "4f42365b9bb44c83410d79d23a10ff3ce09c7863336ce044c737eb7359769090";
+        "53f3864940fe0e829a1ae129fb35e379d5ab7010b738169f617a990c678bca51";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -212,6 +238,12 @@ mod tests {
     const PEER_CONFIG_RPC_SIGNATURES: [&str; 1] = [
         "openshell.v1.OpenShell/PeerNotifyConfigUpdate|.openshell.v1.PeerNotifyConfigUpdateRequest|.openshell.v1.PeerNotifyConfigUpdateResponse|false|false",
     ];
+    const FROZEN_POLICY_RPC_SIGNATURES: &[&str] = &[
+        "openshell.v1.FrozenSandboxPolicies/CreateSandbox|.openshell.v1.CreateFrozenSandboxRequest|.openshell.v1.FrozenSandboxResponse|false|false",
+        "openshell.v1.FrozenSandboxPolicies/GetPolicy|.openshell.v1.GetFrozenSandboxPolicyRequest|.openshell.v1.FrozenSandboxPolicyState|false|false",
+        "openshell.v1.FrozenSandboxPolicies/GetConfig|.openshell.v1.GetFrozenSandboxConfigRequest|.openshell.v1.FrozenSandboxConfigResponse|false|false",
+        "openshell.v1.FrozenSandboxPolicies/UpdateGlobalConfig|.openshell.v1.UpdateFrozenGlobalConfigRequest|.openshell.v1.UpdateFrozenGlobalConfigResponse|false|false",
+    ];
     // Synthetic SandboxSpec bytes with log level, provider, and command fields,
     // emitted before the gateway-owned attachment epoch field was introduced.
     const PRE_READINESS_SANDBOX_SPEC: &str =
@@ -225,6 +257,8 @@ mod tests {
         ".openshell.storage.v1.StoredConfigUpdateOperation",
         ".openshell.storage.v1.StoredProviderCredentialRefreshStateV2",
         ".openshell.storage.v1.StoredProviderProfile",
+        ".openshell.storage.image.v1.StoredSandboxImageState",
+        ".openshell.storage.frozen.v1.StoredFrozenSandboxPolicy",
         ".openshell.v1.Sandbox",
         ".openshell.v1.SandboxWorkloadTemplate",
         ".openshell.v1.ServiceEndpoint",
@@ -467,7 +501,12 @@ mod tests {
         let public = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET)
             .expect("public descriptor set must decode");
         for file in public.file {
-            assert_ne!(file.package.as_deref(), Some("openshell.storage.v1"));
+            assert!(
+                !file
+                    .package
+                    .as_deref()
+                    .is_some_and(|package| package.starts_with("openshell.storage."))
+            );
             for message in file.message_type {
                 let name = message.name.expect("message name");
                 assert!(
@@ -538,6 +577,7 @@ mod tests {
         let mut compiled_method_count = 0;
         let mut isolation_methods = BTreeSet::new();
         let mut sandbox_protocol_methods = BTreeSet::new();
+        let mut supervisor_host_methods = BTreeSet::new();
         for file in &public.file {
             let package = file.package.as_deref().unwrap_or_default();
             for service in &file.service {
@@ -561,9 +601,20 @@ mod tests {
                             .expect("sandbox protocol method name")
                     }));
                 }
+                // Private gateway-to-shared-supervisor protocol: served by the
+                // gateway but never part of the public SDK surface.
+                if package == "openshell.supervisor.host.v1" {
+                    assert_eq!(service_name, "SupervisorHost");
+                    supervisor_host_methods.extend(service.method.iter().map(|method| {
+                        method.name.as_deref().expect("supervisor host method name")
+                    }));
+                }
                 if !matches!(
                     (package, service_name),
-                    ("openshell.v1", "OpenShell") | ("openshell.inference.v1", "Inference")
+                    (
+                        "openshell.v1",
+                        "OpenShell" | "SandboxUpdates" | "FrozenSandboxPolicies"
+                    ) | ("openshell.inference.v1", "Inference")
                 ) {
                     continue;
                 }
@@ -597,6 +648,7 @@ mod tests {
             sandbox_protocol_methods,
             BTreeSet::from(["Exchange", "Mediate"])
         );
+        assert_eq!(supervisor_host_methods, BTreeSet::from(["Attach"]));
         for signature in PROVIDER_READINESS_RPC_SIGNATURES {
             assert!(
                 methods.iter().any(|method| method == signature),
@@ -615,20 +667,29 @@ mod tests {
                 "peer config RPC is missing or changed: {signature}"
             );
         }
+        for signature in FROZEN_POLICY_RPC_SIGNATURES {
+            assert!(
+                methods.iter().any(|method| method == signature),
+                "frozen policy RPC is missing or changed: {signature}"
+            );
+        }
         assert_eq!(
             compiled_method_count,
-            103 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            108 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
-                + sandbox_protocol_methods.len(),
+                + sandbox_protocol_methods.len()
+                + supervisor_host_methods.len()
+                + FROZEN_POLICY_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            81 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
-                + PEER_CONFIG_RPC_SIGNATURES.len(),
+                + PEER_CONFIG_RPC_SIGNATURES.len()
+                + FROZEN_POLICY_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -636,11 +697,16 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
+        assert!(
+            methods
+                .iter()
+                .all(|method| !method.contains(".supervisor.host."))
+        );
 
         let public_closure = schema_closure(&index, public_roots);
         let durable_closure =
@@ -682,9 +748,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (332, 29),
-                (99, 22),
-                (87, 22),
+                (350, 31),
+                (105, 22),
+                (90, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -727,7 +793,6 @@ mod tests {
         assert_eq!(spec.providers, ["synthetic-provider"]);
         assert_eq!(spec.command, ["echo"]);
         assert!(spec.provider_attachment_epoch.is_empty());
-        assert!(!spec.frozen);
     }
 
     #[test]
@@ -743,7 +808,6 @@ mod tests {
         assert!(status.configuration_admission.is_none());
         assert_eq!(status.configuration_activated, None);
         assert!(status.provisioning.is_none());
-        assert!(status.frozen_policy.is_none());
         assert!(!crate::policy_store::permits_initial_static_policy_repair(
             &sandbox
         ));

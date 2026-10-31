@@ -195,6 +195,26 @@ service OpenShell {
     };
   }
 
+  // Freeze a ready sandbox and retain its memory state for a later resume.
+  // Requires a compute driver and isolation backend that support state
+  // retention.
+  rpc SuspendSandbox(SuspendSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
+  // Restore a suspended sandbox in a new runtime generation.
+  rpc ResumeSandbox(ResumeSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
   // Create a short-lived SSH session for a sandbox.
   rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse) {
     option (openshell.options.v1.authorization) = {
@@ -838,6 +858,151 @@ service OpenShell {
   }
 }
 
+// Optional sandbox mutations are separate from OpenShell so existing generated
+// OpenShell server implementations remain source-compatible.
+service SandboxUpdates {
+  // Update the workload image, command, environment, labels, or annotations of a
+  // stopped sandbox while preserving its identity and retained storage. Requires
+  // compute-driver support for the selected changes and explicit gateway activation
+  // of sandbox updates.
+  rpc UpdateSandbox(UpdateSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+}
+
+// Opt-in frozen policy operations. Existing sandbox messages and the OpenShell
+// service retain their source shape on the 0.1.x release train.
+service FrozenSandboxPolicies {
+  // Atomically choose frozen mode when creating a sandbox, including from a template.
+  rpc CreateSandbox(CreateFrozenSandboxRequest) returns (FrozenSandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+  // Read the creation mode and first-accepted snapshot. An absent policy is pending.
+  rpc GetPolicy(GetFrozenSandboxPolicyRequest) returns (FrozenSandboxPolicyState) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+  // Runtime delivery includes an explicit captured-policy signal without extending
+  // the stable PolicySource enum. Uncaptured policies retain normal startup behavior.
+  rpc GetConfig(GetFrozenSandboxConfigRequest) returns (FrozenSandboxConfigResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "dual"
+      scope: "config:read"
+      workspace_role: "user"
+    };
+  }
+  // Update gateway-global policy and report sandboxes retaining captured policy.
+  // global must be true; the ordinary UpdateConfig response remains unchanged.
+  rpc UpdateGlobalConfig(UpdateFrozenGlobalConfigRequest)
+      returns (UpdateFrozenGlobalConfigResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:write"
+      global_role: "platform_admin"
+    };
+  }
+}
+
+// Frozen mode is chosen at creation; it cannot be enabled or reset later.
+message FrozenSandboxPolicyState {
+  bool requested = 1;
+  // Absent until the first successfully accepted configuration is captured.
+  FrozenSandboxPolicy policy = 2;
+}
+
+message FrozenSandboxResponse {
+  Sandbox sandbox = 1;
+  FrozenSandboxPolicyState frozen_policy = 2;
+  map<string, string> service_urls = 3;
+}
+
+message FrozenSandboxConfigResponse {
+  openshell.sandbox.v1.GetSandboxConfigResponse config = 1;
+  // True only after the authoritative first-accepted snapshot was captured.
+  bool frozen = 2;
+  // Chosen at creation, including before the first configuration is accepted.
+  bool frozen_requested = 3;
+}
+
+message UpdateFrozenGlobalConfigResponse {
+  UpdateConfigResponse update = 1;
+  // Workspace-qualified names that retain a captured policy.
+  repeated string frozen_sandboxes = 2;
+}
+
+message CreateFrozenSandboxRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 7;
+  SandboxSpec spec = 1;
+  // Optional user-supplied sandbox name. When empty the server generates one.
+  string name = 2;
+  // Optional labels for the sandbox (key-value metadata).
+  map<string, string> labels = 3;
+  // Optional annotations for the sandbox (non-selector metadata). Keys under
+  // the `internal.openshell.ai/` prefix are reserved for the gateway.
+  map<string, string> annotations = 4;
+  // One-shot launch hint indicating that the creating client will attach to
+  // the canonical main process. The supervisor keeps the terminal transport
+  // alive until that attachment connects and closes naturally.
+  bool await_main_process_attachment = 5;
+  // Workspace-scoped SandboxWorkloadTemplate name to resolve at creation time.
+  string workload_template = 6;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 8;
+  // HTTP services to expose when the sandbox is created. Endpoints are
+  // registered after the sandbox has been persisted and route only while the
+  // sandbox is ready.
+  repeated SandboxServiceExposure service_exposures = 9;
+}
+
+message GetFrozenSandboxPolicyRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+  string name = 1;
+}
+
+message GetFrozenSandboxConfigRequest {
+  // Workspace scope. Select one named workspace; authenticated sandbox callers may omit it during bootstrap.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
+  string name = 1;
+}
+
+// Global-only counterpart of UpdateConfig. The mirrored sandbox-only fields
+// retain familiar request mapping but must remain absent/empty; the gateway
+// rejects them rather than silently ignoring a requested operation.
+message UpdateFrozenGlobalConfigRequest {
+  // Must be omitted for this global operation.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 10;
+  openshell.sandbox.v1.SandboxPolicy policy = 2;
+  string setting_key = 3;
+  openshell.sandbox.v1.SettingValue setting_value = 4;
+  bool delete_setting = 5;
+  // Required to be true.
+  bool global = 6;
+  // Unsupported at global scope; must be empty.
+  repeated PolicyMergeOperation merge_operations = 7;
+  // Unsupported at global scope; must be zero.
+  uint64 expected_resource_version = 8;
+  // Unsupported at global scope; must be empty.
+  map<string, string> annotations = 9;
+  // Unsupported at global scope; must be empty.
+  string sandbox = 1;
+  // Optional nonzero UUID for durable at-most-once admission.
+  string request_id = 11;
+}
+
 // IssueSandboxToken request. Empty body; identity is established by the
 // authentication credentials carried in the request headers (a projected
 // Kubernetes ServiceAccount JWT in the K8s driver path).
@@ -1074,9 +1239,6 @@ message SandboxSpec {
   // Gateway-owned policy for replacing the sandbox runtime after the canonical
   // main process exits. Unspecified is normalized to Never before persistence.
   SandboxRestartPolicy restart_policy = 15;
-  // Keep the first accepted effective policy until this sandbox is deleted.
-  // Chosen only at creation; a different policy requires a new sandbox.
-  bool frozen = 16;
 }
 
 message ResourceRequirements {
@@ -1225,12 +1387,9 @@ message SandboxStatus {
   // failures before a configured endpoint or credential could be selected.
   // Matching grant success or a policy, provider, or supervisor reset clears it.
   TokenGrantFailureObservation last_token_grant_failure = 17;
-  // Read-only, non-secret policy and provider authorization captured atomically
-  // with first configuration acceptance. Retained across runtime replacement.
-  FrozenSandboxPolicy frozen_policy = 18;
 }
 
-// Authoritative policy for a sandbox created with frozen=true.
+// Non-secret policy and provider authorization captured by frozen creation.
 message FrozenSandboxPolicy {
   openshell.sandbox.v1.SandboxPolicy policy = 1;
   uint32 version = 2;
@@ -1289,6 +1448,11 @@ enum SandboxPhase {
   SANDBOX_PHASE_COMPLETED = 9;
   reserved 10;
   reserved "SANDBOX_PHASE_RESTARTING";
+  // The gateway requested suspension and the driver has not confirmed it.
+  SANDBOX_PHASE_SUSPENDING = 11;
+  // The workload is frozen and its memory state is retained by the isolation
+  // backend. ResumeSandbox restores it; StartSandbox discards it.
+  SANDBOX_PHASE_SUSPENDED = 12;
 }
 
 // Public platform event exposed on the sandbox watch stream.
@@ -1334,6 +1498,40 @@ message CreateSandboxRequest {
   // registered after the sandbox has been persisted and route only while the
   // sandbox is ready.
   repeated SandboxServiceExposure service_exposures = 9;
+}
+
+// Update selected configuration of a stopped sandbox. Omitted fields are unchanged.
+// Start explicitly after a successful update. With no fields selected, resume
+// the pending operation stored by the gateway using the current resource version.
+message UpdateSandboxRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  // Canonical name of the existing sandbox; this is not a rename or upsert.
+  string name = 2;
+  // Nonempty OCI workload image reference. This does not change trusted runtime
+  // images or reseed an existing workspace.
+  optional string image = 3;
+  // Replace workload argv; an empty list restores image-resolved default shell behavior.
+  SandboxCommandUpdate command = 6;
+  // Replace sandbox-level overrides. Empty clears overrides; template defaults remain.
+  SandboxMapUpdate environment = 7;
+  // Replace user metadata, preserving gateway-owned keys. These do not set pod metadata.
+  SandboxMapUpdate labels = 8;
+  SandboxMapUpdate annotations = 9;
+  // Required nonzero resource version read by the caller.
+  uint64 expected_resource_version = 4;
+  // Optional nonzero UUID for durable at-most-once admission.
+  string request_id = 5;
+}
+
+// Presence selects replacement, including an explicitly empty list.
+message SandboxCommandUpdate {
+  repeated string argv = 1;
+}
+
+// Presence selects replacement, including an explicitly empty map.
+message SandboxMapUpdate {
+  map<string, string> values = 1;
 }
 
 message CreateSandboxTemplateRequest {
@@ -1519,6 +1717,23 @@ message StartSandboxRequest {
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 3;
+}
+
+// Suspend sandbox request.
+message SuspendSandboxRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+  string name = 1;
+}
+
+// Resume sandbox request.
+message ResumeSandboxRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+  string name = 1;
+  // If true, the isolation backend may boot the workload cleanly when it
+  // cannot restore the retained memory state. If false, resume fails instead.
+  bool restart_if_restore_fails = 3;
 }
 
 // Sandbox response.
@@ -2957,9 +3172,6 @@ message UpdateConfigResponse {
   bool deleted = 4;
   // Sandbox metadata annotations after the update. Empty for global updates.
   map<string, string> annotations = 5;
-  // Workspace-qualified sandbox names that retain a frozen policy after a
-  // gateway-global policy update or deletion. Empty for other mutations.
-  repeated string frozen_sandboxes = 6;
 }
 
 // Get sandbox policy status request.

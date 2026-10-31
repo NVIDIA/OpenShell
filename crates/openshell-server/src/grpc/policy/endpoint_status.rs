@@ -258,23 +258,30 @@ async fn current_endpoint_context(
     state: &ServerState,
     sandbox: &Sandbox,
 ) -> Result<EndpointContext, Status> {
-    if super::frozen::snapshot(sandbox).is_some() {
-        return frozen_endpoint_context(state, sandbox).await;
+    if let Some(snapshot) = super::frozen::snapshot(state.store.as_ref(), sandbox).await? {
+        return frozen_endpoint_context(state, sandbox, &snapshot).await;
     }
-    let workspace = sandbox.object_workspace();
-    let catalog = state
-        .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref(), workspace)
+    let live = async {
+        let workspace = sandbox.object_workspace();
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), workspace)
+            .await?;
+        let policy = current_effective_policy_for_sandbox(
+            state,
+            &catalog,
+            workspace,
+            sandbox,
+            sandbox.object_id(),
+        )
         .await?;
-    let policy = current_effective_policy_for_sandbox(
-        state,
-        &catalog,
-        workspace,
-        sandbox,
-        sandbox.object_id(),
-    )
-    .await?;
-    derive_endpoint_context(state, sandbox, &catalog, policy).await
+        derive_endpoint_context(state, sandbox, &catalog, policy).await
+    }
+    .await;
+    if let Some(snapshot) = super::frozen::snapshot(state.store.as_ref(), sandbox).await? {
+        return frozen_endpoint_context(state, sandbox, &snapshot).await;
+    }
+    live
 }
 
 async fn active_endpoint_context(
@@ -301,37 +308,45 @@ async fn endpoint_context_for_loaded_policy(
     sandbox: &Sandbox,
     version: i64,
 ) -> Result<EndpointContext, Status> {
-    if super::frozen::snapshot(sandbox).is_some() {
-        return frozen_endpoint_context(state, sandbox).await;
+    if let Some(snapshot) = super::frozen::snapshot(state.store.as_ref(), sandbox).await? {
+        return frozen_endpoint_context(state, sandbox, &snapshot).await;
     }
-    let workspace = sandbox.object_workspace();
-    let catalog = state
-        .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref(), workspace)
-        .await?;
-    let global_settings = load_global_settings(state.store.as_ref()).await?;
-    let global_policy = decode_policy_from_global_settings(&global_settings)?;
-    endpoint_context_for_loaded_policy_with_inputs(
-        state,
-        sandbox,
-        version,
-        &catalog,
-        global_policy.as_ref(),
-    )
-    .await
+    let live = async {
+        let workspace = sandbox.object_workspace();
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), workspace)
+            .await?;
+        let global_settings = load_global_settings(state.store.as_ref()).await?;
+        let global_policy = decode_policy_from_global_settings(&global_settings)?;
+        endpoint_context_for_loaded_policy_with_inputs(
+            state,
+            sandbox,
+            version,
+            &catalog,
+            global_policy.as_ref(),
+        )
+        .await
+    }
+    .await;
+    if let Some(snapshot) = super::frozen::snapshot(state.store.as_ref(), sandbox).await? {
+        return frozen_endpoint_context(state, sandbox, &snapshot).await;
+    }
+    live
 }
 
 async fn frozen_endpoint_context(
     state: &ServerState,
     sandbox: &Sandbox,
+    snapshot: &openshell_core::proto::FrozenSandboxPolicy,
 ) -> Result<EndpointContext, Status> {
-    let snapshot = super::frozen::snapshot(sandbox).expect("frozen snapshot checked by caller");
     let policy = super::frozen::policy(snapshot)?;
-    let providers = super::frozen::provider_context(state, sandbox).await?;
+    let providers = super::frozen::provider_context_from_snapshot(state, sandbox, snapshot).await?;
     let bindings = policy_static_credential_endpoint_bindings(Some(&policy))?;
     let provider_env_revision = providers.revision(
         &bindings,
-        super::frozen::uses_global_policy(sandbox, PolicySource::Frozen).then_some(&policy),
+        super::frozen::uses_global_policy(Some(snapshot), super::frozen::source(snapshot)?)
+            .then_some(&policy),
     )?;
     Ok(EndpointContext {
         policy_hash: snapshot.policy_hash.clone(),
@@ -1019,11 +1034,11 @@ pub(super) async fn endpoint_status_reset_for_loaded_policy(
     version: i64,
 ) -> Result<Option<BTreeMap<String, EndpointStatus>>, Status> {
     let current_version = i64::from(sandbox.current_policy_version());
-    if super::frozen::snapshot(sandbox).is_some() {
+    if let Some(snapshot) = super::frozen::snapshot(state.store.as_ref(), sandbox).await? {
         // Every acknowledged revision of an initialized frozen sandbox resolves
         // to the captured authorization. Never consult today's profile source
         // or global override when replacing its supervisor.
-        let context = frozen_endpoint_context(state, sandbox).await?;
+        let context = frozen_endpoint_context(state, sandbox, &snapshot).await?;
         let same_configuration =
             current_version != 0 || endpoint_cursor_matches_context(state, sandbox, &context);
         return Ok((!same_configuration).then(|| unknown_endpoint_reports(&context.endpoints)));

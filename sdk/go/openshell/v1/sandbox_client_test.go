@@ -5,7 +5,6 @@ package v1
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -30,7 +29,6 @@ type mockSandboxServer struct {
 	sandboxes            map[string]*pb.Sandbox
 	providers            map[string][]*dm.Provider
 	createErr            error
-	createResponse       *pb.SandboxResponse
 	getErr               error
 	listErr              error
 	listPages            [][]*pb.Sandbox
@@ -44,6 +42,7 @@ type mockSandboxServer struct {
 	detachErr            error
 	listProvErr          error
 	createRequest        *pb.CreateSandboxRequest
+	resumeRequest        *pb.ResumeSandboxRequest
 	watchEvents          []*pb.SandboxStreamEvent
 	watchErr             error
 	watchPostEventsErr   error
@@ -69,13 +68,6 @@ func (s *mockSandboxServer) CreateSandbox(_ context.Context, req *pb.CreateSandb
 	s.createRequest = proto.Clone(req).(*pb.CreateSandboxRequest)
 	if s.createErr != nil {
 		return nil, s.createErr
-	}
-	if s.createResponse != nil {
-		sb := s.createResponse.GetSandbox()
-		if sb != nil {
-			s.sandboxes[sb.GetMetadata().GetName()] = sb
-		}
-		return proto.Clone(s.createResponse).(*pb.SandboxResponse), nil
 	}
 	sb := &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{
@@ -181,6 +173,31 @@ func (s *mockSandboxServer) StopSandbox(_ context.Context, req *pb.StopSandboxRe
 func (s *mockSandboxServer) StartSandbox(_ context.Context, req *pb.StartSandboxRequest) (*pb.SandboxResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	name := req.GetName()
+	sb, ok := s.sandboxes[name]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
+	}
+	sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_STARTING
+	return &pb.SandboxResponse{Sandbox: proto.Clone(sb).(*pb.Sandbox)}, nil
+}
+
+func (s *mockSandboxServer) SuspendSandbox(_ context.Context, req *pb.SuspendSandboxRequest) (*pb.SandboxResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	name := req.GetName()
+	sb, ok := s.sandboxes[name]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
+	}
+	sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_SUSPENDED
+	return &pb.SandboxResponse{Sandbox: proto.Clone(sb).(*pb.Sandbox)}, nil
+}
+
+func (s *mockSandboxServer) ResumeSandbox(_ context.Context, req *pb.ResumeSandboxRequest) (*pb.SandboxResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resumeRequest = req
 	name := req.GetName()
 	sb, ok := s.sandboxes[name]
 	if !ok {
@@ -674,6 +691,36 @@ func TestSandboxStopAndStart(t *testing.T) {
 	starting, err := client.Start(context.Background(), "team-a", "lifecycle")
 	require.NoError(t, err)
 	assert.Equal(t, SandboxStarting, starting.Status.Phase)
+}
+
+func TestSandboxSuspendAndResume(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.sandboxes["frozen"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Name: "frozen", Workspace: "team-a"},
+		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_READY},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	suspended, err := client.Suspend(context.Background(), "team-a", "frozen")
+	require.NoError(t, err)
+	assert.Equal(t, SandboxSuspended, suspended.Status.Phase)
+
+	waited, err := client.WaitSuspended(context.Background(), "team-a", "frozen")
+	require.NoError(t, err)
+	assert.Equal(t, SandboxSuspended, waited.Status.Phase)
+
+	_, err = client.WaitReady(context.Background(), "team-a", "frozen")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "suspended")
+
+	resumed, err := client.Resume(context.Background(), "team-a", "frozen", ResumeOptions{RestartIfRestoreFails: true})
+	require.NoError(t, err)
+	assert.Equal(t, SandboxStarting, resumed.Status.Phase)
+	mock.mu.Lock()
+	assert.True(t, mock.resumeRequest.GetRestartIfRestoreFails())
+	assert.Equal(t, "frozen", mock.resumeRequest.GetName())
+	mock.mu.Unlock()
 }
 
 // --- T030: AttachProvider, DetachProvider, ListProviders tests ---
@@ -1494,53 +1541,4 @@ func TestSandboxGetLogs_SinceZeroNotSent(t *testing.T) {
 	mock.mu.Lock()
 	assert.Nil(t, mock.getLogsRequest.GetSinceTime())
 	mock.mu.Unlock()
-}
-
-func TestSandboxFrozenCreateRequiresAcknowledgement(t *testing.T) {
-	for _, mode := range []struct {
-		name string
-		spec *pb.SandboxSpec
-	}{
-		{name: "absent"},
-		{name: "false", spec: &pb.SandboxSpec{}},
-		{name: "pending", spec: &pb.SandboxSpec{Frozen: true}},
-	} {
-		for _, template := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/template=%t", mode.name, template), func(t *testing.T) {
-				mock := newMockSandboxServer()
-				mock.createResponse = &pb.SandboxResponse{Sandbox: &pb.Sandbox{
-					Metadata: &dm.ObjectMeta{Id: "created-id", Name: "created-frozen", Workspace: "staging"},
-					Spec:     mode.spec,
-				}}
-				client, cleanup := setupSandboxTest(t, mock)
-				defer cleanup()
-				var result *Sandbox
-				var err error
-				if template {
-					result, err = client.CreateFromTemplate(context.Background(), "staging", "", "agent", &SandboxSpec{Frozen: true})
-				} else {
-					result, err = client.Create(context.Background(), "staging", "", &SandboxSpec{Frozen: true})
-				}
-				if mode.spec.GetFrozen() {
-					require.NoError(t, err)
-					require.NotNil(t, result)
-					assert.True(t, result.Spec.Frozen)
-					assert.Nil(t, result.Status.FrozenPolicy)
-				} else {
-					require.Error(t, err)
-					assert.Nil(t, result)
-					assert.True(t, IsUnimplemented(err))
-					assert.ErrorContains(t, err, "gateway did not honor frozen=true")
-					assert.ErrorContains(t, err, "created-frozen")
-					assert.ErrorContains(t, err, "created-id")
-					assert.ErrorContains(t, err, "staging")
-				}
-				mock.mu.Lock()
-				defer mock.mu.Unlock()
-				assert.True(t, mock.createRequest.GetSpec().GetFrozen())
-				assert.Contains(t, mock.sandboxes, "created-frozen", "the SDK must leave cleanup to the caller")
-				assert.Nil(t, mock.deleteRequest)
-			})
-		}
-	}
 }

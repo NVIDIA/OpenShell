@@ -26,10 +26,25 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # names because binary() fails in workspaces without the HA test binary.
 [test-groups]
 kubernetes-ha = { max-threads = 1 }
+kubernetes-shared-supervisor-pool = { max-threads = 1 }
 
 [[profile.e2e-kubernetes.overrides]]
 filter = "test(/gateway_(scale_and_rollout|pod_rolls)$/)"
 test-group = "kubernetes-ha"
+
+# Both change the shared supervisor pool of the release they run against: one
+# kills a member, the other scales the pool. Never run them at once. Test
+# names, not binary(), for the reason above.
+[[profile.e2e-kubernetes.overrides]]
+filter = "test(/^(losing_a_supervisor_pod_moves_its_sandboxes_without_restarting_them|scaling_a_supervisor_pool_up_and_down_keeps_its_sandboxes_running)$/)"
+test-group = "kubernetes-shared-supervisor-pool"
+
+# Scaling the pool runs two bounded Helm upgrades (up to 6 minutes each), waits
+# for each member to join or leave, and creates sandboxes until one lands on
+# the new member, so it gets 20 minutes instead of five.
+[[profile.e2e-kubernetes.overrides]]
+filter = "test(/^scaling_a_supervisor_pool_up_and_down_keeps_its_sandboxes_running$/)"
+slow-timeout = { period = "60s", terminate-after = 20 }
 
 # Relative to the profile store dir (`e2e/rust/target/nextest/e2e-kubernetes/`).
 [profile.e2e-kubernetes.junit]

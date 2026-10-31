@@ -50,14 +50,17 @@ mod frozen_policy_tests {
         provider.profile_workspace.clear();
         provider.credentials = HashMap::from([(TOKEN.to_string(), "original-token".to_string())]);
         state.store.put_message(&provider).await.unwrap();
-        let mut sandbox = test_sandbox(
+        let sandbox = test_sandbox(
             ID,
             NAME,
             openshell_policy::restrictive_default_policy(),
             vec![PROVIDER.to_string()],
         );
-        sandbox.spec.as_mut().unwrap().frozen = frozen;
-        state.store.put_message(&sandbox).await.unwrap();
+        if frozen {
+            state.store.create_frozen_sandbox(&sandbox).await.unwrap();
+        } else {
+            state.store.put_message(&sandbox).await.unwrap();
+        }
         // Creation persists the baseline revision that supervisors acknowledge.
         let policy =
             validate_and_canonicalize_policy(openshell_policy::restrictive_default_policy())
@@ -166,7 +169,12 @@ mod frozen_policy_tests {
             "{}",
             config.configuration_error
         );
-        assert!(frozen::snapshot(&stored_sandbox(state).await).is_none());
+        assert!(
+            frozen::snapshot(state.store.as_ref(), &stored_sandbox(state).await)
+                .await
+                .unwrap()
+                .is_none()
+        );
         accept(state, &instance, &config).await.unwrap();
         (config, instance)
     }
@@ -202,6 +210,235 @@ mod frozen_policy_tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn frozen_policy_service_delivers_mode_with_matching_config_and_workspace_authz() {
+        use openshell_core::proto::frozen_sandbox_policies_server::FrozenSandboxPolicies;
+        use openshell_core::proto::{GetFrozenSandboxConfigRequest, GetFrozenSandboxPolicyRequest};
+        let state = test_server_state().await;
+        seed(&state, true).await;
+        let service = crate::grpc::OpenShellService::new(Arc::clone(&state));
+        let pending = FrozenSandboxPolicies::get_config(
+            &service,
+            with_sandbox(
+                Request::new(GetFrozenSandboxConfigRequest {
+                    name: NAME.into(),
+                    workspace_scope: None,
+                }),
+                ID,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!pending.frozen);
+        assert!(pending.frozen_requested);
+        let (accepted, _) = initialize(&state).await;
+        let captured = FrozenSandboxPolicies::get_config(
+            &service,
+            with_sandbox(
+                Request::new(GetFrozenSandboxConfigRequest {
+                    name: NAME.into(),
+                    workspace_scope: None,
+                }),
+                ID,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(captured.frozen);
+        assert!(captured.frozen_requested);
+        assert_eq!(captured.config.unwrap().policy_hash, accepted.policy_hash);
+        let policy = FrozenSandboxPolicies::get_policy(
+            &service,
+            with_user(Request::new(GetFrozenSandboxPolicyRequest {
+                name: NAME.into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(policy.requested);
+        assert_eq!(policy.policy.unwrap().policy_hash, accepted.policy_hash);
+        drop(service);
+        let mut restricted = Arc::try_unwrap(state).ok().unwrap();
+        restricted.admin_role = "required-platform-admin".into();
+        let state = Arc::new(restricted);
+        let mut foreign = stored_sandbox(&state).await;
+        let metadata = foreign.metadata.as_mut().unwrap();
+        metadata.id = "foreign-frozen-id".into();
+        metadata.workspace = "foreign".into();
+        state.store.create_frozen_sandbox(&foreign).await.unwrap();
+        let service = crate::grpc::OpenShellService::new(Arc::clone(&state));
+        let error = FrozenSandboxPolicies::get_policy(
+            &service,
+            with_user(Request::new(GetFrozenSandboxPolicyRequest {
+                name: NAME.into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("foreign")),
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::NotFound);
+        let error = FrozenSandboxPolicies::get_config(
+            &service,
+            with_sandbox(
+                Request::new(GetFrozenSandboxConfigRequest {
+                    name: "other-sandbox".into(),
+                    workspace_scope: None,
+                }),
+                ID,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frozen_policy_capture_during_live_reads_rebuilds_from_captured_authority() {
+        use openshell_core::proto::GetFrozenSandboxConfigRequest;
+        use openshell_core::proto::frozen_sandbox_policies_server::FrozenSandboxPolicies;
+        for entry in ["unary", "combined"] {
+            let state = test_server_state().await;
+            seed(&state, true).await;
+            update_global(&state, "api.original.example").await;
+            let original = config(&state).await;
+            let sandbox = stored_sandbox(&state).await;
+            let inputs = load_sandbox_config_inputs(&state, sandbox.clone())
+                .await
+                .unwrap();
+            let captured = frozen::capture(&original, &inputs, current_time_ms()).unwrap();
+            let (sources, gate) =
+                ProviderProfileSources::from_test_profiles_blocked(vec![profile(
+                    "api.changed.example",
+                )]);
+            let mut server = Arc::try_unwrap(state).ok().unwrap();
+            server.provider_profile_sources = sources;
+            let state = Arc::new(server);
+            let reader = Arc::clone(&state);
+            let pending = sandbox.clone();
+            let read = tokio::spawn(async move {
+                match entry {
+                    "unary" => {
+                        let service = crate::grpc::OpenShellService::new(Arc::clone(&reader));
+                        let response = FrozenSandboxPolicies::get_config(
+                            &service,
+                            with_sandbox(
+                                Request::new(GetFrozenSandboxConfigRequest {
+                                    name: NAME.into(),
+                                    workspace_scope: None,
+                                }),
+                                ID,
+                            ),
+                        )
+                        .await
+                        .unwrap()
+                        .into_inner();
+                        assert!(response.frozen && response.frozen_requested);
+                        let config = response.config.unwrap();
+                        (config.policy_hash, config.global_policy_version)
+                    }
+                    "combined" => {
+                        // These same shared builders feed pushed configuration
+                        // and session bootstrap from one input selection.
+                        let inputs = load_sandbox_config_inputs(&reader, pending).await.unwrap();
+                        let (config, environment) = tokio::try_join!(
+                            build_sandbox_config_snapshot_from_inputs(&reader, &inputs),
+                            build_provider_environment_snapshot_from_inputs(
+                                &reader, &inputs, true, true
+                            ),
+                        )
+                        .unwrap();
+                        assert!(inputs.frozen.unwrap().policy.is_some());
+                        assert_eq!(config.policy_hash, environment.policy_hash);
+                        (config.policy_hash, config.global_policy_version)
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            // The blocked source pauses the first poll before later SQL reads
+            // in try_join, making capture-before-new-global-read deterministic.
+            gate.entered().await;
+            state
+                .store
+                .accept_frozen_sandbox_configuration(sandbox, captured.clone())
+                .await
+                .unwrap();
+            update_global(&state, "api.changed.example").await;
+            gate.release();
+            let (hash, global_version) = read.await.unwrap();
+            assert_eq!(hash, original.policy_hash, "{entry}");
+            assert_eq!(global_version, captured.global_policy_version, "{entry}");
+        }
+    }
+
+    #[tokio::test]
+    async fn frozen_policy_session_acceptance_requires_first_unary_capture() {
+        let state = test_server_state().await;
+        seed(&state, true).await;
+        let instance = uuid::Uuid::new_v4().to_string();
+        register(&state, &instance, "").await;
+        let config = config(&state).await;
+        let admission = SandboxConfigurationAdmission {
+            instance_id: instance.clone(),
+            state: ConfigurationAdmissionState::Accepted.into(),
+            policy_version: config.version,
+            policy_hash: config.policy_hash.clone(),
+            config_revision: config.config_revision,
+            provider_env_revision: config.provider_env_revision,
+            ..Default::default()
+        };
+        let error = state
+            .compute
+            .supervisor_session_admission(ID, "session-first", "supervisor-first", &admission)
+            .await
+            .unwrap_err();
+        assert!(error.contains("ReportSandboxConfiguration"));
+        let pending = stored_sandbox(&state).await;
+        assert_eq!(
+            pending
+                .status
+                .unwrap()
+                .configuration_admission
+                .unwrap()
+                .state,
+            i32::from(ConfigurationAdmissionState::Pending)
+        );
+        assert!(
+            state
+                .store
+                .get_sandbox_frozen_policy(ID)
+                .await
+                .unwrap()
+                .unwrap()
+                .policy
+                .is_none()
+        );
+        accept(&state, &instance, &config).await.unwrap();
+        let captured = state
+            .store
+            .get_sandbox_frozen_policy(ID)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .compute
+            .supervisor_session_admission(ID, "session-first", "supervisor-first", &admission)
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .store
+                .get_sandbox_frozen_policy(ID)
+                .await
+                .unwrap()
+                .unwrap(),
+            captured
+        );
     }
 
     #[tokio::test]
@@ -250,11 +487,22 @@ mod frozen_policy_tests {
                     .code(),
                 Code::Aborted
             );
-            assert!(frozen::snapshot(&stored_sandbox(&state).await).is_none());
+            assert!(
+                frozen::snapshot(state.store.as_ref(), &stored_sandbox(&state).await)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             let accepted = config(&state).await;
             accept(&state, &instance, &accepted).await.unwrap();
             let sandbox = stored_sandbox(&state).await;
-            assert_eq!(frozen::snapshot(&sandbox).is_some(), frozen_requested);
+            assert_eq!(
+                frozen::snapshot(state.store.as_ref(), &sandbox)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                frozen_requested
+            );
             if !frozen_requested {
                 update_global(&state, "api.changed.example").await;
                 let changed = config(&state).await;
@@ -262,7 +510,11 @@ mod frozen_policy_tests {
                 assert_eq!(changed.policy_source, i32::from(PolicySource::Global));
                 continue;
             }
-            let captured = frozen::snapshot(&sandbox).unwrap().clone();
+            let captured = frozen::snapshot(state.store.as_ref(), &sandbox)
+                .await
+                .unwrap()
+                .unwrap()
+                .clone();
             assert_eq!(captured.policy, accepted.policy);
             assert_eq!(captured.policy_hash, accepted.policy_hash);
             assert!(captured.frozen_time.is_some());
@@ -291,7 +543,7 @@ mod frozen_policy_tests {
             update_global(&state, "api.changed.example").await;
             let delivered = config(&state).await;
             let credentials = environment(&state).await;
-            assert_eq!(delivered.policy_source, i32::from(PolicySource::Frozen));
+            assert_eq!(delivered.policy_source, captured.policy_source);
             assert_eq!(delivered.policy, accepted.policy);
             assert_eq!(delivered.policy_hash, accepted.policy_hash);
             assert_eq!(delivered.version, accepted.version);
@@ -311,8 +563,10 @@ mod frozen_policy_tests {
                 .await
                 .unwrap();
             assert_eq!(
-                frozen::snapshot(&stored_sandbox(&state).await),
-                Some(&captured)
+                frozen::snapshot(state.store.as_ref(), &stored_sandbox(&state).await)
+                    .await
+                    .unwrap(),
+                Some(captured.clone())
             );
             assert_eq!(fetches.load(Ordering::SeqCst), 0);
 
@@ -324,11 +578,28 @@ mod frozen_policy_tests {
             for secret in ["original-token", "rotated-token"] {
                 assert!(!String::from_utf8_lossy(&bytes).contains(secret));
             }
-            store.put_message(&sandbox).await.unwrap();
+            store.create_frozen_sandbox(&sandbox).await.unwrap();
+            let persisted = store.get_message::<Sandbox>(ID).await.unwrap().unwrap();
+            store
+                .accept_frozen_sandbox_configuration(persisted, captured.clone())
+                .await
+                .unwrap();
+            let private = store
+                .get_sandbox_frozen_policy(ID)
+                .await
+                .unwrap()
+                .unwrap()
+                .encode_to_vec();
+            for secret in ["original-token", "rotated-token"] {
+                assert!(!String::from_utf8_lossy(&private).contains(secret));
+            }
             drop(store);
             let reopened = Store::connect(&database_url).await.unwrap();
             let restored = reopened.get_message::<Sandbox>(ID).await.unwrap().unwrap();
-            assert_eq!(frozen::snapshot(&restored), Some(&captured));
+            assert_eq!(
+                frozen::snapshot(&reopened, &restored).await.unwrap(),
+                Some(captured)
+            );
         }
     }
 

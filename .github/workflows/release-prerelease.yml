@@ -10,62 +10,129 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Pre-release tag to publish and qualify (e.g. v0.0.4-pre.1)"
-        required: true
+        description: "Existing prerelease tag (e.g. v0.0.4-pre.1); omit to create the next candidate on this branch"
+        required: false
         type: string
 
 permissions:
   contents: read
 
 jobs:
+  resolve:
+    name: Resolve Prerelease Tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: release-prerelease-tags
+      cancel-in-progress: false
+      queue: max
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      source-sha: ${{ steps.tag.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.10.12"
+          python-version: "3.13"
+          enable-cache: false
+
+      - name: Resolve or create candidate tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG}"
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            tag="${REF_NAME}"
+          fi
+          if [[ -z "${tag}" ]]; then
+            test "${REF_TYPE}" = branch
+            tag=$(uv run --no-project python tasks/scripts/next-prerelease-tag.py)
+            source_sha=$(git rev-parse HEAD)
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/${tag}" -f "sha=${source_sha}"
+          else
+            if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$ ]]; then
+              echo "Unsupported prerelease tag: ${tag}" >&2
+              exit 1
+            fi
+            source_sha=$(git rev-parse "refs/tags/${tag}^{commit}")
+          fi
+          {
+            echo "tag=${tag}"
+            echo "source_sha=${source_sha}"
+          } >> "${GITHUB_OUTPUT}"
+          {
+            echo "## Prerelease candidate"
+            echo "- Tag: \`${tag}\`"
+            echo "- Source commit: \`${source_sha}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
   build:
     name: Build
+    needs: resolve
     permissions:
       actions: read
       contents: read
       packages: write
     uses: ./.github/workflows/release-build.yml
     with:
-      release-tag: ${{ inputs.tag || github.ref_name }}
+      release-tag: ${{ needs.resolve.outputs.tag }}
+      expected-source-sha: ${{ needs.resolve.outputs.source-sha }}
       is-prerelease: true
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   release-notes:
     name: Preview Release Notes
-    needs: build
+    needs: [resolve, build]
     permissions:
       contents: read
       pull-requests: read
     uses: ./.github/workflows/release-notes.yml
     with:
-      release-tag: ${{ inputs.tag || github.ref_name }}
+      release-tag: ${{ needs.resolve.outputs.tag }}
       advisory: true
     secrets:
       LLM_INFERENCE_API_KEY: ${{ secrets.LLM_INFERENCE_API_KEY }}
 
   publish:
     name: Publish
-    needs: build
+    needs: [resolve, build]
     permissions:
       actions: read
       contents: write
+      pull-requests: read
       packages: write
       id-token: write
       attestations: write
       artifact-metadata: write
     uses: ./.github/workflows/release-publish.yml
     with:
-      release-tag: ${{ inputs.tag || github.ref_name }}
+      release-tag: ${{ needs.resolve.outputs.tag }}
       source-sha: ${{ needs.build.outputs.source_sha }}
       semver: ${{ needs.build.outputs.semver }}
       python-version: ${{ needs.build.outputs.python_version }}
       npm-version: ${{ needs.build.outputs.npm_version }}
       is-prerelease: true
+    secrets:
+      SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   qualify:
     name: Qualify
-    needs: build
+    needs: [resolve, build]
     permissions:
       actions: read
       contents: read
@@ -74,7 +141,7 @@ jobs:
       pull-requests: read
     uses: ./.github/workflows/release-qualification.yml
     with:
-      release-tag: ${{ inputs.tag || github.ref_name }}
+      release-tag: ${{ needs.resolve.outputs.tag }}
       source-sha: ${{ needs.build.outputs.source_sha }}
       is-prerelease: true
     secrets:
@@ -83,7 +150,7 @@ jobs:
 
   notify-prerelease-success:
     name: Notify Prerelease Success
-    needs: [build, publish, qualify]
+    needs: [resolve, build, publish, qualify]
     if: success()
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -92,10 +159,10 @@ jobs:
       - name: Send Slack notification
         continue-on-error: true
         env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL }}
           RUN_URL: ${{ format('{0}/{1}/actions/runs/{2}/attempts/{3}', github.server_url, github.repository, github.run_id, github.run_attempt) }}
-          TAG_URL: ${{ format('{0}/{1}/tree/{2}', github.server_url, github.repository, inputs.tag || github.ref_name) }}
+          TAG_URL: ${{ format('{0}/{1}/tree/{2}', github.server_url, github.repository, needs.resolve.outputs.tag) }}
         run: |
           set -euo pipefail
           if [[ -z "${SLACK_WEBHOOK_URL}" ]]; then
@@ -111,7 +178,7 @@ jobs:
 
   notify-prerelease-failure:
     name: Notify Prerelease Failure
-    needs: [build, publish, qualify]
+    needs: [resolve, build, publish, qualify]
     if: failure()
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -124,7 +191,7 @@ jobs:
       - name: Send Slack notification
         continue-on-error: true
         env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag || inputs.tag || github.ref_name }}
           PUBLICATION_RESULT: ${{ needs.publish.result }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL }}
           SLACK_MENTION: ${{ secrets.SLACK_OPENSHELL_TRIAGE_MENTION }}

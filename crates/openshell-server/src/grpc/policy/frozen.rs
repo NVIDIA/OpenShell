@@ -68,16 +68,30 @@ pub(super) fn provider_env_revision(
     )?))
 }
 
-pub(in crate::grpc) fn snapshot(sandbox: &Sandbox) -> Option<&FrozenSandboxPolicy> {
-    sandbox.status.as_ref()?.frozen_policy.as_deref()
+pub(in crate::grpc) async fn snapshot(
+    store: &Store,
+    sandbox: &Sandbox,
+) -> Result<Option<FrozenSandboxPolicy>, Status> {
+    Ok(store
+        .get_sandbox_frozen_policy(sandbox.object_id())
+        .await
+        .map_err(|error| Status::internal(format!("fetch frozen policy failed: {error}")))?
+        .and_then(|state| state.policy))
 }
 
-pub(super) fn requested(sandbox: &Sandbox) -> bool {
-    sandbox.spec.as_ref().is_some_and(|spec| spec.frozen)
+pub(super) async fn requested(store: &Store, sandbox: &Sandbox) -> Result<bool, Status> {
+    Ok(store
+        .get_sandbox_frozen_policy(sandbox.object_id())
+        .await
+        .map_err(|error| Status::internal(format!("fetch frozen policy failed: {error}")))?
+        .is_some())
 }
 
-pub(in crate::grpc) fn ensure_mutable(sandbox: &Sandbox) -> Result<(), Status> {
-    if snapshot(sandbox).is_some() {
+pub(in crate::grpc) async fn ensure_mutable(
+    store: &Store,
+    sandbox: &Sandbox,
+) -> Result<(), Status> {
+    if snapshot(store, sandbox).await?.is_some() {
         return Err(Status::failed_precondition(format!(
             "sandbox '{}' is frozen; delete and recreate it to change its policy or providers",
             sandbox.object_name()
@@ -92,7 +106,7 @@ pub(in crate::grpc) async fn ensure_mutable_by_id(store: &Store, id: &str) -> Re
         .await
         .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    ensure_mutable(&sandbox)
+    ensure_mutable(store, &sandbox).await
 }
 
 pub(super) async fn names(state: &ServerState) -> Result<Vec<String>, Status> {
@@ -101,13 +115,27 @@ pub(super) async fn names(state: &ServerState) -> Result<Vec<String>, Status> {
         .collect_messages::<Sandbox>(ObjectListQuery::AllWorkspaces)
         .await
         .map_err(|error| Status::internal(format!("list frozen sandboxes failed: {error}")))?;
-    let mut names: Vec<_> = sandboxes
-        .iter()
-        .filter(|sandbox| snapshot(sandbox).is_some())
-        .map(|sandbox| format!("{}/{}", sandbox.object_workspace(), sandbox.object_name()))
-        .collect();
+    let mut names = Vec::new();
+    for sandbox in sandboxes {
+        if snapshot(state.store.as_ref(), &sandbox).await?.is_some() {
+            names.push(format!(
+                "{}/{}",
+                sandbox.object_workspace(),
+                sandbox.object_name()
+            ));
+        }
+    }
     names.sort();
     Ok(names)
+}
+
+pub(super) fn source(snapshot: &FrozenSandboxPolicy) -> Result<PolicySource, Status> {
+    match PolicySource::try_from(snapshot.policy_source) {
+        Ok(source @ (PolicySource::Sandbox | PolicySource::Global)) => Ok(source),
+        _ => Err(Status::failed_precondition(
+            "frozen policy has an invalid original source",
+        )),
+    }
 }
 
 pub(super) fn policy(snapshot: &FrozenSandboxPolicy) -> Result<ProtoSandboxPolicy, Status> {
@@ -125,33 +153,12 @@ pub(super) fn policy(snapshot: &FrozenSandboxPolicy) -> Result<ProtoSandboxPolic
     Ok(canonical)
 }
 
-pub(in crate::grpc) async fn provider_context(
+pub(in crate::grpc) async fn provider_context_from_snapshot(
     state: &ServerState,
     sandbox: &Sandbox,
+    frozen: &FrozenSandboxPolicy,
 ) -> Result<ProviderContext, Status> {
     let workspace = sandbox.object_workspace();
-    let Some(frozen) = snapshot(sandbox) else {
-        let catalog = state
-            .provider_profile_sources
-            .snapshot_catalog(state.store.as_ref(), workspace)
-            .await?;
-        let names = sandbox
-            .spec
-            .as_ref()
-            .map_or(&[][..], |spec| spec.providers.as_slice());
-        let records = super::super::provider::load_provider_environment_records(
-            state.store.as_ref(),
-            workspace,
-            names,
-        )
-        .await?;
-        return Ok(ProviderContext {
-            catalog,
-            records,
-            withheld_providers: BTreeSet::new(),
-        });
-    };
-
     // The captured catalog, rather than today's live source, defines how both
     // fresh credential values and the frozen endpoint authority are interpreted.
     let profiles: Vec<ProviderProfile> = frozen
@@ -271,17 +278,17 @@ pub(super) fn capture(
     })
 }
 
-pub(super) fn uses_global_policy(sandbox: &Sandbox, source: PolicySource) -> bool {
-    snapshot(sandbox).map_or(source == PolicySource::Global, |snapshot| {
+pub(super) fn uses_global_policy(
+    snapshot: Option<&FrozenSandboxPolicy>,
+    source: PolicySource,
+) -> bool {
+    snapshot.map_or(source == PolicySource::Global, |snapshot| {
         snapshot.policy_source == i32::from(PolicySource::Global)
     })
 }
 
-pub(super) fn disable_proposals(
-    sandbox: &Sandbox,
-    settings: &mut HashMap<String, EffectiveSetting>,
-) {
-    if requested(sandbox) || snapshot(sandbox).is_some() {
+pub(super) fn disable_proposals(requested: bool, settings: &mut HashMap<String, EffectiveSetting>) {
+    if requested {
         settings.insert(
             settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY.to_string(),
             EffectiveSetting {

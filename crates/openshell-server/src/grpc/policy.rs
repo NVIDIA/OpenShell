@@ -1989,8 +1989,8 @@ async fn current_effective_policy_from_records(
     sandbox_id: &str,
     records: &[super::provider::ProviderEnvironmentRecord],
 ) -> Result<(ProtoSandboxPolicy, PolicySource), Status> {
-    if let Some(snapshot) = frozen::snapshot(sandbox) {
-        return Ok((frozen::policy(snapshot)?, PolicySource::Frozen));
+    if let Some(snapshot) = frozen::snapshot(state.store.as_ref(), sandbox).await? {
+        return Ok((frozen::policy(&snapshot)?, frozen::source(&snapshot)?));
     }
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let global_policy = decode_policy_from_global_settings(&global_settings)?;
@@ -2021,9 +2021,6 @@ fn effective_policy_from_captured_inputs(
     latest_policy: Option<&PolicyRecord>,
     sandbox: &Sandbox,
 ) -> Result<(ProtoSandboxPolicy, PolicySource), Status> {
-    if let Some(snapshot) = frozen::snapshot(sandbox) {
-        return Ok((frozen::policy(snapshot)?, PolicySource::Frozen));
-    }
     if let Some(global_policy) = global_policy {
         // A global policy is the complete effective policy. Dormant sandbox
         // history and specs may predate the current schema, but they must not
@@ -2527,7 +2524,10 @@ async fn validate_provider_composition_for_existing_sandboxes(
             .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
 
         for sandbox in page.messages {
-            if frozen::snapshot(&sandbox).is_some() {
+            if frozen::snapshot(state.store.as_ref(), &sandbox)
+                .await?
+                .is_some()
+            {
                 continue;
             }
             let provider_names = sandbox
@@ -2681,7 +2681,6 @@ fn update_config_response(
         settings_revision,
         deleted,
         annotations,
-        frozen_sandboxes: Vec::new(),
     })
 }
 
@@ -2766,8 +2765,22 @@ async fn resolve_sandbox_by_name_for_principal(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
 
     match principal {
-        Principal::Sandbox(_) => {
+        Principal::Sandbox(caller) => {
             let Some(sandbox) = sandbox else {
+                // A supervisor only ever names its own sandbox. When its own
+                // record is gone too, the sandbox was deleted, which is not
+                // misuse.
+                let caller_exists = store
+                    .get_message::<Sandbox>(&caller.sandbox_id)
+                    .await
+                    .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                    .is_some();
+                if caller_exists {
+                    crate::auth::audit::emit_authorization_denial(
+                        principal,
+                        crate::auth::audit::AuthzDenial::CrossSandboxName { name },
+                    );
+                }
                 return Err(Status::permission_denied(
                     "sandbox not found or not owned by caller",
                 ));
@@ -2786,8 +2799,8 @@ async fn resolve_sandbox_by_name_for_principal(
         Principal::User(_) | Principal::Operator(_) => {
             sandbox.ok_or_else(|| Status::not_found("sandbox not found"))
         }
-        Principal::Peer(_) => Err(Status::permission_denied(
-            "gateway peer principals may not resolve sandbox configuration",
+        Principal::Peer(_) | Principal::Supervisor(_) => Err(Status::permission_denied(
+            "gateway peer and supervisor principals may not resolve sandbox configuration",
         )),
         Principal::Anonymous => Err(Status::unauthenticated(
             "sandbox-scoped methods require an authenticated caller",
@@ -2803,6 +2816,16 @@ pub(super) async fn handle_get_sandbox_config(
     state: &Arc<ServerState>,
     request: Request<GetSandboxConfigRequest>,
 ) -> Result<Response<GetSandboxConfigResponse>, Status> {
+    handle_get_sandbox_config_with_frozen(state, request)
+        .await
+        .map(|(response, _, _)| response)
+}
+
+/// Return the mode from the same captured inputs as the configuration.
+pub(super) async fn handle_get_sandbox_config_with_frozen(
+    state: &Arc<ServerState>,
+    request: Request<GetSandboxConfigRequest>,
+) -> Result<(Response<GetSandboxConfigResponse>, bool, bool), Status> {
     let principal = super::extract_principal(&request)?;
     let sandbox_name = request.get_ref().name.clone();
     let workspace = match (&principal, request.get_ref().workspace_scope.as_ref()) {
@@ -2822,9 +2845,24 @@ pub(super) async fn handle_get_sandbox_config(
                 MinWorkspaceRole::User,
             )
             .await?;
-            Ok(Response::new(sandbox_config_response(
-                unadmitted_sandbox_config(state, &sandbox, &error),
-            )))
+            let frozen_state = state
+                .store
+                .get_sandbox_frozen_policy(sandbox.object_id())
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("fetch frozen policy failed: {error}"))
+                })?;
+            let frozen = frozen_state
+                .as_ref()
+                .is_some_and(|state| state.policy.is_some());
+            let requested = frozen_state.is_some();
+            Ok((
+                Response::new(sandbox_config_response(unadmitted_sandbox_config(
+                    state, &sandbox, &error,
+                ))),
+                frozen,
+                requested,
+            ))
         }
         result => result,
     }
@@ -2870,7 +2908,7 @@ pub fn unadmitted_sandbox_config(
 async fn handle_get_sandbox_config_inner(
     state: &Arc<ServerState>,
     request: Request<GetSandboxConfigRequest>,
-) -> Result<Response<GetSandboxConfigResponse>, Status> {
+) -> Result<(Response<GetSandboxConfigResponse>, bool, bool), Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = match &principal {
@@ -2885,7 +2923,17 @@ async fn handle_get_sandbox_config_inner(
         MinWorkspaceRole::User,
     )
     .await?;
-    Ok(Response::new(load_sandbox_config(state, &sandbox).await?))
+    let inputs = load_sandbox_config_inputs(state, sandbox).await?;
+    let frozen = inputs
+        .frozen
+        .as_ref()
+        .is_some_and(|state| state.policy.is_some());
+    let config = build_sandbox_config_snapshot_from_inputs(state, &inputs).await?;
+    Ok((
+        Response::new(sandbox_config_response(config)),
+        frozen,
+        inputs.frozen.is_some(),
+    ))
 }
 
 /// Resolve the same effective configuration for authenticated RPCs and trusted
@@ -2910,8 +2958,7 @@ pub async fn build_sandbox_config_snapshot(
     build_sandbox_config_snapshot_from_inputs(state, &inputs).await
 }
 
-/// Build the effective configuration from captured inputs. Sandbox settings
-/// and global policy version metadata are read here.
+/// Build the effective configuration from one captured set of inputs.
 pub async fn build_sandbox_config_snapshot_from_inputs(
     state: &ServerState,
     inputs: &SandboxConfigInputs,
@@ -2922,14 +2969,17 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
     let provider_profile_catalog = &inputs.catalog;
     let provider_records = &inputs.provider_records;
     let global_settings = &inputs.global_settings;
-    let frozen_policy = frozen::snapshot(sandbox);
+    let frozen_policy = inputs
+        .frozen
+        .as_ref()
+        .and_then(|state| state.policy.as_ref());
 
     let global_policy = if frozen_policy.is_some() {
         None
     } else {
         decode_policy_from_global_settings(global_settings)?
     };
-    let mut global_policy_version = frozen_policy.map_or(0, |policy| policy.global_policy_version);
+    let global_policy_version = inputs.global_policy_version;
 
     // Under a global override, only the sandbox version metadata is observed;
     // the dormant payload is neither decoded nor validated.
@@ -2941,7 +2991,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
             Some(frozen::policy(frozen)?),
             frozen.version,
             frozen.policy_hash.clone(),
-            PolicySource::Frozen,
+            frozen::source(frozen)?,
         )
     } else if let Some(global_policy) = global_policy {
         let version = latest
@@ -2985,19 +3035,9 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
         }
     };
 
-    let sandbox_settings =
-        load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name()).await?;
+    let sandbox_settings = inputs.sandbox_settings.as_ref().map_err(Clone::clone)?;
     let mut provider_policy_context =
         provider_policy_context_from_records(provider_profile_catalog, provider_records);
-
-    if matches!(policy_source, PolicySource::Global)
-        && let Ok(Some(global_rev)) = state
-            .store
-            .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
-            .await
-    {
-        global_policy_version = u32::try_from(global_rev.version).unwrap_or(0);
-    }
 
     if frozen_policy.is_none()
         && let Some(source_policy) = policy.as_mut()
@@ -3065,8 +3105,8 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
             })?;
     }
 
-    let mut settings = merge_effective_settings(global_settings, &sandbox_settings)?;
-    frozen::disable_proposals(sandbox, &mut settings);
+    let mut settings = merge_effective_settings(global_settings, sandbox_settings)?;
+    frozen::disable_proposals(inputs.frozen.is_some(), &mut settings);
     let supervisor_middleware_services =
         state.middleware_registry.required_services(policy.as_ref());
     let config_revision = compute_config_revision_with_validation_mode(
@@ -3092,7 +3132,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
         &policy_credential_bindings,
         policy
             .as_ref()
-            .filter(|_| frozen::uses_global_policy(sandbox, policy_source)),
+            .filter(|_| frozen::uses_global_policy(frozen_policy, policy_source)),
     )?;
 
     Ok(SandboxConfigSnapshot {
@@ -3896,17 +3936,21 @@ fn provider_environment_target(
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
     let provider_profile_catalog = &inputs.catalog;
     let provider_records = &inputs.provider_records;
-    let (effective_policy, policy_source) = effective_policy_from_captured_inputs(
-        provider_profile_catalog,
-        provider_records,
-        if frozen::snapshot(sandbox).is_some() {
-            None
-        } else {
-            decode_policy_from_global_settings(&inputs.global_settings)?
-        },
-        inputs.latest_policy.as_ref(),
-        sandbox,
-    )?;
+    let (effective_policy, policy_source) = if let Some(policy) = inputs
+        .frozen
+        .as_ref()
+        .and_then(|state| state.policy.as_ref())
+    {
+        (frozen::policy(policy)?, frozen::source(policy)?)
+    } else {
+        effective_policy_from_captured_inputs(
+            provider_profile_catalog,
+            provider_records,
+            decode_policy_from_global_settings(&inputs.global_settings)?,
+            inputs.latest_policy.as_ref(),
+            sandbox,
+        )?
+    };
     let policy_credential_bindings =
         policy_static_credential_endpoint_bindings(Some(&effective_policy))?;
     validate_policy_credential_binding_context(
@@ -3920,7 +3964,7 @@ fn provider_environment_target(
         provider_records,
         &inputs.withheld_providers,
         &policy_credential_bindings,
-        frozen::uses_global_policy(sandbox, policy_source).then_some(&effective_policy),
+        (policy_source == PolicySource::Global).then_some(&effective_policy),
     )?;
     Ok(ProviderEnvironmentTarget {
         spec,
@@ -3975,7 +4019,7 @@ pub async fn build_provider_environment_snapshot_from_inputs(
         )
         .await?;
 
-    if frozen::uses_global_policy(&inputs.sandbox, policy_source) {
+    if policy_source == PolicySource::Global {
         // A global policy replaces provider ACLs. Grants retain their profile
         // destination selectors, but only the selected global endpoint may
         // authorize their use. Keeping every global owner avoids reimplementing
@@ -4252,7 +4296,12 @@ async fn handle_update_config_inner(
         sandbox.object_workspace().to_string()
     });
     if sandbox_caller {
-        validate_sandbox_caller_update(&req)?;
+        validate_sandbox_caller_update(&req).inspect_err(|_| {
+            crate::auth::audit::emit_authorization_denial(
+                principal,
+                crate::auth::audit::AuthzDenial::MethodNotPermitted,
+            );
+        })?;
     }
     let key = req.setting_key.trim();
     let has_policy = req.policy.is_some();
@@ -4356,7 +4405,9 @@ async fn handle_update_config_inner(
                     false,
                     HashMap::new(),
                 );
-                response.get_mut().frozen_sandboxes = frozen_sandboxes;
+                response
+                    .extensions_mut()
+                    .insert(super::frozen_policy::FrozenSandboxes(frozen_sandboxes));
                 return Ok(response);
             }
 
@@ -4416,7 +4467,9 @@ async fn handle_update_config_inner(
                 false,
                 HashMap::new(),
             );
-            response.get_mut().frozen_sandboxes = frozen_sandboxes;
+            response
+                .extensions_mut()
+                .insert(super::frozen_policy::FrozenSandboxes(frozen_sandboxes));
             return Ok(response);
         }
 
@@ -4479,7 +4532,9 @@ async fn handle_update_config_inner(
             req.delete_setting && changed,
             HashMap::new(),
         );
-        response.get_mut().frozen_sandboxes = frozen_sandboxes;
+        response
+            .extensions_mut()
+            .insert(super::frozen_policy::FrozenSandboxes(frozen_sandboxes));
         return Ok(response);
     }
 
@@ -5156,7 +5211,11 @@ pub(super) async fn handle_report_sandbox_configuration(
                 "configuration changed or is not admitted; fetch and validate again",
             ));
         }
-        if frozen::requested(&sandbox) && frozen::snapshot(&sandbox).is_none() {
+        if inputs
+            .frozen
+            .as_ref()
+            .is_some_and(|state| state.policy.is_none())
+        {
             frozen_policy = Some(frozen::capture(&config, &inputs, current_time_ms())?);
         }
         admission.error.clear();
@@ -5216,38 +5275,38 @@ pub(super) async fn handle_report_sandbox_configuration(
                 .map_err(Status::internal)?;
         }
     }
-    let updated = state
-        .store
-        .update_message_cas::<Sandbox, _>(&sandbox_id, expected_version, |sandbox| {
+    let update = |sandbox: &mut Sandbox| {
+        sandbox
+            .status
+            .get_or_insert_with(Default::default)
+            .provisioning
+            .clone_from(&provisioning);
+        sandbox
+            .status
+            .get_or_insert_with(Default::default)
+            .configuration_admission = Some(admission.clone());
+        if reported == ConfigurationAdmissionState::Accepted {
             sandbox
                 .status
-                .get_or_insert_with(Default::default)
-                .provisioning
-                .clone_from(&provisioning);
-            sandbox
-                .status
-                .get_or_insert_with(Default::default)
-                .configuration_admission = Some(admission.clone());
-            if reported == ConfigurationAdmissionState::Accepted {
-                sandbox
-                    .status
-                    .as_mut()
-                    .expect("status initialized")
-                    .configuration_activated = Some(true);
-                if let Some(policy) = &frozen_policy {
-                    sandbox
-                        .status
-                        .as_mut()
-                        .expect("status initialized")
-                        .frozen_policy = Some(Box::new(policy.clone()));
-                }
-            }
-            crate::compute::apply_configuration_readiness(sandbox);
-        })
-        .await
-        .map_err(|error| {
-            super::persistence_error_to_status(error, "report configuration admission")
-        })?;
+                .as_mut()
+                .expect("status initialized")
+                .configuration_activated = Some(true);
+        }
+        crate::compute::apply_configuration_readiness(sandbox);
+    };
+    let updated = if let Some(policy) = frozen_policy {
+        update(&mut sandbox);
+        state
+            .store
+            .accept_frozen_sandbox_configuration(sandbox, policy)
+            .await
+    } else {
+        state
+            .store
+            .update_message_cas::<Sandbox, _>(&sandbox_id, expected_version, update)
+            .await
+    }
+    .map_err(|error| super::persistence_error_to_status(error, "report configuration admission"))?;
     state.sandbox_index.update_from_sandbox(&updated);
     state.sandbox_watch_bus.notify(&sandbox_id);
     Ok(Response::new(
@@ -5467,6 +5526,8 @@ pub(super) async fn handle_push_sandbox_logs(
     state: &Arc<ServerState>,
     request: Request<tonic::Streaming<PushSandboxLogsRequest>>,
 ) -> Result<Response<PushSandboxLogsResponse>, Status> {
+    const MAX_BATCH_LINES: usize = 100;
+
     let principal = request
         .extensions()
         .get::<Principal>()
@@ -5492,8 +5553,19 @@ pub(super) async fn handle_push_sandbox_logs(
         )
         .await?;
 
-        let logs: Vec<_> = batch.logs.into_iter().take(100).collect();
+        let received_lines = batch.logs.len();
+        let logs: Vec<_> = batch.logs.into_iter().take(MAX_BATCH_LINES).collect();
         validate_sandbox_log_timestamps(&logs)?;
+
+        if received_lines > logs.len() {
+            warn!(
+                sandbox_id = %batch.sandbox_id,
+                received_lines,
+                accepted_lines = logs.len(),
+                dropped_lines = received_lines - logs.len(),
+                "Truncated sandbox log batch"
+            );
+        }
 
         for log in logs {
             let mut log = log;
@@ -5523,6 +5595,9 @@ async fn ensure_log_stream_sandbox_scope(
     sandbox_id: &str,
     validated_sandbox_id: &mut Option<String>,
 ) -> Result<(), Status> {
+    // Guard every batch, so switching to another sandbox mid-stream is
+    // recorded like any other cross-sandbox attempt.
+    crate::auth::guard::ensure_sandbox_scope(principal, sandbox_id)?;
     if let Some(validated) = validated_sandbox_id.as_deref() {
         if sandbox_id != validated {
             return Err(Status::permission_denied(
@@ -5532,7 +5607,6 @@ async fn ensure_log_stream_sandbox_scope(
         return Ok(());
     }
 
-    crate::auth::guard::ensure_sandbox_scope(principal, sandbox_id)?;
     state
         .store
         .get_message::<Sandbox>(sandbox_id)
@@ -5594,7 +5668,7 @@ pub(super) async fn handle_submit_policy_analysis(
 
     // Network activity remains observable, but a frozen sandbox does not
     // generate proposals or enter an automatic approval path.
-    if frozen::requested(&sandbox) || frozen::snapshot(&sandbox).is_some() {
+    if frozen::requested(state.store.as_ref(), &sandbox).await? {
         return Ok(Response::new(SubmitPolicyAnalysisResponse {
             accepted_chunks: 0,
             rejected_chunks: u32::try_from(req.proposed_chunks.len()).unwrap_or(u32::MAX),
@@ -6102,7 +6176,7 @@ async fn handle_approve_draft_chunk_inner(
         return Err(Status::invalid_argument("chunk_id is required"));
     }
 
-    frozen::ensure_mutable(&sandbox)?;
+    frozen::ensure_mutable(state.store.as_ref(), &sandbox).await?;
     require_no_global_policy(state).await?;
 
     let sandbox_id = sandbox.object_id().to_string();
@@ -6247,7 +6321,7 @@ async fn handle_reject_draft_chunk_inner(
     )
     .await?;
     let workspace = sandbox.object_workspace().to_string();
-    frozen::ensure_mutable(&sandbox)?;
+    frozen::ensure_mutable(state.store.as_ref(), &sandbox).await?;
     if req.chunk_id.is_empty() {
         return Err(Status::invalid_argument("chunk_id is required"));
     }
@@ -6355,7 +6429,7 @@ async fn handle_approve_all_draft_chunks_inner(
     .await?;
     let workspace = sandbox.object_workspace().to_string();
 
-    frozen::ensure_mutable(&sandbox)?;
+    frozen::ensure_mutable(state.store.as_ref(), &sandbox).await?;
     require_no_global_policy(state).await?;
 
     let sandbox_id = sandbox.object_id().to_string();
@@ -6659,7 +6733,7 @@ pub(super) async fn handle_edit_draft_chunk(
     )
     .await?;
     let workspace = sandbox.object_workspace().to_string();
-    frozen::ensure_mutable(&sandbox)?;
+    frozen::ensure_mutable(state.store.as_ref(), &sandbox).await?;
     if req.chunk_id.is_empty() {
         return Err(Status::invalid_argument("chunk_id is required"));
     }
@@ -6736,7 +6810,7 @@ async fn handle_undo_draft_chunk_inner(
     )
     .await?;
     let workspace = sandbox.object_workspace().to_string();
-    frozen::ensure_mutable(&sandbox)?;
+    frozen::ensure_mutable(state.store.as_ref(), &sandbox).await?;
     if req.chunk_id.is_empty() {
         return Err(Status::invalid_argument("chunk_id is required"));
     }
@@ -8294,10 +8368,9 @@ fn materialize_global_settings(
 mod tests {
     include!("policy/frozen_tests.rs");
     use super::*;
+    use crate::auth::audit::test_support::assert_boundary_finding;
     use crate::auth::identity::{Identity, IdentityProvider};
-    use crate::auth::principal::{
-        Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
-    };
+    use crate::auth::principal::{Principal, UserPrincipal};
     use crate::grpc::test_support::{authed_request, test_server_state};
 
     /// An in-memory store with the example profiles imported at platform scope.
@@ -8337,6 +8410,148 @@ mod tests {
                 },
             }));
         request
+    }
+
+    #[tokio::test]
+    async fn push_sandbox_logs_accepts_batched_replay_and_warns_on_truncation() {
+        use openshell_core::proto::open_shell_client::OpenShellClient;
+        use openshell_core::proto::open_shell_server::OpenShellServer;
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-log-replay";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "log-replay",
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let principal = crate::auth::principal::test_support::sandbox(sandbox_id);
+        let service = OpenShellServer::with_interceptor(
+            crate::grpc::OpenShellService::new(state.clone()),
+            move |mut request: Request<()>| {
+                request.extensions_mut().insert(principal.clone());
+                Ok(request)
+            },
+        );
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let mut client = OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+
+        let diagnostics = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter("off,openshell_server::grpc::policy=warn")
+            .with_writer(std::sync::Mutex::new(diagnostics.reopen().unwrap()))
+            .finish();
+        // This test uses a current-thread runtime, including the gateway tasks.
+        let _capture = tracing::subscriber::set_default(subscriber);
+        let mut seen_warnings = 0;
+
+        for (batch_size, count, accepted_count) in [
+            (200, 200, 100),
+            (1, 0, 0),
+            (1, 1, 1),
+            (50, 50, 50),
+            (100, 100, 100),
+            (101, 101, 100),
+            (199, 199, 100),
+            (201, 201, 100),
+            (50, 200, 200),
+            (50, 201, 201),
+        ] {
+            state.tracing_log_bus.remove(sandbox_id);
+            let logs: Vec<_> = (0..count)
+                .map(|index| SandboxLogLine {
+                    sandbox_id: "untrusted-id".to_string(),
+                    event_time: openshell_core::time::timestamp_from_millis(index).ok(),
+                    level: "INFO".to_string(),
+                    target: "reconnect-test".to_string(),
+                    message: format!("line {index}"),
+                    source: "gateway".to_string(),
+                    fields: HashMap::from([("index".to_string(), index.to_string())]),
+                })
+                .collect();
+            let expected: Vec<_> = logs
+                .iter()
+                .take(accepted_count)
+                .cloned()
+                .map(|mut log| {
+                    log.sandbox_id = sandbox_id.to_string();
+                    log.source = "sandbox".to_string();
+                    log
+                })
+                .collect();
+            let received_lines = logs.len();
+            let requests: Vec<_> = logs
+                .chunks(batch_size)
+                .map(|chunk| PushSandboxLogsRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    logs: chunk.to_vec(),
+                })
+                .collect();
+            client
+                .push_sandbox_logs(tokio_stream::iter(requests))
+                .await
+                .unwrap();
+
+            let received: Vec<_> = state
+                .tracing_log_bus
+                .tail(sandbox_id, 201)
+                .into_iter()
+                .map(|entry| {
+                    let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
+                        entry.event.payload
+                    else {
+                        panic!("expected a log event");
+                    };
+                    log
+                })
+                .collect();
+            assert_eq!(
+                received.len(),
+                expected.len(),
+                "gateway ingestion of {count} log lines in batches of {batch_size}"
+            );
+            assert_eq!(
+                received, expected,
+                "{count} log lines, batches of {batch_size}"
+            );
+
+            let warnings: Vec<serde_json::Value> = std::fs::read_to_string(diagnostics.path())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let emitted = &warnings[seen_warnings..];
+            assert_eq!(emitted.len(), usize::from(received_lines > accepted_count));
+            if let Some(warning) = emitted.first() {
+                assert_eq!(warning["level"], "WARN");
+                assert_eq!(
+                    warning["fields"],
+                    serde_json::json!({
+                        "message": "Truncated sandbox log batch",
+                        "sandbox_id": sandbox_id,
+                        "received_lines": received_lines,
+                        "accepted_lines": accepted_count,
+                        "dropped_lines": received_lines - accepted_count,
+                    })
+                );
+            }
+            seen_warnings = warnings.len();
+        }
+        server.abort();
     }
 
     #[test]
@@ -8526,13 +8741,7 @@ mod tests {
     pub(super) fn with_sandbox<T>(mut request: Request<T>, sandbox_id: &str) -> Request<T> {
         request
             .extensions_mut()
-            .insert(Principal::Sandbox(SandboxPrincipal {
-                sandbox_id: sandbox_id.to_string(),
-                source: SandboxIdentitySource::BootstrapJwt {
-                    issuer: "openshell-gateway:test".to_string(),
-                },
-                trust_domain: Some("openshell".to_string()),
-            }));
+            .insert(crate::auth::principal::test_support::sandbox(sandbox_id));
         request
     }
 
@@ -10544,6 +10753,7 @@ mod tests {
                 sandbox_id: "test-sandbox".to_string(),
                 source: SandboxIdentitySource::BootstrapJwt {
                     issuer: "openshell-gateway:test".to_string(),
+                    auth_epoch: None,
                 },
                 trust_domain: None,
             }));
@@ -11761,6 +11971,8 @@ mod tests {
     #[tokio::test]
     async fn sandbox_submit_policy_analysis_missing_name_returns_permission_denied() {
         let state = test_server_state().await;
+        let own = test_sandbox("sb-a", "own", ProtoSandboxPolicy::default(), vec![]);
+        state.store.put_message(&own).await.unwrap();
         let req = with_sandbox(
             Request::new(SubmitPolicyAnalysisRequest {
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
@@ -11770,10 +11982,43 @@ mod tests {
             "sb-a",
         );
 
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+
         let err = handle_submit_policy_analysis(&state, req)
             .await
             .expect_err("missing name must not leak existence to sandbox callers");
         assert_eq!(err.code(), Code::PermissionDenied);
+        let events = capture.json_events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["status_detail"], "cross_sandbox");
+        assert_eq!(
+            events[0]["resources"],
+            serde_json::json!([{"name": "missing-sandbox", "type": "sandbox"}])
+        );
+        assert_boundary_finding(&events[0], &events[1]);
+    }
+
+    #[tokio::test]
+    async fn sandbox_whose_own_record_is_gone_is_denied_without_a_finding() {
+        let state = test_server_state().await;
+        let req = with_sandbox(
+            Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: "own".to_string(),
+                ..Default::default()
+            }),
+            "sb-a",
+        );
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+
+        let err = handle_submit_policy_analysis(&state, req)
+            .await
+            .expect_err("a deleted sandbox must be refused");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert!(capture.events().is_empty(), "deletion is not misuse");
     }
 
     #[tokio::test]
@@ -11841,15 +12086,22 @@ mod tests {
         let req = with_sandbox(Request::new(()), "sb-a");
         let principal = req.extensions().get::<Principal>().unwrap().clone();
         let mut validated = None;
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
 
         ensure_log_stream_sandbox_scope(&state, &principal, "sb-a", &mut validated)
             .await
             .expect("first frame should validate");
+        assert!(capture.events().is_empty(), "own sandbox is not a denial");
         let err = ensure_log_stream_sandbox_scope(&state, &principal, "sb-b", &mut validated)
             .await
             .expect_err("later frame must not switch sandbox ids");
 
         assert_eq!(err.code(), Code::PermissionDenied);
+        let events = capture.json_events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["status_detail"], "cross_sandbox");
+        assert_boundary_finding(&events[0], &events[1]);
     }
 
     #[tokio::test]
@@ -23248,19 +23500,34 @@ mod tests {
 
     #[test]
     fn config_revision_changes_when_supervisor_middleware_services_change() {
+        use openshell_core::proto::{
+            SupervisorMiddlewareBinding, SupervisorMiddlewareBindingPolicy,
+        };
+
         let policy = ProtoSandboxPolicy::default();
         let settings = HashMap::new();
-        let service = openshell_core::proto::SupervisorMiddlewareService {
+        let mut service = openshell_core::proto::SupervisorMiddlewareService {
             name: "local-guard".into(),
             grpc_endpoint: "http://127.0.0.1:50051".into(),
             max_payload_bytes: 1024,
             ..Default::default()
         };
 
-        let without = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
-        let with =
-            compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[service]);
-        assert_ne!(without, with);
+        let revision = |services: &[openshell_core::proto::SupervisorMiddlewareService]| {
+            compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, services)
+        };
+        let without = revision(&[]);
+        let dynamic = revision(std::slice::from_ref(&service));
+        assert_ne!(without, dynamic);
+
+        service.binding_policy = SupervisorMiddlewareBindingPolicy::Allowlist.into();
+        service.bindings = vec![SupervisorMiddlewareBinding::HttpRequestPreCredentials.into()];
+        let request = revision(std::slice::from_ref(&service));
+        assert_ne!(dynamic, request);
+        service
+            .bindings
+            .push(SupervisorMiddlewareBinding::HttpResponsePreReturn.into());
+        assert_ne!(request, revision(&[service]));
     }
 
     #[test]

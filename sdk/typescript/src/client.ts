@@ -19,9 +19,10 @@ import { type CallOptions, type Client, Code, createClient, type Transport } fro
 import { errorCode, fromConnect, SdkError } from './errors.js';
 import type { Provider, WorkspaceSelectorSchema } from './gen/datamodel_pb.js';
 import type {
+  FrozenSandboxPolicyState,
+  FrozenSandboxResponse,
   Sandbox,
   SandboxLogLine,
-  SandboxResponse,
   SandboxStreamEvent,
   SandboxWorkloadTemplate,
   UpdateConfigResponse,
@@ -29,6 +30,7 @@ import type {
 } from './gen/openshell_pb.js';
 import {
   type ExecSandboxInputSchema,
+  FrozenSandboxPolicies,
   OpenShell,
   ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
   SandboxPhase,
@@ -106,7 +108,9 @@ export type SandboxPhaseName =
   | 'stopping'
   | 'stopped'
   | 'starting'
-  | 'completed';
+  | 'completed'
+  | 'suspending'
+  | 'suspended';
 
 /** Restart behavior after the canonical main process exits. */
 export type SandboxRestartPolicyName = 'never' | 'on-failure' | 'always';
@@ -118,7 +122,7 @@ export type HealthStatus = 'unspecified' | 'healthy' | 'degraded' | 'unhealthy';
 export type SettingScopeName = 'unspecified' | 'sandbox' | 'global';
 
 /** Lowercase mirror of the generated `PolicySource` enum. Hand-maintained. */
-export type PolicySourceName = 'unspecified' | 'sandbox' | 'global' | 'frozen';
+export type PolicySourceName = 'unspecified' | 'sandbox' | 'global';
 
 export interface Health {
   status: HealthStatus;
@@ -162,8 +166,6 @@ export interface SandboxSpec {
   environment?: Record<string, string>;
   providers?: string[];
   gpu?: boolean;
-  /** Freeze the effective policy after initialization for the sandbox's lifetime. */
-  frozen?: boolean;
   /** Exact canonical command. Empty selects the gateway scratch shell. */
   command?: string[];
   /** Allocate a retained pseudo-terminal for the canonical command. */
@@ -217,8 +219,6 @@ export interface SandboxFromTemplateSpec {
   /** Workspace name. Omit for `default`; empty strings are invalid. */
   workspace?: string;
   workloadTemplate: string;
-  /** Freeze the effective policy after initialization for the sandbox's lifetime. */
-  frozen?: boolean;
   labels?: Record<string, string>;
   providers?: string[];
   /** Exact canonical command. Empty selects the gateway scratch shell. */
@@ -239,9 +239,6 @@ export interface SandboxRef {
   name: string;
   workspace: string;
   phase: SandboxPhaseName;
-  /** Whether freezing was requested; frozenPolicy is absent until initialization succeeds. */
-  frozen: boolean;
-  frozenPolicy?: FrozenSandboxPolicy;
   labels: Record<string, string>;
   /** u64 rendered as a string — JS numbers can't hold it safely. */
   resourceVersion: string;
@@ -257,13 +254,6 @@ export interface SandboxRef {
   createdAtMs?: number;
   nextRestartAtMs?: number;
   mainProcessStartedAtMs?: number;
-}
-
-/** Accepted immutable policy identity. Read the policy body through getConfig. */
-export interface FrozenSandboxPolicy {
-  version: number;
-  policyHash: string;
-  frozenAtMs?: number;
 }
 
 export interface SandboxWorkloadTemplateProvenance {
@@ -553,7 +543,7 @@ export interface SandboxConfig {
   settings: Record<string, EffectiveSettingView>;
   /** u64 rendered as a string. */
   configRevision: string;
-  /** Source of the effective policy, including an accepted frozen snapshot. */
+  /** 'unspecified' | 'sandbox' | 'global'. */
   policySource: PolicySourceName;
   globalPolicyVersion: number;
   /** u64 rendered as a string. */
@@ -575,7 +565,35 @@ export interface UpdateConfigResult {
   /** u64 rendered as a string. */
   settingsRevision: string;
   deleted: boolean;
-  /** Workspace-qualified sandboxes retaining a frozen policy after a global policy change. */
+}
+
+/** Immutable accepted policy, exposed without changing ordinary sandbox references. */
+export interface FrozenSandboxPolicy {
+  policy?: SandboxPolicy;
+  version: number;
+  policyHash: string;
+  frozenAtMs?: number;
+  policySource: PolicySourceName;
+  globalPolicyVersion: number;
+}
+
+/** A requested freeze is pending until policy is present. */
+export interface FrozenPolicyState {
+  requested: boolean;
+  policy?: FrozenSandboxPolicy;
+}
+
+export interface FrozenGlobalConfigUpdateSpec {
+  policy?: MessageInitShape<typeof SandboxPolicySchema>;
+  settingKey?: string;
+  settingValue?: MessageInitShape<typeof SettingValueSchema>;
+  deleteSetting?: boolean;
+  requestId?: string;
+}
+
+/** Result of the optional global update operation, including frozen exceptions. */
+export interface FrozenGlobalConfigUpdate {
+  update: UpdateConfigResult;
   frozenSandboxes: string[];
 }
 
@@ -594,6 +612,8 @@ export const PHASE_NAMES: Record<SandboxPhase, SandboxPhaseName> = {
   [SandboxPhase.STOPPED]: 'stopped',
   [SandboxPhase.STARTING]: 'starting',
   [SandboxPhase.COMPLETED]: 'completed',
+  [SandboxPhase.SUSPENDING]: 'suspending',
+  [SandboxPhase.SUSPENDED]: 'suspended',
 };
 export const STATUS_NAMES: Record<ServiceStatus, HealthStatus> = {
   [ServiceStatus.UNSPECIFIED]: 'unspecified',
@@ -610,7 +630,6 @@ export const POLICY_SOURCE_NAMES: Record<PolicySource, PolicySourceName> = {
   [PolicySource.UNSPECIFIED]: 'unspecified',
   [PolicySource.SANDBOX]: 'sandbox',
   [PolicySource.GLOBAL]: 'global',
-  [PolicySource.FROZEN]: 'frozen',
 };
 
 function phaseName(p: SandboxPhase): SandboxPhaseName {
@@ -648,14 +667,6 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
     name: meta.name,
     workspace: meta.workspace,
     phase: phaseName(sandbox.status?.phase ?? SandboxPhase.UNSPECIFIED),
-    frozen: sandbox.spec?.frozen ?? false,
-    frozenPolicy: sandbox.status?.frozenPolicy
-      ? {
-          version: sandbox.status.frozenPolicy.version,
-          policyHash: sandbox.status.frozenPolicy.policyHash,
-          frozenAtMs: timestampEpochMs(sandbox.status.frozenPolicy.frozenTime),
-        }
-      : undefined,
     labels: meta?.labels ?? {},
     resourceVersion: (meta?.resourceVersion ?? 0n).toString(),
     hostKeyFingerprint: sandbox.hostKeyFingerprint || undefined,
@@ -673,17 +684,6 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
     nextRestartAtMs: timestampEpochMs(sandbox.status?.nextRestartTime),
     mainProcessStartedAtMs: timestampEpochMs(sandbox.status?.mainProcessStartedTime),
   };
-}
-
-function sandboxFromCreateResponse(response: SandboxResponse, frozen: boolean): SandboxRef {
-  const sandbox = sandboxRef(response.sandbox, response.serviceUrls);
-  if (frozen && !sandbox.frozen) {
-    throw new SdkError(
-      'invalid_config',
-      `gateway did not honor frozen=true for sandbox '${sandbox.name}' (ID '${sandbox.id}', workspace '${sandbox.workspace}'); it may already be running. Upgrade the gateway and remove the sandbox before retrying`,
-    );
-  }
-  return sandbox;
 }
 
 function sandboxTemplate(template: SandboxWorkloadTemplate | undefined): SandboxWorkloadTemplate {
@@ -732,7 +732,86 @@ function updateConfigResult(resp: UpdateConfigResponse): UpdateConfigResult {
     policyHash: resp.policyHash,
     settingsRevision: resp.settingsRevision.toString(),
     deleted: resp.deleted,
-    frozenSandboxes: [...resp.frozenSandboxes],
+  };
+}
+
+function frozenPolicyState(state: FrozenSandboxPolicyState): FrozenPolicyState {
+  const policy = state.policy;
+  return {
+    requested: state.requested,
+    policy: policy
+      ? {
+          policy: policy.policy,
+          version: policy.version,
+          policyHash: policy.policyHash,
+          frozenAtMs: timestampEpochMs(policy.frozenTime),
+          policySource: POLICY_SOURCE_NAMES[policy.policySource] ?? 'unspecified',
+          globalPolicyVersion: policy.globalPolicyVersion,
+        }
+      : undefined,
+  };
+}
+
+function frozenSandboxFromResponse(response: FrozenSandboxResponse): SandboxRef {
+  const sandbox = sandboxRef(response.sandbox, response.serviceUrls);
+  if (!response.frozenPolicy?.requested) {
+    throw new SdkError(
+      'invalid_config',
+      `gateway did not acknowledge frozen creation for sandbox '${sandbox.name}' (ID '${sandbox.id}', workspace '${sandbox.workspace}'); remove the sandbox before retrying`,
+    );
+  }
+  return sandbox;
+}
+
+function createSandboxRequest(
+  spec: SandboxSpec,
+): Omit<MessageInitShape<typeof OpenShell.method.createSandbox.input>, '$typeName'> {
+  const specInit: MessageInitShape<typeof SandboxSpecSchema> = {
+    environment: spec.environment ?? {},
+    providers: spec.providers ?? [],
+    template: spec.image ? { image: spec.image } : undefined,
+    resourceRequirements: spec.gpu ? { gpu: {} } : undefined,
+    policy: spec.policy,
+    command: spec.command ?? [],
+    tty: spec.tty ?? false,
+    restartPolicy: restartPolicyValue(spec.restartPolicy),
+  };
+  if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
+  return {
+    workspaceScope: workspaceScope(spec),
+    name: spec.name ?? '',
+    labels: spec.labels ?? {},
+    spec: specInit,
+    serviceExposures:
+      spec.serviceExposures?.map((exposure) => ({
+        service: exposure.service ?? '',
+        targetPort: exposure.targetPort,
+        authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
+      })) ?? [],
+  };
+}
+
+function createSandboxTemplateRequest(
+  spec: SandboxFromTemplateSpec,
+): Omit<MessageInitShape<typeof OpenShell.method.createSandbox.input>, '$typeName'> {
+  if (spec.workloadTemplate.trim() === '') throw new SdkError('invalid_config', 'workloadTemplate is required');
+  return {
+    workspaceScope: workspaceScope(spec),
+    name: spec.name ?? '',
+    labels: spec.labels ?? {},
+    spec: {
+      providers: spec.providers ?? [],
+      command: spec.command ?? [],
+      tty: spec.tty ?? false,
+      policy: spec.policy,
+    },
+    workloadTemplate: spec.workloadTemplate,
+    serviceExposures:
+      spec.serviceExposures?.map((exposure) => ({
+        service: exposure.service ?? '',
+        targetPort: exposure.targetPort,
+        authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
+      })) ?? [],
   };
 }
 
@@ -1217,6 +1296,7 @@ export class SandboxTemplateClient {
 // transport (one connection) across all of its scoped clients.
 export class SandboxClient {
   private readonly grpc: Client<typeof OpenShell>;
+  private readonly frozenGrpc: Client<typeof FrozenSandboxPolicies>;
 
   /**
    * Advanced escape hatch: a generated client for every gateway RPC, including
@@ -1234,6 +1314,44 @@ export class SandboxClient {
     this.transport = transport;
     this.grpc = grpc;
     this.raw = this.grpc;
+    this.frozenGrpc = createClient(FrozenSandboxPolicies, transport);
+  }
+
+  /** Create through the optional frozen-policy service; never fall back to ordinary creation. */
+  async createFrozen(spec: SandboxSpec): Promise<SandboxRef> {
+    try {
+      return frozenSandboxFromResponse(await this.frozenGrpc.createSandbox(createSandboxRequest(spec)));
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
+  }
+
+  async createFrozenFromTemplate(spec: SandboxFromTemplateSpec): Promise<SandboxRef> {
+    try {
+      return frozenSandboxFromResponse(await this.frozenGrpc.createSandbox(createSandboxTemplateRequest(spec)));
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
+  }
+
+  async getFrozenPolicy(name: string, options?: SandboxCallOptions | null): Promise<FrozenPolicyState> {
+    try {
+      return frozenPolicyState(
+        await this.frozenGrpc.getPolicy(namedTarget(name, options), requestCallOptions(options)),
+      );
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
+  }
+
+  async updateGlobalConfig(update: FrozenGlobalConfigUpdateSpec): Promise<FrozenGlobalConfigUpdate> {
+    try {
+      const response = await this.frozenGrpc.updateGlobalConfig({ ...update, global: true });
+      if (!response.update) throw new SdkError('invalid_config', 'global update result missing from gateway response');
+      return { update: updateConfigResult(response.update), frozenSandboxes: [...response.frozenSandboxes] };
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
   }
 
   /**
@@ -1246,66 +1364,18 @@ export class SandboxClient {
 
   async create(spec: SandboxSpec): Promise<SandboxRef> {
     try {
-      // Curated fields build the base spec; rawSpec then shallow-overrides at
-      // the top spec level (Object.assign, so any field it sets wins). The
-      // runtime assign avoids the generated $typeName upgrading the literal and
-      // rejecting the curated `template: { image }` init shorthand.
-      const specInit: MessageInitShape<typeof SandboxSpecSchema> = {
-        environment: spec.environment ?? {},
-        providers: spec.providers ?? [],
-        template: spec.image ? { image: spec.image } : undefined,
-        resourceRequirements: spec.gpu ? { gpu: {} } : undefined,
-        policy: spec.policy,
-        frozen: spec.frozen ?? false,
-        command: spec.command ?? [],
-        tty: spec.tty ?? false,
-        restartPolicy: restartPolicyValue(spec.restartPolicy),
-      };
-      if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
-      const frozen = specInit.frozen ?? false;
-
-      const resp = await this.grpc.createSandbox({
-        workspaceScope: workspaceScope(spec),
-        name: spec.name ?? '',
-        labels: spec.labels ?? {},
-        spec: specInit,
-        serviceExposures:
-          spec.serviceExposures?.map((exposure) => ({
-            service: exposure.service ?? '',
-            targetPort: exposure.targetPort,
-            authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
-          })) ?? [],
-      });
-      return sandboxFromCreateResponse(resp, frozen);
+      const response = await this.grpc.createSandbox(createSandboxRequest(spec));
+      return sandboxRef(response.sandbox, response.serviceUrls);
     } catch (e) {
       throw fromConnect(e);
     }
   }
 
   async createFromTemplate(spec: SandboxFromTemplateSpec): Promise<SandboxRef> {
-    if (spec.workloadTemplate.trim() === '') throw new SdkError('invalid_config', 'workloadTemplate is required');
-    const frozen = spec.frozen ?? false;
+    const request = createSandboxTemplateRequest(spec);
     try {
-      const resp = await this.grpc.createSandbox({
-        workspaceScope: workspaceScope(spec),
-        name: spec.name ?? '',
-        labels: spec.labels ?? {},
-        spec: {
-          providers: spec.providers ?? [],
-          command: spec.command ?? [],
-          tty: spec.tty ?? false,
-          policy: spec.policy,
-          frozen,
-        },
-        workloadTemplate: spec.workloadTemplate,
-        serviceExposures:
-          spec.serviceExposures?.map((exposure) => ({
-            service: exposure.service ?? '',
-            targetPort: exposure.targetPort,
-            authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
-          })) ?? [],
-      });
-      return sandboxFromCreateResponse(resp, frozen);
+      const response = await this.grpc.createSandbox(request);
+      return sandboxRef(response.sandbox, response.serviceUrls);
     } catch (e) {
       throw fromConnect(e);
     }
@@ -1379,6 +1449,9 @@ export class SandboxClient {
       if (ref.phase === 'ready' || ref.phase === 'completed') return ref;
       if (ref.phase === 'stopped') throw new SdkError('connect', `sandbox '${name}' stopped before becoming ready`);
       if (ref.phase === 'error') throw new SdkError('connect', `sandbox '${name}' entered error phase`);
+      if (ref.phase === 'suspending' || ref.phase === 'suspended') {
+        throw new SdkError('connect', `sandbox '${name}' is suspended; resume it before waiting for ready`);
+      }
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}'`);
       await waitSleep(delay, deadline, signal);
       delay = Math.min(delay * 2, 2000);

@@ -39,7 +39,9 @@ Without either, the sandbox uses a policy from its image or the restrictive
 
 ## Freeze a Sandbox Policy
 
-Use `--frozen` to keep a sandbox's first accepted effective policy for its lifetime:
+Use `--frozen` to keep a sandbox's first accepted effective policy for its lifetime.
+All gateways sharing its store must support frozen policies before you create
+a frozen sandbox. Do not downgrade those gateways while frozen sandboxes exist.
 
 ```shell
 openshell sandbox create --name review-bot \
@@ -50,7 +52,12 @@ openshell policy get review-bot --full
 
 The snapshot includes any global override and attached provider profiles and
 authorization. Later global-policy or profile changes leave it unchanged, even
-across restarts.
+across restarts. Sandbox and image policies receive required proxy filesystem
+paths before the snapshot is captured. A global policy must already include
+those paths; otherwise initialization is rejected until you repair it.
+An upgraded runtime that requires additional paths refuses to start a captured
+policy. Review the required paths and recreate the sandbox instead of extending
+its existing access.
 
 After the configuration is accepted, policy edits, proposal approvals, and
 provider attach or detach fail. Recreate the sandbox to change its policy or

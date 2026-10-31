@@ -21,9 +21,6 @@ type SandboxTemplate = types.SandboxTemplate
 // SandboxStatus holds the observed state of a sandbox.
 type SandboxStatus = types.SandboxStatus
 
-// FrozenSandboxPolicy is the effective policy captured at initialization.
-type FrozenSandboxPolicy = types.FrozenSandboxPolicy
-
 // SandboxCondition describes an observed condition of a sandbox.
 type SandboxCondition = types.SandboxCondition
 
@@ -112,4 +109,16 @@ type SandboxInterface interface {
 // workload templates without widening SandboxInterface.
 type SandboxTemplateCreateInterface interface {
 	CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error)
+}
+
+// SandboxSuspendResumeInterface defines sandbox suspend and resume without
+// widening SandboxInterface. Suspend and resume require a compute driver and
+// isolation backend that retain workload memory state.
+type SandboxSuspendResumeInterface interface {
+	// Suspend freezes a Ready sandbox and retains its memory state.
+	Suspend(ctx context.Context, workspace, name string) (*Sandbox, error)
+	// Resume restores a Suspended sandbox in a new runtime generation.
+	Resume(ctx context.Context, workspace, name string, opts ...ResumeOptions) (*Sandbox, error)
+	// WaitSuspended polls until the sandbox reaches the Suspended phase.
+	WaitSuspended(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
 }

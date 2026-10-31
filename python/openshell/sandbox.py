@@ -28,6 +28,7 @@ from ._proto import (
     datamodel_pb2,
     openshell_pb2,
     openshell_pb2_grpc,
+    sandbox_pb2,
 )
 from .errors import _error_mapping_channel
 from .mutations import DeletionOutcome, DeletionResult
@@ -463,11 +464,30 @@ class SandboxConditionRef:
 
 @dataclass(frozen=True)
 class FrozenSandboxPolicyRef:
-    """Accepted immutable policy identity from the gateway."""
+    """Immutable snapshot identity and a copied effective policy."""
 
+    policy: sandbox_pb2.SandboxPolicy | None
     version: int
     policy_hash: str
-    frozen_at_ms: int | None = None
+    frozen_at_ms: int | None
+    policy_source: int
+    global_policy_version: int
+
+
+@dataclass(frozen=True)
+class FrozenPolicyState:
+    """A requested freeze is pending until its policy is present."""
+
+    requested: bool
+    policy: FrozenSandboxPolicyRef | None = None
+
+
+@dataclass(frozen=True)
+class FrozenGlobalConfigUpdate:
+    """Global mutation result with names retaining a captured policy."""
+
+    update: openshell_pb2.UpdateConfigResponse
+    frozen_sandboxes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -479,7 +499,6 @@ class SandboxStatusRef:
     next_restart_at_ms: int | None = None
     main_process_started_at_ms: int | None = None
     conditions: tuple[SandboxConditionRef, ...] = ()
-    frozen_policy: FrozenSandboxPolicyRef | None = None
 
 
 class ServiceAuthorizationMode(IntEnum):
@@ -545,8 +564,6 @@ class SandboxRef:
     )
     # Stable SSH host identity; absent on older runtimes.
     host_key_fingerprint: str | None = None
-    # True while a freeze is pending and after it has initialized successfully.
-    frozen: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "labels", _ImmutableLabels(self.labels))
@@ -651,6 +668,20 @@ class SandboxSession:
         self.sandbox = self._client.start(self.sandbox.name, workspace=self._workspace)
         return self.sandbox
 
+    def suspend(self) -> SandboxRef:
+        self.sandbox = self._client.suspend(
+            self.sandbox.name, workspace=self._workspace
+        )
+        return self.sandbox
+
+    def resume(self, *, restart_if_restore_fails: bool = False) -> SandboxRef:
+        self.sandbox = self._client.resume(
+            self.sandbox.name,
+            workspace=self._workspace,
+            restart_if_restore_fails=restart_if_restore_fails,
+        )
+        return self.sandbox
+
 
 class SandboxClient:
     """gRPC client for sandbox CRUD and command execution."""
@@ -726,6 +757,9 @@ class SandboxClient:
                 _BearerAuthInterceptor(provider),
             )
         self._stub = openshell_pb2_grpc.OpenShellStub(
+            _error_mapping_channel(self._channel)
+        )
+        self._frozen_stub = openshell_pb2_grpc.FrozenSandboxPoliciesStub(
             _error_mapping_channel(self._channel)
         )
 
@@ -868,23 +902,19 @@ class SandboxClient:
         service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
-        request = openshell_pb2.CreateSandboxRequest(
-            workspace_scope=_workspace_scope(workspace),
-            spec=request_spec,
-            name=name or "",
-            labels=dict(labels) if labels else {},
-            service_exposures=_service_exposure_messages(service_exposures),
+        response = self._stub.CreateSandbox(
+            openshell_pb2.CreateSandboxRequest(
+                workspace_scope=_workspace_scope(workspace),
+                spec=request_spec,
+                name=name or "",
+                labels=dict(labels) if labels else {},
+                service_exposures=_service_exposure_messages(service_exposures),
+            ),
+            timeout=self._timeout,
         )
-        response = self._stub.CreateSandbox(request, timeout=self._timeout)
         sandbox_ref = _sandbox_ref(response.sandbox, response.service_urls)
         if sandbox_ref.id == "":
             raise SandboxError("CreateSandbox returned empty sandbox id")
-        if request.spec.frozen and not sandbox_ref.frozen:
-            raise SandboxError(
-                "gateway did not honor frozen=True for sandbox "
-                f"'{sandbox_ref.name}' (ID '{sandbox_ref.id}', workspace '{workspace}'); "
-                "it may already be running. Upgrade the gateway and remove the sandbox before retrying"
-            )
         return sandbox_ref
 
     def create_from_template(
@@ -900,24 +930,20 @@ class SandboxClient:
         if not workload_template.strip():
             raise SandboxError("workload_template is required")
         request_spec = spec if spec is not None else openshell_pb2.SandboxSpec()
-        request = openshell_pb2.CreateSandboxRequest(
-            workspace_scope=_workspace_scope(workspace),
-            spec=request_spec,
-            name=name or "",
-            labels=dict(labels) if labels else {},
-            workload_template=workload_template,
-            service_exposures=_service_exposure_messages(service_exposures),
+        response = self._stub.CreateSandbox(
+            openshell_pb2.CreateSandboxRequest(
+                workspace_scope=_workspace_scope(workspace),
+                spec=request_spec,
+                name=name or "",
+                labels=dict(labels) if labels else {},
+                workload_template=workload_template,
+                service_exposures=_service_exposure_messages(service_exposures),
+            ),
+            timeout=self._timeout,
         )
-        response = self._stub.CreateSandbox(request, timeout=self._timeout)
         sandbox_ref = _sandbox_ref(response.sandbox, response.service_urls)
         if sandbox_ref.id == "":
             raise SandboxError("CreateSandbox returned empty sandbox id")
-        if request.spec.frozen and not sandbox_ref.frozen:
-            raise SandboxError(
-                "gateway did not honor frozen=True for sandbox "
-                f"'{sandbox_ref.name}' (ID '{sandbox_ref.id}', workspace '{workspace}'); "
-                "it may already be running. Upgrade the gateway and remove the sandbox before retrying"
-            )
         return sandbox_ref
 
     def create_session(
@@ -939,6 +965,124 @@ class SandboxClient:
                 service_exposures=service_exposures,
             ),
         )
+
+    def create_frozen(
+        self,
+        *,
+        workspace: str,
+        spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+        service_exposures: Sequence[ServiceExposure] | None = None,
+    ) -> SandboxRef:
+        """Create through the optional frozen-policy service without a legacy fallback."""
+        return self._create_frozen(
+            workspace=workspace,
+            spec=spec if spec is not None else _default_spec(),
+            name=name,
+            labels=labels,
+            service_exposures=service_exposures,
+        )
+
+    def create_frozen_from_template(
+        self,
+        *,
+        workspace: str,
+        workload_template: str,
+        spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+        service_exposures: Sequence[ServiceExposure] | None = None,
+    ) -> SandboxRef:
+        """Create a frozen sandbox using a workspace-scoped workload template."""
+        if not workload_template.strip():
+            raise SandboxError("workload_template is required")
+        return self._create_frozen(
+            workspace=workspace,
+            workload_template=workload_template,
+            spec=spec if spec is not None else openshell_pb2.SandboxSpec(),
+            name=name,
+            labels=labels,
+            service_exposures=service_exposures,
+        )
+
+    def _create_frozen(
+        self,
+        *,
+        workspace: str,
+        spec: openshell_pb2.SandboxSpec,
+        name: str | None,
+        labels: Mapping[str, str] | None,
+        service_exposures: Sequence[ServiceExposure] | None,
+        workload_template: str = "",
+    ) -> SandboxRef:
+        response = self._frozen_stub.CreateSandbox(
+            openshell_pb2.CreateFrozenSandboxRequest(
+                workspace_scope=_workspace_scope(workspace),
+                spec=spec,
+                name=name or "",
+                labels=dict(labels) if labels else {},
+                workload_template=workload_template,
+                service_exposures=_service_exposure_messages(service_exposures),
+            ),
+            timeout=self._timeout,
+        )
+        sandbox = _sandbox_ref(response.sandbox, response.service_urls)
+        if not sandbox.id:
+            raise SandboxError("CreateSandbox returned empty sandbox id")
+        if (
+            not response.HasField("frozen_policy")
+            or not response.frozen_policy.requested
+        ):
+            raise SandboxError(
+                "gateway did not acknowledge frozen creation for sandbox "
+                f"'{sandbox.name}' (ID '{sandbox.id}', workspace '{workspace}'); "
+                "remove the sandbox before retrying"
+            )
+        return sandbox
+
+    def get_frozen_policy(self, name: str, *, workspace: str) -> FrozenPolicyState:
+        """Read a pending freeze or the first accepted policy snapshot."""
+        response = self._frozen_stub.GetPolicy(
+            openshell_pb2.GetFrozenSandboxPolicyRequest(
+                workspace_scope=_workspace_scope(workspace), name=name
+            ),
+            timeout=self._timeout,
+        )
+        policy = None
+        if response.HasField("policy"):
+            snapshot = response.policy
+            body = None
+            if snapshot.HasField("policy"):
+                body = sandbox_pb2.SandboxPolicy()
+                body.CopyFrom(snapshot.policy)
+            policy = FrozenSandboxPolicyRef(
+                policy=body,
+                version=snapshot.version,
+                policy_hash=snapshot.policy_hash,
+                frozen_at_ms=snapshot.frozen_time.ToMilliseconds()
+                if snapshot.HasField("frozen_time")
+                else None,
+                policy_source=snapshot.policy_source,
+                global_policy_version=snapshot.global_policy_version,
+            )
+        return FrozenPolicyState(requested=response.requested, policy=policy)
+
+    def update_global_config(
+        self, request: openshell_pb2.UpdateFrozenGlobalConfigRequest
+    ) -> FrozenGlobalConfigUpdate:
+        """Update global configuration and report frozen-policy exceptions."""
+        global_request = openshell_pb2.UpdateFrozenGlobalConfigRequest()
+        global_request.CopyFrom(request)
+        setattr(global_request, "global", True)
+        response = self._frozen_stub.UpdateGlobalConfig(
+            global_request, timeout=self._timeout
+        )
+        if not response.HasField("update"):
+            raise SandboxError("global update result missing from gateway response")
+        update = openshell_pb2.UpdateConfigResponse()
+        update.CopyFrom(response.update)
+        return FrozenGlobalConfigUpdate(update, tuple(response.frozen_sandboxes))
 
     def create_session_from_template(
         self,
@@ -1126,6 +1270,39 @@ class SandboxClient:
         )
         return _sandbox_ref(response.sandbox)
 
+    def suspend(self, name: str, *, workspace: str) -> SandboxRef:
+        """Suspend a ready sandbox, retaining its memory state.
+
+        Requires a compute driver and isolation backend that support suspend
+        and resume.
+        """
+        response = self._stub.SuspendSandbox(
+            openshell_pb2.SuspendSandboxRequest(
+                workspace_scope=_workspace_scope(workspace),
+                name=name,
+            ),
+            timeout=self._timeout,
+        )
+        return _sandbox_ref(response.sandbox)
+
+    def resume(
+        self,
+        name: str,
+        *,
+        workspace: str,
+        restart_if_restore_fails: bool = False,
+    ) -> SandboxRef:
+        """Resume a suspended sandbox in a new runtime generation."""
+        response = self._stub.ResumeSandbox(
+            openshell_pb2.ResumeSandboxRequest(
+                workspace_scope=_workspace_scope(workspace),
+                name=name,
+                restart_if_restore_fails=restart_if_restore_fails,
+            ),
+            timeout=self._timeout,
+        )
+        return _sandbox_ref(response.sandbox)
+
     def wait_deleted(
         self,
         name: str,
@@ -1172,6 +1349,17 @@ class SandboxClient:
             timeout_seconds=timeout_seconds,
         )
 
+    def wait_suspended(
+        self, name: str, *, workspace: str, timeout_seconds: float = 300.0
+    ) -> SandboxRef:
+        return self._wait_for_phase(
+            name,
+            workspace=workspace,
+            target_phase=openshell_pb2.SANDBOX_PHASE_SUSPENDED,
+            target_name="suspended",
+            timeout_seconds=timeout_seconds,
+        )
+
     def _wait_for_phase(
         self,
         name: str,
@@ -1196,6 +1384,16 @@ class SandboxClient:
                 and sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
             ):
                 raise SandboxError(f"sandbox {name} stopped before becoming ready")
+            if target_phase == openshell_pb2.SANDBOX_PHASE_READY and (
+                sandbox.status.phase
+                in (
+                    openshell_pb2.SANDBOX_PHASE_SUSPENDING,
+                    openshell_pb2.SANDBOX_PHASE_SUSPENDED,
+                )
+            ):
+                raise SandboxError(
+                    f"sandbox {name} is suspended; resume it before waiting for ready"
+                )
             if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
                 raise SandboxError(f"sandbox {name} entered error phase")
             time.sleep(1)
@@ -1867,17 +2065,7 @@ def _sandbox_ref(
             if status is not None and status.HasField("main_process_started_time")
             else None,
             conditions=_sandbox_conditions(status),
-            frozen_policy=FrozenSandboxPolicyRef(
-                version=status.frozen_policy.version,
-                policy_hash=status.frozen_policy.policy_hash,
-                frozen_at_ms=status.frozen_policy.frozen_time.ToMilliseconds()
-                if status.frozen_policy.HasField("frozen_time")
-                else None,
-            )
-            if status is not None and status.HasField("frozen_policy")
-            else None,
         ),
-        frozen=sandbox.spec.frozen if sandbox.HasField("spec") else False,
         labels=sandbox.metadata.labels if sandbox.metadata else {},
         created_from_workload_template=provenance,
         service_urls=service_urls or {},

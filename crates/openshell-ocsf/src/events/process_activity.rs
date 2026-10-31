@@ -95,9 +95,7 @@ mod tests {
                 },
             ),
             process: Process::new("python3", 42).with_cmd_line("python3 /app/main.py"),
-            actor: Some(Actor {
-                process: Process::new("openshell-sandbox", 1),
-            }),
+            actor: Some(Actor::process(Process::new("openshell-sandbox", 1))),
             launch_type: Some(LaunchTypeId::Spawn),
             exit_code: None,
             action: Some(ActionId::Allowed),

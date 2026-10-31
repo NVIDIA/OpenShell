@@ -1473,6 +1473,10 @@ enum SandboxCommands {
         /// Outside a Git work tree, uploads proceed unfiltered with a warning.
         /// Filtering errors or empty selections stop the upload; use
         /// `--no-git-ignore` to intentionally upload everything.
+        ///
+        /// Cannot be combined with a trailing command, because uploads finish
+        /// after the main process starts. Create the sandbox without a command,
+        /// then run the workload with `sandbox exec`.
         #[arg(
             long,
             value_hint = ValueHint::AnyPath,
@@ -1710,6 +1714,25 @@ enum SandboxCommands {
     /// Start a stopped sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Start {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Suspend a ready sandbox and retain its memory state.
+    ///
+    /// Requires a compute driver and isolation backend that support
+    /// suspend and resume. Use `sandbox resume` to restore the sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Suspend {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Resume a suspended sandbox from its retained memory state.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Resume {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
@@ -3450,42 +3473,53 @@ async fn run_async() -> Result<()> {
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
-                    let exit_code = Box::pin(run::sandbox_create(
-                        endpoint,
-                        &ctx.name,
-                        run::SandboxCreateConfig {
-                            name: name.as_deref(),
-                            template: template.as_deref(),
-                            from: from.as_deref(),
-                            uploads: &upload_specs,
-                            keep,
-                            gpu_requirements,
-                            cpu: cpu.as_deref(),
-                            memory: memory.as_deref(),
-                            driver_config_json: driver_config_json.as_deref(),
-                            editor,
-                            providers: &providers,
-                            policy: policy.as_deref(),
-                            frozen,
-                            forward,
-                            expose,
-                            expose_authorization_mode: expose_authorization_mode.into(),
-                            command: &command,
-                            tty_override,
-                            auto_providers_override,
-                            labels: labels_map,
-                            annotations: annotations_map,
-                            environment: env_map,
-                            approval_mode: &approval_mode,
-                            output: output.as_str(),
-                            detach,
-                            suppress_credential_warnings: no_credential_warnings,
-                            restart_policy: &restart_policy,
-                        },
-                        &cli.workspace,
-                        &tls,
-                    ))
-                    .await?;
+                    let config = run::SandboxCreateConfig {
+                        name: name.as_deref(),
+                        template: template.as_deref(),
+                        from: from.as_deref(),
+                        uploads: &upload_specs,
+                        keep,
+                        gpu_requirements,
+                        cpu: cpu.as_deref(),
+                        memory: memory.as_deref(),
+                        driver_config_json: driver_config_json.as_deref(),
+                        editor,
+                        providers: &providers,
+                        policy: policy.as_deref(),
+                        forward,
+                        expose,
+                        expose_authorization_mode: expose_authorization_mode.into(),
+                        command: &command,
+                        tty_override,
+                        auto_providers_override,
+                        labels: labels_map,
+                        annotations: annotations_map,
+                        environment: env_map,
+                        approval_mode: &approval_mode,
+                        output: output.as_str(),
+                        detach,
+                        suppress_credential_warnings: no_credential_warnings,
+                        restart_policy: &restart_policy,
+                    };
+                    let exit_code = if frozen {
+                        Box::pin(run::sandbox_create_frozen(
+                            endpoint,
+                            &ctx.name,
+                            config,
+                            &cli.workspace,
+                            &tls,
+                        ))
+                        .await?
+                    } else {
+                        Box::pin(run::sandbox_create(
+                            endpoint,
+                            &ctx.name,
+                            config,
+                            &cli.workspace,
+                            &tls,
+                        ))
+                        .await?
+                    };
                     if exit_code != 0 {
                         std::process::exit(exit_code);
                     }
@@ -3600,6 +3634,14 @@ async fn run_async() -> Result<()> {
                         SandboxCommands::Start { name } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             run::sandbox_start(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
+                        SandboxCommands::Suspend { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_suspend(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
+                        SandboxCommands::Resume { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_resume(endpoint, &name, &cli.workspace, &tls).await?;
                         }
                         SandboxCommands::Connect { name, editor } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -4886,6 +4928,35 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_create_upload_conflicts_with_command_and_help_says_so() {
+        let err = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--upload",
+            ".",
+            "--",
+            "true",
+        ])
+        .expect_err("--upload with a trailing command should be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let cmd = Cli::command();
+        let create = cmd
+            .find_subcommand("sandbox")
+            .and_then(|c| c.find_subcommand("create"))
+            .expect("missing sandbox create subcommand");
+        let help = create
+            .get_arguments()
+            .find(|a| a.get_id() == "upload")
+            .and_then(|a| a.get_long_help())
+            .expect("--upload has long help")
+            .to_string();
+        assert!(help.contains("Cannot be combined with a trailing command"));
+        assert!(help.contains("sandbox exec"));
+    }
+
+    #[test]
     fn sandbox_create_no_git_ignore_requires_upload() {
         let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--no-git-ignore"]);
         assert!(
@@ -5513,6 +5584,38 @@ mod tests {
             Some(Commands::Sandbox {
                 command: Some(SandboxCommands::Start { name: None }),
             })
+        ));
+    }
+
+    #[test]
+    fn sandbox_suspend_and_resume_accept_optional_names() {
+        let suspend = Cli::try_parse_from(["openshell", "sandbox", "suspend", "demo"])
+            .expect("suspend command should parse");
+        assert!(matches!(
+            suspend.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Suspend { name: Some(ref name) }),
+            }) if name == "demo"
+        ));
+
+        let resume = Cli::try_parse_from(["openshell", "sandbox", "resume"])
+            .expect("resume command should parse");
+        assert!(matches!(
+            resume.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Resume { name: None }),
+            })
+        ));
+
+        let named = Cli::try_parse_from(["openshell", "sandbox", "resume", "demo"])
+            .expect("named resume should parse");
+        assert!(matches!(
+            named.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Resume {
+                    name: Some(ref name),
+                }),
+            }) if name == "demo"
         ));
     }
 

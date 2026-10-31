@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Support crates for test suites, one per concern, such as a service the
+# environment runs. Suites depend on them by path.
+[workspace]
+resolver = "2"
+members = ["keycloak"]

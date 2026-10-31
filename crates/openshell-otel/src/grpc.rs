@@ -102,6 +102,11 @@ pub mod rpc {
         "CreateSandbox",
         "openshell.compute.v1.ComputeDriver/CreateSandbox",
     );
+    pub const UPDATE_SANDBOX_CONFIGURATION: ComputeDriverRpc = ComputeDriverRpc {
+        service: "openshell.compute.v1.ComputeDriverConfigurationUpdates",
+        method: "UpdateSandboxConfiguration",
+        operation: "openshell.compute.v1.ComputeDriverConfigurationUpdates/UpdateSandboxConfiguration",
+    };
     pub const GET_SANDBOX: ComputeDriverRpc = ComputeDriverRpc::new(
         "GetSandbox",
         "openshell.compute.v1.ComputeDriver/GetSandbox",
@@ -117,6 +122,10 @@ pub mod rpc {
     pub const START_SANDBOX: ComputeDriverRpc = ComputeDriverRpc::new(
         "StartSandbox",
         "openshell.compute.v1.ComputeDriver/StartSandbox",
+    );
+    pub const SUSPEND_SANDBOX: ComputeDriverRpc = ComputeDriverRpc::new(
+        "SuspendSandbox",
+        "openshell.compute.v1.ComputeDriver/SuspendSandbox",
     );
     pub const DELETE_SANDBOX: ComputeDriverRpc = ComputeDriverRpc::new(
         "DeleteSandbox",
@@ -190,10 +199,12 @@ pub fn compute_driver_rpc_operation(path: &str) -> Option<ComputeDriverRpc> {
         Some("GetCapabilities") => Some(rpc::GET_CAPABILITIES),
         Some("ValidateSandboxCreate") => Some(rpc::VALIDATE_SANDBOX_CREATE),
         Some("CreateSandbox") => Some(rpc::CREATE_SANDBOX),
+        Some("UpdateSandboxConfiguration") => Some(rpc::UPDATE_SANDBOX_CONFIGURATION),
         Some("GetSandbox") => Some(rpc::GET_SANDBOX),
         Some("ListSandboxes") => Some(rpc::LIST_SANDBOXES),
         Some("StopSandbox") => Some(rpc::STOP_SANDBOX),
         Some("StartSandbox") => Some(rpc::START_SANDBOX),
+        Some("SuspendSandbox") => Some(rpc::SUSPEND_SANDBOX),
         Some("DeleteSandbox") => Some(rpc::DELETE_SANDBOX),
         Some("WatchSandboxes") => Some(rpc::WATCH_SANDBOXES),
         Some("EnsureWorkspace") => Some(rpc::ENSURE_WORKSPACE),
@@ -312,10 +323,12 @@ mod tests {
             rpc::GET_CAPABILITIES,
             rpc::VALIDATE_SANDBOX_CREATE,
             rpc::CREATE_SANDBOX,
+            rpc::UPDATE_SANDBOX_CONFIGURATION,
             rpc::GET_SANDBOX,
             rpc::LIST_SANDBOXES,
             rpc::STOP_SANDBOX,
             rpc::START_SANDBOX,
+            rpc::SUSPEND_SANDBOX,
             rpc::DELETE_SANDBOX,
             rpc::WATCH_SANDBOXES,
             rpc::ENSURE_WORKSPACE,

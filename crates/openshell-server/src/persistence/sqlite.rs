@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
-    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error,
-    map_migrate_error,
+    AtomicWrite, DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
+    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, atomic_write_order,
+    current_time_ms, map_db_error, map_migrate_error,
 };
 use crate::policy_store::{
     AtomicPolicyRevisionWrite, apply_draft_chunk_evaluation, draft_chunk_evaluation_inputs_match,
@@ -48,7 +48,7 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
-    pool: SqlitePool,
+    pub(super) pool: SqlitePool,
     /// Pool for writes whose loss after a crash is harmless; see
     /// [`SqliteStore::create_relaxed`]. On-disk stores open it with
     /// `synchronous=NORMAL`; in-memory stores share `pool`.
@@ -526,6 +526,104 @@ RETURNING "resource_version", "created_at_ms", "updated_at_ms"
                 Ok(write_result_from_row(&row))
             }
         }
+    }
+
+    pub async fn write_atomically(
+        &self,
+        writes: &[AtomicWrite],
+    ) -> PersistenceResult<Vec<Option<WriteResult>>> {
+        let now_ms = current_time_ms();
+        let mut results = vec![None; writes.len()];
+        // Dropping the transaction on an early return rolls every write back.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        for index in atomic_write_order(writes) {
+            match &writes[index] {
+                AtomicWrite::Create {
+                    object_type,
+                    id,
+                    name,
+                    workspace,
+                    payload,
+                } => {
+                    sqlx::query(
+                        r#"
+INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, '{}', 1)
+"#,
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(name)
+                    .bind(workspace)
+                    .bind(payload)
+                    .bind(now_ms)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+                    results[index] = Some(WriteResult {
+                        resource_version: 1,
+                        created_at_ms: now_ms,
+                        updated_at_ms: now_ms,
+                    });
+                }
+                AtomicWrite::Update {
+                    object_type,
+                    id,
+                    payload,
+                    expected_version,
+                } => {
+                    let row = sqlx::query(
+                        r#"
+UPDATE "objects"
+SET "payload" = ?4, "updated_at_ms" = ?5, "resource_version" = "resource_version" + 1
+WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+RETURNING "resource_version", "created_at_ms", "updated_at_ms"
+"#,
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(i64::try_from(*expected_version).unwrap_or(i64::MAX))
+                    .bind(payload)
+                    .bind(now_ms)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?
+                    .ok_or(PersistenceError::Conflict {
+                        current_resource_version: None,
+                    })?;
+                    results[index] = Some(write_result_from_row(&row));
+                }
+                AtomicWrite::Delete {
+                    object_type,
+                    id,
+                    expected_version,
+                } => {
+                    let deleted = sqlx::query(
+                        r#"
+DELETE FROM "objects"
+WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+"#,
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(i64::try_from(*expected_version).unwrap_or(i64::MAX))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+                    if deleted.rows_affected() == 0 {
+                        return Err(PersistenceError::Conflict {
+                            current_resource_version: None,
+                        });
+                    }
+                }
+            }
+        }
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(results)
     }
 
     pub async fn delete_if(
@@ -1356,6 +1454,23 @@ WHERE "object_type" = 'sandbox' AND "id" = ?1
         let sandbox_payload: Vec<u8> = row.get("payload");
         let current_version: i64 = row.try_get("resource_version").unwrap_or(1);
         let current_version = current_version.max(1).cast_unsigned();
+        // Locking the sandbox first serializes this check with first acceptance.
+        let frozen_payload: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT payload FROM objects WHERE object_type = ?1 AND id = ?2")
+                .bind(super::frozen_policy::FROZEN_POLICY_OBJECT_TYPE)
+                .bind(super::frozen_policy::frozen_policy_id(&write.sandbox_id))
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| map_db_error(&error))?;
+        if let Some(payload) = frozen_payload
+            && super::frozen_policy::decode_frozen_policy(&write.sandbox_id, &payload)?
+                .policy
+                .is_some()
+        {
+            return Err(PersistenceError::Conflict {
+                current_resource_version: Some(current_version),
+            });
+        }
         let (mut sandbox, sandbox_changed) =
             project_policy_revision_onto_sandbox(write, &sandbox_payload, current_version)?;
 
