@@ -147,14 +147,14 @@ message ValidateConfigResponse {
 // HTTP session hooks. One ordered event in a HttpSessionMiddleware.EvaluateRequest
 // stream. Preflight is always first and sees the preceding stage's completed
 // output headers. An inspect result is followed by begin
-// and exactly one body lifecycle: buffered_body for BUFFERED, or input_chunk
-// events ending with input_end for STREAM. session_end is best effort and has
+// and exactly one body lifecycle: whole_body for WHOLE_BODY, or input_chunk
+// events ending with input_end for DUPLEX. session_end is best effort and has
 // no result.
 message HttpRequestSessionEvent {
   oneof event {
     HttpRequestSessionPreflight preflight = 1;
     HttpBegin begin = 2;
-    HttpBufferedBody buffered_body = 3;
+    HttpWholeBody whole_body = 3;
     HttpInputChunk input_chunk = 4;
     HttpInputEnd input_end = 5;
     MiddlewareSessionEnd session_end = 6;
@@ -167,7 +167,7 @@ message HttpResponseSessionEvent {
   oneof event {
     HttpResponseSessionPreflight preflight = 1;
     HttpBegin begin = 2;
-    HttpBufferedBody buffered_body = 3;
+    HttpWholeBody whole_body = 3;
     HttpInputChunk input_chunk = 4;
     HttpInputEnd input_end = 5;
     MiddlewareSessionEnd session_end = 6;
@@ -175,18 +175,18 @@ message HttpResponseSessionEvent {
 }
 
 // HTTP session hooks. One ordered result in a HttpSessionMiddleware.EvaluateRequest
-// stream. Preflight requires preflight_result or deny. BUFFERED ends with
-// buffered_result or deny. STREAM sends output_start before any
+// stream. Preflight requires preflight_result or deny. WHOLE_BODY ends with
+// whole_body_result or deny. DUPLEX sends output_start before any
 // output_chunk, even for an empty output, and ends with finish or deny. An
 // unset or unknown result fails the exchange closed.
 //
 // A service may close its result stream right after the result that ends its
-// part in the exchange (continue_without_body, buffered_result, finish, or
+// part in the exchange (continue_without_body, whole_body_result, finish, or
 // deny), or keep it open until session_end. OpenShell accepts both.
 message HttpRequestSessionResult {
   oneof result {
     HttpPreflightResult preflight_result = 1;
-    HttpBufferedResult buffered_result = 2;
+    HttpWholeBodyResult whole_body_result = 2;
     HttpOutputStart output_start = 3;
     HttpOutputChunk output_chunk = 4;
     HttpFinish finish = 5;
@@ -201,7 +201,7 @@ message HttpRequestSessionResult {
 message HttpResponseSessionResult {
   oneof result {
     HttpPreflightResult preflight_result = 1;
-    HttpBufferedResult buffered_result = 2;
+    HttpWholeBodyResult whole_body_result = 2;
     HttpOutputStart output_start = 3;
     HttpOutputChunk output_chunk = 4;
     HttpFinish finish = 5;
@@ -215,12 +215,12 @@ enum HttpBodyMode {
   // One complete body and one terminal result. OpenShell holds the body in
   // memory, up to the selected max_body_bytes. A larger body, such as a
   // chunked body without a declared length, fails the exchange; OpenShell
-  // does not fall back to STREAM.
-  HTTP_BODY_MODE_BUFFERED = 1;
+  // does not fall back to DUPLEX.
+  HTTP_BODY_MODE_WHOLE_BODY = 1;
   // Independent ordered input and output streams. The stage returns every
   // output byte and owns any working storage. No total time limit, and no
   // total size limit unless limits.max_output_body_bytes is set.
-  HTTP_BODY_MODE_STREAM = 2;
+  HTTP_BODY_MODE_DUPLEX = 2;
 }
 
 // Why OpenShell does not offer a body mode for a message.
@@ -346,24 +346,24 @@ message HttpResponsePreflightHead {
   repeated HttpHeader request_headers = 4;
 }
 
-// Limits for one stage exchange. max_buffered_body_bytes is 0 unless BUFFERED
+// Limits for one stage exchange. max_whole_body_bytes is 0 unless WHOLE_BODY
 // is permitted, and max_chunk_bytes is 0 when no body mode is permitted.
-// STREAM has no total deadline, and no total byte cap unless
-// max_output_body_bytes is set. BUFFERED has 2 minutes to receive, process,
+// DUPLEX has no total deadline, and no total byte cap unless
+// max_output_body_bytes is set. WHOLE_BODY has 2 minutes to receive, process,
 // and deliver one body, and each body exchange is also bounded by the binding
 // timeout.
 message HttpBodyLimits {
   // Largest input_chunk and output_chunk payload.
   uint64 max_chunk_bytes = 1;
-  // Largest BUFFERED input and replacement.
-  uint64 max_buffered_body_bytes = 2;
-  // STREAM middleware-stall timeout. A STREAM stage fails when it does not
+  // Largest WHOLE_BODY input and replacement.
+  uint64 max_whole_body_bytes = 2;
+  // DUPLEX middleware-stall timeout. A DUPLEX stage fails when it does not
   // accept the next input within this duration, or returns nothing within
   // this duration after input_end. Time the sandbox or upstream takes to
   // produce input does not count. OpenShell uses 30 seconds.
   google.protobuf.Duration idle_timeout = 3;
   // Largest request body OpenShell forwards after every stage, set when
-  // STREAM is permitted and OpenShell holds the complete output before it
+  // DUPLEX is permitted and OpenShell holds the complete output before it
   // contacts the upstream, such as to sign it. Output beyond it fails the
   // message with body_over_limit. Unset when the output streams without a
   // total cap.
@@ -399,38 +399,38 @@ message HttpContinue {}
 // Selects one permitted body mode.
 message HttpInspect {
   oneof mode {
-    HttpBufferedMode buffered = 1;
-    HttpStreamMode stream = 2;
+    HttpWholeBodyMode whole_body = 1;
+    HttpDuplexMode duplex = 2;
   }
 }
 
-message HttpBufferedMode {
-  // Positive and no larger than the offered max_buffered_body_bytes. The cap
+message HttpWholeBodyMode {
+  // Positive and no larger than the offered max_whole_body_bytes. The cap
   // applies separately to the input and the replacement.
   uint64 max_body_bytes = 1;
 }
 
-// STREAM makes the stage responsible for all output from accepted preflight.
-message HttpStreamMode {}
+// DUPLEX makes the stage responsible for all output from accepted preflight.
+message HttpDuplexMode {}
 
 // Starts the selected body lifecycle.
 message HttpBegin {
   // The preflight head plus this stage's preflight mutations. Earlier
   // stages have already finalized these headers; later stages cannot change
-  // this stage's input. Mutations in buffered_result or output_start apply
+  // this stage's input. Mutations in whole_body_result or output_start apply
   // on top of this head before the next stage receives its preflight.
   repeated HttpHeader headers = 1;
 }
 
-// BUFFERED input: exactly one complete body, possibly empty.
-message HttpBufferedBody {
+// WHOLE_BODY input: exactly one complete body, possibly empty.
+message HttpWholeBody {
   bytes data = 1;
   // Trailers of a chunked message, in wire order.
   repeated HttpHeader trailers = 2;
 }
 
-// BUFFERED terminal success.
-message HttpBufferedResult {
+// WHOLE_BODY terminal success.
+message HttpWholeBodyResult {
   oneof body {
     // Keep the body.
     HttpUnchanged unchanged = 1;
@@ -459,7 +459,7 @@ message HttpInputEnd {
   repeated HttpHeader trailers = 1;
 }
 
-// Starts STREAM output. OpenShell commits the outgoing head when the last
+// Starts DUPLEX output. OpenShell commits the outgoing head when the last
 // stage in the chain starts output, unless that output declares an empty body.
 message HttpOutputStart {
   // Head mutations applied after this stage's preflight mutations, before
@@ -480,11 +480,11 @@ message HttpOutputChunk {
   bytes data = 1;
 }
 
-// STREAM terminal success. Valid only after output_start and after input_end
+// DUPLEX terminal success. Valid only after output_start and after input_end
 // was consumed.
 message HttpFinish {
   // Ordered trailer mutations, under the rules of
-  // HttpBufferedResult.trailer_mutations.
+  // HttpWholeBodyResult.trailer_mutations.
   repeated HeaderMutation trailer_mutations = 1;
   MiddlewareDiagnostics diagnostics = 2;
 }
