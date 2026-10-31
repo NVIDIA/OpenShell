@@ -495,7 +495,7 @@ pub fn spawn_cleanup(state: Arc<ServerState>, mut shutdown: tokio::sync::watch::
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     fn route() -> SandboxServiceRoute {
@@ -645,6 +645,7 @@ mod tests {
             port: 9443,
             domain: "services.example.com".into(),
         };
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".into();
         let sandbox = Sandbox {
             metadata: Some(ObjectMeta {
                 id: "sandbox".into(),
