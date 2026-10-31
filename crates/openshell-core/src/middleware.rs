@@ -11,12 +11,27 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::proto::{
-    HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget, HttpResponseEvent,
-    HttpResponseEventResult, MiddlewareDescribeRequest, MiddlewareManifest, RequestContext,
-    SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
+    HttpHeader, HttpRequestEvaluation, HttpRequestHookEvent, HttpRequestHookResult,
+    HttpRequestResult, HttpRequestTarget, HttpResponseEvent, HttpResponseEventResult,
+    HttpResponseHookEvent, HttpResponseHookResult, MiddlewareDescribeRequest, MiddlewareManifest,
+    RequestContext, SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
     WebSocketSessionEvent, WebSocketSessionEventResult,
 };
 
+/// Transport-neutral result stream for one `HttpHooks.EvaluateRequest`
+/// exchange.
+pub type HttpRequestHookResultStream = Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<HttpRequestHookResult, Status>> + Send + 'static>,
+>;
+
+/// Transport-neutral result stream for one `HttpHooks.EvaluateResponse`
+/// exchange.
+pub type HttpResponseHookResultStream = Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<HttpResponseHookResult, Status>> + Send + 'static>,
+>;
+
+/// Legacy HTTP hooks. Removed in 0.2.0.
+///
 /// Transport-neutral result stream for one HTTP response middleware stage.
 pub type HttpResponseResultStream = Pin<
     Box<dyn tokio_stream::Stream<Item = Result<HttpResponseEventResult, Status>> + Send + 'static>,
@@ -63,6 +78,26 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
     ) -> Result<HttpResponseResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP response pre-return evaluation",
+        ))
+    }
+
+    /// Open one HTTP hook request exchange (`HttpHooks.EvaluateRequest`).
+    async fn open_http_request_hook(
+        &self,
+        _requests: mpsc::Receiver<HttpRequestHookEvent>,
+    ) -> Result<HttpRequestHookResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP hook requests",
+        ))
+    }
+
+    /// Open one HTTP hook response exchange (`HttpHooks.EvaluateResponse`).
+    async fn open_http_response_hook(
+        &self,
+        _requests: mpsc::Receiver<HttpResponseHookEvent>,
+    ) -> Result<HttpResponseHookResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP hook responses",
         ))
     }
 }
@@ -193,7 +228,7 @@ impl<'a> HttpRequestView<'a> {
 ///                 operation: SupervisorMiddlewareOperation::HttpRequest as i32,
 ///                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
 ///                 max_payload_bytes: 1024,
-///                 request_timeout: None,
+///                 ..Default::default()
 ///             }],
 ///             expected_audience: String::new(),
 ///             extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -278,6 +313,33 @@ pub trait InProcessMiddleware: Send + Sync {
             "middleware does not implement HTTP response pre-return evaluation",
         ))
     }
+
+    /// Open one HTTP hook request exchange (`HttpHooks.EvaluateRequest`),
+    /// for one HTTP request.
+    ///
+    /// Implementations that do not require the HTTP hooks capability
+    /// may keep the default unsupported response.
+    async fn open_http_request_hook(
+        &self,
+        _requests: mpsc::Receiver<HttpRequestHookEvent>,
+    ) -> std::result::Result<HttpRequestHookResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP hook requests",
+        ))
+    }
+
+    /// Open one HTTP hook response exchange (`HttpHooks.EvaluateResponse`).
+    ///
+    /// Implementations that do not require the HTTP hooks capability
+    /// may keep the default unsupported response.
+    async fn open_http_response_hook(
+        &self,
+        _requests: mpsc::Receiver<HttpResponseHookEvent>,
+    ) -> std::result::Result<HttpResponseHookResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP hook responses",
+        ))
+    }
 }
 
 /// Default timeout for one supervisor middleware RPC.
@@ -292,12 +354,32 @@ pub const MAX_MIDDLEWARE_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Process-wide safety valve for concurrently buffered middleware work.
 pub const MAX_CONCURRENT_MIDDLEWARE_WORK: usize = 32;
-/// Process-wide safety valve for retained streaming middleware sessions.
+/// Process-wide safety valve for retained WebSocket and legacy HTTP response
+/// middleware sessions.
 ///
-/// A session consumes one permit regardless of its protocol or stage fan-out.
-/// Persistent middleware protocols must acquire from this shared budget before
-/// opening streams and retain the permit while any stage remains active.
+/// A session consumes one permit regardless of its stage fan-out. These
+/// protocols acquire from this shared budget before opening streams and retain
+/// the permit while any stage remains active. HTTP hooks use
+/// [`MAX_HTTP_HOOK_BUFFERING_SLOTS`] and
+/// [`MAX_HTTP_HOOK_STREAMING_SLOTS`] instead.
 pub const MAX_CONCURRENT_MIDDLEWARE_SESSIONS: usize = 32;
+/// Process-wide bound on HTTP requests and responses in HTTP hook preflight
+/// or in a `WHOLE_BODY` stage.
+///
+/// A request and its response each hold one slot, and only while a stage
+/// inspects them: one whose stages all continue at preflight releases its
+/// slot then. A request or response waits for a slot within its chain
+/// deadline.
+pub const MAX_HTTP_HOOK_BUFFERING_SLOTS: usize = 64;
+/// Process-wide bound on HTTP requests and responses whose HTTP hook chain
+/// has a DUPLEX stage or deferred stages.
+///
+/// Such a body has no total deadline, so a server-sent events response can
+/// hold its slot indefinitely. This separate budget keeps such streams from
+/// starving short requests and responses. It allows a request and a response
+/// stream for each of the 96 network streams the `OpenShell` sandbox runtime
+/// relays at once.
+pub const MAX_HTTP_HOOK_STREAMING_SLOTS: usize = 256;
 
 /// Largest number of middleware configurations accepted in one sandbox policy.
 pub const MAX_MIDDLEWARE_CONFIGS: usize = 10;

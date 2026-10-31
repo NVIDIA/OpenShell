@@ -4,10 +4,22 @@
 //! Supervisor middleware registration and chain execution.
 
 mod binding_policy;
+mod diagnostics;
 pub mod headers;
+mod http_hooks;
 mod remote;
 mod response;
 mod websocket;
+
+pub use http_hooks::{
+    ChainHttpHookVersion, HTTP_STREAM_IDLE_TIMEOUT, HTTP_WHOLE_BODY_TIMEOUT, HttpBodyInput,
+    HttpBodyOutput, HttpFailureCode, HttpMiddlewareFailure, HttpPipelineFinish,
+    HttpRequestPipeline, HttpRequestPreflightInput, HttpRequestPreflightOutcome,
+    HttpResponseDelivery, HttpResponsePipeline, HttpResponsePipelinePreflight,
+    HttpStageDiagnostics, HttpStageInvocation, HttpStageOutcome, MAX_HTTP_REQUEST_WITHHELD_BYTES,
+    MAX_HTTP_STREAM_UNIT_BYTES, MIDDLEWARE_CANNOT_INSPECT, MIDDLEWARE_HOOK_VERSIONS_MIXED,
+    MiddlewareFailureDetail, chain_http_hook_version, chain_inspects_http_response_bodies,
+};
 
 pub use response::{
     HttpResponseDiagnostics, HttpResponseFinish, HttpResponseInvocation,
@@ -32,22 +44,24 @@ use miette::{Result, miette};
 use prost::Message;
 
 use openshell_core::extension_protocol::{
-    ExtensionFamily, NegotiatedExtension, gateway_metadata, negotiate,
+    ExtensionFamily, NegotiatedExtension, SUPERVISOR_MIDDLEWARE_HTTP_HOOKS, gateway_metadata,
+    negotiate,
 };
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestTarget,
-    MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest, NetworkMiddlewareConfig,
-    RequestContext, SandboxPolicy, SupervisorMiddlewareBinding, SupervisorMiddlewareOperation,
-    SupervisorMiddlewarePhase, SupervisorMiddlewareService, ValidateConfigRequest,
-    ValidateConfigResponse,
+    Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestHookEvent,
+    HttpRequestTarget, HttpResponseHookEvent, MiddlewareBinding, MiddlewareDescribeRequest,
+    MiddlewareManifest, NetworkMiddlewareConfig, Process, RequestContext, SandboxPolicy,
+    SupervisorMiddlewareBinding, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
+    SupervisorMiddlewareService, ValidateConfigRequest, ValidateConfigResponse,
 };
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
 
 use binding_policy::BindingPolicy;
 pub use openshell_core::middleware::{
-    HttpRequestView, HttpResponseResultStream, InProcessMiddleware, SupervisorMiddlewareEndpoint,
+    HttpRequestHookResultStream, HttpRequestView, HttpResponseHookResultStream,
+    HttpResponseResultStream, InProcessMiddleware, SupervisorMiddlewareEndpoint,
     WebSocketResponseStream,
 };
 
@@ -207,6 +221,20 @@ impl InProcessMiddleware for EndpointInProcessAdapter {
     ) -> std::result::Result<HttpResponseResultStream, tonic::Status> {
         self.endpoint.open_http_response_pre_return(requests).await
     }
+
+    async fn open_http_request_hook(
+        &self,
+        requests: tokio::sync::mpsc::Receiver<HttpRequestHookEvent>,
+    ) -> std::result::Result<HttpRequestHookResultStream, tonic::Status> {
+        self.endpoint.open_http_request_hook(requests).await
+    }
+
+    async fn open_http_response_hook(
+        &self,
+        requests: tokio::sync::mpsc::Receiver<HttpResponseHookEvent>,
+    ) -> std::result::Result<HttpResponseHookResultStream, tonic::Status> {
+        self.endpoint.open_http_response_hook(requests).await
+    }
 }
 
 /// Adapt a transport-neutral endpoint to the in-process registry contract.
@@ -269,15 +297,26 @@ impl MiddlewareWorkAdmissionOutcome {
     }
 }
 
-/// One slot in the shared persistent middleware session budget.
+/// One slot in a persistent middleware session budget.
 ///
 /// Protocol-specific session runners retain this guard while at least one
 /// streaming stage remains active. Registry replacement preserves the shared
-/// admission state so future streaming HTTP middleware can use the same
-/// process-wide bound.
+/// admission state, so each budget stays process-wide.
 #[derive(Debug)]
 struct MiddlewareSessionPermit {
     _session: OwnedSemaphorePermit,
+}
+
+/// Wait until `deadline` for one slot of `budget`.
+async fn reserve_until(
+    budget: &Arc<Semaphore>,
+    deadline: tokio::time::Instant,
+) -> Option<MiddlewareSessionPermit> {
+    tokio::time::timeout_at(deadline, Arc::clone(budget).acquire_owned())
+        .await
+        .ok()?
+        .ok()
+        .map(|permit| MiddlewareSessionPermit { _session: permit })
 }
 
 enum MiddlewareSessionAdmission {
@@ -287,8 +326,9 @@ enum MiddlewareSessionAdmission {
 
 pub use openshell_core::middleware::{
     DEFAULT_MIDDLEWARE_TIMEOUT, MAX_CONCURRENT_MIDDLEWARE_SESSIONS, MAX_CONCURRENT_MIDDLEWARE_WORK,
-    MAX_MIDDLEWARE_CHAIN_FINDINGS, MAX_MIDDLEWARE_CHAIN_STAGES, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
-    MAX_MIDDLEWARE_CONFIGS, MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT,
+    MAX_HTTP_HOOK_BUFFERING_SLOTS, MAX_HTTP_HOOK_STREAMING_SLOTS, MAX_MIDDLEWARE_CHAIN_FINDINGS,
+    MAX_MIDDLEWARE_CHAIN_STAGES, MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_CONFIGS,
+    MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT,
     MAX_MIDDLEWARE_SELECTOR_PATTERNS, MAX_MIDDLEWARE_TIMEOUT, MIN_MIDDLEWARE_TIMEOUT,
     middleware_timeout_or_default, parse_middleware_timeout,
 };
@@ -364,6 +404,103 @@ impl OnError {
     }
 }
 
+/// HTTP hook version of a service's HTTP bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HttpHookVersion {
+    /// Legacy HTTP hooks (`EvaluateHttpRequest`, `HttpResponsePreReturn`).
+    /// Deprecated and removed in 0.2.0.
+    Legacy,
+    /// HTTP hooks (`HttpHooks.EvaluateRequest`,
+    /// `HttpHooks.EvaluateResponse`), selected by requiring
+    /// [`SUPERVISOR_MIDDLEWARE_HTTP_HOOKS`]. Always fail-closed.
+    Current,
+}
+
+impl HttpHookVersion {
+    /// Stable, audit-safe name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy_http_hook",
+            Self::Current => "http_hook",
+        }
+    }
+}
+
+/// True when the service requires the HTTP hooks capability. Peers
+/// that predate HTTP hooks do not support it, so they reject the
+/// service at Describe instead of calling the legacy HTTP hooks.
+fn requires_http_hooks(manifest: &MiddlewareManifest) -> bool {
+    manifest.extension.as_ref().is_some_and(|extension| {
+        extension
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_HOOKS)
+    })
+}
+
+/// HTTP hook version of one binding: `None` for a WebSocket or unknown
+/// operation. The service's capabilities select the hook version for all of
+/// its HTTP bindings.
+fn binding_http_hook_version(
+    manifest: &MiddlewareManifest,
+    binding: &MiddlewareBinding,
+) -> Option<HttpHookVersion> {
+    match SupervisorMiddlewareOperation::try_from(binding.operation) {
+        Ok(
+            SupervisorMiddlewareOperation::HttpRequest
+            | SupervisorMiddlewareOperation::HttpResponse,
+        ) => Some(if requires_http_hooks(manifest) {
+            HttpHookVersion::Current
+        } else {
+            HttpHookVersion::Legacy
+        }),
+        _ => None,
+    }
+}
+
+/// Hook version of a described service's HTTP bindings, or `None` when it has no
+/// HTTP binding.
+fn manifest_http_hook_version(manifest: &MiddlewareManifest) -> Option<HttpHookVersion> {
+    manifest
+        .bindings
+        .iter()
+        .find_map(|binding| binding_http_hook_version(manifest, binding))
+}
+
+/// A service that supports the HTTP hooks capability must also
+/// require it. Only a required capability makes peers that predate HTTP
+/// hooks reject the service; otherwise they would call its HTTP
+/// bindings through the legacy HTTP hooks.
+fn validate_manifest_http_hooks_capability(
+    source: &str,
+    manifest: &MiddlewareManifest,
+) -> Result<()> {
+    let supported = manifest.extension.as_ref().is_some_and(|extension| {
+        extension
+            .supported_capabilities
+            .iter()
+            .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_HOOKS)
+    });
+    if supported && !requires_http_hooks(manifest) {
+        return Err(miette!(
+            "{source} supports {SUPERVISOR_MIDDLEWARE_HTTP_HOOKS} without requiring it; list it in required_capabilities so that peers without HTTP hooks reject the service instead of calling legacy HTTP hooks"
+        ));
+    }
+    Ok(())
+}
+
+/// Legacy HTTP hooks and WebSocket bindings carry payloads. An HTTP hook
+/// binding that advertises no payload limit is offered no body modes, so it
+/// can only continue or deny at preflight.
+fn binding_requires_payload_limit(
+    manifest: &MiddlewareManifest,
+    binding: &MiddlewareBinding,
+) -> bool {
+    binding_http_hook_version(manifest, binding) != Some(HttpHookVersion::Current)
+        || binding.max_payload_bytes > 0
+}
+
 #[derive(Debug, Clone)]
 pub struct ChainEntry {
     pub name: String,
@@ -409,6 +546,8 @@ pub struct DescribedChainEntry {
     binding: Option<MiddlewareBinding>,
     max_payload_bytes: usize,
     timeout: Duration,
+    /// HTTP hook version of the resolved binding.
+    http_hook_version: Option<HttpHookVersion>,
 }
 
 struct DescribedChain {
@@ -421,8 +560,14 @@ impl DescribedChainEntry {
         self.max_payload_bytes
     }
 
+    /// Effective failure policy. HTTP hook entries always fail closed,
+    /// whatever the policy entry says.
     pub fn on_error(&self) -> OnError {
-        self.entry.on_error
+        if self.http_hook_version == Some(HttpHookVersion::Current) {
+            OnError::FailClosed
+        } else {
+            self.entry.on_error
+        }
     }
 
     pub fn timeout(&self) -> Duration {
@@ -435,6 +580,53 @@ impl DescribedChainEntry {
     /// imposes no payload-buffering limit on the chain.
     pub fn is_resolved(&self) -> bool {
         self.binding.is_some()
+    }
+
+    /// HTTP hook version of the resolved HTTP binding. `None` for WebSocket
+    /// bindings and unresolved entries.
+    #[must_use]
+    pub fn http_hook_version(&self) -> Option<HttpHookVersion> {
+        self.http_hook_version
+    }
+
+    /// Policy-local middleware config name.
+    #[must_use]
+    pub fn config_name(&self) -> &str {
+        &self.entry.name
+    }
+
+    /// Built-in middleware name or operator-owned registration name.
+    #[must_use]
+    pub fn implementation(&self) -> &str {
+        &self.entry.implementation
+    }
+}
+
+/// The workload process shown to middleware as `RequestContext.originating_process`.
+///
+/// It holds the executable and ancestors (nearest parent first) the
+/// connection's network policy resolved, or is `None` when the caller is
+/// unknown. The pid is 0: the identity is resolved per connection.
+pub fn originating_process(binary: &str, ancestors: &[String]) -> Option<Process> {
+    (!binary.is_empty()).then(|| Process {
+        binary: binary.to_string(),
+        pid: 0,
+        ancestors: ancestors.to_vec(),
+    })
+}
+
+/// Keep a request context within [`MAX_MIDDLEWARE_CONTEXT_BYTES`].
+///
+/// Drops the farthest ancestors of its originating process, then the process
+/// itself, so a deep process tree never becomes an over-capacity failure.
+pub fn fit_request_context(context: &mut RequestContext) {
+    while context.encoded_len() > MAX_MIDDLEWARE_CONTEXT_BYTES {
+        let Some(process) = context.originating_process.as_mut() else {
+            return;
+        };
+        if process.ancestors.pop().is_none() {
+            context.originating_process = None;
+        }
     }
 }
 
@@ -466,6 +658,8 @@ pub struct HttpRequestInput {
     pub sandbox_id: String,
     pub sandbox_name: String,
     pub workspace: String,
+    /// Workload process that opened the connection, when resolved.
+    pub originating_process: Option<Process>,
     pub scheme: String,
     pub host: String,
     pub port: u16,
@@ -655,6 +849,26 @@ impl MiddlewareDispatch {
             Self::Grpc(service) => service.open_http_response_pre_return(receiver).await,
         }
     }
+
+    async fn open_http_request_hook(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<HttpRequestHookEvent>,
+    ) -> std::result::Result<HttpRequestHookResultStream, tonic::Status> {
+        match self {
+            Self::InProcess(service) => service.open_http_request_hook(receiver).await,
+            Self::Grpc(service) => service.open_http_request_hook(receiver).await,
+        }
+    }
+
+    async fn open_http_response_hook(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<HttpResponseHookEvent>,
+    ) -> std::result::Result<HttpResponseHookResultStream, tonic::Status> {
+        match self {
+            Self::InProcess(service) => service.open_http_response_hook(receiver).await,
+            Self::Grpc(service) => service.open_http_response_hook(receiver).await,
+        }
+    }
 }
 
 struct MiddlewareServiceState {
@@ -733,11 +947,16 @@ impl MiddlewareDiagnosticPolicy {
 pub struct MiddlewareRegistry {
     services: Arc<Vec<Arc<MiddlewareServiceState>>>,
     registered_services: Arc<Vec<RegisteredMiddlewareService>>,
+    /// Policy configs already warned that `fail_open` does not apply to their
+    /// HTTP hook service.
+    fail_open_warnings: Arc<std::sync::Mutex<HashSet<String>>>,
     middleware_names: Arc<HashSet<String>>,
     negotiated_extensions: Arc<Vec<NegotiatedExtension>>,
     work_admission: Arc<Semaphore>,
     work_admission_waiters: Arc<Semaphore>,
     session_admission: Arc<Semaphore>,
+    http_buffering_admission: Arc<Semaphore>,
+    http_streaming_admission: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for MiddlewareRegistry {
@@ -755,6 +974,14 @@ impl std::fmt::Debug for MiddlewareRegistry {
                 "available_session_permits",
                 &self.session_admission.available_permits(),
             )
+            .field(
+                "available_http_buffering_permits",
+                &self.http_buffering_admission.available_permits(),
+            )
+            .field(
+                "available_http_streaming_permits",
+                &self.http_streaming_admission.available_permits(),
+            )
             .finish()
     }
 }
@@ -769,11 +996,14 @@ impl Default for MiddlewareRegistry {
         Self {
             services: Arc::new(Vec::new()),
             registered_services: Arc::new(Vec::new()),
+            fail_open_warnings: Arc::default(),
             middleware_names: Arc::new(HashSet::new()),
             negotiated_extensions: Arc::new(Vec::new()),
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
+            http_buffering_admission: Arc::new(Semaphore::new(MAX_HTTP_HOOK_BUFFERING_SLOTS)),
+            http_streaming_admission: Arc::new(Semaphore::new(MAX_HTTP_HOOK_STREAMING_SLOTS)),
         }
     }
 }
@@ -852,8 +1082,12 @@ fn middleware_denial_reason(config_name: &str, reason_code: Option<&str>) -> Str
     )
 }
 
-fn validate_payload_limit(source: &str, binding: &MiddlewareBinding) -> Result<usize> {
-    if binding.max_payload_bytes == 0 {
+fn validate_payload_limit(
+    source: &str,
+    binding: &MiddlewareBinding,
+    required: bool,
+) -> Result<usize> {
+    if required && binding.max_payload_bytes == 0 {
         return Err(miette!("{source} must advertise a non-zero payload limit"));
     }
     if binding.max_payload_bytes > MAX_MIDDLEWARE_PAYLOAD_BYTES as u64 {
@@ -905,6 +1139,7 @@ fn validate_manifest_bindings(
         return Err(miette!("{source} describes no bindings"));
     }
 
+    validate_manifest_http_hooks_capability(source, manifest)?;
     let mut bindings = BTreeMap::new();
     for binding in &manifest.bindings {
         let selector = supported_binding(source, binding)?;
@@ -913,7 +1148,11 @@ fn validate_manifest_bindings(
                 "{source} describes a duplicate middleware operation/phase pair"
             ));
         }
-        validate_payload_limit(source, binding)?;
+        validate_payload_limit(
+            source,
+            binding,
+            binding_requires_payload_limit(manifest, binding),
+        )?;
         if binding.request_timeout.is_some() {
             middleware_proto_timeout_or_default(binding.request_timeout.as_ref())
                 .map_err(|reason| miette!("{source} has invalid timeout for binding: {reason}"))?;
@@ -952,7 +1191,10 @@ fn authorize_external_manifest(
     let mut bindings = validate_manifest_bindings(&source, manifest)?;
     policy.authorize(&source, &mut bindings)?;
     let operator_max_payload_bytes = registration.max_payload_bytes;
-    for binding in bindings.values() {
+    for binding in bindings
+        .values()
+        .filter(|binding| binding_requires_payload_limit(manifest, binding))
+    {
         let advertised = binding.max_payload_bytes;
         if operator_max_payload_bytes > advertised {
             return Err(miette!(
@@ -1275,12 +1517,114 @@ impl MiddlewareRegistry {
         Ok(Self {
             services: Arc::new(services),
             registered_services: Arc::new(registered_services),
+            fail_open_warnings: Arc::default(),
             middleware_names: Arc::new(middleware_names),
             negotiated_extensions: Arc::new(negotiated_extensions),
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
+            http_buffering_admission: Arc::new(Semaphore::new(MAX_HTTP_HOOK_BUFFERING_SLOTS)),
+            http_streaming_admission: Arc::new(Semaphore::new(MAX_HTTP_HOOK_STREAMING_SLOTS)),
         })
+    }
+
+    /// HTTP hook version of a registered middleware, without a network call.
+    /// `None` when the middleware has no HTTP binding or this registry has
+    /// not described it; such an entry follows its `on_error`.
+    #[must_use]
+    pub fn http_hook_version_of(&self, implementation: &str) -> Option<HttpHookVersion> {
+        self.services.iter().find_map(|state| {
+            let manifest = state.manifest.get()?;
+            (ChainRunner::attachment_name(state, manifest) == implementation)
+                .then(|| manifest_http_hook_version(manifest))
+                .flatten()
+        })
+    }
+
+    /// Gateway rules for policies that use HTTP hook middleware.
+    ///
+    /// - `on_error: fail_open` is rejected on an entry whose service runs HTTP
+    ///   hooks, including one with WebSocket bindings. HTTP hooks
+    ///   are always fail-closed, but a supervisor that cannot describe the
+    ///   service, including one that predates HTTP hooks, follows
+    ///   `on_error` and would skip it under `fail_open`.
+    /// - Two entries whose endpoint selectors may overlap must use the same
+    ///   HTTP hook version for every HTTP operation both serve: one HTTP message
+    ///   never runs both hook versions.
+    ///
+    /// Supervisors do not apply these rules to stored policies; they run an
+    /// HTTP hook entry fail-closed and refuse a mixed chain at runtime.
+    pub async fn validate_http_hook_rules(&self, policy: &SandboxPolicy) -> Result<()> {
+        let manifests = ChainRunner::from_registry(self.clone()).manifests().await?;
+        let mut configs: Vec<_> = policy.network_middlewares.iter().collect();
+        configs.sort_unstable_by_key(|(name, _)| name.as_str());
+        let manifest_for = |implementation: &str| {
+            manifests
+                .iter()
+                .find(|(state, manifest)| {
+                    ChainRunner::attachment_name(state, manifest) == implementation
+                })
+                .map(|(_, manifest)| manifest)
+        };
+        for (name, config) in &configs {
+            let Some(manifest) = manifest_for(&config.middleware) else {
+                continue;
+            };
+            if OnError::parse(&config.on_error)? == OnError::FailOpen
+                && manifest_http_hook_version(manifest) == Some(HttpHookVersion::Current)
+            {
+                return Err(miette!(
+                    "middleware config '{name}' cannot use on_error: fail_open with '{}': HTTP hook middleware is always fail-closed, and a supervisor that cannot describe it would skip it under fail_open; use fail_closed",
+                    config.middleware
+                ));
+            }
+        }
+        for (index, (left_name, left)) in configs.iter().enumerate() {
+            let Some(left_manifest) = manifest_for(&left.middleware) else {
+                continue;
+            };
+            for (right_name, right) in &configs[index + 1..] {
+                let Some(right_manifest) = manifest_for(&right.middleware) else {
+                    continue;
+                };
+                for operation in [
+                    SupervisorMiddlewareOperation::HttpRequest,
+                    SupervisorMiddlewareOperation::HttpResponse,
+                ] {
+                    let protocol = |manifest: &MiddlewareManifest| {
+                        manifest
+                            .bindings
+                            .iter()
+                            .find(|binding| binding.operation == operation as i32)
+                            .map(|binding| binding_http_hook_version(manifest, binding))
+                    };
+                    let (Some(left_protocol), Some(right_protocol)) =
+                        (protocol(left_manifest), protocol(right_manifest))
+                    else {
+                        continue;
+                    };
+                    if left_protocol == right_protocol
+                        || !selectors_may_overlap(left.endpoints.as_ref(), right.endpoints.as_ref())
+                    {
+                        continue;
+                    }
+                    let describe = |protocol: Option<HttpHookVersion>| match protocol {
+                        Some(HttpHookVersion::Current) => "HTTP hooks",
+                        _ => "legacy HTTP hooks",
+                    };
+                    let operation_name = match operation {
+                        SupervisorMiddlewareOperation::HttpResponse => "HTTP responses",
+                        _ => "HTTP requests",
+                    };
+                    return Err(miette!(
+                        "middleware configs '{left_name}' ({}) and '{right_name}' ({}) may select the same destination for {operation_name}, and one HTTP message cannot run both hook versions; separate their endpoint selectors, or move both services to the same HTTP hook version",
+                        describe(left_protocol),
+                        describe(right_protocol),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Validate implementation-owned configuration for every middleware entry.
@@ -1377,11 +1721,14 @@ impl ChainRunner {
                     operator_timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
                 })]),
                 registered_services: Arc::new(Vec::new()),
+                fail_open_warnings: Arc::default(),
                 middleware_names: Arc::new(HashSet::new()),
                 negotiated_extensions: Arc::new(Vec::new()),
                 work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
                 work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
                 session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
+                http_buffering_admission: Arc::new(Semaphore::new(MAX_HTTP_HOOK_BUFFERING_SLOTS)),
+                http_streaming_admission: Arc::new(Semaphore::new(MAX_HTTP_HOOK_STREAMING_SLOTS)),
             }),
         }
     }
@@ -1408,6 +1755,8 @@ impl ChainRunner {
         registry.work_admission = Arc::clone(&self.registry.work_admission);
         registry.work_admission_waiters = Arc::clone(&self.registry.work_admission_waiters);
         registry.session_admission = Arc::clone(&self.registry.session_admission);
+        registry.http_buffering_admission = Arc::clone(&self.registry.http_buffering_admission);
+        registry.http_streaming_admission = Arc::clone(&self.registry.http_streaming_admission);
         Self::from_registry(registry)
     }
 
@@ -1462,6 +1811,31 @@ impl ChainRunner {
             })
     }
 
+    /// Wait until `deadline` for one HTTP hook buffering slot, held through
+    /// preflight and `WHOLE_BODY` stages. `None` when none freed up in time.
+    async fn reserve_http_buffering_slot(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Option<MiddlewareSessionPermit> {
+        reserve_until(&self.registry.http_buffering_admission, deadline).await
+    }
+
+    /// Take one HTTP hook streaming slot if one is free now.
+    fn try_reserve_http_streaming_slot(&self) -> Option<MiddlewareSessionPermit> {
+        Arc::clone(&self.registry.http_streaming_admission)
+            .try_acquire_owned()
+            .ok()
+            .map(|permit| MiddlewareSessionPermit { _session: permit })
+    }
+
+    /// Wait until `deadline` for one HTTP hook streaming slot.
+    async fn reserve_http_streaming_slot(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Option<MiddlewareSessionPermit> {
+        reserve_until(&self.registry.http_streaming_admission, deadline).await
+    }
+
     async fn manifests(&self) -> Result<Vec<(Arc<MiddlewareServiceState>, MiddlewareManifest)>> {
         let mut manifests = Vec::with_capacity(self.registry.services.len());
         for state in self.registry.services.iter() {
@@ -1494,6 +1868,7 @@ impl ChainRunner {
             .unwrap_or(manifest.name.as_str())
     }
 
+    /// The service's binding for one stage.
     fn binding(
         manifest: &MiddlewareManifest,
         operation: SupervisorMiddlewareOperation,
@@ -1560,12 +1935,15 @@ impl ChainRunner {
             let Some((state, manifest)) = manifests.iter().find(|(state, manifest)| {
                 Self::attachment_name(state, manifest) == entry.implementation
             }) else {
+                // An undescribed service follows its on_error. The gateway
+                // rejects fail_open for HTTP hook services.
                 described_entries.push(DescribedChainEntry {
                     entry,
                     service: None,
                     binding: None,
                     max_payload_bytes: 0,
                     timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
+                    http_hook_version: None,
                 });
                 continue;
             };
@@ -1575,15 +1953,28 @@ impl ChainRunner {
                 unbound.push(entry);
                 continue;
             };
+            let http_hook_version = binding_http_hook_version(manifest, &binding);
+            if http_hook_version == Some(HttpHookVersion::Current)
+                && entry.on_error == OnError::FailOpen
+            {
+                self.warn_fail_open_not_applied(&entry);
+            }
             let timeout = state.timeout_for_binding(&binding)?;
-            let advertised = validate_payload_limit("middleware manifest", &binding)?;
-            let max_payload_bytes = state.operator_max_payload_bytes.unwrap_or(advertised);
+            let payload_limit_required = binding_requires_payload_limit(manifest, &binding);
+            let advertised =
+                validate_payload_limit("middleware manifest", &binding, payload_limit_required)?;
+            let max_payload_bytes = if payload_limit_required {
+                state.operator_max_payload_bytes.unwrap_or(advertised)
+            } else {
+                0
+            };
             described_entries.push(DescribedChainEntry {
                 entry,
                 service: Some(Arc::clone(state)),
                 binding: Some(binding),
                 max_payload_bytes,
                 timeout,
+                http_hook_version,
             });
         }
         ensure_chain_capacity(described_entries.len())?;
@@ -1591,6 +1982,33 @@ impl ChainRunner {
             entries: described_entries,
             unbound,
         })
+    }
+
+    /// HTTP hook version of a registered middleware, without a network call. See
+    /// [`MiddlewareRegistry::http_hook_version_of`].
+    #[must_use]
+    pub fn http_hook_version_of(&self, implementation: &str) -> Option<HttpHookVersion> {
+        self.registry.http_hook_version_of(implementation)
+    }
+
+    /// Warn once per policy config that its `fail_open` does not apply to an
+    /// HTTP hook service. The gateway rejects such policies, but one
+    /// stored before the service moved to HTTP hooks still loads.
+    fn warn_fail_open_not_applied(&self, entry: &ChainEntry) {
+        let key = format!("{}\0{}", entry.name, entry.implementation);
+        let first = self
+            .registry
+            .fail_open_warnings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key);
+        if first {
+            tracing::warn!(
+                config = %entry.name,
+                middleware = %entry.implementation,
+                "middleware config sets on_error: fail_open, but its service runs HTTP hooks, which always fail closed; HTTP traffic fails closed"
+            );
+        }
     }
 
     pub async fn validate_config(
@@ -1689,11 +2107,36 @@ impl ChainRunner {
         admission: Option<MiddlewareWorkAdmission>,
     ) -> Result<ChainOutcome> {
         ensure_chain_capacity(entries.len())?;
+        // This engine runs legacy HTTP hooks only. A chain with an HTTP hook
+        // entry runs on the HTTP hook pipeline; one that reaches here mixes both
+        // hook versions and fails closed.
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.http_hook_version() == Some(HttpHookVersion::Current))
+        {
+            return Ok(ChainOutcome {
+                allowed: false,
+                reason: format!("middleware_failed: {MIDDLEWARE_HOOK_VERSIONS_MIXED}"),
+                body: input.body,
+                header_mutations: Vec::new(),
+                findings: Vec::new(),
+                metadata: BTreeMap::new(),
+                applied: vec![MiddlewareInvocation {
+                    name: entry.entry.name.clone(),
+                    implementation: entry.entry.implementation.clone(),
+                    decision: Decision::Deny,
+                    transformed: false,
+                    failed: true,
+                }],
+                denial: None,
+            });
+        }
         let HttpRequestInput {
             request_id,
             sandbox_id,
             sandbox_name,
             workspace,
+            originating_process,
             scheme,
             host,
             port,
@@ -1707,13 +2150,14 @@ impl ChainRunner {
         // The request envelope is moved into one stable chain state. Built-ins
         // borrow these values for every stage; only the gRPC adapter clones them
         // when an operator service requires an owned protobuf message.
-        let context = RequestContext {
+        let mut context = RequestContext {
             request_id,
             sandbox_id,
             sandbox: sandbox_name,
             workspace,
-            originating_process: None,
+            originating_process,
         };
+        fit_request_context(&mut context);
         let target = HttpRequestTarget {
             scheme,
             host,
@@ -2059,6 +2503,34 @@ impl ChainRunner {
     }
 }
 
+/// Conservatively determine whether two endpoint selectors can select the same
+/// host. Invalid selectors are reported by static policy validation.
+fn selectors_may_overlap(
+    left: Option<&openshell_core::proto::MiddlewareEndpointSelector>,
+    right: Option<&openshell_core::proto::MiddlewareEndpointSelector>,
+) -> bool {
+    use openshell_core::host_pattern::{HostPattern, HostSelector};
+    let (Some(left), Some(right)) = (left, right) else {
+        return false;
+    };
+    let (Ok(left_selector), Ok(right_selector)) = (
+        HostSelector::new(&left.include, &left.exclude),
+        HostSelector::new(&right.include, &right.exclude),
+    ) else {
+        return false;
+    };
+    let overlaps = |selector: &HostSelector, other: &HostSelector, patterns: &[String]| {
+        patterns
+            .iter()
+            .filter_map(|pattern| HostPattern::new(pattern).ok())
+            .any(|pattern| {
+                selector.may_match_pattern(&pattern) && other.may_match_pattern(&pattern)
+            })
+    };
+    overlaps(&left_selector, &right_selector, &right.include)
+        || overlaps(&right_selector, &left_selector, &left.include)
+}
+
 /// Sort middleware by policy-defined priority. Valid policies have unique order
 /// values; the name comparison only keeps direct internal callers deterministic.
 pub fn sort_chain_entries(entries: &mut [ChainEntry]) {
@@ -2120,6 +2592,37 @@ mod tests {
     }
 
     #[test]
+    fn fit_request_context_drops_farthest_ancestors_then_process() {
+        let ancestors: Vec<String> = (0..200)
+            .map(|i| format!("/opt/tools/bin/ancestor-{i:03}"))
+            .collect();
+        let mut context = RequestContext {
+            request_id: "req".into(),
+            originating_process: originating_process("/usr/bin/curl", &ancestors),
+            ..Default::default()
+        };
+        assert!(context.encoded_len() > MAX_MIDDLEWARE_CONTEXT_BYTES);
+        fit_request_context(&mut context);
+        assert!(context.encoded_len() <= MAX_MIDDLEWARE_CONTEXT_BYTES);
+        let process = context.originating_process.expect("process is kept");
+        assert_eq!(process.binary, "/usr/bin/curl");
+        assert!(!process.ancestors.is_empty());
+        assert_eq!(process.ancestors[..], ancestors[..process.ancestors.len()]);
+
+        let mut context = RequestContext {
+            originating_process: originating_process(
+                &format!("/{}", "b".repeat(MAX_MIDDLEWARE_CONTEXT_BYTES)),
+                &ancestors,
+            ),
+            ..Default::default()
+        };
+        fit_request_context(&mut context);
+        assert!(context.originating_process.is_none());
+
+        assert!(originating_process("", &ancestors).is_none());
+    }
+
+    #[test]
     fn advertised_audience_mismatch_fails_registration() {
         let configured = "urn:openshell:extension:middleware:content-guard";
 
@@ -2178,6 +2681,7 @@ mod tests {
             sandbox_id: "sbx-id".into(),
             sandbox_name: "sbx-name".into(),
             workspace: "wrks-default".into(),
+            originating_process: originating_process("/usr/bin/curl", &["/usr/bin/bash".into()]),
             scheme: "https".into(),
             host: "api.example.com".into(),
             port: 443,
@@ -2334,7 +2838,7 @@ mod tests {
         assert_eq!(outcome.body.as_ptr().addr(), expected_body);
         assert_eq!(received.len(), 2);
         assert_eq!(received[0].phase, SupervisorMiddlewarePhase::PreCredentials);
-        assert!(!received[0].originating_process_present);
+        assert!(received[0].originating_process_present);
         assert_eq!(received[0].request_id, expected_request_id);
         assert_eq!(received[0].host, expected_host);
         assert_eq!(received[0].first_header_name, expected_header_name);
@@ -3520,7 +4024,13 @@ mod tests {
         assert_eq!(context.sandbox_id, "sbx-id");
         assert_eq!(context.sandbox, "sbx-name");
         assert_eq!(context.workspace, "wrks-default");
-        assert!(context.originating_process.is_none());
+        let process = context
+            .originating_process
+            .as_ref()
+            .expect("originating process");
+        assert_eq!(process.binary, "/usr/bin/curl");
+        assert_eq!(process.ancestors, vec!["/usr/bin/bash".to_string()]);
+        assert_eq!(process.pid, 0);
         let target = received[0].target.as_ref().expect("request target");
         assert_eq!(target.scheme, "https");
         assert_eq!(target.host, "api.example.com");
@@ -3610,11 +4120,14 @@ mod tests {
                 }),
             ]),
             registered_services: Arc::new(vec![RegisteredMiddlewareService { registration }]),
+            fail_open_warnings: Arc::default(),
             middleware_names: Arc::new(HashSet::from([builtin_name, registration_name])),
             negotiated_extensions: Arc::new(Vec::new()),
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
+            http_buffering_admission: Arc::new(Semaphore::new(MAX_HTTP_HOOK_BUFFERING_SLOTS)),
+            http_streaming_admission: Arc::new(Semaphore::new(MAX_HTTP_HOOK_STREAMING_SLOTS)),
         }
     }
 
@@ -5122,6 +5635,7 @@ mod tests {
             sandbox_id: "sandbox".into(),
             sandbox_name: "sandbox-name".into(),
             workspace: "wrks-default".into(),
+            originating_process: originating_process("/usr/bin/node", &[]),
             scheme: "wss".into(),
             host: "api.openai.com".into(),
             port: 443,
@@ -5566,6 +6080,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -5634,6 +6149,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -5698,6 +6214,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -5771,6 +6288,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: originating_process("/usr/bin/node", &[]),
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -5805,6 +6323,11 @@ mod tests {
         assert_eq!(target.path, "/v1/responses");
         assert!(target.query.is_empty());
         assert_eq!(observed.requested_subprotocols, ["realtime"]);
+        let process = observed
+            .context
+            .and_then(|context| context.originating_process)
+            .expect("preflight originating process");
+        assert_eq!(process.binary, "/usr/bin/node");
         session
             .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
@@ -5857,6 +6380,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: None,
                     scheme: "ws".into(),
                     host: "api.openai.com".into(),
                     port: 80,
@@ -6154,6 +6678,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,

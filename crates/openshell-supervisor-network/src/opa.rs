@@ -11455,6 +11455,7 @@ network_policies:
                 sandbox_id: "sandbox".into(),
                 sandbox_name: "sandbox-name".into(),
                 workspace: "workspace".into(),
+                originating_process: None,
                 scheme: "wss".into(),
                 host: "api.openai.com".into(),
                 port: 443,
@@ -12404,6 +12405,18 @@ network_middlewares:
     middleware: openshell/regex
     endpoints:
       include: ["api[.example.com"]
+"#,
+                "invalid middleware configuration",
+            ),
+            (
+                "selector with a port",
+                r#"
+network_middlewares:
+  redactor:
+    middleware: openshell/regex
+    endpoints:
+      include: ["api.example.com"]
+      exclude: ["api.example.com:22"]
 "#,
                 "invalid middleware configuration",
             ),
