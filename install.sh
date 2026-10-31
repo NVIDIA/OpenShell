@@ -73,8 +73,8 @@ NOTES:
     x86_64/aarch64, depending on the host package manager. Set
     OPENSHELL_INSTALL_METHOD=snap to install the OpenShell snap instead; hosts
     that already have the OpenShell snap keep refreshing it. snap installs use
-    latest/stable by default and latest/edge for dev, and do not support
-    explicit release tags or prereleases. The OpenShell snap requires a running
+    latest/stable by default, latest/beta for pre, and latest/edge for dev. They
+    do not support explicit release tags. The OpenShell snap requires a running
     Docker Engine installed from a system package or Docker's package
     repository. The Docker snap is not currently compatible with OpenShell.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
@@ -612,6 +612,20 @@ user_home() {
   echo "/home/${_user}"
 }
 
+# Config dir the openshell CLI will use, resolved in the same environment the CLI
+# runs in. The CLI takes $XDG_CONFIG_HOME when set and $HOME/.config otherwise,
+# so asking through as_target_user covers both cases: the same-user branch
+# inherits the caller's XDG_CONFIG_HOME, while the sudo and runuser branches
+# reset the environment and fall back to the target user's home.
+#
+# An empty XDG_CONFIG_HOME falls back to $HOME/.config, per the XDG base
+# directory spec. openshell_core::paths::xdg_config_dir() does the same, so the
+# installer and the CLI agree on every value.
+target_openshell_config_dir() {
+  # shellcheck disable=SC2016
+  as_target_user sh -c 'printf "%s\n" "${XDG_CONFIG_HOME:-$HOME/.config}/openshell"'
+}
+
 as_target_user() {
   if [ "${PLATFORM:-}" = "darwin" ]; then
     if [ "$(id -u)" -eq "$TARGET_UID" ]; then
@@ -1043,7 +1057,7 @@ wait_for_local_gateway_listener() {
   _last_output=""
   _service_failed=0
   _probe_url="$(local_gateway_endpoint)/"
-  _mtls_dir="${TARGET_HOME}/.config/openshell/gateways/openshell/mtls"
+  _mtls_dir="$(target_openshell_config_dir)/gateways/openshell/mtls"
 
   info "waiting for local gateway listener to become reachable..."
   while [ "$_elapsed" -lt "$_timeout" ]; do
@@ -1119,7 +1133,7 @@ remove_local_gateway_registration_from() {
 }
 
 remove_local_gateway_registration() {
-  remove_local_gateway_registration_from "${TARGET_HOME}/.config/openshell"
+  remove_local_gateway_registration_from "$(target_openshell_config_dir)"
 }
 
 remove_snap_gateway_registration() {
@@ -1257,6 +1271,7 @@ install_linux_rpm() {
 openshell_snap_channel() {
   case "${OPENSHELL_VERSION:-}" in
     dev) printf '%s\n' "latest/edge" ;;
+    pre) printf '%s\n' "latest/beta" ;;
     '') printf '%s\n' "latest/stable" ;;
     *) error "snap installs do not support OPENSHELL_VERSION=${OPENSHELL_VERSION}; use a native package" ;;
   esac

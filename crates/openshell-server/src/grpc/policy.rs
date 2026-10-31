@@ -2788,8 +2788,8 @@ async fn resolve_sandbox_by_name_for_principal(
         Principal::User(_) | Principal::Operator(_) => {
             sandbox.ok_or_else(|| Status::not_found("sandbox not found"))
         }
-        Principal::Peer(_) => Err(Status::permission_denied(
-            "gateway peer principals may not resolve sandbox configuration",
+        Principal::Peer(_) | Principal::Supervisor(_) => Err(Status::permission_denied(
+            "gateway peer and supervisor principals may not resolve sandbox configuration",
         )),
         Principal::Anonymous => Err(Status::unauthenticated(
             "sandbox-scoped methods require an authenticated caller",
@@ -5412,6 +5412,8 @@ pub(super) async fn handle_push_sandbox_logs(
     state: &Arc<ServerState>,
     request: Request<tonic::Streaming<PushSandboxLogsRequest>>,
 ) -> Result<Response<PushSandboxLogsResponse>, Status> {
+    const MAX_BATCH_LINES: usize = 100;
+
     let principal = request
         .extensions()
         .get::<Principal>()
@@ -5437,8 +5439,19 @@ pub(super) async fn handle_push_sandbox_logs(
         )
         .await?;
 
-        let logs: Vec<_> = batch.logs.into_iter().take(100).collect();
+        let received_lines = batch.logs.len();
+        let logs: Vec<_> = batch.logs.into_iter().take(MAX_BATCH_LINES).collect();
         validate_sandbox_log_timestamps(&logs)?;
+
+        if received_lines > logs.len() {
+            warn!(
+                sandbox_id = %batch.sandbox_id,
+                received_lines,
+                accepted_lines = logs.len(),
+                dropped_lines = received_lines - logs.len(),
+                "Truncated sandbox log batch"
+            );
+        }
 
         for log in logs {
             let mut log = log;
@@ -8221,10 +8234,9 @@ fn materialize_global_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::audit::test_support::assert_boundary_finding;
     use crate::auth::identity::{Identity, IdentityProvider};
-    use crate::auth::principal::{
-        Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
-    };
+    use crate::auth::principal::{Principal, UserPrincipal};
     use crate::grpc::test_support::{authed_request, test_server_state};
 
     /// An in-memory store with the example profiles imported at platform scope.
@@ -8264,6 +8276,148 @@ mod tests {
                 },
             }));
         request
+    }
+
+    #[tokio::test]
+    async fn push_sandbox_logs_accepts_batched_replay_and_warns_on_truncation() {
+        use openshell_core::proto::open_shell_client::OpenShellClient;
+        use openshell_core::proto::open_shell_server::OpenShellServer;
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-log-replay";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "log-replay",
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let principal = crate::auth::principal::test_support::sandbox(sandbox_id);
+        let service = OpenShellServer::with_interceptor(
+            crate::grpc::OpenShellService::new(state.clone()),
+            move |mut request: Request<()>| {
+                request.extensions_mut().insert(principal.clone());
+                Ok(request)
+            },
+        );
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let mut client = OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+
+        let diagnostics = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter("off,openshell_server::grpc::policy=warn")
+            .with_writer(std::sync::Mutex::new(diagnostics.reopen().unwrap()))
+            .finish();
+        // This test uses a current-thread runtime, including the gateway tasks.
+        let _capture = tracing::subscriber::set_default(subscriber);
+        let mut seen_warnings = 0;
+
+        for (batch_size, count, accepted_count) in [
+            (200, 200, 100),
+            (1, 0, 0),
+            (1, 1, 1),
+            (50, 50, 50),
+            (100, 100, 100),
+            (101, 101, 100),
+            (199, 199, 100),
+            (201, 201, 100),
+            (50, 200, 200),
+            (50, 201, 201),
+        ] {
+            state.tracing_log_bus.remove(sandbox_id);
+            let logs: Vec<_> = (0..count)
+                .map(|index| SandboxLogLine {
+                    sandbox_id: "untrusted-id".to_string(),
+                    event_time: openshell_core::time::timestamp_from_millis(index).ok(),
+                    level: "INFO".to_string(),
+                    target: "reconnect-test".to_string(),
+                    message: format!("line {index}"),
+                    source: "gateway".to_string(),
+                    fields: HashMap::from([("index".to_string(), index.to_string())]),
+                })
+                .collect();
+            let expected: Vec<_> = logs
+                .iter()
+                .take(accepted_count)
+                .cloned()
+                .map(|mut log| {
+                    log.sandbox_id = sandbox_id.to_string();
+                    log.source = "sandbox".to_string();
+                    log
+                })
+                .collect();
+            let received_lines = logs.len();
+            let requests: Vec<_> = logs
+                .chunks(batch_size)
+                .map(|chunk| PushSandboxLogsRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    logs: chunk.to_vec(),
+                })
+                .collect();
+            client
+                .push_sandbox_logs(tokio_stream::iter(requests))
+                .await
+                .unwrap();
+
+            let received: Vec<_> = state
+                .tracing_log_bus
+                .tail(sandbox_id, 201)
+                .into_iter()
+                .map(|entry| {
+                    let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
+                        entry.event.payload
+                    else {
+                        panic!("expected a log event");
+                    };
+                    log
+                })
+                .collect();
+            assert_eq!(
+                received.len(),
+                expected.len(),
+                "gateway ingestion of {count} log lines in batches of {batch_size}"
+            );
+            assert_eq!(
+                received, expected,
+                "{count} log lines, batches of {batch_size}"
+            );
+
+            let warnings: Vec<serde_json::Value> = std::fs::read_to_string(diagnostics.path())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let emitted = &warnings[seen_warnings..];
+            assert_eq!(emitted.len(), usize::from(received_lines > accepted_count));
+            if let Some(warning) = emitted.first() {
+                assert_eq!(warning["level"], "WARN");
+                assert_eq!(
+                    warning["fields"],
+                    serde_json::json!({
+                        "message": "Truncated sandbox log batch",
+                        "sandbox_id": sandbox_id,
+                        "received_lines": received_lines,
+                        "accepted_lines": accepted_count,
+                        "dropped_lines": received_lines - accepted_count,
+                    })
+                );
+            }
+            seen_warnings = warnings.len();
+        }
+        server.abort();
     }
 
     #[test]
@@ -8453,13 +8607,7 @@ mod tests {
     pub(super) fn with_sandbox<T>(mut request: Request<T>, sandbox_id: &str) -> Request<T> {
         request
             .extensions_mut()
-            .insert(Principal::Sandbox(SandboxPrincipal {
-                sandbox_id: sandbox_id.to_string(),
-                source: SandboxIdentitySource::BootstrapJwt {
-                    issuer: "openshell-gateway:test".to_string(),
-                },
-                trust_domain: Some("openshell".to_string()),
-            }));
+            .insert(crate::auth::principal::test_support::sandbox(sandbox_id));
         request
     }
 
@@ -10462,6 +10610,7 @@ mod tests {
                 sandbox_id: "test-sandbox".to_string(),
                 source: SandboxIdentitySource::BootstrapJwt {
                     issuer: "openshell-gateway:test".to_string(),
+                    auth_epoch: None,
                 },
                 trust_domain: None,
             }));
@@ -11697,18 +11846,14 @@ mod tests {
             .await
             .expect_err("missing name must not leak existence to sandbox callers");
         assert_eq!(err.code(), Code::PermissionDenied);
-        let events: Vec<_> = capture
-            .events()
-            .iter()
-            .map(|event| event.to_json().unwrap())
-            .collect();
+        let events = capture.json_events();
         assert_eq!(events.len(), 2, "{events:?}");
         assert_eq!(events[0]["status_detail"], "cross_sandbox");
         assert_eq!(
             events[0]["resources"],
             serde_json::json!([{"name": "missing-sandbox", "type": "sandbox"}])
         );
-        assert_eq!(events[1]["class_uid"], 2004);
+        assert_boundary_finding(&events[0], &events[1]);
     }
 
     #[tokio::test]
@@ -11810,14 +11955,10 @@ mod tests {
             .expect_err("later frame must not switch sandbox ids");
 
         assert_eq!(err.code(), Code::PermissionDenied);
-        let events: Vec<_> = capture
-            .events()
-            .iter()
-            .map(|event| event.to_json().unwrap())
-            .collect();
+        let events = capture.json_events();
         assert_eq!(events.len(), 2, "{events:?}");
         assert_eq!(events[0]["status_detail"], "cross_sandbox");
-        assert_eq!(events[1]["class_uid"], 2004);
+        assert_boundary_finding(&events[0], &events[1]);
     }
 
     #[tokio::test]
@@ -23166,19 +23307,34 @@ mod tests {
 
     #[test]
     fn config_revision_changes_when_supervisor_middleware_services_change() {
+        use openshell_core::proto::{
+            SupervisorMiddlewareBinding, SupervisorMiddlewareBindingPolicy,
+        };
+
         let policy = ProtoSandboxPolicy::default();
         let settings = HashMap::new();
-        let service = openshell_core::proto::SupervisorMiddlewareService {
+        let mut service = openshell_core::proto::SupervisorMiddlewareService {
             name: "local-guard".into(),
             grpc_endpoint: "http://127.0.0.1:50051".into(),
             max_payload_bytes: 1024,
             ..Default::default()
         };
 
-        let without = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
-        let with =
-            compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[service]);
-        assert_ne!(without, with);
+        let revision = |services: &[openshell_core::proto::SupervisorMiddlewareService]| {
+            compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, services)
+        };
+        let without = revision(&[]);
+        let dynamic = revision(std::slice::from_ref(&service));
+        assert_ne!(without, dynamic);
+
+        service.binding_policy = SupervisorMiddlewareBindingPolicy::Allowlist.into();
+        service.bindings = vec![SupervisorMiddlewareBinding::HttpRequestPreCredentials.into()];
+        let request = revision(std::slice::from_ref(&service));
+        assert_ne!(dynamic, request);
+        service
+            .bindings
+            .push(SupervisorMiddlewareBinding::HttpResponsePreReturn.into());
+        assert_ne!(request, revision(&[service]));
     }
 
     #[test]

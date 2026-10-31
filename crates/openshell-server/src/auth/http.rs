@@ -12,8 +12,10 @@
 //! The handler reads the `CF_Authorization` cookie from the request headers
 //! (required because the cookie is typically `HttpOnly`) and serves a styled
 //! confirmation page. When the user clicks "Connect", JavaScript POSTs
-//! the token to `http://127.0.0.1:<callback_port>/callback`, where the
-//! CLI's ephemeral localhost server captures and stores the token.
+//! the token to `http://<callback_host>:<callback_port>/callback`, where the
+//! CLI's ephemeral localhost server captures and stores the token. The CLI
+//! supplies `callback_host` (validated to a loopback IP literal; IPv4
+//! loopback by default) so IPv6-bound listeners are reached at `[::1]`.
 
 use axum::{
     Json, Router,
@@ -52,6 +54,38 @@ struct ConnectParams {
     /// clicking Connect. Sent back in the XHR POST to the CLI callback
     /// server for cryptographic binding.
     code: String,
+    /// Unbracketed IP literal the browser should use to reach the CLI's
+    /// callback server (for example `127.0.0.1` or `::1`). Optional for
+    /// backward compatibility with older CLIs, which only bind IPv4
+    /// loopback. Strictly validated to a loopback literal by
+    /// [`sanitize_callback_host`] before use.
+    callback_host: Option<String>,
+}
+
+/// Validate the CLI-provided `callback_host` query parameter.
+///
+/// Returns the host in URL form (IPv4 bare, IPv6 bracketed) for use in the
+/// page's fetch URL and CSP, plus the unbracketed literal for round-tripping
+/// through the waiting-page refresh. Only loopback IP literals are accepted:
+/// the confirmation page embeds the edge auth token, and a crafted
+/// `callback_host` must never direct the browser to POST that token to an
+/// external host. Anything missing or untrusted falls back to the historical
+/// `127.0.0.1` target.
+fn sanitize_callback_host(raw: &Option<String>) -> (String, String) {
+    let fallback = ("127.0.0.1".to_string(), "127.0.0.1".to_string());
+    let Some(raw) = raw.as_deref().map(str::trim).filter(|h| !h.is_empty()) else {
+        return fallback;
+    };
+    let Ok(ip) = raw.parse::<std::net::IpAddr>() else {
+        return fallback;
+    };
+    if !ip.is_loopback() {
+        return fallback;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => (v4.to_string(), v4.to_string()),
+        std::net::IpAddr::V6(v6) => (format!("[{v6}]"), v6.to_string()),
+    }
 }
 
 /// Create the auth router.
@@ -211,14 +245,14 @@ async fn auth_connect(
 
     if let Some(token) = cf_token {
         let nonce = uuid::Uuid::new_v4().to_string();
-        let csp = format!(
-            "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; connect-src http://127.0.0.1:*"
-        );
+        let (url_host, _) = sanitize_callback_host(&params.callback_host);
+        let csp = connect_page_csp(&nonce, &url_host);
         (
             [(header::CONTENT_SECURITY_POLICY, csp)],
             Html(render_connect_page(
                 &safe_gateway,
                 params.callback_port,
+                &url_host,
                 &token,
                 &params.code,
                 &nonce,
@@ -227,12 +261,37 @@ async fn auth_connect(
             .into_response()
     } else {
         let csp = "default-src 'none'; style-src 'unsafe-inline'".to_string();
+        let (_, wire_host) = sanitize_callback_host(&params.callback_host);
         (
             [(header::CONTENT_SECURITY_POLICY, csp)],
-            Html(render_waiting_page(params.callback_port, &params.code)),
+            Html(render_waiting_page(
+                params.callback_port,
+                &wire_host,
+                &params.code,
+            )),
         )
             .into_response()
     }
+}
+
+/// Build the Content-Security-Policy for the connect page.
+///
+/// The page's only network egress is the POST to the CLI callback server,
+/// so `connect-src` targets the validated callback host. The IPv4 loopback
+/// source is always included: Chrome's CSP implementation does not support
+/// IPv6 literals in host-source expressions, so an IPv6 target's source is
+/// dropped there and the policy must not degrade to empty. The IPv6
+/// edge-login limitation this implies is documented in the CLI auth
+/// reference.
+fn connect_page_csp(nonce: &str, url_host: &str) -> String {
+    let connect_src = if url_host == "127.0.0.1" {
+        "http://127.0.0.1:*".to_string()
+    } else {
+        format!("http://127.0.0.1:* http://{url_host}:*")
+    };
+    format!(
+        "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; connect-src {connect_src}"
+    )
 }
 
 /// Extract a named cookie value from a `Cookie` header string.
@@ -258,6 +317,7 @@ fn extract_cookie(cookies: &str, name: &str) -> Option<String> {
 fn render_connect_page(
     gateway_addr: &str,
     callback_port: u16,
+    callback_host: &str,
     cf_token: &str,
     code: &str,
     nonce: &str,
@@ -276,6 +336,13 @@ fn render_connect_page(
         .replace('>', "\\u003e");
     let json_code = serde_json::to_string(code)
         .unwrap_or_else(|_| "\"\"".to_string())
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e");
+    // `callback_host` is validated by `sanitize_callback_host` to a loopback
+    // IP literal in URL form (IPv6 bracketed), so embedding it via JSON
+    // serialization is inject-safe.
+    let json_host = serde_json::to_string(callback_host)
+        .unwrap_or_else(|_| "\"127.0.0.1\"".to_string())
         .replace('<', "\\u003c")
         .replace('>', "\\u003e");
 
@@ -436,6 +503,7 @@ fn render_connect_page(
         var token = {json_token};
         var code = {json_code};
         var port = {callback_port};
+        var host = {json_host};
         function connect() {{
             var btn = document.getElementById('connectBtn');
             var status = document.getElementById('status');
@@ -444,7 +512,7 @@ fn render_connect_page(
             status.textContent = '';
             status.className = 'status';
 
-            fetch('http://127.0.0.1:' + port + '/callback', {{
+            fetch('http://' + host + ':' + port + '/callback', {{
                 method: 'POST',
                 headers: {{ 'Content-Type': 'application/json' }},
                 body: JSON.stringify({{ token: token, code: code }})
@@ -498,16 +566,19 @@ fn html_escape(s: &str) -> String {
 ///
 /// This can happen if the edge proxy hasn't completed authentication yet. The
 /// page auto-reloads after a short delay to pick up the cookie once login
-/// finishes. The `code` parameter is preserved across reloads.
-fn render_waiting_page(callback_port: u16, code: &str) -> String {
+/// finishes. The `code` and `callback_host` parameters are preserved across
+/// reloads; `callback_host` is the unbracketed loopback literal validated by
+/// [`sanitize_callback_host`].
+fn render_waiting_page(callback_port: u16, callback_host: &str, code: &str) -> String {
     let safe_code = html_escape(code);
+    let safe_host = html_escape(callback_host);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="refresh" content="2;url=/auth/connect?callback_port={callback_port}&amp;code={safe_code}">
+    <meta http-equiv="refresh" content="2;url=/auth/connect?callback_port={callback_port}&amp;callback_host={safe_host}&amp;code={safe_code}">
     <title>OpenShell — Authenticating</title>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -602,6 +673,7 @@ mod tests {
         let html = render_connect_page(
             "gateway.example.com:8080",
             12345,
+            "127.0.0.1",
             "test-jwt-token",
             "ABC-1234",
             "test-nonce",
@@ -622,10 +694,80 @@ mod tests {
     }
 
     #[test]
+    fn render_connect_page_targets_ipv4_loopback_by_default() {
+        let html = render_connect_page("gw", 1234, "127.0.0.1", "jwt", "ABC-1234", "nonce");
+        assert!(html.contains(r#"var host = "127.0.0.1""#));
+        assert!(html.contains("'http://' + host + ':' + port + '/callback'"));
+        // No hardcoded IPv4 target remains in the fetch URL construction.
+        assert!(!html.contains("fetch('http://127.0.0.1:"));
+    }
+
+    #[test]
+    fn render_connect_page_targets_bracketed_ipv6_loopback() {
+        let html = render_connect_page("gw", 1234, "[::1]", "jwt", "ABC-1234", "nonce");
+        assert!(html.contains(r#"var host = "[::1]""#));
+        assert!(html.contains("'http://' + host + ':' + port + '/callback'"));
+    }
+
+    #[test]
+    fn connect_page_csp_targets_callback_host() {
+        let ipv4 = connect_page_csp("n", "127.0.0.1");
+        assert!(ipv4.contains("connect-src http://127.0.0.1:*"), "{ipv4}");
+        assert_eq!(ipv4.matches("http://127.0.0.1").count(), 1);
+
+        // Chrome drops IPv6 host-source expressions it cannot parse, so the
+        // IPv4 loopback source must always remain in the policy.
+        let ipv6 = connect_page_csp("n", "[::1]");
+        assert!(
+            ipv6.contains("connect-src http://127.0.0.1:* http://[::1]:*"),
+            "{ipv6}"
+        );
+    }
+
+    #[test]
+    fn sanitize_callback_host_accepts_only_loopback_literals() {
+        // Default when missing.
+        assert_eq!(
+            sanitize_callback_host(&None),
+            ("127.0.0.1".to_string(), "127.0.0.1".to_string())
+        );
+        // IPv4 loopback passes through.
+        assert_eq!(
+            sanitize_callback_host(&Some("127.0.0.1".to_string())),
+            ("127.0.0.1".to_string(), "127.0.0.1".to_string())
+        );
+        // IPv6 loopback is bracketed for URLs.
+        assert_eq!(
+            sanitize_callback_host(&Some("::1".to_string())),
+            ("[::1]".to_string(), "::1".to_string())
+        );
+        // Non-loopback, hostnames, and garbage fall back to IPv4 loopback so
+        // a crafted parameter can never redirect the token elsewhere.
+        for hostile in [
+            "evil.example.com",
+            "192.168.1.5",
+            "0.0.0.0",
+            "::",
+            "localhost",
+            "127.0.0.1:8080",
+            "[::1]",
+            "",
+            "   ",
+        ] {
+            assert_eq!(
+                sanitize_callback_host(&Some(hostile.to_string())),
+                ("127.0.0.1".to_string(), "127.0.0.1".to_string()),
+                "hostile value: {hostile:?}"
+            );
+        }
+    }
+
+    #[test]
     fn render_connect_page_escapes_special_chars() {
         let html = render_connect_page(
             "gw",
             1234,
+            "127.0.0.1",
             "token<script>alert('xss')</script>",
             "ABC-1234",
             "nonce",
@@ -636,7 +778,7 @@ mod tests {
 
     #[test]
     fn render_connect_page_includes_code_in_js_payload() {
-        let html = render_connect_page("gw", 1234, "jwt", "XY7-9KLM", "nonce");
+        let html = render_connect_page("gw", 1234, "127.0.0.1", "jwt", "XY7-9KLM", "nonce");
         // The JS should send the code in the JSON payload (now JSON-encoded)
         assert!(html.contains(r#"var code = "XY7-9KLM""#));
         assert!(html.contains("code: code"));
@@ -661,15 +803,22 @@ mod tests {
 
     #[test]
     fn render_waiting_page_has_auto_refresh_with_code() {
-        let html = render_waiting_page(12345, "ABC-1234");
+        let html = render_waiting_page(12345, "127.0.0.1", "ABC-1234");
         assert!(html.contains("meta http-equiv=\"refresh\""));
         assert!(html.contains("callback_port=12345"));
         assert!(html.contains("code=ABC-1234"));
+        assert!(html.contains("callback_host=127.0.0.1"));
+    }
+
+    #[test]
+    fn render_waiting_page_preserves_ipv6_callback_host() {
+        let html = render_waiting_page(12345, "::1", "ABC-1234");
+        assert!(html.contains("callback_host=::1"));
     }
 
     #[test]
     fn render_waiting_page_escapes_code() {
-        let html = render_waiting_page(1234, "x\"onload=\"alert(1)");
+        let html = render_waiting_page(1234, "127.0.0.1", "x\"onload=\"alert(1)");
         // The double quote should be escaped so it can't break out of the
         // meta-refresh content attribute.
         assert!(!html.contains("x\"onload"));

@@ -72,6 +72,10 @@
       - --detach
       - --name
       - "{{ keycloak_container_name }}"
+      # Environment setup bakes the container into a cached disk; it must
+      # come back when a session boots from that disk.
+      - --restart
+      - unless-stopped
       - --publish
       - "127.0.0.1:{{ keycloak_port }}:8080"
       - --env

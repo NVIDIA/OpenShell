@@ -118,6 +118,9 @@ fn build_provider(
 pub struct OtlpExport {
     traces: Option<Signal<SdkTracerProvider>>,
     ocsf: Option<Signal<OcsfOtlp>>,
+    /// Validated collector that supervisors relay workload traces to. The
+    /// gateway itself exports nothing for this signal.
+    agent_endpoint: Option<String>,
 }
 
 /// One signal's exporter and the endpoint it sends to.
@@ -168,15 +171,25 @@ impl OtlpExport {
                 let target = target(&ocsf.endpoint)?;
                 Ok::<_, SetupError>(Signal {
                     endpoint: target.endpoint().to_string(),
-                    exporter: OcsfOtlp::start(
-                        target.log_exporter()?,
-                        target.resource().clone(),
-                        ocsf.schema_version,
-                    ),
+                    exporter: OcsfOtlp::start(target.log_exporter()?, target.resource().clone()),
                 })
             })
             .transpose()?;
-        Ok(Self { traces, ocsf })
+        let agent_endpoint = cfg
+            .agent_endpoint()
+            .map(|endpoint| target(endpoint).map(|target| target.endpoint().to_string()))
+            .transpose()?;
+        Ok(Self {
+            traces,
+            ocsf,
+            agent_endpoint,
+        })
+    }
+
+    /// The collector that supervisors relay workload traces to, when the
+    /// agent trace relay is enabled.
+    pub fn agent_endpoint(&self) -> Option<&str> {
+        self.agent_endpoint.as_deref()
     }
 
     /// The collector receiving traces, when trace export is enabled.
@@ -574,6 +587,7 @@ mod tests {
                 endpoint: endpoint.into(),
             }),
             ocsf: None,
+            agent: None,
         }
     }
 
@@ -709,7 +723,6 @@ mod tests {
                 .log_exporter_with_headers(Some("authorization=Bearer%20collector-token"))
                 .unwrap(),
             target.resource().clone(),
-            None,
         );
         let event =
             ConfigStateChangeBuilder::new(&crate::gateway_ocsf::context("sandbox-1", "sandbox"))
@@ -887,7 +900,15 @@ mod tests {
     async fn misconfigured_endpoint_disables_export_without_failing_startup() {
         let mut bad_ocsf = config();
         bad_ocsf.ocsf = Some(ocsf_config("definitely not a url"));
-        for cfg in [with_traces_endpoint("definitely not a url"), bad_ocsf] {
+        let mut bad_agent = config();
+        bad_agent.agent = Some(crate::config_file::AgentOtlpConfig {
+            endpoint: "definitely not a url".into(),
+        });
+        for cfg in [
+            with_traces_endpoint("definitely not a url"),
+            bad_ocsf,
+            bad_agent,
+        ] {
             let (export, err) = OtlpExport::start(Some(&cfg), GatewayResourceAttributes::default());
             assert!(
                 export.is_none(),

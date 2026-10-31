@@ -381,7 +381,7 @@ fn map_session_stream_message<T>(
 /// The task runs for the lifetime of the sandbox process, reconnecting with
 /// exponential backoff on failures.
 pub fn spawn(
-    endpoint: String,
+    gateway: grpc_client::GatewayEndpoint,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
     port_forward: Arc<BoundaryLoopbackConnector>,
@@ -390,7 +390,7 @@ pub fn spawn(
     runtime: SessionRuntimeContext,
 ) -> tokio::task::JoinHandle<()> {
     spawn_with_readiness(
-        endpoint,
+        gateway,
         sandbox_id,
         ssh_socket_path,
         port_forward,
@@ -403,7 +403,7 @@ pub fn spawn(
 
 /// Spawn the supervisor session and expose when the gateway has accepted it.
 pub fn spawn_with_readiness(
-    endpoint: String,
+    gateway: grpc_client::GatewayEndpoint,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
     port_forward: Arc<BoundaryLoopbackConnector>,
@@ -413,7 +413,7 @@ pub fn spawn_with_readiness(
 ) -> (tokio::task::JoinHandle<()>, watch::Receiver<bool>) {
     let (ready_tx, ready_rx) = watch::channel(false);
     let config = SessionConfig {
-        endpoint,
+        gateway,
         sandbox_id,
         ssh_socket_path,
         port_forward,
@@ -429,7 +429,7 @@ pub fn spawn_with_readiness(
 }
 
 struct SessionConfig {
-    endpoint: String,
+    gateway: grpc_client::GatewayEndpoint,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
     port_forward: Arc<BoundaryLoopbackConnector>,
@@ -453,7 +453,7 @@ async fn run_session_loop(config: SessionConfig) {
     // dial `target` for the next attempt and mark it as redirected so that
     // replica serves us rather than redirecting again. Any failure sends us
     // back to the configured address, which load-balances across replicas.
-    let mut target = config.endpoint.clone();
+    let mut target = config.gateway.clone();
     let mut redirected = false;
 
     loop {
@@ -466,8 +466,11 @@ async fn run_session_loop(config: SessionConfig) {
         match result {
             Ok(SessionOutcome::Closed) => {
                 config.ready_tx.send_replace(false);
-                let event =
-                    session_closed_event(openshell_ocsf::ctx::ctx(), &target, &config.sandbox_id);
+                let event = session_closed_event(
+                    &openshell_ocsf::ctx::ctx(),
+                    target.url(),
+                    &config.sandbox_id,
+                );
                 ocsf_emit!(event);
                 break;
             }
@@ -482,23 +485,23 @@ async fn run_session_loop(config: SessionConfig) {
                     peer_endpoint = %peer_endpoint,
                     "supervisor session: following gateway redirect"
                 );
-                target = peer_endpoint;
+                target = config.gateway.with_url(peer_endpoint);
                 redirected = true;
                 // No backoff: this is an expected handoff, not a failure.
             }
             Err(e) => {
                 let accepted = config.ready_tx.send_replace(false);
                 let event = session_failed_event(
-                    openshell_ocsf::ctx::ctx(),
-                    &target,
+                    &openshell_ocsf::ctx::ctx(),
+                    target.url(),
                     attempt,
                     &e.to_string(),
                 );
                 ocsf_emit!(event);
                 // Fall back to the configured gateway address so a redirect
                 // to a replica that is going away cannot strand the sandbox.
-                let failed_redirect_target = target != config.endpoint && !accepted;
-                target.clone_from(&config.endpoint);
+                let failed_redirect_target = target.url() != config.gateway.url() && !accepted;
+                target.clone_from(&config.gateway);
                 redirected = redirect_survives_failure(redirected, accepted);
                 if let Some(delay) = backoff.on_failure(accepted, failed_redirect_target) {
                     tokio::time::sleep(delay).await;
@@ -580,7 +583,7 @@ enum SessionOutcome {
 
 async fn run_single_session(
     config: &SessionConfig,
-    target: &str,
+    target: &grpc_client::GatewayEndpoint,
     redirected: bool,
     connection_epoch: u64,
 ) -> Result<SessionOutcome, Box<dyn std::error::Error + Send + Sync>> {
@@ -667,8 +670,8 @@ async fn run_single_session(
         updates.send_replace(Some(accepted.session_id.clone()));
     }
     let event = session_established_event(
-        openshell_ocsf::ctx::ctx(),
-        target,
+        &openshell_ocsf::ctx::ctx(),
+        target.url(),
         &accepted.session_id,
         u32::try_from(heartbeat_secs).unwrap_or(u32::MAX),
     );
@@ -807,12 +810,12 @@ async fn apply_update(
 
 /// Report the canonical process result and wait for durable handling.
 pub async fn report_main_process_exit(
-    endpoint: &str,
+    gateway: &grpc_client::GatewayEndpoint,
     sandbox_id: &str,
     instance_id: &str,
     exit_code: i32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let channel = grpc_client::connect_channel_pub(endpoint)
+    let channel = grpc_client::connect_channel_pub(gateway)
         .await
         .map_err(|error| format!("connect failed: {error}"))?;
     let mut client = OpenShellClient::new(channel);
@@ -844,11 +847,11 @@ pub(crate) async fn test_bridge_ssh_relay(
 
 /// Confirm terminal delivery and permit ephemeral cleanup.
 pub async fn finalize_main_process_exit(
-    endpoint: &str,
+    gateway: &grpc_client::GatewayEndpoint,
     sandbox_id: &str,
     instance_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let channel = grpc_client::connect_channel_pub(endpoint)
+    let channel = grpc_client::connect_channel_pub(gateway)
         .await
         .map_err(|error| format!("connect failed: {error}"))?;
     let mut client = OpenShellClient::new(channel);
@@ -904,7 +907,8 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
             let expected_ssh_peer_pid = context.expected_ssh_peer_pid;
             let terminating = Arc::clone(context.terminating);
 
-            let event = relay_open_event(openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
+            let event =
+                relay_open_event(&openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
             ocsf_emit!(event);
 
             tokio::spawn(async move {
@@ -922,7 +926,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
                 {
                     Ok(()) => {
                         let event = relay_closed_event(
-                            openshell_ocsf::ctx::ctx(),
+                            &openshell_ocsf::ctx::ctx(),
                             &event_open,
                             &ssh_socket_path,
                         );
@@ -930,7 +934,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
                     }
                     Err(e) => {
                         let event = relay_failed_event(
-                            openshell_ocsf::ctx::ctx(),
+                            &openshell_ocsf::ctx::ctx(),
                             &event_open,
                             &ssh_socket_path,
                             &e.to_string(),
@@ -948,7 +952,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
         }
         Some(gateway_message::Payload::RelayClose(close)) => {
             let event = relay_close_from_gateway_event(
-                openshell_ocsf::ctx::ctx(),
+                &openshell_ocsf::ctx::ctx(),
                 &close.channel_id,
                 &close.reason,
             );

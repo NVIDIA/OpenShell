@@ -8,6 +8,11 @@ module.exports = async function checkIssueAcceptance({ github, context, core }) 
   });
   const author = pr.user.login;
 
+  if (author === 'dependabot[bot]') {
+    core.info('Dependabot PRs are exempt from issue acceptance.');
+    return;
+  }
+
   async function evaluate() {
     try {
       const { data } = await github.rest.repos.getCollaboratorPermissionLevel({

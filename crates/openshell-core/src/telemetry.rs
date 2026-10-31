@@ -105,6 +105,8 @@ pub enum LifecycleOperation {
     Delete,
     Stop,
     Start,
+    Suspend,
+    Resume,
     Update,
 }
 
@@ -116,6 +118,8 @@ impl LifecycleOperation {
             Self::Delete => "delete",
             Self::Stop => "stop",
             Self::Start => "start",
+            Self::Suspend => "suspend",
+            Self::Resume => "resume",
             Self::Update => "update",
         }
     }

@@ -204,7 +204,8 @@ async fn sandbox_service_routing_first(
     req: Request,
     next: Next,
 ) -> impl IntoResponse {
-    if crate::service_routing::is_sandbox_service_request(&req, &state.config.service_routing) {
+    let host = crate::service_routing::service_request_host(&req);
+    if crate::service_routing::is_sandbox_service_request_with_state(host, &state).await {
         return crate::service_routing::proxy_sandbox_service_request(state, req)
             .await
             .into_response();
@@ -216,7 +217,8 @@ async fn sandbox_service_routing_only(
     State(state): State<Arc<crate::ServerState>>,
     req: Request,
 ) -> impl IntoResponse {
-    if !crate::service_routing::is_sandbox_service_request(&req, &state.config.service_routing) {
+    let host = crate::service_routing::service_request_host(&req);
+    if !crate::service_routing::is_sandbox_service_request_with_state(host, &state).await {
         return StatusCode::NOT_FOUND.into_response();
     }
     if !browser_context_allows_plaintext_service_request(&req) {

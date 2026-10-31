@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+{{- include "openshell.validateValues" . }}
+{{- if and (include "openshell.supervisorEnabled" .) .Values.networkPolicy.enabled }}
+{{- $kubernetes := include "openshell.effectiveKubernetesConfig" . | fromYaml }}
+{{- $shared := get $kubernetes "shared_supervisor" }}
+# Only sandbox workloads in this gateway's sandbox namespaces reach the routed
+# runtime listener. Each sandbox's own egress allowance limits its workload to
+# that port, and the routing preface plus the generation's pinned TLS identity
+# decide which instance it reaches. The supervisor dials the gateway itself,
+# so no ingress from the gateway is needed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "openshell.supervisorName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: supervisor
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "openshell.supervisorSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- include "openshell.supervisorSandboxNamespaces" (dict "kubernetes" $kubernetes) | nindent 12 }}
+          podSelector:
+            matchLabels:
+              openshell.ai/boundary-role: workload
+      ports:
+        - protocol: TCP
+          port: {{ get $shared "runtime_port" }}
+  # Instances carry policy-approved sandbox egress, as dedicated supervisors
+  # do, and the host reaches the gateway.
+  egress:
+    - {}
+{{- end }}

@@ -689,7 +689,7 @@ impl ConfigRuntime {
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
         apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-        apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
+        report_deprecated_ocsf_schema_version(&ctx.ocsf_schema_version, &result.settings);
 
         // Apply the agent-proposals feature toggle. On a false→true transition
         // we lazily install the skill so a sandbox that started with the flag
@@ -738,7 +738,7 @@ impl ConfigRuntime {
         );
         let provider = match client
             .fetch_provider_environment(
-                &ctx.endpoint,
+                &ctx.gateway,
                 &ctx.sandbox_id,
                 ctx.provider_credentials.requires_stable_placeholders(),
             )
@@ -1159,7 +1159,7 @@ impl ConfigRuntime {
 
 pub async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     let client = openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
-        &ctx.endpoint,
+        &ctx.gateway,
         ctx.extension_credentials.clone(),
     )
     .await?;
@@ -1198,7 +1198,7 @@ async fn report_runtime_configuration(
         );
     }
     openshell_core::grpc_client::report_sandbox_configuration(
-        &ctx.endpoint,
+        &ctx.gateway,
         &ctx.sandbox_id,
         instance_id,
         Some(snapshot),
@@ -1277,7 +1277,10 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                         runtime.applied_revision = Some(sandbox_config_revision(&result));
                     }
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-                    apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
+                    report_deprecated_ocsf_schema_version(
+                        &ctx.ocsf_schema_version,
+                        &result.settings,
+                    );
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
                         agent_proposals_enabled_from_settings(&result.settings),
@@ -1316,7 +1319,10 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 }
                 (InitialPollDisposition::TrackOnly, _) => {
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-                    apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
+                    report_deprecated_ocsf_schema_version(
+                        &ctx.ocsf_schema_version,
+                        &result.settings,
+                    );
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
                         agent_proposals_enabled_from_settings(&result.settings),
@@ -1465,20 +1471,33 @@ fn extract_bool_setting(
         })
 }
 
-fn apply_ocsf_schema_version_setting(
-    version: &std::sync::Mutex<String>,
+/// Report a newly set `ocsf_schema_version`, which is deprecated and ignored.
+fn report_deprecated_ocsf_schema_version(
+    seen: &std::sync::Mutex<String>,
     settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
-) {
-    let new_version = extract_string_setting(settings, "ocsf_schema_version").unwrap_or_default();
-    if let Ok(mut current) = version.lock()
-        && *current != new_version
-    {
-        info!(
-            ocsf_schema_version = %new_version,
-            "OCSF schema version target changed"
-        );
-        *current = new_version;
+) -> bool {
+    let value = extract_string_setting(settings, "ocsf_schema_version").unwrap_or_default();
+    let Ok(mut seen) = seen.lock() else {
+        return false;
+    };
+    if *seen == value {
+        return false;
     }
+    seen.clone_from(&value);
+    if value.is_empty() {
+        return false;
+    }
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Medium)
+            .state(StateId::Other, "deprecated")
+            .unmapped("ocsf_schema_version", serde_json::json!(value))
+            .message(
+                "Setting ocsf_schema_version is deprecated and ignored; OpenShell emits OCSF 1.8.0"
+            )
+            .build()
+    );
+    true
 }
 
 /// Extract a string value from an effective setting, if present.
@@ -1618,6 +1637,7 @@ mod tests {
     use super::*;
     use crate::tests::{
         proto_policy_fixture, proto_tcp_policy_fixture, settings_poll_result, startup_provider,
+        test_gateway,
     };
     use crate::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1693,9 +1713,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_ocsf_schema_version_setting_updates_from_initial_settings_snapshot() {
-        let version = std::sync::Mutex::new(String::new());
+    fn deprecated_ocsf_schema_version_is_reported_once_per_change() {
+        let seen = std::sync::Mutex::new(String::new());
         let mut settings = std::collections::HashMap::new();
+        assert!(!report_deprecated_ocsf_schema_version(&seen, &settings));
+
         settings.insert(
             "ocsf_schema_version".to_string(),
             openshell_core::proto::EffectiveSetting {
@@ -1707,20 +1729,11 @@ mod tests {
                 scope: openshell_core::proto::SettingScope::Sandbox.into(),
             },
         );
+        assert!(report_deprecated_ocsf_schema_version(&seen, &settings));
+        assert!(!report_deprecated_ocsf_schema_version(&seen, &settings));
 
-        apply_ocsf_schema_version_setting(&version, &settings);
-
-        assert_eq!(*version.lock().unwrap(), "1.3");
-    }
-
-    #[test]
-    fn apply_ocsf_schema_version_setting_clears_when_setting_is_unset() {
-        let version = std::sync::Mutex::new("1.1".to_string());
-        let settings = std::collections::HashMap::new();
-
-        apply_ocsf_schema_version_setting(&version, &settings);
-
-        assert_eq!(*version.lock().unwrap(), "");
+        settings.clear();
+        assert!(!report_deprecated_ocsf_schema_version(&seen, &settings));
     }
 
     #[test]
@@ -1779,7 +1792,7 @@ mod tests {
 
         async fn fetch_provider_environment(
             &self,
-            _endpoint: &str,
+            _gateway: &openshell_core::grpc_client::GatewayEndpoint,
             _sandbox_id: &str,
             _requires_stable_placeholders: bool,
         ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
@@ -1826,12 +1839,12 @@ mod tests {
 
         async fn fetch_provider_environment(
             &self,
-            endpoint: &str,
+            gateway: &openshell_core::grpc_client::GatewayEndpoint,
             sandbox_id: &str,
             requires_stable_placeholders: bool,
         ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
             self.inner
-                .fetch_provider_environment(endpoint, sandbox_id, requires_stable_placeholders)
+                .fetch_provider_environment(gateway, sandbox_id, requires_stable_placeholders)
                 .await
         }
 
@@ -2074,7 +2087,7 @@ mod tests {
 
         async fn fetch_provider_environment(
             &self,
-            _endpoint: &str,
+            _gateway: &openshell_core::grpc_client::GatewayEndpoint,
             sandbox_id: &str,
             requires_stable_placeholders: bool,
         ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
@@ -2212,12 +2225,12 @@ mod tests {
 
         async fn fetch_provider_environment(
             &self,
-            endpoint: &str,
+            gateway: &openshell_core::grpc_client::GatewayEndpoint,
             sandbox_id: &str,
             requires_stable_placeholders: bool,
         ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
             self.inner
-                .fetch_provider_environment(endpoint, sandbox_id, requires_stable_placeholders)
+                .fetch_provider_environment(gateway, sandbox_id, requires_stable_placeholders)
                 .await
         }
 
@@ -2709,7 +2722,7 @@ mod tests {
             );
         }
         PolicyPollLoopContext {
-            endpoint: String::new(),
+            gateway: test_gateway(),
             sandbox_id: "sandbox-test".to_string(),
             sandbox: "sandbox-test-name".to_string(),
             opa_engine,

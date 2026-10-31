@@ -9,12 +9,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, Utc};
-use openshell_ocsf::{OcsfEvent, format::downgrade::downgrade_event};
+use openshell_ocsf::OcsfEvent;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
-use crate::config_file::{OcsfLogConfig, OcsfLogRotation, OcsfSchemaVersion};
+use crate::config_file::{OcsfLogConfig, OcsfLogRotation};
 
 const BATCH_SIZE: usize = 100;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
@@ -49,7 +49,7 @@ impl Collector {
     }
 
     pub(crate) fn collect(&self, event: &OcsfEvent) {
-        match serialize_event(event, self.0.config.schema_version) {
+        match event.to_json_line().map(String::into_bytes) {
             Ok(line) => {
                 self.enqueue(line);
             }
@@ -156,20 +156,6 @@ impl Collector {
             metrics::counter!("openshell_ocsf_log_written_total").increment(1);
         }
     }
-}
-
-fn serialize_event(
-    event: &OcsfEvent,
-    schema_version: Option<OcsfSchemaVersion>,
-) -> Result<Vec<u8>, serde_json::Error> {
-    let Some(schema_version) = schema_version else {
-        return event.to_json_line().map(String::into_bytes);
-    };
-    let mut event = serde_json::to_value(event)?;
-    downgrade_event(&mut event, schema_version.as_str());
-    let mut line = serde_json::to_vec(&event)?;
-    line.push(b'\n');
-    Ok(line)
 }
 
 pub struct OcsfLog {
@@ -483,11 +469,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_events_use_the_configured_schema_version() {
+    async fn deprecated_schema_version_is_ignored() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
         let mut settings = config(&path);
-        settings.schema_version = Some(OcsfSchemaVersion::V1_3);
+        settings.schema_version = Some("1.3".to_string());
         let log = OcsfLog::start(settings).unwrap();
         let event = ConfigStateChangeBuilder::new(&crate::gateway_ocsf::context("", ""))
             .message("Gateway configuration changed")
@@ -498,11 +484,7 @@ mod tests {
 
         let event: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(event["metadata"]["version"], "1.3");
-        assert_eq!(
-            event["unmapped"]["downgraded_from"],
-            openshell_ocsf::OCSF_VERSION
-        );
+        assert_eq!(event["metadata"]["version"], openshell_ocsf::OCSF_VERSION);
     }
 
     #[tokio::test]

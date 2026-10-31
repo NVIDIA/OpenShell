@@ -68,8 +68,8 @@ fn membership_filter_subject<'a>(
             }
         }
         Principal::Sandbox(_) | Principal::Operator(_) => Ok(None),
-        Principal::Peer(_) => Err(Status::permission_denied(
-            "gateway peer principals cannot list workspaces",
+        Principal::Peer(_) | Principal::Supervisor(_) => Err(Status::permission_denied(
+            "gateway peer and supervisor principals cannot list workspaces",
         )),
         Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
     }
@@ -469,11 +469,9 @@ pub(super) fn authorize_member_role(
         ));
     }
     if role == WorkspaceRole::Admin && grant != AuthGrant::PlatformAdmin {
-        crate::auth::audit::emit_authorization_denial(
+        return Err(crate::auth::audit::deny(
             principal,
             crate::auth::audit::AuthzDenial::PlatformAdminRequired,
-        );
-        return Err(Status::permission_denied(
             "only platform admins can assign the workspace admin role",
         ));
     }

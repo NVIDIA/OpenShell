@@ -684,6 +684,12 @@ certificate—still applies. The application is responsible for authentication
 enabled on its endpoint, and an upstream edge proxy may still apply its own
 access policy. For gateway service-domain configuration, refer to
 [Manage Gateways](/how-it-works/gateways/overview#configure-service-forwarding).
+
+Consume the URL the CLI or SDK prints rather than constructing hostnames from
+workspace, sandbox, and service names. The hostname format is a gateway
+configuration detail: gateways configured with a service routing name return
+opaque hashed hostnames (`https://<hash>.<base-domain>/`) instead of the
+readable composite.
 </Note>
 
 ## Monitor and Debug
@@ -1000,9 +1006,129 @@ command. Starting a fresh instance invalidates SSH sessions issued for the
 previous runtime generation. Delete an inactive sandbox normally when you no
 longer need its retained state.
 
+To change the configuration of a retained `Completed` or `Error/MainProcessFailed`
+sandbox, run `sandbox stop` first. Stop cleans up compute and moves the sandbox
+to `Stopped`, preserving its exit code until the next start. This stop behavior
+also applies when sandbox updates are disabled.
+
+If the terminal sandbox's compute resource is already gone, stop succeeds and
+preserves its terminal phase and exit code. Configuration updates require a
+retained compute resource.
+
 If an infrastructure failure leaves a sandbox in `Error`, fix the reported cause, then run `sandbox stop` followed by `sandbox start`. Wait for stop to succeed before starting. This retains the sandbox and its persistent workspace on backends that support restarting stopped sandboxes; it cannot recover deleted resources or storage.
 
 For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
+
+### Update the Image of a Stopped Sandbox
+
+Use `openshell.v1.SandboxUpdates/UpdateSandbox` to change a stopped sandbox's
+workload image, command, environment overrides, labels, and annotations together. This separate service uses the same gateway listener
+and authentication as `OpenShell`; it requires `sandbox:write` and workspace
+user access. This operation initially supports the Kubernetes compute driver
+for workload changes; metadata-only updates work with every compute driver. There is no
+`sandbox update` CLI command or curated SDK update method.
+
+Image updates default to disabled. Ask the operator to complete the
+[compatible deployment rollout](/kubernetes/high-availability#activate-sandbox-updates)
+before enabling `enable_sandbox_updates` in the
+[gateway configuration](/how-it-works/gateways/configuration#sandbox-updates).
+
+The update preserves the sandbox ID, Kubernetes custom resource, and persistent
+volume claim. It does not delete and recreate the sandbox, reseed its existing
+workspace from the new image, or change the trusted supervisor and sandbox
+runtime images. Omitted fields retain their current values. A supplied command
+replaces the argv list without shell expansion; an empty list restores the default
+login shell resolved from the workload image. The Kubernetes driver rejects an
+update before acceptance if the encoded command and other custom-resource
+annotations exceed Kubernetes' combined 256 KiB annotation limit.
+A supplied environment map replaces
+sandbox-level overrides; clearing it restores any template-provided defaults.
+Labels and annotations replace user metadata on the gateway resource, preserve
+system-owned keys, and do not set Kubernetes pod metadata. Attempts to supply
+system-owned keys are rejected. Metadata-only changes commit directly without
+contacting the compute driver. The retention annotation is preserved when omitted.
+Annotation changes accepted through `UpdateConfig` after the sandbox update is
+accepted remain in place when the update completes, including after a retry.
+
+Without a pending update, a request whose target values already match is a no-op.
+Use a different image tag or an immutable digest to select new image content.
+Workload changes require `openshell.compute.update-sandbox-configuration`.
+Upgrade every gateway before enabling updates.
+
+Follow this sequence through the CLI and a generated/raw RPC client.
+
+1. Run `openshell sandbox stop my-sandbox` and wait for `Stopped`.
+2. Call `GetSandbox` with the named `workspace_scope` and sandbox `name`. Read
+   `sandbox.metadata.resource_version` after stop completes.
+3. Call `UpdateSandbox` with the same scope and name, the selected update fields,
+   and `expected_resource_version` set to that current, nonzero
+   version. The response is a `SandboxResponse`; the sandbox remains stopped.
+4. After the update succeeds, run `openshell sandbox start my-sandbox` to launch
+   the new image.
+
+With an authenticated Rust SDK `OpenShellClient`, use the separate raw client
+and the `current_resource_version` read in step 2:
+
+```rust
+use openshell_sdk::raw::{UpdateSandboxRequest, proto};
+
+let mut updates = client.raw_sandbox_updates_fresh().await?;
+let response = updates.update_sandbox(UpdateSandboxRequest {
+    workspace_scope: Some(proto::workspace_selector("default")),
+    name: "my-sandbox".into(),
+    image: Some("registry.example.com/agents/my-agent:2.0".into()),
+    command: Some(proto::SandboxCommandUpdate {
+        argv: vec!["/usr/local/bin/start-agent".into(), "--new-option".into()],
+    }),
+    environment: Some(proto::SandboxMapUpdate {
+        values: [("AGENT_MODE".into(), "updated".into())].into_iter().collect(),
+    }),
+    expected_resource_version: current_resource_version,
+    request_id: String::new(),
+    ..Default::default()
+}).await?;
+```
+
+The helper shares the main client's transport and live authentication slot.
+Generated clients use the `SandboxUpdates` service, not `OpenShell`.
+
+If the new image fails to start and provisioning times out, wait until
+`provisioning.cleanup_completed_time` is present and
+`provisioning.driver_operation_pending` is false. Run `sandbox stop` to move the
+reclaimed sandbox from `Error` to `Stopped`, then repeat the update sequence with
+a working image. Stop retains the timeout record and storage; it does not stop
+compute again. This Stop behavior also applies when updates are disabled.
+Cleanup that is still pending cannot be bypassed.
+
+An `ABORTED` version conflict requires another read before you construct a new
+conditional request. The gateway limits driver preflight and each accepted update
+attempt to one minute each. A timed-out preflight does not accept an update.
+An accepted update continues after client cancellation until it completes or
+times out. A timeout releases the sandbox for recovery or deletion; it does not
+roll back an update the driver may have applied.
+An update failure or disconnected response can leave a
+pending operation, even when `sandbox.spec.template.image` already names the
+target image. Start, stop, and provisioning retry remain blocked until reconciliation
+succeeds. The gateway retries accepted updates at startup and periodically, even
+if new updates are disabled. Failed automatic attempts wait 1, 2, 4, 8, then
+15 minutes before another attempt becomes eligible. Recovery continues at the
+15-minute limit; periodic scans can add up to a minute to the wait. Each gateway
+retries independently, and restarting a gateway resets its retry delay.
+If the driver is unavailable or no longer supports
+updates, restore a compatible driver. Explicit deletion can reclaim a sandbox
+whose update cannot complete; deletion also removes its stored workspace.
+
+To resume immediately, read the current resource version and call `UpdateSandbox`
+with the same scope and name, that version, and no selected fields. The gateway
+uses the stored operation and target values. With no pending update, this returns
+`FAILED_PRECONDITION`. The operation ID is visible in
+`status.provisioning.driver_operation_id` while pending; the full intent stays private.
+
+The optional `request_id` uses [durable request admission](/sdk/api-errors#durable-request-admission).
+Reusing an unresolved ID returns `REQUEST_OUTCOME_UNCERTAIN`. For explicit resume,
+use a new ID or omit it, and use the fresh resource version. Do not change the
+original payload under its original ID. A confirmed successful request still
+replays without applying another update.
 
 ## Delete Sandboxes
 

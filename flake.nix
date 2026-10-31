@@ -127,7 +127,7 @@
           firmwarePkgs = testGuestPkgs;
         };
         testMachines = import ./tests/tmachine/config.nix {
-          inherit pkgs toolchains;
+          inherit pkgs toolchains rustToolchain;
           qemuPkgs = tmachineRuntimePkgs;
           firmwarePkgs = tmachineRuntimePkgs;
         };
@@ -203,10 +203,31 @@
           tmachine = testMachines.package;
           tmachine-config = testMachines.config;
           tmachine-unwrapped = testMachines.unwrapped;
+          openshell-test-runner = testMachines.testRunner;
         };
 
         devShells = {
           default = pkgs.mkShellNoCC commonDevShell;
+
+          # Crypto backend tests need native OpenSSL and Cargo's symbol-prefixed
+          # AWS-LC build. The release toolchains expose an unprefixed system
+          # AWS-LC libcrypto/libssl that collides with OpenSSL when both link.
+          crypto = pkgs.mkShell {
+            packages = [
+              rustToolchain
+              pkgs.cmakeMinimal
+              pkgs.pkg-config
+              pkgs.uv
+            ];
+            buildInputs = [ pkgs.openssl_3_5 ];
+            env = {
+              OPENSSL_LIB_DIR = "${pkgs.lib.getLib pkgs.openssl_3_5}/lib";
+              OPENSSL_INCLUDE_DIR = "${pkgs.lib.getDev pkgs.openssl_3_5}/include";
+              OPENSSL_NO_VENDOR = "1";
+              OPENSSL_STATIC = "0";
+              AWS_LC_SYS_USE_SYSTEM = "0";
+            };
+          };
 
           testing = pkgs.mkShellNoCC (
             commonDevShell

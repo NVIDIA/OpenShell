@@ -32,6 +32,9 @@ pub struct Environment {
 pub struct Setup {
     pub use_galaxy: bool,
     pub playbooks: Vec<PathBuf>,
+    /// Files the setup playbooks read, such as a service's fixture data.
+    #[serde(default)]
+    pub inputs: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Clone, Deserialize)]
