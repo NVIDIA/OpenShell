@@ -1032,28 +1032,6 @@ after it attempts every requested deletion if any entry failed.
 
 Every sandbox moves through a defined set of phases:
 
-```mermaid
-stateDiagram-v2
-    [*] --> Provisioning: create
-    Provisioning --> Ready: supervisor connects
-    Provisioning --> Error: preparation or admission times out
-    Ready --> Provisioning: supervisor disconnects
-    Ready --> Completed: main process exits 0
-    Ready --> Error: main process exits nonzero
-    Ready --> Stopping: stop
-    Error --> Stopping: stop
-    Stopping --> Stopped
-    Stopped --> Starting: start
-    Completed --> Starting: start or restart policy
-    Error --> Starting: start or restart policy
-    Starting --> Ready: new supervisor connects
-    Completed --> Deleting: delete, or --no-keep cleanup
-    Error --> Deleting: delete, or --no-keep cleanup
-    Stopped --> Deleting: delete
-    Ready --> Deleting: delete
-    Deleting --> [*]
-```
-
 Before workload activation, OpenShell validates the effective policy and matching
 provider configuration. A rejection keeps the workload unstarted and exposes a
 `ConfigurationInvalid` condition in `Provisioning`. Use `openshell sandbox get`
@@ -1130,7 +1108,7 @@ supervisor stays connected:
 - exposed services
 
 `sandbox connect` fails, because it attaches to the main process and that
-process has exited. Use `sandbox exec --tty` instead.
+process has exited.
 
 An `Error` caused by an infrastructure failure, such as
 `ImagePreparationTimedOut`, usually has no supervisor left, so these
