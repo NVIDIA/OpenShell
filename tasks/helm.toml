@@ -55,7 +55,7 @@ run = """
 run_windows = "echo Skipping helm:lint: Helm validation is not part of the native Windows lane."
 
 ["helm:test"]
-description = "Run gateway and workspace Helm chart unit tests"
+description = "Run gateway, workspace, and sandbox proxy Helm chart unit tests"
 run = """
   set -e
   if ! helm plugin list | grep -q unittest; then
@@ -64,6 +64,7 @@ run = """
   helm dependency build deploy/helm/openshell
   helm unittest deploy/helm/openshell
   helm unittest deploy/helm/openshell-workspace
+  helm unittest deploy/helm/openshell-sandbox-proxy
   deploy/helm/test-split-ownership.sh
   deploy/helm/test-gateway-config-parser.sh
   deploy/helm/test-gateway-resource-coherence.sh

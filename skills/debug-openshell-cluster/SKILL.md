@@ -1704,6 +1704,17 @@ stripped; application cookies and explicit bearer passthrough remain available.
 Only explicit local-development unauthenticated access bypasses gateway auth.
 Direct listener authentication belongs to the ingress provider.
 
+For `openshell-sandbox-proxy`, check `/readyz` on port 9091 and discovery access
+before inspecting application TLS. `/healthz` is liveness, while `/metrics`
+reports accepted, rejected, and active connections. The proxy Service's port 443
+maps to a nonroot TLS-passthrough listener on 8443. It reads one explicit
+workspace through the same snapshot/watch API; discovery identity files reload
+on reconnect. Never mount application TLS private keys or grant the proxy
+Kubernetes API access. Missing SNI, unknown/expired routes, and exhausted setup
+capacity are rejected. Discovery authorization loss clears the cache; temporary
+errors retain entries only until expiry. Preserve application SNI to the owning
+supervisor and inspect NetworkPolicy on both proxy and supervisor paths.
+
 For discovery-only readers, verify the TLS client CA and an `OU=discovery`
 certificate whose lowercase DER SHA-256 fingerprint appears in the
 administrator-managed `openshell.gateway.auth.discovery_grants_file` JSON.
@@ -1713,3 +1724,9 @@ propagation precedes the gateway's one-second refresh and bounded collection
 rechecks. Do not replace a discovery identity with an operator certificate.
 Single, finite-set, and all-workspaces discovery require explicit selectors;
 workspace users retain membership checks and cannot request platform scope.
+
+For proxy workspace selection, configure exactly one of Helm `workspace`,
+`workspaces`, or `allWorkspaces`. The CLI accepts repeatable `--workspace` flags
+or `--all-workspaces`. Check the entire selected set against the certificate's
+grant; rejection is never a partially authorized successful snapshot. Limits
+apply to the combined view. Discovery credentials and bearer mode are exclusive.
