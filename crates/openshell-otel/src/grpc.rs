@@ -111,10 +111,11 @@ pub mod rpc {
         "GetSandbox",
         "openshell.compute.v1.ComputeDriver/GetSandbox",
     );
-    pub const RESOLVE_SUPERVISOR_APP_ENDPOINT: ComputeDriverRpc = ComputeDriverRpc::new(
-        "ResolveSupervisorAppEndpoint",
-        "openshell.compute.v1.ComputeDriverAppEndpoints/ResolveSupervisorAppEndpoint",
-    );
+    pub const RESOLVE_SUPERVISOR_APP_ENDPOINT: ComputeDriverRpc = ComputeDriverRpc {
+        service: "openshell.compute.v1.ComputeDriverAppEndpoints",
+        method: "ResolveSupervisorAppEndpoint",
+        operation: "openshell.compute.v1.ComputeDriverAppEndpoints/ResolveSupervisorAppEndpoint",
+    };
     pub const LIST_SANDBOXES: ComputeDriverRpc = ComputeDriverRpc::new(
         "ListSandboxes",
         "openshell.compute.v1.ComputeDriver/ListSandboxes",
