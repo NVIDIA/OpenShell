@@ -4,9 +4,11 @@
 //! Gateway-minted session and extension JWTs.
 //!
 //! [`SandboxSessionJwtAuthority`] mints and verifies generation-bound sandbox
-//! session tokens. [`ExtensionJwtIssuer`] mints explicitly typed credentials
-//! for supervisor middleware and gateway interceptors and publishes the
-//! corresponding JWKS metadata.
+//! session tokens, and with the same key the shared supervisor's token for
+//! the private assignment stream (its own `typ` and claims, see
+//! [`super::supervisor_token`]). [`ExtensionJwtIssuer`] mints explicitly
+//! typed credentials for supervisor middleware and gateway interceptors and
+//! publishes the corresponding JWKS metadata.
 //!
 //! Algorithm: `EdDSA` (Ed25519). Pinned via `Validation::algorithms` to
 //! prevent algorithm-confusion attacks.
@@ -22,10 +24,10 @@ pub use openshell_extension_core::{
     EXTENSION_JWT_TYP, ExtensionAudience, ExtensionCallerKind, ExtensionJwtClaims,
     MAX_EXTENSION_TOKEN_TTL,
 };
+use rustls::pki_types::pem::{PemObject, SectionKind};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use std::{
-    io::Cursor,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -35,12 +37,17 @@ use x509_parser::{oid_registry::OID_SIG_ED25519, prelude::FromDer, x509::Subject
 
 use openshell_core::SandboxSessionId;
 use openshell_core::jwt::{
-    AuthenticatedSandboxSession, CredentialEpoch, GATEWAY_SESSION_JWT_TYPE, SandboxId,
-    SandboxLaunchAuthentication, SandboxRuntimeIdentity, SessionJwtError, SessionJwtIssuer,
-    SessionJwtVerifier, SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle,
+    AuthenticatedSandboxSession, AuthenticatedSupervisor, CredentialEpoch,
+    GATEWAY_SESSION_JWT_TYPE, MintedSessionToken, SandboxId, SandboxLaunchAuthentication,
+    SandboxRuntimeIdentity, SessionJwtError, SessionJwtIssuer, SessionJwtVerifier,
+    SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle, SupervisorJwtVerifier,
     SystemJwtClock,
 };
 use openshell_core::sandbox_generation::SandboxGenerationId;
+
+/// The method on which a sandbox renews its gateway JWT, and the only one that
+/// accepts a just-consumed bearer.
+pub const REFRESH_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/RefreshSandboxToken";
 
 /// SPIFFE-shaped subject prefix. Embedded in the `sub` claim of every
 /// minted token so a future migration to per-sandbox certs or SPIRE can
@@ -98,6 +105,7 @@ pub struct MintedToken {
 pub struct SandboxSessionJwtAuthority {
     issuer: SessionJwtIssuer,
     gateway_verifier: SessionJwtVerifier,
+    supervisor_verifier: SupervisorJwtVerifier,
     gateway_id: String,
     verification_keys: Vec<SessionVerificationKey>,
 }
@@ -144,12 +152,16 @@ impl SandboxSessionJwtAuthority {
             gateway_id,
             SessionTokenProfile::Gateway,
             verification_keys.clone(),
-            clock,
+            clock.clone(),
         )
         .map_err(|error| error.to_string())?;
+        let supervisor_verifier =
+            SupervisorJwtVerifier::new(gateway_id, verification_keys.clone(), clock)
+                .map_err(|error| error.to_string())?;
         Ok(Self {
             issuer,
             gateway_verifier,
+            supervisor_verifier,
             gateway_id: gateway_id.to_string(),
             verification_keys,
         })
@@ -272,6 +284,45 @@ impl SandboxSessionJwtAuthority {
             )
         })
     }
+
+    /// Mint the shared supervisor's token for the assignment stream. Its
+    /// lifetime is bounded on its own; the session lifetime may be
+    /// non-expiring.
+    pub fn mint_supervisor_token(
+        &self,
+        ttl: Duration,
+    ) -> Result<MintedSessionToken, SessionJwtError> {
+        self.issuer.mint_supervisor_token(ttl)
+    }
+
+    /// Mint the takeover grant of one supervisor term of a shared pool
+    /// instance. The caller has already advanced the sandbox's persisted
+    /// credential epoch to the grant's.
+    pub fn mint_supervisor_takeover(
+        &self,
+        takeover: &openshell_core::jwt::SupervisorTakeover,
+        ttl: Duration,
+    ) -> Result<MintedSessionToken, SessionJwtError> {
+        self.issuer.mint_supervisor_takeover(takeover, ttl)
+    }
+
+    /// Verify a presented supervisor token.
+    pub fn verify_supervisor_token(
+        &self,
+        token: &str,
+    ) -> Result<AuthenticatedSupervisor, AuthRejection> {
+        self.supervisor_verifier.verify(token).map_err(|error| {
+            let reason = match error {
+                SessionJwtError::SubjectMismatch => AuthFailureReason::AudienceOrIssuerMismatch,
+                ref other => session_failure_reason(other),
+            };
+            AuthRejection::new(
+                AuthMechanism::SupervisorToken,
+                reason,
+                Status::unauthenticated(format!("invalid supervisor token: {error}")),
+            )
+        })
+    }
 }
 
 /// Authenticates launch-scoped supervisor tokens and checks their identity
@@ -318,7 +369,7 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
         // Refresh performs its own lineage check so the immediately consumed
         // bearer can recover an already-committed successor after a lost
         // response. Every other RPC accepts only the current bearer.
-        if path != "/openshell.v1.OpenShell/RefreshSandboxToken" {
+        if path != REFRESH_SANDBOX_TOKEN_PATH {
             crate::auth::sandbox_session::authorize_persisted(&self.store, &authenticated).await?;
         }
         Ok(Authentication::Accepted(Principal::Sandbox(
@@ -326,6 +377,7 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
                 sandbox_id: authenticated.sandbox_id.to_string(),
                 source: SandboxIdentitySource::BootstrapJwt {
                     issuer: "launch-session".to_string(),
+                    auth_epoch: Some(authenticated.auth_epoch),
                 },
                 trust_domain: Some("openshell".to_string()),
             },
@@ -482,9 +534,11 @@ impl ExtensionJwtIssuer {
 
 impl GatewayJwks {
     fn from_public_key_pem(public_key_pem: &[u8], kid: String) -> Result<Self, String> {
-        let item = rustls_pemfile::read_one(&mut Cursor::new(public_key_pem))
+        let item = <(SectionKind, Vec<u8>)>::pem_slice_iter(public_key_pem)
+            .next()
+            .transpose()
             .map_err(|e| format!("failed to parse Ed25519 public key PEM for JWKS: {e}"))?;
-        let Some(rustls_pemfile::Item::SubjectPublicKeyInfo(der)) = item else {
+        let Some((SectionKind::PublicKey, der)) = item else {
             return Err("Ed25519 public key PEM does not contain a PUBLIC KEY block".into());
         };
         let (remainder, spki) = SubjectPublicKeyInfo::from_der(der.as_ref())

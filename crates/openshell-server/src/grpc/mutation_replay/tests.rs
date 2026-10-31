@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::auth::audit::test_support::{assert_boundary_finding, assert_origin, audited};
 use crate::grpc::test_support::{authed_request, test_server_state};
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::open_shell_server::OpenShell;
@@ -1032,14 +1033,6 @@ async fn restart_after_effect_without_success_persistence_never_reexecutes() {
     );
 }
 
-fn captured_json(capture: &openshell_ocsf::test_support::OcsfCapture) -> Vec<serde_json::Value> {
-    capture
-        .events()
-        .iter()
-        .map(|event| event.to_json().unwrap())
-        .collect()
-}
-
 #[tokio::test]
 async fn sandbox_request_with_a_request_id_records_the_denial() {
     let state = test_server_state().await;
@@ -1048,26 +1041,20 @@ async fn sandbox_request_with_a_request_id_records_the_denial() {
         request_id: uuid::Uuid::new_v4().to_string(),
         ..Default::default()
     });
-    request.extensions_mut().insert(Principal::Sandbox(
-        crate::auth::principal::SandboxPrincipal {
-            sandbox_id: "sb-a".to_string(),
-            source: crate::auth::principal::SandboxIdentitySource::BootstrapJwt {
-                issuer: "openshell-gateway:test".to_string(),
-            },
-            trust_domain: Some("openshell".to_string()),
-        },
-    ));
+    request
+        .extensions_mut()
+        .insert(crate::auth::principal::test_support::sandbox("sb-a"));
     let capture = openshell_ocsf::test_support::OcsfCapture::default();
     let _guard = capture.install();
 
     let err = run(&state, request).await.unwrap_err();
 
     assert_eq!(err.code(), Code::PermissionDenied);
-    let events = captured_json(&capture);
+    let events = capture.json_events();
     assert_eq!(events.len(), 2, "{events:?}");
     assert_eq!(events[0]["status_detail"], "method_not_permitted");
     assert_eq!(events[0]["actor"]["user"]["type"], "Sandbox");
-    assert_eq!(events[1]["class_uid"], 2004);
+    assert_boundary_finding(&events[0], &events[1]);
 }
 
 /// Refuses its caller from inside the admission worker, as a handler whose
@@ -1099,11 +1086,11 @@ impl Mutation for DeniedInWorker {
         request: Request<Self>,
     ) -> Result<Response<Self::Output>, Status> {
         let principal = request.extensions().get::<Principal>().unwrap();
-        crate::auth::audit::emit_authorization_denial(
+        Err(crate::auth::audit::deny(
             principal,
             crate::auth::audit::AuthzDenial::PlatformAdminRequired,
-        );
-        Err(Status::permission_denied("membership revoked"))
+            "membership revoked",
+        ))
     }
     fn capture(response: &Response<Self::Output>) -> Result<Success, Status> {
         resource_success(response.get_ref().workspace.as_ref())
@@ -1122,30 +1109,15 @@ async fn denial_in_the_admission_worker_keeps_the_request_context() {
         name: "worker-denial".to_string(),
         request_id: uuid::Uuid::new_v4().to_string(),
     });
-    let request_id = "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f";
-    let mut headers = http::HeaderMap::new();
-    headers.insert("x-request-id", request_id.parse().unwrap());
-    let origin = crate::auth::audit::RequestOrigin::new(
-        Some(crate::auth::audit::ConnectionSource::Peer(
-            "203.0.113.7:51234".parse().unwrap(),
-        )),
-        &headers,
-    );
-    let capture = openshell_ocsf::test_support::OcsfCapture::default();
-    let _guard = capture.install();
 
-    let err = crate::auth::audit::with_request(
-        "/openshell.v1.OpenShell/CreateWorkspace".to_string(),
-        origin,
+    let (result, events) = audited(
+        "/openshell.v1.OpenShell/CreateWorkspace",
         run(&state, request),
     )
-    .await
-    .unwrap_err();
+    .await;
 
-    assert_eq!(err.code(), Code::PermissionDenied);
-    let events = captured_json(&capture);
+    assert_eq!(result.unwrap_err().code(), Code::PermissionDenied);
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["api"]["operation"], "CreateWorkspace");
-    assert_eq!(events[0]["src_endpoint"]["ip"], "203.0.113.7");
-    assert_eq!(events[0]["metadata"]["correlation_uid"], request_id);
+    assert_origin(&events[0]);
 }

@@ -3,6 +3,7 @@
 
 //! Utility helpers shared across compute-driver crates.
 
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use std::path::{Path, PathBuf};
 
 use crate::proto::compute::v1::DriverSandbox;
@@ -473,7 +474,7 @@ pub fn read_upstream_proxy_ca_bundle_file(path: &str, label: &str) -> Result<Str
 /// Validating that rustls accepts an anchor — rather than only that PEM
 /// framing base64-decodes — is what makes the host-side check equivalent to
 /// the guest-side one: a PEM block holding invalid DER passes
-/// `rustls_pemfile::certs` but is silently dropped by
+/// `CertificateDer::pem_reader_iter` but is silently dropped by
 /// `RootCertStore::add_parsable_certificates`, so counting PEM blocks alone
 /// would accept on the host a bundle that contributes zero anchors at runtime.
 ///
@@ -486,7 +487,7 @@ pub fn validate_upstream_proxy_ca_bundle_pem(
     path: &str,
     label: &str,
 ) -> Result<(), String> {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut pem.as_bytes())
+    let certs: Vec<_> = CertificateDer::pem_reader_iter(&mut pem.as_bytes())
         .flatten()
         .collect();
     if certs.is_empty() {
@@ -545,7 +546,7 @@ fn read_regular_file_bounded(path: &str, max_bytes: u64) -> Result<String, Bound
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(nix::libc::O_NONBLOCK)
+            .custom_flags(libc::O_NONBLOCK)
             .open(path)
     };
     #[cfg(not(unix))]
@@ -1318,7 +1319,7 @@ mod tests {
 
     #[test]
     fn ca_bundle_rejects_pem_blocks_holding_invalid_der() {
-        // Passes `rustls_pemfile::certs` but contributes no trust anchor, so
+        // Passes `CertificateDer::pem_reader_iter` but contributes no trust anchor, so
         // accepting it on the host would break every guest after boot.
         let err = validate_upstream_proxy_ca_bundle_pem(
             "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",

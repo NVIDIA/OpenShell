@@ -1236,6 +1236,7 @@ mod tests {
 
     #[derive(Clone)]
     struct RemoteResponseService {
+        advertise_request: tokio::sync::watch::Receiver<bool>,
         session_end_tx: Option<mpsc::UnboundedSender<MiddlewareSessionEndReason>>,
     }
 
@@ -1249,9 +1250,17 @@ mod tests {
             &self,
             _request: tonic::Request<openshell_core::proto::MiddlewareDescribeRequest>,
         ) -> Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
-            Ok(tonic::Response::new(response_manifest(
-                "test/remote-response",
-            )))
+            use openshell_core::proto::{SupervisorMiddlewareOperation, SupervisorMiddlewarePhase};
+
+            let mut manifest = response_manifest("test/remote-response");
+            if *self.advertise_request.borrow() {
+                manifest.bindings.push(MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpRequest.into(),
+                    phase: SupervisorMiddlewarePhase::PreCredentials.into(),
+                    ..manifest.bindings[0]
+                });
+            }
+            Ok(tonic::Response::new(manifest))
         }
 
         async fn validate_config(
@@ -2553,8 +2562,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn remote_service_executes_through_http_response_pre_return_rpc() {
+    async fn serve_remote_response_service(
+        service: RemoteResponseService,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
         use openshell_core::proto::middleware::v1::http_response_pre_return_server::HttpResponsePreReturnServer;
         use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddlewareServer;
 
@@ -2563,10 +2577,6 @@ mod tests {
             .expect("bind response middleware");
         let address = listener.local_addr().expect("response middleware address");
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let (session_end_tx, mut session_end_rx) = mpsc::unbounded_channel();
-        let service = RemoteResponseService {
-            session_end_tx: Some(session_end_tx),
-        };
         let server = tonic::transport::Server::builder()
             .add_service(SupervisorMiddlewareServer::new(service.clone()))
             .add_service(HttpResponsePreReturnServer::new(service))
@@ -2574,11 +2584,101 @@ mod tests {
                 let _ = shutdown_rx.await;
             });
         let server_task = tokio::spawn(server);
+        (format!("http://{address}"), shutdown_tx, server_task)
+    }
+
+    #[tokio::test]
+    async fn supervisor_rechecks_required_binding_after_gateway_accepts_service() {
+        use crate::MiddlewareRegistry;
+        use openshell_core::proto::{
+            NetworkMiddlewareConfig, SandboxPolicy, SupervisorMiddlewareBinding,
+            SupervisorMiddlewareBindingPolicy, SupervisorMiddlewareService,
+        };
+
+        // The gateway sees a service offering both request and response hooks.
+        let (request, advertise_request) = tokio::sync::watch::channel(true);
+        let (grpc_endpoint, shutdown, server) =
+            serve_remote_response_service(RemoteResponseService {
+                advertise_request,
+                session_end_tx: None,
+            })
+            .await;
+        let name = "remote-response";
+        let registration = SupervisorMiddlewareService {
+            name: name.into(),
+            grpc_endpoint,
+            max_payload_bytes: 4096,
+            binding_policy: SupervisorMiddlewareBindingPolicy::Allowlist.into(),
+            bindings: vec![SupervisorMiddlewareBinding::HttpRequestPreCredentials.into()],
+            ..Default::default()
+        };
+        let gateway = MiddlewareRegistry::connect_services(vec![], vec![registration.clone()])
+            .await
+            .expect("gateway accepts required request binding");
+        let entry = ChainEntry {
+            implementation: name.into(),
+            ..entry(OnError::FailClosed)
+        };
+        let runner = ChainRunner::from_registry(gateway.clone());
+        assert_eq!(
+            runner
+                .describe_chain(std::slice::from_ref(&entry))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            runner
+                .describe_http_response_chain(&[entry])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Deliver the gateway's actual registration to a supervisor. This time
+        // Describe offers only a response hook, so no registry can be installed.
+        let policy = SandboxPolicy {
+            network_middlewares: std::collections::HashMap::from([(
+                "guard".into(),
+                NetworkMiddlewareConfig {
+                    middleware: name.into(),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let delivered = gateway.required_services(Some(&policy));
+        assert_eq!(delivered, [registration]);
+        request.send(false).unwrap();
+        let error = MiddlewareRegistry::connect_services(vec![], delivered)
+            .await
+            .expect_err("supervisor must reject a missing required binding");
+        assert!(
+            error
+                .to_string()
+                .contains("does not advertise required binding HttpRequestPreCredentials"),
+            "{error}"
+        );
+
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_service_executes_through_http_response_pre_return_rpc() {
+        let (session_end_tx, mut session_end_rx) = mpsc::unbounded_channel();
+        let service = RemoteResponseService {
+            session_end_tx: Some(session_end_tx),
+            advertise_request: tokio::sync::watch::channel(false).1,
+        };
+        let (grpc_endpoint, shutdown_tx, server_task) =
+            serve_remote_response_service(service).await;
         let registry = super::super::MiddlewareRegistry::connect_services(
             Vec::new(),
             vec![openshell_core::proto::SupervisorMiddlewareService {
                 name: "remote-response".into(),
-                grpc_endpoint: format!("http://{address}"),
+                grpc_endpoint,
                 max_payload_bytes: 4096,
                 allow_insecure_transport: true,
                 ..Default::default()

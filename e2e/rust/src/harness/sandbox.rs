@@ -232,10 +232,20 @@ impl SandboxGuard {
     /// Unlike [`SandboxGuard::create_keep`], this does not open an attachment,
     /// which lets tests control competing and reconnecting clients directly.
     pub async fn create_detached_main(command: &[&str]) -> Result<Self, String> {
+        Self::create_detached_main_with_args(&[], command).await
+    }
+
+    /// Like [`SandboxGuard::create_detached_main`], but forwards extra flags
+    /// to `sandbox create` before the `-- <command>` separator.
+    pub async fn create_detached_main_with_args(
+        create_args: &[&str],
+        command: &[&str],
+    ) -> Result<Self, String> {
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox").arg("create").arg("--detach");
-        add_unique_name_if_missing(&mut cmd, &[]);
-        add_test_image_if_missing(&mut cmd, &[]);
+        add_unique_name_if_missing(&mut cmd, create_args);
+        add_test_image_if_missing(&mut cmd, create_args);
+        cmd.args(create_args);
         cmd.arg("--")
             .args(command)
             .stdout(Stdio::piped())
@@ -586,10 +596,13 @@ impl SandboxGuard {
             cmd.arg(arg);
         }
         // Never share the test runner's stdin: parallel test processes share
-        // its open file description, and the command needs no input.
+        // its open file description, and the command needs no input. A caller
+        // that bounds the exec with a timeout drops this future; the CLI then
+        // goes with it instead of lingering.
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         let output = cmd
             .output()
@@ -690,6 +703,45 @@ impl SandboxGuard {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
         let _ = cmd.status().await;
+    }
+}
+
+impl SandboxGuard {
+    /// Delete the sandbox and report whether that worked. On failure the
+    /// guard still deletes it when dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns the CLI's output when the delete fails.
+    pub async fn delete(&mut self) -> Result<(), String> {
+        if self.cleaned_up {
+            return Ok(());
+        }
+        if let Some(ref mut child) = self.child {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        let output = openshell_cmd()
+            .arg("sandbox")
+            .arg("delete")
+            .arg(&self.name)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| format!("failed to spawn openshell sandbox delete: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "sandbox delete {} failed (exit {:?}):\n{}{}",
+                self.name,
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        self.cleaned_up = true;
+        Ok(())
     }
 }
 

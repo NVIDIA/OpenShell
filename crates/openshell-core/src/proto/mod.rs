@@ -82,6 +82,11 @@ pub mod gateway_interceptor {
     pub use super::generated::openshell::gateway_interceptor::v1;
 }
 
+/// Private gateway-to-shared-supervisor assignment protocol.
+pub mod supervisor_host {
+    pub use super::generated::openshell::supervisor::host::v1;
+}
+
 pub use datamodel::v1::*;
 pub use gateway_interceptor::v1::*;
 pub use middleware::v1::*;

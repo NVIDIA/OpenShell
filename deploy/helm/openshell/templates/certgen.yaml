@@ -4,6 +4,7 @@
 {{- if or .Values.pkiInitJob.enabled .Values.certManager.enabled }}
 {{- $hookName := printf "%s-certgen" (include "openshell.fullname" .) }}
 {{- $ns := .Release.Namespace }}
+{{- $podLabels := merge (include "openshell.certgenPodLabels" . | fromYaml) (.Values.pkiInitJob.podLabels | default dict) }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -75,7 +76,11 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "openshell.certgenPodLabels" . | nindent 8 }}
+        {{- toYaml $podLabels | nindent 8 }}
+      {{- with .Values.pkiInitJob.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       restartPolicy: OnFailure
       serviceAccountName: {{ $hookName }}
@@ -143,7 +148,11 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "openshell.certgenPodLabels" . | nindent 8 }}
+        {{- toYaml $podLabels | nindent 8 }}
+      {{- with .Values.pkiInitJob.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       restartPolicy: OnFailure
       serviceAccountName: {{ $hookName }}

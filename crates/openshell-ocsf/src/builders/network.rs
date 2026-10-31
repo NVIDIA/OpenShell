@@ -3,7 +3,7 @@
 
 //! Builder for Network Activity [4001] events.
 
-use crate::builders::EventContext;
+use crate::builders::ContextRef;
 use crate::enums::{ActionId, ActivityId, DispositionId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{NetworkActivityEvent, OcsfEvent};
@@ -11,7 +11,7 @@ use crate::objects::{Actor, ConnectionInfo, Endpoint, FirewallRule};
 
 /// Builder for Network Activity [4001] events.
 pub struct NetworkActivityBuilder<'a, EndpointState = MissingNetworkEndpoint> {
-    ctx: &'a EventContext,
+    ctx: ContextRef<'a>,
     activity: ActivityId,
     activity_name: Option<String>,
     action: Option<ActionId>,
@@ -44,23 +44,14 @@ impl<'a> NetworkActivityBuilder<'a, MissingNetworkEndpoint> {
     /// it can be built.
     ///
     /// ```compile_fail
-    /// use openshell_ocsf::{EventContext, NetworkActivityBuilder};
+    /// use openshell_ocsf::NetworkActivityBuilder;
     ///
-    /// let ctx = EventContext {
-    ///     sandbox_id: String::new(),
-    ///     sandbox_name: String::new(),
-    ///     container_image: String::new(),
-    ///     hostname: String::new(),
-    ///     product_version: String::new(),
-    ///     proxy_ip: "127.0.0.1".parse().unwrap(),
-    ///     proxy_port: 3128,
-    /// };
-    /// NetworkActivityBuilder::new(&ctx).build();
+    /// NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx()).build();
     /// ```
     #[must_use]
-    pub fn new(ctx: &'a EventContext) -> Self {
+    pub fn new(ctx: impl Into<ContextRef<'a>>) -> Self {
         Self {
-            ctx,
+            ctx: ctx.into(),
             activity: ActivityId::Unknown,
             activity_name: None,
             action: None,
@@ -202,24 +193,6 @@ impl<'a, EndpointState> NetworkActivityBuilder<'a, EndpointState> {
     }
 
     #[must_use]
-    pub fn activity(mut self, id: ActivityId) -> Self {
-        self.activity = id;
-        self
-    }
-
-    #[must_use]
-    pub fn action(mut self, id: ActionId) -> Self {
-        self.action = Some(id);
-        self
-    }
-
-    #[must_use]
-    pub fn disposition(mut self, id: DispositionId) -> Self {
-        self.disposition = Some(id);
-        self
-    }
-
-    #[must_use]
     pub fn actor_process(mut self, process: crate::objects::Process) -> Self {
         self.actor = Some(Actor::process(process));
         self
@@ -230,25 +203,11 @@ impl<'a, EndpointState> NetworkActivityBuilder<'a, EndpointState> {
         self.firewall_rule = Some(FirewallRule::new(name, rule_type));
         self
     }
-
-    #[must_use]
-    pub fn severity(mut self, id: SeverityId) -> Self {
-        self.severity = id;
-        self
-    }
-
-    #[must_use]
-    pub fn status(mut self, id: StatusId) -> Self {
-        self.status = Some(id);
-        self
-    }
-
-    #[must_use]
-    pub fn message(mut self, msg: impl Into<String>) -> Self {
-        self.message = Some(msg.into());
-        self
-    }
 }
+
+impl_activity_setter!(NetworkActivityBuilder<EndpointState>);
+impl_action_disposition_setters!(NetworkActivityBuilder<EndpointState>);
+impl_builder_setters!(NetworkActivityBuilder<EndpointState>);
 
 impl NetworkActivityBuilder<'_, HasNetworkEndpoint> {
     /// Finalize and return the `OcsfEvent`.

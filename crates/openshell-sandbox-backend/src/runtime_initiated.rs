@@ -255,8 +255,12 @@ impl Listener {
         socket.set_nonblocking(true)?;
         socket.bind(&socket2::SockAddr::vsock(libc::VMADDR_CID_ANY, port))?;
         socket.listen(64)?;
+        // SAFETY: `socket` owns a valid descriptor and is moved into AsyncFd.
+        // The descriptor is never closed or replaced while registered.
+        #[allow(unsafe_code)]
+        let listener = unsafe { tokio::io::unix::AsyncFd::register(socket)? };
         Ok(Self::Vsock {
-            listener: tokio::io::unix::AsyncFd::new(socket)?,
+            listener,
             guest_cid,
         })
     }

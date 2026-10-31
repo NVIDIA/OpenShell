@@ -4293,7 +4293,8 @@ async fn exchange_provider_subject_token_inner(
             Principal::Sandbox(_)
             | Principal::User(_)
             | Principal::Operator(_)
-            | Principal::Peer(_),
+            | Principal::Peer(_)
+            | Principal::Supervisor(_),
         ) => Some(tonic::Code::PermissionDenied),
         Some(Principal::Anonymous) | None => Some(tonic::Code::Unauthenticated),
     };
@@ -5676,6 +5677,7 @@ mod tests {
                     sandbox_id: "grant-sandbox".to_string(),
                     source: SandboxIdentitySource::BootstrapJwt {
                         issuer: SECRET.to_string(),
+                        auth_epoch: None,
                     },
                     trust_domain: None,
                 }));

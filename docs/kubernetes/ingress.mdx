@@ -257,7 +257,7 @@ helm upgrade <release-name> oci://ghcr.io/nvidia/openshell/helm-chart \
   --set grpcRoute.replicaRouting.enabled=true
 ```
 
-The chart renders one Service per replica and a GRPCRoute rule that matches the `x-openshell-replica` request header. The CLI sets that header from the owner the gateway reports and retries without it if the named replica is unavailable. Replica routing requires `workload.kind=statefulset`, `workload.allowMultiReplicaStatefulSet=true`, and at most 15 replicas.
+The chart renders one Service per replica and a GRPCRoute rule that matches the `x-openshell-replica` request header. The CLI and SDKs send `x-openshell-want-owner: 1` on `GetSandbox`, read the owner from the `x-openshell-owner` response header, and set it as `x-openshell-replica`. If the proxy answers `UNAVAILABLE` with an empty message, `no healthy upstream`, or `connection failure`, they retry once without it. Replica routing requires `workload.kind=statefulset`, `workload.allowMultiReplicaStatefulSet=true`, and at most 15 replicas.
 
 If the release uses `workload.kind=deployment`, this upgrade replaces the Deployment with a StatefulSet, so every gateway pod restarts at once. The StatefulSet also requests a 1Gi PersistentVolumeClaim per replica, which stays `Pending` on clusters without a default StorageClass.
 
@@ -266,6 +266,50 @@ If the release uses `workload.kind=deployment`, this upgrade replaces the Deploy
 Sandbox SSH uses the gateway endpoint registered with the CLI. No separate Helm SSH host or port values are required.
 
 When a Gateway terminates TLS, register its externally reachable `https://` endpoint with the CLI. OpenShell uses that registered endpoint for `sandbox connect`, `sandbox exec`, and port forwarding, even when the gateway pod reports an internal plaintext endpoint.
+
+## Route Sandbox Service Traffic
+
+The chart creates only a `Gateway` and a `GRPCRoute`. Browser and WebSocket
+traffic to exposed sandbox services — the URLs printed by
+`openshell service expose` — has no chart-managed route. Operators configure
+it themselves.
+
+Service URLs use a hostname under the gateway's service base domain, which
+comes from the wildcard SAN in `pkiInitJob.serverDnsNames` or
+`certManager.serverDnsNames` (for example `*.apps.example.com`). Create an
+`HTTPRoute` or `Ingress` that matches those hostnames and forwards to the
+OpenShell gateway Service, terminating TLS on the shared wildcard certificate.
+The route must preserve the original `Host` header: the gateway parses it to
+select the sandbox service.
+
+### Multiple gateways behind one ingress
+
+When two gateways share a cluster, one ingress, and one wildcard certificate,
+identically named workspaces, sandboxes, and services produce identical
+composite hostnames, so the ingress cannot select the correct gateway. Give
+each gateway a unique routing name:
+
+```shell
+helm upgrade openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set server.name=gateway-a \
+  --set server.serviceHostnameFormat=hashed
+```
+
+With a routing name set, each gateway emits opaque, fixed-length hashed
+hostnames (`https://<hash>.apps.example.com/`) for its exposed services. Hash
+hostnames are deterministic and unique per gateway, so exact-host
+`HTTPRoute`/`Ingress` rules route them unambiguously with the single shared
+wildcard certificate. The hostnames exist only once services are exposed, so
+the rules must be created as services are exposed — for example by automation
+that reads `openshell service list` or the gateway API and reconciles
+exact-host routes per gateway. The chart does not create or manage these
+routes.
+
+See [Gateway configuration](/how-it-works/gateways/configuration#service-routing)
+for the routing-name field, its validation, and the effects of changing it.
 
 ## Next Steps
 

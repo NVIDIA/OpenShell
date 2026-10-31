@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Publish how tests reach a service the environment runs. Include it with
+# `test_env_name` (the file name) and `test_env_vars` (OPENSHELL_TEST_* names
+# to values). openshell-test-runner passes every
+# /etc/openshell-test/env.d/*.env file to the tests, and the suite's fixture
+# reads the variables.
+---
+- name: Create the test environment directory
+  become: true
+  ansible.builtin.file:
+    path: /etc/openshell-test/env.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Publish {{ test_env_name }} test variables
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/openshell-test/env.d/{{ test_env_name }}.env
+    owner: tmachine
+    group: tmachine
+    mode: "0600"
+    content: "{% for key, value in test_env_vars.items() %}{{ key }}={{ value }}\n{% endfor %}"

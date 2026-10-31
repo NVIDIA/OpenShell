@@ -237,6 +237,21 @@ if [ -s "$err" ]; then
   exit 1
 fi
 
+if ! OPENSHELL_VERSION=pre openshell_snap_channel >"$out" 2>"$err"; then
+  echo "FAIL: pre must select the latest/beta snap channel" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+if [ "$(cat "$out")" != "latest/beta" ]; then
+  echo "FAIL: pre must select the latest/beta snap channel" >&2
+  exit 1
+fi
+if [ -s "$err" ]; then
+  echo "FAIL: pre must not warn about an ignored version" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+
 if ! OPENSHELL_VERSION="" openshell_snap_channel >"$out" 2>"$err"; then
   echo "FAIL: unset OPENSHELL_VERSION must select the latest/stable snap channel" >&2
   cat "$err" >&2 || true
@@ -385,6 +400,18 @@ assert_snap_install_flow \
   1 0 "" \
   "wait:user-docker
 root:snap install openshell --channel=latest/stable
+root:systemctl --global disable snap.openshell.user-gateway.service
+target:systemctl --user daemon-reload
+target:systemctl --user enable --now snap.openshell.user-gateway.service
+wait:user-gateway-listener
+register:user-gateway
+wait:gateway-status"
+
+assert_snap_install_flow \
+  "prerelease snap tracks beta" \
+  1 0 "pre" \
+  "wait:user-docker
+root:snap install openshell --channel=latest/beta
 root:systemctl --global disable snap.openshell.user-gateway.service
 target:systemctl --user daemon-reload
 target:systemctl --user enable --now snap.openshell.user-gateway.service
@@ -1006,5 +1033,94 @@ for asset in "$HOMEBREW_CLI_ASSET" "$HOMEBREW_GATEWAY_ASSET" "$HOMEBREW_DRIVER_V
 done
 
 unset -f gh uname linux_package_method
+
+# The installer must look for gateway entries and client certs where the CLI
+# keeps them, which is $XDG_CONFIG_HOME/openshell when that variable is set.
+assert_target_config_dir() {
+  local name=$1
+  local expected=$2
+  local actual
+  actual="$(target_openshell_config_dir)"
+  if [ "$actual" != "$expected" ]; then
+    echo "FAIL: ${name}: expected ${expected}, got ${actual}" >&2
+    exit 1
+  fi
+}
+
+TARGET_HOME="${tmpdir}/target-home"
+TARGET_USER="$(id -un)"
+TARGET_UID="$(id -u)"
+PLATFORM=linux
+TARGET_RUNTIME_DIR="${tmpdir}/runtime"
+
+saved_xdg_config_home="${XDG_CONFIG_HOME-}"
+saved_xdg_config_home_set="${XDG_CONFIG_HOME+set}"
+
+unset XDG_CONFIG_HOME
+assert_target_config_dir "unset XDG_CONFIG_HOME uses the target home" \
+  "${TARGET_HOME}/.config/openshell"
+
+export XDG_CONFIG_HOME="${tmpdir}/xdg-config"
+assert_target_config_dir "XDG_CONFIG_HOME is honored" \
+  "${tmpdir}/xdg-config/openshell"
+
+export XDG_CONFIG_HOME=""
+assert_target_config_dir "empty XDG_CONFIG_HOME falls back per the XDG spec" \
+  "${TARGET_HOME}/.config/openshell"
+
+export XDG_CONFIG_HOME="${tmpdir}/xdg config"
+assert_target_config_dir "XDG_CONFIG_HOME with spaces is honored" \
+  "${tmpdir}/xdg config/openshell"
+
+# Registration cleanup must clear the entry the CLI wrote, wherever
+# XDG_CONFIG_HOME puts it, and leave the default location alone.
+seed_gateway_registration() {
+  local config_dir=$1
+  mkdir -p "${config_dir}/gateways/openshell" "${config_dir}/gateways/local"
+  printf '{}\n' >"${config_dir}/gateways/openshell/metadata.json"
+  printf 'openshell\n' >"${config_dir}/active_gateway"
+}
+
+assert_registration_removed() {
+  local name=$1
+  local config_dir=$2
+  if [ -e "${config_dir}/gateways/openshell/metadata.json" ] ||
+    [ -e "${config_dir}/gateways/local" ] ||
+    [ -e "${config_dir}/active_gateway" ]; then
+    echo "FAIL: ${name}: registration left behind in ${config_dir}" >&2
+    exit 1
+  fi
+}
+
+xdg_spaces_config="${tmpdir}/xdg config/openshell"
+default_config="${TARGET_HOME}/.config/openshell"
+
+rm -rf "${tmpdir}/xdg config" "${TARGET_HOME}/.config"
+seed_gateway_registration "$xdg_spaces_config"
+seed_gateway_registration "$default_config"
+remove_local_gateway_registration
+assert_registration_removed "cleanup honors XDG_CONFIG_HOME with spaces" "$xdg_spaces_config"
+if [ ! -e "${default_config}/gateways/openshell/metadata.json" ]; then
+  echo "FAIL: cleanup with XDG_CONFIG_HOME set must not touch ${default_config}" >&2
+  exit 1
+fi
+
+# An empty XDG_CONFIG_HOME must clean up under $HOME/.config, never a
+# directory relative to the working directory.
+export XDG_CONFIG_HOME=""
+cleanup_cwd="${tmpdir}/cleanup-cwd"
+mkdir -p "$cleanup_cwd"
+(cd "$cleanup_cwd" && remove_local_gateway_registration)
+assert_registration_removed "cleanup with empty XDG_CONFIG_HOME uses the target home" "$default_config"
+if [ -e "${cleanup_cwd}/openshell" ]; then
+  echo "FAIL: cleanup with empty XDG_CONFIG_HOME must not create a relative openshell dir" >&2
+  exit 1
+fi
+
+if [ "$saved_xdg_config_home_set" = "set" ]; then
+  export XDG_CONFIG_HOME="$saved_xdg_config_home"
+else
+  unset XDG_CONFIG_HOME
+fi
 
 echo "install.sh focused tests passed"

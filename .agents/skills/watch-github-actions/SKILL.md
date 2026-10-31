@@ -127,6 +127,8 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 For tmachine Kubernetes conformance failures, inspect the `tmachine-diagnostics-*` artifact. The K3s report includes Agent Sandbox controller state, leader leases, events, and current and previous controller logs. The conformance playbook checks reconciliation after guest boot with a temporary scheduling-gated Sandbox probe before running tests. Distinguish a failed controller probe from a failed conformance scenario; gateway connectivity and controller Deployment availability do not prove reconciliation works.
 
+For the `e2e-suites` lane (`.github/workflows/e2e-suites.yml`), the last lines of the job log give the runner's result: PASS, FAIL (exit 1) after the end of the nextest log (which names the failed tests), or ERROR (exit 2) with the step that broke. FAIL and ERROR also appear as annotations on the run's summary page. Then inspect the `e2e-results-<family>-<package>-<environment>-<installer>` artifact, which holds `junit.xml`, `nextest.log` and, after a failure, the guest's `diagnostics/`.
+
 `Pre-release` temporarily omits Codex Security from its `Security Scan` job.
 `Release` uses the passing prerelease qualification result. Other scanners and
 qualification gates still run. Use the standalone
@@ -162,6 +164,13 @@ not substitute the current `main` tip or the event's older PR base SHA. Merge
 groups and manual runs use their explicit baseline. Findings are reported by
 `Reject new high or critical findings`; distinguish those from scanner failures.
 
+For `Cargo Deny`, the metadata-only commands clear Rust compiler wrappers after
+entering mise; they do not require sccache. For OpenSSL backend and dynamic-linkage
+checks, use `nix develop .#crypto` from outside the default shell. The release
+toolchains in the default shell expose an unprefixed system AWS-LC that conflicts
+with OpenSSL. The crypto shell uses native OpenSSL and Cargo's symbol-prefixed
+AWS-LC build for dual-backend tests.
+
 For `Protobuf Compatibility`, check the logged train and comparison baseline.
 Branch Checks compares the prospective merge tree with its target; release qualification
 compares the tagged candidate with the previous stable release. Both use
@@ -176,6 +185,13 @@ selects the latest passing prerelease for the requested version and branch,
 verifies its qualification evidence, creates the stable tag at its exact commit,
 then rebuilds and publishes without rerunning qualification. The promotion job
 summary and `stable-promotion-*` artifact record the candidate and evidence.
+Both workflows accept optional tags. Tagless Pre-release creates the next
+candidate in the selected branch's seeded series; inspect Resolve Prerelease Tag
+for the actual tag and commit. Tagless Release infers the highest reachable
+prerelease version and stops if it is already stable. Explicit tags select an
+existing candidate or stable version for retries. Release Auto-Tag and manual
+candidate creation share a concurrency group; pending tag-resolution jobs can
+be waiting for that lock.
 Failed, cancelled, or skipped required suites fail
 qualification; stable publication is blocked, while published pre-release
 artifacts remain available. The Pre-release failure notification includes the

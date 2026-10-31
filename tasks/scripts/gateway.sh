@@ -268,6 +268,9 @@ endpoint = "http://127.0.0.1:4317"
 [openshell.gateway.otlp.ocsf]
 enabled = true
 
+[openshell.gateway.otlp.agent]
+enabled = true
+
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
 

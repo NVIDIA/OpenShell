@@ -2,30 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use miette::{IntoDiagnostic, Result, WrapErr};
-use openshell_core::auth::EdgeAuthInterceptor;
-use openshell_core::net::set_tcp_nodelay_best_effort;
-use openshell_core::proto::open_shell_client::OpenShellClient;
+pub use openshell_core::replica_routing::{
+    owner_replica, retry_unrouted, routed_to, with_owner_hint,
+};
+use openshell_sdk::{AuthConfig, ClientConfig, ClientIdentity, OpenShellClient};
 use rustls::{
     RootCertStore,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject},
 };
-use std::collections::HashMap;
-use std::future::Future;
 use std::io::Cursor;
-use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::OnceLock;
-use std::time::Duration;
-use tokio::sync::Mutex;
-use tonic::metadata::AsciiMetadataValue;
-use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
-use tracing::debug;
-use url::{Host, Url};
+use tonic::transport::Channel;
 
 /// Concrete gRPC client type used by all commands.
-pub type GrpcClient = OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
+pub type GrpcClient = openshell_sdk::raw::AuthedGrpcClient;
 
 #[derive(Clone, Debug, Default)]
 pub struct TlsOptions {
@@ -194,7 +185,9 @@ pub fn require_tls_materials(server: &str, tls: &TlsOptions) -> Result<TlsMateri
 
 fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
     let mut cursor = Cursor::new(pem);
-    let key = rustls_pemfile::private_key(&mut cursor)
+    let key = PrivateKeyDer::pem_reader_iter(&mut cursor)
+        .next()
+        .transpose()
         .into_diagnostic()?
         .ok_or_else(|| miette::miette!("no private key found in TLS key PEM"))?;
     Ok(key)
@@ -203,7 +196,7 @@ fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
 pub fn build_rustls_config(materials: &TlsMaterials) -> Result<rustls::ClientConfig> {
     let mut roots = RootCertStore::empty();
     let mut ca_cursor = Cursor::new(&materials.ca);
-    let ca_certs = rustls_pemfile::certs(&mut ca_cursor)
+    let ca_certs = CertificateDer::pem_reader_iter(&mut ca_cursor)
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()
         .into_diagnostic()?;
     for cert in ca_certs {
@@ -211,44 +204,17 @@ pub fn build_rustls_config(materials: &TlsMaterials) -> Result<rustls::ClientCon
     }
 
     let mut cert_cursor = Cursor::new(&materials.cert);
-    let cert_chain = rustls_pemfile::certs(&mut cert_cursor)
+    let cert_chain = CertificateDer::pem_reader_iter(&mut cert_cursor)
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()
         .into_diagnostic()?;
     let key = load_private_key(&materials.key)?;
 
-    openshell_crypto::tls::client_builder()
+    openshell_crypto::tls::try_client_builder()
+        .into_diagnostic()
+        .wrap_err("configure gateway TLS client")?
         .with_root_certificates(roots)
         .with_client_auth_cert(cert_chain, key)
         .into_diagnostic()
-}
-
-pub fn build_tonic_tls_config(server: &str, materials: &TlsMaterials) -> Result<ClientTlsConfig> {
-    let ca_cert = Certificate::from_pem(materials.ca.clone());
-    let identity = Identity::from_pem(materials.cert.clone(), materials.key.clone());
-    tls_config_with_server_name(
-        server,
-        ClientTlsConfig::new()
-            .ca_certificate(ca_cert)
-            .identity(identity),
-    )
-}
-
-fn tls_config_with_server_name(server: &str, config: ClientTlsConfig) -> Result<ClientTlsConfig> {
-    Ok(config.domain_name(tls_server_name(server)?))
-}
-
-fn tls_server_name(server: &str) -> Result<String> {
-    let endpoint = Url::parse(server)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("invalid gateway endpoint '{server}'"))?;
-    let host = endpoint
-        .host()
-        .ok_or_else(|| miette::miette!("gateway endpoint '{server}' has no host"))?;
-    Ok(match host {
-        Host::Domain(domain) => domain.to_string(),
-        Host::Ipv4(address) => address.to_string(),
-        Host::Ipv6(address) => address.to_string(),
-    })
 }
 
 #[derive(Debug)]
@@ -291,315 +257,120 @@ impl ServerCertVerifier for InsecureServerCertVerifier {
     }
 }
 
-#[derive(Clone)]
-struct InsecureTlsConnector {
-    tls_connector: tokio_rustls::TlsConnector,
-}
-
-impl tower::Service<hyper::Uri> for InsecureTlsConnector {
-    type Response = hyper_util::rt::TokioIo<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
-    type Error = Box<dyn std::error::Error + Send + Sync>;
-    type Future =
-        std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, uri: hyper::Uri) -> Self::Future {
-        let tls_connector = self.tls_connector.clone();
-        Box::pin(async move {
-            let host = uri.host().unwrap_or("localhost").to_string();
-            let port = uri.port_u16().unwrap_or(443);
-            let addr = format!("{host}:{port}");
-            let tcp = tokio::net::TcpStream::connect(addr).await?;
-            set_tcp_nodelay_best_effort(&tcp);
-            let server_name = ServerName::try_from(host)?;
-            let tls_stream = tls_connector.connect(server_name, tcp).await?;
-            Ok(hyper_util::rt::TokioIo::new(tls_stream))
-        })
-    }
-}
-
 pub fn build_insecure_rustls_config() -> Result<rustls::ClientConfig> {
-    let config = openshell_crypto::tls::client_builder()
+    let config = openshell_crypto::tls::try_client_builder()
+        .into_diagnostic()
+        .wrap_err("configure gateway TLS client")?
         .dangerous()
         .with_custom_certificate_verifier(std::sync::Arc::new(InsecureServerCertVerifier))
         .with_no_client_auth();
     Ok(config)
 }
 
-/// Tunnel proxy addresses keyed by upstream endpoint + token.
-///
-/// Each distinct edge-authenticated gateway gets its own local proxy instead of
-/// reusing the first gateway touched in the current process.
-static EDGE_TUNNEL_ADDRS: OnceLock<Mutex<HashMap<(String, String), SocketAddr>>> = OnceLock::new();
+fn sdk_client_config(server: &str, tls: &TlsOptions) -> Result<ClientConfig> {
+    let mut config = ClientConfig::new(server);
+    config.insecure_skip_verify = tls.gateway_insecure;
+    let uses_edge_tunnel = tls.oidc_token.is_none() && tls.edge_token.is_some();
+    config.auth = tls
+        .oidc_token
+        .as_deref()
+        .map(AuthConfig::oidc)
+        .or_else(|| tls.edge_token.clone().map(AuthConfig::EdgeJwt));
 
-async fn edge_tunnel_addr(server: &str, token: &str) -> Result<SocketAddr> {
-    let key = (server.to_string(), token.to_string());
-    let registry = EDGE_TUNNEL_ADDRS.get_or_init(|| Mutex::new(HashMap::new()));
-
-    {
-        let addrs = registry.lock().await;
-        if let Some(addr) = addrs.get(&key).copied() {
-            return Ok(addr);
-        }
-    }
-
-    let proxy = crate::edge_tunnel::start_tunnel_proxy(server, token).await?;
-    debug!(
-        local_addr = %proxy.local_addr,
-        server,
-        "edge tunnel proxy started, routing gRPC through local proxy"
-    );
-
-    let mut addrs = registry.lock().await;
-    Ok(*addrs.entry(key).or_insert(proxy.local_addr))
-}
-
-pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
-    if server.starts_with("http://") {
-        let endpoint = Endpoint::from_shared(server.to_string())
-            .into_diagnostic()?
-            .connect_timeout(Duration::from_secs(10))
-            .http2_adaptive_window(true)
-            .http2_keep_alive_interval(Duration::from_secs(10))
-            .keep_alive_while_idle(true);
-        return endpoint.connect().await.into_diagnostic();
-    }
-
-    // When Cloudflare edge bearer auth is active and the server is HTTPS,
-    // route traffic through a local WebSocket tunnel proxy instead.
-    // OIDC tokens bypass the tunnel — they connect directly.
-    if tls.edge_token.is_some() && server.starts_with("https://") {
-        let token = tls
-            .edge_token
-            .as_deref()
-            .ok_or_else(|| miette::miette!("edge token required for tunnel"))?;
-        let local_addr = edge_tunnel_addr(server, token).await?;
-
-        // Connect to the local tunnel proxy over plaintext HTTP/2.
-        let local_url = format!("http://{local_addr}");
-        let endpoint = Endpoint::from_shared(local_url)
-            .into_diagnostic()?
-            .connect_timeout(Duration::from_secs(10))
-            .http2_adaptive_window(true)
-            .http2_keep_alive_interval(Duration::from_secs(10))
-            .keep_alive_while_idle(true);
-        return endpoint.connect().await.into_diagnostic();
-    }
-
-    if tls.gateway_insecure && server.starts_with("https://") {
-        tracing::warn!("TLS certificate verification is disabled — do not use in production");
-        let rustls_config = build_insecure_rustls_config()?;
-        let tls_connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(rustls_config));
-        let connector = InsecureTlsConnector { tls_connector };
-        // Use http:// so tonic does not layer its own TLS on top — our
-        // connector performs TLS with the insecure config.
-        let http_uri = server.replacen("https://", "http://", 1);
-        let endpoint = Endpoint::from_shared(http_uri)
-            .into_diagnostic()?
-            .connect_timeout(Duration::from_secs(10))
-            .http2_keep_alive_interval(Duration::from_secs(10))
-            .keep_alive_while_idle(true);
-        return endpoint
-            .connect_with_connector(connector)
-            .await
-            .into_diagnostic();
-    }
-
-    let mut endpoint = Endpoint::from_shared(server.to_string())
-        .into_diagnostic()?
-        .connect_timeout(Duration::from_secs(10))
-        .http2_adaptive_window(true)
-        .http2_keep_alive_interval(Duration::from_secs(10))
-        .keep_alive_while_idle(true);
-
-    let tls_config = if tls.oidc_token.is_some() {
-        // Bearer auth over HTTPS: use mTLS certs for the transport layer when
-        // available (server may still require client certs), and layer the
-        // Bearer token on top via the interceptor.
-        if let Ok(materials) = require_tls_materials(server, tls) {
-            build_tonic_tls_config(server, &materials)?
+    // Plaintext, the edge tunnel, and insecure TLS do not consume certificate
+    // material. For verified HTTPS, preserve the CLI's existing behavior:
+    // mTLS is required without bearer auth and optional with OIDC.
+    if server.starts_with("https://") && !tls.gateway_insecure && !uses_edge_tunnel {
+        if tls.oidc_token.is_some() {
+            if let Ok(materials) = require_tls_materials(server, tls) {
+                config.ca_cert = Some(materials.ca);
+                config.client_identity = Some(ClientIdentity::new(materials.cert, materials.key));
+            } else {
+                let resolved = tls.with_default_paths(server);
+                config.ca_cert = resolved
+                    .ca
+                    .as_ref()
+                    .and_then(|ca_path| std::fs::read(ca_path).ok());
+            }
         } else {
-            let resolved = tls.with_default_paths(server);
-            let config = resolved
-                .ca
-                .as_ref()
-                .and_then(|ca_path| std::fs::read(ca_path).ok())
-                .map_or_else(
-                    || ClientTlsConfig::new().with_enabled_roots(),
-                    |ca_pem| ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem)),
-                );
-            tls_config_with_server_name(server, config)?
+            let materials = require_tls_materials(server, tls)?;
+            config.ca_cert = Some(materials.ca);
+            config.client_identity = Some(ClientIdentity::new(materials.cert, materials.key));
         }
-    } else if tls.edge_token.is_some() {
-        // Edge bearer mode — routed through tunnel above; if we reach here
-        // the server is not HTTPS so connect plaintext.
-        return endpoint.connect().await.into_diagnostic();
-    } else {
-        // Standard mTLS: private CA + client cert.
-        let materials = require_tls_materials(server, tls)?;
-        build_tonic_tls_config(server, &materials)?
-    };
-    endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
-    endpoint.connect().await.into_diagnostic()
+    }
+
+    Ok(config)
 }
 
-/// Build a gRPC [`OpenShellClient`].
+/// Build a gateway channel through `openshell-sdk` while retaining the CLI's
+/// filesystem-aware certificate discovery.
+pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
+    let config = sdk_client_config(server, tls)?;
+    openshell_sdk::transport::build_channel(&config)
+        .await
+        .into_diagnostic()
+}
+
+/// Build the SDK client and return its raw gRPC escape hatch.
 ///
 /// When `tls.edge_token` is set, the returned client is wrapped with an
 /// interceptor that injects authentication headers on every request.
 /// Otherwise, standard mTLS is used (interceptor is a no-op).
 pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
-    let channel = build_channel(server, tls).await?;
-    let interceptor = interceptor_from_tls(tls)?;
-    Ok(OpenShellClient::with_interceptor(channel, interceptor))
-}
-
-fn interceptor_from_tls(tls: &TlsOptions) -> Result<EdgeAuthInterceptor> {
-    EdgeAuthInterceptor::new(tls.oidc_token.as_deref(), tls.edge_token.as_deref())
-}
-
-/// Gateway replica that owns the sandbox named in `response`, when it says.
-pub fn owner_replica<T>(response: &tonic::Response<T>) -> Option<AsciiMetadataValue> {
-    response
-        .metadata()
-        .get(openshell_core::replica_routing::OWNER_REPLICA_HEADER)
-        .cloned()
-}
-
-pub fn with_owner_hint<T>(message: T) -> tonic::Request<T> {
-    let mut request = tonic::Request::new(message);
-    request.metadata_mut().insert(
-        openshell_core::replica_routing::OWNER_REQUEST_HEADER,
-        AsciiMetadataValue::from_static("1"),
-    );
-    request
-}
-
-/// Wrap `message` so the edge proxy can route it straight to `replica`.
-pub fn routed_to<T>(message: T, replica: Option<&AsciiMetadataValue>) -> tonic::Request<T> {
-    let mut request = tonic::Request::new(message);
-    if let Some(replica) = replica {
-        request.metadata_mut().insert(
-            openshell_core::replica_routing::ROUTE_REPLICA_HEADER,
-            replica.clone(),
-        );
-    }
-    request
-}
-
-/// A routed call is retried once without routing only when no gateway
-/// received it.
-///
-/// Envoy Gateway answers a replica route whose Service has no ready endpoints
-/// with `grpc-status: 14` and no `grpc-message`, while gateway errors and
-/// mid-request resets always carry a message.
-pub fn retry_unrouted(replica: Option<&AsciiMetadataValue>, status: &tonic::Status) -> bool {
-    let message = status.message();
-    replica.is_some()
-        && status.code() == tonic::Code::Unavailable
-        && (message.is_empty()
-            || message.contains("no healthy upstream")
-            || message.contains("connection failure"))
+    let config = sdk_client_config(server, tls)?;
+    // Keep the SDK's transport state machine out of every command future.
+    // Most CLI commands compose this helper into larger async operations.
+    let client = Box::pin(OpenShellClient::connect(config))
+        .await
+        .into_diagnostic()?;
+    Ok(client.raw_grpc())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{owner_replica, retry_unrouted, routed_to, tls_server_name, with_owner_hint};
-    use openshell_core::replica_routing::{
-        OWNER_REPLICA_HEADER, OWNER_REQUEST_HEADER, ROUTE_REPLICA_HEADER,
-    };
+    use super::{TlsOptions, sdk_client_config};
+    use openshell_sdk::AuthConfig;
+    use std::io::Write;
 
     #[test]
-    fn owner_hint_is_requested_explicitly() {
-        assert!(
-            with_owner_hint(())
-                .metadata()
-                .contains_key(OWNER_REQUEST_HEADER)
+    fn sdk_config_carries_cli_mtls_materials() {
+        let mut ca = tempfile::NamedTempFile::new().unwrap();
+        let mut cert = tempfile::NamedTempFile::new().unwrap();
+        let mut key = tempfile::NamedTempFile::new().unwrap();
+        ca.write_all(b"ca pem").unwrap();
+        cert.write_all(b"cert pem").unwrap();
+        key.write_all(b"key pem").unwrap();
+
+        let tls = TlsOptions::new(
+            Some(ca.path().to_path_buf()),
+            Some(cert.path().to_path_buf()),
+            Some(key.path().to_path_buf()),
         );
+        let config = sdk_client_config("https://gateway.example", &tls).unwrap();
+
+        assert_eq!(config.ca_cert.as_deref(), Some(b"ca pem".as_slice()));
+        let identity = config.client_identity.unwrap();
+        assert_eq!(identity.certificate, b"cert pem");
+        assert_eq!(identity.private_key, b"key pem");
     }
 
     #[test]
-    fn owner_replica_is_carried_to_the_routed_request() {
-        let mut response = tonic::Response::new(());
-        response
-            .metadata_mut()
-            .insert(OWNER_REPLICA_HEADER, "openshell-1".parse().unwrap());
-        let replica = owner_replica(&response);
-        let request = routed_to((), replica.as_ref());
-        assert_eq!(
-            request.metadata().get(ROUTE_REPLICA_HEADER).unwrap(),
-            "openshell-1"
-        );
+    fn sdk_config_maps_oidc_without_requiring_mtls() {
+        let tls = TlsOptions {
+            oidc_token: Some("access-token".to_string()),
+            ..Default::default()
+        };
+
+        let config = sdk_client_config("https://gateway.example", &tls).unwrap();
+
+        assert!(matches!(config.auth, Some(AuthConfig::Oidc { .. })));
+        assert!(config.client_identity.is_none());
     }
 
     #[test]
-    fn requests_without_a_known_owner_are_not_routed() {
-        let replica = owner_replica(&tonic::Response::new(()));
-        assert!(replica.is_none());
-        let request = routed_to((), replica.as_ref());
-        assert!(request.metadata().get(ROUTE_REPLICA_HEADER).is_none());
-    }
-
-    #[test]
-    fn only_unavailable_routed_calls_are_retried() {
-        let replica = "openshell-1".parse().unwrap();
-        let unavailable = tonic::Status::unavailable("no healthy upstream");
-        assert!(retry_unrouted(Some(&replica), &unavailable));
-        assert!(!retry_unrouted(None, &unavailable));
-        assert!(!retry_unrouted(
-            Some(&replica),
-            &tonic::Status::permission_denied("denied")
-        ));
-    }
-
-    #[test]
-    fn calls_are_retried_only_when_no_gateway_received_them() {
-        let replica = "openshell-1".parse().unwrap();
-        for never_arrived in [
-            "",
-            "no healthy upstream",
-            "upstream connect error or disconnect/reset before headers. reset reason: connection failure, transport failure reason: delayed connect error: Connection refused",
-        ] {
-            assert!(retry_unrouted(
-                Some(&replica),
-                &tonic::Status::unavailable(never_arrived)
-            ));
-        }
-        for may_have_started in [
-            "supervisor session not connected",
-            "upstream connect error or disconnect/reset before headers. reset reason: connection termination",
-        ] {
-            assert!(!retry_unrouted(
-                Some(&replica),
-                &tonic::Status::unavailable(may_have_started)
-            ));
-        }
-        assert!(!retry_unrouted(
-            None,
-            &tonic::Status::unavailable("no healthy upstream")
-        ));
-    }
-
-    #[test]
-    fn tls_server_name_normalizes_bracketed_ipv6_endpoint() {
-        assert_eq!(
-            tls_server_name("https://[::1]:17670").unwrap(),
-            "::1",
-            "rustls accepts an unbracketed IPv6 address as an IP server name"
-        );
-    }
-
-    #[test]
-    fn tls_server_name_preserves_dns_endpoint() {
-        assert_eq!(
-            tls_server_name("https://localhost:17670").unwrap(),
-            "localhost"
-        );
+    fn sdk_config_ignores_certificates_for_plaintext() {
+        let config = sdk_client_config("http://127.0.0.1:8080", &TlsOptions::default()).unwrap();
+        assert!(config.ca_cert.is_none());
+        assert!(config.client_identity.is_none());
     }
 }

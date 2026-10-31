@@ -8,7 +8,7 @@
 //! auth mode + scope + global role; this module validates workspace membership
 //! and workspace-level role.
 
-use super::audit::{AuthzDenial, emit_authorization_denial};
+use super::audit::{AuthzDenial, deny};
 use super::principal::Principal;
 use openshell_core::proto::{
     WorkspaceRole as ProtoWorkspaceRole, WorkspaceSelector,
@@ -159,39 +159,39 @@ pub async fn authorize_workspace(
                 .map_err(|e| Status::internal(format!("membership lookup failed: {e}")))?;
 
             let Some(member) = member else {
-                emit_authorization_denial(
+                let workspace_arg = shell_quote_for_hint(&workspace);
+                let subject_arg = shell_quote_for_hint(&user.identity.subject);
+                return Err(deny(
                     principal,
                     AuthzDenial::NotWorkspaceMember {
                         workspace: &workspace,
                     },
-                );
-                let workspace_arg = shell_quote_for_hint(&workspace);
-                let subject_arg = shell_quote_for_hint(&user.identity.subject);
-                return Err(Status::permission_denied(format!(
-                    "not a member of workspace '{workspace}'; ask a platform admin to run: \
-                     openshell workspace member add --workspace {workspace_arg} \
-                     --subject {subject_arg} --role user"
-                )));
+                    format!(
+                        "not a member of workspace '{workspace}'; ask a platform admin to run: \
+                         openshell workspace member add --workspace {workspace_arg} \
+                         --subject {subject_arg} --role user"
+                    ),
+                ));
             };
 
             let member_role = ProtoWorkspaceRole::try_from(member.role)
                 .unwrap_or(ProtoWorkspaceRole::Unspecified);
 
             if !role_satisfies(member_role, min_role) {
-                emit_authorization_denial(
+                let workspace_arg = shell_quote_for_hint(&workspace);
+                let subject_arg = shell_quote_for_hint(&user.identity.subject);
+                let role = min_role.as_str();
+                return Err(deny(
                     principal,
                     AuthzDenial::InsufficientWorkspaceRole {
                         workspace: &workspace,
                     },
-                );
-                let workspace_arg = shell_quote_for_hint(&workspace);
-                let subject_arg = shell_quote_for_hint(&user.identity.subject);
-                let role = min_role.as_str();
-                return Err(Status::permission_denied(format!(
-                    "workspace role '{role}' required in workspace '{workspace}'; ask a platform \
-                     admin to run: openshell workspace member add --workspace {workspace_arg} \
-                     --subject {subject_arg} --role {role}"
-                )));
+                    format!(
+                        "workspace role '{role}' required in workspace '{workspace}'; ask a \
+                         platform admin to run: openshell workspace member add --workspace \
+                         {workspace_arg} --subject {subject_arg} --role {role}"
+                    ),
+                ));
             }
 
             Ok(AuthorizedWorkspace {
@@ -207,12 +207,11 @@ pub async fn authorize_workspace(
             workspace,
             grant: AuthGrant::Sandbox,
         }),
-        Principal::Peer(_) => {
-            emit_authorization_denial(principal, AuthzDenial::MethodNotPermitted);
-            Err(Status::permission_denied(
-                "gateway peer principals cannot perform workspace operations",
-            ))
-        }
+        Principal::Peer(_) | Principal::Supervisor(_) => Err(deny(
+            principal,
+            AuthzDenial::MethodNotPermitted,
+            "gateway peer and supervisor principals cannot perform workspace operations",
+        )),
         Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
     }
 }
@@ -245,11 +244,12 @@ pub fn require_platform_admin(admin_role: &str, principal: &Principal) -> Result
         }
         Principal::User(_) => "platform admin role required for cross-workspace operations",
         Principal::Sandbox(_) => "sandbox principals cannot perform cross-workspace operations",
-        Principal::Peer(_) => "gateway peer principals cannot perform cross-workspace operations",
+        Principal::Peer(_) | Principal::Supervisor(_) => {
+            "gateway peer and supervisor principals cannot perform cross-workspace operations"
+        }
         Principal::Anonymous => return Err(Status::unauthenticated("authentication required")),
     };
-    emit_authorization_denial(principal, AuthzDenial::PlatformAdminRequired);
-    Err(Status::permission_denied(message))
+    Err(deny(principal, AuthzDenial::PlatformAdminRequired, message))
 }
 
 /// Check whether the caller's OIDC roles include the platform admin role.
@@ -278,8 +278,10 @@ fn role_satisfies(member_role: ProtoWorkspaceRole, min_role: MinWorkspaceRole) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::audit::test_support::assert_boundary_finding;
     use crate::auth::identity::{Identity, IdentityProvider};
-    use crate::auth::principal::{SandboxIdentitySource, SandboxPrincipal, UserPrincipal};
+    use crate::auth::principal::UserPrincipal;
+    use crate::auth::principal::test_support::sandbox;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{WorkspaceMember, WorkspaceRole as ProtoWorkspaceRole};
     use std::collections::HashMap;
@@ -297,16 +299,6 @@ mod tests {
                 scopes: vec![],
                 provider: IdentityProvider::Oidc,
             },
-        })
-    }
-
-    fn sandbox_principal() -> Principal {
-        Principal::Sandbox(SandboxPrincipal {
-            sandbox_id: "sandbox-a".to_string(),
-            source: SandboxIdentitySource::BootstrapJwt {
-                issuer: "openshell-gateway:test".to_string(),
-            },
-            trust_domain: Some("openshell".to_string()),
         })
     }
 
@@ -444,21 +436,13 @@ mod tests {
         let capture = openshell_ocsf::test_support::OcsfCapture::default();
         let _guard = capture.install();
 
-        require_platform_admin("openshell-admin", &sandbox_principal())
+        require_platform_admin("openshell-admin", &sandbox("sandbox-a"))
             .expect_err("sandbox must be denied");
 
-        let events: Vec<_> = capture
-            .events()
-            .iter()
-            .map(|event| event.to_json().unwrap())
-            .collect();
+        let events = capture.json_events();
         assert_eq!(events.len(), 2, "{events:?}");
         assert_eq!(events[0]["status_detail"], "platform_admin_required");
-        assert_eq!(events[1]["class_uid"], 2004);
-        assert_eq!(
-            events[0]["metadata"]["correlation_uid"],
-            events[1]["metadata"]["correlation_uid"]
-        );
+        assert_boundary_finding(&events[0], &events[1]);
     }
 
     #[tokio::test]
@@ -522,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn sandbox_principal_passes_through() {
         let store = test_store().await;
-        let principal = sandbox_principal();
+        let principal = sandbox("sandbox-a");
         let result = authorize_workspace(
             &store,
             "openshell-admin",
