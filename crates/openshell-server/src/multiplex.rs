@@ -274,7 +274,31 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let operator = if self.state.config.mtls_auth.operator_enabled {
+        self.serve_with_certificate_expiry(stream, peer_identity, certificate_sha256, None, source)
+            .await
+    }
+
+    /// TLS listener entry point carrying verified certificate validity.
+    pub async fn serve_with_certificate_expiry<S>(
+        &self,
+        stream: S,
+        peer_identity: Option<Identity>,
+        certificate_sha256: Option<String>,
+        certificate_expires_at_ms: Option<i64>,
+        source: ConnectionSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let discovery = peer_identity
+            .as_ref()
+            .filter(|identity| crate::auth::discovery::is_certificate(identity))
+            .and(certificate_sha256.as_ref())
+            .map(|fingerprint| crate::auth::principal::DiscoveryPrincipal {
+                certificate_sha256: fingerprint.clone(),
+                expires_at_ms: certificate_expires_at_ms.unwrap_or(0),
+            });
+        let operator = if discovery.is_none() && self.state.config.mtls_auth.operator_enabled {
             peer_identity
                 .as_ref()
                 .filter(|identity| {
@@ -334,6 +358,10 @@ impl MultiplexService {
         )
         .with_peer_certificate(certificate_sha256.clone())
         .with_operator(operator)
+        .with_discovery(
+            discovery,
+            self.state.config.auth.discovery_grants_file.clone(),
+        )
         .with_connection_source(source)
         .with_logons(self.state.logons.clone());
         let grpc_service =
@@ -835,6 +863,13 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
             fields.insert("subject".to_string(), supervisor.identity.subject.clone());
             fields.insert("token_id".to_string(), supervisor.identity.token_id.clone());
         }
+        Principal::Discovery(reader) => {
+            fields.insert("kind".to_string(), "discovery".to_string());
+            fields.insert(
+                "certificate_sha256".to_string(),
+                reader.certificate_sha256.clone(),
+            );
+        }
         Principal::Anonymous => {
             fields.insert("kind".to_string(), "anonymous".to_string());
         }
@@ -1153,6 +1188,8 @@ pub struct AuthGrpcRouter<S> {
     mtls_auth_enabled: bool,
     allow_unauthenticated_users: bool,
     operator: Option<OperatorPrincipal>,
+    discovery: Option<crate::auth::principal::DiscoveryPrincipal>,
+    discovery_grants_file: Option<std::path::PathBuf>,
     connection_source: Option<ConnectionSource>,
     logons: audit::Logons,
 }
@@ -1184,9 +1221,21 @@ impl<S> AuthGrpcRouter<S> {
             mtls_auth_enabled,
             allow_unauthenticated_users,
             operator: None,
+            discovery: None,
+            discovery_grants_file: None,
             connection_source: None,
             logons: audit::Logons::default(),
         }
+    }
+
+    fn with_discovery(
+        mut self,
+        discovery: Option<crate::auth::principal::DiscoveryPrincipal>,
+        path: Option<std::path::PathBuf>,
+    ) -> Self {
+        self.discovery = discovery;
+        self.discovery_grants_file = path;
+        self
     }
 
     fn with_operator(mut self, operator: Option<OperatorPrincipal>) -> Self {
@@ -1251,6 +1300,8 @@ where
         let mtls_auth_enabled = self.mtls_auth_enabled;
         let allow_unauthenticated_users = self.allow_unauthenticated_users;
         let operator = self.operator.clone();
+        let discovery = self.discovery.clone();
+        let discovery_grants_file = self.discovery_grants_file.clone();
         let connection_source = self.connection_source;
         let logons = self.logons.clone();
         let peer_certificate_sha256 = self.peer_certificate_sha256.clone();
@@ -1270,7 +1321,33 @@ where
                 return inner.ready().await?.call(req).await;
             }
 
-            let principal = if let Some(operator) = operator {
+            let principal = if let Some(reader) = discovery {
+                if req.headers().contains_key(http::header::AUTHORIZATION)
+                    || !crate::auth::discovery::is_method(&path)
+                {
+                    audit::emit_authorization_denial_for(
+                        &path,
+                        &origin(req.headers()),
+                        &Principal::Discovery(reader),
+                        AuthzDenial::MethodNotPermitted,
+                    );
+                    return Ok(status_response(tonic::Status::permission_denied(
+                        "discovery certificates may call only discovery methods without bearer credentials",
+                    )));
+                }
+                if let Err(status) =
+                    crate::auth::discovery::grant(discovery_grants_file.as_deref(), &reader).await
+                {
+                    audit::emit_authorization_denial_for(
+                        &path,
+                        &origin(req.headers()),
+                        &Principal::Discovery(reader),
+                        AuthzDenial::MethodNotPermitted,
+                    );
+                    return Ok(status_response(status));
+                }
+                Principal::Discovery(reader)
+            } else if let Some(operator) = operator {
                 if req.headers().contains_key(http::header::AUTHORIZATION) {
                     audit::emit_authentication_failure(
                         &path,
@@ -1362,6 +1439,9 @@ where
                 Some((denial, tonic::Status::permission_denied(message)))
             };
             let denial = match principal {
+                Principal::Discovery(_) if !crate::auth::discovery::is_method(&path) => {
+                    method_denied("discovery method required")
+                }
                 Principal::Operator(_)
                     if !crate::auth::method_authz::is_operator_callable(&path) =>
                 {
@@ -1394,7 +1474,8 @@ where
                         "anonymous callers may not call authenticated methods",
                     )));
                 }
-                Principal::Operator(_)
+                Principal::Discovery(_)
+                | Principal::Operator(_)
                 | Principal::Sandbox(_)
                 | Principal::Peer(_)
                 | Principal::Supervisor(_) => None,
@@ -1601,6 +1682,17 @@ where
         scopes: Vec::new(),
         provider: IdentityProvider::Mtls,
     })
+}
+
+/// Validity metadata parsed from the TLS-verified leaf certificate. X.509
+/// decoding is dependency-owned parsing; verification remains in the TLS backend.
+pub fn extract_peer_certificate_expiry<S>(
+    stream: &tokio_rustls::server::TlsStream<S>,
+) -> Option<i64> {
+    use x509_parser::prelude::*;
+    let leaf = stream.get_ref().1.peer_certificates()?.first()?;
+    let (_, cert) = X509Certificate::from_der(leaf.as_ref()).ok()?;
+    cert.validity().not_after.timestamp().checked_mul(1000)
 }
 
 /// Fingerprint of the leaf certificate verified during the TLS handshake.

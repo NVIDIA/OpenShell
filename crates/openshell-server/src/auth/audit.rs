@@ -216,7 +216,8 @@ fn authenticated(principal: &Principal) -> bool {
     match principal {
         Principal::User(user) => user.identity.provider != IdentityProvider::LocalDev,
         Principal::Anonymous => false,
-        Principal::Operator(_)
+        Principal::Discovery(_)
+        | Principal::Operator(_)
         | Principal::Sandbox(_)
         | Principal::Peer(_)
         | Principal::Supervisor(_) => true,
@@ -226,7 +227,7 @@ fn authenticated(principal: &Principal) -> bool {
 /// The mechanism that established `principal`, when it has an audit label.
 fn mechanism(principal: &Principal) -> Option<AuthMechanism> {
     match principal {
-        Principal::Operator(_) => Some(AuthMechanism::Mtls),
+        Principal::Discovery(_) | Principal::Operator(_) => Some(AuthMechanism::Mtls),
         Principal::User(user) => match user.identity.provider {
             IdentityProvider::Oidc => Some(AuthMechanism::Oidc),
             IdentityProvider::Mtls => Some(AuthMechanism::Mtls),
@@ -253,6 +254,7 @@ fn credential_digest(
     peer_certificate_sha256: Option<&str>,
 ) -> Option<[u8; 32]> {
     let credential = match principal {
+        Principal::Discovery(reader) => reader.certificate_sha256.as_str(),
         Principal::Operator(operator) => operator.certificate_sha256.as_str(),
         Principal::User(user) if user.identity.provider == IdentityProvider::Mtls => {
             peer_certificate_sha256.unwrap_or_default()
@@ -513,6 +515,7 @@ fn principal_user(principal: &Principal) -> User {
         Principal::Supervisor(supervisor) => {
             User::other(&supervisor.identity.subject, "Supervisor")
         }
+        Principal::Discovery(reader) => User::other(&reader.certificate_sha256, "Discovery Reader"),
         Principal::Anonymous => User::unidentified(),
     }
 }

@@ -23,6 +23,8 @@ use openshell_core::jwt::CredentialEpoch;
 /// retrieve it via `req.extensions().get::<Principal>()`.
 #[derive(Debug, Clone)]
 pub enum Principal {
+    /// Restricted verified certificate; authority is reloaded from an administrator grant.
+    Discovery(DiscoveryPrincipal),
     /// Human caller authenticated via OIDC (Keycloak, Entra ID, Okta, etc.).
     User(UserPrincipal),
     /// Gateway-wide administrator authenticated only by a verified operator certificate.
@@ -57,6 +59,13 @@ pub struct OperatorPrincipal {
     pub identity: Identity,
     /// SHA-256 fingerprint of the verified leaf certificate (not a private key).
     pub certificate_sha256: String,
+}
+
+/// Verified TLS discovery identity. No general user, role, or application authority.
+#[derive(Debug, Clone)]
+pub struct DiscoveryPrincipal {
+    pub certificate_sha256: String,
+    pub expires_at_ms: i64,
 }
 
 impl Principal {
@@ -148,6 +157,7 @@ impl Principal {
             Self::Sandbox(sandbox) => format!("sandbox:{}", sandbox.sandbox_id),
             Self::Peer(peer) => format!("peer:{}", peer.replica_id),
             Self::Supervisor(supervisor) => format!("supervisor:{}", supervisor.identity.subject),
+            Self::Discovery(reader) => format!("discovery:{}", reader.certificate_sha256),
             Self::Anonymous => "anonymous".to_string(),
         }
     }

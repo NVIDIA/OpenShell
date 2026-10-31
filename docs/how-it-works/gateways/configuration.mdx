@@ -1872,3 +1872,49 @@ TLS gateways advertise HTTPS for authenticated gateway service access, including
 on loopback, so clients can present an mTLS identity. The separate plaintext
 loopback service listener cannot accept a client-certificate identity or browser
 sessions; use an explicit gateway bearer credential there.
+
+### Discovery reader grants
+
+Configure an administrator-managed JSON file to authorize noninteractive route
+readers without workspace membership or operator access:
+
+```toml
+[openshell.gateway.auth]
+discovery_grants_file = "/run/discovery/grants.json"
+```
+
+This requires gateway TLS and a configured client CA. Issue each reader a
+client-authentication certificate from that CA with `OU=discovery`. This OU
+restricts the certificate to discovery; it does not grant access. Map the exact
+lowercase SHA-256 fingerprint of its DER leaf certificate in the grant file:
+
+```json
+{
+  "readers": [
+    {"certificate_sha256": "<64 lowercase hex digits>", "workspaces": ["team-a", "team-b"]},
+    {"certificate_sha256": "<another certificate fingerprint>", "all_workspaces": true}
+  ]
+}
+```
+
+Each entry selects either a nonempty workspace set or all workspaces. Only
+`GetServiceRouteSnapshot` and `WatchServiceRoutes` accept this identity. It grants
+no user, application, exec, forwarding, provider, or administrative access.
+Combining a discovery certificate with bearer credentials is rejected.
+
+Upgrade every gateway replica to a version supporting discovery-only certificates
+before provisioning reader identities. Mount the same administrator-controlled
+mapping on every replica. Keep
+it writable only by the administrator and update it atomically. The gateway
+reloads it on requests and watch refreshes. Removing a fingerprint revokes its
+authority on existing connections. Grant-file reads have a two-second deadline;
+watches recheck at one-second refreshes and after bounded collection. Allow up
+to sixteen seconds for collection and a backpressured watch to terminate, plus
+file propagation to each replica in the deployment's revocation bound. Missing or invalid files fail
+closed; consumers must independently expire cached routes during errors.
+Certificates are also checked against their handshake-derived expiry.
+
+For rotation, add the replacement fingerprint, project the new certificate/key
+to the consumer, then remove the old fingerprint. The proxy reloads mounted
+identity and trust files on reconnect. No certificate issuance or renewal is
+performed by the gateway.

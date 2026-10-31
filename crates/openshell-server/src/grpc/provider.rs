@@ -4290,7 +4290,8 @@ async fn exchange_provider_subject_token_inner(
     let auth_code = match request.extensions().get::<Principal>() {
         Some(Principal::Sandbox(principal)) if principal.sandbox_id == req.sandbox_id => None,
         Some(
-            Principal::Sandbox(_)
+            Principal::Discovery(_)
+            | Principal::Sandbox(_)
             | Principal::User(_)
             | Principal::Operator(_)
             | Principal::Peer(_)

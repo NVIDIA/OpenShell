@@ -19962,13 +19962,15 @@ func (x *SupervisorServiceAdvertisement) GetServiceDomain() string {
 	return ""
 }
 
-// One explicit active workspace is required. Omitted and all-workspaces
-// selectors are rejected; discovery-only machine grants are separate work.
+// Select one workspace, or all active workspaces with an explicit platform grant.
+// Alternatively provide a finite set in workspaces; never combine selectors.
 type GetServiceRouteSnapshotRequest struct {
 	state          protoimpl.MessageState         `protogen:"open.v1"`
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,1,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Up to 64 distinct canonical workspace references; exclusive with workspace_scope.
+	Workspaces    []string `protobuf:"bytes,2,rep,name=workspaces,proto3" json:"workspaces,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetServiceRouteSnapshotRequest) Reset() {
@@ -20004,6 +20006,13 @@ func (*GetServiceRouteSnapshotRequest) Descriptor() ([]byte, []int) {
 func (x *GetServiceRouteSnapshotRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
 	if x != nil {
 		return x.WorkspaceScope
+	}
+	return nil
+}
+
+func (x *GetServiceRouteSnapshotRequest) GetWorkspaces() []string {
+	if x != nil {
+		return x.Workspaces
 	}
 	return nil
 }
@@ -20059,8 +20068,10 @@ func (x *GetServiceRouteSnapshotResponse) GetSnapshot() *ServiceRouteSnapshot {
 type WatchServiceRoutesRequest struct {
 	state          protoimpl.MessageState         `protogen:"open.v1"`
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,1,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Up to 64 distinct canonical workspace references; exclusive with workspace_scope.
+	Workspaces    []string `protobuf:"bytes,2,rep,name=workspaces,proto3" json:"workspaces,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *WatchServiceRoutesRequest) Reset() {
@@ -20096,6 +20107,13 @@ func (*WatchServiceRoutesRequest) Descriptor() ([]byte, []int) {
 func (x *WatchServiceRoutesRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
 	if x != nil {
 		return x.WorkspaceScope
+	}
+	return nil
+}
+
+func (x *WatchServiceRoutesRequest) GetWorkspaces() []string {
+	if x != nil {
+		return x.Workspaces
 	}
 	return nil
 }
@@ -21860,13 +21878,19 @@ const file_openshell_proto_rawDesc = "" +
 	"\x19configuration_instance_id\x18\x02 \x01(\tR\x17configurationInstanceId\x12'\n" +
 	"\x0fconfig_revision\x18\x03 \x01(\x04R\x0econfigRevision\x12A\n" +
 	"\x06routes\x18\x04 \x03(\v2).openshell.sandbox.v1.SandboxServiceRouteR\x06routes\x12%\n" +
-	"\x0eservice_domain\x18\x05 \x01(\tR\rserviceDomain\"t\n" +
+	"\x0eservice_domain\x18\x05 \x01(\tR\rserviceDomain\"\x94\x01\n" +
 	"\x1eGetServiceRouteSnapshotRequest\x12R\n" +
-	"\x0fworkspace_scope\x18\x01 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\"a\n" +
+	"\x0fworkspace_scope\x18\x01 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1e\n" +
+	"\n" +
+	"workspaces\x18\x02 \x03(\tR\n" +
+	"workspaces\"a\n" +
 	"\x1fGetServiceRouteSnapshotResponse\x12>\n" +
-	"\bsnapshot\x18\x01 \x01(\v2\".openshell.v1.ServiceRouteSnapshotR\bsnapshot\"o\n" +
+	"\bsnapshot\x18\x01 \x01(\v2\".openshell.v1.ServiceRouteSnapshotR\bsnapshot\"\x8f\x01\n" +
 	"\x19WatchServiceRoutesRequest\x12R\n" +
-	"\x0fworkspace_scope\x18\x01 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\"\\\n" +
+	"\x0fworkspace_scope\x18\x01 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1e\n" +
+	"\n" +
+	"workspaces\x18\x02 \x03(\tR\n" +
+	"workspaces\"\\\n" +
 	"\x1aWatchServiceRoutesResponse\x12>\n" +
 	"\bsnapshot\x18\x01 \x01(\v2\".openshell.v1.ServiceRouteSnapshotR\bsnapshot\"p\n" +
 	"\x14ServiceRouteSnapshot\x12<\n" +
