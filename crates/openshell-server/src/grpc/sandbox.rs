@@ -2853,8 +2853,9 @@ pub(super) async fn handle_forward_tcp(
     .await?;
 
     // The main process may finish between minting the SSH token and opening
-    // its transport. Keep the relay reachable until terminal delivery is
-    // finalized so fast commands can attach without a readiness race.
+    // its transport. The access rules keep a Completed or Error sandbox
+    // reachable while its supervisor is connected, so fast commands attach
+    // without a readiness race.
     let access = crate::sandbox_access::acquire(state, &sandbox).await?;
 
     let connection_guard =

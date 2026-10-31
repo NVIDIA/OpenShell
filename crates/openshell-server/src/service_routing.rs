@@ -730,12 +730,12 @@ async fn proxy_to_endpoint(
     };
     // Every request passes the access gate, including ones served from a
     // pooled upstream connection.
-    let access = match sandbox_access::acquire(&state, &sandbox).await {
+    let access = match sandbox_access::acquire_for_exposed_service(&state, &sandbox).await {
         Ok(access) => access,
         Err(err) => {
             let route_err = match err {
                 AccessError::NotReachable => ServiceRouteError::sandbox_not_ready(),
-                AccessError::Lookup(err) | AccessError::Relay(err) => {
+                AccessError::Lookup(err) => {
                     warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "sandbox service routing: failed to check sandbox access");
                     ServiceRouteError::internal_error()
                 }

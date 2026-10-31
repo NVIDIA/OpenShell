@@ -17,6 +17,9 @@
 //! - A `Completed` or `Error` sandbox is usable while its supervisor is still
 //!   connected to any replica. A retained sandbox keeps its access plane after
 //!   its main process exits.
+//! - Exposed services, which do not authenticate callers, reach an `Error`
+//!   sandbox only when its main process failed. An infrastructure failure
+//!   stays reachable for debugging through the authenticated paths only.
 //! - Every other phase is refused.
 
 use std::fmt;
@@ -42,8 +45,6 @@ pub enum AccessError {
     NotReachable,
     /// The gateway could not determine whether the sandbox is reachable.
     Lookup(Status),
-    /// The supervisor did not open the relay.
-    Relay(Status),
 }
 
 impl fmt::Display for AccessError {
@@ -51,7 +52,6 @@ impl fmt::Display for AccessError {
         match self {
             Self::NotReachable => f.write_str("sandbox is not ready"),
             Self::Lookup(status) => write!(f, "sandbox access check failed: {status}"),
-            Self::Relay(status) => write!(f, "supervisor relay failed: {status}"),
         }
     }
 }
@@ -61,7 +61,6 @@ impl From<AccessError> for Status {
         match err {
             AccessError::NotReachable => Self::failed_precondition(err.to_string()),
             AccessError::Lookup(status) => status,
-            AccessError::Relay(_) => Self::unavailable(err.to_string()),
         }
     }
 }
@@ -95,6 +94,20 @@ pub async fn acquire(
     })
 }
 
+/// Apply the access rules for an exposed service, which serves callers the
+/// gateway does not authenticate.
+pub async fn acquire_for_exposed_service(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+) -> Result<SandboxAccess, AccessError> {
+    if sandbox.phase() == SandboxPhase::Error as i32
+        && !crate::compute::is_failed_main_process_result(sandbox)
+    {
+        return Err(AccessError::NotReachable);
+    }
+    acquire(state, sandbox).await
+}
+
 impl SandboxAccess {
     /// Ask the supervisor to open a relay to `target`, returning the channel
     /// id and a receiver that resolves once the supervisor claims it.
@@ -102,7 +115,7 @@ impl SandboxAccess {
         &self,
         target: relay_open::Target,
         service_id: String,
-    ) -> Result<(String, oneshot::Receiver<Result<DuplexStream, Status>>), AccessError> {
+    ) -> Result<(String, oneshot::Receiver<Result<DuplexStream, Status>>), Status> {
         crate::supervisor_session::open_routed_relay_with_target(
             &self.state,
             &self.sandbox_id,
@@ -111,7 +124,7 @@ impl SandboxAccess {
             RELAY_SESSION_WAIT,
         )
         .await
-        .map_err(AccessError::Relay)
+        .map_err(|err| Status::unavailable(format!("supervisor relay failed: {err}")))
     }
 }
 
@@ -185,6 +198,54 @@ mod tests {
         ] {
             assert!(!reachable(phase).await, "{phase:?}");
         }
+    }
+
+    fn error_sandbox(id: &str, reason: &str, exit_code: Option<i32>) -> Sandbox {
+        let mut sandbox = sandbox_in(id, SandboxPhase::Error);
+        sandbox.status = Some(openshell_core::proto::SandboxStatus {
+            phase: SandboxPhase::Error.into(),
+            exit_code,
+            conditions: vec![openshell_core::proto::SandboxCondition {
+                r#type: "Ready".into(),
+                status: "False".into(),
+                reason: reason.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        sandbox
+    }
+
+    #[tokio::test]
+    async fn exposed_services_skip_infrastructure_errors() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        state.supervisor_sessions.register(
+            "access".to_string(),
+            "session".to_string(),
+            tx,
+            shutdown_tx,
+        );
+        let main_failed = error_sandbox("access", "MainProcessFailed", Some(3));
+        let timed_out = error_sandbox("access", "ProvisioningTimedOut", None);
+
+        assert!(
+            acquire_for_exposed_service(&state, &main_failed)
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            acquire_for_exposed_service(&state, &timed_out).await,
+            Err(AccessError::NotReachable)
+        ));
+        // Authenticated paths keep the debugging shell.
+        assert!(acquire(&state, &timed_out).await.is_ok());
+        assert!(
+            acquire_for_exposed_service(&state, &sandbox_in("access", SandboxPhase::Completed))
+                .await
+                .is_ok()
+        );
     }
 
     #[test]

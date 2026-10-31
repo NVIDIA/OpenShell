@@ -528,8 +528,16 @@ async fn exec_names_the_phase_when_the_gateway_refuses() {
     drop(child.stdin.take());
     let output = finish(child).await;
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("is not ready (phase: Stopped)"), "{stderr}");
+    // The error renderer wraps long messages, so compare the words alone.
+    let stderr = String::from_utf8_lossy(&output.stderr)
+        .split_whitespace()
+        .filter(|word| *word != "│")
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        stderr.contains("is not ready (phase: Stopped); start it with `openshell sandbox start"),
+        "{stderr}"
+    );
     assert!(gateway.calls.lock().unwrap().starts.is_empty());
 }
 
