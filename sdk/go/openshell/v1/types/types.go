@@ -19,6 +19,8 @@ const (
 	SandboxStopped      SandboxPhase = "Stopped"
 	SandboxStarting     SandboxPhase = "Starting"
 	SandboxCompleted    SandboxPhase = "Completed"
+	SandboxSuspending   SandboxPhase = "Suspending"
+	SandboxSuspended    SandboxPhase = "Suspended"
 )
 
 // SandboxRestartPolicy controls replacement after the canonical main process exits.

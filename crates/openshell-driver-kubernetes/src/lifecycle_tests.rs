@@ -35,7 +35,9 @@ mod lifecycle_reconciliation {
             sandbox_api_version: Arc::new(OnceCell::new()),
             lifecycle_gates: Arc::default(),
             config: KubernetesComputeConfig::default(),
+            network_trust_bundle: None,
             operator_allowlist: None,
+            shared_supervisor: None,
         };
         (driver, steps, Arc::default())
     }
@@ -175,6 +177,23 @@ mod lifecycle_reconciliation {
             workload(),
             supervisor(),
             workload(),
+            // The recorded mode (none: supervisor-initiated) must still match
+            // the role the boundary Service selects.
+            (
+                http::Method::GET,
+                "/api/v1/namespaces/openshell/services/os-boundary-sandbox-1",
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "Service",
+                        "metadata": {"name": "os-boundary-sandbox-1"},
+                        "spec": {"selector": {
+                            BOUNDARY_PAIR_LABEL: "sandbox-1",
+                            BOUNDARY_ROLE_LABEL: "workload"
+                        }}
+                    }),
+                ),
+            ),
             (
                 http::Method::GET,
                 "/api/v1/namespaces/openshell/pods/os-supervisor-sandbox-1",

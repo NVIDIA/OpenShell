@@ -72,6 +72,7 @@ fn hello() -> SupervisorHello {
         instance_id: Uuid::new_v4().to_string(),
         connection_epoch: 0,
         supports_provider_readiness: true,
+        supports_config_push: false,
         redirected: false,
         supports_session_redirect: true,
     }
@@ -187,6 +188,7 @@ fn reporting_requires_own_authenticated_sandbox() {
             sandbox_id: hello.sandbox_id.clone(),
             source: SandboxIdentitySource::BootstrapJwt {
                 issuer: "test".to_string(),
+                auth_epoch: None,
             },
             trust_domain: Some("test".to_string()),
         }));
@@ -237,6 +239,7 @@ async fn report_rpc_requires_the_authenticated_sandboxes_current_session() {
                 sandbox_id: sandbox_id.to_string(),
                 source: SandboxIdentitySource::BootstrapJwt {
                     issuer: "test".to_string(),
+                    auth_epoch: None,
                 },
                 trust_domain: Some("test".to_string()),
             }));
@@ -826,7 +829,7 @@ async fn attach_waiting_for_update_captures_published_revision_and_becomes_ready
     .provider
     .unwrap();
 
-    // The credential driver's gate holds UpdateProvider inside the shared
+    // The credential driver's gate holds UpdateProvider inside the workspace
     // mutation guard while the attach request reaches that same guard.
     let (store_hit, release_store) = state.credentials.gate_next_store();
     let update_state = Arc::clone(&state);

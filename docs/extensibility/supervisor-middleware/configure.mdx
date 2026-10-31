@@ -44,6 +44,14 @@ timeout = "500ms"
   Largest request body, response body, or WebSocket message the service inspects. Must be at most 4 MiB and no larger than the service advertises.
 </ParamField>
 
+<ParamField path="binding_policy" type="'dynamic' | 'allowlist' | 'exact'" default="dynamic">
+  Which advertised operation and phase pairs OpenShell uses. To require a request hook, set `binding_policy = "allowlist"` and `bindings = ["http_request_pre_credentials"]`. Both the gateway and the supervisor reject a response-only service with this registration. Keep `on_error: fail_closed` on the policy attachment to block matching requests if the middleware is unavailable.
+</ParamField>
+
+<ParamField path="bindings" type="string[]">
+  Bindings required by `allowlist` or `exact`: `http_request_pre_credentials`, `http_response_pre_return`, or `websocket_message_pre_credentials`. An allowlist ignores additional valid bindings; an exact policy rejects them. Omit this field for dynamic discovery. [Gateway Configuration](/how-it-works/gateways/configuration#supervisor-middleware-services) explains upgrade requirements.
+</ParamField>
+
 <ParamField path="timeout" type="string" default="500ms">
   Time limit for `Describe`, `ValidateConfig`, and individual evaluations or stream exchanges. Use an integer followed by `ms` or `s`, from `10ms` through `30s`. A binding may advertise a shorter evaluation timeout. Accepted HTTP response and WebSocket streams have no connection-wide deadline.
 </ParamField>

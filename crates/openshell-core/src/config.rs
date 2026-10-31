@@ -46,6 +46,33 @@ pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 /// Default domain used for browser-facing sandbox service URLs.
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
+/// Gateway delivery path for supervisor configuration.
+///
+/// `Push` sends configuration over the supervisor session to supervisors that
+/// apply streamed configuration, which then stop polling. Other supervisors
+/// keep polling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDeliveryMode {
+    #[default]
+    Poll,
+    Push,
+}
+
+impl FromStr for ConfigDeliveryMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "poll" => Ok(Self::Poll),
+            "push" => Ok(Self::Push),
+            _ => Err(format!(
+                "invalid config delivery mode '{value}'; expected poll or push"
+            )),
+        }
+    }
+}
+
 /// Gateway posture when a sandbox rejects a candidate policy generation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -209,6 +236,9 @@ pub struct Config {
     /// Security posture for rejected sandbox policy generations.
     pub policy_validation_failure_mode: PolicyValidationFailureMode,
 
+    /// Whether supervisors poll for configuration or receive it over their session.
+    pub config_delivery_mode: ConfigDeliveryMode,
+
     /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
     pub tls: Option<TlsConfig>,
 
@@ -221,6 +251,11 @@ pub struct Config {
     /// Allow the WebSocket tunnel used by authenticated edge proxies.
     /// Disabled for local gateways by default.
     pub enable_websocket_tunnel: bool,
+
+    /// Operator activation after all gateways and outstanding legacy driver
+    /// operations have been drained onto the configuration-update-compatible protocol.
+    /// Disabled by default; not a license to run mixed-version writers.
+    pub enable_sandbox_updates: bool,
 
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
@@ -242,6 +277,24 @@ pub struct Config {
 
     /// Database URL for persistence.
     pub database_url: String,
+
+    /// Connection ceiling for the persistence pool.
+    ///
+    /// `None` leaves the backend's built-in default in place. The right
+    /// ceiling depends on the deployment — how many gateway replicas share
+    /// the database, and what `max_connections` a Postgres server itself
+    /// allows — so it cannot be one number baked into the binary. An
+    /// in-memory `SQLite` database ignores it: the database lives in its single
+    /// connection.
+    pub database_max_connections: Option<u32>,
+
+    /// Connection ceiling for the `PostgreSQL` mutation lock pool.
+    ///
+    /// `None` keeps the built-in default of 4. Each mutation guard holds one
+    /// lock connection, so this bounds how many guarded mutations a replica
+    /// runs or waits on in `PostgreSQL` at once. `SQLite` has no lock pool and
+    /// ignores it.
+    pub database_lock_max_connections: Option<u32>,
 
     /// Explicit compute driver configured for the gateway.
     /// `None` enables runtime auto-detection.
@@ -298,6 +351,68 @@ pub struct ServiceRoutingConfig {
     /// Enable TLS-enabled loopback gateway listeners to also accept plaintext
     /// HTTP for sandbox service hostnames.
     pub enable_loopback_service_http: bool,
+
+    /// Format used for newly generated service hostnames.
+    ///
+    /// `Readable` (the default) generates
+    /// `<workspace>--<sandbox>[--<service>]` hostnames. `Hashed` generates a
+    /// stable, one-label opaque hash derived from the gateway installation
+    /// name plus the workspace, sandbox, and service — see
+    /// [`Config::service_routing_discriminator`].
+    pub service_hostname_format: ServiceHostnameFormat,
+}
+
+/// Format of exposed-service hostnames minted by the gateway.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceHostnameFormat {
+    /// Readable `<workspace>--<sandbox>[--<service>]` hostnames.
+    #[default]
+    Readable,
+    /// Opaque one-label hashed hostnames, discriminated by the gateway
+    /// installation name.
+    Hashed,
+}
+
+impl FromStr for ServiceHostnameFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "readable" => Ok(Self::Readable),
+            "hashed" => Ok(Self::Hashed),
+            _ => Err(format!(
+                "invalid service hostname format '{value}'; expected readable or hashed"
+            )),
+        }
+    }
+}
+
+impl ServiceRoutingConfig {
+    /// Validate the service-routing configuration against the gateway
+    /// installation name.
+    ///
+    /// When [`ServiceHostnameFormat::Hashed`] is selected, the installation
+    /// name becomes the hash discriminator and must be a DNS-1123 label —
+    /// 1–63 ASCII bytes of lowercase `a-z`, `0-9`, or `-`, with no leading or
+    /// trailing `-`. It must also be unique among all gateways sharing the
+    /// service base domain; that uniqueness is an operational contract the
+    /// deploying platform is responsible for, since a single gateway cannot
+    /// observe its siblings.
+    pub fn validate(&self, installation_name: &str) -> crate::error::Result<()> {
+        if self.service_hostname_format == ServiceHostnameFormat::Hashed
+            && !is_dns_label(installation_name)
+        {
+            return Err(crate::error::Error::Config {
+                message: format!(
+                    "hashed service hostnames require the gateway installation name to be \
+                     a DNS label (1-63 lowercase ASCII alphanumeric or '-' bytes, no \
+                     leading/trailing '-'): {installation_name:?}"
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// TLS configuration.
@@ -493,20 +608,21 @@ impl GatewayInterceptorConfig {
     }
 }
 
-/// Operator policy for authorizing interceptor manifest bindings.
+/// Operator policy for authorizing bindings advertised by an extension.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayInterceptorBindingPolicy {
-    /// Preserve manifest-controlled binding discovery. Configured bindings
-    /// may narrow or disable manifest declarations.
+    /// Preserve manifest-controlled binding discovery.
     #[default]
     Dynamic,
-    /// Enable only configured RPC selectors and phases. Extra manifest
-    /// declarations are ignored.
+    /// Require and enable only configured bindings. Ignore extra declarations.
     Allowlist,
-    /// Require configured and manifest RPC selectors and phases to match.
+    /// Require configured and manifest bindings to match exactly.
     Exact,
 }
+
+/// The binding policy shared by gateway interceptors and supervisor middleware.
+pub use GatewayInterceptorBindingPolicy as ExtensionBindingPolicy;
 
 /// One configured source in the gateway's effective provider-profile catalog.
 ///
@@ -883,15 +999,19 @@ impl Config {
             metrics_bind_address: None,
             log_level: default_log_level(),
             policy_validation_failure_mode: PolicyValidationFailureMode::default(),
+            config_delivery_mode: ConfigDeliveryMode::default(),
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
             enable_websocket_tunnel: false,
+            enable_sandbox_updates: false,
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),
+            database_max_connections: None,
+            database_lock_max_connections: None,
             compute_driver: None,
             compute_driver_endpoints: BTreeMap::new(),
             credential_drivers: Vec::new(),
@@ -941,6 +1061,27 @@ impl Config {
     #[must_use]
     pub fn with_database_url(mut self, url: impl Into<String>) -> Self {
         self.database_url = url.into();
+        self
+    }
+
+    /// Create a new configuration with a database pool connection ceiling.
+    ///
+    /// `None` keeps the persistence backend's default.
+    #[must_use]
+    pub const fn with_database_max_connections(mut self, max_connections: Option<u32>) -> Self {
+        self.database_max_connections = max_connections;
+        self
+    }
+
+    /// Create a new configuration with a mutation lock pool connection ceiling.
+    ///
+    /// `None` keeps the built-in default.
+    #[must_use]
+    pub const fn with_database_lock_max_connections(
+        mut self,
+        max_connections: Option<u32>,
+    ) -> Self {
+        self.database_lock_max_connections = max_connections;
         self
     }
 
@@ -1053,6 +1194,36 @@ impl Config {
         self
     }
 
+    /// Select the hostname format for exposed sandbox services.
+    ///
+    /// [`ServiceHostnameFormat::Hashed`] derives its discriminator from the
+    /// gateway installation name ([`Config::name`]); see
+    /// [`Self::service_routing_discriminator`].
+    #[must_use]
+    pub fn with_service_hostname_format(mut self, format: ServiceHostnameFormat) -> Self {
+        self.service_routing.service_hostname_format = format;
+        self
+    }
+
+    /// The discriminator hashed into exposed-service hostnames when
+    /// [`ServiceHostnameFormat::Hashed`] is selected: the gateway
+    /// installation name.
+    ///
+    /// Returns `None` while readable hostnames are in use, in which case no
+    /// hashed service hosts exist. The name is an operator- or
+    /// platform-assigned value; it must be unique among all gateways sharing
+    /// the service base domain, an operational contract enforced by the
+    /// deploying platform rather than the gateway itself. Renaming the
+    /// installation changes every minted hostname.
+    ///
+    /// Unrelated to [`GatewayJwtConfig::gateway_id`], which carries security
+    /// and Kubernetes-ownership semantics.
+    #[must_use]
+    pub fn service_routing_discriminator(&self) -> Option<&str> {
+        (self.service_routing.service_hostname_format == ServiceHostnameFormat::Hashed)
+            .then_some(self.name.as_str())
+    }
+
     /// Enable or disable plaintext HTTP routing for loopback sandbox service
     /// hostnames on TLS-enabled gateway listeners.
     #[must_use]
@@ -1074,6 +1245,7 @@ impl Default for ServiceRoutingConfig {
         Self {
             base_domains: default_service_routing_domains(),
             enable_loopback_service_http: default_enable_loopback_service_http(),
+            service_hostname_format: ServiceHostnameFormat::default(),
         }
     }
 }
@@ -1149,10 +1321,11 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppArmorProfile, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
-        GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
-        GatewayProviderProfileSourceConfig, ImagePullPolicy, PolicyValidationFailureMode,
-        UpstreamProxyConfig, default_sandbox_pids_limit, normalize_compute_driver_name,
+        AppArmorProfile, Config, ConfigDeliveryMode, DEFAULT_SERVICE_ROUTING_DOMAIN,
+        GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
+        GatewayJwtConfig, GatewayProviderProfileSourceConfig, ImagePullPolicy,
+        PolicyValidationFailureMode, ServiceHostnameFormat, UpstreamProxyConfig,
+        default_sandbox_pids_limit, normalize_compute_driver_name,
     };
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -1170,6 +1343,19 @@ mod tests {
             PolicyValidationFailureMode::RetainLastValid
         );
         assert!("keep_old".parse::<PolicyValidationFailureMode>().is_err());
+    }
+
+    #[test]
+    fn config_delivery_defaults_to_poll_and_rejects_unknown_modes() {
+        assert_eq!(
+            Config::new(None).config_delivery_mode,
+            ConfigDeliveryMode::Poll
+        );
+        assert_eq!(
+            "push".parse::<ConfigDeliveryMode>().unwrap(),
+            ConfigDeliveryMode::Push
+        );
+        assert!("enabled".parse::<ConfigDeliveryMode>().is_err());
     }
 
     #[test]
@@ -1612,6 +1798,75 @@ mod tests {
             ]
         );
         assert!(!cfg.service_routing.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn service_hostname_format_defaults_to_readable() {
+        let cfg = Config::new(None);
+        assert_eq!(
+            cfg.service_routing.service_hostname_format,
+            ServiceHostnameFormat::Readable
+        );
+        assert_eq!(cfg.service_routing_discriminator(), None);
+        cfg.service_routing
+            .validate("any name")
+            .expect("readable is valid");
+    }
+
+    #[test]
+    fn hashed_format_discriminates_on_the_installation_name() {
+        let cfg = Config::new(None)
+            .with_name("gateway-west")
+            .with_service_hostname_format(ServiceHostnameFormat::Hashed);
+        assert_eq!(cfg.service_routing_discriminator(), Some("gateway-west"));
+        cfg.service_routing
+            .validate("gateway-west")
+            .expect("DNS-label installation name is valid");
+    }
+
+    #[test]
+    fn hashed_format_requires_a_dns_label_installation_name() {
+        for name in [
+            "",
+            "Gateway-West",
+            "-gateway",
+            "gateway-",
+            "gateway_west",
+            "gateway west",
+            &"g".repeat(64),
+        ] {
+            let cfg = Config::new(None)
+                .with_name(name)
+                .with_service_hostname_format(ServiceHostnameFormat::Hashed);
+            let error = cfg
+                .service_routing
+                .validate(name)
+                .expect_err(&format!("{name:?} must be rejected"));
+            let message = error.to_string();
+            assert!(
+                message.contains("hashed service hostnames require"),
+                "{name:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_sans_update_preserves_service_hostname_format() {
+        let cfg = Config::new(None)
+            .with_service_hostname_format(ServiceHostnameFormat::Hashed)
+            .with_server_sans(["*.apps.example.com"]);
+
+        assert_eq!(
+            cfg.service_routing.service_hostname_format,
+            ServiceHostnameFormat::Hashed
+        );
+        assert_eq!(
+            cfg.service_routing.base_domains,
+            vec![
+                "apps.example.com".to_string(),
+                DEFAULT_SERVICE_ROUTING_DOMAIN.to_string()
+            ]
+        );
     }
 
     #[test]

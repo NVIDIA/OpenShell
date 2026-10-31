@@ -122,6 +122,7 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 		"phase":                     true,
 		"conditions":                true,
 		"endpoint_statuses":         true,
+		"last_token_grant_failure":  true,
 		"current_policy_version":    true,
 		"exit_code":                 true,
 		"configuration_admission":   true,
@@ -134,7 +135,9 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 	// Provisioning carries gateway-owned attempt, deadline, and cleanup state;
 	// the curated API exposes its outcome through phase and conditions. Detailed
 	// lifecycle bookkeeping remains available through the raw protobuf API.
-	skipped := fieldSet{"main_process_instance_id": true, "configuration_activated": true, "provisioning": true}
+	// Image updates are raw-only; their pending reconciliation intent and
+	// monotonic image revision bookkeeping are not part of the curated status model.
+	skipped := fieldSet{"main_process_instance_id": true, "configuration_activated": true, "provisioning": true, "image_update": true, "image_revision": true}
 
 	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, skipped)
 }
@@ -159,9 +162,34 @@ func TestConverterCoversAllProtoFields_EndpointStatus(t *testing.T) {
 		"path":               true,
 		"last_result":        true,
 		"last_reported_time": true,
+		"last_failure":       true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.EndpointStatus{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_EndpointFailure(t *testing.T) {
+	handled := fieldSet{
+		"domain":               true,
+		"code":                 true,
+		"recovery_action":      true,
+		"provider":             true,
+		"credential_key":       true,
+		"stage":                true,
+		"upstream_http_status": true,
+		"request_id":           true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.EndpointFailure{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_TokenGrantFailureObservation(t *testing.T) {
+	handled := fieldSet{
+		"destination_host": true,
+		"destination_port": true,
+		"failure":          true,
+	}
+	assertAllFieldsCovered(t, (&pb.TokenGrantFailureObservation{}).ProtoReflect().Descriptor(), handled, nil)
 }
 
 func TestConverterCoversAllProtoFields_SandboxPolicy(t *testing.T) {

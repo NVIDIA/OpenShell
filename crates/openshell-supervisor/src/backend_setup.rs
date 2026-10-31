@@ -3,6 +3,9 @@
 
 //! Backend-owned launch decoding and client construction for supervisor startup.
 
+mod registration;
+pub use registration::{BackendRegistration, BackendRegistrations, RegisteredBackendSetup};
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -12,9 +15,9 @@ use openshell_core::jwt::{SessionBearerTokenSlot, SupervisorAuthBundle};
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::{
-    BackendDescriptor, BackendError, BackendRegistry, BoundBoundary, IsolationBackend,
-    ResolvedWorkloadIdentity, SandboxContext, SandboxPolicy,
+    BackendDescriptor, BackendError, ResolvedWorkloadIdentity, SandboxContext, SandboxPolicy,
 };
+use openshell_sandbox_backend::BoundBoundary;
 
 /// Coordinates decoded by the selected trusted backend. Shared startup checks
 /// these against admission before credentials or discovery reach that backend.
@@ -27,13 +30,26 @@ pub struct LaunchIdentity {
     pub vm_policy_identity: Option<super::VmPolicyIdentity>,
 }
 
-/// Runtime state remains owned by the supervisor. Backends retain these same
-/// handles so CA publication, provider reload, and bearer rotation stay visible
+/// Runtime state remains owned by the supervisor.
+///
+/// Backends retain these same handles so CA publication, provider reload, and bearer rotation stay visible
 /// after attachment; copying their current contents would lose later updates.
 pub struct BackendServices {
     pub ca_file_paths: Arc<Mutex<Option<(PathBuf, PathBuf)>>>,
     pub provider_credentials: ProviderCredentialState,
     pub sandbox_bearer: SessionBearerTokenSlot,
+    /// Gateway-granted authority to replace the generation's current owner.
+    pub takeover: Option<openshell_sandbox_backend::BoundaryTakeover>,
+    /// Recovery deadline (seconds) offered to the runtime at every attach.
+    pub supervisor_recovery_timeout_secs: Option<u32>,
+}
+
+/// Startup result; native payload decoding never reaches shared runtime
+/// descriptors or the public isolation interface.
+pub struct BuiltBackend {
+    pub backend: Arc<openshell_sandbox_backend::OpenShellRuntimeBackend>,
+    pub payload: Vec<u8>,
+    pub proxy_listener: Option<openshell_supervisor_network::run::ProxyListenerConfig>,
 }
 
 /// Selected by trusted composition, never by payload contents. Decoding and
@@ -66,7 +82,7 @@ pub trait PreparedBackend: Send + Sync {
     fn build(
         self: Box<Self>,
         services: BackendServices,
-    ) -> std::result::Result<Arc<dyn IsolationBackend>, BackendError>;
+    ) -> std::result::Result<BuiltBackend, BackendError>;
 }
 
 /// Created only after name and launch identity checks. Consuming attachment
@@ -151,28 +167,30 @@ impl SelectedBackend {
     }
 
     /// Construct and attach the selected client using the admitted policy and
-    /// shared services. Registry verification rejects a differently named client.
+    /// shared services. Client validation rejects a differently named endpoint selection.
     pub async fn attach(
-        self,
+        mut self,
         services: BackendServices,
         policy: SandboxPolicy,
         agent: AgentSpec,
-    ) -> Result<Box<dyn BoundBoundary>> {
-        let backend = self
+    ) -> Result<(
+        Box<BoundBoundary>,
+        Option<openshell_supervisor_network::run::ProxyListenerConfig>,
+    )> {
+        let built = self
             .prepared
             .build(services)
             .map_err(|error| miette::miette!(error.to_string()))?;
-        let mut registry = BackendRegistry::new();
-        registry
-            .register(backend)
-            .map_err(|error| miette::miette!(error.to_string()))?;
-        let admitted_backend = self.descriptor.backend_name.clone();
-        let (backend, verified) = registry
-            .resolve(self.descriptor, &admitted_backend)
-            .map_err(|error| miette::miette!(error.to_string()))?;
-        backend
+        self.descriptor.payload = built.payload;
+        if built.backend.backend_name() != self.descriptor.backend_name {
+            return Err(miette::miette!(
+                "RPC client backend does not match admitted backend"
+            ));
+        }
+        let backend = built.backend;
+        let bound = backend
             .attach(
-                verified,
+                self.descriptor,
                 SandboxContext {
                     sandbox_id: self.identity.sandbox_id,
                     session_id: self.identity.session_id,
@@ -182,7 +200,8 @@ impl SelectedBackend {
                 },
             )
             .await
-            .map_err(|error| miette::miette!(error.to_string()))
+            .map_err(|error| miette::miette!(error.to_string()))?;
+        Ok((bound, built.proxy_listener))
     }
 }
 
@@ -216,11 +235,79 @@ impl BackendSetup for OpenShellBackendSetup {
                     gid: descriptor.workload_identity.gid,
                 }),
         };
-        Ok((identity, Box::new(OpenShellLaunch(descriptor))))
+        let transport = openshell_sandbox_backend::BoundaryTransport::for_descriptor(&descriptor)?;
+        Ok((
+            identity,
+            Box::new(OpenShellLaunch {
+                descriptor,
+                transport,
+            }),
+        ))
     }
 }
 
-struct OpenShellLaunch(openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor);
+/// The built-in Sandbox Protocol for one sandbox instance of a shared
+/// supervisor.
+///
+/// The descriptor must use the routed transport for exactly `route`;
+/// decoding claims that route on the shared listener for as long as the
+/// instance's backend exists.
+pub struct RoutedBackendSetup {
+    router: Arc<openshell_sandbox_backend::runtime_routed::RuntimeRouter>,
+    route: String,
+}
+
+impl RoutedBackendSetup {
+    #[must_use]
+    pub fn new(
+        router: Arc<openshell_sandbox_backend::runtime_routed::RuntimeRouter>,
+        route: String,
+    ) -> Self {
+        Self { router, route }
+    }
+}
+
+impl BackendSetup for RoutedBackendSetup {
+    fn backend_name(&self) -> &str {
+        openshell_sandbox_backend::BACKEND_NAME
+    }
+
+    fn decode(
+        &self,
+        payload: &[u8],
+    ) -> std::result::Result<(LaunchIdentity, Box<dyn PreparedBackend>), BackendError> {
+        let descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor =
+            serde_json::from_slice(payload).map_err(|error| {
+                BackendError::Descriptor(format!("decode sandbox runtime descriptor: {error}"))
+            })?;
+        openshell_sandbox_backend::validate_runtime_coordinates(&descriptor)?;
+        let registration = self.router.register(&self.route, &descriptor.tls)?;
+        let transport =
+            openshell_sandbox_backend::BoundaryTransport::routed(&descriptor, registration)?;
+        let identity = LaunchIdentity {
+            sandbox_id: descriptor.boundary_id.clone(),
+            generation: descriptor.generation.clone(),
+            session_id: descriptor.session_id,
+            workload_identity: descriptor.workload_identity.clone(),
+            vm_policy_identity: None,
+        };
+        Ok((
+            identity,
+            Box::new(OpenShellLaunch {
+                descriptor,
+                transport,
+            }),
+        ))
+    }
+}
+
+/// Launch data plus the transport chosen for it. Discovery and the attached
+/// backend use clones of one transport, so a runtime-initiated descriptor binds
+/// its control listener once for the supervisor's lifetime.
+struct OpenShellLaunch {
+    descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor,
+    transport: openshell_sandbox_backend::BoundaryTransport,
+}
 
 #[tonic::async_trait]
 impl PreparedBackend for OpenShellLaunch {
@@ -228,21 +315,34 @@ impl PreparedBackend for OpenShellLaunch {
         &self,
         bearer: SessionBearerTokenSlot,
     ) -> std::result::Result<(Option<String>, bool), BackendError> {
-        openshell_sandbox_backend::OpenShellRuntimeBackend::discover_policy(self.0.clone(), bearer)
-            .await
+        openshell_sandbox_backend::OpenShellRuntimeBackend::discover_policy(
+            self.descriptor.clone(),
+            bearer,
+            self.transport.clone(),
+        )
+        .await
     }
 
     fn build(
         self: Box<Self>,
         services: BackendServices,
-    ) -> std::result::Result<Arc<dyn IsolationBackend>, BackendError> {
-        Ok(Arc::new(
-            openshell_sandbox_backend::OpenShellRuntimeBackend::new(
-                services.ca_file_paths,
-                services.provider_credentials,
-                services.sandbox_bearer,
-            ),
-        ))
+    ) -> std::result::Result<BuiltBackend, BackendError> {
+        let payload = self.descriptor.backend_descriptor()?.payload;
+        let mut backend = openshell_sandbox_backend::OpenShellRuntimeBackend::new(
+            services.ca_file_paths,
+            services.provider_credentials,
+            services.sandbox_bearer,
+        )
+        .with_transport(self.transport)
+        .with_recovery_timeout_secs(services.supervisor_recovery_timeout_secs);
+        if let Some(takeover) = services.takeover {
+            backend = backend.with_takeover(takeover);
+        }
+        Ok(BuiltBackend {
+            payload,
+            proxy_listener: None,
+            backend: Arc::new(backend),
+        })
     }
 }
 

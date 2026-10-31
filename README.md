@@ -38,6 +38,8 @@ openshell sandbox create --name demo
 
 The installer sets up the CLI and a local gateway. The default sandbox image is minimal Ubuntu with no agent installed. To run a real agent, follow [Run Your First Agent](https://docs.nvidia.com/openshell/latest/about/run-your-first-agent): it runs OpenCode against a free OpenRouter model and shows how to approve new access as the agent needs it.
 
+For native Windows support through Microsoft MXC, see the [Windows build and runtime guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md) for setup and current limitations.
+
 ## Explore Further
 
 - [Sandboxes](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview): images, runtimes, GPUs, and lifecycle.
@@ -48,23 +50,6 @@ The installer sets up the CLI and a local gateway. The default sandbox image is 
 - [Extensibility](https://docs.nvidia.com/openshell/latest/extensibility/overview): middleware, interceptors, and compute drivers.
 - [Tutorials](https://docs.nvidia.com/openshell/latest/tutorials/first-network-policy): step-by-step policy and agent walkthroughs.
 - [Prerelease and development builds](https://docs.nvidia.com/openshell/latest/about/installation#prerelease-and-development-builds): try an upcoming release or the latest commit on `main`.
-
-### Test the gRPC API with grpcurl
-
-The gateway serves the gRPC reflection v1 protocol. After starting a local
-plaintext gateway, use `grpcurl` without checking out or supplying the proto
-files:
-
-```shell
-grpcurl -plaintext localhost:18080 list
-grpcurl -plaintext localhost:18080 describe openshell.v1.OpenShell
-grpcurl -plaintext -d '{}' localhost:18080 openshell.v1.OpenShell/Health
-```
-
-The service list contains the public `openshell.v1.OpenShell` API. Reflection
-does not advertise the gateway's internal compute-driver, credential-driver,
-interceptor, or middleware services. For a TLS gateway, omit `-plaintext` and
-supply the CA and client certificate options required by the deployment.
 
 ## Agent Skills
 

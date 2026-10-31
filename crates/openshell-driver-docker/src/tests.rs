@@ -64,6 +64,7 @@ fn test_launch_authentication() -> Vec<u8> {
             sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
             sandbox_expires_at: i64::MAX,
             ssh_host_private_key: None,
+            ocsf_otlp_headers: None,
         },
         gateway_id: "gateway-test".to_string(),
         verification_keys: vec![SessionVerificationKey {
@@ -72,6 +73,117 @@ fn test_launch_authentication() -> Vec<u8> {
         }],
     })
     .unwrap()
+}
+
+#[tokio::test]
+async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together() {
+    let config = runtime_config();
+    let sandbox_id = format!("restart-{}", openshell_core::SandboxSessionId::new());
+    let directory = docker_boundary_state_dir_by_id(&sandbox_id, &config).unwrap();
+    fs::create_dir_all(&directory).unwrap();
+    let mut authentication: SandboxLaunchAuthentication =
+        serde_json::from_slice(&test_launch_authentication()).unwrap();
+    let tls = generate_sandbox_tls_material(authentication.supervisor.session_id).unwrap();
+    let provisioned = isolation::DockerBoundarySpec {
+        boundary_id: sandbox_id.clone(),
+        generation: authentication.supervisor.runtime_generation.to_string(),
+        session_id: authentication.supervisor.session_id,
+        session_rotation: authentication.supervisor.session_rotation,
+        auth_epoch: authentication.supervisor.auth_epoch,
+        gateway_id: authentication.gateway_id.clone(),
+        verification_keys: gateway_verification_keys(&authentication.verification_keys).unwrap(),
+        container_id: "container-test".into(),
+        image_identity: "image-test".into(),
+        gpu_requested: false,
+        listener_socket: BOUNDARY_SOCKET_MOUNT_PATH.into(),
+        control_socket: BOUNDARY_SOCKET_MOUNT_PATH.into(),
+        sandbox_tls: SandboxTlsServerConfig {
+            certificate_chain_path: BOUNDARY_CERTIFICATE_MOUNT_PATH.into(),
+            private_key_path: BOUNDARY_PRIVATE_KEY_MOUNT_PATH.into(),
+        },
+        supervisor_tls: SandboxTlsClientConfig {
+            server_name: tls.server_name,
+            trust_anchor_pem: tls.trust_anchor_pem,
+        },
+        host_gateway_ip: None,
+        workload_identity: ResolvedWorkloadIdentity::new(
+            1000,
+            1000,
+            vec![],
+            "image".into(),
+            "image-test".into(),
+        )
+        .unwrap(),
+        child_env: HashMap::new(),
+    }
+    .provision()
+    .unwrap();
+    fs::write(
+        directory.join(BOUNDARY_CONFIG_FILE),
+        provisioned.boundary_config.encode().unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        directory.join(RUNTIME_DESCRIPTOR_FILE),
+        provisioned
+            .runtime_descriptor
+            .backend_descriptor()
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    let previous_evidence = provisioned.boundary_config.provisioning_evidence;
+    authentication.supervisor.runtime_generation =
+        openshell_core::sandbox_generation::SandboxGenerationId::parse("generation-2").unwrap();
+    authentication.supervisor.session_id = openshell_core::SandboxSessionId::new();
+    let encoded = serde_json::to_vec(&authentication).unwrap();
+    refresh_docker_boundary_authentication(&sandbox_id, &config, &encoded)
+        .await
+        .unwrap();
+
+    let bootstrap: BoundaryConfig =
+        serde_json::from_slice(&fs::read(directory.join(BOUNDARY_CONFIG_FILE)).unwrap()).unwrap();
+    let descriptor = read_docker_runtime_descriptor(&sandbox_id, &config)
+        .await
+        .unwrap()
+        .unwrap();
+    let supervisor: SupervisorAuthBundle =
+        serde_json::from_slice(&fs::read(directory.join(SUPERVISOR_AUTH_BUNDLE_FILE)).unwrap())
+            .unwrap();
+    assert_eq!(bootstrap.generation, "generation-2");
+    assert_eq!(descriptor.generation, bootstrap.generation);
+    assert_eq!(supervisor.runtime_generation.as_str(), bootstrap.generation);
+    assert_eq!(bootstrap.session_id, descriptor.session_id);
+    assert_eq!(bootstrap.session_id, supervisor.session_id);
+    bootstrap
+        .provisioning_evidence
+        .validate("generation-2")
+        .unwrap();
+    assert_eq!(
+        bootstrap.provisioning_evidence,
+        descriptor.provisioning_evidence
+    );
+    assert_ne!(
+        bootstrap.provisioning_evidence.evidence_digest,
+        previous_evidence.evidence_digest
+    );
+    assert_eq!(
+        bootstrap.resource_claims,
+        provisioned.runtime_descriptor.resource_claims
+    );
+    // Retrying this launch keeps its generation/evidence binding stable.
+    refresh_docker_boundary_authentication(&sandbox_id, &config, &encoded)
+        .await
+        .unwrap();
+    let retried = read_docker_runtime_descriptor(&sandbox_id, &config)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retried.provisioning_evidence,
+        descriptor.provisioning_evidence
+    );
+    fs::remove_dir_all(directory).unwrap();
 }
 
 fn test_sandbox() -> DriverSandbox {
@@ -100,6 +212,7 @@ fn test_sandbox() -> DriverSandbox {
             await_main_process_attachment: false,
             workload_identity: None,
             launch_authentication: test_launch_authentication(),
+            ..Default::default()
         }),
         status: None,
         workspace: String::new(),
@@ -212,6 +325,13 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         supervisor_image_id: "sha256:supervisor-test".to_string(),
         supervisor_grpc_endpoint: "https://host.openshell.internal:8443".to_string(),
         supervisor_otlp_endpoint: None,
+        supervisor_network_mode: DockerSupervisorNetworkMode::Host,
+        supervisor_endpoint_explicit: true,
+        bridge_default_endpoint: Some("https://host.docker.internal:8443".to_string()),
+        host_gateway_ip: None,
+        supervisor_ocsf_export: None,
+        supervisor_otlp_agent_endpoint: None,
+        supervisor_gateway_name: None,
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
@@ -226,6 +346,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         proxy_ca_bundle: None,
         provider_spiffe_workload_api_socket: None,
         app_armor_profile: Some(AppArmorProfile::Unconfined),
+        network_trust: None,
     }
 }
 
@@ -309,7 +430,7 @@ async fn docker_constructor_rejects_proxy_ca_bundle_without_proxy() {
     config.upstream_proxy.https_proxy = None;
 
     let Err(error) =
-        DockerComputeDriver::new("127.0.0.1:17670".parse().unwrap(), "info", &config).await
+        DockerComputeDriver::new("127.0.0.1:17670".parse().unwrap(), "info", &config, None).await
     else {
         panic!("constructor must reject incoherent proxy CA configuration before Docker I/O");
     };
@@ -918,6 +1039,7 @@ async fn start_sandbox_span_does_not_capture_launch_authentication() {
             "sandbox",
             "invalid-generation",
             b"secret-launch-authentication",
+            None,
         )
         .with_subscriber(subscriber)
         .await
@@ -1007,7 +1129,8 @@ async fn tracing_direct_start_exports_a_docker_start_span() {
     let driver = test_driver_with_config(runtime_config());
 
     Box::pin(
-        DockerComputeDriver::start_sandbox(&driver, "", "", "", &[]).with_subscriber(subscriber),
+        DockerComputeDriver::start_sandbox(&driver, "", "", "", &[], None)
+            .with_subscriber(subscriber),
     )
     .await
     .expect_err("missing identifier should fail");
@@ -1392,17 +1515,40 @@ fn docker_child_environment_strips_supervisor_control_keys() {
 }
 
 #[test]
-fn supervisor_tracing_environment_requires_an_endpoint() {
+fn supervisor_otlp_environment_carries_only_configured_signals() {
+    use openshell_core::sandbox_env::{
+        GATEWAY_NAME, OTLP_AGENT_ENDPOINT, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OcsfOtlpExport,
+    };
+
     let mut config = runtime_config();
-    assert!(supervisor_tracing_environment(&config).is_empty());
+    assert!(supervisor_otlp_environment(&config).is_empty());
 
     config.supervisor_otlp_endpoint = Some("http://127.0.0.1:4317".to_string());
     assert_eq!(
-        supervisor_tracing_environment(&config),
-        [format!(
-            "{}=http://127.0.0.1:4317",
-            openshell_core::sandbox_env::OTLP_ENDPOINT
-        )]
+        supervisor_otlp_environment(&config),
+        [format!("{OTLP_ENDPOINT}=http://127.0.0.1:4317")]
+    );
+
+    config.supervisor_otlp_endpoint = None;
+    config.supervisor_ocsf_export = Some(OcsfOtlpExport {
+        endpoint: "http://siem:4317".to_string(),
+    });
+    assert_eq!(
+        supervisor_otlp_environment(&config),
+        [format!("{OTLP_OCSF_ENDPOINT}=http://siem:4317")]
+    );
+
+    config.supervisor_ocsf_export = None;
+    config.supervisor_otlp_agent_endpoint = Some("http://agents:4317".to_string());
+    assert_eq!(
+        supervisor_otlp_environment(&config),
+        [format!("{OTLP_AGENT_ENDPOINT}=http://agents:4317")]
+    );
+
+    config.supervisor_gateway_name = Some("prod-west".to_string());
+    assert_eq!(
+        supervisor_otlp_environment(&config).last(),
+        Some(&format!("{GATEWAY_NAME}=prod-west"))
     );
 }
 
@@ -1917,7 +2063,7 @@ fn build_container_create_body_includes_driver_config_mounts() {
         .mounts
         .expect("driver config mounts should be set");
 
-    assert_eq!(mounts.len(), 3);
+    assert_eq!(mounts.len(), 4);
     assert_eq!(mounts[0].typ, Some(MountTypeEnum::VOLUME));
     assert_eq!(mounts[0].source.as_deref(), Some("work-nfs"));
     assert_eq!(mounts[0].target.as_deref(), Some("/sandbox/work"));
@@ -2440,6 +2586,15 @@ fn build_container_create_body_replaces_inherited_cmd_with_sandbox_bootstrap() {
             BOUNDARY_CONFIG_MOUNT_PATH.to_string(),
         ])
     );
+    assert!(
+        create_body
+            .host_config
+            .as_ref()
+            .and_then(|config| config.binds.as_ref())
+            .is_some_and(|binds| binds
+                .iter()
+                .all(|bind| !bind.contains(ADDITIONAL_CA_MOUNT_PATH)))
+    );
     assert_eq!(
         create_body
             .labels
@@ -2462,6 +2617,128 @@ fn build_container_create_body_replaces_inherited_cmd_with_sandbox_bootstrap() {
     assert_eq!(host_config.network_mode.as_deref(), Some("none"));
     assert_eq!(host_config.extra_hosts, None);
     assert!(create_body.networking_config.is_none());
+}
+
+#[test]
+fn additional_destination_trust_is_supervisor_only_and_digest_paired() {
+    let dir = TempDir::new().unwrap();
+    let artifact = dir.path().join("normalized-additional-ca.crt");
+    let pem = b"normalized certificate fixture";
+    fs::write(&artifact, pem).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(
+        &artifact,
+        std::os::unix::fs::PermissionsExt::from_mode(0o444),
+    )
+    .unwrap();
+    let bundle = NetworkSupervisorTrustBundle::new(
+        pem.to_vec(),
+        1,
+        "sha256:paired-digest",
+        artifact.clone(),
+    );
+    let mut config = runtime_config();
+    config.network_trust = Some(bundle.clone());
+
+    let workload = build_container_create_body(&test_sandbox(), &config).unwrap();
+    assert!(
+        workload
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
+            .is_some()
+    );
+    assert!(
+        workload
+            .cmd
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|argument| argument != "--additional-ca-bundle")
+    );
+    assert!(
+        workload
+            .host_config
+            .as_ref()
+            .and_then(|host| host.mounts.as_ref())
+            .unwrap()
+            .iter()
+            .all(|mount| mount.target.as_deref() != Some(ADDITIONAL_CA_MOUNT_PATH))
+    );
+
+    let args = docker_network_trust_supervisor_args(Some(&bundle));
+    assert!(
+        args.windows(2)
+            .any(|arguments| { arguments == ["--additional-ca-bundle", ADDITIONAL_CA_MOUNT_PATH] })
+    );
+    let mount = docker_network_trust_supervisor_mount(&bundle).unwrap();
+    assert_eq!(mount.target.as_deref(), Some(ADDITIONAL_CA_MOUNT_PATH));
+    assert_eq!(mount.source.as_deref(), artifact.to_str());
+    assert_eq!(mount.read_only, Some(true));
+}
+
+#[test]
+fn tampered_additional_destination_trust_fails_closed_without_pem_contents() {
+    let dir = TempDir::new().unwrap();
+    let artifact = dir.path().join("normalized-additional-ca.crt");
+    fs::write(&artifact, b"expected").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(
+        &artifact,
+        std::os::unix::fs::PermissionsExt::from_mode(0o444),
+    )
+    .unwrap();
+    let bundle = NetworkSupervisorTrustBundle::new(
+        b"expected".to_vec(),
+        1,
+        "sha256:expected",
+        artifact.clone(),
+    );
+    fs::remove_file(&artifact).unwrap();
+    fs::write(&artifact, b"BEGIN CERTIFICATE modified secret data").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(
+        &artifact,
+        std::os::unix::fs::PermissionsExt::from_mode(0o444),
+    )
+    .unwrap();
+
+    let error = docker_network_trust_supervisor_mount(&bundle)
+        .expect_err("a changed gateway artifact must fail closed");
+    assert!(error.message().contains("network additional CA artifact"));
+    assert!(!error.message().contains("modified secret data"));
+}
+
+#[test]
+fn user_mount_cannot_replace_network_trust_destination() {
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().join("user-ca.crt");
+    fs::write(&source, b"user-controlled fixture").unwrap();
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": source,
+            "target": ADDITIONAL_CA_MOUNT_PATH
+        }]
+    })));
+
+    let error = build_container_create_body(&sandbox, &config)
+        .expect_err("user mount must not mask network trust material");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().contains("reserved OpenShell path"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -3030,7 +3307,12 @@ fn build_container_create_body_disables_docker_networking() {
 
 #[test]
 fn docker_supervisor_uses_host_network() {
-    let host = docker_supervisor_host_config(Vec::new(), "https://127.0.0.1:17670");
+    let host = docker_supervisor_host_config(
+        Vec::new(),
+        "https://127.0.0.1:17670",
+        DockerSupervisorNetworkMode::Host,
+        None,
+    );
 
     assert_eq!(host.network_mode.as_deref(), Some("host"));
     assert_eq!(
@@ -3046,7 +3328,12 @@ fn docker_supervisor_uses_host_network() {
 
 #[test]
 fn docker_supervisor_maps_host_aliases_to_the_gateway_address() {
-    let host = docker_supervisor_host_config(Vec::new(), "https://172.20.0.4:17670");
+    let host = docker_supervisor_host_config(
+        Vec::new(),
+        "https://172.20.0.4:17670",
+        DockerSupervisorNetworkMode::Host,
+        None,
+    );
 
     assert_eq!(
         host.extra_hosts,
@@ -3063,13 +3350,27 @@ fn docker_supervisor_maps_host_aliases_to_the_gateway_address() {
 
 #[test]
 fn docker_supervisor_leaves_named_gateway_hosts_to_dns() {
-    let host = docker_supervisor_host_config(Vec::new(), "https://gateway.example.com:17670");
+    let host = docker_supervisor_host_config(
+        Vec::new(),
+        "https://gateway.example.com:17670",
+        DockerSupervisorNetworkMode::Host,
+        None,
+    );
 
     assert_eq!(host.extra_hosts, None);
     assert_eq!(
         docker_supervisor_host_address("https://gateway.example.com:17670"),
         None
     );
+}
+
+#[test]
+fn docker_supervisor_healthcheck_probes_fast_only_during_startup() {
+    let health = docker_supervisor_healthcheck();
+
+    assert_eq!(health.start_interval, Some(250_000_000));
+    assert_eq!(health.interval, Some(30_000_000_000));
+    assert_eq!(health.start_period, Some(60_000_000_000));
 }
 
 #[test]
@@ -3081,6 +3382,309 @@ fn docker_supervisor_defaults_to_the_primary_loopback_endpoint() {
     assert_eq!(
         default_docker_supervisor_grpc_endpoint(17_670, true),
         "https://127.0.0.1:17670"
+    );
+}
+
+#[test]
+fn docker_supervisor_honors_operator_network_mode() {
+    for (requested, expected) in [
+        (
+            DockerSupervisorNetworkMode::Auto,
+            DockerSupervisorNetworkMode::Host,
+        ),
+        (
+            DockerSupervisorNetworkMode::Host,
+            DockerSupervisorNetworkMode::Host,
+        ),
+        (
+            DockerSupervisorNetworkMode::Bridge,
+            DockerSupervisorNetworkMode::Bridge,
+        ),
+    ] {
+        let mut config = runtime_config();
+        config.supervisor_network_mode = requested;
+        config.supervisor_endpoint_explicit = false;
+        config.supervisor_grpc_endpoint = "https://127.0.0.1:8443".into();
+        let (mode, endpoint) = docker_supervisor_networking(&config).unwrap();
+        assert_eq!(mode, expected);
+        assert_eq!(
+            endpoint,
+            if mode == DockerSupervisorNetworkMode::Bridge {
+                "https://host.docker.internal:8443"
+            } else {
+                "https://127.0.0.1:8443"
+            }
+        );
+    }
+}
+
+#[test]
+fn docker_bridge_preserves_explicit_endpoints_and_rejects_loopback() {
+    let mut config = runtime_config();
+    config.supervisor_network_mode = DockerSupervisorNetworkMode::Bridge;
+    for endpoint in [
+        "https://gateway.example.com:9443",
+        "http://172.20.0.4:8080",
+        "https://[fd00::2]:9443",
+    ] {
+        config.supervisor_grpc_endpoint = endpoint.into();
+        let (_, selected) = docker_supervisor_networking(&config).unwrap();
+        assert_eq!(selected, endpoint);
+    }
+    for endpoint in [
+        "https://127.0.0.1:8443",
+        "http://localhost:8080",
+        "https://[::1]:8443",
+        "http://0.0.0.0:8080",
+        "http://[::]:8080",
+    ] {
+        config.supervisor_grpc_endpoint = endpoint.into();
+        let error = docker_supervisor_networking(&config).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("grpc_endpoint"));
+    }
+}
+
+#[test]
+fn docker_bridge_defaults_respect_desktop_and_linux_listener_reachability() {
+    assert_eq!(
+        default_docker_bridge_endpoint("127.0.0.1:17670".parse().unwrap(), true, true).as_deref(),
+        Some("https://host.docker.internal:17670")
+    );
+    assert_eq!(
+        default_docker_bridge_endpoint("0.0.0.0:8080".parse().unwrap(), false, false).as_deref(),
+        Some("http://host.docker.internal:8080")
+    );
+    assert_eq!(
+        default_docker_bridge_endpoint("192.168.1.2:8080".parse().unwrap(), true, false).as_deref(),
+        Some("https://192.168.1.2:8080")
+    );
+    assert_eq!(
+        default_docker_bridge_endpoint("[fd00::2]:8080".parse().unwrap(), true, false).as_deref(),
+        Some("https://[fd00::2]:8080")
+    );
+    assert!(
+        default_docker_bridge_endpoint("127.0.0.1:17670".parse().unwrap(), true, false).is_none()
+    );
+    let mut config = runtime_config();
+    config.supervisor_network_mode = DockerSupervisorNetworkMode::Bridge;
+    config.supervisor_endpoint_explicit = false;
+    config.bridge_default_endpoint = None;
+    let error = docker_supervisor_networking(&config).unwrap_err();
+    assert!(error.message().contains("bind_address"));
+}
+
+#[test]
+fn docker_bridge_host_aliases_are_independent_of_gateway_endpoint() {
+    let host = docker_supervisor_host_config(
+        Vec::new(),
+        "https://gateway.example.com:9443",
+        DockerSupervisorNetworkMode::Bridge,
+        Some("172.17.0.1".parse().unwrap()),
+    );
+    assert_eq!(host.network_mode.as_deref(), Some("bridge"));
+    assert_eq!(
+        host.extra_hosts,
+        Some(vec![
+            "host.openshell.internal:172.17.0.1".into(),
+            "host.docker.internal:172.17.0.1".into()
+        ])
+    );
+    assert_eq!(host.cap_drop, Some(vec!["ALL".into()]));
+    assert_eq!(host.cap_add, None);
+    assert_eq!(
+        host.security_opt,
+        Some(vec!["no-new-privileges:true".into()])
+    );
+    assert_eq!(
+        build_container_create_body(&test_sandbox(), &runtime_config())
+            .unwrap()
+            .host_config
+            .unwrap()
+            .network_mode
+            .as_deref(),
+        Some("none")
+    );
+}
+
+#[test]
+fn docker_host_gateway_parser_prefers_one_ipv4_and_rejects_invalid_mappings() {
+    assert_eq!(parse_docker_host_gateway_hosts(b"172.29.0.254 host.openshell.internal\nfd00::1 host.openshell.internal\n172.29.0.254 host.openshell.internal # duplicate\n").unwrap(), "172.29.0.254".parse::<IpAddr>().unwrap());
+    assert_eq!(
+        parse_docker_host_gateway_hosts(b"fd00::1 HOST.OPENSHELL.INTERNAL\n").unwrap(),
+        "fd00::1".parse::<IpAddr>().unwrap()
+    );
+    for contents in [
+        "127.0.0.1 localhost",
+        "172.17.0.1 host.docker.internal",
+        "172.17.0.1 host.openshell.internal\n172.18.0.1 host.openshell.internal",
+        "bad-ip host.openshell.internal",
+        "169.254.169.254 host.openshell.internal",
+        "127.0.0.1 host.openshell.internal",
+        "::ffff:127.0.0.1 host.openshell.internal",
+        "0.0.0.0 host.openshell.internal",
+        "224.0.0.1 host.openshell.internal",
+    ] {
+        assert!(
+            parse_docker_host_gateway_hosts(contents.as_bytes()).is_err(),
+            "{contents}"
+        );
+    }
+    assert!(parse_docker_host_gateway_hosts(&[0xff]).is_err());
+}
+
+#[test]
+fn docker_host_gateway_resolver_uses_the_trusted_image_without_network_or_privileges() {
+    let body = docker_host_gateway_resolver_body("sha256:trusted", "resolver-test");
+    assert_eq!(body.image.as_deref(), Some("sha256:trusted"));
+    assert_eq!(body.user.as_deref(), Some("65534:65534"));
+    assert_eq!(
+        body.entrypoint.unwrap(),
+        [SUPERVISOR_IMAGE_CONTROL_BINARY_PATH]
+    );
+    assert_eq!(body.cmd.unwrap(), ["--help"]);
+    let labels = body.labels.unwrap();
+    assert_eq!(
+        labels.get(LABEL_SANDBOX_NAMESPACE).map(String::as_str),
+        Some("resolver-test")
+    );
+    assert_eq!(
+        labels.get(LABEL_ISOLATION_ROLE).map(String::as_str),
+        Some(LABEL_ISOLATION_ROLE_STAGING)
+    );
+    let host = body.host_config.unwrap();
+    assert_eq!(host.network_mode.as_deref(), Some("none"));
+    assert_eq!(
+        host.extra_hosts.unwrap(),
+        ["host.openshell.internal:host-gateway"]
+    );
+    assert_eq!(host.cap_drop.unwrap(), ["ALL"]);
+    assert_eq!(host.cap_add, None);
+    assert_eq!(host.security_opt.unwrap(), ["no-new-privileges:true"]);
+    assert_eq!(host.readonly_rootfs, Some(true));
+    assert!(host.binds.is_none());
+    assert!(host.mounts.is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires Docker and local supervisor/sandbox images; starts one confined resolver at a time"]
+async fn live_docker_host_gateway_resolver_reads_daemon_mapping_and_cleans_up() {
+    let docker = Docker::connect_with_local_defaults().unwrap();
+    let supervisor =
+        std::env::var("OPENSHELL_TEST_DOCKER_SUPERVISOR_IMAGE").expect("set supervisor image");
+    let sandbox = std::env::var("OPENSHELL_TEST_DOCKER_SANDBOX_IMAGE")
+        .expect("set sandbox image with no supervisor binary");
+    let temporary = TempDir::new().unwrap();
+    let namespace = format!(
+        "host-gateway-{}",
+        temporary.path().file_name().unwrap().to_str().unwrap()
+    );
+    let image_id = docker.inspect_image(&supervisor).await.unwrap().id.unwrap();
+    let ip = resolve_docker_host_gateway(&docker, &image_id, &namespace)
+        .await
+        .unwrap();
+    eprintln!("Docker daemon host-gateway resolved to {ip}");
+    if let Ok(expected) = std::env::var("OPENSHELL_TEST_DOCKER_HOST_GATEWAY_IP") {
+        assert_eq!(ip, expected.parse::<IpAddr>().unwrap());
+    }
+    let assert_clean = || async {
+        let filters = HashMap::from([(
+            "label",
+            vec![format!("{LABEL_SANDBOX_NAMESPACE}={namespace}")],
+        )]);
+        let remaining = docker
+            .list_containers(Some(
+                ListContainersOptionsBuilder::default()
+                    .all(true)
+                    .filters(&filters)
+                    .build(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            remaining.is_empty(),
+            "resolver container leaked: {remaining:?}"
+        );
+    };
+    assert_clean().await;
+    let failure_image_id = docker.inspect_image(&sandbox).await.unwrap().id.unwrap();
+    assert!(
+        resolve_docker_host_gateway(&docker, &failure_image_id, &namespace)
+            .await
+            .is_err()
+    );
+    assert_clean().await;
+}
+
+#[test]
+fn docker_host_gateway_override_is_operator_owned_and_matches_the_alias_pin() {
+    let config: DockerComputeConfig =
+        toml::from_str("supervisor_network_mode = 'bridge'\nhost_gateway_ip = '172.29.0.254'")
+            .unwrap();
+    let ip = validate_docker_host_gateway_ip(
+        config.host_gateway_ip.unwrap(),
+        config.supervisor_network_mode,
+    )
+    .unwrap();
+    let host = docker_supervisor_host_config(
+        Vec::new(),
+        "https://gateway.example.com:8443",
+        config.supervisor_network_mode,
+        Some(ip),
+    );
+    assert_eq!(
+        host.extra_hosts.unwrap(),
+        [
+            "host.openshell.internal:172.29.0.254",
+            "host.docker.internal:172.29.0.254"
+        ]
+    );
+    assert!(
+        serde_json::from_value::<DockerSandboxDriverConfig>(
+            serde_json::json!({"host_gateway_ip": "172.29.0.254"})
+        )
+        .is_err()
+    );
+    assert!(
+        validate_docker_host_gateway_ip(
+            "127.0.0.1".parse().unwrap(),
+            DockerSupervisorNetworkMode::Host
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_docker_host_gateway_ip(
+            "0.0.0.0".parse().unwrap(),
+            DockerSupervisorNetworkMode::Host
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn docker_supervisor_network_mode_is_an_operator_config_enum() {
+    assert_eq!(
+        toml::from_str::<DockerComputeConfig>("")
+            .unwrap()
+            .supervisor_network_mode,
+        DockerSupervisorNetworkMode::Host
+    );
+    for (value, expected) in [
+        ("auto", DockerSupervisorNetworkMode::Auto),
+        ("host", DockerSupervisorNetworkMode::Host),
+        ("bridge", DockerSupervisorNetworkMode::Bridge),
+    ] {
+        let config: DockerComputeConfig =
+            toml::from_str(&format!("supervisor_network_mode = '{value}'")).unwrap();
+        assert_eq!(config.supervisor_network_mode, expected);
+    }
+    assert!(toml::from_str::<DockerComputeConfig>("supervisor_network_mode = 'none'").is_err());
+    assert!(
+        serde_json::from_value::<DockerSandboxDriverConfig>(serde_json::json!({
+            "supervisor_network_mode": "host"
+        }))
+        .is_err(),
+        "workloads cannot select supervisor networking"
     );
 }
 

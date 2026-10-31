@@ -111,6 +111,8 @@ struct ProviderState {
     readiness_sequence: Arc<AtomicU64>,
     corrupt_mutation_receipt: Arc<Mutex<Option<ReceiptCorruption>>>,
     fail_mutation_after_save: Arc<Mutex<Option<Status>>>,
+    /// Plain resource-version conflicts to return before an attachment saves.
+    sandbox_provider_conflicts: Arc<AtomicU64>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
 }
 
@@ -233,6 +235,13 @@ impl TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn peer_notify_config_update(
+        &self,
+        _request: tonic::Request<openshell_core::proto::PeerNotifyConfigUpdateRequest>,
+    ) -> Result<Response<openshell_core::proto::PeerNotifyConfigUpdateResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn peer_report_provider_readiness(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
@@ -325,6 +334,20 @@ impl OpenShell for TestOpenShell {
     async fn start_sandbox(
         &self,
         _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::SuspendSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ResumeSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
@@ -422,6 +445,18 @@ impl OpenShell for TestOpenShell {
                 sandbox_name: sandbox_name.clone(),
                 provider: request.provider.clone(),
             });
+        if self
+            .state
+            .sandbox_provider_conflicts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(Status::aborted(
+                "sandbox was modified concurrently (current resource_version: 2)",
+            ));
+        }
         if !self
             .state
             .providers
@@ -484,6 +519,18 @@ impl OpenShell for TestOpenShell {
                 sandbox_name: sandbox_name.clone(),
                 provider: request.provider.clone(),
             });
+        if self
+            .state
+            .sandbox_provider_conflicts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(Status::aborted(
+                "sandbox was modified concurrently (current resource_version: 2)",
+            ));
+        }
         let mut sandbox_providers = self.state.sandbox_providers.lock().await;
         let providers = sandbox_providers.entry(sandbox_name.clone()).or_default();
         let before_len = providers.len();
@@ -3432,6 +3479,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         &ts.endpoint,
         100,
         "",
+        "",
         false,
         "table",
         "default",
@@ -3744,6 +3792,7 @@ async fn provider_list_json_output() {
         &ts.endpoint,
         100,
         "",
+        "",
         false,
         "json",
         "default",
@@ -3787,6 +3836,7 @@ async fn provider_list_yaml_output() {
         &ts.endpoint,
         100,
         "",
+        "",
         false,
         "yaml",
         "default",
@@ -3814,6 +3864,7 @@ async fn provider_list_json_empty() {
     run::provider_list(
         &ts.endpoint,
         100,
+        "",
         "",
         false,
         "json",
@@ -4061,6 +4112,7 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
     );
 
     run::provider_create_with_options(run::ProviderCreateOptions {
+        labels: &["team=ml".into()],
         server: &ts.endpoint,
         name: "custom-refresh-provider",
         provider_type: "custom-refresh",
@@ -4077,6 +4129,7 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
     let stored = ts.state.providers.lock().await;
     let provider = stored.get("custom-refresh-provider").expect("provider");
     assert_eq!(provider.r#type, "custom-refresh");
+    assert_eq!(provider.metadata.as_ref().unwrap().labels["team"], "ml");
     assert!(provider.credentials.is_empty());
 }
 
@@ -5377,6 +5430,7 @@ async fn provider_create_sends_inline_credentials() {
     let ts = run_server().await;
 
     run::provider_create_with_options(run::ProviderCreateOptions {
+        labels: &[],
         server: &ts.endpoint,
         name: "openai-inline",
         provider_type: "openai",
@@ -5413,6 +5467,7 @@ async fn provider_create_prefers_exact_imported_alias_profile() {
     install_test_profile(&ts, "gh", "GITHUB_TOKEN").await;
 
     run::provider_create_with_options(run::ProviderCreateOptions {
+        labels: &[],
         server: &ts.endpoint,
         name: "enterprise-github",
         provider_type: "gh",
@@ -5607,17 +5662,18 @@ async fn provider_create_from_gcloud_adc_happy_path() {
 
     Environment::from_pairs(&[("GOOGLE_APPLICATION_CREDENTIALS", &adc_path)])
         .run_async(async {
-            run::provider_create(
-                &ts.endpoint,
-                "my-vertex",
-                "google-vertex-ai",
-                false,
-                &[],  // no explicit credentials; refresh bootstrap covers it
-                true, // from_gcloud_adc
-                &[],
-                "default",
-                &ts.tls,
-            )
+            run::provider_create_with_options(run::ProviderCreateOptions {
+                server: &ts.endpoint,
+                name: "my-vertex",
+                provider_type: "google-vertex-ai",
+                labels: &["team=ml".into()],
+                credentials: &[],
+                credential_source: run::ProviderCreateCredentialSource::GcloudAdc,
+                config: &[],
+                workspace: "default",
+                profile_workspace: "default",
+                tls: &ts.tls,
+            })
             .await
             .expect("provider_create with --from-gcloud-adc should succeed");
 
@@ -5627,6 +5683,7 @@ async fn provider_create_from_gcloud_adc_happy_path() {
                 .get("my-vertex")
                 .expect("provider should be stored after create");
             assert_eq!(provider.r#type, "google-vertex-ai");
+            assert_eq!(provider.metadata.as_ref().unwrap().labels["team"], "ml");
             assert_eq!(
                 provider
                     .credentials
@@ -6164,4 +6221,96 @@ async fn provider_create_from_gcloud_adc_missing_client_secret() {
             );
         })
         .await;
+}
+
+#[tokio::test]
+async fn provider_attachment_retries_resource_version_conflicts() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    for action in ["attach", "detach"] {
+        let sandbox_name = "conflicted";
+        server.state.sandbox_providers.lock().await.insert(
+            sandbox_name.to_string(),
+            if action == "attach" {
+                Vec::new()
+            } else {
+                vec![READINESS_PROVIDER.to_string()]
+            },
+        );
+        server.state.sandbox_provider_requests.lock().await.clear();
+        server
+            .state
+            .sandbox_provider_conflicts
+            .store(2, Ordering::SeqCst);
+        let output = run_readiness_cli(
+            &server,
+            &[
+                "sandbox",
+                "provider",
+                action,
+                sandbox_name,
+                READINESS_PROVIDER,
+            ],
+        )
+        .await;
+        assert!(
+            output.status.success(),
+            "{action}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            server.state.sandbox_provider_requests.lock().await.len(),
+            3,
+            "{action} retried each conflict once"
+        );
+        assert_eq!(
+            server
+                .state
+                .sandbox_providers
+                .lock()
+                .await
+                .get(sandbox_name)
+                .unwrap()
+                .contains(&READINESS_PROVIDER.to_string()),
+            action == "attach"
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_attachment_reports_persistent_conflicts() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    server
+        .state
+        .sandbox_providers
+        .lock()
+        .await
+        .insert("contended".to_string(), Vec::new());
+    server
+        .state
+        .sandbox_provider_conflicts
+        .store(u64::MAX, Ordering::SeqCst);
+    let output = run_readiness_cli(
+        &server,
+        &[
+            "sandbox",
+            "provider",
+            "attach",
+            "contended",
+            READINESS_PROVIDER,
+        ],
+    )
+    .await;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Please retry the command"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(server.state.sandbox_provider_requests.lock().await.len(), 5);
+    server
+        .state
+        .sandbox_provider_conflicts
+        .store(0, Ordering::SeqCst);
 }

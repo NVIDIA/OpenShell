@@ -3,10 +3,14 @@
 
 //! Persistence layer for `OpenShell` Server.
 
+mod image_activation;
 mod legacy_time_wire;
+pub mod lock_order;
+pub mod mutation_lock;
 mod postgres;
 #[cfg(test)]
 mod refresh_lock_tests;
+mod sandbox_image;
 mod sqlite;
 
 pub use crate::storage_proto::{
@@ -19,6 +23,7 @@ use rand::Rng;
 use std::collections::HashMap;
 use thiserror::Error;
 
+pub use mutation_lock::{LockMode, MutationLockKey, MutationLockSet};
 pub use postgres::PostgresStore;
 pub use sqlite::SqliteStore;
 
@@ -60,6 +65,10 @@ pub enum PersistenceError {
     Conflict {
         current_resource_version: Option<u64>,
     },
+    /// The mutation lock was not acquired before its deadline, so this
+    /// request's guarded writes did not run; the operation is safe to retry.
+    #[error("mutation lock timeout: {0}")]
+    LockTimeout(String),
 }
 
 impl PersistenceError {
@@ -173,6 +182,57 @@ pub struct MessagePage<T> {
 
 const FULL_SCAN_PAGE_SIZE: u32 = 1000;
 
+/// One conditional write of a [`Store::write_atomically`] group.
+#[derive(Debug, Clone)]
+pub enum AtomicWrite {
+    /// Insert a new object at resource version 1; the group fails when it
+    /// exists (or its name is taken).
+    Create {
+        object_type: String,
+        id: String,
+        name: String,
+        workspace: String,
+        payload: Vec<u8>,
+    },
+    /// Replace an object's payload at exactly `expected_version`.
+    Update {
+        object_type: String,
+        id: String,
+        payload: Vec<u8>,
+        expected_version: u64,
+    },
+    /// Delete an object at exactly `expected_version`.
+    Delete {
+        object_type: String,
+        id: String,
+        expected_version: u64,
+    },
+}
+
+impl AtomicWrite {
+    fn key(&self) -> (&str, &str) {
+        match self {
+            Self::Create {
+                object_type, id, ..
+            }
+            | Self::Update {
+                object_type, id, ..
+            }
+            | Self::Delete {
+                object_type, id, ..
+            } => (object_type, id),
+        }
+    }
+}
+
+/// The order a group's writes run in: by `(object_type, id)`, so groups that
+/// share rows take their row locks in one order and cannot deadlock.
+fn atomic_write_order(writes: &[AtomicWrite]) -> Vec<usize> {
+    let mut order = (0..writes.len()).collect::<Vec<_>>();
+    order.sort_by(|left, right| writes[*left].key().cmp(&writes[*right].key()));
+    order
+}
+
 /// Write condition for compare-and-swap operations.
 #[derive(Debug, Clone, Copy)]
 pub enum WriteCondition {
@@ -202,6 +262,31 @@ pub enum Store {
 /// RAII guard for the database-backed cross-object mutation lock.
 pub struct DistributedMutationGuard {
     _postgres: Option<postgres::PostgresAdvisoryLockGuard>,
+}
+
+/// RAII guard for the database-backed SSH identity lock.
+pub struct SshIdentityMutationGuard {
+    _postgres: Option<postgres::PostgresDataPoolLockGuard>,
+    _order: lock_order::Held,
+}
+
+pub struct RefreshMutationGuard {
+    _postgres: Option<postgres::PostgresDataPoolLockGuard>,
+}
+
+#[cfg(test)]
+impl DistributedMutationGuard {
+    /// Backend process id of the `PostgreSQL` session holding the locks, or
+    /// `None` on `SQLite`.
+    pub(crate) async fn postgres_backend_pid(&mut self) -> Option<i32> {
+        let Self {
+            _postgres: postgres,
+        } = self;
+        match postgres {
+            Some(guard) => Some(guard.backend_pid().await),
+            None => None,
+        }
+    }
 }
 
 /// Trait for inferring an object type string from a message type.
@@ -284,33 +369,66 @@ impl Store {
         matches!(self, Self::Sqlite(_))
     }
 
+    /// Maximum number of pooled database connections for this backend.
+    pub fn max_connections(&self) -> u32 {
+        match self {
+            Self::Postgres(store) => store.max_connections(),
+            Self::Sqlite(store) => store.max_connections(),
+        }
+    }
+
+    /// Configured size of the `PostgreSQL` mutation lock pool, or `None` on
+    /// `SQLite`, which has no lock pool.
+    pub fn mutation_lock_connections(&self) -> Option<u32> {
+        match self {
+            Self::Postgres(store) => Some(store.lock_connection_capacity()),
+            Self::Sqlite(_) => None,
+        }
+    }
+
     /// Serialize mutations whose invariants span multiple persisted objects.
     ///
     /// `SQLite` deployments are single-replica and use only the caller's local
-    /// mutex. `PostgreSQL` deployments additionally hold a session-level
-    /// advisory lock so concurrent gateway replicas cannot validate and write
-    /// the same cross-object invariant independently.
+    /// locks. `PostgreSQL` deployments additionally hold `locks` as
+    /// session-level advisory locks, taken in ascending key order on one
+    /// connection from the dedicated lock pool, so concurrent gateway replicas
+    /// cannot validate and write the same cross-object invariant
+    /// independently. Fails with [`PersistenceError::LockTimeout`] when the
+    /// locks are not acquired by `deadline`, and with
+    /// [`PersistenceError::Database`] when `PostgreSQL` does not open a lock
+    /// connection in at least [`mutation_lock::LOCK_CONNECTION_MIN_BUDGET`].
     pub async fn acquire_distributed_mutation_guard(
         &self,
+        locks: &MutationLockSet,
+        deadline: tokio::time::Instant,
     ) -> PersistenceResult<DistributedMutationGuard> {
         match self {
             Self::Postgres(store) => Ok(DistributedMutationGuard {
-                _postgres: Some(store.acquire_cross_object_lock().await?),
+                _postgres: Some(store.acquire_mutation_locks(locks, deadline).await?),
             }),
             Self::Sqlite(_) => Ok(DistributedMutationGuard { _postgres: None }),
         }
     }
 
-    /// Independent of the cross-object lock: creation already holds that
-    /// lock when it provisions a supervisor's durable SSH identity.
+    /// Independent of the mutation locks: creation already holds its sandbox
+    /// mutation guard when it provisions a supervisor's durable SSH identity.
     pub(crate) async fn acquire_ssh_identity_mutation_guard(
         &self,
-    ) -> PersistenceResult<DistributedMutationGuard> {
+    ) -> PersistenceResult<SshIdentityMutationGuard> {
+        lock_order::check(lock_order::Lock::SshIdentity);
         match self {
-            Self::Postgres(store) => Ok(DistributedMutationGuard {
-                _postgres: Some(store.acquire_mutation_lock(0x4f53_5348_484f_5354).await?),
+            Self::Postgres(store) => Ok(SshIdentityMutationGuard {
+                _postgres: Some(
+                    store
+                        .acquire_data_pool_lock(mutation_lock::SSH_IDENTITY_LOCK_KEY)
+                        .await?,
+                ),
+                _order: lock_order::hold(lock_order::Lock::SshIdentity),
             }),
-            Self::Sqlite(_) => Ok(DistributedMutationGuard { _postgres: None }),
+            Self::Sqlite(_) => Ok(SshIdentityMutationGuard {
+                _postgres: None,
+                _order: lock_order::hold(lock_order::Lock::SshIdentity),
+            }),
         }
     }
 
@@ -320,7 +438,7 @@ impl Store {
         &self,
         provider_id: &str,
         credential_key: &str,
-    ) -> PersistenceResult<DistributedMutationGuard> {
+    ) -> PersistenceResult<RefreshMutationGuard> {
         use sha2::{Digest, Sha256};
         let mut digest = Sha256::new();
         digest.update(b"openshell-provider-refresh-lock-v1\0");
@@ -330,17 +448,45 @@ impl Store {
         let hash = digest.finalize();
         let key = i64::from_be_bytes(hash[..8].try_into().expect("eight digest bytes"));
         match self {
-            Self::Postgres(store) => Ok(DistributedMutationGuard {
-                _postgres: Some(store.acquire_mutation_lock(key).await?),
+            Self::Postgres(store) => Ok(RefreshMutationGuard {
+                _postgres: Some(store.acquire_data_pool_lock(key).await?),
             }),
-            Self::Sqlite(_) => Ok(DistributedMutationGuard { _postgres: None }),
+            Self::Sqlite(_) => Ok(RefreshMutationGuard { _postgres: None }),
         }
     }
 
-    /// Connect to a persistence store based on the database URL.
+    /// Connect to a persistence store based on the database URL, leaving pool
+    /// sizing at the backend default.
     pub async fn connect(url: &str) -> CoreResult<Self> {
+        Self::connect_with_pool_sizes(url, None, None).await
+    }
+
+    /// Connect to a persistence store based on the database URL.
+    ///
+    /// `max_connections` overrides the backend's pool ceiling, which stays at
+    /// its built-in default when `None`. The two backends have different
+    /// defaults, and an in-memory `SQLite` database ignores the override
+    /// entirely — it must be held by exactly one connection.
+    /// `lock_max_connections` sizes the `PostgreSQL` mutation lock pool the
+    /// same way; `SQLite` has no lock pool and ignores it. A `PostgreSQL`
+    /// data pool below 2 is rejected before any connection opens.
+    pub async fn connect_with_pool_sizes(
+        url: &str,
+        max_connections: Option<u32>,
+        lock_max_connections: Option<u32>,
+    ) -> CoreResult<Self> {
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            let store = PostgresStore::connect(url)
+            if let Some(configured) = max_connections
+                && configured < postgres::MIN_MAX_CONNECTIONS
+            {
+                return Err(CoreError::config(format!(
+                    "database_max_connections (--db-max-connections, OPENSHELL_DB_MAX_CONNECTIONS) \
+                     is {configured}, but PostgreSQL needs at least {}: the SSH identity lock \
+                     keeps one data connection while it queries the pool",
+                    postgres::MIN_MAX_CONNECTIONS
+                )));
+            }
+            let store = PostgresStore::connect(url, max_connections, lock_max_connections)
                 .await
                 .map_err(|e| CoreError::execution(e.to_string()))?;
             store
@@ -349,7 +495,12 @@ impl Store {
                 .map_err(|e| CoreError::execution(e.to_string()))?;
             Ok(Self::Postgres(store))
         } else if url.starts_with("sqlite:") {
-            let store = SqliteStore::connect(url)
+            if lock_max_connections.is_some() {
+                tracing::warn!(
+                    "ignoring the configured mutation lock pool ceiling: SQLite has no lock pool"
+                );
+            }
+            let store = SqliteStore::connect(url, max_connections)
                 .await
                 .map_err(|e| CoreError::execution(e.to_string()))?;
             store
@@ -480,6 +631,25 @@ impl Store {
         expected_resource_version: u64,
     ) -> PersistenceResult<bool> {
         store_dispatch_traced!(self.delete_if(object_type, id, expected_resource_version))
+    }
+
+    /// Apply conditional writes to several objects all together or not at
+    /// all, in one transaction on one connection. A create whose object or
+    /// name exists fails the group with `UniqueViolation`; an update or delete
+    /// whose object is absent or at another version fails it with `Conflict`
+    /// (with no current version). Returns each write's result in input order,
+    /// `None` for deletes.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.write_atomically", otel.status_code = tracing::field::Empty, writes = writes.len())
+    )]
+    pub async fn write_atomically(
+        &self,
+        writes: &[AtomicWrite],
+    ) -> PersistenceResult<Vec<Option<WriteResult>>> {
+        store_dispatch_traced!(self.write_atomically(writes))
     }
 
     /// Insert or update a generic named object with an application-owned scope.
@@ -1066,20 +1236,6 @@ impl Store {
             .collect()
     }
 
-    /// List and decode protobuf messages across all workspaces, hydrating
-    /// `resource_version` from the authoritative DB row.
-    pub async fn list_all_messages<T: Message + Default + ObjectType + SetResourceVersion>(
-        &self,
-        limit: u32,
-        offset: u32,
-    ) -> PersistenceResult<Vec<T>> {
-        self.list_by_type(T::object_type(), limit, offset)
-            .await?
-            .into_iter()
-            .map(decode_record)
-            .collect()
-    }
-
     /// List and decode objects that have a related membership record, with
     /// pagination. See [`Store::list_with_membership`] for details.
     pub async fn list_messages_with_membership<
@@ -1426,6 +1582,14 @@ impl Store {
             Self::Postgres(_) => unreachable!("tests use SQLite"),
         }
     }
+
+    /// Runs raw SQL against the test database.
+    pub(crate) async fn execute_for_test(&self, sql: &'static str) {
+        match self {
+            Self::Sqlite(store) => store.execute_for_test(sql).await,
+            Self::Postgres(_) => unreachable!("tests use SQLite"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1434,6 +1598,12 @@ pub async fn test_store() -> Store {
         .await
         .expect("in-memory SQLite store should connect")
 }
+
+#[cfg(test)]
+pub mod test_postgres;
+
+#[cfg(test)]
+mod mutation_lock_pg_tests;
 
 #[cfg(test)]
 mod tests;

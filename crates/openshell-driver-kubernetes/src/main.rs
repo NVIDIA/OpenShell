@@ -45,6 +45,19 @@ struct Args {
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
 
+    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
+    #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
+    otlp_ocsf_endpoint: Option<String>,
+
+    /// Deprecated and ignored: `OpenShell` emits OCSF 1.8.0 only.
+    #[arg(long, env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION", hide = true)]
+    otlp_ocsf_schema_version: Option<String>,
+
+    /// OTLP/gRPC collector endpoint that supervisors relay workload traces
+    /// to. Absent keeps the agent trace relay off.
+    #[arg(long, env = "OPENSHELL_OTLP_AGENT_ENDPOINT")]
+    otlp_agent_endpoint: Option<String>,
+
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
 
@@ -86,6 +99,16 @@ struct Args {
         value_delimiter = ','
     )]
     sandbox_image_pull_secrets: Vec<String>,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_K8S_ALLOWED_POD_ANNOTATIONS",
+        value_delimiter = ','
+    )]
+    allowed_pod_annotations: Vec<String>,
+
+    #[arg(long, env = "OPENSHELL_K8S_ALLOWED_POD_LABELS", value_delimiter = ',')]
+    allowed_pod_labels: Vec<String>,
 
     #[arg(long, env = "OPENSHELL_MANAGED_SSH_INGRESS_ENABLED")]
     managed_ssh_ingress_enabled: bool,
@@ -221,6 +244,11 @@ async fn main() -> Result<()> {
             log_level: &args.log_level,
         },
     );
+    if args.otlp_ocsf_schema_version.is_some() {
+        tracing::warn!(
+            "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION is deprecated and ignored; OpenShell emits OCSF 1.8.0"
+        );
+    }
 
     let managed_ssh_gateway_pod_selector = args
         .managed_ssh_gateway_pod_selector
@@ -238,6 +266,8 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let driver = KubernetesComputeDriver::new(
         KubernetesComputeConfig {
+            supervisor_topology: None,
+            shared_supervisor: None,
             allow_driver_config: args.admission_config_json.allow_driver_config,
             resource_admission: args.admission_config_json.resource_admission.clone(),
             workspace_mode: args.workspace_mode,
@@ -274,6 +304,12 @@ async fn main() -> Result<()> {
             proxy_ca_bundle: args.proxy_ca_bundle,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
             supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
+            supervisor_otlp_agent_endpoint: args.otlp_agent_endpoint.clone(),
+            supervisor_gateway_name: args.gateway_name.clone(),
+            supervisor_ocsf_export: args
+                .otlp_ocsf_endpoint
+                .clone()
+                .map(|endpoint| openshell_core::sandbox_env::OcsfOtlpExport { endpoint }),
             ssh_socket_path: args.sandbox_ssh_socket_path,
             client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
             host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
@@ -288,6 +324,8 @@ async fn main() -> Result<()> {
                 .unwrap_or_default(),
             default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
                 .unwrap_or_default(),
+            allowed_pod_annotations: args.allowed_pod_annotations,
+            allowed_pod_labels: args.allowed_pod_labels,
             sa_token_ttl_secs: args.sa_token_ttl_secs,
             provider_spiffe_workload_api_socket_path: args
                 .provider_spiffe_workload_api_socket_path
@@ -296,11 +334,14 @@ async fn main() -> Result<()> {
             sandbox_gid: args.sandbox_gid,
         },
         shutdown_rx,
+        None,
     )
     .await
     .into_diagnostic()?;
 
-    let service = ComputeDriverServer::new(ComputeDriverService::new(driver));
+    let driver_service = ComputeDriverService::new(driver);
+    let configuration_updates_service = openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdatesServer::new(driver_service.clone());
+    let service = ComputeDriverServer::new(driver_service);
     let shutdown = async move {
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);
@@ -314,6 +355,7 @@ async fn main() -> Result<()> {
         tonic::transport::Server::builder()
             .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
+            .add_service(configuration_updates_service)
             .serve_with_incoming_shutdown(
                 openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
                 shutdown,
@@ -325,6 +367,7 @@ async fn main() -> Result<()> {
         tonic::transport::Server::builder()
             .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
+            .add_service(configuration_updates_service)
             .serve_with_shutdown(args.bind_address, shutdown)
             .await
             .into_diagnostic()

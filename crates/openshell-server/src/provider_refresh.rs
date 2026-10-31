@@ -1430,6 +1430,11 @@ async fn apply_minted_credential(
     credential_key: &str,
     minted: &MintedCredential,
 ) -> Result<(), Status> {
+    // Validate the expiration before staging anything, so this conversion can
+    // never leave staged credential handles behind.
+    let credential_expiration_time =
+        openshell_core::time::optional_timestamp_from_legacy_millis(minted.expires_at_ms)
+            .map_err(|error| Status::internal(error.to_string()))?;
     let mut updated = provider.clone();
     let staging_id = format!("{}-refresh-{}", provider.object_id(), uuid::Uuid::new_v4());
     let staged_handles = if let Some(credentials) = credentials
@@ -1477,9 +1482,6 @@ async fn apply_minted_credential(
         }
         None
     };
-    let credential_expiration_time =
-        openshell_core::time::optional_timestamp_from_legacy_millis(minted.expires_at_ms)
-            .map_err(|error| Status::internal(error.to_string()))?;
     if let Some(expiration_time) = credential_expiration_time.as_ref() {
         updated
             .credential_expiration_times
@@ -1495,14 +1497,28 @@ async fn apply_minted_credential(
             updated.credential_expiration_times.remove(key);
         }
     }
-    // Acquire the shared sandbox mutation boundary only around validation and
+    // Acquire the workspace mutation key only around validation and
     // persistence, after any remote minting or credential staging. This
     // prevents route status from committing against the old provider revision
     // after the rotation writes, without holding the guard across network I/O.
-    let _sandbox_sync_guard = if let Some(compute) = compute {
-        Some(compute.sandbox_sync_guard().await.map_err(|error| {
-            Status::internal(format!("acquire provider mutation lock: {error}"))
-        })?)
+    let _mutation_guard = if let Some(compute) = compute {
+        match compute
+            .mutation_guard(crate::compute::MutationScope::Workspace(workspace))
+            .await
+        {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                if let Some(credentials) = credentials
+                    && let Some(handles) = &staged_handles
+                {
+                    cleanup_staged_refresh_handles(credentials, provider, handles).await;
+                }
+                return Err(crate::grpc::persistence_error_to_status(
+                    error,
+                    "acquire provider mutation lock",
+                ));
+            }
+        }
     } else {
         None
     };
@@ -1724,7 +1740,7 @@ async fn mint_google_service_account_jwt(
         exp: now_secs.saturating_add(lifetime_secs),
         sub: subject.as_deref(),
     };
-    let assertion = jsonwebtoken::encode(
+    let assertion = openshell_crypto::jwt::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
         &claims,
         &jsonwebtoken::EncodingKey::from_rsa_pem(private_key.as_bytes()).map_err(|_| {
@@ -1888,13 +1904,15 @@ async fn request_token(
         }
     }
 
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    openshell_crypto::tls::ensure_default_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| Status::internal(format!("build refresh HTTP client failed: {e}")))?;
+    // GitHub returns form-encoded bodies unless JSON is requested.
     let response = client
         .post(parsed)
+        .header(reqwest::header::ACCEPT, "application/json")
         .form(form)
         .send()
         .await
@@ -2218,24 +2236,37 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) = Box::pin(run_refresh_worker_tick(
+            match Box::pin(run_refresh_worker_tick(
                 state.store.as_ref(),
                 Some(&state.credentials),
                 Some(&state.compute),
             ))
             .await
             {
-                warn!(error = %err, "provider credential refresh worker tick failed");
+                Ok(providers) => {
+                    for (workspace, provider_name) in providers {
+                        crate::config_delivery::publish_provider(
+                            &state,
+                            &workspace,
+                            &provider_name,
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, "provider credential refresh worker tick failed");
+                }
             }
         }
     });
 }
 
+/// Returns the `(workspace, provider)` pairs whose provider records changed.
 async fn run_refresh_worker_tick(
     store: &Store,
     credentials: Option<&crate::credentials::CredentialRuntime>,
     compute: Option<&crate::compute::ComputeRuntime>,
-) -> Result<(), Status> {
+) -> Result<std::collections::HashSet<(String, String)>, Status> {
+    let changed_providers = std::collections::HashSet::new();
     let now_ms = current_time_ms();
     let states = list_all_refresh_states(store).await?;
     let watched_count = states.len();
@@ -2255,7 +2286,7 @@ async fn run_refresh_worker_tick(
         .iter()
         .any(|state| refresh_state_has_work(state, now_ms))
     {
-        return Ok(());
+        return Ok(changed_providers);
     }
     let span = tracing::info_span!(
         "refresh",
@@ -2263,8 +2294,10 @@ async fn run_refresh_worker_tick(
         watched_count,
         due_count,
     );
-    Box::pin(refresh_states(store, credentials, compute, states, now_ms).instrument(span)).await;
-    Ok(())
+    Ok(
+        Box::pin(refresh_states(store, credentials, compute, states, now_ms).instrument(span))
+            .await,
+    )
 }
 
 fn refresh_state_has_work(state: &StoredProviderCredentialRefreshState, now_ms: i64) -> bool {
@@ -2284,7 +2317,8 @@ async fn refresh_states(
     compute: Option<&crate::compute::ComputeRuntime>,
     states: Vec<StoredProviderCredentialRefreshState>,
     now_ms: i64,
-) {
+) -> std::collections::HashSet<(String, String)> {
+    let mut changed_providers = std::collections::HashSet::new();
     for state in states {
         if state
             .metadata
@@ -2314,6 +2348,8 @@ async fn refresh_states(
                     error = %err,
                     "failed to finalize tombstoned provider refresh; retrying on the next sweep"
                 );
+            } else {
+                changed_providers.insert(changed_provider(&state));
             }
             continue;
         }
@@ -2392,8 +2428,18 @@ async fn refresh_states(
                 error = %err,
                 "provider credential refresh failed"
             );
+        } else {
+            changed_providers.insert(changed_provider(&state));
         }
     }
+    changed_providers
+}
+
+fn changed_provider(state: &StoredProviderCredentialRefreshState) -> (String, String) {
+    (
+        state.object_workspace().to_string(),
+        state.provider_name.clone(),
+    )
 }
 
 #[cfg(test)]
@@ -2406,7 +2452,7 @@ mod tests {
         list_all_refresh_states, list_refresh_states_for_provider, max_lifetime_seconds,
         new_refresh_state, next_refresh_at_ms, put_refresh_state, read_bounded_oauth_error_body,
         refresh_has_expiration, refresh_material_scope, refresh_provider_credential,
-        refresh_state_name, refresh_status_from_state, refresh_strategy_name,
+        refresh_state_name, refresh_status_from_state, refresh_strategy_name, request_token,
         run_refresh_worker_tick, seconds_until_ms, set_refresh_expiration_presence,
         validate_secret_material_references,
     };
@@ -2445,7 +2491,7 @@ mod tests {
     };
     use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
     use std::collections::HashMap;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn ts(milliseconds: i64) -> prost_types::Timestamp {
@@ -2852,7 +2898,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         let response = reqwest::get(format!("{}/oversized", mock_server.uri()))
             .await
             .unwrap();
@@ -3000,6 +3046,30 @@ mod tests {
         assert_eq!(stored.provider_error_subtype, "invalid_rapt");
         assert!(stored.last_error_at_ms > 0);
         assert!(!stored.last_error.contains("provider-controlled detail"));
+    }
+
+    #[tokio::test]
+    async fn request_token_sends_accept_json() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(header("accept", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "minted-token",
+                "expires_in": 3600
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let minted = request_token(
+            &format!("{}/token", mock_server.uri()),
+            &[("grant_type".to_string(), "refresh_token".to_string())],
+            60,
+            OAuthGrantKind::UserRefreshToken,
+        )
+        .await
+        .unwrap();
+        assert_eq!(minted.access_token, "minted-token");
     }
 
     #[tokio::test]
@@ -4050,10 +4120,18 @@ mod tests {
         put_refresh_state(&store, &state).await.unwrap();
         assert_eq!(credentials.stored_credential_count(), Some(1));
 
-        Box::pin(run_refresh_worker_tick(&store, Some(&credentials), None))
+        let changed = Box::pin(run_refresh_worker_tick(&store, Some(&credentials), None))
             .await
             .unwrap();
 
+        assert_eq!(
+            changed,
+            std::collections::HashSet::from([(
+                "default".to_string(),
+                "tombstoned-refresh".to_string()
+            )]),
+            "only the refreshed provider's attached sandboxes need an update"
+        );
         assert!(
             get_refresh_state(
                 &store,
@@ -4617,6 +4695,141 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("AWS_SECRET_ACCESS_KEY"));
         assert_eq!(credentials.stored_credential_count(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn apply_minted_credential_rejects_invalid_expiry_without_staging() {
+        use super::apply_minted_credential;
+
+        let store = test_store().await;
+        let credentials = test_credentials();
+        let mut prov = provider("expiring-aws", "aws");
+        let original_handles = credentials
+            .store_provider_credentials(
+                prov.object_name(),
+                prov.object_workspace(),
+                prov.object_id(),
+                &HashMap::from([(
+                    "AWS_ACCESS_KEY_ID".to_string(),
+                    "old-access-key".to_string(),
+                )]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        prov.credential_handles.clone_from(&original_handles);
+        let stored_credential_count = credentials.stored_credential_count();
+        store.put_message(&prov).await.unwrap();
+
+        // i64::MAX milliseconds is past the latest protobuf timestamp, so the
+        // expiration conversion fails.
+        let minted = super::MintedCredential {
+            access_token: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            expires_at_ms: i64::MAX,
+            refresh_token: None,
+            additional_credentials: HashMap::new(),
+        };
+        let err = apply_minted_credential(
+            &store,
+            "default",
+            Some(&credentials),
+            None,
+            &prov,
+            "AWS_ACCESS_KEY_ID",
+            &minted,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(
+            credentials.stored_credential_count(),
+            stored_credential_count
+        );
+        let stored = store
+            .get_message_by_name::<Provider>("default", "expiring-aws")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.credential_handles, original_handles);
+    }
+
+    #[tokio::test]
+    async fn apply_minted_credential_returns_unavailable_when_guard_times_out() {
+        use super::apply_minted_credential;
+
+        let state = crate::grpc::test_support::test_server_state().await;
+        state
+            .compute
+            .set_mutation_lock_timeout_for_tests(std::time::Duration::from_millis(50));
+        let credentials = test_credentials();
+        let mut prov = provider("guarded-aws", "aws");
+        let original_handles = credentials
+            .store_provider_credentials(
+                prov.object_name(),
+                prov.object_workspace(),
+                prov.object_id(),
+                &HashMap::from([(
+                    "AWS_ACCESS_KEY_ID".to_string(),
+                    "old-access-key".to_string(),
+                )]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        prov.credential_handles.clone_from(&original_handles);
+        let stored_credential_count = credentials.stored_credential_count();
+        state.store.put_message(&prov).await.unwrap();
+        let provider_writer = crate::persistence::lock_order::branch(
+            state
+                .compute
+                .mutation_guard(crate::compute::MutationScope::Workspace("default")),
+        )
+        .await
+        .unwrap();
+
+        let minted = super::MintedCredential {
+            access_token: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            expires_at_ms: 4_000_000_000_000,
+            refresh_token: None,
+            additional_credentials: HashMap::new(),
+        };
+        let err = apply_minted_credential(
+            &state.store,
+            "default",
+            Some(&credentials),
+            Some(&state.compute),
+            &prov,
+            "AWS_ACCESS_KEY_ID",
+            &minted,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        let details = openshell_core::rpc_error::decode_details(&err).expect("error details");
+        assert_eq!(
+            details.error_info().expect("error info").reason,
+            "MUTATION_LOCK_TIMEOUT"
+        );
+        let stored = state
+            .store
+            .get_message_by_name::<Provider>("default", "guarded-aws")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.credential_handles, original_handles);
+        let resolved = credentials
+            .resolve_provider_handles(&stored, current_time_ms())
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.values.get("AWS_ACCESS_KEY_ID"),
+            Some(&"old-access-key".to_string())
+        );
+        assert_eq!(
+            credentials.stored_credential_count(),
+            stored_credential_count
+        );
+        drop(provider_writer);
     }
 
     // A wiremock responder that blocks the STS response until the test releases

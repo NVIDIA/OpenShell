@@ -265,12 +265,15 @@ jobs:
   publish-snap:
     name: Publish snap
     needs: build-snap
+    permissions:
+      actions: read
+      contents: read
     uses: ./.github/workflows/snap-publish.yml
     with:
       upload-channel: latest/edge
       github-environment: latest/edge
     secrets:
-      publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+      SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   # ---------------------------------------------------------------------------
   # Create / update the dev GitHub Release with CLI, gateway, driver, and wheels
@@ -287,7 +290,7 @@ jobs:
       - vm-e2e
       - build-deb
       - build-rpm
-      - publish-snap
+      - build-snap
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:
@@ -452,7 +455,7 @@ jobs:
           cat release/openshell.rb
 
       - name: Attest VM driver artifacts
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz

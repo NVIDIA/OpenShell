@@ -32,7 +32,6 @@ export type SdkErrorCode =
   | 'already_exists'
   | 'aborted'
   | 'canceled'
-  | 'out_of_range'
   | 'rpc';
 
 /** Extra context attached to an SdkError raised from a Connect RPC. */
@@ -100,8 +99,6 @@ export function fromConnect(err: unknown): SdkError {
     case Code.Unauthenticated:
     case Code.PermissionDenied:
       return new SdkError('auth', ce.rawMessage, options);
-    case Code.OutOfRange:
-      return new SdkError('out_of_range', ce.rawMessage, options);
     default:
       return new SdkError('rpc', ce.rawMessage, options);
   }

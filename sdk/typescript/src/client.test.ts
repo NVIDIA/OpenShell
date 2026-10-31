@@ -652,7 +652,7 @@ describe('watchLogs', () => {
           // drain
         }
       })(),
-    ).rejects.toMatchObject({ code: 'out_of_range' });
+    ).rejects.toMatchObject({ code: 'rpc', connectCode: Code.OutOfRange });
     expect(calls).toBe(1);
   });
 
@@ -1347,6 +1347,21 @@ describe('waits', () => {
       }),
     });
     await expect(sandbox.waitReady('sb', 30)).rejects.toMatchObject({ code: 'connect' });
+  });
+
+  it('waitReady rejects suspended sandboxes without waiting for timeout', async () => {
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: {
+          metadata: { id: 'sb-id', name: 'sb' },
+          status: { phase: SandboxPhase.SUSPENDED },
+        },
+      }),
+    });
+    await expect(sandbox.waitReady('sb', 30)).rejects.toMatchObject({
+      code: 'connect',
+      message: expect.stringContaining('suspended'),
+    });
   });
 
   it('waitReady rejects rather than hanging when get() never resolves', async () => {

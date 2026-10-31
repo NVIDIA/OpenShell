@@ -105,7 +105,9 @@ export type SandboxPhaseName =
   | 'stopping'
   | 'stopped'
   | 'starting'
-  | 'completed';
+  | 'completed'
+  | 'suspending'
+  | 'suspended';
 
 /** Restart behavior after the canonical main process exits. */
 export type SandboxRestartPolicyName = 'never' | 'on-failure' | 'always';
@@ -577,6 +579,8 @@ export const PHASE_NAMES: Record<SandboxPhase, SandboxPhaseName> = {
   [SandboxPhase.STOPPED]: 'stopped',
   [SandboxPhase.STARTING]: 'starting',
   [SandboxPhase.COMPLETED]: 'completed',
+  [SandboxPhase.SUSPENDING]: 'suspending',
+  [SandboxPhase.SUSPENDED]: 'suspended',
 };
 export const STATUS_NAMES: Record<ServiceStatus, HealthStatus> = {
   [ServiceStatus.UNSPECIFIED]: 'unspecified',
@@ -819,7 +823,7 @@ export function __setWatchLogsBackoffSleepForTests(
 }
 
 // Only Unavailable (connection drop, gateway restart) is retryable. Every
-// other status — including out_of_range — is terminal so the caller sees it
+// other status — including OUT_OF_RANGE — is terminal so the caller sees it
 // instead of the loop silently restarting from an empty cursor and hiding a gap.
 function isRetryableWatchLogsError(err: SdkError): boolean {
   return err.connectCode === Code.Unavailable;
@@ -1337,6 +1341,9 @@ export class SandboxClient {
       if (ref.phase === 'ready' || ref.phase === 'completed') return ref;
       if (ref.phase === 'stopped') throw new SdkError('connect', `sandbox '${name}' stopped before becoming ready`);
       if (ref.phase === 'error') throw new SdkError('connect', `sandbox '${name}' entered error phase`);
+      if (ref.phase === 'suspending' || ref.phase === 'suspended') {
+        throw new SdkError('connect', `sandbox '${name}' is suspended; resume it before waiting for ready`);
+      }
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}'`);
       await waitSleep(delay, deadline, signal);
       delay = Math.min(delay * 2, 2000);
@@ -1451,8 +1458,8 @@ export class SandboxClient {
    * highest cursor already delivered. A recoverable server-side lag surfaces
    * as a `{ kind: 'warning' }` item and the stream continues.
    *
-   * An `out_of_range` `SdkError` is terminal and deliberately not retried: it
-   * means the resume point is gone (trimmed from the buffer, or issued by a
+   * An `SdkError` with `connectCode === Code.OutOfRange` is terminal and not
+   * retried: the resume point is gone (trimmed from the buffer, or issued by a
    * cursor space the gateway no longer has), so events between it and now are
    * unrecoverable. Auto-restarting from scratch would hide that loss, which is
    * exactly what this method exists to surface. Callers who accept the gap can

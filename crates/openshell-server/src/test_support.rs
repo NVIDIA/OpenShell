@@ -21,9 +21,9 @@ use openshell_core::proto::compute::v1::{
     DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverSandbox, EnsureWorkspaceRequest,
     EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
     GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
-    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_server::ComputeDriver,
+    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, SuspendSandboxRequest,
+    SuspendSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -105,6 +105,12 @@ pub enum FakeComputeDriverCall {
     CreateSandbox {
         sandbox: Option<DriverSandbox>,
     },
+    UpdateSandboxConfiguration {
+        request: openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest,
+    },
+    UpdateSandboxImage {
+        request: openshell_core::proto::compute::v1::SandboxUpdatePreconditions,
+    },
     StopSandbox {
         sandbox_id: String,
         sandbox_name: String,
@@ -112,6 +118,15 @@ pub enum FakeComputeDriverCall {
     StartSandbox {
         sandbox_id: String,
         sandbox_name: String,
+        isolation_backend: Option<openshell_core::proto::compute::v1::IsolationBackendRegistration>,
+        /// Fresh supervisor-facing credentials. These remain opaque in test
+        /// diagnostics just as they do in production tracing.
+        launch_authentication: Vec<u8>,
+        generation_id: String,
+        /// The optional durable provisioning snapshot supplied by newer
+        /// gateways. Keeping it in the fake makes compatibility and
+        /// reconciliation tests able to verify the start contract.
+        sandbox: Option<DriverSandbox>,
     },
     DeleteSandbox {
         sandbox_id: String,
@@ -131,6 +146,9 @@ struct FakeComputeDriverState {
     sandboxes: HashMap<String, DriverSandbox>,
     calls: Vec<FakeComputeDriverCall>,
     traceparents: Vec<String>,
+    image_update_error: Option<tonic::Code>,
+    image_validation_error: Option<tonic::Code>,
+    image_update_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>)>,
 }
 
 impl Default for FakeComputeDriver {
@@ -174,6 +192,9 @@ impl FakeComputeDriver {
                 sandboxes: HashMap::new(),
                 calls: Vec::new(),
                 traceparents: Vec::new(),
+                image_update_error: None,
+                image_validation_error: None,
+                image_update_pause: None,
             })),
         }
     }
@@ -199,6 +220,36 @@ impl FakeComputeDriver {
     #[must_use]
     pub fn with_gateway_manages_lifecycle(self) -> Self {
         self.with_state(|state| state.capabilities.gateway_manages_lifecycle = true);
+        self
+    }
+
+    #[must_use]
+    pub fn with_isolation_backend_registration(self) -> Self {
+        self.with_state(|state| {
+            state
+                .capabilities
+                .extension
+                .as_mut()
+                .unwrap()
+                .supported_capabilities
+                .push(openshell_core::extension_protocol::COMPUTE_ISOLATION_BACKEND.into());
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn with_sandbox_image_updates(self) -> Self {
+        self.with_state(|state| {
+            state
+                .capabilities
+                .extension
+                .as_mut()
+                .unwrap()
+                .supported_capabilities
+                .push(
+                    openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION.into(),
+                );
+        });
         self
     }
 
@@ -230,11 +281,29 @@ impl FakeComputeDriver {
         let driver = self.clone();
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(ComputeDriverServer::new(driver))
+                .add_service(ComputeDriverServer::new(driver.clone()))
+                .add_service(openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdatesServer::new(driver.clone()))
                 .serve_with_incoming(UnixIncoming { listener })
                 .await
         });
         Ok(FakeComputeDriverServerHandle { socket_path, task })
+    }
+
+    pub fn pause_image_updates(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        self.with_state(|state| {
+            state.image_update_pause = Some((entered.clone(), release.clone()));
+        });
+        (entered, release)
+    }
+
+    pub fn set_image_update_error(&self, code: Option<tonic::Code>) {
+        self.with_state(|state| state.image_update_error = code);
+    }
+
+    pub fn set_image_validation_error(&self, code: Option<tonic::Code>) {
+        self.with_state(|state| state.image_validation_error = code);
     }
 
     fn with_state<R>(&self, f: impl FnOnce(&mut FakeComputeDriverState) -> R) -> R {
@@ -284,6 +353,50 @@ impl Stream for UnixIncoming {
             Poll::Ready(Err(err)) => Poll::Ready(Some(Err(err))),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for FakeComputeDriver {
+    async fn update_sandbox_configuration(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>,
+        Status,
+    > {
+        let pause = self.with_state(|state| state.image_update_pause.clone());
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.acquire().await.unwrap().forget();
+        }
+        self.record_traceparent(request.metadata());
+        self.with_state(|state| {
+            let request = request.into_inner();
+            let validate_only = request.preconditions.as_ref().unwrap().validate_only;
+            state.calls.push(FakeComputeDriverCall::UpdateSandboxImage {
+                request: request.preconditions.clone().unwrap(),
+            });
+            state
+                .calls
+                .push(FakeComputeDriverCall::UpdateSandboxConfiguration { request });
+            if let Some(code) = state.image_validation_error.filter(|_| validate_only) {
+                return Err(Status::new(code, "injected configuration validation error"));
+            }
+            if let Some(code) = state.image_update_error.filter(|_| !validate_only) {
+                return Err(Status::new(code, "injected configuration update error"));
+            }
+            Ok(Response::new(
+                openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse {},
+            ))
+        })
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdates for FakeComputeDriver {
+    async fn update_sandbox_configuration(&self, request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>, Status> {
+        openshell_core::compute::ComputeDriver::update_sandbox_configuration(self, request).await
     }
 }
 
@@ -385,6 +498,15 @@ impl ComputeDriver for FakeComputeDriver {
         Ok(Response::new(CreateSandboxResponse::default()))
     }
 
+    async fn suspend_sandbox(
+        &self,
+        _request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SuspendSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "the test compute driver does not support sandbox suspend",
+        ))
+    }
+
     async fn stop_sandbox(
         &self,
         request: Request<StopSandboxRequest>,
@@ -410,6 +532,10 @@ impl ComputeDriver for FakeComputeDriver {
             state.calls.push(FakeComputeDriverCall::StartSandbox {
                 sandbox_id: request.sandbox_id,
                 sandbox_name: request.name,
+                isolation_backend: request.isolation_backend,
+                launch_authentication: request.launch_authentication,
+                generation_id: request.generation_id,
+                sandbox: request.sandbox,
             });
         });
         Ok(Response::new(StartSandboxResponse::default()))

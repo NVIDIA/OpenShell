@@ -69,6 +69,74 @@ supervisor:
     tag: ""
     # -- Supervisor image digest. When set, this takes precedence over tag.
     digest: ""
+  # -- Shared supervisor pool members, used only when gatewayConfig selects
+  # supervisor_topology = "gateway". The gateway always coordinates the shared
+  # supervisor as a high-availability pool: when a member fails or leaves,
+  # another member takes over its sandboxes without restarting their
+  # workloads. 1 has no failover; use 2 or more to survive losing a member.
+  # Only the supervisor Deployment's replica count depends on this value, so
+  # changing it neither restarts the gateway nor replaces running members.
+  # Ignored when supervisor.autoscaling.enabled is true.
+  replicas: 1
+  autoscaling:
+    # -- Enable memory-based autoscaling of the shared supervisor Deployment.
+    # Requires supervisor_topology = "gateway" and the Kubernetes resource
+    # metrics API (usually Metrics Server). When enabled, the HPA owns the
+    # replica count and supervisor.replicas is ignored.
+    enabled: false
+    # -- Minimum supervisor replicas. Keep at least 2 for failover capacity.
+    minReplicas: 2
+    # -- Maximum supervisor replicas.
+    maxReplicas: 4
+    # -- Target average memory working set per supervisor Pod, as a positive
+    # Kubernetes quantity. This is an absolute value, not a percentage of
+    # requests. Scaling up adds capacity for new sandboxes; it does not move
+    # existing sandboxes away from a busy member.
+    targetMemoryAverageValue: 512Mi
+    # -- HPA scaling behavior. Remove at most one member every two minutes,
+    # after a five-minute stabilization window, to allow ownership handoff.
+    behavior:
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        policies:
+          - type: Pods
+            value: 1
+            periodSeconds: 120
+  podDisruptionBudget:
+    # -- Render a PodDisruptionBudget with maxUnavailable 1 for the shared
+    # supervisor, used only when gatewayConfig selects supervisor_topology =
+    # "gateway". Disable it only when maintenance must evict more than one
+    # supervisor Pod at a time, or evict a member while another is unavailable.
+    enabled: true
+  # -- Seconds a sandbox workload stays frozen after losing its pool member's
+  # supervision before the sandbox runtime terminates it, rendered as
+  # [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an
+  # integer from 30 to 300. Null leaves the gateway's pool default of 60
+  # seconds.
+  recoveryTimeoutSeconds: 60
+  # Pod security context for the shared supervisor Deployment, rendered only
+  # when gatewayConfig selects supervisor_topology = "gateway". On OpenShift,
+  # set the user and group IDs to null so the restricted-v2 SCC can assign the
+  # namespace range; ci/values-openshift-scc.yaml does this.
+  podSecurityContext:
+    # -- Require the shared supervisor to run as a non-root user.
+    runAsNonRoot: true
+    # -- UID assigned to the shared supervisor pod.
+    runAsUser: 65534
+    # -- Primary GID assigned to the shared supervisor pod.
+    runAsGroup: 65534
+    # -- fsGroup assigned to the shared supervisor pod.
+    fsGroup: 65534
+    seccompProfile:
+      # -- Seccomp profile applied to the shared supervisor pod.
+      type: RuntimeDefault
+  # -- Affinity rules for the shared supervisor pod, rendered only when
+  # gatewayConfig selects supervisor_topology = "gateway". Top-level affinity
+  # applies only to the gateway pod.
+  affinity: {}
+  network:
+    # -- Name of an operator-owned ConfigMap with a `ca.crt` key containing additional destination CA certificates for sandbox supervisors. Empty disables additional destination trust.
+    additionalCaConfigMapName: ""
   sandboxRuntime:
     # -- Workload boundary TLS listener port.
     boundaryPort: 5500
@@ -189,6 +257,9 @@ securityContext:
     # -- Linux capabilities dropped from the gateway container.
     drop:
       - ALL
+  seccompProfile:
+    # -- Seccomp profile applied to the gateway container.
+    type: RuntimeDefault
 
 service:
   # -- Kubernetes Service type for the gateway.
@@ -231,9 +302,13 @@ autoscaling:
   enabled: false
   # -- Minimum gateway replicas. Use 2 or more to survive a pod failure.
   minReplicas: 2
-  # -- Maximum gateway replicas. Each replica opens its own PostgreSQL
-  # connection pool; size the database for rollouts at this count, as the High
-  # Availability guide describes.
+  # -- Maximum gateway replicas. Each replica opens up to
+  # database_max_connections + database_lock_max_connections PostgreSQL
+  # connections (14 with the defaults; set them under
+  # gatewayConfig.openshell.gateway); size the database for rollouts at this
+  # count, as the High Availability guide describes. With a Deployment and the
+  # default pool sizes, the default of 4 needs `max_connections` of at least
+  # 126, more than the PostgreSQL default of 100.
   maxReplicas: 4
   # -- Target average CPU utilization, as a percentage of
   # resources.requests.cpu. Set to null to disable. Requires
@@ -331,8 +406,8 @@ server:
     # When replicas share the volume, set subPathExpr: $(OPENSHELL_POD_NAME)
     # on the mount so each replica writes its own file.
     path: /tmp/gateway-ocsf.jsonl
-    # -- Optional OCSF downgrade target. Empty emits native OCSF 1.8.0.
-    # Supported values: "1.1", "1.3".
+    # -- Deprecated and ignored: the gateway emits native OCSF 1.8.0 and logs
+    # a warning at startup when this is set.
     schemaVersion: ""
     # -- Rotate the active file daily in UTC, or never.
     rotation: daily
@@ -346,6 +421,9 @@ server:
   extraVolumes: []
   # -- Additional volume mounts for the gateway container.
   extraVolumeMounts: []
+  # -- Additional environment variables for the gateway container, such as
+  # OTEL_* exporter settings. Entries can read from a Secret with valueFrom.
+  extraEnv: []
   # -- Enable anonymous OpenShell telemetry from the gateway and the sandbox
   # supervisors it launches.
   telemetryEnabled: true
@@ -356,6 +434,17 @@ server:
   # in WAL mode and needs a local block-backed volume, not NFS or other network
   # filesystems.
   dbUrl: "sqlite:/var/openshell/openshell.db"
+  # -- Storage request for the gateway data PVC, `openshell-data` (StatefulSet
+  # workload only). Uses Kubernetes quantity syntax and requires an explicit unit
+  # ("20Gi", not "20"). Empty = built-in default (1Gi). Growing an existing
+  # release's claim is PVC expansion, not a values change.
+  dataStorageSize: ""
+  # -- Kubernetes StorageClass for the gateway data PVC (StatefulSet workload
+  # only). Empty (default) = omit storageClassName, using the cluster's default
+  # StorageClass. Set this on clusters with no default StorageClass, otherwise
+  # the gateway PVC stays Pending. Use a block-backed class, not NFS or other
+  # network filesystems. Immutable after install.
+  dataStorageClass: ""
   # -- Name of a pre-existing Opaque Secret containing a PostgreSQL
   # connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL
   # from this Secret instead of using dbUrl. The Secret must contain a
@@ -433,6 +522,13 @@ server:
   # -- Enable plaintext HTTP routing for loopback sandbox service URLs on
   # TLS-enabled gateways.
   enableLoopbackServiceHttp: true
+  # -- Hostname format for exposed sandbox services. Empty or "readable"
+  # keeps readable `<workspace>--<sandbox>[--<service>]` hostnames; "hashed"
+  # mints opaque one-label hostnames discriminated by the gateway
+  # installation name (server.name, defaulting to the release name). The
+  # name must be unique among all gateways sharing the service base domain,
+  # and renaming the installation changes every minted hostname.
+  serviceHostnameFormat: ""
   # -- Enable the WebSocket tunnel used by CLI/SDK clients behind an
   # authenticated edge proxy. Leave disabled for direct gateway installs.
   enableWebsocketTunnel: false
@@ -624,6 +720,10 @@ pkiInitJob:
   # Secrets. When certManager.enabled=true, cert-manager owns TLS and this same
   # hook runs in JWT-only mode even if pkiInitJob.enabled remains true.
   enabled: true
+  # -- Additional labels on both certificate hook Pods. Chart-owned labels take precedence.
+  podLabels: {}
+  # -- Additional annotations on both certificate hook Pods.
+  podAnnotations: {}
   # -- Extra DNS SANs to append to the server certificate.
   serverDnsNames: []
   # -- Extra IP SANs to append to the server certificate.
@@ -645,6 +745,20 @@ pkiInitJob:
   # see "TLS error: Secret is not supplied by SDS" when connecting to the gateway,
   # check if the TLS secret exists and run `helm upgrade` to create the ConfigMap.
   failOnTimeout: true
+  # Leave runAsUser unset so the OpenShift restricted-v2 SCC can assign the
+  # namespace UID.
+  securityContext:
+    # -- Require the certgen hook container to run as a non-root user.
+    runAsNonRoot: true
+    # -- Whether the certgen hook container can gain additional privileges.
+    allowPrivilegeEscalation: false
+    capabilities:
+      # -- Linux capabilities dropped from the certgen hook container.
+      drop:
+        - ALL
+    seccompProfile:
+      # -- Seccomp profile applied to the certgen hook container.
+      type: RuntimeDefault
 
 # cert-manager Certificate/Issuer resources (requires cert-manager CRDs in-cluster).
 # Does not install cert-manager itself.

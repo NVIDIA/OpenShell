@@ -354,7 +354,7 @@ def ordered_entries(
 def render_versions(entries: list[VersionEntry]) -> list[YamlMapping]:
     rendered: list[YamlMapping] = []
     for entry in entries:
-        item = {
+        item: YamlMapping = {
             "display-name": entry.display_name,
             "path": entry.path,
             "slug": entry.slug,

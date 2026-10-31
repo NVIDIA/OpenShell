@@ -41,6 +41,7 @@ use openshell_core::telemetry::TelemetryComputeDriver;
 ))]
 use openshell_server::ComputeDriverRegistration;
 use openshell_server::ComputeDriverRegistry;
+use openshell_server::config_file::OtlpConfig;
 
 #[cfg(all(
     not(target_os = "windows"),
@@ -50,6 +51,16 @@ use openshell_server::ComputeDriverRegistry;
         feature = "compute-driver-podman"
     )
 ))]
+/// The OCSF event export that drivers pass to supervisors, from `[otlp.ocsf]`.
+fn supervisor_ocsf_export(
+    otlp: Option<&OtlpConfig>,
+) -> Option<openshell_core::sandbox_env::OcsfOtlpExport> {
+    let ocsf = otlp?.ocsf.as_ref()?;
+    Some(openshell_core::sandbox_env::OcsfOtlpExport {
+        endpoint: ocsf.endpoint.clone(),
+    })
+}
+
 fn prefer_environment<T>(configured: T, environment: Option<T>) -> T {
     environment.unwrap_or(configured)
 }
@@ -251,6 +262,10 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         true
     }
 
+    fn supports_network_supervisor_trust(&self) -> bool {
+        true
+    }
+
     fn validate_config(
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
@@ -260,21 +275,76 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
             .map_err(openshell_core::Error::config)
     }
 
+    fn uses_shared_supervision(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<bool> {
+        Ok(kubernetes_config(context)?.shared_supervisor.is_some())
+    }
+
     async fn build(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
+        self.build_with_configuration_updates(context)
+            .await
+            .map(|(instance, _)| instance)
+    }
+
+    async fn build_with_configuration_updates(
+        &self,
+        context: openshell_server::ComputeDriverBuildContext<'_>,
+    ) -> openshell_core::Result<(
+        openshell_server::ComputeDriverInstance,
+        Option<openshell_server::SharedComputeDriverConfigurationUpdates>,
+    )> {
         let mut config = kubernetes_config(context.config_context())?;
-        config.supervisor_otlp_endpoint = context.otlp_config().map(|otlp| otlp.endpoint.clone());
-        let driver = openshell_driver_kubernetes::KubernetesComputeDriver::new(
-            config,
-            context.shutdown_receiver(),
-        )
-        .await
+        config.supervisor_otlp_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::traces_endpoint)
+            .map(str::to_string);
+        config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+        config.supervisor_otlp_agent_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::agent_endpoint)
+            .map(str::to_string);
+        config.supervisor_gateway_name = Some(context.gateway_name().to_string());
+        // With the gateway supervisor topology, the gateway owns the shared
+        // supervisor's assignments and token; the driver adapts them to
+        // Kubernetes objects. The experimental shared supervisor topology
+        // does not support the network supervisor additional destination CA;
+        // refuse the combination fail-closed rather than silently
+        // supervising generations without the operator's trust bundle.
+        let network_trust = context.network_trust_bundle().cloned();
+        let driver = if config.shared_supervisor.is_some() {
+            if network_trust.is_some() {
+                return Err(openshell_core::Error::execution(
+                    "the experimental shared supervisor topology does not support the \
+                     network supervisor additional destination CA"
+                        .to_string(),
+                ));
+            }
+            openshell_driver_kubernetes::KubernetesComputeDriver::with_shared_supervision(
+                config,
+                context.shutdown_receiver(),
+                context.shared_supervision(),
+            )
+            .await
+        } else {
+            openshell_driver_kubernetes::KubernetesComputeDriver::new(
+                config,
+                context.shutdown_receiver(),
+                network_trust,
+            )
+            .await
+        }
         .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
-        let driver = openshell_driver_kubernetes::ComputeDriverService::new_in_process(driver);
-        Ok(openshell_server::ComputeDriverInstance::InProcess(
-            std::sync::Arc::new(driver),
+        let driver = std::sync::Arc::new(
+            openshell_driver_kubernetes::ComputeDriverService::new_in_process(driver),
+        );
+        Ok((
+            openshell_server::ComputeDriverInstance::InProcess(driver.clone()),
+            Some(driver),
         ))
     }
 }
@@ -313,6 +383,10 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
         true
     }
 
+    fn supports_network_supervisor_trust(&self) -> bool {
+        true
+    }
+
     fn validate_config(
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
@@ -326,13 +400,23 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config = docker_config(context.config_context())?;
-        config.supervisor_otlp_endpoint = context.otlp_config().map(|otlp| otlp.endpoint.clone());
+        config.supervisor_otlp_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::traces_endpoint)
+            .map(str::to_string);
+        config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+        config.supervisor_otlp_agent_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::agent_endpoint)
+            .map(str::to_string);
+        config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         require_guest_tls_for_local_driver(&context, "docker")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
         let driver = openshell_driver_docker::DockerComputeDriver::new(
             context.gateway_bind_address(),
             context.gateway_log_level(),
             &config,
+            context.network_trust_bundle().cloned(),
         )
         .await
         .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
@@ -374,6 +458,10 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
         true
     }
 
+    fn supports_network_supervisor_trust(&self) -> bool {
+        true
+    }
+
     fn validate_config(
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
@@ -388,12 +476,24 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config = podman_config(context.config_context())?;
-        config.supervisor_otlp_endpoint = context.otlp_config().map(|otlp| otlp.endpoint.clone());
+        config.supervisor_otlp_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::traces_endpoint)
+            .map(str::to_string);
+        config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+        config.supervisor_otlp_agent_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::agent_endpoint)
+            .map(str::to_string);
+        config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         require_guest_tls_for_local_driver(&context, "podman")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
-        let driver = openshell_driver_podman::PodmanComputeDriver::new(config)
-            .await
-            .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
+        let driver = openshell_driver_podman::PodmanComputeDriver::new(
+            config,
+            context.network_trust_bundle().cloned(),
+        )
+        .await
+        .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
         let driver = openshell_driver_podman::ComputeDriverService::new_in_process(driver);
         Ok(openshell_server::ComputeDriverInstance::InProcess(
             std::sync::Arc::new(driver),
@@ -441,6 +541,10 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
             .map_err(openshell_core::Error::config)
     }
 
+    fn supports_network_supervisor_trust(&self) -> bool {
+        true
+    }
+
     fn validate_config(
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
@@ -479,6 +583,7 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
             context.gateway_name(),
             &config,
             context.otlp_config(),
+            context.network_trust_bundle(),
         )
         .await?;
         Ok(openshell_server::ComputeDriverInstance::ManagedRemote(
@@ -662,5 +767,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn first_party_network_supervisor_drivers_opt_into_trust_propagation() {
+        #[cfg(feature = "compute-driver-docker")]
+        assert!(<DockerFactory as openshell_server::ComputeDriverFactory>::supports_network_supervisor_trust(&DockerFactory));
+        #[cfg(feature = "compute-driver-kubernetes")]
+        assert!(<KubernetesFactory as openshell_server::ComputeDriverFactory>::supports_network_supervisor_trust(&KubernetesFactory));
+        #[cfg(feature = "compute-driver-podman")]
+        assert!(<PodmanFactory as openshell_server::ComputeDriverFactory>::supports_network_supervisor_trust(&PodmanFactory));
+        #[cfg(feature = "compute-driver-vm")]
+        assert!(<VmFactory as openshell_server::ComputeDriverFactory>::supports_network_supervisor_trust(&VmFactory));
     }
 }

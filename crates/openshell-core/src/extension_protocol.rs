@@ -19,6 +19,16 @@ pub const PROTOCOL_MINOR: u32 = 0;
 /// configured signer before accepting sandbox creation.
 pub const COMPUTE_LAUNCH_AUTHENTICATION: &str = "openshell.compute.launch-authentication";
 
+/// Driver stages operator-selected external isolation routes for the supervisor.
+pub const COMPUTE_ISOLATION_BACKEND: &str = "openshell.compute.isolation-backend";
+
+/// Driver implements `SuspendSandbox` and resuming through `StartSandbox`.
+pub const COMPUTE_SUSPEND_RESUME: &str = "openshell.compute.suspend-resume";
+
+/// Optional stopped-state workload configuration updates retaining the resource and storage.
+pub const COMPUTE_UPDATE_SANDBOX_CONFIGURATION: &str =
+    "openshell.compute.update-sandbox-configuration";
+
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;
@@ -121,6 +131,8 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
     let mut supported_capabilities = vec![contract.clone()];
     if family == ExtensionFamily::Compute {
         supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
+        supported_capabilities.push(COMPUTE_ISOLATION_BACKEND.to_string());
+        supported_capabilities.push(COMPUTE_UPDATE_SANDBOX_CONFIGURATION.to_string());
     }
     PeerMetadata {
         protocol_version: Some(ProtocolVersion {
@@ -157,10 +169,10 @@ pub fn extension_metadata(
 }
 
 /// Protocol version and base capability an extension of `family` must declare.
-fn expected_contract(family: ExtensionFamily) -> String {
+fn expected_contract(gateway: &PeerMetadata) -> String {
     format!(
         "protocol {PROTOCOL_MAJOR}.{PROTOCOL_MINOR} and capability {}",
-        family.contract_capability()
+        gateway.required_capabilities.join(", ")
     )
 }
 
@@ -171,8 +183,32 @@ pub fn negotiate(
     extension: Option<PeerMetadata>,
 ) -> Result<NegotiatedExtension, NegotiationError> {
     let configured_name = configured_name.into();
-    let family_name = family.as_str();
-    let expected = expected_contract(family);
+    let metadata = negotiate_metadata(family.as_str(), &configured_name, gateway, extension)?;
+    let version = metadata
+        .protocol_version
+        .expect("validated protocol version");
+    Ok(NegotiatedExtension {
+        family,
+        configured_name,
+        implementation_name: metadata.implementation_name,
+        implementation_version: metadata.implementation_version,
+        protocol_major: version.major,
+        protocol_minor: version.minor,
+        supported_capabilities: metadata.supported_capabilities,
+        required_capabilities: metadata.required_capabilities,
+    })
+}
+
+/// Validate a versioned peer contract, including families owned by the supervisor.
+/// Both peers must advertise every capability required by the other peer.
+pub fn negotiate_metadata(
+    family_name: &'static str,
+    configured_name: impl Into<String>,
+    gateway: &PeerMetadata,
+    extension: Option<PeerMetadata>,
+) -> Result<PeerMetadata, NegotiationError> {
+    let configured_name = configured_name.into();
+    let expected = expected_contract(gateway);
     let extension = extension.ok_or_else(|| NegotiationError::MissingMetadata {
         family: family_name,
         name: configured_name.clone(),
@@ -265,13 +301,10 @@ pub fn negotiate(
         });
     }
 
-    Ok(NegotiatedExtension {
-        family,
-        configured_name,
+    Ok(PeerMetadata {
+        protocol_version: Some(*version),
         implementation_name: extension.implementation_name,
         implementation_version: extension.implementation_version,
-        protocol_major: version.major,
-        protocol_minor: version.minor,
         supported_capabilities: extension_supported.into_iter().collect(),
         required_capabilities: extension_required.into_iter().collect(),
     })
@@ -370,6 +403,23 @@ fn valid_capability(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_gateway_advertises_both_optional_extensions() {
+        let gateway = gateway_metadata(ExtensionFamily::Compute);
+        assert!(
+            gateway
+                .supported_capabilities
+                .iter()
+                .any(|c| c == COMPUTE_ISOLATION_BACKEND)
+        );
+        assert!(
+            gateway
+                .supported_capabilities
+                .iter()
+                .any(|c| c == COMPUTE_UPDATE_SANDBOX_CONFIGURATION)
+        );
+    }
 
     fn compatible() -> (PeerMetadata, PeerMetadata) {
         let gateway = gateway_metadata(ExtensionFamily::Compute);

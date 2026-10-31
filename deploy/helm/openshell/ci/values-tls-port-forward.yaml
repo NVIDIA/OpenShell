@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# E2E overlay: keep gateway TLS on over the Skaffold values, for topologies
+# that require it, such as the shared supervisor. The harness reaches the
+# gateway through its port-forward with the chart-generated client
+# certificate (OPENSHELL_E2E_KUBE_TLS=1); the server certificate names
+# 127.0.0.1.
+server:
+  disableTls: false

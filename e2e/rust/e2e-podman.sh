@@ -11,7 +11,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 E2E_TEST="${OPENSHELL_E2E_PODMAN_TEST:-}"
 E2E_TEST_SET="${OPENSHELL_E2E_PODMAN_TEST_SET:-}"
-E2E_FEATURES="${OPENSHELL_E2E_PODMAN_FEATURES-e2e-podman}"
+# Unset or empty selects Rust defaults; e2e-conformance-only skips Rust tests.
+E2E_FEATURES="${OPENSHELL_E2E_PODMAN_FEATURES:-e2e-podman}"
 DEFAULT_WORKLOAD_MANIFEST="${ROOT}/e2e/gpu/images/.build/workloads.yaml"
 RUN_WITH_GATEWAY_COMMAND="__openshell_run_podman_e2e"
 # shellcheck source=e2e/support/conformance.sh
@@ -36,11 +37,14 @@ PODMAN_CI_TESTS=(
   live_policy_update
   local_driver_token_restart
   no_proxy
+  ocsf_jsonl_conformance
+  otlp_relay
   podman_corporate_proxy
   podman_gateway_start
   podman_host_gateway
   podman_oci_identity
   provider_token_exchange
+  upload_backpressure
 )
 
 if [ -n "${E2E_TEST}" ] && [ -n "${E2E_TEST_SET}" ]; then
@@ -65,13 +69,19 @@ if [ -n "${E2E_TEST}" ]; then
   SELECTED_TESTS=("${E2E_TEST}")
 fi
 
+if [ "${E2E_TEST}" = "additional_ca" ]; then
+  export OPENSHELL_E2E_ADDITIONAL_CA=1
+  E2E_FEATURES="${E2E_FEATURES},e2e-additional-ca"
+fi
+
 if [ "${E2E_TEST}" = "gpu" ] && [ -z "${OPENSHELL_E2E_WORKLOAD_MANIFEST:-}" ] && [ ! -f "${DEFAULT_WORKLOAD_MANIFEST}" ]; then
   echo "note: running Podman GPU e2e without a workload manifest; workload validation will log an explicit skip. Build one with 'CONTAINER_ENGINE=podman mise run e2e:workloads:build' or set OPENSHELL_E2E_WORKLOAD_MANIFEST."
 fi
 
 if [ "${1:-}" = "${RUN_WITH_GATEWAY_COMMAND}" ]; then
   e2e_run_openshell_conformance "Podman"
-  if [ -z "${E2E_FEATURES}" ]; then
+  if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
+    echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
     exit 0
   fi
 
@@ -92,12 +102,22 @@ if [ "${#SELECTED_TESTS[@]}" -eq 0 ] || [[ " ${SELECTED_TESTS[*]} " == *" provid
   export OPENSHELL_E2E_SPIFFE_FIXTURE="${OPENSHELL_E2E_SPIFFE_FIXTURE:-1}"
 fi
 
+# When the selection includes otlp_relay, enable OTLP export in the generated
+# gateway config so the test can bind a collector stub on this port. All
+# selected tests share the gateway, so they run with the relay enabled too.
+# Containers reach the host through host.containers.internal. Set the
+# variable to an empty string to disable export and run the relay's inert
+# case instead.
+if [ "${#SELECTED_TESTS[@]}" -eq 0 ] || [[ " ${SELECTED_TESTS[*]} " == *" otlp_relay "* ]]; then
+  export OPENSHELL_E2E_OTLP_ENDPOINT="${OPENSHELL_E2E_OTLP_ENDPOINT-http://host.containers.internal:4317}"
+fi
+
 if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ] && [ -z "${OPENSHELL_BIN:-}" ]; then
   cargo build -p openshell-cli
   export OPENSHELL_BIN="${ROOT}/target/debug/openshell"
 fi
 
-if [ -n "${E2E_FEATURES}" ]; then
+if [ "${E2E_FEATURES}" != "e2e-conformance-only" ]; then
   CONTAINER_ENGINE=podman bash "${ROOT}/tasks/scripts/e2e-build-workload.sh"
 fi
 

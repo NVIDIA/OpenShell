@@ -25,13 +25,27 @@ use tonic::{Code, Status};
 pub const SUPERVISOR_SESSIONS: &str = "openshell_server_supervisor_sessions";
 pub const RELAY_PENDING: &str = "openshell_server_relay_pending";
 pub const RELAY_PENDING_CAPACITY: &str = "openshell_server_relay_pending_capacity";
+pub const MUTATION_LOCK_CONNECTIONS_IN_USE: &str =
+    "openshell_server_mutation_lock_connections_in_use";
+pub const MUTATION_LOCK_CONNECTIONS_CAPACITY: &str =
+    "openshell_server_mutation_lock_connections_capacity";
 // Counters
 pub const RELAY_REJECTED_TOTAL: &str = "openshell_server_relay_rejected_total";
 pub const RELAY_EXPIRED_TOTAL: &str = "openshell_server_relay_expired_total";
 pub const ROUTED_REQUEST_ATTEMPTS_TOTAL: &str = "openshell_server_routed_request_attempts_total";
+pub const MUTATION_LOCK_TIMEOUTS_TOTAL: &str = "openshell_server_mutation_lock_timeouts_total";
+pub const MUTATION_LOCK_ERRORS_TOTAL: &str = "openshell_server_mutation_lock_errors_total";
+pub const PROVISIONING_DEADLINE_SKIPS_TOTAL: &str =
+    "openshell_server_provisioning_deadline_skips_total";
 // Histograms (explicit buckets, see BUCKETED_HISTOGRAMS)
 pub const RELAY_CLAIM_DURATION_SECONDS: &str = "openshell_server_relay_claim_duration_seconds";
 pub const PEER_REQUEST_DURATION_SECONDS: &str = "openshell_server_peer_request_duration_seconds";
+pub const SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS: &str =
+    "openshell_supervisor_config_build_duration_seconds";
+pub const SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS: &str =
+    "openshell_supervisor_config_apply_duration_seconds";
+pub const MUTATION_LOCK_WAIT_SECONDS: &str = "openshell_server_mutation_lock_wait_seconds";
+pub const MUTATION_LOCK_HOLD_SECONDS: &str = "openshell_server_mutation_lock_hold_seconds";
 
 const LABEL_REASON: &str = "reason";
 const LABEL_OPERATION: &str = "operation";
@@ -39,17 +53,25 @@ const LABEL_OUTCOME: &str = "outcome";
 const LABEL_GRPC_CODE: &str = "grpc_code";
 const LABEL_RELAY_KIND: &str = "relay_kind";
 const LABEL_ROUTE: &str = "route";
+const LABEL_SCOPE: &str = "scope";
+const LABEL_OVERDUE: &str = "overdue";
 
 /// Buckets for the new latency histograms, 1 ms to 15 s. The top buckets cover the 10 s relay
-/// claim timeout and the 15 s routed-relay wait.
+/// claim and lock timeouts and the 15 s routed-relay wait.
 const LATENCY_BUCKETS_SECONDS: [f64; 14] = [
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0,
 ];
 
 /// Only these names render as Prometheus histograms. Every existing `*_duration_seconds` metric
 /// keeps its summary format, so current dashboards are unaffected.
-const BUCKETED_HISTOGRAMS: [&str; 2] =
-    [RELAY_CLAIM_DURATION_SECONDS, PEER_REQUEST_DURATION_SECONDS];
+const BUCKETED_HISTOGRAMS: [&str; 6] = [
+    RELAY_CLAIM_DURATION_SECONDS,
+    PEER_REQUEST_DURATION_SECONDS,
+    SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
+    SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS,
+    MUTATION_LOCK_WAIT_SECONDS,
+    MUTATION_LOCK_HOLD_SECONDS,
+];
 
 /// Protocol the supervisor is asked to relay. Never label metrics with the target address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +155,26 @@ impl PeerRpc {
     }
 }
 
+/// Mutation lock scope kind. The platform scope ("" workspace) maps to `Global`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockScope {
+    Global,
+    Workspace,
+    Sandbox,
+}
+
+impl LockScope {
+    pub const ALL: [Self; 3] = [Self::Global, Self::Workspace, Self::Sandbox];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Workspace => "workspace",
+            Self::Sandbox => "sandbox",
+        }
+    }
+}
+
 /// Where a routed attempt ended. A relay succeeds only when the supervisor claims it, on either
 /// route, so the values mean the same thing for local and peer attempts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,16 +242,21 @@ pub fn configure_exporter(builder: PrometheusBuilder) -> Result<PrometheusBuilde
 }
 
 /// Install the process-wide recorder, then describe and zero-initialize the catalog. Call
-/// once, from `run_server`.
-pub fn install_global_recorder(relay: RelayCapacity) -> Result<PrometheusHandle, BuildError> {
+/// once, from `run_server`. `mutation_lock_connections` is the `PostgreSQL` lock pool size,
+/// `None` on a backend without a lock pool.
+pub fn install_global_recorder(
+    relay: RelayCapacity,
+    mutation_lock_connections: Option<u32>,
+) -> Result<PrometheusHandle, BuildError> {
     let handle = configure_exporter(PrometheusBuilder::new())?.install_recorder()?;
-    describe_and_initialize(relay);
+    describe_and_initialize(relay, mutation_lock_connections);
     Ok(handle)
 }
 
-/// Emit HELP metadata, create every fixed-label series at 0, and publish the relay caps. An
-/// idle replica then exports 0 instead of "no data", which HPA and `rate()` need.
-pub fn describe_and_initialize(relay: RelayCapacity) {
+/// Emit HELP metadata, create every fixed-label series at 0, and publish the relay caps and,
+/// with a lock pool, its size. An idle replica then exports 0 instead of "no data", which HPA
+/// and `rate()` need.
+pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: Option<u32>) {
     describe_gauge!(
         SUPERVISOR_SESSIONS,
         Unit::Count,
@@ -240,6 +287,21 @@ pub fn describe_and_initialize(relay: RelayCapacity) {
         Unit::Count,
         "Pending relay channels dropped because the supervisor did not connect back in time."
     );
+    describe_counter!(
+        MUTATION_LOCK_TIMEOUTS_TOTAL,
+        Unit::Count,
+        "Mutation lock acquisitions that timed out."
+    );
+    describe_counter!(
+        MUTATION_LOCK_ERRORS_TOTAL,
+        Unit::Count,
+        "Mutation lock acquisitions that failed without timing out, such as a lock connection PostgreSQL did not open."
+    );
+    describe_counter!(
+        PROVISIONING_DEADLINE_SKIPS_TOTAL,
+        Unit::Count,
+        "Times the provisioning deadline scan skipped a sandbox because its local mutation locks were busy."
+    );
     describe_histogram!(
         RELAY_CLAIM_DURATION_SECONDS,
         Unit::Seconds,
@@ -249,6 +311,26 @@ pub fn describe_and_initialize(relay: RelayCapacity) {
         PEER_REQUEST_DURATION_SECONDS,
         Unit::Seconds,
         "Latency of outbound requests to the owning replica. For relays, until the owner's supervisor claimed the relay."
+    );
+    describe_histogram!(
+        SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
+        Unit::Seconds,
+        "Time to build one pushed supervisor configuration, including store reads and credential resolution."
+    );
+    describe_histogram!(
+        SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS,
+        Unit::Seconds,
+        "Time from queuing a pushed configuration update on the supervisor session to receiving its apply result."
+    );
+    describe_histogram!(
+        MUTATION_LOCK_WAIT_SECONDS,
+        Unit::Seconds,
+        "Time spent acquiring the mutation lock for a scope."
+    );
+    describe_histogram!(
+        MUTATION_LOCK_HOLD_SECONDS,
+        Unit::Seconds,
+        "Time a mutation lock was held, from acquisition to release, including requests cancelled while holding it."
     );
 
     // `increment(0)` registers a series without overwriting a value recorded earlier.
@@ -272,6 +354,28 @@ pub fn describe_and_initialize(relay: RelayCapacity) {
         counter!(RELAY_REJECTED_TOTAL, LABEL_REASON => reason.label()).increment(0);
     }
     counter!(RELAY_EXPIRED_TOTAL).increment(0);
+    for scope in LockScope::ALL {
+        counter!(MUTATION_LOCK_TIMEOUTS_TOTAL, LABEL_SCOPE => scope.label()).increment(0);
+        counter!(MUTATION_LOCK_ERRORS_TOTAL, LABEL_SCOPE => scope.label()).increment(0);
+    }
+    for overdue in [false, true] {
+        counter!(PROVISIONING_DEADLINE_SKIPS_TOTAL, LABEL_OVERDUE => overdue_label(overdue))
+            .increment(0);
+    }
+    if let Some(capacity) = mutation_lock_connections {
+        describe_gauge!(
+            MUTATION_LOCK_CONNECTIONS_IN_USE,
+            Unit::Count,
+            "PostgreSQL lock-pool connections checked out on this replica: held by mutation guards, by acquisitions waiting for an advisory lock, or being returned to the pool."
+        );
+        describe_gauge!(
+            MUTATION_LOCK_CONNECTIONS_CAPACITY,
+            Unit::Count,
+            "Maximum PostgreSQL lock-pool connections on one gateway replica."
+        );
+        gauge!(MUTATION_LOCK_CONNECTIONS_IN_USE).increment(0.0);
+        gauge!(MUTATION_LOCK_CONNECTIONS_CAPACITY).set(f64::from(capacity));
+    }
     for rpc in PeerRpc::ALL {
         if rpc == PeerRpc::Relay {
             continue;
@@ -311,6 +415,11 @@ impl GaugeSlot {
         Self::acquire(RELAY_PENDING)
     }
 
+    /// Share of `openshell_server_mutation_lock_connections_in_use`.
+    pub fn mutation_lock_connection() -> Self {
+        Self::acquire(MUTATION_LOCK_CONNECTIONS_IN_USE)
+    }
+
     fn acquire(name: &'static str) -> Self {
         let gauge = gauge!(name);
         gauge.increment(1.0);
@@ -337,6 +446,44 @@ pub fn record_relay_expired(count: usize) {
 
 pub fn record_relay_claimed(waited: Duration) {
     histogram!(RELAY_CLAIM_DURATION_SECONDS).record(waited);
+}
+
+/// Time to acquire every key of one mutation guard (local registry plus Postgres), recorded
+/// on success only.
+pub fn record_lock_wait(scope: LockScope, waited: Duration) {
+    histogram!(MUTATION_LOCK_WAIT_SECONDS, LABEL_SCOPE => scope.label()).record(waited);
+}
+
+/// How long one mutation guard was held, recorded when it is released. Holds longer than the
+/// top bucket count only in `+Inf`; the hold warning logs their duration.
+pub fn record_lock_hold(scope: LockScope, held: Duration) {
+    histogram!(MUTATION_LOCK_HOLD_SECONDS, LABEL_SCOPE => scope.label()).record(held);
+}
+
+/// A guard acquisition that timed out: a local wait, a full lock pool, too little time left to
+/// open a lock connection, or Postgres `lock_timeout` (SQLSTATE 55P03). A lock connection that
+/// Postgres does not open with at least `LOCK_CONNECTION_MIN_BUDGET` left counts in
+/// [`record_lock_error`] instead. RPC callers return the timeout as `Status::unavailable`.
+pub fn record_lock_timeout(scope: LockScope) {
+    counter!(MUTATION_LOCK_TIMEOUTS_TOTAL, LABEL_SCOPE => scope.label()).increment(1);
+}
+
+/// A guard acquisition that failed without timing out: Postgres did not open a lock connection,
+/// or a lock statement failed. RPC callers return it as `Status::internal`. A cancelled
+/// acquisition is not counted.
+pub fn record_lock_error(scope: LockScope) {
+    counter!(MUTATION_LOCK_ERRORS_TOTAL, LABEL_SCOPE => scope.label()).increment(1);
+}
+
+/// The provisioning deadline scan skipped a sandbox whose local mutation locks stayed busy. An
+/// `overdue` sandbox was already past its deadline, so the skip delays its expiry.
+pub fn record_provisioning_deadline_skip(overdue: bool) {
+    counter!(PROVISIONING_DEADLINE_SKIPS_TOTAL, LABEL_OVERDUE => overdue_label(overdue))
+        .increment(1);
+}
+
+const fn overdue_label(overdue: bool) -> &'static str {
+    if overdue { "true" } else { "false" }
 }
 
 /// Counts one local relay setup or outbound peer attempt exactly once, and times peer requests.
@@ -488,10 +635,12 @@ mod tests {
     #[test]
     fn describe_and_initialize_exports_capacity_and_zero_series() {
         let metrics = MetricsCapture::install();
-        describe_and_initialize(RelayCapacity { per_replica: 256 });
+        describe_and_initialize(RelayCapacity { per_replica: 256 }, Some(4));
 
         for (series, expected) in [
             ("openshell_server_relay_pending_capacity", 256),
+            ("openshell_server_mutation_lock_connections_capacity", 4),
+            ("openshell_server_mutation_lock_connections_in_use", 0),
             ("openshell_server_supervisor_sessions", 0),
             ("openshell_server_relay_pending", 0),
             (
@@ -503,6 +652,38 @@ mod tests {
                 0,
             ),
             ("openshell_server_relay_expired_total", 0),
+            (
+                "openshell_server_mutation_lock_timeouts_total{scope=\"global\"}",
+                0,
+            ),
+            (
+                "openshell_server_mutation_lock_timeouts_total{scope=\"workspace\"}",
+                0,
+            ),
+            (
+                "openshell_server_mutation_lock_timeouts_total{scope=\"sandbox\"}",
+                0,
+            ),
+            (
+                "openshell_server_mutation_lock_errors_total{scope=\"global\"}",
+                0,
+            ),
+            (
+                "openshell_server_mutation_lock_errors_total{scope=\"workspace\"}",
+                0,
+            ),
+            (
+                "openshell_server_mutation_lock_errors_total{scope=\"sandbox\"}",
+                0,
+            ),
+            (
+                "openshell_server_provisioning_deadline_skips_total{overdue=\"false\"}",
+                0,
+            ),
+            (
+                "openshell_server_provisioning_deadline_skips_total{overdue=\"true\"}",
+                0,
+            ),
         ] {
             assert_eq!(metrics.value(series), Some(expected), "{series}");
         }
@@ -532,6 +713,24 @@ mod tests {
     }
 
     #[test]
+    fn describe_and_initialize_without_a_lock_pool_omits_lock_connection_gauges() {
+        let metrics = MetricsCapture::install();
+        describe_and_initialize(RelayCapacity { per_replica: 256 }, None);
+
+        assert_eq!(metrics.value(MUTATION_LOCK_CONNECTIONS_IN_USE), None);
+        assert_eq!(metrics.value(MUTATION_LOCK_CONNECTIONS_CAPACITY), None);
+        assert!(
+            !metrics
+                .render()
+                .contains("openshell_server_mutation_lock_connections")
+        );
+        assert_eq!(
+            metrics.value("openshell_server_mutation_lock_errors_total{scope=\"sandbox\"}"),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn routed_attempts_have_seven_bounded_success_series_and_keep_counts_on_initialize() {
         let metrics = MetricsCapture::install();
         for kind in RelayKind::ALL {
@@ -540,7 +739,7 @@ mod tests {
             }
         }
         RoutedRequestTimer::relay(RelayKind::Tcp, RelayRoute::Peer).finish(&Ok::<(), Status>(()));
-        describe_and_initialize(RelayCapacity { per_replica: 256 });
+        describe_and_initialize(RelayCapacity { per_replica: 256 }, None);
 
         for kind in ["ssh", "tcp"] {
             for route in ["local", "peer"] {
@@ -577,6 +776,18 @@ mod tests {
             PEER_REQUEST_DURATION_SECONDS,
             LABEL_OPERATION => "relay",
             LABEL_OUTCOME => "success"
+        )
+        .record(sample);
+        histogram!(MUTATION_LOCK_WAIT_SECONDS, LABEL_SCOPE => "sandbox").record(sample);
+        histogram!(MUTATION_LOCK_HOLD_SECONDS, LABEL_SCOPE => "sandbox").record(sample);
+        histogram!(
+            SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
+            "outcome" => "ok"
+        )
+        .record(sample);
+        histogram!(
+            SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS,
+            "outcome" => "CONFIG_APPLY_OUTCOME_APPLIED"
         )
         .record(sample);
         histogram!(
@@ -639,6 +850,14 @@ mod tests {
         assert_eq!(metrics.value(SUPERVISOR_SESSIONS), Some(1));
         drop(session);
         assert_eq!(metrics.value(SUPERVISOR_SESSIONS), Some(0));
+
+        let first = GaugeSlot::mutation_lock_connection();
+        let second = GaugeSlot::mutation_lock_connection();
+        assert_eq!(metrics.value(MUTATION_LOCK_CONNECTIONS_IN_USE), Some(2));
+        drop(first);
+        assert_eq!(metrics.value(MUTATION_LOCK_CONNECTIONS_IN_USE), Some(1));
+        drop(second);
+        assert_eq!(metrics.value(MUTATION_LOCK_CONNECTIONS_IN_USE), Some(0));
     }
 
     #[test]

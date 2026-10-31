@@ -16,6 +16,10 @@ crates/*/tests/        # Rust integration tests
 python/openshell/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
 e2e/rust/              # Rust CLI E2E tests
+tests/testkit/         # Support library for SDK-driven E2E suites
+tests/suites/          # E2E suites, grouped by test family
+tests/tmachine/        # QEMU test machines, Ansible playbooks, and the Session API
+tests/runner/          # openshell-test-runner: runs a test family in a tmachine environment
 ```
 
 ## Rust Tests
@@ -48,7 +52,67 @@ mise run test:rust     # cargo test --workspace
 
 Rust validation checks tracked Cargo lockfiles; run `mise run rust:lockfiles:check` to check them directly. If one is stale, refresh it with Cargo using its adjacent manifest, review the diff, and commit the update.
 
+### PostgreSQL-backed tests
+
+Tests that need a real PostgreSQL server, such as advisory-lock concurrency
+across two stores, are `#[ignore]`d and named `postgres_*`. Run them with:
+
+```shell
+mise run test:rust:postgres
+```
+
+The task starts a disposable PostgreSQL container with Docker or Podman
+(set `CONTAINER_ENGINE` to choose), runs the tests one at a time, and removes
+the container. Each test works in its own temporary schema, except the replay
+and provider refresh lock tests, which use the default schema. To use your own
+disposable database, set `OPENSHELL_TEST_POSTGRES_URL`. The task overrides
+`OPENSHELL_REPLAY_TEST_DATABASE_URL` so legacy tests use that same database.
+Never point it at a database that a running gateway uses: the tests take
+fleet-wide advisory locks.
+Branch Checks runs them on x86_64 Linux.
+Load-sensitive capacity checks are named `bench_postgres_*` instead, so that
+task skips them. Run them on an idle machine with
+`mise run test:rust:postgres:bench`.
+
 ### Native Windows validation
+
+Start with the [Windows build prerequisites](WINDOWS.md#build) in a checkout
+based on `windows`. Run the lane matching the native host:
+
+```powershell
+# Native x64 host
+mise run --skip-tools windows:lint:x64
+mise run --skip-tools windows:build:x64
+mise run --skip-tools windows:test:x64
+mise run --skip-tools windows:test:unsupported:x64
+
+# Native ARM64 host
+mise run --skip-tools windows:lint:arm64
+mise run --skip-tools windows:build:arm64
+mise run --skip-tools windows:test:arm64
+mise run --skip-tools windows:test:unsupported:arm64
+```
+
+The test tasks use the CI nextest profile and server test support. They reject
+a target that does not match the host architecture. `windows:ci` is the x64-host
+aggregate, including ARM64 cross-check/build unless explicitly skipped; it
+does not establish native ARM64 test coverage.
+
+For runtime validation, provision a capable MXC host and build its native
+release binaries first. On x64, run:
+
+```powershell
+mise run --skip-tools windows:test:mxc-real:x64
+mise run --skip-tools windows:e2e:mxc
+```
+
+Use `windows:test:mxc-real:arm64` on ARM64. The real-runtime unit tests can
+report `SKIP` when the executor or backend is absent; E2E returns nonzero
+when required runtime coverage is missing. Report passed, failed, and
+skipped/ignored executions separately, including why any probe gated coverage.
+Passing E2E does not qualify the [known Windows enforcement gaps](WINDOWS.md#runtime-and-current-limits).
+See the [Windows test task definitions](https://github.com/NVIDIA/OpenShell/blob/windows/tasks/windows.toml)
+for boundary, loopback, network, and audit suites.
 
 Use `mise run --skip-tools pre-commit` with the existing Rust/MSVC toolchain.
 Windows now checks tracked Cargo lockfiles through PowerShell rather than
@@ -106,6 +170,122 @@ requires mTLS.
 `mise run test:gateway-config` validates generated gateway TOML without a live
 runtime. It covers the current schema and the Podman in-tree versus external
 driver configuration boundary.
+
+### testkit (`tests/testkit/`)
+
+`testkit` is the support library for SDK-driven end-to-end suites. Tests are
+`#[testkit::test]` functions with a required doc comment. They find the
+gateway the same way the CLI does, through `OPENSHELL_GATEWAY_ENDPOINT`,
+`OPENSHELL_GATEWAY`, or the active gateway, and `cx.cli` runs the CLI named
+by `OPENSHELL_BIN`. See
+[tests/testkit/README.md](tests/testkit/README.md) for how to write and run
+tests.
+
+Suites live under `tests/suites/<family>/`. Each family is a Cargo workspace
+with its own lockfile. Run the `conformance` suites against a local Docker
+gateway with:
+
+```shell
+mise run e2e:testkit
+```
+
+Workspaces that build root crates through path dependencies must lock shared
+crates at the versions in the root `Cargo.lock`; otherwise CI can build against
+dependencies the Nix toolchain doesn't support. `mise run rust:lockfiles:check`
+verifies this, and `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`
+re-locks a workspace from the root lockfile. Add new testkit workspaces to
+`ALIGNED_WORKSPACES` in that script.
+
+### Running suites in a tmachine environment (`tests/runner/`)
+
+`openshell-test-runner` runs a test family inside a tmachine VM, against the
+OpenShell that the VM's installer set up.
+
+```shell
+nix run .#openshell-test-runner -- \
+  --environment ubuntu-docker-rootful --installer deb \
+  --family conformance --package sandbox
+```
+
+It needs KVM, and tmachine only boots guests of the host's architecture. The
+runner points the tests at the installed CLI and the gateway the installer
+registered (`--gateway`, default `openshell`). A run passes if nextest
+succeeds; nextest fails a run with no tests. The runner exits with 1 when a
+test failed and 2 when the run could not complete, for example because the
+environment didn't come up. It writes `junit.xml`, `nextest.log` and, after a
+failure, the guest's diagnostics to `artifacts/test-results/` (`--results`),
+even when the run timed out.
+
+`--filter <filterset>` narrows the tests with a nextest filterset, and
+`--keep` leaves the VM running until you press Enter. Two runs on one host
+need different `TMACHINE_SSH_PORT` values (default 2222). The installer
+inputs, such as the Debian package and the images, come from `artifacts/`,
+built by `nix run .#build-artifacts` or downloaded by CI.
+
+A flaky or broken test is marked `#[ignore = "<issue link>"]`, which takes it
+out of every environment until it's fixed.
+
+**CI.** `.github/workflows/e2e-suites.yml` lists the environments and suites as
+an explicit matrix and runs the runner once per row. Branch E2E calls it when
+the `test:e2e` label is set, and a failure fails the Core E2E result. To run
+a suite in another environment on CI, add a row.
+
+### Adding a feature suite
+
+Feature suites live in the `tests/suites/features` workspace, one crate per
+suite, with a name that says what the suite tests.
+`tests/suites/features/keycloak-provider-refresh` is the example to copy.
+
+1. Add a crate under `tests/suites/features/<name>` that depends on
+   `openshell-testkit`, and add it to `members` in
+   `tests/suites/features/Cargo.toml`.
+2. Write the tests in `tests/*.rs` as `#[testkit::test]` functions.
+3. Re-lock the workspace: `cargo metadata --manifest-path
+   tests/suites/features/Cargo.toml`, then
+   `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`.
+4. Add `cargo fmt` and `cargo clippy` lines for the package (`-p <name>`) to
+   `tasks/rust.toml` and to the Format and Lint steps in
+   `.github/workflows/branch-checks.yml`.
+5. Add a row for the suite to the matrix in `.github/workflows/e2e-suites.yml`.
+
+If the feature only needs the gateway, run the suite in an existing
+environment such as `ubuntu-docker-rootful`, and skip the rest of this
+section.
+
+**Suites that need a service.** A feature that needs something besides the
+gateway, such as an OIDC issuer, runs in a tmachine environment that provides
+it. The environment and the suite share a contract: a set of
+`OPENSHELL_TEST_<SERVICE>_*` environment variables that say how to reach the
+service.
+
+- **Environment.** Add an environment to `tests/tmachine/config.nix` whose
+  setup playbook starts the service (with a restart policy, since setup is
+  cached as a disk) and writes the variables as `KEY=VALUE` lines to
+  `/etc/openshell-test/env.d/<service>.env`. Pass files the playbook needs
+  through the environment's setup `inputs`, and add them to the tmachine disk
+  cache key in `e2e-suites.yml`. The runner rejects names without the
+  `OPENSHELL_TEST_` prefix, and the tests get the variables in the guest, so
+  values never appear in a runner command. Values are taken literally, without
+  quoting.
+- **Fixture.** Put the service's fixture in a support crate under
+  `tests/support/<service>`, so any suite can depend on it, or reuse the
+  existing one. It defines the variable names as constants and a
+  `<Service>Context::new(cx)` that reads them, waits for the service, and
+  wraps the testkit `Context`. Each test calls it on its first line.
+  Nextest runs each test in its own process, so the fixture builds its
+  clients there from the variables. A missing variable fails the test; it
+  never skips it.
+- **Documentation.** Document the variables in the fixture's module docs, so
+  anyone can run the suite against their own deployment by setting them.
+
+The Keycloak fixture is `tests/support/keycloak`. Run the suite that uses it
+with:
+
+```shell
+nix run .#openshell-test-runner -- \
+  --environment ubuntu-docker-rootful-keycloak --installer deb \
+  --family features --package keycloak-provider-refresh
+```
 
 ### Python E2E (`e2e/python/`)
 
@@ -224,8 +404,21 @@ Suites:
   the selected deployment.
 - Docker suite (`--features e2e-docker`) - includes Docker-only coverage such as Dockerfile image builds, Docker preflight checks, and managed Docker gateway start.
 - Docker GPU suite (`--features e2e-docker-gpu`) - Docker suite plus GPU sandbox smoke coverage.
+- Configuration push suite (`--features e2e-config-push`) - CLI conformance and the policy tests against a Docker gateway with `config_delivery_mode = "push"`. Run it with `mise run e2e:rust:push`.
 - VM suite (`--features e2e-vm`) - runs e2e tests on a VM.
 - Kubernetes credential-driver suite (`--features e2e-kubernetes-credential-drivers`) - targeted Kubernetes Secrets and Vault provider credential storage coverage.
+
+The Docker, Podman, Kubernetes, and VM runners execute CLI
+conformance before their Rust tests. Set the driver's feature variable
+(`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURES`,
+`OPENSHELL_E2E_KUBERNETES_FEATURES`, or `OPENSHELL_E2E_VM_FEATURES`) to
+`e2e-conformance-only` to skip the Rust tests; the runner logs a notice when
+it skips them. Unset or empty values select the driver's default Rust
+features. The selector is handled by the runner; it is not a Cargo feature.
+
+```shell
+OPENSHELL_E2E_KUBERNETES_FEATURES=e2e-conformance-only mise run e2e:kubernetes
+```
 
 GPU device-selection tests compare OpenShell sandboxes against a plain Docker or
 Podman container that requests `--device nvidia.com/gpu=all`. The probe image
@@ -295,6 +488,29 @@ Run the Podman-backed Rust CLI e2e suite:
 mise run e2e:podman
 ```
 
+The `nix run` commands below need the local Nix setup in
+[CONTRIBUTING.md](CONTRIBUTING.md#nix-setup).
+
+`nix run .#build-artifacts` also builds
+`artifacts/packages/openshell.deb` for tmachine's `deb` installer, targeting the
+host's Linux architecture (`arm64` or `amd64`). Set `OPENSHELL_DEB_VERSION` to
+override the default package version, `0.0.0-local`.
+
+It also builds `artifacts/packages/rpm/openshell.rpm` and
+`artifacts/packages/rpm/openshell-gateway.rpm` for tmachine's `rpm` installer.
+The RPM step runs `packit build locally` with `openshell.spec` in the Fedora
+container that CI uses, so it needs a Docker daemon that runs Linux containers
+for the host's architecture (`aarch64` or `x86_64`), such as Docker Desktop on
+macOS. The package version defaults to the development version that branch CI
+computes; set `OPENSHELL_RPM_VERSION` and `OPENSHELL_RPM_RELEASE` to override
+it. After `nix run .#build-artifacts-binaries`, `nix run .#build-artifacts-rpm`
+rebuilds only the RPMs. Run conformance against the installed RPMs:
+
+```shell
+nix run .#build-artifacts
+nix run .#tmachine -- test fedora-podman-rootful rpm conformance
+```
+
 Run the portable subset in a disposable rootless Podman guest:
 
 ```shell
@@ -316,7 +532,7 @@ Podman user-namespace mappings for the default, `auto`, `keep-id`, and private
 profiles. The E2E archive excludes binaries that still depend on wrapper-owned
 gateway controls, SPIFFE fixtures, the caller driver-config setting, or other
 guest setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
-binary. `tests/artifacts.nix` keeps the follow-up exclusions explicit and uses
+binary. `tests/tmachine/artifacts.nix` keeps the follow-up exclusions explicit and uses
 the same filter for the generated inventory, so excluded binaries cannot appear
 as false passes or silently re-enter the archive.
 
@@ -362,6 +578,12 @@ mise run e2e:kubernetes:credential-drivers
 
 ### Kubernetes E2E (`e2e/rust/e2e-kubernetes.sh`)
 
+The `e2e-kubernetes` nextest profile temporarily excludes only
+`canonical_main_connect_recovers_its_ssh_transport` while
+[#4445](https://github.com/NVIDIA/OpenShell/issues/4445) investigates delayed SSH
+input-owner release through port-forwarding. The test remains available to other
+driver profiles; the remaining Kubernetes tests stay enabled.
+
 Kubernetes e2e tests deploy an OpenShell gateway into a real Kubernetes cluster
 via Helm and run the Rust e2e suite against it. On vanilla Kubernetes the harness
 reaches the gateway through `kubectl port-forward`; on OpenShift it instead uses a
@@ -386,14 +608,19 @@ OPENSHELL_E2E_KUBE_TEST=smoke mise run e2e:kubernetes
 ```
 
 **OpenShift**: when the target cluster exposes the `route.openshift.io` API
-group, the harness automatically applies SCC-compatible Helm overrides, grants
-the required SCCs (`privileged` to `openshell-sandbox`, and `anyuid` to the
-PostgreSQL fixture for DB scenarios), and drives the gateway through a
-passthrough Route with mandatory mTLS instead of port-forward. No extra flags are
-needed, but `oc` must be installed and authenticated against the target cluster
-with permission to modify SCC bindings (`oc adm policy add-scc-to-user`) — the
-harness exits early if `oc` is missing. The SCC grants and extracted client
-mTLS material are removed during cleanup, including on failure or interrupt.
+group, the harness automatically applies SCC-compatible Helm overrides and
+drives the gateway through a passthrough Route with mandatory mTLS instead of
+port-forward. No extra flags are needed, but `oc` must be installed and
+authenticated against the target cluster; the harness exits early if `oc` is
+missing. DB scenarios grant `anyuid` to the PostgreSQL fixture and require
+permission to modify SCC bindings (`oc adm policy add-scc-to-user`). That grant
+and extracted client mTLS material are removed during cleanup, including on
+failure or interrupt.
+
+Sandbox pods use the namespace-assigned UID/GID and run under `restricted-v2`
+without a privileged SCC grant to `openshell-sandbox`. Earlier versions required
+that grant for in-container isolation setup. [RFC 0012](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0012-isolation-backend/README.md#motivation)
+explains the isolation backend separation behind the capability-free runtime.
 
 On a **remote** cluster, drop the `e2e-host-gateway` feature. Those tests rely
 on the sandbox-side `host.openshell.internal` alias reaching the machine running
@@ -501,6 +728,9 @@ Available task variants:
 | `e2e:kubernetes:workspace-operator` | Operator workspace mode (pre-provisioned namespaces) |
 | `e2e:kubernetes:v1alpha1` | Agent Sandbox v1alpha1 compatibility |
 | `e2e:kubernetes:external-driver` | External Kubernetes driver sidecar |
+| `e2e:kubernetes:shared-supervisor` | One-member shared supervisor pool for the gateway's sandboxes (gateway TLS through the port-forward) |
+| `e2e:kubernetes:shared-supervisor-ha` | Two-replica shared supervisor pool: kills the member that owns a sandbox and checks the sandbox is adopted, not restarted |
+| `e2e:kubernetes:shared-supervisor-scaling` | One-member shared supervisor pool: scales it to two members and back with `helm upgrade`, checking sandboxes stay running and the removed member hands its sandboxes off |
 
 Kubernetes e2e environment variables:
 
@@ -509,6 +739,8 @@ Kubernetes e2e environment variables:
 | `OPENSHELL_E2E_KUBE_CONTEXT` | kubectl context for an existing cluster (skips k3d creation) |
 | `OPENSHELL_E2E_KUBE_TEST` | Scope to a single test (e.g. `smoke`) |
 | `OPENSHELL_E2E_KUBE_EXTRA_VALUES` | Colon-separated additional Helm values files |
+| `OPENSHELL_E2E_KUBE_CHART`, `OPENSHELL_E2E_KUBECONFIG` | Set by the harness for tests that upgrade the release, such as the supervisor pool scaling test: the chart it installed, and the kubeconfig passed as `--kubeconfig` to kubectl and helm. Set them yourself when running such a test directly against an existing release |
+| `OPENSHELL_E2E_KUBE_TLS` | `1` reaches the gateway over mTLS through the port-forward; pair it with an overlay that keeps gateway TLS on, such as `ci/values-tls-port-forward.yaml` |
 | `OPENSHELL_E2E_KUBERNETES_FEATURES` | Cargo feature flags (default: `e2e,e2e-host-gateway,e2e-kubernetes`) |
 | `IMAGE_TAG` | Gateway/supervisor image tag (default: `latest` for existing clusters) |
 | `OPENSHELL_REGISTRY` | Image registry prefix (default: `ghcr.io/nvidia/openshell`) |

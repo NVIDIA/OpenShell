@@ -66,6 +66,8 @@ pub fn phase_name(phase: i32) -> &'static str {
         Ok(SandboxPhase::Stopped) => "Stopped",
         Ok(SandboxPhase::Starting) => "Starting",
         Ok(SandboxPhase::Completed) => "Completed",
+        Ok(SandboxPhase::Suspending) => "Suspending",
+        Ok(SandboxPhase::Suspended) => "Suspended",
         Ok(SandboxPhase::Unknown) | Err(_) => "Unknown",
     }
 }
@@ -891,6 +893,47 @@ pub fn parse_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     Ok(map)
 }
 
+/// Resolve `--env-from KEY[=ENVVAR]` values from the CLI process environment.
+///
+/// This keeps environment values out of process arguments while preserving the
+/// same sandbox environment validation as `--env KEY=VALUE`.
+pub fn parse_env_from_pairs(items: &[String]) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+
+    for item in items {
+        let (key, env_name) = match item.split_once('=') {
+            Some((key, env_name)) => (key.trim(), env_name.trim()),
+            None => (item.trim(), item.trim()),
+        };
+        if !is_valid_env_name(key) {
+            return Err(miette::miette!(
+                "--env-from key must match [A-Za-z_][A-Za-z0-9_]*; got '{key}'"
+            ));
+        }
+        if key.starts_with("OPENSHELL_") {
+            return Err(miette::miette!(
+                "--env-from keys starting with OPENSHELL_ are reserved; got '{key}'"
+            ));
+        }
+        if !is_valid_env_name(env_name) {
+            return Err(miette::miette!(
+                "--env-from source must match [A-Za-z_][A-Za-z0-9_]*; got '{env_name}'"
+            ));
+        }
+        if map.contains_key(key) {
+            return Err(miette::miette!("duplicate --env-from sandbox key '{key}'"));
+        }
+        let value = std::env::var(env_name).map_err(|_| {
+            miette::miette!(
+                "--env-from source environment variable '{env_name}' is not set or is not valid Unicode"
+            )
+        })?;
+        map.insert(key.to_string(), value);
+    }
+
+    Ok(map)
+}
+
 /// Resolve `--secret-material-env KEY[=ENVVAR]` values from the CLI process
 /// environment (`ENVVAR` defaults to `KEY`) so secrets never transit argv.
 pub fn parse_secret_material_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
@@ -1071,6 +1114,27 @@ pub fn scrub_git_env(command: &mut Command) -> &mut Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_key_value_pairs_keeps_slashes_spaces_and_equals() {
+        let items = vec!["source=/home/you/my policy.yaml?a=b".to_string()];
+        let map = parse_key_value_pairs(&items, "--annotation").expect("annotation should parse");
+        assert_eq!(
+            map.get("source").map(String::as_str),
+            Some("/home/you/my policy.yaml?a=b")
+        );
+    }
+
+    #[test]
+    fn parse_key_value_pairs_rejects_malformed_and_empty_keys() {
+        let err =
+            parse_key_value_pairs(&["nokey".to_string()], "--annotation").expect_err("missing '='");
+        assert!(err.to_string().contains("--annotation expects KEY=VALUE"));
+
+        let err =
+            parse_key_value_pairs(&["=value".to_string()], "--annotation").expect_err("empty key");
+        assert!(err.to_string().contains("--annotation key cannot be empty"));
+    }
 
     #[test]
     fn parse_duration_to_ms_parses_supported_units() {

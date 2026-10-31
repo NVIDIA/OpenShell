@@ -174,7 +174,7 @@ openshell logs demo --since 5m --source sandbox
 ```
 
 ```text
-[1775014140.412] [sandbox] [OCSF ] [ocsf] HTTP:POST [MED] DENIED POST http://api.github.com:443/repos/octocat/hello-world/issues [policy:github_api engine:l7] [reason:L7_REQUEST deny POST api.github.com:443/repos/octocat/hello-world/issues reason=POST /repos/octocat/hello-world/issues not permitted by policy]
+[1775014140.412] [sandbox] [OCSF ] [ocsf] HTTP:POST [MED] DENIED POST https://api.github.com/repos/octocat/hello-world/issues [policy:github_api engine:l7] [reason:L7_REQUEST deny POST api.github.com:443/repos/octocat/hello-world/issues reason=POST /repos/octocat/hello-world/issues not permitted by policy]
 ```
 
 Policy events are INFO-level log records regardless of their severity, so do not filter them out with `--level warn`. In production, export these events to your SIEM for a complete audit trail of every request your agent makes. Refer to [Logging](/observability/logging) for the event format.

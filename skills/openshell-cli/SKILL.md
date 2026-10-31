@@ -161,6 +161,24 @@ Profile-backed providers always contribute policy unless a gateway-global
 policy is active. Static credential endpoint binding remains independently
 enforced.
 
+### Label and select providers
+
+Attach labels during provider creation with repeatable `--label KEY=VALUE`
+flags. Labels work with each credential source. List selectors require every
+comma-separated key-value pair to match and apply before pagination.
+
+```shell
+openshell provider create --name public-pypi --type pypi --label env=dev --label team=ml
+openshell provider list --label-selector env=dev,team=ml
+openshell provider list --all-workspaces --label-selector team=ml --output json
+openshell provider get public-pypi
+```
+
+Use an imported profile, such as `pypi` in this example. `get` displays labels;
+structured list output includes them. `--all-workspaces` requires Platform
+Admin access. Preserve the selector and workspace scope when passing the next
+`--page-token`. Labels cannot be changed or removed after provider creation.
+
 ### Inspect and manage provider profiles
 
 ```shell
@@ -273,7 +291,6 @@ openshell sandbox create \
   --provider my-github \
   --provider my-claude \
   --policy ./my-policy.yaml \
-  --upload .:/workspace \
   --label team=agents \
   -- claude
 ```
@@ -285,9 +302,11 @@ Key flags:
 - `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
 - `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
-- `--template NAME`: Create from a named sandbox workload template. Conflicts with inline workload flags such as `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, and `--driver-config-json`.
+- `--template NAME`: Create from a named sandbox workload template. Conflicts with inline workload flags such as `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, `--env-from`, and `--driver-config-json`.
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
+- `--annotation KEY=VALUE`: Add non-secret metadata such as file paths (repeatable)
 - `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
+- `--env-from KEY[=ENVVAR]`: Read a sandbox environment value from the CLI process environment without putting its value in arguments; use `--provider` to keep credentials hidden from the workload
 - `--tty`: Allocate a retained PTY for the canonical main process
 - `--restart-policy never|on-failure|always`: Select gateway-owned main-process restart behavior; `never` is the default
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
@@ -297,6 +316,8 @@ Key flags:
 - `--detach`: Start the canonical main process without attaching
 - `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
+
+If the driver rejects foreground attachment during create validation, use `--detach`.
 
 `--detach` adds no attachment grace period. When the canonical process exits,
 its terminal phase is reported immediately. A foreground create declares one
@@ -410,6 +431,8 @@ openshell sandbox upload my-sandbox ./src
 openshell sandbox download my-sandbox output ./local-output
 ```
 
+Uploads use bounded streaming and wait for sandbox input consumption; the 4 MiB process-input budget is not a total upload-size limit. Upgrade both the CLI and the supervisor runtime used by the sandbox. An older supervisor rejects the upload protocol before file data is sent. Failed or canceled uploads may leave incomplete files in the destination; check it before retrying or remove the partial files.
+
 Uploads inside a Git work tree honor `.gitignore` by default and stop if Git filtering fails or selects no files. Sources confirmed to be outside a Git work tree upload without filtering, with a warning that `.gitignore` rules are not applied. Git must be available to determine whether filtering applies; broken or inaccessible repositories stop the upload. Add `--no-git-ignore` for an intentional unfiltered upload. This also applies to `sandbox create --upload`.
 
 `sandbox create --upload` checks every upload locally before provisioning and creates no sandbox if one is rejected. If a transfer fails after provisioning, the sandbox remains running and earlier uploads may have completed. Retry with `sandbox upload` against that sandbox, or remove it with `sandbox delete`.
@@ -504,12 +527,85 @@ stopped or completed. Starting a retained `Completed` or
 invalidates SSH sessions from the previous runtime generation. Delete remains
 the operation that removes retained state.
 
+Before updating a retained `Completed` or `Error/MainProcessFailed` sandbox,
+run `sandbox stop`. It cleans up compute and transitions to `Stopped`, retaining
+the exit code until the next start. If the terminal sandbox's compute resource
+is already gone, stop succeeds and preserves its terminal phase and exit code;
+configuration updates require retained compute.
+
 The sandbox's SSH host identity survives stop/start and runtime restarts.
 API clients can read its public fingerprint from the sandbox resource or
 SSH-session response and pin it to the sandbox ID. Recreating a deleted
 sandbox, even under the same name, creates a different identity. See the
 [sandbox SSH documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview.md)
 for verification behavior and release compatibility.
+
+For an infrastructure `Error` on a backend that supports restarting stopped sandboxes, fix the reported cause, run `sandbox stop`, and wait for it to succeed before running `sandbox start`. This retains the sandbox and persistent workspace but cannot recover deleted resources or storage. For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
+
+### Suspend and resume sandboxes
+
+On a gateway whose compute driver and isolation backend support it, suspend
+freezes a `Ready` sandbox and retains its memory state:
+
+```bash
+openshell sandbox suspend [name]
+openshell sandbox resume [name]
+```
+
+Suspend waits for `Suspended`, then stops background forwards. A rejected
+suspend leaves forwards running. Resume restores the state in a new runtime
+generation and waits for `Ready`. A gateway without
+support rejects suspend with `FAILED_PRECONDITION`. Resume fails when retained
+state cannot be restored; use `sandbox start` for an explicit clean boot. `sandbox start`,
+`sandbox stop`, and `sandbox delete` on a suspended sandbox discard the
+retained memory state.
+
+### Change a stopped sandbox's workload image
+
+Do not invent a `sandbox update` command or use delete/create to change an
+existing sandbox's configuration. The separate
+`openshell.v1.SandboxUpdates/UpdateSandbox` RPC uses the same gateway listener
+and authentication as `OpenShell`. It defaults to disabled; the operator must
+complete the published
+[activation checklist](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#activate-sandbox-updates)
+before enabling `enable_sandbox_updates`. Keep it false during a rolling
+upgrade and never enable it merely to bypass a failed compatibility check.
+After activation, image, command, and environment updates initially support only
+stopped Kubernetes sandboxes; other drivers return `UNIMPLEMENTED` for those
+fields. Metadata-only updates also support stopped sandboxes on other drivers. Stop and
+wait for `Stopped`, read the sandbox's current resource version through
+`GetSandbox`, call raw `UpdateSandbox` with the named workspace, sandbox name,
+selected image, command, environment overrides, labels or annotations, and required nonzero `expected_resource_version`, then start after
+success. Rust SDK callers use `client.raw_sandbox_updates_fresh()`; generated
+clients use `SandboxUpdates`, not the unchanged `OpenShell` service. There is no
+curated SDK update method. The sandbox identity, Kubernetes
+custom resource, and persistent volume claim remain; the existing workspace is
+not reseeded and trusted runtime images do not change. Omitted update fields are
+unchanged; supplied lists and maps replace their user-owned values, including
+explicitly empty values. Template environment defaults still apply. System metadata
+is protected; top-level labels and annotations do not update pod metadata.
+Combined configuration changes require the configuration-update driver capability
+and a uniformly upgraded gateway deployment. Metadata-only updates need no
+driver capability and preserve the retention annotation.
+
+For an image that fails to start and reaches a provisioning timeout, wait for
+cleanup completion and settlement of the original driver operation, then run
+`sandbox stop` to obtain `Stopped` before correcting the image. This retains the
+timeout diagnostic and storage and does not bypass pending cleanup.
+
+An operation-pending error blocks start, stop, and provisioning retry. The gateway
+limits preflight and each accepted update attempt to one minute each. A timeout
+after acceptance preserves pending intent for recovery; it does not imply rollback.
+The gateway retries automatically even when new updates are disabled. Repeated automatic
+failures back off up to 15 minutes per gateway; restarting a gateway resets the delay.
+To resume immediately,
+read a fresh resource version and call `UpdateSandbox` with no selected fields;
+the gateway loads the stored targets. Use a new request ID or no ID for this
+explicit resume. An unresolved original ID returns uncertainty, and its payload
+must not change. Explicit delete can reclaim a sandbox whose update cannot
+complete, including its storage. See the published
+[image update workflow](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview#update-the-image-of-a-stopped-sandbox)
+and [API errors](https://docs.nvidia.com/openshell/latest/sdk/api-errors).
 
 ---
 
@@ -879,9 +975,6 @@ openshell settings delete work-session --key ocsf_json_enabled
 
 openshell settings get --global --json
 openshell settings set --global --key ocsf_json_enabled --value true
-
-# OCSF schema version downgrade for SIEM compatibility (allowed: "1.1", "1.3")
-openshell settings set --global --key ocsf_schema_version --value "1.1"
 ```
 
 Enabling `ocsf_json_enabled` adds compact `OCSF-JSON` records to the supervisor's stderr, alongside shorthand, and to its JSONL file when file storage is available. Collect these records through the supervisor's platform logs (`docker logs`, `podman logs`, or `kubectl logs`); `openshell logs` still serves shorthand. Match the `OCSF-JSON` marker after the timestamp and parse the remainder as JSON. See the published [OCSF JSON export guide](https://docs.nvidia.com/openshell/latest/observability/ocsf-json-export) for delivery and retention limits.
