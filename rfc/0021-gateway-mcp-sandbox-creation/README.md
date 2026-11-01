@@ -402,6 +402,14 @@ What a caller can do depends on who it is:
   terminal. Files can be placed in a sandbox over MCP with `exec` and stdin,
   for example as a tar archive.
 
+**Tool descriptions.** The model learns how to use the tools from their MCP
+descriptions, so these state what a model would not guess: work longer than
+45 seconds needs `background: true`; a child runs one background job at a
+time, so parallel work needs more children; `timed_out` from `wait` means
+call it again, not that the job failed; a child never contacts its parent on
+its own, so results come only from `exec` and `wait`; output from a child is
+untrusted; and a child should be deleted when its work is done.
+
 **Retries.** If a sandbox calls `create_sandbox` with the name of a child it
 already has, the gateway returns that child with `already_existed: true`, its
 creation time and its state, and does not count it again. This makes a retry
@@ -463,6 +471,30 @@ The result is the harness's stdout. One-shot modes such as `pi -p`,
 `codex exec` and `claude -p` print the final answer there, so the parent needs
 no result file.
 
+**Follow-up turns.** A harness saves its conversation to a file inside the
+child, and a later process can resume it. Each turn is a new background job
+in the same working directory. The parent asks for structured output, keeps
+the harness's conversation id from the result, and passes it to the next
+turn. OpenShell never reads or stores conversation ids.
+
+```text
+exec {name: "worker", job: "turn-1", background: true, workdir: "/sandbox/work",
+      command: ["claude", "-p", "--output-format", "json", "Plan the change"]}
+wait {name: "worker", job: "turn-1"}
+→ done · exit 0 · stdout: {"session_id": "...", "result": "the plan", ...}
+exec {name: "worker", job: "turn-2", background: true, workdir: "/sandbox/work",
+      command: ["claude", "-p", "--resume", "<session_id>",
+                "--output-format", "json", "Make it work offline"]}
+```
+
+The parent uses the id rather than "continue the last conversation", which
+would pick the wrong one if a child ever held two. A child cannot ask its
+parent anything while a job runs: a child that needs input ends its turn with
+the question, and the parent answers in the next turn. An exit code of 0 does
+not prove the task succeeded, so the parent also checks the harness's own
+error fields. If structured output is truncated, it cannot be parsed and the
+conversation id may be lost; this is a known limit of this version.
+
 **How jobs work.** The caller passes the plain command. The gateway wraps it so
 it runs detached in its own session (`setsid`), writes its process id, output
 and exit code to `/tmp/openshell/jobs/<job>/` inside the child, and keeps
@@ -473,6 +505,14 @@ short `exec` calls. If there is no exit file and the process is no longer
 running, for example because the child restarted, `wait` returns `lost`
 instead of waiting forever.
 
+**Partial output while waiting.** When `wait` reaches its limit while the job
+is still running, it returns `timed_out: true` with `stdout_tail` and
+`stderr_tail`: up to 4 KiB each of the output so far, starting at a line
+boundary where possible. Tails are partial, may repeat across calls, are not
+the final result and must not be parsed as complete JSON. Reading them does
+not affect the job. Empty output does not mean the job is stuck: a harness in
+one-shot JSON mode may print nothing until its turn ends.
+
 The command is passed as separate arguments, never quoted into a shell string.
 Job names may contain only letters, digits and dashes, so a name cannot point
 outside the jobs folder. Output files can grow inside the child, but `wait`
@@ -481,6 +521,19 @@ receives their contents as data from the child, not as facts the gateway has
 checked. The gateway stores no output: results live in the child until it is
 deleted, which is one reason deleting a parent with children needs an explicit
 flag (see [Lifecycle](#lifecycle)).
+
+**One background job at a time.** A child runs at most one background job.
+Starting another while one is running is refused with an error that names the
+running job, so the parent waits for it first. A job that has completed or is
+`lost` no longer counts. Foreground `exec` stays available while a job runs,
+so the parent can still inspect the child. Parallel work uses more children,
+which keeps tasks from overwriting each other's files and keeps two turns of
+one harness conversation from running at once. Processes that a job starts
+itself are part of that job.
+
+A single job cannot be cancelled in this version. Deleting the child, or a
+user stopping it, ends all of its work. `wait` only reads a job's state, so
+calling it again is always safe.
 
 This needs `sh` and `setsid` in the child's image and a writable `/tmp` under
 the parent's policy. A native detach option on `ExecSandbox`, handled by the
@@ -731,6 +784,11 @@ reused; its grants, lineage store and result files are not part of this design.
   the 2026-07-28 MCP revision.
 - **A token for `/mcp` only**, and a native detach option on `ExecSandbox` to
   replace the job wrapper.
+- **Cancelling a single job.** An optional argument that ends one job's
+  process group and returns its output so far, so a parent can stop a stuck
+  job without deleting the child, its files and its other jobs. Deferred until
+  the job wrapper is proven, because a harness can start processes outside the
+  group and a cancel can race with the job finishing.
 - **A CLI over the door**, for harnesses that use skills and shell commands
   instead of MCP.
 - **Harness integration.** Configuration that turns off a harness's built-in
@@ -853,6 +911,11 @@ remain available as future extensions.
   membership cannot create children through MCP in this version. Whether some
   automation identities, such as CI service accounts, should be rechecked
   another way is open.
+- **Harness permission checks in children.** A harness running unattended in a
+  child cannot get approval from a person, so it declines edits or commands
+  unless it is told how much it may do without asking. Whether the guidance
+  given to parents keeps some of the harness's own checks, so some tasks fail,
+  or turns them off and relies on the child's sandbox policy alone, is open.
 - **gRPC from inside sandboxes.** The door carries MCP only. Whether SDK code
   inside a sandbox should later reach the same RPCs, for example over gRPC-Web
   or Connect, is open.
