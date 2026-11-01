@@ -638,12 +638,14 @@ async fn preauthorize_transparent_open(
     let PendingTcpOpen {
         stream,
         binary_identity,
-        destination,
+        mut destination,
         socket: _,
         policy_generation: _,
         timing,
         decision: completion,
     } = connection;
+    // Use the IPv4 identity for mapped destinations throughout routing and policy.
+    destination.set_ip(destination.ip().to_canonical());
     let _timing = NetworkOpenTimingGuard {
         timing,
         operation: "tcp",
@@ -7200,6 +7202,8 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
     reason = "Test code: test fixtures and explicit control-flow markers are idiomatic in tests."
 )]
 mod tests {
+    mod ipv4_mapped;
+
     #[test]
     fn proxy_authorization_rejects_missing_wrong_cross_and_duplicate_credentials() {
         let expected = "Basic sandbox-a-generation";

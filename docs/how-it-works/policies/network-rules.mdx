@@ -89,6 +89,10 @@ OpenShell checks network traffic in two stages:
    For example, with `protocol: rest`, a rule can allow `GET` requests to an API
    while blocking `POST` and `DELETE` requests.
 
+Transparent TCP connections to IPv4-mapped IPv6 addresses, such as
+`::ffff:203.0.113.7`, use the same destination rules as the equivalent IPv4
+address, `203.0.113.7`.
+
 The second stage is called request inspection, and an endpoint that uses it is
 an inspected endpoint. The `protocol` field selects what OpenShell inspects:
 
