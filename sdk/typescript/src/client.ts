@@ -1275,12 +1275,7 @@ export class SandboxClient {
   }
 
   async get(name: string, options?: SandboxCallOptions | null): Promise<SandboxRef> {
-    try {
-      const resp = await this.grpc.getSandbox({ ...namedTarget(name, options) }, requestCallOptions(options));
-      return sandboxRef(resp.sandbox);
-    } catch (e) {
-      throw fromConnect(e);
-    }
+    return this.getSandbox(name, options);
   }
 
   // get() that also asks the gateway which replica owns the supervisor session.
@@ -1289,18 +1284,22 @@ export class SandboxClient {
     options?: SandboxCallOptions | null,
   ): Promise<{ ref: SandboxRef; owner?: string }> {
     let owner: string | undefined;
+    const ref = await this.getSandbox(name, options, {
+      headers: { [OWNER_REQUEST_HEADER]: '1' },
+      onHeader: (header) => {
+        owner = header.get(OWNER_REPLICA_HEADER) || undefined;
+      },
+    });
+    return { ref, owner };
+  }
+
+  private async getSandbox(name: string, options?: SandboxCallOptions | null, call?: CallOptions): Promise<SandboxRef> {
     try {
       const resp = await this.grpc.getSandbox(
         { ...namedTarget(name, options) },
-        {
-          ...requestCallOptions(options),
-          headers: { [OWNER_REQUEST_HEADER]: '1' },
-          onHeader: (header) => {
-            owner = header.get(OWNER_REPLICA_HEADER) || undefined;
-          },
-        },
+        { ...requestCallOptions(options), ...call },
       );
-      return { ref: sandboxRef(resp.sandbox), owner };
+      return sandboxRef(resp.sandbox);
     } catch (e) {
       throw fromConnect(e);
     }

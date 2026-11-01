@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Metadata that lets an edge proxy send a sandbox's long-lived calls straight
-// to the gateway replica holding its supervisor session.
+// to the gateway replica holding its supervisor session. The headers and the
+// retry rule are documented in docs/kubernetes/ingress.mdx.
 
 import { Code, ConnectError } from '@connectrpc/connect';
 
