@@ -516,6 +516,17 @@ async fn run_session_loop(config: SessionConfig) {
                 follow_home = false;
                 // No backoff: this is an expected handoff, not a failure.
             }
+            Ok(SessionOutcome::HomeMoved { peer_endpoint }) => {
+                backoff.on_redirect(config.ready_tx.send_replace(false));
+                info!(
+                    sandbox_id = %config.sandbox_id,
+                    peer_endpoint = %peer_endpoint,
+                    "supervisor session: following the shared host to another gateway"
+                );
+                target = config.gateway.with_url(peer_endpoint);
+                redirected = true;
+                follow_home = false;
+            }
             Err(e) => {
                 let accepted = config.ready_tx.send_replace(false);
                 let event = session_failed_event(
@@ -598,6 +609,23 @@ async fn wait_for_home(
     .and_then(|home| (*home).clone())
 }
 
+/// The peer endpoint the shared host moves to, once it changes to one other
+/// than `current`. Pending forever without a shared host.
+async fn home_moved(home: Option<&mut watch::Receiver<Option<String>>>, current: &str) -> String {
+    let Some(home) = home else {
+        return std::future::pending().await;
+    };
+    loop {
+        if home.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+        let endpoint = home.borrow_and_update().clone();
+        if let Some(endpoint) = endpoint.filter(|endpoint| endpoint != current) {
+            return endpoint;
+        }
+    }
+}
+
 /// Keep asking not to be redirected when a redirected attempt never got a
 /// session, so a stale ring pointing at a dead replica cannot bounce us back
 /// to it. A session that was accepted and later dropped starts placement over.
@@ -622,6 +650,9 @@ enum SessionOutcome {
         peer_endpoint: String,
         owner_replica_id: String,
     },
+    /// The shared host reattached to another replica. The caller reconnects
+    /// there.
+    HomeMoved { peer_endpoint: String },
 }
 
 async fn run_single_session(
@@ -736,9 +767,16 @@ async fn run_single_session(
     // Main loop: receive gateway messages + send heartbeats.
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));
     heartbeat_interval.tick().await; // skip immediate tick
+    let mut home = config.gateway_home.clone();
+    if let Some(home) = home.as_mut() {
+        home.mark_unchanged();
+    }
 
     loop {
         tokio::select! {
+            peer_endpoint = home_moved(home.as_mut(), target.url()) => {
+                return Ok(SessionOutcome::HomeMoved { peer_endpoint });
+            }
             msg = inbound.message() => {
                 let msg = match map_session_stream_message(
                     msg,
@@ -1702,6 +1740,25 @@ mod ocsf_event_tests {
         tokio::task::yield_now().await;
         tx.send_replace(Some("https://gw-b:8443".to_string()));
         assert_eq!(moved.await.unwrap().as_deref(), Some("https://gw-b:8443"));
+    }
+
+    #[tokio::test]
+    async fn an_established_session_follows_its_host_to_another_gateway() {
+        let (tx, mut home) = watch::channel(Some("https://gw-a:8443".to_string()));
+        home.mark_unchanged();
+        let moved =
+            tokio::spawn(async move { home_moved(Some(&mut home), "https://gw-a:8443").await });
+
+        tx.send_replace(None);
+        tx.send_replace(Some("https://gw-a:8443".to_string()));
+        tokio::task::yield_now().await;
+        assert!(
+            !moved.is_finished(),
+            "a reattach to the same gateway is not a move"
+        );
+
+        tx.send_replace(Some("https://gw-b:8443".to_string()));
+        assert_eq!(moved.await.unwrap(), "https://gw-b:8443");
     }
 
     #[test]
