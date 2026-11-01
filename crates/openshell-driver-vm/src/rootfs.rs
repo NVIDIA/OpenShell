@@ -552,7 +552,7 @@ fn prepare_sandbox_rootfs(
 
     let init_path = rootfs.join("srv/openshell-vm-sandbox-init.sh");
     if let Some(parent) = init_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        create_guest_dir_all(parent)?;
     }
     fs::write(
         &init_path,
@@ -572,7 +572,7 @@ fn prepare_sandbox_rootfs(
     ensure_umoci_binary(rootfs)?;
 
     let opt_dir = rootfs.join("opt/openshell");
-    fs::create_dir_all(&opt_dir).map_err(|e| format!("create {}: {e}", opt_dir.display()))?;
+    create_guest_dir_all(&opt_dir)?;
     fs::write(opt_dir.join(".rootfs-type"), "sandbox\n")
         .map_err(|e| format!("write sandbox rootfs marker: {e}"))?;
     ensure_sandbox_guest_user(rootfs, sandbox_uid, sandbox_gid)?;
@@ -606,7 +606,24 @@ pub fn validate_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
 }
 
 fn create_sandbox_mountpoint(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    create_guest_dir_all(path)?;
+    chmod_guest_dir(path)
+}
+
+/// Like `create_dir_all`, but each directory it makes is 0755 whatever the
+/// umask. The sandbox user must be able to traverse the guest rootfs.
+fn create_guest_dir_all(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        create_guest_dir_all(parent)?;
+    }
+    fs::create_dir(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    chmod_guest_dir(path)
+}
+
+fn chmod_guest_dir(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -614,6 +631,8 @@ fn create_sandbox_mountpoint(path: &Path) -> Result<(), String> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("chmod {}: {e}", path.display()))?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -1100,7 +1119,7 @@ fn ensure_supervisor_binary(rootfs: &Path) -> Result<(), String> {
         }
     } else {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+            create_guest_dir_all(parent)?;
         }
 
         let sandbox = zstd::decode_all(Cursor::new(SANDBOX))
@@ -1130,7 +1149,7 @@ fn ensure_vm_init_binary(rootfs: &Path) -> Result<(), String> {
         }
     } else {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+            create_guest_dir_all(parent)?;
         }
         let helper = zstd::decode_all(Cursor::new(VM_INIT))
             .map_err(|e| format!("decompress VM guest init helper: {e}"))?;
@@ -1159,7 +1178,7 @@ fn ensure_umoci_binary(rootfs: &Path) -> Result<(), String> {
         }
     } else {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+            create_guest_dir_all(parent)?;
         }
 
         let umoci =
@@ -1429,6 +1448,49 @@ mod tests {
             account < hosts,
             "hosts are written after the root is set up"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guest_dirs_are_traversable_under_a_private_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // The umask is process-wide, so the check runs in a child.
+        const DIR: &str = "OPENSHELL_TEST_GUEST_DIR";
+        if let Ok(dir) = std::env::var(DIR) {
+            create_guest_dir_all(&Path::new(&dir).join("opt/openshell/bin")).expect("create dirs");
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let test = "rootfs::tests::guest_dirs_are_traversable_under_a_private_umask";
+        let status = Command::new("sh")
+            .args(["-c", "umask 077; exec \"$0\" --exact \"$1\""])
+            .arg(std::env::current_exe().expect("test binary"))
+            .arg(test)
+            .env(DIR, &dir)
+            .status()
+            .expect("run child");
+        assert!(status.success());
+
+        for path in ["opt", "opt/openshell", "opt/openshell/bin"] {
+            let mode = fs::metadata(dir.join(path)).expect("stat").permissions();
+            assert_eq!(mode.mode() & 0o777, 0o755, "{path}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guest_init_normalizes_the_overlay_root_before_mounting_it() {
+        // Overlayfs takes the root's owner and mode from upper, which the host
+        // creates under the gateway's umask. A private umask would make / 0700
+        // and unreadable to the sandbox user.
+        let script = include_str!("../scripts/openshell-vm-sandbox-init.sh");
+        let position = |needle: &str| script.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let chown = position("chown 0:0 /overlay/upper");
+        let chmod = position("chmod 0755 /overlay/upper");
+        let mount = position("mount -t overlay overlay");
+        assert!(chown < mount && chmod < mount);
     }
 
     #[test]
