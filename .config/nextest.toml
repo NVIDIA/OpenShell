@@ -32,11 +32,11 @@ kubernetes-shared-supervisor-pool = { max-threads = 1 }
 filter = "test(/gateway_(scale_and_rollout|pod_rolls)$/)"
 test-group = "kubernetes-ha"
 
-# Both change the shared supervisor pool of the release they run against: one
-# kills a member, the other scales the pool. Never run them at once. Test
-# names, not binary(), for the reason above.
+# These change the shared supervisor pool of the release they run against:
+# they kill members or gateways, or scale the pool. Never run them at once.
+# Test names, not binary(), for the reason above.
 [[profile.e2e-kubernetes.overrides]]
-filter = "test(/^(losing_a_supervisor_pod_moves_its_sandboxes_without_restarting_them|scaling_a_supervisor_pool_up_and_down_keeps_its_sandboxes_running)$/)"
+filter = "test(/^(losing_a_supervisor_pod_moves_its_sandboxes_without_restarting_them|scaling_a_supervisor_pool_up_and_down_keeps_its_sandboxes_running|pool_sessions_follow_their_supervisors_gateway)$/)"
 test-group = "kubernetes-shared-supervisor-pool"
 
 # Scaling the pool runs two bounded Helm upgrades (up to 6 minutes each), waits
