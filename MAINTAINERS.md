@@ -5,6 +5,7 @@ The current maintainers of OpenShell are listed below.
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
 | Derek Carr | [@derekwaynecarr](https://github.com/derekwaynecarr) | Red Hat |
+| Divesh | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
 | Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
 | Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
 | Seth Jennings | [@sjenning](https://github.com/sjenning) | Red Hat |
