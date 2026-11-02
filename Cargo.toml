@@ -16,7 +16,7 @@ repository = "https://github.com/NVIDIA/OpenShell"
 # Product backend selection. Consumer crates inherit this choice.
 openshell-crypto = { path = "crates/openshell-crypto", default-features = false, features = ["aws-lc"] }
 # Async runtime
-tokio = { version = "1.43", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 
 # gRPC/Protobuf
 tonic = "0.14"
@@ -115,7 +115,7 @@ jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"
 zeroize = { version = "1", features = ["derive"] }
 getrandom = "0.3"
 aws-lc-rs = "1.16"
-spiffe = { version = "0.15", default-features = false, features = ["workload-api-jwt", "jwt-verify-rust-crypto", "tracing"] }
+spiffe = { version = "0.15", default-features = false, features = ["workload-api-jwt", "jwt-verify-aws-lc-rs", "tracing"] }
 
 # Filesystem embedding
 include_dir = "0.7"
@@ -149,7 +149,7 @@ uuid = { version = "1.10", features = ["v4"] }
 signal-hook = "0.3"
 
 # SMT solver (system libz3 by default; opt into vendored source or a prebuilt release)
-z3 = "0.21"
+z3 = "0.22"
 
 [workspace.lints.rust]
 unsafe_code = "warn"
