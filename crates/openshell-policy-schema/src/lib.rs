@@ -234,6 +234,8 @@ pub struct ProcessPolicy {
     pub run_as_user: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub run_as_group: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_process_group_signals: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -757,7 +759,7 @@ fn inspect_document(root: &serde_yml::Value) -> InspectionResult {
     inspect_named(
         root.get("process"),
         "process",
-        &["run_as_user", "run_as_group"],
+        &["run_as_user", "run_as_group", "allow_process_group_signals"],
     )?;
 
     for (name, rule) in open_map(root.get("network_policies")) {

@@ -272,8 +272,9 @@ func processPolicyFromProto(p *sbv1.ProcessPolicy) *types.ProcessPolicy {
 		return nil
 	}
 	return &types.ProcessPolicy{
-		RunAsUser:  p.GetRunAsUser(),
-		RunAsGroup: p.GetRunAsGroup(),
+		RunAsUser:                p.GetRunAsUser(),
+		RunAsGroup:               p.GetRunAsGroup(),
+		AllowProcessGroupSignals: p.GetAllowProcessGroupSignals(),
 	}
 }
 
@@ -282,8 +283,9 @@ func processPolicyToProto(p *types.ProcessPolicy) *sbv1.ProcessPolicy {
 		return nil
 	}
 	return &sbv1.ProcessPolicy{
-		RunAsUser:  p.RunAsUser,
-		RunAsGroup: p.RunAsGroup,
+		RunAsUser:                p.RunAsUser,
+		RunAsGroup:               p.RunAsGroup,
+		AllowProcessGroupSignals: p.AllowProcessGroupSignals,
 	}
 }
 

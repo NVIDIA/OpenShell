@@ -613,8 +613,11 @@ impl ProcessHandle {
         let prepared_sandbox = prepare_child_sandbox(policy, workspace.root(), &runtime_read_only)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
         #[cfg(target_os = "linux")]
-        let mut child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
-            .map_err(|error| miette::miette!("prepare child self-protection filter: {error}"))?;
+        let mut child_hardening = crate::linux::child_seccomp::prepare(
+            std::process::id(),
+            policy.process.allow_process_group_signals,
+        )
+        .map_err(|error| miette::miette!("prepare child self-protection filter: {error}"))?;
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
@@ -1177,6 +1180,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(current_user.name.clone()),
             run_as_group: None,
+            allow_process_group_signals: false,
         });
         let workspace = ResolvedWorkspace::default();
         let mut cmd = Command::new("/usr/bin/env");
@@ -1287,6 +1291,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(current_user.name),
             run_as_group: None,
+            allow_process_group_signals: false,
         });
         // Mirror production: inherit the sandbox environment, no env_clear.
         let mut cmd = Command::new("/usr/bin/env");
@@ -1326,6 +1331,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(current_user.name),
             run_as_group: None,
+            allow_process_group_signals: false,
         });
         for interactive in [false, true] {
             let mut cmd = Command::new("/usr/bin/env");
@@ -1401,6 +1407,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(current_user.name),
             run_as_group: None,
+            allow_process_group_signals: false,
         });
         let workspace = ResolvedWorkspace::default();
         let probe = |declared: HashMap<String, String>,
@@ -1557,6 +1564,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(current_user.name),
             run_as_group: None,
+            allow_process_group_signals: false,
         });
         let workspace = ResolvedWorkspace::default();
         let ca_paths = (
@@ -1648,6 +1656,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(current_user.name),
             run_as_group: None,
+            allow_process_group_signals: false,
         });
         let mut cmd = Command::new("/usr/bin/env");
         cmd.stdout(StdStdio::piped());

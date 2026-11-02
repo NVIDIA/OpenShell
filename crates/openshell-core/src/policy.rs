@@ -83,6 +83,8 @@ pub struct ProcessPolicy {
 
     /// Group name to run the sandboxed process as.
     pub run_as_group: Option<String>,
+    /// Allow workload-only process group signals within the caller's session.
+    pub allow_process_group_signals: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -185,6 +187,7 @@ impl From<ProtoProcessPolicy> for ProcessPolicy {
             } else {
                 Some(proto.run_as_group)
             },
+            allow_process_group_signals: proto.allow_process_group_signals,
         }
     }
 }

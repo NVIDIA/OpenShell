@@ -618,9 +618,11 @@ type ProcessPolicy struct {
 	// User name to run the sandboxed process as.
 	RunAsUser string `protobuf:"bytes,1,opt,name=run_as_user,json=runAsUser,proto3" json:"run_as_user,omitempty"`
 	// Group name to run the sandboxed process as.
-	RunAsGroup    string `protobuf:"bytes,2,opt,name=run_as_group,json=runAsGroup,proto3" json:"run_as_group,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	RunAsGroup string `protobuf:"bytes,2,opt,name=run_as_group,json=runAsGroup,proto3" json:"run_as_group,omitempty"`
+	// Allow process-group signals within workload groups in the caller's session.
+	AllowProcessGroupSignals bool `protobuf:"varint,3,opt,name=allow_process_group_signals,json=allowProcessGroupSignals,proto3" json:"allow_process_group_signals,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *ProcessPolicy) Reset() {
@@ -665,6 +667,13 @@ func (x *ProcessPolicy) GetRunAsGroup() string {
 		return x.RunAsGroup
 	}
 	return ""
+}
+
+func (x *ProcessPolicy) GetAllowProcessGroupSignals() bool {
+	if x != nil {
+		return x.AllowProcessGroupSignals
+	}
+	return false
 }
 
 // A named network access policy rule.
@@ -952,7 +961,6 @@ type NetworkEndpoint struct {
 	// When non-empty, the SSRF internal-IP check is replaced by an allowlist check:
 	//   - If host is also set: domain must resolve to an IP in this list.
 	//   - If host is empty: any domain is allowed as long as it resolves to an IP in this list.
-	//
 	// Supports exact IPs ("10.0.5.20") and CIDR notation ("10.0.5.0/24").
 	// Loopback (127.0.0.0/8) and link-local (169.254.0.0/16) are always blocked
 	// regardless of this field.
@@ -2627,11 +2635,12 @@ const file_sandbox_proto_rawDesc = "" +
 	"\n" +
 	"read_write\x18\x03 \x03(\tR\treadWrite\"6\n" +
 	"\x0eLandlockPolicy\x12$\n" +
-	"\rcompatibility\x18\x01 \x01(\tR\rcompatibility\"Q\n" +
+	"\rcompatibility\x18\x01 \x01(\tR\rcompatibility\"\x90\x01\n" +
 	"\rProcessPolicy\x12\x1e\n" +
 	"\vrun_as_user\x18\x01 \x01(\tR\trunAsUser\x12 \n" +
 	"\frun_as_group\x18\x02 \x01(\tR\n" +
-	"runAsGroup\"\xad\x01\n" +
+	"runAsGroup\x12=\n" +
+	"\x1ballow_process_group_signals\x18\x03 \x01(\bR\x18allowProcessGroupSignals\"\xad\x01\n" +
 	"\x11NetworkPolicyRule\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12C\n" +
 	"\tendpoints\x18\x02 \x03(\v2%.openshell.sandbox.v1.NetworkEndpointR\tendpoints\x12?\n" +

@@ -5,6 +5,13 @@ qualification probes. The `linux` module contains seccomp notifications and chil
 filters, task-memory access, process-signal mediation, procfs descriptor lookup,
 socket identity, Landlock qualification, and the workload launch thread.
 
+When `process.allow_process_group_signals` is enabled, the inherited seccomp
+listener sends group signals through `process_signal`. The broker requires the
+caller's session and workload root for every member, then signals retained
+pidfds individually. PID zero names the caller's group; negative PIDs name
+other groups. PGID 1 and broadcast `kill(-1, ...)` remain denied. An omitted
+setting keeps the child filter's previous group-signal denial.
+
 `sandbox::linux` composes policy enforcement. The top-level `linux` module owns
 the lower-level mechanisms used by that orchestration and the boundary server.
 Unsafe kernel ABI, process-launch, and descriptor-ownership operations stay in

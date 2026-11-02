@@ -170,12 +170,15 @@ type LandlockPolicy struct {
 	Compatibility string
 }
 
-// ProcessPolicy controls the user and group identity under which sandboxed processes execute.
+// ProcessPolicy controls workload identity and process-group signals.
 type ProcessPolicy struct {
 	// RunAsUser is the user name for sandboxed processes.
 	RunAsUser string
 	// RunAsGroup is the group name for sandboxed processes.
 	RunAsGroup string
+	// AllowProcessGroupSignals permits all process-group signals within the caller's workload session.
+	// It is disabled by default and fixed when the sandbox starts.
+	AllowProcessGroupSignals bool
 }
 
 // SandboxPolicyRevision represents a versioned policy revision for a sandbox.

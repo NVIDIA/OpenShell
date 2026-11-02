@@ -6606,6 +6606,7 @@ mod linux {
                 process: openshell_core::policy::ProcessPolicy {
                     run_as_user: user.map(str::to_string),
                     run_as_group: group.map(str::to_string),
+                    allow_process_group_signals: false,
                 },
             })
         }

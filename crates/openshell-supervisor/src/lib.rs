@@ -5223,6 +5223,7 @@ network_policies:
         policy.process = Some(openshell_core::proto::ProcessPolicy {
             run_as_user: "10000".into(),
             run_as_group: "1001".into(),
+            allow_process_group_signals: false,
         });
         let (reports, mut reported) = tokio::sync::mpsc::unbounded_channel();
         let gateway = TestStartupGateway {
@@ -5309,6 +5310,7 @@ network_policies:
                 process: Some(openshell_core::proto::ProcessPolicy {
                     run_as_user: user.into(),
                     run_as_group: group.into(),
+                    allow_process_group_signals: false,
                 }),
                 ..Default::default()
             };
@@ -5328,6 +5330,7 @@ network_policies:
         policy.process = Some(openshell_core::proto::ProcessPolicy {
             run_as_user: "sandbox".into(),
             run_as_group: "10000".into(),
+            allow_process_group_signals: false,
         });
         let committed = AtomicBool::new(false);
         let result = reload_gateway_configuration_runtime(

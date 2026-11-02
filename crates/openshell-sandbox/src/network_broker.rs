@@ -2885,6 +2885,299 @@ mod tests {
     }
 
     #[test]
+    fn job_control_signals_stay_within_workload_groups() {
+        use std::os::unix::process::CommandExt as _;
+
+        const CHILD_MARKER: &str = "OPENSHELL_JOB_CONTROL_SIGNAL_CHILD";
+        const REJOIN_MARKER: &str = "OPENSHELL_JOB_CONTROL_REJOIN_CHILD";
+        const SESSION_MARKER: &str = "OPENSHELL_JOB_CONTROL_SESSION_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let signal_errno = |pid: i32, signal: i32| {
+                // SAFETY: signal zero has no delivery effect; other targets
+                // below are disposable children of this test process.
+                if unsafe { libc::kill(pid, signal) } == 0 {
+                    0
+                } else {
+                    io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+                }
+            };
+            let own_group = unsafe { libc::getpgrp() };
+            let trusted_group = std::env::var("OPENSHELL_TEST_TRUSTED_GROUP")
+                .unwrap()
+                .parse::<i32>()
+                .unwrap();
+            if std::env::var_os(REJOIN_MARKER).is_some() {
+                // A nonleader workload process may join the supervisor's
+                // group in the same session. Its group signal must still fail.
+                assert_eq!(unsafe { libc::setpgid(0, trusted_group) }, 0);
+                assert_eq!(signal_errno(0, 0), libc::EPERM);
+                return;
+            }
+            if std::env::var_os(SESSION_MARKER).is_some() {
+                assert!(unsafe { libc::setsid() } > 0);
+                assert_eq!(signal_errno(0, 0), 0);
+                assert_eq!(signal_errno(-trusted_group, 0), libc::EPERM);
+                return;
+            }
+            let other_group = std::env::var("OPENSHELL_TEST_OTHER_GROUP")
+                .unwrap()
+                .parse::<i32>()
+                .unwrap();
+            assert_eq!(signal_errno(0, 0), 0);
+            assert_eq!(signal_errno(-own_group, 0), 0);
+            assert_eq!(signal_errno(-trusted_group, 0), libc::EPERM);
+            assert_eq!(signal_errno(-other_group, 0), libc::EPERM);
+            // -1 is both the broadcast form and the only numeric spelling
+            // of PGID 1. Neither may reach the notification broker.
+            assert_eq!(signal_errno(-1, 0), libc::EPERM);
+            // SAFETY: zeroed siginfo has valid scalar and pointer fields.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            info.si_signo = libc::SIGCONT;
+            info.si_code = libc::SI_QUEUE;
+            let queued_other = unsafe {
+                libc::syscall(libc::SYS_rt_sigqueueinfo, -other_group, 0, &raw const info)
+            };
+            assert_eq!(queued_other, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+            let queued_trusted = unsafe {
+                libc::syscall(
+                    libc::SYS_rt_sigqueueinfo,
+                    -trusted_group,
+                    0,
+                    &raw const info,
+                )
+            };
+            assert_eq!(queued_trusted, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+            let queued_broadcast =
+                unsafe { libc::syscall(libc::SYS_rt_sigqueueinfo, -1, 0, &raw const info) };
+            assert_eq!(queued_broadcast, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+
+            let mut job = std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let job_pid = i32::try_from(job.id()).unwrap();
+            let stop = signal_errno(-job_pid, libc::SIGTSTP);
+            let stopped = (0..100).any(|_| {
+                let stat = std::fs::read_to_string(format!("/proc/{job_pid}/stat")).unwrap();
+                if stat
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with('T'))
+                {
+                    true
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    false
+                }
+            });
+            let resume = signal_errno(-job_pid, libc::SIGCONT);
+            let queued_resume = unsafe {
+                libc::syscall(
+                    libc::SYS_rt_sigqueueinfo,
+                    -job_pid,
+                    libc::SIGCONT,
+                    &raw const info,
+                )
+            };
+            let queued_resume_errno = io::Error::last_os_error().raw_os_error();
+            let running = (0..100).any(|_| {
+                let stat = std::fs::read_to_string(format!("/proc/{job_pid}/stat")).unwrap();
+                if stat
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, rest)| !rest.starts_with('T'))
+                {
+                    true
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    false
+                }
+            });
+            let _ = signal_errno(job_pid, libc::SIGCONT);
+            job.kill().unwrap();
+            job.wait().unwrap();
+            assert_eq!(stop, 0);
+            assert!(stopped);
+            assert_eq!(resume, 0);
+            assert_eq!(
+                queued_resume, 0,
+                "queued group resume: {queued_resume_errno:?}"
+            );
+            assert!(running);
+
+            let mut outside = std::process::Command::new("sleep");
+            outside.arg("30");
+            // SAFETY: setsid takes no arguments and runs only in this child.
+            unsafe {
+                outside.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            let mut outside = outside.spawn().unwrap();
+            let outside_pid = i32::try_from(outside.id()).unwrap();
+            let other_session = signal_errno(-outside_pid, 0);
+            outside.kill().unwrap();
+            outside.wait().unwrap();
+            assert_eq!(other_session, libc::EPERM);
+
+            for marker in [REJOIN_MARKER, SESSION_MARKER] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "network_broker::tests::job_control_signals_stay_within_workload_groups",
+                        "--nocapture",
+                    ])
+                    .env(marker, "1")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{marker}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let trusted_group = unsafe { libc::getpgrp() };
+        let mut other = launcher
+            .execute(|| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .process_group(0)
+                    .spawn()
+            })
+            .unwrap()
+            .unwrap();
+        let other_group = other.id();
+        let output = launcher
+            .execute(move || {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "network_broker::tests::job_control_signals_stay_within_workload_groups",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_MARKER, "1")
+                    .env("OPENSHELL_TEST_TRUSTED_GROUP", trusted_group.to_string())
+                    .env("OPENSHELL_TEST_OTHER_GROUP", other_group.to_string())
+                    .process_group(0);
+                let mut filter = crate::linux::child_seccomp::prepare(std::process::id(), true)?;
+                // SAFETY: installation uses the prebuilt, allocation-free
+                // child filter after the standard process-group setup.
+                unsafe { command.pre_exec(move || filter.install()) };
+                command.output()
+            })
+            .unwrap()
+            .unwrap();
+        other.kill().unwrap();
+        other.wait().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn terminating_group_signal_reaches_members_before_caller() {
+        use std::io::Write as _;
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+
+        const CHILD_MARKER: &str = "OPENSHELL_TERMINATING_GROUP_SIGNAL_CHILD";
+        const MEMBER_PREFIX: &str = "OPENSHELL_GROUP_MEMBER=";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let mut sibling = std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn group member");
+            // SAFETY: these calls only inspect the disposable child group.
+            assert_eq!(unsafe { libc::getpgrp() }, unsafe { libc::getpid() });
+            assert_eq!(
+                unsafe { libc::getpgid(i32::try_from(sibling.id()).unwrap()) },
+                unsafe { libc::getpgrp() }
+            );
+            println!("{MEMBER_PREFIX}{}", sibling.id());
+            io::stdout().flush().unwrap();
+            // SAFETY: this child owns a dedicated disposable process group.
+            unsafe { libc::kill(0, libc::SIGKILL) };
+            let _ = sibling.kill();
+            let _ = sibling.wait();
+            panic!("group SIGKILL returned to caller");
+        }
+
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let output = launcher
+            .execute(move || {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "network_broker::tests::terminating_group_signal_reaches_members_before_caller",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_MARKER, "1")
+                    .process_group(0);
+                let mut filter = crate::linux::child_seccomp::prepare(std::process::id(), true)?;
+                // SAFETY: installation uses the prebuilt, allocation-free child filter.
+                unsafe { command.pre_exec(move || filter.install()) };
+                command.output()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGKILL),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let sibling_pid = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(MEMBER_PREFIX))
+            .expect("child reported member PID")
+            .parse::<u32>()
+            .unwrap();
+        let sibling_stat = format!("/proc/{sibling_pid}/stat");
+        let sibling_exited = (0..100).any(|_| match std::fs::read_to_string(&sibling_stat) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+            Err(error) => panic!("read group member stat: {error}"),
+            Ok(stat) => {
+                let exited = stat.rsplit_once(") ").is_some_and(|(_, fields)| {
+                    matches!(fields.chars().next(), Some('Z' | 'X' | 'x'))
+                });
+                if !exited {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                exited
+            }
+        });
+        if !sibling_exited {
+            // SAFETY: this is the disposable member reported by the test child.
+            unsafe { libc::kill(i32::try_from(sibling_pid).unwrap(), libc::SIGKILL) };
+        }
+        assert!(
+            sibling_exited,
+            "group member remained live after caller died"
+        );
+    }
+
+    #[test]
     fn slow_loopback_connect_does_not_stall_other_mediation() {
         // A listener that never accepts, with a full backlog, makes further
         // connects wait. Other mediated syscalls must not wait behind them,

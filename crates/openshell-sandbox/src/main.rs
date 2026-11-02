@@ -429,7 +429,7 @@ fn probe_socket_virtualization() -> Result<()> {
         .into_diagnostic()
         .wrap_err("resolve socket probe executable")?;
     let sandbox_tgid = std::process::id();
-    let mut child_hardening = openshell_sandbox::linux::child_seccomp::prepare(sandbox_tgid)
+    let mut child_hardening = openshell_sandbox::linux::child_seccomp::prepare(sandbox_tgid, false)
         .into_diagnostic()
         .wrap_err("prepare socket probe child hardening")?;
     let (listener_tx, listener_rx) = mpsc::sync_channel::<std::io::Result<NotificationListener>>(1);

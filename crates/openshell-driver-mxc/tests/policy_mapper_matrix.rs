@@ -882,6 +882,7 @@ fn b_run_as_user_warning() {
         process: Some(ProcessPolicy {
             run_as_user: "sandbox".into(),
             run_as_group: String::new(),
+            allow_process_group_signals: false,
         }),
         ..Default::default()
     };
@@ -896,6 +897,7 @@ fn b_run_as_group_warning() {
         process: Some(ProcessPolicy {
             run_as_user: String::new(),
             run_as_group: "sandboxers".into(),
+            allow_process_group_signals: false,
         }),
         ..Default::default()
     };
@@ -1121,6 +1123,7 @@ fn handled_fields_inventory() {
         process: Some(ProcessPolicy {
             run_as_user: "sandbox".into(),
             run_as_group: "sandbox".into(),
+            allow_process_group_signals: false,
         }),
         network_policies: {
             let mut m = std::collections::HashMap::new();

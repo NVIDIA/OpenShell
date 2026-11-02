@@ -7981,6 +7981,7 @@ mod tests {
             process: Some(openshell_core::proto::ProcessPolicy {
                 run_as_user: String::new(),
                 run_as_group: "1234".to_string(),
+                allow_process_group_signals: false,
             }),
             ..Default::default()
         };
@@ -8052,6 +8053,7 @@ mod tests {
             process: Some(openshell_core::proto::ProcessPolicy {
                 run_as_user: String::new(),
                 run_as_group: "1234".to_string(),
+                allow_process_group_signals: false,
             }),
             ..Default::default()
         };

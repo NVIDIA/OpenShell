@@ -2147,6 +2147,7 @@ mod tests {
             process: Some(ProcessPolicy {
                 run_as_user: "root".into(),
                 run_as_group: "sandbox".into(),
+                allow_process_group_signals: false,
             }),
             ..Default::default()
         };
@@ -2327,10 +2328,18 @@ mod tests {
             process: Some(ProcessPolicy {
                 run_as_user: "sandbox".into(),
                 run_as_group: "sandbox".into(),
+                allow_process_group_signals: false,
             }),
             ..Default::default()
         };
         assert!(validate_static_fields_unchanged(&policy, &policy).is_ok());
+        let mut changed = policy.clone();
+        changed
+            .process
+            .as_mut()
+            .unwrap()
+            .allow_process_group_signals = true;
+        assert!(validate_static_fields_unchanged(&policy, &changed).is_err());
     }
 
     #[test]
@@ -2447,6 +2456,7 @@ mod tests {
             process: Some(openshell_core::proto::ProcessPolicy {
                 run_as_user: "sandbox".into(),
                 run_as_group: "1001".into(),
+                allow_process_group_signals: false,
             }),
             ..Default::default()
         };
@@ -2460,6 +2470,7 @@ mod tests {
             changed.process = Some(openshell_core::proto::ProcessPolicy {
                 run_as_user: user.into(),
                 run_as_group: group.into(),
+                allow_process_group_signals: false,
             });
             let error = validate_static_fields_unchanged(&baseline, &changed).unwrap_err();
             assert!(error.message().contains("process policy cannot be changed"));

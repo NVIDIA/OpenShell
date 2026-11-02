@@ -234,8 +234,11 @@ impl LocalBoundaryExec {
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
         #[cfg(target_os = "linux")]
-        let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
-            .map_err(|error| BackendError::Process(error.to_string()))?;
+        let child_hardening = crate::linux::child_seccomp::prepare(
+            std::process::id(),
+            self.policy.process.allow_process_group_signals,
+        )
+        .map_err(|error| BackendError::Process(error.to_string()))?;
         crate::pty::install_dedicated_process_group(&mut command);
         crate::pty::install_pre_exec_no_pty(
             &mut command,
@@ -344,8 +347,11 @@ impl LocalBoundaryExec {
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
         #[cfg(target_os = "linux")]
-        let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
-            .map_err(|error| BackendError::Process(error.to_string()))?;
+        let child_hardening = crate::linux::child_seccomp::prepare(
+            std::process::id(),
+            self.policy.process.allow_process_group_signals,
+        )
+        .map_err(|error| BackendError::Process(error.to_string()))?;
         crate::pty::install_pre_exec(
             &mut command,
             self.policy.clone(),
