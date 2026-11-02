@@ -16,17 +16,24 @@ use openshell_driver_vm::VmDriverConfig;
 /// downloading an image, running a VM, or requiring host filesystem utilities.
 #[test]
 fn worker_publishes_complete_overlay_and_reports_resolved_owner() {
-    worker_overlay_case(false);
+    worker_overlay_case(false, false);
 }
 
 /// Retrying an interrupted first start must never turn an incomplete copy
 /// into persisted overlay state. The next retry must still be able to start.
 #[test]
 fn interrupted_missing_overlay_retry_does_not_publish_partial_state() {
-    worker_overlay_case(true);
+    worker_overlay_case(true, false);
 }
 
-fn worker_overlay_case(interrupt_retry: bool) {
+/// The serialized worker request must preserve the prepared disk layout when
+/// the driver has not configured an explicit sandbox UID or GID.
+#[test]
+fn worker_resolves_prepared_image_sandbox_account() {
+    worker_overlay_case(false, true);
+}
+
+fn worker_overlay_case(interrupt_retry: bool, prepared_layout: bool) {
     let root = tempfile::tempdir().unwrap();
     let cache = root.path().join("images");
     let attempts = cache.join("preparations");
@@ -59,11 +66,45 @@ fn worker_overlay_case(interrupt_retry: bool) {
     }
     let source = cache.join("test-image/rootfs.ext4");
     fs::create_dir_all(source.parent().unwrap()).unwrap();
-    fs::write(&source, b"identity comes from driver configuration").unwrap();
+    let (uid, gid) = if prepared_layout {
+        let image_root = root.path().join("prepared-source");
+        fs::create_dir_all(image_root.join("etc")).unwrap();
+        fs::create_dir_all(image_root.join("image-rootfs/etc")).unwrap();
+        fs::write(
+            image_root.join("etc/passwd"),
+            b"sandbox:x:4242:4243:Unrelated:/sandbox:/bin/sh\n",
+        )
+        .unwrap();
+        fs::write(
+            image_root.join("image-rootfs/etc/passwd"),
+            b"sandbox:x:998:999:Sandbox:/sandbox:/bin/sh\n",
+        )
+        .unwrap();
+        File::create(&source)
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+        let formatter = openshell_core::e2fsprogs::resolve(&["mke2fs", "mkfs.ext4"]).unwrap();
+        let output = Command::new(formatter)
+            .args(["-q", "-F", "-t", "ext4", "-d"])
+            .arg(&image_root)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (998, 999)
+    } else {
+        fs::write(&source, b"identity comes from driver configuration").unwrap();
+        (1000, 1000)
+    };
     let config = VmDriverConfig {
         state_dir: root.path().to_path_buf(),
-        sandbox_uid: Some(1000),
-        sandbox_gid: Some(1000),
+        sandbox_uid: (!prepared_layout).then_some(1000),
+        sandbox_gid: (!prepared_layout).then_some(1000),
         overlay_disk_mib: 1,
         ..VmDriverConfig::default()
     };
@@ -78,7 +119,7 @@ fn worker_overlay_case(interrupt_retry: bool) {
             "bootstrap_only": false,
             "overlay": {
                 "source_disk": source,
-                "source_layout": "Root",
+                "source_layout": if prepared_layout { "Prepared" } else { "Root" },
                 "preparation": if interrupt_retry { "PreserveExisting" } else { "Fresh" },
             },
             "lease_fd": fd,
@@ -183,7 +224,7 @@ fn worker_overlay_case(interrupt_retry: bool) {
         .expect("worker completion");
     assert_eq!(
         completion,
-        serde_json::json!({"Ok": {"Overlay": {"uid": 1000, "gid": 1000}}})
+        serde_json::json!({"Ok": {"Overlay": {"uid": uid, "gid": gid}}})
     );
     assert_eq!(fs::read(sandbox.join("overlay.ext4")).unwrap(), expected);
     assert_eq!(
@@ -193,7 +234,7 @@ fn worker_overlay_case(interrupt_retry: bool) {
     );
     assert_eq!(
         fs::read_to_string(sandbox.join("sandbox-owner-state")).unwrap(),
-        "sandbox-owner-v2:1000:1000\n"
+        format!("sandbox-owner-v2:{uid}:{gid}\n")
     );
 }
 

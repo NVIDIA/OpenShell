@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,6 +26,8 @@ const SUPERVISOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-su
 const VM_INIT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-vm-init.zst"));
 const UMOCI: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/umoci.zst"));
 const ROOTFS_VARIANT_MARKER: &str = ".openshell-rootfs-variant";
+const MAX_SANDBOX_PASSWD_BYTES: usize = 1024 * 1024;
+const MAX_DEBUGFS_DIAGNOSTIC_BYTES: usize = 4096;
 /// Leading bytes of a gzip stream, used to recognize `.tar.gz`/`.tgz` input
 /// without trusting the file name.
 pub const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
@@ -896,33 +898,89 @@ fn sandbox_guest_user_ids_from_image_path(
     let quoted_path = debugfs_quote_absolute_path(guest_path)
         .expect("the static passwd path is a valid debugfs path");
     let command = format!("cat {quoted_path}");
-    let output = e2fs_command("debugfs")?
-        .arg("-R")
-        .arg(&command)
-        .arg(image_path)
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            let passwd = String::from_utf8(output.stdout).map_err(|error| {
-                format!(
-                    "read {guest_path} from {} as UTF-8: {error}",
-                    image_path.display()
-                )
-            })?;
-            parse_sandbox_guest_user_ids(&passwd, &image_path.display().to_string())
-        }
-        Ok(output) => Err(format!(
+    let output = debugfs_cat_bounded(image_path, &command)?;
+    if !output.status.success() {
+        return Err(format!(
             "debugfs command '{command}' failed for {}: debugfs failed with status {}\nstdout: {}\nstderr: {}. Install e2fsprogs (debugfs) and retry",
             image_path.display(),
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
-        )),
-        Err(error) => Err(format!(
-            "debugfs command '{command}' failed for {}: {error}. Install e2fsprogs (debugfs) and retry",
-            image_path.display()
-        )),
+        ));
     }
+    let passwd = String::from_utf8(output.stdout).map_err(|error| {
+        format!(
+            "read {guest_path} from {} as UTF-8: {error}",
+            image_path.display()
+        )
+    })?;
+    parse_sandbox_guest_user_ids(&passwd, &image_path.display().to_string())
+}
+
+fn debugfs_cat_bounded(image_path: &Path, command: &str) -> Result<std::process::Output, String> {
+    let mut child = e2fs_command("debugfs")?
+        .arg("-R")
+        .arg(command)
+        .arg(image_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("start debugfs for {}: {error}", image_path.display()))?;
+    let mut stderr = child.stderr.take().expect("debugfs stderr was piped");
+    let stderr_reader = match std::thread::Builder::new()
+        .name("debugfs-stderr".to_string())
+        .spawn(move || -> std::io::Result<Vec<u8>> {
+            let mut diagnostic = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stderr.read(&mut chunk)?;
+                if read == 0 {
+                    return Ok(diagnostic);
+                }
+                let remaining = MAX_DEBUGFS_DIAGNOSTIC_BYTES.saturating_sub(diagnostic.len());
+                diagnostic.extend_from_slice(&chunk[..read.min(remaining)]);
+            }
+        }) {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("start debugfs stderr reader: {error}"));
+        }
+    };
+
+    let mut stdout = child.stdout.take().expect("debugfs stdout was piped");
+    let mut contents = Vec::new();
+    let read_result = (&mut stdout)
+        .take((MAX_SANDBOX_PASSWD_BYTES + 1) as u64)
+        .read_to_end(&mut contents);
+    drop(stdout);
+    let oversized = contents.len() > MAX_SANDBOX_PASSWD_BYTES;
+    if oversized || read_result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait();
+    if status.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let diagnostic = stderr_reader
+        .join()
+        .map_err(|_| "debugfs stderr reader panicked".to_string())?
+        .map_err(|error| format!("read debugfs stderr: {error}"))?;
+    let status = status.map_err(|error| format!("wait for debugfs: {error}"))?;
+    read_result.map_err(|error| format!("read debugfs stdout: {error}"))?;
+    if oversized {
+        return Err(format!(
+            "sandbox passwd in {} exceeds {MAX_SANDBOX_PASSWD_BYTES} bytes",
+            image_path.display()
+        ));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout: contents,
+        stderr: diagnostic,
+    })
 }
 
 fn sandbox_guest_user_ids(rootfs: &Path) -> Result<Option<(u32, u32)>, String> {
@@ -1678,6 +1736,25 @@ mod tests {
                 .expect("read root image account"),
             Some((1500, 1501))
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sandbox_guest_user_ids_from_image_rejects_oversized_passwd() {
+        let dir = unique_temp_dir();
+        let source = dir.join("prepared-source");
+        fs::create_dir_all(source.join("image-rootfs/etc")).expect("create image etc");
+        let mut passwd = b"sandbox:x:998:999:Sandbox:/sandbox:/bin/sh\n".to_vec();
+        passwd.resize(1024 * 1024 + 1, b'x');
+        fs::write(source.join("image-rootfs/etc/passwd"), passwd).expect("write oversized passwd");
+        let image = dir.join("prepared.ext4");
+        create_ext4_image_from_dir_with_size(&source, &image, 32 * 1024 * 1024)
+            .expect("create prepared image");
+
+        let error = sandbox_guest_user_ids_from_image(&image, ImageRootfsLayout::Prepared)
+            .expect_err("oversized passwd must not be buffered into the driver");
+        assert!(error.contains("exceeds 1048576 bytes"), "{error}");
 
         let _ = fs::remove_dir_all(&dir);
     }
