@@ -169,6 +169,8 @@ Logging, metrics, tracing, telemetry, dashboards, event correlation, and the col
 | Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
 | Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
 | Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
+| Artem Lytvyn | [@letv1nnn](https://github.com/letv1nnn) | Independent |
+| Roland Huss | [@rhuss](https://github.com/rhuss) | Red Hat |
 
 ### topic:operability
 
