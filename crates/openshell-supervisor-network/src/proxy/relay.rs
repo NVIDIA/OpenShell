@@ -51,6 +51,22 @@ pub(super) fn http_context(
     agent_proposals: openshell_core::proposals::AgentProposals,
     signals: RelaySignals,
 ) -> L7EvalContext {
+    let middleware_process = decision.binary.as_ref().and_then(|binary| {
+        let binary = binary.to_str()?;
+        if binary.is_empty() {
+            return None;
+        }
+        let ancestors = decision
+            .ancestors
+            .iter()
+            .map(|ancestor| ancestor.to_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()?;
+        Some(openshell_core::proto::Process {
+            binary: binary.to_owned(),
+            pid: decision.binary_pid.unwrap_or_default(),
+            ancestors,
+        })
+    });
     // Provider-backed credentials must be acquired from the live state for
     // each request after middleware/token-grant awaits. Keep only the legacy
     // resolver fallback when no live provider state exists.
@@ -81,6 +97,7 @@ pub(super) fn http_context(
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        middleware_process,
         ancestors: decision
             .ancestors
             .iter()
@@ -390,6 +407,7 @@ mod tests {
             request_default_port: Some(80),
             policy_name: "test".to_string(),
             binary_path: String::new(),
+            middleware_process: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
@@ -403,6 +421,82 @@ mod tests {
             workspace: String::new(),
             endpoint_observation_tx: None,
         }
+    }
+
+    #[test]
+    fn http_context_keeps_admitted_process_identity() {
+        let mut decision = decision(1);
+        decision.binary = Some("/usr/bin/curl".into());
+        decision.binary_pid = Some(42);
+        decision.ancestors = vec!["/usr/bin/claude".into()];
+        let context = http_context(
+            &decision,
+            None,
+            None,
+            None,
+            openshell_core::proposals::AgentProposals::default(),
+            RelaySignals {
+                activity: None,
+                endpoint_observation: None,
+            },
+        );
+        assert_eq!(context.binary_path, "/usr/bin/curl");
+        assert_eq!(
+            context.originating_process(),
+            Some(openshell_core::proto::Process {
+                binary: "/usr/bin/curl".into(),
+                pid: 42,
+                ancestors: vec!["/usr/bin/claude".into()],
+            })
+        );
+        assert_eq!(context.ancestors, ["/usr/bin/claude"]);
+    }
+
+    #[test]
+    fn http_context_uses_zero_for_unknown_pid() {
+        let mut decision = decision(1);
+        decision.binary = Some("/usr/bin/curl".into());
+        let context = http_context(
+            &decision,
+            None,
+            None,
+            None,
+            openshell_core::proposals::AgentProposals::default(),
+            RelaySignals {
+                activity: None,
+                endpoint_observation: None,
+            },
+        );
+        assert_eq!(context.originating_process().expect("process").pid, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_context_omits_process_with_non_utf8_identity_path() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
+
+        let context_for = |decision: &EgressDecision| {
+            http_context(
+                decision,
+                None,
+                None,
+                None,
+                openshell_core::proposals::AgentProposals::default(),
+                RelaySignals {
+                    activity: None,
+                    endpoint_observation: None,
+                },
+            )
+        };
+        let mut decision = decision(1);
+        decision.binary = Some(PathBuf::from(OsString::from_vec(b"/bin/\xff".to_vec())));
+        assert!(context_for(&decision).originating_process().is_none());
+
+        decision.binary = Some("/usr/bin/curl".into());
+        decision.ancestors = vec![PathBuf::from(OsString::from_vec(b"/bin/\xfe".to_vec()))];
+        assert!(context_for(&decision).originating_process().is_none());
     }
 
     async fn assert_response_lifecycle<C, P>(mut caller: C, mut client: P)

@@ -164,7 +164,7 @@ pub(super) struct EgressDecision {
     pub(super) binary: Option<PathBuf>,
     /// Digest used to authorize the executable, when identity was available.
     pub(super) binary_sha256: Option<String>,
-    /// PID owning the socket.
+    /// PID owning the socket when the owner is unambiguous.
     pub(super) binary_pid: Option<u32>,
     /// Ancestor binary paths from process tree walk.
     pub(super) ancestors: Vec<PathBuf>,

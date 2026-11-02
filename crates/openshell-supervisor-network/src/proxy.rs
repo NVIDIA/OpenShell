@@ -3486,7 +3486,7 @@ async fn handle_mediated_connection(
 #[cfg(target_os = "linux")]
 struct ResolvedIdentity {
     bin_path: PathBuf,
-    binary_pid: u32,
+    binary_pid: Option<u32>,
     ancestors: Vec<PathBuf>,
     cmdline_paths: Vec<PathBuf>,
     bin_hash: String,
@@ -3573,7 +3573,7 @@ fn resolve_owner_identity(
 
     Ok(ResolvedIdentity {
         bin_path,
-        binary_pid: owner_pid,
+        binary_pid: Some(owner_pid),
         ancestors,
         cmdline_paths,
         bin_hash,
@@ -3665,10 +3665,7 @@ fn resolve_process_identity(
         .skip(1)
         .any(|identity| identity.policy_key() != first_key)
     {
-        let mut pids: Vec<u32> = identities
-            .iter()
-            .map(|identity| identity.binary_pid)
-            .collect();
+        let mut pids: Vec<u32> = socket_owners.owners.iter().map(|owner| owner.pid).collect();
         pids.sort_unstable();
         return Err(IdentityError {
             reason: format!(
@@ -3685,9 +3682,12 @@ fn resolve_process_identity(
         });
     }
 
+    let multiple_owners = identities.len() > 1;
     let mut identity = identities.swap_remove(0);
-    if let Some(lowest_pid) = socket_owners.owners.iter().map(|owner| owner.pid).min() {
-        identity.binary_pid = lowest_pid;
+    if multiple_owners {
+        // The owners share a policy identity, but procfs cannot tell which
+        // process wrote a request on this socket.
+        identity.binary_pid = None;
     }
     Ok(identity)
 }
@@ -3800,7 +3800,7 @@ fn authorize_egress_intent_inner(
             endpoint: EndpointDecision::from_authorization(&authorization),
             binary: Some(bin_path),
             binary_sha256: Some(input.binary_sha256),
-            binary_pid: Some(binary_pid),
+            binary_pid,
             ancestors,
             cmdline_paths,
         },
@@ -3808,7 +3808,7 @@ fn authorize_egress_intent_inner(
             format!("policy evaluation error: {e}"),
             ProcessIdentityEvidence::Available,
             Some(bin_path),
-            Some(binary_pid),
+            binary_pid,
             ancestors,
             cmdline_paths,
         ),
@@ -15760,7 +15760,8 @@ network_policies:
         match result {
             Ok(identity) => {
                 assert_eq!(
-                    identity.binary_pid, child_pid,
+                    identity.binary_pid,
+                    Some(child_pid),
                     "expected the hot-swapped bash child to own the socket"
                 );
                 assert_eq!(
@@ -15862,7 +15863,7 @@ network_policies:
 
         match result {
             Ok(identity) => panic!(
-                "resolve_process_identity unexpectedly succeeded for shared socket owned by PID {}",
+                "resolve_process_identity unexpectedly succeeded for shared socket owned by PID {:?}",
                 identity.binary_pid
             ),
             Err(err) => {
@@ -15883,6 +15884,54 @@ network_policies:
                 );
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_process_identity_omits_pid_for_shared_same_identity_socket() {
+        use crate::identity::BinaryIdentityCache;
+        use std::net::{TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let proxy_addr = listener.local_addr().expect("listener address");
+        let stream = TcpStream::connect(proxy_addr).expect("connect");
+        let workload_addr = stream.local_addr().expect("workload address");
+        let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
+        let (_accepted, _) = listener.accept().expect("accept");
+
+        let first = crate::test_support::spawn_socket_holder(&stream, false);
+        let second = crate::test_support::spawn_socket_holder(&stream, false);
+        drop(stream);
+
+        let entrypoint_pid = std::process::id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(owners) =
+                crate::procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, connection)
+                && owners.owners.len() == 2
+                && owners.owners.iter().any(|owner| owner.pid == first.0.id())
+                && owners.owners.iter().any(|owner| owner.pid == second.0.id())
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "both socket holders were not found"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let identity =
+            resolve_process_identity(entrypoint_pid, connection, &BinaryIdentityCache::new())
+                .unwrap_or_else(|error| {
+                    panic!("same-identity socket holders denied: {}", error.reason)
+                });
+        assert_eq!(identity.binary_pid, None);
+        assert_eq!(
+            identity.bin_path,
+            std::env::current_exe().expect("test executable")
+        );
     }
 
     #[tokio::test]
