@@ -594,6 +594,12 @@ jobs:
       - name: Test
         run: mise run test:python
 
+      - name: Test installer shell script
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends gawk
+          bash tasks/scripts/test-install-sh.sh
+
       - name: Test local gateway configuration helpers
         run: |
           bash tasks/scripts/test-gateway-pull-policy.sh
