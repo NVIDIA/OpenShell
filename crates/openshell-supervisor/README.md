@@ -272,7 +272,9 @@ poll and push application installs that allowlist; rejected configuration
 suspends it. Polling renews a 30-second freshness lease. In push mode, an accepted
 live supervisor session renews already installed, unexpired routes even when no
 configuration changes. Rejection or a lease lapse cannot revive an old stream.
-Ending the configuration loop suspends routes.
+With the listener enabled, both polling and push maintenance cap their sleep at
+five seconds, even if the configured polling interval is longer. Failed polls
+do not renew routes. Ending the configuration loop suspends routes.
 
 `OPENSHELL_APP_LISTENER_ENABLED=true` explicitly enables the process listener.
 `OPENSHELL_APP_LISTEN_ADDRESS`, `OPENSHELL_APP_SERVICE_DOMAIN`,
@@ -285,7 +287,10 @@ supervisor to reload application certificates.
 This path uses application or trusted-edge authentication independently from
 gateway authentication. It validates Host against SNI, preserves public
 Host/Origin and application cookies, strips gateway/edge identity material, and
-retains service-specific bearer passthrough. It has no discovery API or public
+retains service-specific bearer passthrough. Hop-by-hop headers are removed from
+requests and responses, preserving successful WebSocket upgrades. An application
+closing its upstream HTTP connection does not close the client connection.
+It has no discovery API or public
 URL selection. Dedicated and shared supervisors expose the app listener on their
 Pod IPs without app Services. Clients must select the member owning their
 sandbox. HA takeover may preserve the workload generation; existing ingress streams

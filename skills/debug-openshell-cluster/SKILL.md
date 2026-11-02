@@ -1643,6 +1643,8 @@ configuration until restarted.
 Service changes arrive through polling or push configuration. Only admitted
 service declarations are installed. Polling and accepted live push sessions
 renew a 30-second lease; rejected configuration or expired freshness closes
-routes. App traffic uses application/edge authentication independently of gateway
+routes. When the listener is enabled, polling delays are capped at five seconds
+even if the configured interval is longer; failed polls do not renew the lease.
+App traffic uses application/edge authentication independently of gateway
 user authentication. This listener stage does not add service discovery or
 change the public URLs printed by the CLI.

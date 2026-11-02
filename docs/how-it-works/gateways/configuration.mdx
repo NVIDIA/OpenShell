@@ -1777,6 +1777,11 @@ or driver options alone do not enable it. Use an unprivileged port distinct from
 the supervisor runtime and health ports. The common `port` controls both the
 listener and its Kubernetes endpoint.
 
+With the listener enabled, supervisors cap configuration polling delays at five
+seconds so healthy routes retain their 30-second freshness lease. Failed polls
+do not renew the lease; expiry closes affected application connections. Disabling
+the listener preserves the configured polling interval.
+
 On Kubernetes, provide a TLS Secret with `tls.crt` and `tls.key` matching
 `*.services.example.com` in each supervisor namespace, and allow your ingress
 clients to reach the app port through NetworkPolicy. The driver mounts the Secret

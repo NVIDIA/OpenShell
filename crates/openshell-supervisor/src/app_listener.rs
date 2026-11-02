@@ -704,6 +704,30 @@ fn hop_header(name: &str) -> bool {
     )
 }
 
+fn strip_hop_headers(headers: &mut http::HeaderMap, websocket: bool) {
+    let connection_headers: Vec<String> = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .collect();
+    let remove: Vec<_> = headers
+        .keys()
+        .filter(|name| {
+            (hop_header(name.as_str())
+                || connection_headers
+                    .iter()
+                    .any(|value| value == name.as_str()))
+                && !(websocket && matches!(name.as_str(), "connection" | "upgrade"))
+        })
+        .cloned()
+        .collect();
+    for name in remove {
+        headers.remove(name);
+    }
+}
+
 fn sanitize_headers(headers: &mut http::HeaderMap, passthrough: bool, websocket: bool) -> bool {
     if passthrough {
         let values: Vec<_> = headers.get_all(header::AUTHORIZATION).iter().collect();
@@ -730,23 +754,10 @@ fn sanitize_headers(headers: &mut http::HeaderMap, passthrough: bool, websocket:
     } else {
         headers.remove(header::AUTHORIZATION);
     }
-    let connection_headers: Vec<String> = headers
-        .get_all(header::CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(|value| value.trim().to_ascii_lowercase())
-        .collect();
+    strip_hop_headers(headers, websocket);
     let remove: Vec<_> = headers
         .keys()
-        .filter(|name| {
-            gateway_header(name.as_str())
-                || ((hop_header(name.as_str())
-                    || connection_headers
-                        .iter()
-                        .any(|value| value == name.as_str()))
-                    && !(websocket && matches!(name.as_str(), "connection" | "upgrade")))
-        })
+        .filter(|name| gateway_header(name.as_str()))
         .cloned()
         .collect();
     for name in remove {
@@ -831,7 +842,9 @@ async fn proxy(
         upstream_task.abort();
         return Ok(error(StatusCode::BAD_GATEWAY));
     };
-    if response.status() == StatusCode::SWITCHING_PROTOCOLS && websocket {
+    let upgraded = response.status() == StatusCode::SWITCHING_PROTOCOLS && websocket;
+    strip_hop_headers(response.headers_mut(), upgraded);
+    if upgraded {
         let upstream = hyper::upgrade::on(&mut response);
         let downstream = downstream.expect("websocket upgrade");
         tokio::spawn(async move {
@@ -980,6 +993,16 @@ mod tests {
                                 .unwrap(),
                         );
                     }
+                    if req.uri().path() == "/close" {
+                        return Ok(Response::builder()
+                            .header(header::CONNECTION, "close, X-Upstream-Only")
+                            .header("x-upstream-only", "private")
+                            .header("keep-alive", "timeout=1")
+                            .header(header::CONTENT_TYPE, "text/plain")
+                            .header(header::SET_COOKIE, "app=session; HttpOnly")
+                            .body(Body::from("upstream closed"))
+                            .unwrap());
+                    }
                     let body = format!(
                         "{} {} {} {}",
                         req.uri(),
@@ -1101,6 +1124,58 @@ mod tests {
             .await
             .unwrap();
         String::from_utf8(response).unwrap()
+    }
+
+    #[tokio::test]
+    async fn upstream_connection_close_preserves_client_keepalive() {
+        use http_body_util::BodyExt as _;
+
+        let f = fixture();
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[f.address])
+            .await
+            .unwrap();
+        let tls = tokio_rustls::TlsConnector::from(f.tls.clone())
+            .connect(
+                rustls::pki_types::ServerName::try_from(HOST).unwrap(),
+                stream,
+            )
+            .await
+            .unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+            .await
+            .unwrap();
+        let client_task = tokio::spawn(connection);
+        for _ in 0..2 {
+            let response = tokio::time::timeout(
+                Duration::from_secs(3),
+                sender.send_request(
+                    Request::builder()
+                        .uri("/close")
+                        .header(header::HOST, HOST)
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .expect("upstream close must not close the client connection");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(!response.headers().contains_key(header::CONNECTION));
+            assert!(!response.headers().contains_key("x-upstream-only"));
+            assert!(!response.headers().contains_key("keep-alive"));
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
+            assert_eq!(
+                response.headers()[header::SET_COOKIE],
+                "app=session; HttpOnly"
+            );
+            let body = tokio::time::timeout(Duration::from_secs(3), response.into_body().collect())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(body.to_bytes(), "upstream closed");
+        }
+        assert_eq!(f.connector.calls.load(Ordering::SeqCst), 2);
+        client_task.abort();
     }
 
     #[tokio::test]

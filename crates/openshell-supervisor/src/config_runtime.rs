@@ -1370,7 +1370,13 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         }
     }
 
-    let interval = Duration::from_secs(ctx.interval_secs);
+    // Accepted configurations must renew app routes before their freshness
+    // lease expires, including when a gateway uses polling instead of push.
+    let interval = if ctx.app_routes.is_some() {
+        Duration::from_secs(ctx.interval_secs).min(Duration::from_secs(5))
+    } else {
+        Duration::from_secs(ctx.interval_secs)
+    };
     loop {
         if let Some(updates) = config_push_updates.as_ref() {
             config_push_enabled = *updates.borrow();
@@ -1388,11 +1394,6 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 routes.renew();
             }
             let delay = next_poll_delay(&ctx.extension_credentials, interval);
-            let delay = if ctx.app_routes.is_some() {
-                delay.min(Duration::from_secs(5))
-            } else {
-                delay
-            };
             tokio::select! {
                 changed = async {
                     match config_push_updates.as_mut() {
@@ -3510,6 +3511,45 @@ mod tests {
         // Only the startup poll reached the gateway.
         assert_eq!(poll_calls.load(Ordering::SeqCst), 1);
         handle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn app_listener_caps_polling_interval_without_changing_disabled_behavior() {
+        for listener_enabled in [false, true] {
+            let initial = settings_poll_result(
+                Some(proto_policy_fixture()),
+                1,
+                openshell_core::proto::PolicySource::Sandbox,
+            );
+            let (mut ctx, _config_apply_tx, push_tx) = push_session_poll_loop(&initial);
+            push_tx.send_replace(false);
+            ctx.interval_secs = 60;
+            ctx.app_routes = listener_enabled.then(app_listener::Routes::default);
+            let (client, polls, mut reports) = scripted_policy_gateway();
+            let poll_calls = Arc::clone(&client.poll_calls);
+            for _ in 0..16 {
+                polls.send(initial.clone()).unwrap();
+            }
+            let task = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+            expect_policy_report(&mut reports, 1).await;
+            for step in 1..=13 {
+                tokio::time::advance(Duration::from_secs(5)).await;
+                // Let the poll reconcile its ready scripted response and
+                // register the next sleep before advancing virtual time.
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                let expected = 1 + if listener_enabled { step } else { step / 12 };
+                assert_eq!(
+                    poll_calls.load(Ordering::SeqCst),
+                    expected,
+                    "listener enabled={listener_enabled}, elapsed={}s",
+                    step * 5
+                );
+            }
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     #[tokio::test]
