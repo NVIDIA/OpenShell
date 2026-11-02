@@ -872,6 +872,58 @@ if [ "$(find_rpm_asset "${tmpdir}/checksums" x86_64 openshell-prover)" != "opens
   exit 1
 fi
 
+cat >"${tmpdir}/rpm-fallback-checksums" <<'EOF'
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  openshell-1.2.3-x86_64.rpm
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  openshell-1.2.3.x86_64-rpm
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  openshell-1.2.3.x86_64.rpm
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  openshell-gateway-1.2.3-x86_64.rpm
+eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee  openshell-gateway-1.2.3.x86_64-rpm
+ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  openshell-gateway-1.2.3.x86_64.rpm
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  openshell-prover-1.2.3-x86_64.rpm
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  openshell-prover-1.2.3.x86_64-rpm
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  openshell-prover-1.2.3.x86_64.rpm
+EOF
+
+assert_rpm_fallback() {
+  local awk_bin=$1
+  local package=$2
+  local expected=$3
+  local actual
+
+  if ! actual="$(
+    awk() {
+      if [ "$awk_bin" = busybox ]; then
+        busybox awk "$@"
+      else
+        command "$awk_bin" "$@"
+      fi
+    }
+    find_rpm_asset "${tmpdir}/rpm-fallback-checksums" x86_64 "$package"
+  )" 2>"$err"; then
+    echo "FAIL: ${awk_bin} RPM ${package} fallback failed" >&2
+    cat "$err" >&2
+    exit 1
+  fi
+  if [ -s "$err" ]; then
+    echo "FAIL: ${awk_bin} RPM ${package} fallback wrote to stderr" >&2
+    cat "$err" >&2
+    exit 1
+  fi
+  if [ "$actual" != "$expected" ]; then
+    echo "FAIL: ${awk_bin} RPM ${package} fallback: expected ${expected}, got ${actual}" >&2
+    exit 1
+  fi
+}
+
+for awk_bin in awk gawk mawk busybox; do
+  if ! command -v "$awk_bin" >/dev/null 2>&1; then
+    continue
+  fi
+  assert_rpm_fallback "$awk_bin" openshell openshell-1.2.3.x86_64.rpm
+  assert_rpm_fallback "$awk_bin" openshell-gateway openshell-gateway-1.2.3.x86_64.rpm
+  assert_rpm_fallback "$awk_bin" openshell-prover openshell-prover-1.2.3.x86_64.rpm
+done
+
 mock_gh_log="${tmpdir}/gh.log"
 PLATFORM=linux
 linux_package_method() {

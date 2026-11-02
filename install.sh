@@ -794,15 +794,15 @@ find_rpm_asset() {
   case "$_package" in
     openshell)
       _dev_name="openshell-dev-${_arch}.rpm"
-      _fallback_re="^openshell-[0-9].*\\.${_arch}\\.rpm$"
+      _fallback_re="^openshell-[0-9].*[.]${_arch}[.]rpm$"
       ;;
     openshell-gateway)
       _dev_name="openshell-gateway-dev-${_arch}.rpm"
-      _fallback_re="^openshell-gateway-[0-9].*\\.${_arch}\\.rpm$"
+      _fallback_re="^openshell-gateway-[0-9].*[.]${_arch}[.]rpm$"
       ;;
     openshell-prover)
       _dev_name="openshell-prover-dev-${_arch}.rpm"
-      _fallback_re="^openshell-prover-[0-9].*\\.${_arch}\\.rpm$"
+      _fallback_re="^openshell-prover-[0-9].*[.]${_arch}[.]rpm$"
       ;;
     *)
       error "unknown RPM package selector: ${_package}"
