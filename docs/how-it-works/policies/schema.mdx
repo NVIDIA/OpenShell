@@ -63,12 +63,15 @@ policy can list at most 64 audit patterns. `*` matches within one directory;
 OpenShell compares each pattern with the path text supplied to `open`, `openat`,
 or `openat2`; it does not resolve relative paths, symlinks, or directory file
 descriptors for this match. The field takes effect at sandbox startup and
-does not grant filesystem access.
+does not grant filesystem access. The MXC driver rejects nonempty
+`audit_paths` because it cannot observe these Linux boundary events.
 
 Matching opens produce OCSF File System Activity (`class_uid: 1001`) with
 `action: Observed`, the requested path, access type, and actor process. Observed
 means the workload attempted the open; it does not claim that the kernel later
-allowed or denied it. OpenShell reports at most 100 matching opens per second
+allowed or denied it. Another workload thread can change the path argument
+before the kernel uses it, so these events are not a tamper resistant record of
+the file actually opened. OpenShell reports at most 100 matching opens per second
 per sandbox. For a second in which it suppresses matches, it emits a Base Event
 with `unmapped.dropped_count` and `unmapped.reason: rate_limit`. Empty
 `audit_paths` produces no file activity events.

@@ -236,6 +236,26 @@ mod tests {
     }
 
     #[test]
+    fn embedded_rejects_file_audit_on_both_mxc_paths() {
+        let mapper = EmbeddedPolicyMapper;
+        let mut policy = fs_policy(&["C:/work/demo"], &[]);
+        policy.filesystem.as_mut().unwrap().audit_paths = vec!["/sandbox/private/**".to_string()];
+        for egress in [None, Some("127.0.0.1:18080".parse().unwrap())] {
+            let ctx = MapCtx {
+                sandbox_id: "sb-audit".into(),
+                egress,
+            };
+            let error = mapper.map(Some(&policy), &ctx).unwrap_err();
+            let MapError::Unsupported(loss) = error else {
+                panic!("expected unsupported audit policy");
+            };
+            assert_eq!(loss.len(), 1);
+            assert_eq!(loss[0].rule_kind, "filesystem_policy.audit_paths");
+            assert!(!loss[0].detail.contains("/sandbox/private"));
+        }
+    }
+
+    #[test]
     fn embedded_rejects_network_policy_on_isolation_session() {
         use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
         let mapper = EmbeddedPolicyMapper;

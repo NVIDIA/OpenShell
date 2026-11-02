@@ -21,11 +21,12 @@ mod driver;
 mod grpc;
 #[cfg(target_os = "windows")]
 mod mxc;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 mod policy;
 // Embedded mapper logic (source of truth; was the `openshell-policy-mapper`
-// crate). Windows-only — MXC and the policy mapper are not built for Linux/WSL.
-#[cfg(target_os = "windows")]
+// crate). Production code is Windows-only; tests run the pure mapper on Linux.
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(not(target_os = "windows"), allow(unused_imports))]
 mod policy_map;
 // Real-time ETW → OCSF audit consumer (Plane A). Consumes the OS Sandboxing
 // provider MXC drives and emits OCSF through the gateway's tracing sink.

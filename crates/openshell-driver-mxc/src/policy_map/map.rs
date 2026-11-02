@@ -297,6 +297,16 @@ fn map_filesystem(
 
     match &policy.filesystem {
         Some(fs) => {
+            if !fs.audit_paths.is_empty() {
+                add_loss(
+                    items,
+                    "filesystem_policy.audit_paths",
+                    "error",
+                    "MXC cannot observe watched file opens.",
+                    "watched file opens",
+                    "The sandbox would emit no file activity events for this policy.",
+                );
+            }
             readwrite.clone_from(&fs.read_write);
             readonly.clone_from(&fs.read_only);
             if fs.include_workdir {
