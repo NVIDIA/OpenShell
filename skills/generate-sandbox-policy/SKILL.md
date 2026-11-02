@@ -91,6 +91,12 @@ Regardless of tier, extract (or infer) these from the user's description:
 
 If the host and access level are clear but binaries are not specified, ask the user which binary or process will be making the requests. Suggest common defaults like `/usr/bin/curl`, `/usr/local/bin/claude`, etc.
 
+For Windows binaries, use ordinary absolute executable paths. `/` and `\` are
+equivalent; ASCII case differences match only when Windows confirms that every
+parent directory of the runtime executable is case-insensitive. Keep exact case
+when that cannot be established. UNC, device, and verbatim namespace paths retain
+exact spelling. See the published policy guide's Binary Matching section.
+
 ## Step 2: Refine Scope (Clarification Loop)
 
 Before generating the policy, **proactively ask clarifying questions** to help the user scope the policy down as narrowly as possible. The goal is the most restrictive policy that still satisfies the user's needs.

@@ -9,6 +9,9 @@
 //! collects its process ancestry. Backends bind the returned identity to the
 //! intercepted connection before constructing a `MediatedConnection`.
 
+#[cfg(target_os = "windows")]
+pub mod windows;
+
 use openshell_isolation_interface::contract::{BinaryIdentity, ResolveError};
 #[cfg(target_os = "linux")]
 use openshell_isolation_interface::contract::{ExecutableIdentity, Sha256Digest};

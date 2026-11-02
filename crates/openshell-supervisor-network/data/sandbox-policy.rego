@@ -141,23 +141,52 @@ binary_allowed(_, _) if {
 	not binary_identity_required
 }
 
+# Binary path matching uses exact spelling by default. On Windows, Rust adds an
+# ASCII-folded candidate only after querying every parent directory of the
+# runtime-observed executable and confirming case-insensitive lookup throughout.
+binary_path_matches(binary, candidate) if {
+	binary.path == candidate.path
+}
+
+binary_path_matches(binary, candidate) if {
+	candidate.ascii_case_folded != ""
+	binary.ascii_case_folded_path == candidate.ascii_case_folded
+}
+
+binary_glob_matches(binary, candidate) if {
+	glob.match(binary.path, ["/"], candidate.path)
+}
+
+binary_glob_matches(binary, candidate) if {
+	candidate.ascii_case_folded != ""
+	glob.match(binary.ascii_case_folded_path, ["/"], candidate.ascii_case_folded)
+}
+
 # Binary matching: exact path.
 # SHA256 integrity is enforced in Rust via trust-on-first-use (TOFU) cache,
 # not in Rego. The proxy computes and caches binary hashes at runtime.
 binary_allowed(policy, exec) if {
-	some b
-	b := policy.binaries[_]
+	some b in policy.binaries
 	not contains(b.path, "*")
 	b.path == exec.path
 }
 
 # Binary matching: ancestor exact path (e.g., claude spawns node).
 binary_allowed(policy, exec) if {
-	some b
-	b := policy.binaries[_]
+	some b in policy.binaries
 	not contains(b.path, "*")
-	ancestor := exec.ancestors[_]
+	some ancestor in exec.ancestors
 	b.path == ancestor
+}
+
+# Trusted runtime evidence may additionally authorize an ASCII case-folded
+# Windows path. Legacy and synthetic L7 inputs omit match_paths and continue to
+# use only the exact rules above.
+binary_allowed(policy, exec) if {
+	some b in policy.binaries
+	not contains(b.path, "*")
+	some candidate in exec.match_paths
+	binary_path_matches(b, candidate)
 }
 
 # Binary matching: glob pattern against exe path or any ancestor.
@@ -167,8 +196,15 @@ binary_allowed(policy, exec) if {
 	some b in policy.binaries
 	contains(b.path, "*")
 	all_paths := array.concat([exec.path], exec.ancestors)
-	some p in all_paths
-	glob.match(b.path, ["/"], p)
+	some path in all_paths
+	glob.match(b.path, ["/"], path)
+}
+
+binary_allowed(policy, exec) if {
+	some b in policy.binaries
+	contains(b.path, "*")
+	some candidate in exec.match_paths
+	binary_glob_matches(b, candidate)
 }
 
 # --- Network action (allow / deny) ---

@@ -3,6 +3,17 @@
 This crate forbids unsafe code, including its local tests. Typed socket APIs
 provide original-destination lookup for transparent proxying.
 
+Windows binary-policy comparison normalizes ordinary path separators. ASCII
+case folding requires trusted directory evidence from `openshell-binary-identity`.
+The L4 decision carries that evidence into its generation-pinned L7 evaluator,
+so both layers use the same executable identity. Original paths remain intact
+for hashing; policy loading never opens authored paths.
+
+The Windows glob matcher already accepts either separator in wildcard rules.
+Shared normalization also covers exact rules, and trusted case evidence applies
+to both forms. MXC filesystem-grant normalization and socket-owner attribution
+remain separate from these network-policy comparisons.
+
 Socket attribution tests pass a duplicate connected socket as a spawned child's
 stdin. Re-executing the test binary checks multiple holders with the same binary
 identity; executing a different binary checks ambiguous shared-socket identity.

@@ -3364,11 +3364,12 @@ fn admitted_token_grant_owners_once(
     if engine.is_stale() {
         return Err(miette!("policy changed before token grant selection"));
     }
+    let input = l7_request_policy_input(engine, ctx, request);
     let mut engine = engine
         .engine()
         .lock()
         .map_err(|_| miette!("OPA engine lock poisoned"))?;
-    crate::opa::set_regorus_input(&mut engine, l7_request_policy_input(ctx, request))?;
+    crate::opa::set_regorus_input(&mut engine, input)?;
     let owners = engine
         .eval_rule("data.openshell.sandbox.allowed_token_grant_owners".into())
         .map_err(|error| miette!("{error}"))?;
@@ -3384,13 +3385,18 @@ fn admitted_token_grant_owners_once(
         .collect()
 }
 
-fn l7_request_policy_input(ctx: &L7EvalContext, request: &L7RequestInfo) -> serde_json::Value {
+fn l7_request_policy_input(
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+    request: &L7RequestInfo,
+) -> serde_json::Value {
     serde_json::json!({
         "network": { "host": ctx.host, "port": ctx.port },
         "exec": {
             "path": ctx.binary_path,
             "ancestors": ctx.ancestors,
             "cmdline_paths": ctx.cmdline_paths,
+            "match_paths": engine.binary_match_paths(),
         },
         "request": {
             "method": request.action,
@@ -3415,7 +3421,7 @@ fn evaluate_l7_request_once(
         ));
     }
 
-    let input = l7_request_policy_input(ctx, request);
+    let input = l7_request_policy_input(engine, ctx, request);
 
     let mut engine = engine
         .engine()
@@ -3686,6 +3692,81 @@ mod tests {
     use std::fmt::Write as _;
     use std::path::PathBuf;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_binary_matching_evidence_selects_only_admitted_token_grant_owners() {
+        let engine = OpaEngine::from_strings(
+            TEST_POLICY,
+            r"
+network_policies:
+  windows_binary:
+    endpoints:
+      - host: example.com
+        port: 443
+        protocol: rest
+        token_grant_owner: windows-owner
+        rules:
+          - allow: {method: GET, path: /v1}
+    binaries:
+      - path: 'C:\WINDOWS\SYSTEM32\CURL.EXE'
+",
+        )
+        .unwrap();
+        let input = NetworkInput {
+            host: "example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("c:/windows/system32/curl.exe"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let authorization = engine.authorize_egress(&input).unwrap();
+        assert!(matches!(
+            authorization.action,
+            crate::opa::NetworkAction::Allow { .. }
+        ));
+        let tunnel = engine
+            .clone_engine_for_tunnel_with_match_paths(
+                authorization.generation,
+                authorization.binary_match_paths,
+            )
+            .unwrap();
+        let ctx = L7EvalContext {
+            host: input.host,
+            port: input.port,
+            binary_path: crate::opa::network_binary_match_path(&input.binary_path),
+            ..Default::default()
+        };
+        let mut request = L7RequestInfo {
+            action: "GET".into(),
+            target: "/v1".into(),
+            query_params: TestHashMap::new(),
+            graphql: None,
+            jsonrpc: None,
+        };
+        assert!(evaluate_l7_request_once(&tunnel, &ctx, &request).unwrap().0);
+        assert_eq!(
+            admitted_token_grant_owners_once(&tunnel, &ctx, &request).unwrap(),
+            HashSet::from(["windows-owner".to_string()])
+        );
+
+        let without_evidence = engine
+            .clone_engine_for_tunnel(authorization.generation)
+            .unwrap();
+        assert!(
+            admitted_token_grant_owners_once(&without_evidence, &ctx, &request)
+                .unwrap()
+                .is_empty()
+        );
+        request.action = "POST".into();
+        assert!(!evaluate_l7_request_once(&tunnel, &ctx, &request).unwrap().0);
+        assert!(
+            admitted_token_grant_owners_once(&tunnel, &ctx, &request)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[tokio::test]
     async fn body_denial_returns_actionable_local_json() {
