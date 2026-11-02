@@ -191,6 +191,12 @@ class TimelineTests(unittest.TestCase):
 
 
 class GitHubTests(unittest.TestCase):
+    def test_api_rejects_empty_paginated_response(self):
+        with mock.patch.object(routing.subprocess, "run") as run:
+            run.return_value.stdout = ""
+            with self.assertRaisesRegex(ValueError, "paginated"):
+                routing._api("endpoint", pages=True)
+
     def test_api_reads_all_pages(self):
         with mock.patch.object(routing.subprocess, "run") as run:
             run.return_value.stdout = json.dumps(

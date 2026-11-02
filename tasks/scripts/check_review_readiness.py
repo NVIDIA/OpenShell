@@ -170,7 +170,13 @@ def _api(path: str, *, method: str = "GET", data=None, pages: bool = False):
         check=True,
     )
     value = json.loads(result.stdout) if result.stdout.strip() else None
-    return [item for page in value for item in page] if pages else value
+    if pages:
+        if not isinstance(value, list) or not all(
+            isinstance(page, list) for page in value
+        ):
+            raise ValueError("expected a paginated GitHub API response")
+        return [item for page in value for item in page]
+    return value
 
 
 def _load_reviewers(repository: str, number: int, pr: dict) -> dict[str, set[str]]:
