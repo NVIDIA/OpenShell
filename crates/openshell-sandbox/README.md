@@ -48,6 +48,19 @@ authenticates with its own grant. A retired connection that does not shut down
 gracefully within two seconds, such as an unused spare, has its transport
 dropped.
 
+When `AgentSpec::otlp_relay_active` is set, `child_env::apply_otlp_relay_env`
+gives every workload process (main, exec, and SSH) `OTEL_EXPORTER_OTLP_ENDPOINT`
+pointing at the relay address, `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, and
+`none` for `OTEL_EXPORTER_OTLP_COMPRESSION` and
+`OTEL_EXPORTER_OTLP_TRACES_COMPRESSION`, and removes any inherited
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. These defaults apply after the provider
+variables. If the creation request or a per-exec environment names a generic
+or traces-specific OTLP endpoint, the runtime injects nothing, and the
+workload exports to that endpoint under the sandbox's network policy. An
+endpoint in the image `ENV` does the same for the main process; exec children
+start from a cleared environment (`ChildEnvironment::Cleared`), never see the
+image's endpoint, and still get the relay default.
+
 ## Supervisor takeover
 
 The boundary advertises `openshell.sandbox.supervisor-takeover`. A replacement

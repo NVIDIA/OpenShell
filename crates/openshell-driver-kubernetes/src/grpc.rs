@@ -337,6 +337,38 @@ impl ComputeDriver for ComputeDriverService {
     }
 }
 
+#[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for ComputeDriverService {
+    async fn update_sandbox_configuration(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>,
+        Status,
+    > {
+        self.rpc_tracer
+            .trace(openshell_otel::rpc::UPDATE_SANDBOX_CONFIGURATION, async {
+                self.driver
+                    .update_sandbox_configuration(&request.into_inner())
+                    .await
+                    .map_err(|error| {
+                        Status::from(openshell_core::ComputeDriverError::from(error))
+                    })?;
+                Ok(Response::new(
+                    openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse {},
+                ))
+            })
+            .await
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdates for ComputeDriverService {
+    async fn update_sandbox_configuration(&self, request: Request<openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest>) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxConfigurationResponse>, Status> {
+        openshell_core::compute::ComputeDriver::update_sandbox_configuration(self, request).await
+    }
+}
+
 fn workspace_delete_requires_namespace_access(mode: WorkspaceMode) -> bool {
     matches!(mode, WorkspaceMode::Managed)
 }

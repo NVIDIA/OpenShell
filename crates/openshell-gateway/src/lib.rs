@@ -43,27 +43,6 @@ use openshell_server::ComputeDriverRegistration;
 use openshell_server::ComputeDriverRegistry;
 use openshell_server::config_file::OtlpConfig;
 
-#[cfg(all(
-    not(target_os = "windows"),
-    any(
-        feature = "compute-driver-docker",
-        feature = "compute-driver-kubernetes",
-        feature = "compute-driver-podman"
-    )
-))]
-/// The OCSF event export that drivers pass to supervisors, from `[otlp.ocsf]`.
-fn supervisor_ocsf_export(
-    otlp: Option<&OtlpConfig>,
-) -> Option<openshell_core::sandbox_env::OcsfOtlpExport> {
-    let ocsf = otlp?.ocsf.as_ref()?;
-    Some(openshell_core::sandbox_env::OcsfOtlpExport {
-        endpoint: ocsf.endpoint.clone(),
-        schema_version: ocsf
-            .schema_version
-            .map(|version| version.as_str().to_string()),
-    })
-}
-
 fn prefer_environment<T>(configured: T, environment: Option<T>) -> T {
     environment.unwrap_or(configured)
 }
@@ -278,16 +257,34 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
             .map_err(openshell_core::Error::config)
     }
 
+    fn uses_shared_supervision(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<bool> {
+        Ok(kubernetes_config(context)?.shared_supervisor.is_some())
+    }
+
     async fn build(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
+        self.build_with_configuration_updates(context)
+            .await
+            .map(|(instance, _)| instance)
+    }
+
+    async fn build_with_configuration_updates(
+        &self,
+        context: openshell_server::ComputeDriverBuildContext<'_>,
+    ) -> openshell_core::Result<(
+        openshell_server::ComputeDriverInstance,
+        Option<openshell_server::SharedComputeDriverConfigurationUpdates>,
+    )> {
         let mut config = kubernetes_config(context.config_context())?;
-        config.supervisor_otlp_endpoint = context
+        config.supervisor_otlp = context
             .otlp_config()
-            .and_then(OtlpConfig::traces_endpoint)
-            .map(str::to_string);
-        config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+            .map(OtlpConfig::supervisor_otlp)
+            .unwrap_or_default();
         config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         // With the gateway supervisor topology, the gateway owns the shared
         // supervisor's assignments and token; the driver adapts them to
@@ -319,9 +316,12 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
             .await
         }
         .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
-        let driver = openshell_driver_kubernetes::ComputeDriverService::new_in_process(driver);
-        Ok(openshell_server::ComputeDriverInstance::InProcess(
-            std::sync::Arc::new(driver),
+        let driver = std::sync::Arc::new(
+            openshell_driver_kubernetes::ComputeDriverService::new_in_process(driver),
+        );
+        Ok((
+            openshell_server::ComputeDriverInstance::InProcess(driver.clone()),
+            Some(driver),
         ))
     }
 }
@@ -377,11 +377,10 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config = docker_config(context.config_context())?;
-        config.supervisor_otlp_endpoint = context
+        config.supervisor_otlp = context
             .otlp_config()
-            .and_then(OtlpConfig::traces_endpoint)
-            .map(str::to_string);
-        config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+            .map(OtlpConfig::supervisor_otlp)
+            .unwrap_or_default();
         config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         require_guest_tls_for_local_driver(&context, "docker")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
@@ -449,11 +448,10 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config = podman_config(context.config_context())?;
-        config.supervisor_otlp_endpoint = context
+        config.supervisor_otlp = context
             .otlp_config()
-            .and_then(OtlpConfig::traces_endpoint)
-            .map(str::to_string);
-        config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+            .map(OtlpConfig::supervisor_otlp)
+            .unwrap_or_default();
         config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         require_guest_tls_for_local_driver(&context, "podman")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());

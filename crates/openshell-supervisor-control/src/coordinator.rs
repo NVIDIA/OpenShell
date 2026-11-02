@@ -48,11 +48,16 @@ pub enum LaunchError<E> {
     /// The driver could not persist the launch material; nothing was assigned.
     #[error("{0}")]
     Persist(E),
-    /// The host, or every member of a pool, is at capacity or unavailable.
+    /// The host is at capacity. The material was persisted; the caller rolls
+    /// the generation back before its workload runs.
+    #[error("{0}")]
+    Refused(AssignmentError),
+    /// The pool could not place the instance: it is not ready, no member is
+    /// attached or has room, or its records could not be read or written.
     /// The material was persisted; the caller rolls the generation back
     /// before its workload runs.
     #[error("{0}")]
-    Refused(AssignmentError),
+    Unplaced(String),
 }
 
 /// A new pool instance to record durably before it is assigned.
@@ -196,10 +201,10 @@ impl SharedSupervision {
     /// assign the instance so the host starts it. The launch material is
     /// persisted first so a restarted gateway recovers the assignment from the
     /// generation's own records. The pool records the instance durably for
-    /// every gateway replica, on a live member with room; without one, or
-    /// beyond the pool's capacity, the launch is refused as
-    /// [`LaunchError::Refused`], so the caller fails its create before the
-    /// workload runs. An identical assignment changes nothing.
+    /// every gateway replica, on a live member with room; without one the
+    /// launch fails as [`LaunchError::Unplaced`], and beyond the pool's
+    /// capacity as [`LaunchError::Refused`], so the caller fails its create
+    /// before the workload runs. An identical assignment changes nothing.
     pub async fn launch<E, F>(
         &self,
         registration: &SandboxInstanceRegistration,
@@ -218,11 +223,9 @@ impl SharedSupervision {
         // any member is assigned it, so every gateway replica serves it and a
         // later failure of that member is recovered by takeover.
         let Some(placement) = self.controller.placement() else {
-            tracing::warn!(
-                route = %registration.route,
-                "the supervisor pool is not ready to place sandbox instances"
-            );
-            return Err(LaunchError::Refused(AssignmentError::Capacity));
+            const NOT_READY: &str = "the supervisor pool is not ready to place sandbox instances";
+            tracing::warn!(route = %registration.route, "{NOT_READY}");
+            return Err(LaunchError::Unplaced(NOT_READY.to_string()));
         };
         if let Err(error) = placement
             .place_launch(PlacementRequest {
@@ -237,7 +240,7 @@ impl SharedSupervision {
                 %error,
                 "could not place a shared sandbox instance in the supervisor pool"
             );
-            return Err(LaunchError::Refused(AssignmentError::Capacity));
+            return Err(LaunchError::Unplaced(error));
         }
         let route = assignment.route.clone();
         self.controller.assign(assignment).map_err(|error| {

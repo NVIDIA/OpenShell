@@ -48,14 +48,6 @@ remains in Actions. This checks
 protobuf compatibility; SDK/configuration compatibility and migration review
 remain separate qualification work.
 
-The release qualification workflow has a release-captain-approved exception
-for all `v0.1.6-pre.N` candidates, including replacement candidates after a failed
-run. It still runs Buf and fails on compilation or tooling
-errors, but accepts detected protobuf breaking changes for that tag. The run
-summary and qualification JSON's `exceptions` array record the scope and reason.
-Other versions retain the normal version policy. Remove the workflow exception
-after promotion; release notes must describe the accepted changes and migration.
-
 Fetch the target and tags to check committed branch changes locally, replacing
 `origin/main` for another target:
 
@@ -74,23 +66,6 @@ nix run .#check-protobuf-compatibility -- refs/tags/v0.2.0-pre.1
 For an intentional minor-train incompatibility, record the Buf finding,
 linked issue, consumer impact, and migration plan in the PR. Keep the finding
 visible; do not disable the job or add a broad Buf ignore rule.
-
-### Remove the v0.1.6 exception
-
-Squash-merge [PR #4976](https://github.com/NVIDIA/OpenShell/pull/4976) so the
-exception, checker support, qualification metadata, tests, and temporary guidance
-can be removed together with one revert. After verifying stable v0.1.6 publication,
-open a cleanup PR from current `main` and revert that PR's squash-merge commit:
-
-```shell
-git revert --no-commit <PR-4976-squash-merge-sha>
-git commit --signoff -m "revert(ci): remove temporary v0.1.6 protobuf exception"
-```
-
-Use the final squash-merge SHA shown on the merged PR, not a branch commit SHA.
-Validate the reverted workflow with Actionlint and run the normal protobuf check
-before merging the cleanup. Reverting the whole PR restores normal enforcement
-and removes the exception mechanism; do not leave the bypass support behind.
 
 ### Windows validation
 
@@ -213,7 +188,7 @@ push-triggered workflow jobs themselves.
 
 ### K3s conformance version baseline
 
-The tmachine `ubuntu-k3s` conformance lanes pin Agent Sandbox v0.5.0 as the
+The `ubuntu-k3s` conformance lanes pin Agent Sandbox v0.5.0 as the
 compatibility baseline for the v1beta1 Sandbox API. They do not track the local
 K3s development default, currently v1.0.3. OpenShell also supports v0.4.6 through
 its v1alpha1 fallback, so v0.5.0 is not the overall minimum supported version.
@@ -223,26 +198,26 @@ recreating the Service requires reprovisioning the fixture. The `k3s` lane runs
 one plaintext gateway. The `k3s-ha` lane runs the supported HA configuration:
 three gateway replicas sharing PostgreSQL, serving TLS, with the CLI connecting
 over mTLS. Before conformance, every installer waits up to five minutes for a
-connected gateway; interactive shells skip the wait. K3s failures upload
-diagnostics as `tmachine-diagnostics-*` artifacts.
+connected gateway; interactive shells skip the wait. Each lane uploads its
+JUnit report, nextest log and, after a failure, the guest's diagnostics as an
+`e2e-results-*` artifact.
 
-### Run only the policy advisor conformance tests
+### Run a subset of the conformance tests
 
-Manually dispatch `Integration Tests` on the candidate branch with an
-`artifact-run-id` from a build of the same commit. When a `Release` or `Pre-release` run was
-dispatched from a different commit, also set `source-sha` to the release tag's
-resolved commit so runtime images and test inputs match the candidate binaries.
-Otherwise, `source-sha` defaults to the artifact run's head SHA. Set `category`
-to `policy-advisor` and `test-matrix` to:
+The conformance lanes run the `sandbox` package of `tests/suites/conformance`
+through `.github/workflows/e2e-suites.yml`, which keeps the list of
+environments. To run one suite in one environment from a checkout, build the
+candidate inputs (see [TESTING.md](TESTING.md)) and narrow the tests with a
+nextest filterset:
 
-```json
-[{"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"policy-advisor"}]
+```shell
+nix run .#openshell-test-runner -- \
+  --environment ubuntu-docker-rootful --installer deb \
+  --family conformance --package sandbox \
+  --filter 'binary_id(=sandbox::policy_advisor)'
 ```
 
-This runs the `mechanistic-proposal`, `new-hostname-proposal`, and
-`policy-local` conformance tests in the installed-artifact suite. The artifact run must contain the candidate CLI and
-gateway binaries and runtime images. This manual run does not replace the
-required PR E2E gate.
+A local run does not replace the required PR E2E gate.
 
 ## Informational security reports
 
@@ -382,9 +357,9 @@ reruns without overwriting earlier evidence.
 summarize PRs since the previous stable tag. Prereleases retain a `release-notes`
 artifact, with advisory failures. Stable releases publish the promoted
 prerelease's preview with the prerelease tag replaced by the stable tag. If that
-preview is missing or expired, stable publication generates new notes and
-requires generation to succeed. The promotion summary states whether notes were
-reused or regenerated. Configure the `LLM_INFERENCE_API_KEY` Actions secret and
+preview is missing or expired, the Release workflow's notes job generates new
+notes and requires generation to succeed before publishing. That job's summary
+states whether notes were reused or regenerated. Configure the `LLM_INFERENCE_API_KEY` Actions secret and
 the `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL` Actions variables.
 
 To preview notes without building or publishing:
@@ -446,7 +421,9 @@ same run; the promotion record links to the attempt that produced that evidence.
 Release rebuilds all stable artifacts with the stable version and publishes
 without rerunning qualification. These artifacts have different embedded versions
 from the qualified prerelease. Existing stable tags are never moved; a retry must
-resolve to the same qualified candidate.
+resolve to the same qualified candidate. A retry rebuilds, then publishes only what
+is missing: it keeps published GHCR version tags, Helm charts, GitHub Release assets,
+npm versions, and PyPI versions. Snap uploads are not skipped.
 
 Stable image builds save multi-platform OCI archives as workflow artifacts without
 pushing to GHCR. Publication copies those archives, including their attestations,
@@ -710,15 +687,18 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | File | Role |
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
-| `.github/workflows/release.yml` | Manually promote the latest qualified prerelease for a version and branch, create its stable tag, then rebuild and publish. Support releases preserve shared latest channels. Publishes the prerelease's notes preview, retagged, or generates notes when it is unavailable. The notes-only mode generates a release notes preview artifact. |
+| `.github/workflows/release.yml` | Manually promote the latest qualified prerelease for a version and branch, create its stable tag, then rebuild and publish. Support releases preserve shared latest channels. Publishes the prerelease's notes preview, retagged, or generates notes when it is unavailable. The notes-only mode generates a release notes preview artifact. Published artifacts are never overwritten: a rerun fills in what is missing, and a bad published artifact is fixed by releasing a new patch version. |
 | `.github/workflows/release-auto-tag.yml` | Weekdays at 14:00 Europe/Zurich, tags the next `-pre.N` on `main` when commits landed since the latest one, then dispatches Pre-release. It skips when the train has no `-pre.1` or its version is already stable, so push each train's `-pre.1` tag by hand. |
 | `.github/workflows/release-prerelease.yml` | Pre-release orchestrator, triggered by prerelease tag pushes or dispatched by Release Auto-Tag or manually. A tagless dispatch creates the next candidate on its branch; explicit tags select existing candidates. Builds, then publishes and qualifies in parallel. Qualification failure fails the run and sends the failure notification; published artifacts remain available. |
 | `.github/workflows/release-build.yml` | Shared version computation, binary and image builds, and package builds. Validates that the tag matches the caller's release kind. |
 | `.github/workflows/release-publish.yml` | Shared artifact assembly, OCI image tags and Helm chart publication, and package publication. Stable releases also publish to GitHub Releases, snap, npm, PyPI, and Fern. |
-| `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by prerelease previews, notes-only previews, and stable publication when no preview is reused. |
+| `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by prerelease previews, notes-only previews, and stable releases. Stable releases reuse the promoted prerelease's preview when available. |
 | `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev, Release, and Pre-release without Store credentials or publication. |
-| `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts directly to a Store channel without rebuilding. Release Dev uses `latest/edge`, Pre-release uses `latest/beta`, and Release uses `latest/stable` for the stable rebuild. Uploads queue per channel and architecture, so tagged beta and stable jobs recheck repository tags after earlier publication finishes and before updating their floating channels. |
+| `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts directly to a Store channel without rebuilding. Release Dev uses `latest/edge`, Pre-release uses `latest/beta`, and Release uses `latest/stable` for the stable rebuild. Uploads queue per channel and architecture, so tagged beta and stable jobs recheck repository tags after earlier publication finishes and before updating their floating channels. Manual dispatch uploads the `snap-linux-*` artifacts from `artifact-run-id`. |
+| `.github/workflows/sdk-typescript-publish.yml` | Publishes the TypeScript SDK to GitHub Packages. Called by stable Release; manual dispatch publishes a given tag and npm version. |
+| `.github/workflows/sdk-go-tag.yml` | Creates the `sdk/go/vX.Y.Z` tag and asks the Go module proxy to fetch it. Called by stable Release; manual dispatch tags a given version and commit. |
+| `.github/workflows/wheel-publish.yml` | Triggers the GitLab pipeline that publishes wheels from a GitHub Release to PyPI. Called by stable Release; manual dispatch republishes a given tag. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts

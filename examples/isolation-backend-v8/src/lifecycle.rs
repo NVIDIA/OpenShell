@@ -11,6 +11,7 @@ use anyhow::{Result, ensure};
 use openshell_core::jwt::{SandboxId, SessionJwtVerifier, SessionTokenProfile, SystemJwtClock};
 use openshell_isolation_interface::contract::BoundaryConfirmation;
 use openshell_sandbox_backend::{boundary_protocol as wire, sandbox_auth::*};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
@@ -655,9 +656,11 @@ pub async fn serve(state_dir: PathBuf) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let launch: Launch = serde_json::from_slice(&std::fs::read(&path)?)?;
-        let certs = rustls_pemfile::certs(&mut launch.certificate.as_bytes())
+        let certs = CertificateDer::pem_reader_iter(&mut launch.certificate.as_bytes())
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let key = rustls_pemfile::private_key(&mut launch.private_key.as_bytes())?
+        let key = PrivateKeyDer::pem_reader_iter(&mut launch.private_key.as_bytes())
+            .next()
+            .transpose()?
             .ok_or_else(|| anyhow::anyhow!("missing TLS key"))?;
         let mut tls =
             rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])

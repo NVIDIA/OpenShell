@@ -90,6 +90,9 @@ use tokio::sync::{OnceCell, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
 
+#[path = "image_update.rs"]
+mod image_update;
+
 pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, KubernetesDriverError>> + Send>>;
 
@@ -1106,18 +1109,12 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 
 impl KubernetesComputeDriver {
     /// Environment that lets a supervisor export spans, joining the current
-    /// trace, and OCSF events, identifying the gateway that launched it.
+    /// trace, OCSF events, and relayed workload traces, identifying the
+    /// gateway that launched it.
     fn supervisor_otlp_environment(&self) -> Vec<(&'static str, String)> {
-        let mut environment = Vec::new();
-        if let Some(endpoint) = self.config.supervisor_otlp_endpoint.as_deref() {
-            environment.push((
-                openshell_core::sandbox_env::OTLP_ENDPOINT,
-                endpoint.to_string(),
-            ));
+        let mut environment = self.config.supervisor_otlp.environment();
+        if self.config.supervisor_otlp.traces.is_some() {
             environment.extend(openshell_otel::current_trace_context_environment());
-        }
-        if let Some(export) = &self.config.supervisor_ocsf_export {
-            environment.extend(export.environment());
         }
         if let Some(name) = &self.config.supervisor_gateway_name {
             environment.push((openshell_core::sandbox_env::GATEWAY_NAME, name.clone()));
@@ -1276,12 +1273,9 @@ impl KubernetesComputeDriver {
         if let Some(shared) = &shared_supervisor {
             shared.spawn_token_secret_writer(client.clone(), shutdown_rx.clone());
         }
-        if shared_supervisor.is_some()
-            && (config.supervisor_otlp_endpoint.is_some()
-                || config.supervisor_ocsf_export.is_some())
-        {
+        if shared_supervisor.is_some() && !config.supervisor_otlp.is_empty() {
             warn!(
-                "the gateway supervisor topology does not export supervisor OTLP traces or OCSF events; shared sandbox instances keep console logs and gateway log push"
+                "the gateway supervisor topology does not export supervisor OTLP traces or OCSF events or relay workload traces; shared sandbox instances keep console logs and gateway log push"
             );
         }
         let driver = Self {
@@ -1333,7 +1327,10 @@ impl KubernetesComputeDriver {
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/kubernetes",
                 openshell_core::VERSION,
-                [],
+                [
+                    openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION
+                        .to_string(),
+                ],
             )),
         })
     }
@@ -3863,10 +3860,14 @@ impl KubernetesComputeDriver {
                     .await
                     .map_err(|error| match error {
                         LaunchError::Persist(error) => error,
-                        // The host is at capacity; the create fails before
-                        // its workload runs.
+                        // The host is at capacity, or the pool could not
+                        // place the instance; the create fails before its
+                        // workload runs.
                         LaunchError::Refused(error) => {
                             KubernetesDriverError::Precondition(error.to_string())
+                        }
+                        LaunchError::Unplaced(reason) => {
+                            KubernetesDriverError::Precondition(reason)
                         }
                         LaunchError::Invalid(error) => {
                             KubernetesDriverError::Message(error.to_string())
@@ -8967,38 +8968,77 @@ mod tests {
     #[tokio::test]
     async fn supervisor_otlp_environment_carries_only_configured_signals() {
         use openshell_core::sandbox_env::{
-            OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OTLP_OCSF_SCHEMA_VERSION, OcsfOtlpExport,
+            OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT,
+            OTLP_OCSF_PROTOCOL, OTLP_PROTOCOL, OtlpExport, OtlpProtocol, SupervisorOtlp,
         };
 
-        let names = |config: KubernetesComputeConfig| {
-            KubernetesComputeDriver::new_for_test(config)
-                .supervisor_otlp_environment()
+        let export = |endpoint: &str, protocol| {
+            Some(OtlpExport {
+                endpoint: endpoint.into(),
+                protocol,
+            })
+        };
+        let environment = |supervisor_otlp| {
+            KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+                supervisor_otlp,
+                ..Default::default()
+            })
+            .supervisor_otlp_environment()
+        };
+        let names = |supervisor_otlp| {
+            environment(supervisor_otlp)
                 .into_iter()
                 .map(|(name, _)| name)
                 .collect::<Vec<_>>()
         };
-        assert!(names(KubernetesComputeConfig::default()).is_empty());
-        assert_eq!(
-            names(KubernetesComputeConfig {
-                supervisor_otlp_endpoint: Some("http://traces:4317".into()),
-                ..Default::default()
-            })
-            .first(),
-            Some(&OTLP_ENDPOINT)
-        );
-
-        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
-            supervisor_ocsf_export: Some(OcsfOtlpExport {
-                endpoint: "http://siem:4317".into(),
-                schema_version: Some("1.1".into()),
-            }),
+        assert!(names(SupervisorOtlp::default()).is_empty());
+        let traces = names(SupervisorOtlp {
+            traces: export("http://traces:4317", OtlpProtocol::Grpc),
             ..Default::default()
         });
+        assert_eq!(traces.first(), Some(&OTLP_ENDPOINT));
+        assert!(!traces.contains(&OTLP_PROTOCOL));
         assert_eq!(
-            driver.supervisor_otlp_environment(),
+            names(SupervisorOtlp {
+                traces: export("http://traces:4318", OtlpProtocol::HttpProtobuf),
+                ..Default::default()
+            })[..2],
+            [OTLP_ENDPOINT, OTLP_PROTOCOL]
+        );
+
+        assert_eq!(
+            environment(SupervisorOtlp {
+                ocsf: export("http://siem:4317", OtlpProtocol::Grpc),
+                ..Default::default()
+            }),
+            [(OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string()),]
+        );
+        assert_eq!(
+            environment(SupervisorOtlp {
+                ocsf: export("http://siem:4318", OtlpProtocol::HttpProtobuf),
+                ..Default::default()
+            }),
             [
-                (OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string()),
-                (OTLP_OCSF_SCHEMA_VERSION, "1.1".to_string()),
+                (OTLP_OCSF_ENDPOINT, "http://siem:4318".to_string()),
+                (OTLP_OCSF_PROTOCOL, "http/protobuf".to_string()),
+            ]
+        );
+
+        assert_eq!(
+            environment(SupervisorOtlp {
+                agent: export("http://agents:4317", OtlpProtocol::Grpc),
+                ..Default::default()
+            }),
+            [(OTLP_AGENT_ENDPOINT, "http://agents:4317".to_string())]
+        );
+        assert_eq!(
+            environment(SupervisorOtlp {
+                agent: export("http://agents:4318", OtlpProtocol::HttpProtobuf),
+                ..Default::default()
+            }),
+            [
+                (OTLP_AGENT_ENDPOINT, "http://agents:4318".to_string()),
+                (OTLP_AGENT_PROTOCOL, "http/protobuf".to_string()),
             ]
         );
 

@@ -5,9 +5,6 @@
 
 use super::{ConnectionSource, RequestOrigin};
 use openshell_ocsf::test_support::OcsfCapture;
-use openshell_ocsf::validation::schema::{
-    load_class_schema, validate_known_fields, validate_required_fields,
-};
 use serde_json::Value;
 use std::future::Future;
 
@@ -57,16 +54,14 @@ pub fn assert_redacted(event: &Value, secret: &str) {
     );
 }
 
-fn assert_conforms(event: &Value, class: &str) {
-    let schema = load_class_schema(class);
-    validate_required_fields(event, &schema);
-    validate_known_fields(event, &schema);
+fn assert_conforms(event: &Value) {
+    openshell_ocsf_validate::validate_event(event).unwrap_or_else(|e| panic!("{e}\n{event}"));
 }
 
 /// Assert that `event` is an Authentication failure for `reason` on a
 /// request to `path`.
 pub fn assert_authentication_failure(event: &Value, path: &str, reason: &str) {
-    assert_conforms(event, "authentication");
+    assert_conforms(event);
     assert_eq!(event["class_uid"], 3002, "{event}");
     assert_eq!(event["activity_id"], 1, "{event}");
     assert_eq!(event["status_id"], 2, "{event}");
@@ -79,7 +74,7 @@ pub fn assert_authentication_failure(event: &Value, path: &str, reason: &str) {
 
 /// Assert that `event` is an Authentication logon for a request to `path`.
 pub fn assert_logon(event: &Value, path: &str) {
-    assert_conforms(event, "authentication");
+    assert_conforms(event);
     assert_eq!(event["class_uid"], 3002, "{event}");
     assert_eq!(event["activity_id"], 1, "{event}");
     assert_eq!(event["status_id"], 1, "{event}");
@@ -93,7 +88,7 @@ pub fn assert_logon(event: &Value, path: &str) {
 /// Assert that `event` is an API Activity denial for `reason` on a request
 /// to `path`.
 pub fn assert_denial(event: &Value, path: &str, reason: &str) {
-    assert_conforms(event, "api_activity");
+    assert_conforms(event);
     assert_eq!(event["class_uid"], 6003, "{event}");
     assert_eq!(event["action_id"], 2, "{event}");
     assert_eq!(event["disposition_id"], 2, "{event}");
@@ -105,7 +100,7 @@ pub fn assert_denial(event: &Value, path: &str, reason: &str) {
 /// Assert that `finding` is the sandbox boundary finding paired with
 /// `denial`.
 pub fn assert_boundary_finding(denial: &Value, finding: &Value) {
-    assert_conforms(finding, "detection_finding");
+    assert_conforms(finding);
     assert_eq!(finding["class_uid"], 2004, "{finding}");
     assert_eq!(
         finding["finding_info"]["uid"], "sandbox-authorization-boundary",

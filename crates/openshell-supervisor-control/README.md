@@ -66,8 +66,8 @@ re-implementing the control contracts.
   only then assigns the instance; a host at capacity is refused before the
   workload runs. For a pool, the gateway's installed `InstancePlacement`
   durably records the instance and its launch term's owner before the
-  assignment, and a launch no member can take is refused like a full host
-  (`LaunchError::Refused`). A pool's withdrawals are removed from the durable
+  assignment, and a launch no member can take fails with the pool's reason
+  (`LaunchError::Unplaced`). A pool's withdrawals are removed from the durable
   records by the gateway, and a recovery reconciles those records with the
   driver's listing instead of replacing the desired set. `begin_recovery` captures
   the revision before the driver lists its durable records and
