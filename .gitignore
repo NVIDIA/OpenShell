@@ -107,6 +107,7 @@ cython_debug/
 # Generated Python protobuf stubs (keep package marker)
 python/openshell/_proto/*
 !python/openshell/_proto/__init__.py
+python/openshell/aio.py
 
 # =============================================================================
 # IDE / Editor

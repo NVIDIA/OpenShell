@@ -148,6 +148,44 @@ workspace for repeated exec, stop, start, and delete operations. List methods
 return lazy `Pager` instances; use `list_all()` only when you want to fetch the
 complete collection.
 
+## Use the Async Client
+
+`AsyncSandboxClient` provides the same sandbox operations and arguments as
+`SandboxClient` over `grpc.aio`. Construct and use it on one event loop:
+
+```python
+from openshell import AsyncSandboxClient
+
+async def run():
+    async with AsyncSandboxClient.from_active_cluster() as client:
+        sandbox = await client.get("worker", workspace="default")
+        result = await client.exec(sandbox.name, ["echo", "hello"], workspace="default")
+        print(result.stdout)
+
+        async for page in client.list(workspace="default"):
+            for item in page.items:
+                print(item.name)
+```
+
+List methods return lazy `AsyncPager` objects without an `await`. Use
+`await client.list_all(...)` to collect every page. The provider, sandbox-template,
+and workspace clients also have `Async` counterparts. Authentication settings
+match the synchronous client; credential refresh runs off the event loop.
+
+Both sandbox clients accept a caller-configured channel through `from_channel()`.
+That factory borrows the channel: closing the client leaves it open. Clients
+constructed from an endpoint or registered gateway own and close their channels.
+
+Mutations that support gateway deduplication accept `request_id`; reuse the same
+ID and payload when explicitly retrying an uncertain result. Request IDs do not
+enable general automatic retries. Exec retains the gateway owner-route fallback
+when the route fails before the first response; it never replays a command after
+receiving output.
+
+Async task cancellation propagates to the active RPC. For early exit from
+`exec_stream()`, use `contextlib.aclosing()` so the stream is cancelled promptly.
+Gateway RPC failures raise `GatewayError`, preserving the gRPC status and details.
+
 ## Call Generated RPCs
 
 The generated gRPC stubs include concrete request and response types for synchronous `grpc.Channel` and asynchronous `grpc.aio.Channel` connections. Install the dependency type stubs in your development environment for editor signatures and type checking:
@@ -177,7 +215,7 @@ async def get_provider(channel: grpc.aio.Channel, name: str) -> pb.ProviderRespo
     )
 ```
 
-Your application configures the channel's TLS and authentication, supplies RPC deadlines, and closes the channel. Create and use async channels on the same event loop. Cancellation and gRPC errors propagate directly. Generated stubs do not reuse `SandboxClient` authentication automatically; `SandboxClient` and `ProviderClient` remain synchronous.
+Your application configures the channel's TLS and authentication, supplies RPC deadlines, and closes the channel. Create and use async channels on the same event loop. Cancellation and gRPC errors propagate directly. Generated stubs do not reuse SDK client authentication automatically. Use `AsyncSandboxClient` for the higher-level async methods and managed authentication.
 
 If you annotate a stored async stub explicitly, use a deferred annotation such as `"openshell_pb2_grpc.OpenShellAsyncStub"`. That type exists only in the `.pyi` file; construct `OpenShellStub` at runtime. The same convention applies to credential-driver stubs.
 

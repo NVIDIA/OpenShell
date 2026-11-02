@@ -78,7 +78,7 @@ git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--mat
 [tool.ruff]
 target-version = "py311"
 line-length = 88
-exclude = ["python/openshell/_proto"]
+exclude = ["python/openshell/_proto", "python/openshell/aio.py"]
 
 [tool.ruff.lint]
 select = [
