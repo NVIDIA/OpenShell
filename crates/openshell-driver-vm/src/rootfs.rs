@@ -32,6 +32,7 @@ const ROOTFS_IMAGE_MIN_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 const EXT4_IMAGE_MIN_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
 const OVERLAY_RECOVERY_MIN_AVAILABLE_BYTES: u64 = 32 * 1024 * 1024;
 const OVERLAY_RECOVERY_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
+const OVERLAY_RECOVERY_RESIZE_CUSHION_BYTES: u64 = 16 * 1024 * 1024;
 static INJECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub const fn sandbox_guest_init_path() -> &'static str {
@@ -444,21 +445,22 @@ pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
         }
     }
 
-    let space = ext4_image_space(image_path)?;
-    if space.available_bytes >= OVERLAY_RECOVERY_MIN_AVAILABLE_BYTES {
-        return Ok(());
+    let mut space = ext4_image_space(image_path)?;
+    while space.available_bytes < OVERLAY_RECOVERY_MIN_AVAILABLE_BYTES {
+        space = grow_full_overlay(image_path, space).map_err(|error| {
+            format!(
+                "OverlayDiskFull: cannot provide space for guest init; [openshell.drivers.vm] overlay_disk_mib sizes new overlays: {error}"
+            )
+        })?;
     }
-    grow_full_overlay(image_path, space).map_err(|error| {
-        format!(
-            "OverlayDiskFull: cannot provide space for guest init; [openshell.drivers.vm] overlay_disk_mib sizes new overlays: {error}"
-        )
-    })
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
 struct Ext4ImageSpace {
     available_bytes: u64,
     filesystem_bytes: u64,
+    recovery_shortfall: u64,
 }
 
 fn ext4_image_space(image_path: &Path) -> Result<Ext4ImageSpace, String> {
@@ -523,13 +525,24 @@ fn ext4_image_space(image_path: &Path) -> Result<Ext4ImageSpace, String> {
         .saturating_sub(reserved)
         .checked_mul(block_size)
         .ok_or_else(|| format!("ext4 free space overflows in {}", image_path.display()))?;
+    let recovery_shortfall = (u128::from(reserved) * u128::from(block_size)
+        + u128::from(OVERLAY_RECOVERY_MIN_AVAILABLE_BYTES))
+    .saturating_sub(u128::from(free) * u128::from(block_size))
+    .try_into()
+    .map_err(|error| {
+        format!(
+            "ext4 recovery size overflows in {}: {error}",
+            image_path.display()
+        )
+    })?;
     Ok(Ext4ImageSpace {
         available_bytes,
         filesystem_bytes,
+        recovery_shortfall,
     })
 }
 
-fn grow_full_overlay(image_path: &Path, space: Ext4ImageSpace) -> Result<(), String> {
+fn grow_full_overlay(image_path: &Path, space: Ext4ImageSpace) -> Result<Ext4ImageSpace, String> {
     let image = fs::OpenOptions::new()
         .write(true)
         .open(image_path)
@@ -538,9 +551,20 @@ fn grow_full_overlay(image_path: &Path, space: Ext4ImageSpace) -> Result<(), Str
         .metadata()
         .map_err(|error| format!("stat overlay {}: {error}", image_path.display()))?
         .len();
+    // Include the blocks reserved for root, then leave room for ext4 metadata
+    // and reserved blocks added by resize2fs. A large overlay may need more
+    // than one 64 MiB increment before guest init can write to it.
+    let growth_bytes = space
+        .recovery_shortfall
+        .checked_add(OVERLAY_RECOVERY_RESIZE_CUSHION_BYTES)
+        .ok_or_else(|| "overlay recovery size overflows".to_string())?
+        .max(OVERLAY_RECOVERY_GROWTH_BYTES)
+        .div_ceil(1024 * 1024)
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| "overlay recovery size overflows".to_string())?;
     let target_size = space
         .filesystem_bytes
-        .checked_add(OVERLAY_RECOVERY_GROWTH_BYTES)
+        .checked_add(growth_bytes)
         .ok_or_else(|| "overlay recovery size overflows".to_string())?;
     if current_size < target_size {
         image
@@ -565,13 +589,16 @@ fn grow_full_overlay(image_path: &Path, space: Ext4ImageSpace) -> Result<(), Str
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    if ext4_image_space(image_path)?.available_bytes < OVERLAY_RECOVERY_MIN_AVAILABLE_BYTES {
+    let grown = ext4_image_space(image_path)?;
+    if grown.filesystem_bytes <= space.filesystem_bytes
+        || grown.recovery_shortfall >= space.recovery_shortfall
+    {
         return Err(format!(
-            "overlay {} remains short of free space after resize",
+            "overlay {} did not gain usable space after resize",
             image_path.display()
         ));
     }
-    Ok(())
+    Ok(grown)
 }
 
 #[cfg(target_os = "macos")]
@@ -1793,6 +1820,67 @@ mod tests {
             .expect("read work from image");
         assert!(output.status.success(), "{output:?}");
         assert_eq!(output.stdout, b"important work\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_rootfs_image_reaches_headroom_on_first_restart() {
+        if ["e2fsck", "debugfs", "resize2fs", "tune2fs"]
+            .iter()
+            .any(|tool| e2fs_command(tool).is_err())
+        {
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let source = dir.join("source");
+        let image = dir.join("overlay.ext4");
+        fs::create_dir_all(source.join("upper")).expect("create source upperdir");
+        fs::create_dir_all(source.join("work")).expect("create source workdir");
+        fs::write(source.join("upper/work.txt"), b"important work\n").expect("write work");
+        fs::write(source.join("upper/fill"), vec![b'X'; 44 * 1024 * 1024]).expect("write filler");
+        create_ext4_image_from_dir_with_size(&source, &image, 64 * 1024 * 1024)
+            .expect("create nearly full ext4 image");
+
+        // Model a full overlay whose reserved blocks consume most of one
+        // 64 MiB increase. One growth alone still leaves less than 32 MiB.
+        let reserve = e2fs_command("tune2fs")
+            .expect("tune2fs")
+            .arg("-r")
+            .arg("6500")
+            .arg(&image)
+            .output()
+            .expect("set reserved blocks");
+        assert!(reserve.status.success(), "{reserve:?}");
+
+        recover_rootfs_image(&image).expect("recover on first restart");
+        assert!(
+            ext4_image_space(&image)
+                .expect("inspect recovered space")
+                .available_bytes
+                >= OVERLAY_RECOVERY_MIN_AVAILABLE_BYTES
+        );
+        assert!(
+            fs::metadata(&image).expect("stat recovered image").len() > 128 * 1024 * 1024,
+            "recovery needs more than one 64 MiB increment"
+        );
+        let output = e2fs_command("debugfs")
+            .expect("debugfs")
+            .arg("-R")
+            .arg("cat /upper/work.txt")
+            .arg(&image)
+            .output()
+            .expect("read saved work");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"important work\n");
+
+        let recovered_size = fs::metadata(&image).expect("stat recovered image").len();
+        recover_rootfs_image(&image).expect("restart recovered overlay");
+        assert_eq!(
+            fs::metadata(&image).expect("stat reused image").len(),
+            recovered_size
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

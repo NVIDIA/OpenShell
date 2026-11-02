@@ -244,7 +244,7 @@ When you run `openshell sandbox stop` while the main process is running, OpenShe
 
 Flush errors and timeouts produce warnings while shutdown continues. If a signal kills the supervisor, the driver warns that the guest flush was not confirmed and recent writes may be lost. A completed stop does not guarantee persistence after a failed or timed-out flush. This flush does not cover stops after the main process has already exited.
 
-When you start a stopped MicroVM sandbox, the driver checks its overlay filesystem. If fewer than 32 MiB are usable after repair, it grows the sparse disk by 64 MiB before booting. The sandbox watch stream reports an `OverlayDiskFull` warning when the disk grows. If a previous start left the sandbox in Error, stop it before retrying. After it reaches Ready, download its work and remove the files that filled the disk:
+When you start a stopped MicroVM sandbox, the driver checks its overlay filesystem. If fewer than 32 MiB are usable after repair, it grows the sparse disk by at least 64 MiB and rechecks free space before booting. It can grow further in the same start if needed. The sandbox watch stream reports an `OverlayDiskFull` warning when the disk grows. If a previous start left the sandbox in Error, stop it before retrying. After it reaches Ready, download its work and remove the files that filled the disk:
 
 ```shell
 openshell sandbox stop full
@@ -253,7 +253,7 @@ openshell sandbox download full /sandbox/work ./work
 openshell sandbox exec full -- rm -f /sandbox/fill
 ```
 
-If repair or growth fails, start reports `OverlayDiskFull` and retains the overlay for another attempt. Recovery needs `resize2fs` and free space on the gateway host. Each later full-disk restart can grow the disk again. `overlay_disk_mib` sets the initial size of new sandboxes, not a limit on recovery growth; changing it does not resize an existing overlay.
+If repair or growth fails, start reports `OverlayDiskFull` and retains the overlay for another attempt. Recovery needs `resize2fs` and free space on the gateway host. A later full-disk restart can grow the disk again. `overlay_disk_mib` sets the initial size of new sandboxes, not a limit on recovery growth; changing it does not resize an existing overlay.
 
 ### MicroVM Mounts
 
