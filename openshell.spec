@@ -69,6 +69,8 @@ or explicit operator configuration.
 # --- Optional VM compute driver sub-package ---
 %package driver-vm
 Summary:        OpenShell MicroVM compute driver
+# The embedded libkrunfw library and guest Linux kernel have separate licenses.
+License:        Apache-2.0 AND BSD-3-Clause AND CC0-1.0 AND CDLA-Permissive-2.0 AND GPL-2.0-only AND ISC AND LGPL-2.1-only AND MIT AND Unicode-3.0 AND Zlib
 Requires:       %{name}-gateway = %{version}-%{release}
 Requires:       e2fsprogs >= 1.43
 
@@ -336,6 +338,8 @@ grep -q 'gateway.toml.default.v1' %{buildroot}%{_userunitdir}/%{name}-gateway.se
 %license LICENSE
 %license LICENSE.dependencies
 %license cargo-vendor.txt
+%license deploy/rpm/licenses/LICENSE-GPL-2.0-only
+%license deploy/rpm/licenses/LICENSE-LGPL-2.1-only
 %dir %{_libexecdir}/%{name}
 %{_libexecdir}/%{name}/%{name}-driver-vm
 

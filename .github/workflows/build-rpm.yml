@@ -141,16 +141,7 @@ jobs:
           rpm -qpR "${vm_rpms[0]}" | grep -Fx "openshell-gateway = $(rpm -qp --qf '%{VERSION}-%{RELEASE}' "${vm_rpms[0]}")"
           dnf install -y artifacts/openshell-[0-9]*.rpm artifacts/openshell-gateway-[0-9]*.rpm "${vm_rpms[0]}"
           /usr/libexec/openshell/openshell-driver-vm --version
-          cat > /tmp/openshell-vm-preflight.toml <<'EOF'
-          [openshell]
-          version = 2
-          [openshell.gateway]
-          disable_tls = true
-          compute_driver = "vm"
-          [openshell.drivers.vm]
-          bootstrap_image = "unreachable.invalid/vm:preflight"
-          EOF
-          openshell-gateway config preflight --path /tmp/openshell-vm-preflight.toml
+          bash tasks/scripts/test-rpm-vm-install.sh
 
       - name: Upload RPM artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
