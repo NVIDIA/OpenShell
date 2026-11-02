@@ -174,3 +174,23 @@ jobs:
       GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
       GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
       LLM_INFERENCE_API_KEY: ${{ secrets.LLM_INFERENCE_API_KEY }}
+
+  trivy:
+    name: Scan Stable Images
+    needs: [promote, build, publish]
+    if: ${{ needs.promote.outputs.make-latest == 'true' }}
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    uses: ./.github/workflows/trivy-scan.yml
+    with:
+      candidate_ref: ${{ needs.promote.outputs.tag }}
+      release-lane: latest
+      ignore-unfixed: false
+      images: |
+        ghcr.io/nvidia/openshell/gateway:${{ needs.build.outputs.semver }}
+        ghcr.io/nvidia/openshell/sandbox:${{ needs.build.outputs.semver }}
+        ghcr.io/nvidia/openshell/supervisor:${{ needs.build.outputs.semver }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}

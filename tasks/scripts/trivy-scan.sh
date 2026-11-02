@@ -17,6 +17,12 @@ SEVERITY="${TRIVY_SEVERITY:-HIGH,CRITICAL}"
 REPORT_DIR="${TRIVY_REPORT_DIR:-reports/trivy}"
 IGNORE_UNFIXED="${TRIVY_IGNORE_UNFIXED:-true}"
 PLATFORMS="${TRIVY_PLATFORMS:-linux/amd64 linux/arm64}"
+RELEASE_LANE="${TRIVY_RELEASE_LANE:-}"
+
+case "${RELEASE_LANE}" in
+  "" | latest | support) ;;
+  *) echo "Error: TRIVY_RELEASE_LANE must be latest or support" >&2; exit 2 ;;
+esac
 
 # Disable cluster discovery while rendering charts offline.
 PREFLIGHT_OFF=(--helm-set agentSandbox.preflight.enabled=false)
@@ -173,6 +179,9 @@ scan_images() {
       slug="image-$(artifact_slug "${image}")-${platform//\//-}"
       scan image "${slug}" "" --platform "${platform}" --scanners vuln \
         "${extra[@]}" "${image}"
+      jq --arg platform "${platform}" '.TrivyPlatform = $platform' \
+        "${REPORT_DIR}/${slug}.json" >"${REPORT_DIR}/${slug}.json.tmp"
+      mv "${REPORT_DIR}/${slug}.json.tmp" "${REPORT_DIR}/${slug}.json"
     done
   done
 }
@@ -240,7 +249,7 @@ consolidate_config() {
 # Keep detailed reports for the differential gate, but publish one deduplicated
 # configuration analysis. Images and packaged charts retain separate identities.
 prepare_sarif() {
-  local staging report slug batch=0 count=0
+  local staging report slug category repository platform batch=0 count=0
   staging="${REPORT_DIR}/code-scanning"
   if [ -e "${staging}" ]; then
     echo "Error: ${staging} already exists; use a fresh report directory" >&2
@@ -252,6 +261,9 @@ prepare_sarif() {
   count=1
   for report in "${REPORT_DIR}"/image-*.json "${REPORT_DIR}"/config-packaged-*.json; do
     [ -f "${report}" ] || continue
+    if [[ "${report##*/}" == image-* && "${TRIVY_SARIF_IMAGES:-true}" == false ]]; then
+      continue
+    fi
     # upload-sarif combines a directory into one file; GitHub accepts at most
     # 20 runs per file. Every report produced here contains exactly one run.
     if [ "${count}" -eq 20 ]; then
@@ -260,9 +272,21 @@ prepare_sarif() {
       mkdir -p "${staging}/uploads/${batch}"
     fi
     slug="$(basename "${report}" .json)"
-    convert_sarif "${report}" "${staging}/uploads/${batch}/${slug}.sarif" "${slug}"
+    category="${slug}"
+    if [[ "${slug}" == image-* && -n "${RELEASE_LANE}" ]]; then
+      repository="$(jq -er '.ArtifactName | sub("@.*$"; "") | sub(":[^/]*$"; "")' "${report}")"
+      platform="$(jq -er '.TrivyPlatform' "${report}")"
+      category="${RELEASE_LANE}/image/${repository}/${platform//\//-}"
+    fi
+    convert_sarif "${report}" "${staging}/uploads/${batch}/${slug}.sarif" "${category}"
     count=$((count + 1))
   done
+  # Two versions of one image cannot both own the same support lane.
+  if ! jq -se '[.[].runs[].automationDetails.id] | length == (unique | length)' \
+    "${staging}"/uploads/*/*.sarif >/dev/null; then
+    echo "Error: duplicate Trivy SARIF categories; scan one version per image/platform in a release lane" >&2
+    return 2
+  fi
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     printf 'batches=%s\n' "$(jq -cn --argjson last "${batch}" '[range(0; $last + 1) | tostring]')" \
       >>"${GITHUB_OUTPUT}"
