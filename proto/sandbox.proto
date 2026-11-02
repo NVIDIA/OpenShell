@@ -57,6 +57,8 @@ message ProcessPolicy {
   string run_as_user = 1;
   // Group name to run the sandboxed process as.
   string run_as_group = 2;
+  // Allow job-control signals within workload process groups in the caller's session.
+  bool allow_process_group_signals = 3;
 }
 
 // A named network access policy rule.

@@ -744,6 +744,7 @@ fn standard_setup_decodes_native_descriptor_and_preserves_vm_identity() {
                     process: Some(openshell_core::proto::ProcessPolicy {
                         run_as_user: user.into(),
                         run_as_group: group.into(),
+                        allow_process_group_signals: false,
                     }),
                     ..Default::default()
                 };

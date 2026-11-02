@@ -128,7 +128,10 @@ pub fn mark_inherited_descriptors_close_on_exec() -> io::Result<()> {
 /// `rt_sigqueueinfo`, and `SIGCONT` sent with `tgkill` or
 /// `rt_tgsigqueueinfo`: Linux accepts nonleader TIDs for these operations, so a
 /// static TGID comparison alone cannot protect future sandbox worker threads.
-pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
+pub fn prepare(
+    sandbox_tgid: u32,
+    allow_process_group_signals: bool,
+) -> io::Result<ChildHardeningProgram> {
     if sandbox_tgid == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -211,16 +214,15 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
         append_argument_equal_deny(&mut instructions, syscall, argument, sandbox_tgid)?;
     }
     for syscall in [libc::SYS_kill, libc::SYS_rt_sigqueueinfo] {
-        // PID zero targets the caller's process group. Deny it even though
-        // OpenShell normally gives each workload a dedicated process group:
-        // an untrusted child can otherwise rejoin a trusted group first.
-        append_argument_equal_deny(&mut instructions, syscall, 0, 0)?;
+        if allow_process_group_signals {
+            // -1 broadcasts to every signalable process and also names PGID 1.
+            // Other group targets reach the inherited notification listener.
+            append_argument_equal_deny(&mut instructions, syscall, 0, u32::MAX)?;
+        } else {
+            append_argument_equal_deny(&mut instructions, syscall, 0, 0)?;
+            append_argument_masked_deny(&mut instructions, syscall, 0, 1 << 31)?;
+        }
     }
-    // Negative PID arguments target process groups or every signalable
-    // process. The workload never needs that authority and must not be able
-    // to include the trusted sandbox workers in a broad signal operation.
-    append_argument_masked_deny(&mut instructions, libc::SYS_kill, 0, 1 << 31)?;
-    append_argument_masked_deny(&mut instructions, libc::SYS_rt_sigqueueinfo, 0, 1 << 31)?;
 
     for syscall in [
         libc::SYS_prlimit64,
@@ -429,7 +431,7 @@ mod tests {
     #[test]
     fn rejects_zero_sandbox_tgid() {
         assert_eq!(
-            prepare(0).err().expect("zero TGID must fail").kind(),
+            prepare(0, false).err().expect("zero TGID must fail").kind(),
             io::ErrorKind::InvalidInput
         );
     }
@@ -442,7 +444,7 @@ mod tests {
         assert!(child >= 0, "fork: {}", io::Error::last_os_error());
         if child == 0 {
             let sandbox_tgid = unsafe { libc::getppid() };
-            let Ok(mut filter) = prepare(u32::try_from(sandbox_tgid).unwrap_or(0)) else {
+            let Ok(mut filter) = prepare(u32::try_from(sandbox_tgid).unwrap_or(0), false) else {
                 unsafe { libc::_exit(1) };
             };
             if filter.install().is_err() {
@@ -535,7 +537,7 @@ mod tests {
     #[test]
     fn filter_preserves_thread_and_process_creation() {
         if std::env::var_os("OPENSHELL_CHILD_SECCOMP_CREATION_PROBE").is_some() {
-            let mut filter = prepare(std::process::id().saturating_add(1))
+            let mut filter = prepare(std::process::id().saturating_add(1), false)
                 .expect("prepare child hardening filter");
             filter.install().expect("install child hardening filter");
 

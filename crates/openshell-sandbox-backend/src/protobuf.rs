@@ -108,6 +108,7 @@ impl WireMessage for w::SandboxPolicyWire {
             landlock: self.landlock.to_proto()? as i32,
             run_as_user: self.run_as_user.clone(),
             run_as_group: self.run_as_group.clone(),
+            allow_process_group_signals: self.allow_process_group_signals,
         })
     }
     fn from_proto(v: Self::Proto) -> Result<Self, FrameError> {
@@ -121,6 +122,7 @@ impl WireMessage for w::SandboxPolicyWire {
             landlock: w::LandlockCompatibilityWire::from_proto(enum_value(v.landlock)?)?,
             run_as_user: v.run_as_user,
             run_as_group: v.run_as_group,
+            allow_process_group_signals: v.allow_process_group_signals,
         })
     }
 }
@@ -818,6 +820,43 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_group_signal_policy_preserves_opt_in_and_legacy_default() {
+        let policy = openshell_core::policy::SandboxPolicy {
+            version: 1,
+            filesystem: openshell_core::policy::FilesystemPolicy::default(),
+            network: openshell_core::policy::NetworkPolicy::default(),
+            landlock: openshell_core::policy::LandlockPolicy::default(),
+            process: openshell_core::policy::ProcessPolicy {
+                allow_process_group_signals: true,
+                ..Default::default()
+            },
+        };
+        let wire = w::SandboxPolicyWire::from(policy);
+        assert!(wire.allow_process_group_signals);
+        let decoded = w::SandboxPolicyWire::from_proto(wire.to_proto().unwrap()).unwrap();
+        assert!(decoded.allow_process_group_signals);
+        assert!(
+            openshell_core::policy::SandboxPolicy::from(decoded)
+                .process
+                .allow_process_group_signals
+        );
+
+        let legacy = serde_json::json!({
+            "version": 1,
+            "read_only": [],
+            "read_write": [],
+            "include_workdir": true,
+            "network": "block",
+            "proxy_addr": null,
+            "landlock": "best_effort",
+            "run_as_user": null,
+            "run_as_group": null
+        });
+        let decoded: w::SandboxPolicyWire = serde_json::from_value(legacy).unwrap();
+        assert!(!decoded.allow_process_group_signals);
+    }
 
     #[test]
     fn request_validation_rejects_missing_context_and_unknown_signal() {

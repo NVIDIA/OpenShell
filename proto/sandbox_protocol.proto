@@ -310,6 +310,7 @@ message SandboxPolicy {
   LandlockCompatibility landlock = 7;
   optional string run_as_user = 8;
   optional string run_as_group = 9;
+  bool allow_process_group_signals = 10;
 }
 enum NetworkMode {
   NETWORK_MODE_UNSPECIFIED = 0;

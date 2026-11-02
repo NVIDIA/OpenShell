@@ -415,8 +415,9 @@ func TestLandlockPolicyNil(t *testing.T) {
 
 func TestProcessPolicyRoundTrip(t *testing.T) {
 	original := &v1.ProcessPolicy{
-		RunAsUser:  "app-user",
-		RunAsGroup: "app-group",
+		RunAsUser:                "app-user",
+		RunAsGroup:               "app-group",
+		AllowProcessGroupSignals: true,
 	}
 
 	proto := processPolicyToProto(original)
@@ -427,6 +428,7 @@ func TestProcessPolicyRoundTrip(t *testing.T) {
 
 	assert.Equal(t, original.RunAsUser, roundTrip.RunAsUser)
 	assert.Equal(t, original.RunAsGroup, roundTrip.RunAsGroup)
+	assert.Equal(t, original.AllowProcessGroupSignals, roundTrip.AllowProcessGroupSignals)
 }
 
 func TestProcessPolicyNil(t *testing.T) {

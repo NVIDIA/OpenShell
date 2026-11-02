@@ -1422,6 +1422,7 @@ fn parse_process_policy(val: &regorus::Value) -> ProcessPolicy {
     ProcessPolicy {
         run_as_user: get_str(val, "run_as_user"),
         run_as_group: get_str(val, "run_as_group"),
+        allow_process_group_signals: get_bool(val, "allow_process_group_signals").unwrap_or(false),
     }
 }
 
@@ -2281,12 +2282,14 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
             serde_json::json!({
                 "run_as_user": "sandbox",
                 "run_as_group": "sandbox",
+                "allow_process_group_signals": false,
             })
         },
         |p| {
             serde_json::json!({
                 "run_as_user": p.run_as_user,
                 "run_as_group": p.run_as_group,
+                "allow_process_group_signals": p.allow_process_group_signals,
             })
         },
     );
@@ -3369,6 +3372,7 @@ mod tests {
             process: Some(ProtoProc {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
+                allow_process_group_signals: false,
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
@@ -5136,7 +5140,8 @@ network_policies:
 
     #[test]
     fn from_proto_extracts_sandbox_config() {
-        let proto = test_proto();
+        let mut proto = test_proto();
+        proto.process.as_mut().unwrap().allow_process_group_signals = true;
         let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
         let config = engine.query_sandbox_config().unwrap();
         assert!(config.filesystem.include_workdir);
@@ -5149,6 +5154,7 @@ network_policies:
         );
         assert_eq!(config.process.run_as_user.as_deref(), Some("sandbox"));
         assert_eq!(config.process.run_as_group.as_deref(), Some("sandbox"));
+        assert!(config.process.allow_process_group_signals);
     }
 
     // ========================================================================
@@ -5731,6 +5737,7 @@ process:
             process: Some(ProtoProc {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
+                allow_process_group_signals: false,
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
@@ -6354,6 +6361,7 @@ network_policies:
             process: Some(ProtoProc {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
+                allow_process_group_signals: false,
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
@@ -6425,6 +6433,7 @@ network_policies:
             process: Some(ProtoProc {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
+                allow_process_group_signals: false,
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
@@ -6501,6 +6510,7 @@ network_policies:
             process: Some(ProtoProc {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
+                allow_process_group_signals: false,
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
@@ -8244,6 +8254,7 @@ network_policies:
             process: Some(ProtoProc {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
+                allow_process_group_signals: false,
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
@@ -8301,6 +8312,7 @@ network_policies:
             process: Some(ProtoProc {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
+                allow_process_group_signals: false,
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
@@ -8359,6 +8371,7 @@ network_policies:
             process: Some(ProtoProc {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
+                allow_process_group_signals: false,
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
@@ -8419,6 +8432,7 @@ network_policies:
             process: Some(ProtoProc {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
+                allow_process_group_signals: false,
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
@@ -8478,6 +8492,7 @@ network_policies:
             process: Some(ProtoProc {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
+                allow_process_group_signals: false,
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
@@ -9989,6 +10004,7 @@ network_policies:
             process: Some(ProtoProc {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
+                allow_process_group_signals: false,
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
@@ -10059,6 +10075,7 @@ network_policies:
             process: Some(ProtoProc {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
+                allow_process_group_signals: false,
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
@@ -10289,6 +10306,7 @@ network_policies:
             process: Some(ProtoProc {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
+                allow_process_group_signals: false,
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
@@ -11937,6 +11955,7 @@ network_policies:
             process: Some(ProtoProc {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
+                allow_process_group_signals: false,
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
@@ -12100,6 +12119,7 @@ process:
             process: Some(ProtoProc {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
+                allow_process_group_signals: false,
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),

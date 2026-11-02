@@ -1289,6 +1289,8 @@ pub struct SandboxPolicyWire {
     pub landlock: LandlockCompatibilityWire,
     pub run_as_user: Option<String>,
     pub run_as_group: Option<String>,
+    #[serde(default)]
+    pub allow_process_group_signals: bool,
 }
 
 impl From<SandboxPolicy> for SandboxPolicyWire {
@@ -1313,6 +1315,7 @@ impl From<SandboxPolicy> for SandboxPolicyWire {
         let ProcessPolicy {
             run_as_user,
             run_as_group,
+            allow_process_group_signals,
         } = process;
         Self {
             version,
@@ -1324,6 +1327,7 @@ impl From<SandboxPolicy> for SandboxPolicyWire {
             landlock: LandlockCompatibilityWire::from(compatibility),
             run_as_user,
             run_as_group,
+            allow_process_group_signals,
         }
     }
 }
@@ -1350,6 +1354,7 @@ impl From<SandboxPolicyWire> for SandboxPolicy {
             process: ProcessPolicy {
                 run_as_user: policy.run_as_user,
                 run_as_group: policy.run_as_group,
+                allow_process_group_signals: policy.allow_process_group_signals,
             },
         }
     }

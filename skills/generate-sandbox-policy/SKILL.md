@@ -532,6 +532,12 @@ When the user explicitly requests `process.run_as_user` or
 (`4294967295`). Warn that a low numeric identity inherits permissions granted
 to the same ID on image files, mounted volumes, or devices.
 
+Keep `process.allow_process_group_signals` omitted by default. If the user
+requests shell job control or Ctrl-Z support, set it to `true` and explain that
+the sandbox allows signals only to workload groups in the caller's session.
+The field is fixed when the sandbox starts; a live policy update cannot change
+it.
+
 For MicroVM, numeric selectors must match the resolved owner of the sandbox's writable overlay. User and group are checked independently; either mismatch prevents startup. If the owner UID:GID is unknown, omit the selectors or use `sandbox` so the driver retains that identity. Do not choose another numeric identity or suggest that the policy can change an existing overlay's owner. For example, with an owner of `1000:1000`, a request for UID `10000` must be rejected with an explanation and the omission/`sandbox` alternatives, rather than generating a policy that the VM cannot start.
 
 If the user provides a file path, write to it. Otherwise, ask where to place it. A common convention is a project-local policy file (e.g., `sandbox-policy.yaml`) passed to `openshell sandbox create --policy <path>` or set via the `OPENSHELL_SANDBOX_POLICY` env var.

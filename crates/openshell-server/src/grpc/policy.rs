@@ -16074,6 +16074,7 @@ mod tests {
             process: Some(openshell_core::proto::ProcessPolicy {
                 run_as_user: "sandbox".into(),
                 run_as_group: "sandbox".into(),
+                allow_process_group_signals: false,
             }),
             ..Default::default()
         };
@@ -24004,6 +24005,7 @@ mod tests {
             process: Some(openshell_core::proto::ProcessPolicy {
                 run_as_user: "1234".to_string(),
                 run_as_group: String::new(),
+                allow_process_group_signals: false,
             }),
             ..Default::default()
         };

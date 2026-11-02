@@ -608,6 +608,7 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
         process: raw.process.map(|p| ProcessPolicy {
             run_as_user: p.run_as_user,
             run_as_group: p.run_as_group,
+            allow_process_group_signals: p.allow_process_group_signals,
         }),
         network_policies,
         network_middlewares,
@@ -642,12 +643,13 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
     };
 
     let process = policy.process.as_ref().and_then(|p| {
-        if p.run_as_user.is_empty() && p.run_as_group.is_empty() {
+        if p.run_as_user.is_empty() && p.run_as_group.is_empty() && !p.allow_process_group_signals {
             None
         } else {
             Some(ProcessDef {
                 run_as_user: p.run_as_user.clone(),
                 run_as_group: p.run_as_group.clone(),
+                allow_process_group_signals: p.allow_process_group_signals,
             })
         }
     });
@@ -2264,6 +2266,7 @@ network_policies:
                 process: Some(ProcessPolicy {
                     run_as_user: user.to_owned(),
                     run_as_group: group.to_owned(),
+                    allow_process_group_signals: false,
                 }),
                 ..Default::default()
             };
@@ -2306,6 +2309,49 @@ network_policies:
     }
 
     #[test]
+    fn process_group_signal_opt_in_round_trips_and_defaults_off() {
+        let enabled =
+            parse_sandbox_policy("version: 1\nprocess:\n  allow_process_group_signals: true\n")
+                .unwrap();
+        assert!(
+            enabled
+                .process
+                .as_ref()
+                .unwrap()
+                .allow_process_group_signals
+        );
+        assert!(
+            openshell_core::policy::SandboxPolicy::try_from(enabled.clone())
+                .unwrap()
+                .process
+                .allow_process_group_signals
+        );
+        let yaml = serialize_sandbox_policy(&enabled).unwrap();
+        assert!(yaml.contains("allow_process_group_signals: true"));
+        assert!(
+            parse_sandbox_policy(&yaml)
+                .unwrap()
+                .process
+                .unwrap()
+                .allow_process_group_signals
+        );
+
+        let disabled = parse_sandbox_policy("version: 1\nprocess: {}\n").unwrap();
+        assert!(
+            !disabled
+                .process
+                .as_ref()
+                .unwrap()
+                .allow_process_group_signals
+        );
+        assert!(
+            !serialize_sandbox_policy(&disabled)
+                .unwrap()
+                .contains("allow_process_group_signals")
+        );
+    }
+
+    #[test]
     fn ensure_sandbox_process_identity_fills_each_omitted_field() {
         let cases = [
             (None, None, "sandbox", "sandbox"),
@@ -2319,6 +2365,7 @@ network_policies:
             policy.process = Some(ProcessPolicy {
                 run_as_user: user.unwrap_or_default().to_string(),
                 run_as_group: group.unwrap_or_default().to_string(),
+                allow_process_group_signals: false,
             });
 
             ensure_sandbox_process_identity(&mut policy);
@@ -2885,6 +2932,7 @@ network_policies:
         policy.process = Some(ProcessPolicy {
             run_as_user: "root".to_string(),
             run_as_group: "sandbox".to_string(),
+            allow_process_group_signals: false,
         });
         assert!(validate_sandbox_policy(&policy).is_err());
 
@@ -3034,6 +3082,7 @@ network_policies:
         policy.process = Some(ProcessPolicy {
             run_as_user: "root".into(),
             run_as_group: "sandbox".into(),
+            allow_process_group_signals: false,
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(violations.iter().any(|v| matches!(
@@ -3051,6 +3100,7 @@ network_policies:
         policy.process = Some(ProcessPolicy {
             run_as_user: "0".into(),
             run_as_group: "0".into(),
+            allow_process_group_signals: false,
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert_eq!(violations.len(), 2);
@@ -3423,6 +3473,7 @@ network_policies:
         policy.process = Some(ProcessPolicy {
             run_as_user: "nobody".into(),
             run_as_group: "nogroup".into(),
+            allow_process_group_signals: false,
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert_eq!(violations.len(), 2);
@@ -3715,18 +3766,21 @@ network_policies:
         policy.process = Some(ProcessPolicy {
             run_as_user: String::new(),
             run_as_group: String::new(),
+            allow_process_group_signals: false,
         });
         assert!(validate_sandbox_policy(&policy).is_ok());
 
         policy.process = Some(ProcessPolicy {
             run_as_user: "sandbox".into(),
             run_as_group: String::new(),
+            allow_process_group_signals: false,
         });
         assert!(validate_sandbox_policy(&policy).is_ok());
 
         policy.process = Some(ProcessPolicy {
             run_as_user: String::new(),
             run_as_group: "1234".into(),
+            allow_process_group_signals: false,
         });
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
@@ -4158,6 +4212,7 @@ network_policies:
             process: Some(ProcessPolicy {
                 run_as_user: "1000".into(),
                 run_as_group: "5000".into(),
+                allow_process_group_signals: false,
             }),
             filesystem: None,
             landlock: None,
@@ -4174,6 +4229,7 @@ network_policies:
             process: Some(ProcessPolicy {
                 run_as_user: MIN_SANDBOX_UID.to_string(),
                 run_as_group: MAX_SANDBOX_UID.to_string(),
+                allow_process_group_signals: false,
             }),
             filesystem: None,
             landlock: None,
@@ -4189,6 +4245,7 @@ network_policies:
         policy.process = Some(ProcessPolicy {
             run_as_user: "500".into(),
             run_as_group: "30".into(),
+            allow_process_group_signals: false,
         });
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
@@ -4199,6 +4256,7 @@ network_policies:
         policy.process = Some(ProcessPolicy {
             run_as_user: (MAX_SANDBOX_UID + 1).to_string(),
             run_as_group: "sandbox".into(),
+            allow_process_group_signals: false,
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(violations.iter().any(|v| matches!(
@@ -4216,6 +4274,7 @@ network_policies:
         policy.process = Some(ProcessPolicy {
             run_as_user: "root".into(),
             run_as_group: "sandbox".into(),
+            allow_process_group_signals: false,
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(violations.iter().any(|v| matches!(
@@ -4233,6 +4292,7 @@ network_policies:
         policy.process = Some(ProcessPolicy {
             run_as_user: "nobody".into(),
             run_as_group: "nogroup".into(),
+            allow_process_group_signals: false,
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert_eq!(violations.len(), 2);
@@ -4246,6 +4306,7 @@ network_policies:
             process: Some(ProcessPolicy {
                 run_as_user: "sandbox".into(),
                 run_as_group: "1000".into(),
+                allow_process_group_signals: false,
             }),
             filesystem: None,
             landlock: None,

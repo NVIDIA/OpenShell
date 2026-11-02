@@ -177,10 +177,12 @@ mod tests {
     // selections absent; storage.v1 remains frozen. Public field 3 retains its
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
+    // Process group signals add a policy boolean shared by the public API and
+    // stored policy revisions. Older payloads omit the field and stay denied.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "be99bb3fcc7894eb85d774f54b642173e70dd37bc8e5fcaf3fdff2454ae689e1";
+        "abc3b19ca2805be857bb013cc2ceab331ca9a78b6f68f233b0ae30045d0e478c";
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "c87534f493af1828400986a8718a233c5ada1a7a8d243f3ca2a8104eba54e553";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -732,6 +734,19 @@ mod tests {
             ),
             "the public/durable schema inventory changed; review API and storage ownership, preserve prior-payload decoding, and update the reviewed fingerprints"
         );
+    }
+
+    #[test]
+    fn stored_process_policy_without_group_signal_flag_defaults_off() {
+        use openshell_core::proto::sandbox::v1::ProcessPolicy;
+
+        // Encoded before field 3 was introduced, with only the two identity
+        // fields. Keep these bytes fixed independently of the current encoder.
+        let legacy = b"\x0a\x03app\x12\x03app";
+        let policy = ProcessPolicy::decode(&legacy[..]).unwrap();
+        assert_eq!(policy.run_as_user, "app");
+        assert_eq!(policy.run_as_group, "app");
+        assert!(!policy.allow_process_group_signals);
     }
 
     #[test]

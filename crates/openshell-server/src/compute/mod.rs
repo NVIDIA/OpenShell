@@ -8776,6 +8776,7 @@ mod tests {
                 process: Some(openshell_core::proto::sandbox::v1::ProcessPolicy {
                     run_as_user: "10001".to_string(),
                     run_as_group: "10002".to_string(),
+                    allow_process_group_signals: false,
                 }),
                 ..Default::default()
             }),
