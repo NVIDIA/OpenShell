@@ -204,7 +204,7 @@ JUnit report, nextest log and, after a failure, the guest's diagnostics as an
 
 ### Run a subset of the conformance tests
 
-The conformance lanes run the `sandbox` package of `tests/suites/conformance`
+The conformance lanes run the `conformance` crate in `tests/suites/conformance`
 through `.github/workflows/e2e-suites.yml`, which keeps the list of
 environments. To run one suite in one environment from a checkout, build the
 candidate inputs (see [TESTING.md](TESTING.md)) and narrow the tests with a
@@ -213,8 +213,8 @@ nextest filterset:
 ```shell
 nix run .#openshell-test-runner -- \
   --environment ubuntu-docker-rootful --installer deb \
-  --family conformance --package sandbox \
-  --filter 'binary_id(=sandbox::policy_advisor)'
+  --family conformance --package conformance \
+  --filter 'binary_id(=conformance::policy_advisor)'
 ```
 
 A local run does not replace the required PR E2E gate.

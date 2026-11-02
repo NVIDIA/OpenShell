@@ -223,7 +223,7 @@ OpenShell that the VM's installer set up.
 ```shell
 nix run .#openshell-test-runner -- \
   --environment ubuntu-docker-rootful --installer deb \
-  --family conformance --package sandbox
+  --family conformance --package conformance
 ```
 
 It needs KVM, and tmachine only boots guests of the host's architecture. The
@@ -412,10 +412,10 @@ HTTP `Host`, TLS SNI, and mTLS handling.
 Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
-- Conformance (`tests/suites/conformance`) - the testkit `sandbox` package:
+- Conformance (`tests/suites/conformance`) - the testkit `conformance` crate:
   lifecycle, the CLI, persistent workspaces, file transfer, and the policy
   advisor. Driver E2E runs it with nextest against the lane's gateway. The
-  installed-artifact conformance lanes run the same package through
+  installed-artifact conformance lanes run the same crate through
   `openshell-test-runner` (see above).
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
   `e2e-vm`) - conformance plus the common and driver-specific coverage for
@@ -503,7 +503,7 @@ rebuilds only the RPMs. Run conformance against the installed RPMs:
 nix run .#build-artifacts
 nix run .#openshell-test-runner -- \
   --environment fedora-podman-rootful --installer rpm \
-  --family conformance --package sandbox
+  --family conformance --package conformance
 ```
 
 Run the portable subset in a disposable rootless Podman guest:
