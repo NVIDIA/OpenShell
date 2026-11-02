@@ -1953,6 +1953,10 @@ allow for pool membership failure detection before the last serving lease expire
 Storage errors prevent lease renewal. Discovery expiry and serving expiry are
 separate from external ingress readiness.
 
+Both discovery RPCs require `supervisor_app_listener.enabled = true`. When the
+listener is disabled, they return `FAILED_PRECONDITION` without collecting routes
+or starting a watch.
+
 Discovery clients can call `GetServiceRouteSnapshot` or `WatchServiceRoutes` with
 one explicit workspace selector, `sandbox:read`, and workspace user access. Each
 response replaces the workspace route view and includes the hostname, supervisor

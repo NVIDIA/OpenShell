@@ -298,6 +298,10 @@ records as application health or external ingress readiness.
 
 ## Workspace service discovery
 
+Both discovery RPCs require `supervisor_app_listener.enabled = true`. When the
+listener is disabled, they return `FAILED_PRECONDITION` without collecting routes
+or starting a watch.
+
 `GetServiceRouteSnapshot` and `WatchServiceRoutes` expose accepted installations
 for one explicit active workspace. They require `sandbox:read` and workspace
 user access; omitted/all-workspaces selectors and sandbox principals are rejected.

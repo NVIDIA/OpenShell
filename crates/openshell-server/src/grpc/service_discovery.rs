@@ -57,11 +57,21 @@ async fn authorize(
     Ok(())
 }
 
+fn require_enabled(state: &ServerState) -> Result<(), Status> {
+    if !state.config.supervisor_app_listener.enabled {
+        return Err(Status::failed_precondition(
+            "service discovery requires the supervisor app listener to be enabled",
+        ));
+    }
+    Ok(())
+}
+
 pub async fn get_snapshot(
     state: &Arc<ServerState>,
     request: Request<GetServiceRouteSnapshotRequest>,
 ) -> Result<Response<GetServiceRouteSnapshotResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    require_enabled(state)?;
     let workspace = selected_workspace_name(request.get_ref().workspace_scope.as_ref())?;
     authorize(state, &principal, workspace).await?;
     Ok(Response::new(GetServiceRouteSnapshotResponse {
@@ -74,6 +84,7 @@ pub async fn watch(
     request: Request<WatchServiceRoutesRequest>,
 ) -> Result<Response<RouteWatchStream>, Status> {
     let principal = super::extract_principal(&request)?;
+    require_enabled(state)?;
     let workspace =
         selected_workspace_name(request.get_ref().workspace_scope.as_ref())?.to_string();
     authorize(state, &principal, &workspace).await?;
@@ -298,6 +309,38 @@ mod tests {
         GetServiceRouteSnapshotRequest {
             workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
         }
+    }
+
+    #[tokio::test]
+    async fn disabled_listener_rejects_discovery_without_allocating_a_watch() {
+        let (mut state, owner, report) = installed_fixture().await;
+        // Persist a route first: disabling must reject discovery even with stored evidence.
+        accept(&state, &owner, &report, current_time_ms() + 10_000)
+            .await
+            .unwrap();
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .supervisor_app_listener
+            .enabled = false;
+        let permits = state.discovery_watches.available_permits();
+        let error = get_snapshot(&state, authed_request(request()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("app listener"));
+        let error = watch(
+            &state,
+            authed_request(WatchServiceRoutesRequest {
+                workspace_scope: request().workspace_scope,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("app listener"));
+        assert_eq!(state.discovery_watches.available_permits(), permits);
     }
 
     #[tokio::test]
