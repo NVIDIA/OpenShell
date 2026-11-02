@@ -607,6 +607,18 @@ complete, including its storage. See the published
 [image update workflow](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview#update-the-image-of-a-stopped-sandbox)
 and [API errors](https://docs.nvidia.com/openshell/latest/sdk/api-errors).
 
+For a response to an event from a specific execution, retain the event's
+execution identity and use `openshell sandbox stop NAME --execution-id ID`.
+The gateway rejects stale identities without stopping a replacement; the CLI
+never falls back to a name-only stop. `sandbox get NAME --output json` exposes
+`execution_id` for status observations. Middleware events must use the verified
+supervisor JWT claim. Do not substitute a fresh status identity for a delayed
+event. Conditional stop returns an execution receipt and does not manage local
+forwards or poll by name. It currently requires a single SQLite gateway;
+PostgreSQL/multi-replica deployments reject it with `FailedPrecondition`.
+A matching stop of a suspended execution discards its retained memory;
+an observation from before resume cannot stop the resumed execution.
+
 ---
 
 ## Workflow 4: Policy Iteration Loop

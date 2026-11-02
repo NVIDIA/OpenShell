@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Compile-time source-compatibility fixture for the v0.1.5 public status shape.
+//! Compile-time fixture for the public status shape with execution identity.
 
 use openshell_sdk::raw::proto::SandboxStatus;
 
 #[test]
-fn baseline_exhaustive_sandbox_status_literal_still_compiles() {
-    // Intentionally no `..Default::default()`: adding even an optional public
-    // field breaks existing downstream Rust exhaustive struct literals.
+fn exhaustive_sandbox_status_literal_includes_execution_identity() {
+    // The additive wire field changes exhaustive generated Rust literals.
+    // Keep this fixture current so future additions are reviewed explicitly.
     let status = SandboxStatus {
         agent_pod: String::new(),
         agent_fd: String::new(),
@@ -26,6 +26,7 @@ fn baseline_exhaustive_sandbox_status_literal_still_compiles() {
         next_restart_time: None,
         main_process_started_time: None,
         last_token_grant_failure: None,
+        execution_id: String::new(),
     };
     assert_eq!(status, SandboxStatus::default());
 }

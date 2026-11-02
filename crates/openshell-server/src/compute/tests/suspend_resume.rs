@@ -78,6 +78,64 @@ async fn suspend_commits_suspended_and_revokes_sessions() {
 }
 
 #[tokio::test]
+async fn conditional_stop_of_suspended_execution_discards_retained_state() {
+    let driver = ControlledDriver::new();
+    let runtime = suspend_capable_runtime(driver.clone()).await;
+    let sandbox = sandbox_record(
+        "sb-conditional-suspend",
+        "conditional-suspend",
+        SandboxPhase::Ready,
+    );
+    let execution = crate::auth::sandbox_session::sandbox_execution_id(&sandbox).unwrap();
+    runtime.store.put_message(&sandbox).await.unwrap();
+
+    runtime
+        .suspend_sandbox("default", "conditional-suspend")
+        .await
+        .unwrap();
+    let stopped = runtime
+        .stop_sandbox_execution("default", "conditional-suspend", &execution)
+        .await
+        .unwrap();
+
+    assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
+    assert_eq!(driver.stop_calls(), 1);
+}
+
+#[tokio::test]
+async fn conditional_stop_after_resume_rejects_the_suspended_execution() {
+    let driver = ControlledDriver::new();
+    let runtime = suspend_capable_runtime(driver.clone()).await;
+    let sandbox = sandbox_record(
+        "sb-conditional-resume",
+        "conditional-resume",
+        SandboxPhase::Ready,
+    );
+    let old_execution = crate::auth::sandbox_session::sandbox_execution_id(&sandbox).unwrap();
+    runtime.store.put_message(&sandbox).await.unwrap();
+
+    runtime
+        .suspend_sandbox("default", "conditional-resume")
+        .await
+        .unwrap();
+    let resumed = runtime
+        .resume_sandbox("default", "conditional-resume", false)
+        .await
+        .unwrap();
+    assert_ne!(
+        crate::auth::sandbox_session::sandbox_execution_id(&resumed).unwrap(),
+        old_execution
+    );
+
+    let error = runtime
+        .stop_sandbox_execution("default", "conditional-resume", &old_execution)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert_eq!(driver.stop_calls(), 0);
+}
+
+#[tokio::test]
 async fn suspend_requires_driver_capability() {
     let driver = ControlledDriver::new();
     let runtime = test_runtime(driver.clone()).await;

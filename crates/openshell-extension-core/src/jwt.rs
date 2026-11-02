@@ -43,6 +43,11 @@ pub struct ExtensionJwtClaims {
     pub caller_kind: ExtensionCallerKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox_id: Option<String>,
+    /// Opaque launch identity for conditional lifecycle actions. Consumers must
+    /// use this claim only after verifying the JWT and matching `sandbox_id` to
+    /// the observation. Absent on gateway calls and legacy supervisor tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -72,6 +77,7 @@ mod tests {
             jti: "unique".to_string(),
             caller_kind: ExtensionCallerKind::Gateway,
             sandbox_id: None,
+            execution_id: None,
         };
         let json = serde_json::to_value(claims).unwrap();
         assert!(json.get("sandbox_id").is_none());

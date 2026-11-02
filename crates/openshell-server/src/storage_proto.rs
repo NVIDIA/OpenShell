@@ -177,10 +177,12 @@ mod tests {
     // selections absent; storage.v1 remains frozen. Public field 3 retains its
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
+    // Conditional stop adds two public messages and a status execution ID;
+    // stored statuses without that additive field decode with an empty ID.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "be99bb3fcc7894eb85d774f54b642173e70dd37bc8e5fcaf3fdff2454ae689e1";
+        "bccd6a8a4e6e4752c19da92bd8a46d55b83788b17670a01ea12a6775803c77b6";
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "5911cc0899c44e4e9ec5bdc150d0d34182a00d91b40a5a4c377c6ed7e767e788";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -652,7 +654,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            108 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            109 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -662,7 +664,7 @@ mod tests {
         );
         assert_eq!(
             methods.len(),
-            81 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            82 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
@@ -672,7 +674,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            81 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
@@ -723,7 +725,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (334, 31),
+                (336, 31),
                 (100, 22),
                 (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

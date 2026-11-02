@@ -149,6 +149,30 @@ pub async fn handle_issue_sandbox_token(
         ));
     }
 
+    // A launch identity can advance before the old supervisor has stopped.
+    // Bind bootstrap credentials to the execution for which the driver result
+    // was accepted, so that old Pod credentials cannot mint a new epoch token.
+    let execution_id = crate::auth::sandbox_session::sandbox_execution_id(&sandbox_record)
+        .map_err(|_| {
+            reject(
+                AuthFailureReason::UnknownIdentity,
+                Status::permission_denied("sandbox execution identity is unavailable"),
+            )
+        })?;
+    if metadata
+        .annotations
+        .get(crate::compute::COMPUTE_BOOTSTRAP_EXECUTION_ANNOTATION)
+        .map(String::as_str)
+        != Some(execution_id.as_str())
+    {
+        return Err(reject(
+            AuthFailureReason::StaleIdentity,
+            Status::permission_denied(
+                "compute runtime identity is not bound to the current sandbox execution",
+            ),
+        ));
+    }
+
     let identity =
         crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
             .map_err(|_| {
@@ -364,6 +388,12 @@ pub async fn handle_refresh_sandbox_token(
         mint_extension_credentials(
             issuer,
             &sandbox,
+            &crate::auth::sandbox_session::execution_id(
+                principal.sandbox_id.as_str(),
+                &principal.runtime_generation,
+                principal.auth_epoch,
+            )
+            .map_err(|error| Status::internal(error.to_string()))?,
             &requested_extension_services,
             &available,
             successor.refresh_replay.as_ref(),
@@ -424,6 +454,7 @@ fn current_unix_seconds() -> i64 {
 fn mint_extension_credentials(
     issuer: &crate::auth::sandbox_jwt::ExtensionJwtIssuer,
     sandbox: &SandboxPrincipal,
+    execution_id: &str,
     requested_names: &[String],
     available_services: &[openshell_core::proto::SupervisorMiddlewareService],
     refresh_replay: Option<&crate::auth::sandbox_session::GatewayRefreshReplay>,
@@ -472,27 +503,24 @@ fn mint_extension_credentials(
             }
             let audience = ExtensionAudience::new(service.audience.clone())
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
-            let minted = refresh_replay.map_or_else(
-                || {
-                    issuer.mint_extension_token(
-                        &audience,
-                        ExtensionCallerKind::Supervisor,
-                        Some(&sandbox.sandbox_id),
-                        ttl,
-                    )
-                },
-                |replay| {
-                    issuer.mint_extension_token_with_metadata(
-                        &audience,
-                        ExtensionCallerKind::Supervisor,
-                        Some(&sandbox.sandbox_id),
-                        ttl,
-                        replay.issued_at,
-                        replay
-                            .extension_token_id(name, audience.as_str())
-                            .map_err(|error| Status::internal(error.to_string()))?,
-                    )
-                },
+            let (issued_at, token_id) = if let Some(replay) = refresh_replay {
+                (
+                    replay.issued_at,
+                    replay
+                        .extension_token_id(name, audience.as_str())
+                        .map_err(|error| Status::internal(error.to_string()))?,
+                )
+            } else {
+                (current_unix_seconds(), uuid::Uuid::new_v4())
+            };
+            let minted = issuer.mint_extension_token_with_metadata(
+                &audience,
+                ExtensionCallerKind::Supervisor,
+                Some(&sandbox.sandbox_id),
+                Some(execution_id),
+                ttl,
+                issued_at,
+                token_id,
             )?;
             Ok(ExtensionServiceCredential {
                 service_name: name.clone(),
@@ -631,6 +659,15 @@ mod tests {
         annotations.insert(
             crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION.to_string(),
             "test-runtime".to_string(),
+        );
+        annotations.insert(
+            crate::compute::COMPUTE_BOOTSTRAP_EXECUTION_ANNOTATION.to_string(),
+            crate::auth::sandbox_session::execution_id(
+                sandbox_id,
+                &identity.runtime_generation,
+                identity.auth_epoch,
+            )
+            .unwrap(),
         );
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
@@ -976,6 +1013,7 @@ mod tests {
         let credentials = mint_extension_credentials(
             issuer,
             &sandbox_a(),
+            "exec-v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             &["content-guard".to_string()],
             &available,
             None,
@@ -989,6 +1027,7 @@ mod tests {
         let error = mint_extension_credentials(
             issuer,
             &sandbox_a(),
+            "exec-v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             &["attacker-chosen-audience".to_string()],
             &available,
             None,
@@ -1026,6 +1065,7 @@ mod tests {
         let error = mint_extension_credentials(
             issuer,
             &sandbox_a(),
+            "exec-v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             &["legacy-guard".to_string()],
             &available,
             None,
@@ -1046,6 +1086,7 @@ mod tests {
         let error = mint_extension_credentials(
             issuer,
             &sandbox_a(),
+            "exec-v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             &["content-guard".to_string(), "content-guard".to_string()],
             &available,
             None,
@@ -1190,6 +1231,115 @@ mod tests {
         assert_eq!(error.reason, AuthFailureReason::InvalidCredential);
     }
 
+    fn bootstrap_request(runtime_identity: &str) -> Request<IssueSandboxTokenRequest> {
+        use crate::auth::principal::SandboxIdentitySource;
+        let mut request = Request::new(IssueSandboxTokenRequest {});
+        request
+            .extensions_mut()
+            .insert(Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: "sandbox-a".to_string(),
+                source: SandboxIdentitySource::ComputeDriver {
+                    driver_name: "kubernetes".to_string(),
+                    runtime_identity: runtime_identity.to_string(),
+                },
+                trust_domain: Some("openshell".to_string()),
+            }));
+        request
+    }
+
+    #[tokio::test]
+    async fn issue_fences_old_compute_credentials_during_execution_replacement() {
+        let state = state_with_issuer().await;
+        handle_issue_sandbox_token(&state, bootstrap_request("test-runtime"))
+            .await
+            .expect("original runtime bootstrap");
+        let replacement = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
+            .expect("replacement identity");
+        let updated = state
+            .store
+            .update_message_cas::<Sandbox, _>("sandbox-a", 0, |sandbox| {
+                // The restart has committed B but A's supervisor still exists and
+                // presents the same driver runtime proof while stop is in flight.
+                replacement.write(&mut sandbox.metadata.as_mut().unwrap().annotations);
+                sandbox.set_phase(SandboxPhase::Starting.into());
+            })
+            .await
+            .unwrap();
+        let error = handle_issue_sandbox_token(&state, bootstrap_request("test-runtime"))
+            .await
+            .expect_err("old runtime must not receive B's credentials");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+        let execution = crate::auth::sandbox_session::sandbox_execution_id(&updated).unwrap();
+        state
+            .store
+            .update_message_cas::<Sandbox, _>(
+                "sandbox-a",
+                updated.metadata.as_ref().unwrap().resource_version,
+                |sandbox| {
+                    let annotations = &mut sandbox.metadata.as_mut().unwrap().annotations;
+                    annotations
+                        .insert(
+                            crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION.into(),
+                            "new-runtime".into(),
+                        )
+                        .unwrap();
+                    annotations.insert(
+                        crate::compute::COMPUTE_BOOTSTRAP_EXECUTION_ANNOTATION.into(),
+                        execution.clone(),
+                    );
+                },
+            )
+            .await
+            .unwrap();
+        let error = handle_issue_sandbox_token(&state, bootstrap_request("test-runtime"))
+            .await
+            .expect_err("old runtime proof stays rejected after B is bound");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        let response = handle_issue_sandbox_token(&state, bootstrap_request("new-runtime"))
+            .await
+            .expect("bound replacement bootstrap")
+            .into_inner();
+        let principal = state
+            .sandbox_session_jwt_authority
+            .as_ref()
+            .unwrap()
+            .verify_gateway_token(&response.token)
+            .unwrap();
+        assert_eq!(principal.runtime_generation, replacement.runtime_generation);
+        assert_eq!(principal.auth_epoch, replacement.auth_epoch);
+        assert_eq!(
+            crate::auth::sandbox_session::execution_id(
+                principal.sandbox_id.as_str(),
+                &principal.runtime_generation,
+                principal.auth_epoch,
+            )
+            .unwrap(),
+            execution
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_rejects_legacy_runtime_without_execution_binding() {
+        let state = state_with_issuer().await;
+        state
+            .store
+            .update_message_cas::<Sandbox, _>("sandbox-a", 0, |sandbox| {
+                sandbox
+                    .metadata
+                    .as_mut()
+                    .unwrap()
+                    .annotations
+                    .remove(crate::compute::COMPUTE_BOOTSTRAP_EXECUTION_ANNOTATION);
+            })
+            .await
+            .unwrap();
+        let error = handle_issue_sandbox_token(&state, bootstrap_request("test-runtime"))
+            .await
+            .expect_err("missing execution binding must fail closed");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
     #[tokio::test]
     async fn issue_rejects_mismatched_compute_runtime_identity() {
         let state = state_with_issuer().await;
@@ -1310,7 +1460,7 @@ mod tests {
         .await;
         let err = result.expect_err("no recorded identity to mint from");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        assert_eq!(err.message(), "sandbox runtime identity is invalid");
+        assert_eq!(err.message(), "sandbox execution identity is unavailable");
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["status_detail"], "unknown_identity");
         assert_eq!(events[0]["auth_protocol"], "compute_driver");

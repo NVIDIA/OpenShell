@@ -122,3 +122,9 @@ type SandboxSuspendResumeInterface interface {
 	// WaitSuspended polls until the sandbox reaches the Suspended phase.
 	WaitSuspended(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
 }
+
+// SandboxExecutionInterface adds execution-conditional stop without widening
+// the legacy SandboxInterface. Unsupported gateways never fall back to Stop.
+type SandboxExecutionInterface interface {
+	StopExecution(ctx context.Context, workspace, name, executionID string, opts ...StopExecutionOptions) (*StopExecutionResult, error)
+}
