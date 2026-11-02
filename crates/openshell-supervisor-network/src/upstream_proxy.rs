@@ -2328,6 +2328,10 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(stream.inner, UpstreamStream::Tls(_)));
+        assert_eq!(stream.peer_addr().unwrap(), addr);
+        let local = stream.local_addr().unwrap();
+        assert_eq!(local.ip(), addr.ip());
+        assert_ne!(local.port(), 0);
         drop(stream);
         let request = handle.await.unwrap();
         assert!(request.starts_with("CONNECT api.example.com:443 HTTP/1.1\r\n"));

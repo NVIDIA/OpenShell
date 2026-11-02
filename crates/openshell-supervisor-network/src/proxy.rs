@@ -1372,8 +1372,7 @@ async fn handle_transparent_tcp_connection(
             .into_diagnostic()?;
     drop(dial_span);
     drop(connect_span);
-    let upstream_socket_local = upstream.local_addr().into_diagnostic()?;
-    let upstream_socket_peer = upstream.peer_addr().into_diagnostic()?;
+    let upstream_socket_audit = inspect_upstream_socket(&upstream);
     let (connected_real_destination, dial_mode) = match upstream.connect_target() {
         Some(upstream_proxy::ConnectTarget::Ip(ip)) => (
             Some(SocketAddr::new(ip, port)),
@@ -1400,7 +1399,7 @@ async fn handle_transparent_tcp_connection(
             emit_activity(&activity_tx, true, "transparent_tcp_destination");
             return Ok(());
         }
-        None => (Some(upstream_socket_peer), "direct"),
+        None => (upstream_socket_audit.peer, "direct"),
     };
     generation_guard.ensure_current()?;
     ctx.request_default_port = None;
@@ -1419,8 +1418,7 @@ async fn handle_transparent_tcp_connection(
         .ancestors
         .iter()
         .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(" -> ");
+        .collect::<Vec<_>>();
     ocsf_emit!(build_transparent_tcp_allow_ocsf_event(
         TransparentTcpAllowAudit {
             workload: workload_addr,
@@ -1428,8 +1426,7 @@ async fn handle_transparent_tcp_connection(
             normalized_domain: &host,
             approved_real_ip_candidates: &approved_real_ip_candidates,
             connected_real_destination,
-            upstream_socket_local,
-            upstream_socket_peer,
+            upstream_socket_tuple: upstream_socket_audit.tuple,
             dial_mode,
             mapping_id: mapping.record.mapping_id,
             mapping_generation: mapping.record.mapping_generation,
@@ -1453,8 +1450,7 @@ struct TransparentTcpAllowAudit<'a> {
     normalized_domain: &'a str,
     approved_real_ip_candidates: &'a [SocketAddr],
     connected_real_destination: Option<SocketAddr>,
-    upstream_socket_local: SocketAddr,
-    upstream_socket_peer: SocketAddr,
+    upstream_socket_tuple: Option<UpstreamSocketTuple>,
     dial_mode: &'a str,
     mapping_id: uuid::Uuid,
     mapping_generation: u64,
@@ -1463,7 +1459,7 @@ struct TransparentTcpAllowAudit<'a> {
     binary: &'a str,
     binary_sha256: Option<&'a str>,
     pid: &'a str,
-    ancestors: &'a str,
+    ancestors: &'a [String],
     policy_name: &'a str,
 }
 
@@ -1479,7 +1475,7 @@ fn build_transparent_tcp_allow_ocsf_event(
     let mapping_id = audit.mapping_id.to_string();
     let actual_target = audit
         .connected_real_destination
-        .map_or_else(|| "proxy-resolved".to_string(), |target| target.to_string());
+        .map_or_else(|| "unavailable".to_string(), |target| target.to_string());
     let message = format!(
         "Transparent TCP mapping_id={mapping_id} synthetic={} real={actual_target}",
         audit.synthetic_destination,
@@ -1500,7 +1496,7 @@ fn build_transparent_tcp_allow_ocsf_event(
             audit.synthetic_destination.port(),
         ))
         .src_endpoint_addr(audit.workload.ip(), audit.workload.port())
-        .actor_process(Process::from_bypass(
+        .actor_process(Process::from_ancestor_names(
             audit.binary,
             audit.pid,
             audit.ancestors,
@@ -1517,14 +1513,6 @@ fn build_transparent_tcp_allow_ocsf_event(
             "approved_real_ip_candidates",
             serde_json::json!(approved_real_ip_candidates),
         )
-        .unmapped(
-            "upstream_socket_local",
-            audit.upstream_socket_local.to_string(),
-        )
-        .unmapped(
-            "upstream_socket_peer",
-            audit.upstream_socket_peer.to_string(),
-        )
         .unmapped("dial_mode", audit.dial_mode)
         .unmapped("mapping_id", mapping_id)
         .unmapped("mapping_generation", audit.mapping_generation)
@@ -1536,6 +1524,11 @@ fn build_transparent_tcp_allow_ocsf_event(
         )
         .message(message)
         .status_detail("transparent_tcp_allowed");
+    if let Some(tuple) = audit.upstream_socket_tuple {
+        builder = builder
+            .unmapped("upstream_socket_local", tuple.local.to_string())
+            .unmapped("upstream_socket_peer", tuple.peer.to_string());
+    }
     if let Some(destination) = audit.connected_real_destination {
         builder = builder.unmapped("connected_real_destination", destination.to_string());
     }
@@ -2026,16 +2019,50 @@ fn emit_denial_simple(
     }
 }
 
+#[derive(Clone, Copy)]
+struct UpstreamSocketTuple {
+    local: SocketAddr,
+    peer: SocketAddr,
+}
+
+struct UpstreamSocketAudit {
+    peer: Option<SocketAddr>,
+    tuple: Option<UpstreamSocketTuple>,
+}
+
+fn inspect_upstream_socket(stream: &upstream_proxy::PrefixedStream) -> UpstreamSocketAudit {
+    let peer_result = stream.peer_addr();
+    let peer = peer_result.as_ref().ok().copied();
+    let tuple = capture_upstream_socket_tuple(stream.local_addr(), peer_result);
+    UpstreamSocketAudit { peer, tuple }
+}
+
+fn capture_upstream_socket_tuple(
+    local: std::io::Result<SocketAddr>,
+    peer: std::io::Result<SocketAddr>,
+) -> Option<UpstreamSocketTuple> {
+    match (local, peer) {
+        (Ok(local), Ok(peer)) => Some(UpstreamSocketTuple { local, peer }),
+        (Err(error), _) => {
+            warn!(error = %error, socket = "local", "upstream socket tuple unavailable for audit");
+            None
+        }
+        (_, Err(error)) => {
+            warn!(error = %error, socket = "peer", "upstream socket tuple unavailable for audit");
+            None
+        }
+    }
+}
+
 struct ConnectAllowAudit<'a> {
     workload: SocketAddr,
-    upstream_socket_local: SocketAddr,
-    upstream_socket_peer: SocketAddr,
+    upstream_socket_tuple: Option<UpstreamSocketTuple>,
     host: &'a str,
     port: u16,
     binary: &'a str,
     binary_sha256: Option<&'a str>,
     pid: &'a str,
-    ancestors: &'a str,
+    ancestors: &'a [String],
     cmdline: &'a str,
     policy: &'a str,
     l7_inspection: bool,
@@ -2056,22 +2083,19 @@ fn build_connect_allow_ocsf_event(audit: ConnectAllowAudit<'_>) -> openshell_ocs
         .dst_endpoint(Endpoint::from_domain(audit.host, audit.port))
         .src_endpoint_addr(audit.workload.ip(), audit.workload.port())
         .actor_process(
-            Process::from_bypass(audit.binary, audit.pid, audit.ancestors)
+            Process::from_ancestor_names(audit.binary, audit.pid, audit.ancestors)
                 .with_cmd_line(audit.cmdline),
         )
         .firewall_rule(audit.policy, "opa")
-        .unmapped(
-            "upstream_socket_local",
-            audit.upstream_socket_local.to_string(),
-        )
-        .unmapped(
-            "upstream_socket_peer",
-            audit.upstream_socket_peer.to_string(),
-        )
         .message(format!(
             "{connect_msg} allowed {}:{}",
             audit.host, audit.port
         ));
+    if let Some(tuple) = audit.upstream_socket_tuple {
+        builder = builder
+            .unmapped("upstream_socket_local", tuple.local.to_string())
+            .unmapped("upstream_socket_peer", tuple.peer.to_string());
+    }
     if let Some(digest) = audit.binary_sha256 {
         builder = builder.unmapped("binary_sha256", digest);
     }
@@ -2836,15 +2860,15 @@ async fn handle_mediated_connection(
     let pid_str = decision
         .binary_pid
         .map_or_else(|| "-".to_string(), |p| p.to_string());
-    let ancestors_str = if decision.ancestors.is_empty() {
+    let ancestor_names = decision
+        .ancestors
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    let ancestors_str = if ancestor_names.is_empty() {
         "-".to_string()
     } else {
-        decision
-            .ancestors
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(" -> ")
+        ancestor_names.join(" -> ")
     };
     let cmdline_str = if decision.cmdline_paths.is_empty() {
         "-".to_string()
@@ -3153,8 +3177,7 @@ async fn handle_mediated_connection(
             .await?;
         return Ok(());
     }
-    let upstream_socket_local = upstream.local_addr().into_diagnostic()?;
-    let upstream_socket_peer = upstream.peer_addr().into_diagnostic()?;
+    let upstream_socket_tuple = inspect_upstream_socket(&upstream).tuple;
 
     drop(dial_span);
     drop(connect_span);
@@ -3167,14 +3190,13 @@ async fn handle_mediated_connection(
     // so log consumers can distinguish L4-only decisions from tunnel lifecycle events.
     ocsf_emit!(build_connect_allow_ocsf_event(ConnectAllowAudit {
         workload: workload_addr,
-        upstream_socket_local,
-        upstream_socket_peer,
+        upstream_socket_tuple,
         host: &host_lc,
         port,
         binary: &binary_str,
         binary_sha256: decision.binary_sha256.as_deref(),
         pid: &pid_str,
-        ancestors: &ancestors_str,
+        ancestors: &ancestor_names,
         cmdline: &cmdline_str,
         policy: policy_str,
         l7_inspection: should_inspect_l7,
@@ -10616,8 +10638,10 @@ network_policies:
                 "172.18.0.5:6379".parse().unwrap(),
             ],
             connected_real_destination: Some("172.18.0.5:6379".parse().unwrap()),
-            upstream_socket_local: "127.0.0.1:43000".parse().unwrap(),
-            upstream_socket_peer: "172.18.0.5:6379".parse().unwrap(),
+            upstream_socket_tuple: Some(UpstreamSocketTuple {
+                local: "127.0.0.1:43000".parse().unwrap(),
+                peer: "172.18.0.5:6379".parse().unwrap(),
+            }),
             dial_mode: "direct",
             mapping_id,
             mapping_generation: 4,
@@ -10626,7 +10650,7 @@ network_policies:
             binary: "/sandbox/.venv/bin/python3",
             binary_sha256: Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
             pid: "42",
-            ancestors: "/usr/bin/sh",
+            ancestors: &["/opt/parent -> helper".to_string()],
             policy_name: "redis",
         });
         let json = event.to_json().unwrap();
@@ -10638,7 +10662,12 @@ network_policies:
         );
         assert_eq!(
             json["actor"]["process"]["parent_process"]["name"],
-            "/usr/bin/sh"
+            "/opt/parent -> helper"
+        );
+        assert!(
+            json["actor"]["process"]["parent_process"]
+                .get("parent_process")
+                .is_none()
         );
         assert_eq!(json["dst_endpoint"]["domain"], "redis.openshell.demo");
         assert_eq!(json["firewall_rule"]["name"], "redis");
@@ -10679,8 +10708,10 @@ network_policies:
             normalized_domain: "redis.openshell.demo",
             approved_real_ip_candidates: &["172.18.0.4:6379".parse().unwrap()],
             connected_real_destination: Some("172.18.0.4:6379".parse().unwrap()),
-            upstream_socket_local: "127.0.0.1:43001".parse().unwrap(),
-            upstream_socket_peer: "192.0.2.20:3128".parse().unwrap(),
+            upstream_socket_tuple: Some(UpstreamSocketTuple {
+                local: "127.0.0.1:43001".parse().unwrap(),
+                peer: "192.0.2.20:3128".parse().unwrap(),
+            }),
             dial_mode: "upstream_proxy_validated_ip",
             mapping_id: uuid::Uuid::new_v4(),
             mapping_generation: 4,
@@ -10689,7 +10720,7 @@ network_policies:
             binary: "/usr/bin/redis-cli",
             binary_sha256: None,
             pid: "43",
-            ancestors: "",
+            ancestors: &[],
             policy_name: "redis",
         });
         let json = event.to_json().unwrap();
@@ -10703,6 +10734,39 @@ network_policies:
         assert!(json["unmapped"].get("binary_sha256").is_none());
         assert_eq!(json["unmapped"]["dial_mode"], "upstream_proxy_validated_ip");
         assert!(event.format_shorthand().contains("real=172.18.0.4:6379"));
+    }
+
+    #[test]
+    fn transparent_tcp_allow_omits_unavailable_socket_tuple() {
+        let event = build_transparent_tcp_allow_ocsf_event(TransparentTcpAllowAudit {
+            workload: "127.0.0.1:45123".parse().unwrap(),
+            synthetic_destination: "198.18.0.7:6379".parse().unwrap(),
+            normalized_domain: "redis.openshell.demo",
+            approved_real_ip_candidates: &["172.18.0.4:6379".parse().unwrap()],
+            connected_real_destination: None,
+            upstream_socket_tuple: None,
+            dial_mode: "direct",
+            mapping_id: uuid::Uuid::new_v4(),
+            mapping_generation: 4,
+            mapping_policy_generation: 7,
+            authorization_policy_generation: 7,
+            binary: "/usr/bin/redis-cli",
+            binary_sha256: None,
+            pid: "43",
+            ancestors: &[],
+            policy_name: "redis",
+        });
+        let json = event.to_json().unwrap();
+        assert_eq!(json["action"], "Allowed");
+        assert!(json["unmapped"].get("upstream_socket_local").is_none());
+        assert!(json["unmapped"].get("upstream_socket_peer").is_none());
+        assert!(json["unmapped"].get("connected_real_destination").is_none());
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .contains("real=unavailable")
+        );
     }
 
     #[cfg(target_os = "linux")]

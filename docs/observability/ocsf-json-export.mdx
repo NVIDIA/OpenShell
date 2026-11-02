@@ -155,12 +155,16 @@ Some fields depend on the event class:
 
 Allowed CONNECT and transparent TCP `NetworkActivity` events include the
 immediate upstream socket tuple in `unmapped.upstream_socket_local` and
-`unmapped.upstream_socket_peer`, each as an `IP:port` string. On a direct
-connection without address translation, the receiver's accepted socket sees
+`unmapped.upstream_socket_peer` when socket address lookup succeeds. An address
+lookup failure omits both fields without stopping the connection. IPv4 uses
+`IP:port`; IPv6 uses `[IP]:port`. On a direct connection without address
+translation, the receiver's accepted socket sees
 `unmapped.upstream_socket_local` as its peer address. Compare both ends of the
-socket tuple to distinguish concurrent connections. If an operator upstream
-proxy is configured, these fields describe the connection to that proxy. The
-event's `actor.process` names the resolved executable and ancestors, and
+parsed socket tuple to distinguish concurrent connections. Normalize
+IPv4-mapped IPv6 addresses on dual-stack receivers before comparing. If the
+destination uses an operator upstream proxy, these fields describe the
+connection to that proxy. A bypassed destination records the direct receiver.
+The event's `actor.process` names the resolved executable and ancestors, and
 `unmapped.binary_sha256` contains the executable digest used for authorization
 when available. The event does not add bytes to the TCP stream. JSON export is
 best-effort, so use the event for attribution rather than an in-band access

@@ -46,10 +46,13 @@ trace relay is active.
 
 Allowed CONNECT and transparent TCP `NetworkActivity` events record the
 immediate upstream socket's local and peer addresses in
-`unmapped.upstream_socket_local` and `unmapped.upstream_socket_peer`. The local
-address is captured from the connected `PrefixedStream` before relay starts.
+`unmapped.upstream_socket_local` and `unmapped.upstream_socket_peer` when both
+socket address lookups succeed. A lookup failure omits the tuple without
+stopping the allowed connection. The local address is captured from the
+connected `PrefixedStream` before relay starts.
 For a direct connection without address translation, it matches the peer
 address observed by the receiver.
-When an upstream proxy is configured, the peer address names that proxy. These
+When the destination uses an upstream proxy, the peer address names that
+proxy; a bypassed destination names the direct receiver. These
 events also include `unmapped.binary_sha256` when the executable digest was
 available to the authorization decision. The relay byte stream is unchanged.

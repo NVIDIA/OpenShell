@@ -227,14 +227,16 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
     let peer: SocketAddr = "127.0.0.1:41000".parse().unwrap();
     let connect = serde_json::to_value(build_connect_allow_ocsf_event(ConnectAllowAudit {
         workload: peer,
-        upstream_socket_local: "127.0.0.1:41001".parse().unwrap(),
-        upstream_socket_peer: "127.0.0.1:8443".parse().unwrap(),
+        upstream_socket_tuple: Some(UpstreamSocketTuple {
+            local: "127.0.0.1:41001".parse().unwrap(),
+            peer: "127.0.0.1:8443".parse().unwrap(),
+        }),
         host: "target.example",
         port: 8443,
         binary: "/usr/bin/curl",
         binary_sha256: Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
         pid: "42",
-        ancestors: "/usr/bin/sh",
+        ancestors: &["/opt/parent -> helper".to_string()],
         cmdline: "curl --proxy",
         policy: "proxy_compatibility",
         l7_inspection: true,
@@ -249,6 +251,15 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
     assert_eq!(connect["dst_endpoint"]["domain"], "target.example");
     assert_eq!(connect["dst_endpoint"]["port"], 8443);
     assert_eq!(connect["actor"]["process"]["name"], "/usr/bin/curl");
+    assert_eq!(
+        connect["actor"]["process"]["parent_process"]["name"],
+        "/opt/parent -> helper"
+    );
+    assert!(
+        connect["actor"]["process"]["parent_process"]
+            .get("parent_process")
+            .is_none()
+    );
     assert_eq!(connect["firewall_rule"]["name"], "proxy_compatibility");
     assert_eq!(connect["firewall_rule"]["type"], "opa");
     assert_eq!(connect["message"], "CONNECT_L7 allowed target.example:8443");
@@ -312,14 +323,13 @@ async fn allowed_connect_event_matches_each_receivers_socket() {
     let event_for = |stream: &upstream_proxy::PrefixedStream, binary: &str| {
         serde_json::to_value(build_connect_allow_ocsf_event(ConnectAllowAudit {
             workload: "127.0.0.1:40000".parse().unwrap(),
-            upstream_socket_local: stream.local_addr().unwrap(),
-            upstream_socket_peer: stream.peer_addr().unwrap(),
+            upstream_socket_tuple: inspect_upstream_socket(stream).tuple,
             host: "host.openshell.internal",
             port: listener.local_addr().unwrap().port(),
             binary,
             binary_sha256: None,
             pid: "-",
-            ancestors: "/usr/bin/sh",
+            ancestors: &["/usr/bin/sh".to_string()],
             cmdline: "-",
             policy: "host_proxy",
             l7_inspection: false,
@@ -353,6 +363,35 @@ async fn allowed_connect_event_matches_each_receivers_socket() {
     let mut received = [0_u8; 7];
     first_receiver.read_exact(&mut received).await.unwrap();
     assert_eq!(&received, b"request");
+}
+
+#[test]
+fn socket_lookup_failures_do_not_remove_allowed_event() {
+    let local: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+    let peer: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+    for tuple in [
+        capture_upstream_socket_tuple(Err(std::io::Error::other("local lookup failed")), Ok(peer)),
+        capture_upstream_socket_tuple(Ok(local), Err(std::io::Error::other("peer lookup failed"))),
+    ] {
+        assert!(tuple.is_none());
+        let event = build_connect_allow_ocsf_event(ConnectAllowAudit {
+            workload: "127.0.0.1:41000".parse().unwrap(),
+            upstream_socket_tuple: tuple,
+            host: "target.example",
+            port: 8443,
+            binary: "/usr/bin/curl",
+            binary_sha256: None,
+            pid: "42",
+            ancestors: &[],
+            cmdline: "curl",
+            policy: "proxy_compatibility",
+            l7_inspection: false,
+        });
+        let json = event.to_json().unwrap();
+        assert_eq!(json["action"], "Allowed");
+        assert!(json["unmapped"].get("upstream_socket_local").is_none());
+        assert!(json["unmapped"].get("upstream_socket_peer").is_none());
+    }
 }
 
 #[test]
