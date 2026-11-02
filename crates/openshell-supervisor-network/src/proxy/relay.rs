@@ -81,6 +81,7 @@ pub(super) fn http_context(
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        binary_pid: decision.binary_pid,
         ancestors: decision
             .ancestors
             .iter()
@@ -389,6 +390,7 @@ mod tests {
             request_default_port: Some(80),
             policy_name: "test".to_string(),
             binary_path: String::new(),
+            binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
@@ -402,6 +404,28 @@ mod tests {
             workspace: String::new(),
             endpoint_observation_tx: None,
         }
+    }
+
+    #[test]
+    fn http_context_keeps_admitted_process_identity() {
+        let mut decision = decision(1);
+        decision.binary = Some("/usr/bin/curl".into());
+        decision.binary_pid = Some(42);
+        decision.ancestors = vec!["/usr/bin/claude".into()];
+        let context = http_context(
+            &decision,
+            None,
+            None,
+            None,
+            openshell_core::proposals::AgentProposals::default(),
+            RelaySignals {
+                activity: None,
+                endpoint_observation: None,
+            },
+        );
+        assert_eq!(context.binary_path, "/usr/bin/curl");
+        assert_eq!(context.binary_pid, Some(42));
+        assert_eq!(context.ancestors, ["/usr/bin/claude"]);
     }
 
     async fn assert_response_lifecycle<C, P>(mut caller: C, mut client: P)

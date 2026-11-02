@@ -58,6 +58,8 @@ pub struct L7EvalContext {
     pub policy_name: String,
     /// Binary path (for cross-layer Rego evaluation).
     pub binary_path: String,
+    /// PID resolved for the admitted connection, when meaningful.
+    pub binary_pid: Option<u32>,
     /// Ancestor paths.
     pub ancestors: Vec<String>,
     /// Cmdline paths.
@@ -88,6 +90,31 @@ pub struct L7EvalContext {
 }
 
 impl L7EvalContext {
+    pub(crate) fn originating_process(&self) -> Option<openshell_core::proto::Process> {
+        (!self.binary_path.is_empty()).then(|| openshell_core::proto::Process {
+            binary: self.binary_path.clone(),
+            pid: self.binary_pid.unwrap_or_default(),
+            ancestors: self.ancestors.clone(),
+        })
+    }
+
+    pub(crate) fn middleware_request_context(
+        &self,
+        request_id: String,
+        sandbox: &openshell_ocsf::EventContext,
+    ) -> openshell_core::proto::RequestContext {
+        openshell_supervisor_middleware::request_context_with_process(
+            openshell_core::proto::RequestContext {
+                request_id,
+                sandbox_id: sandbox.sandbox_id.clone(),
+                sandbox: sandbox.sandbox_name.clone(),
+                workspace: self.workspace.clone(),
+                originating_process: None,
+            },
+            self.originating_process(),
+        )
+    }
+
     /// Whether the inspected transport is plaintext rather than TLS-terminated.
     fn is_plaintext(&self) -> bool {
         self.request_default_port == Some(80)
@@ -860,13 +887,7 @@ pub(crate) fn http_response_middleware_relay<'a>(
     crate::l7::rest::HttpResponseMiddlewareRelay {
         chain,
         runner,
-        request_context: openshell_core::proto::RequestContext {
-            request_id: request_id.to_string(),
-            sandbox_id: sandbox.sandbox_id.clone(),
-            sandbox: sandbox.sandbox_name.clone(),
-            workspace: ctx.workspace.clone(),
-            originating_process: None,
-        },
+        request_context: ctx.middleware_request_context(request_id.to_string(), &sandbox),
         target: openshell_core::proto::HttpRequestTarget {
             scheme: scheme.to_string(),
             host: ctx.host.clone(),
@@ -1774,6 +1795,7 @@ fn websocket_preflight_input(
         sandbox_id: sandbox.sandbox_id.clone(),
         sandbox_name: sandbox.sandbox_name.clone(),
         workspace: ctx.workspace.clone(),
+        originating_process: ctx.originating_process(),
         scheme: scheme.to_string(),
         host: ctx.host.clone(),
         port: ctx.port,
@@ -4052,7 +4074,8 @@ mod tests {
             workspace: "team-a".into(),
             policy_name: "api-policy".into(),
             binary_path: "/usr/bin/curl".into(),
-            ancestors: Vec::new(),
+            binary_pid: Some(42),
+            ancestors: vec!["/usr/bin/claude".into()],
             cmdline_paths: Vec::new(),
             secret_resolver: None,
             ..Default::default()
@@ -4071,6 +4094,14 @@ mod tests {
         assert_eq!(input.sandbox_id, "sbx-123");
         assert_eq!(input.sandbox_name, "nightly-build");
         assert_eq!(input.workspace, "team-a");
+        assert_eq!(
+            input.originating_process,
+            Some(openshell_core::proto::Process {
+                binary: "/usr/bin/curl".into(),
+                pid: 42,
+                ancestors: vec!["/usr/bin/claude".into()],
+            })
+        );
     }
 
     #[test]
@@ -7630,6 +7661,9 @@ network_policies:
             port: 443,
             workspace: "workspace-1".into(),
             policy_name: "api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            binary_pid: Some(42),
+            ancestors: vec!["/usr/bin/claude".into()],
             ..Default::default()
         };
         let runner = openshell_supervisor_middleware::ChainRunner::default();
@@ -7645,6 +7679,14 @@ network_policies:
         );
 
         assert_eq!(response.request_context.request_id, "exchange-123");
+        assert_eq!(
+            response.request_context.originating_process,
+            Some(openshell_core::proto::Process {
+                binary: "/usr/bin/curl".into(),
+                pid: 42,
+                ancestors: vec!["/usr/bin/claude".into()],
+            })
+        );
         assert_eq!(
             response.target.query,
             "cursor=next+page&token=%5BREDACTED%5D"
