@@ -6,6 +6,9 @@
 #[path = "preparation.rs"]
 mod preparation;
 
+#[path = "image_cache_admin.rs"]
+pub mod image_cache_admin;
+
 #[cfg(test)]
 #[path = "registry_cache_tests.rs"]
 mod registry_cache_tests;
@@ -1897,6 +1900,20 @@ impl VmDriver {
             .await?
         };
         let image_identity = image_plan.image_identity.clone();
+        let bootstrap_image_ref = self.bootstrap_image_ref()?;
+        if let Err(error) = image_cache_admin::record_use(
+            &self.config.state_dir,
+            &image_plan.bootstrap_image_identity,
+            &bootstrap_image_ref,
+        ) {
+            warn!(%error, "vm driver: could not record bootstrap cache use");
+        }
+        if image_plan.image_disk.is_some()
+            && let Err(error) =
+                image_cache_admin::record_use(&self.config.state_dir, &image_identity, &image_ref)
+        {
+            warn!(%error, "vm driver: could not record prepared image cache use");
+        }
         self.ensure_provisioning_active(&sandbox.id).await?;
         info!(
             sandbox_id = %sandbox.id,
@@ -1946,8 +1963,13 @@ impl VmDriver {
             .map_err(|err| Status::internal(format!("prepare guest overlay disk failed: {err}")))?;
         self.ensure_provisioning_active(&sandbox.id).await?;
 
-        if let Err(err) =
-            write_sandbox_image_metadata(&state_dir, &image_ref, &image_identity).await
+        if let Err(err) = write_sandbox_image_metadata(
+            &state_dir,
+            &image_ref,
+            &image_identity,
+            &image_plan.bootstrap_image_identity,
+        )
+        .await
         {
             return Err(Status::internal(format!(
                 "write sandbox image metadata failed: {err}"
@@ -5225,6 +5247,11 @@ impl VmDriver {
 #[doc(hidden)]
 pub async fn run_image_preparation_worker(request_path: &Path) -> Result<(), String> {
     let (request, directory) = preparation::read_request(request_path)?;
+    let _cache_lease = image_cache_admin::lock_cache(
+        &request.config.state_dir,
+        image_cache_admin::LockMode::Shared,
+    )
+    .map_err(|error| format!("lock image cache for preparation: {error}"))?;
     validate_sandbox_id(&request.sandbox_id).map_err(|error| error.message().to_string())?;
     preparation::watch_parent(request.parent_pid)?;
     tracing_subscriber::fmt()
@@ -7365,6 +7392,7 @@ async fn write_sandbox_image_metadata(
     state_dir: &Path,
     image_ref: &str,
     image_identity: &str,
+    bootstrap_image_identity: &str,
 ) -> Result<(), std::io::Error> {
     tokio::fs::write(
         state_dir.join(IMAGE_IDENTITY_FILE),
@@ -7376,6 +7404,14 @@ async fn write_sandbox_image_metadata(
         format!("{image_ref}\n"),
     )
     .await?;
+    if let Err(error) = tokio::fs::write(
+        state_dir.join(image_cache_admin::BOOTSTRAP_IDENTITY_FILE),
+        format!("{bootstrap_image_identity}\n"),
+    )
+    .await
+    {
+        warn!(%error, "vm driver: could not persist bootstrap cache identity");
+    }
 
     Ok(())
 }
@@ -9163,9 +9199,20 @@ mod tests {
         )
         .await
         .unwrap();
-        write_sandbox_image_metadata(&state_dir, "unused-image", "sha256:original-image")
-            .await
-            .unwrap();
+        write_sandbox_image_metadata(
+            &state_dir,
+            "unused-image",
+            "sha256:original-image",
+            "sha256:bootstrap-image",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(state_dir.join(image_cache_admin::BOOTSTRAP_IDENTITY_FILE))
+                .await
+                .unwrap(),
+            "sha256:bootstrap-image\n"
+        );
         tokio::fs::write(state_dir.join(marker), b"inactive\n")
             .await
             .unwrap();

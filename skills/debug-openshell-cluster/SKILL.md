@@ -1494,6 +1494,13 @@ Use the VM driver logs and host diagnostics available in the user's environment.
 - Host virtualization support is enabled.
 - The sandbox supervisor can establish its authenticated gateway session.
 
+If the VM host reports `No space left on device`, inspect committed image disks
+with `openshell-driver-vm --state-dir <configured-state-dir> image-cache list`.
+Preview cleanup with `image-cache prune --unused --dry-run` using the same
+`--state-dir`. Stop the VM gateway before running `image-cache prune --unused`
+without `--dry-run`; the driver protects persisted sandbox references and
+refuses cleanup while its process holds the cache lease.
+
 For `vm.mounts` (virtiofs host bind mounts) failures, also verify:
 
 - `[openshell.drivers.vm]` sets `allow_driver_config = true` and `enable_bind_mounts = true`; an external VM driver needs `--enable-bind-mounts` and `allow_driver_config` in `--admission-config-json`.

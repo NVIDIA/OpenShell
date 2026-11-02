@@ -239,6 +239,37 @@ Image and writable-overlay preparation run in owned worker processes. Stopping o
 
 At startup, the driver reclaims inactive attempts in this directory. It preserves active attempts, committed image caches, and unmarked staging from older releases. Concurrent preparations serialize image-cache publication; an interrupted attempt cannot publish a partial disk over an existing cache entry. Gateway upload slots for `rootfs_tar_path` keep their existing, separate lifecycle.
 
+### Inspect and prune image disks
+
+Run the VM driver binary on the gateway host with the same `state_dir` configured
+for the gateway:
+
+```shell
+openshell-driver-vm --state-dir /path/to/vm-driver-state image-cache list
+openshell-driver-vm --state-dir /path/to/vm-driver-state image-cache prune --unused --dry-run
+```
+
+`list` reports each committed root disk's cache ID, image reference, allocated
+and apparent bytes, last-use Unix timestamp in milliseconds, cache layout
+version, and persisted sandbox IDs that reference it. Older entries without
+cache metadata show `-` for the image reference and last use. New cache uses
+record this metadata without changing the disk contents.
+
+Stop the VM gateway before removing entries, then run:
+
+```shell
+openshell-driver-vm --state-dir /path/to/vm-driver-state image-cache prune --unused
+```
+
+Prune removes only committed disks that no persisted sandbox references. It
+leaves disks referenced by stopped sandboxes in place. For sandboxes created
+before bootstrap identities were persisted, it conservatively preserves all
+bootstrap disks. Prune refuses to run while a current driver holds the state
+lock or an older driver is reachable at the default state socket. The reported
+bytes are the disks' allocated bytes before removal; filesystem snapshots and
+shared blocks can make actual free space differ. Nothing is removed
+automatically.
+
 Each sandbox gets its own sparse writable
 `<state-dir>/sandboxes/<id>/overlay.ext4`. Guest init mounts overlayfs as `/`
 with the prepared image rootfs as lowerdir when present, otherwise the bootstrap
