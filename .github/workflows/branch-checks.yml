@@ -389,6 +389,7 @@ jobs:
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/testkit/Cargo.toml
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/tmachine/Cargo.toml
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/runner/Cargo.toml
+          cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/support/Cargo.toml
 
   rust-postgres-test:
     name: Rust PostgreSQL tests

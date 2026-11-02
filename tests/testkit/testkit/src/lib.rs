@@ -27,6 +27,7 @@ mod cli;
 mod context;
 mod error;
 pub mod gateway;
+mod image;
 mod poll;
 mod run;
 
@@ -38,6 +39,7 @@ pub use context::{
 };
 pub use error::{Error, Result, ResultExt};
 pub use gateway::Gateway;
+pub use image::{BASE_IMAGE_ENV, DEFAULT_BASE_IMAGE, base_image};
 pub use openshell_sdk as sdk;
 pub use poll::{Poll, poll_until};
 pub use run::{TestInfo, run};

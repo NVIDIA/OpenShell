@@ -287,8 +287,8 @@ service.
   values never appear in a runner command. Values are taken literally, without
   quoting.
 - **Fixture.** Put the service's fixture in a support crate under
-  `tests/support/<service>`, so any suite can depend on it, or reuse the
-  existing one. It defines the variable names as constants and a
+  `tests/support/<service>`, named `<service>-support`, so any suite can
+  depend on it, or reuse the existing one. It defines the variable names as constants and a
   `<Service>Context::new(cx)` that reads them, waits for the service, and
   wraps the testkit `Context`. Each test calls it on its first line.
   Nextest runs each test in its own process, so the fixture builds its

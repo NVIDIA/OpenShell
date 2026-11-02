@@ -5,4 +5,4 @@
 # environment runs. Suites depend on them by path.
 [workspace]
 resolver = "2"
-members = ["keycloak"]
+members = ["container-engine", "keycloak", "podman"]

@@ -204,6 +204,37 @@ impl Context {
         Ok(())
     }
 
+    /// Fail unless the gateway runs exactly one compute driver, `name`, as
+    /// gateway info reports it. Driver suites check this first, so a suite
+    /// pointed at another driver's gateway fails instead of testing it.
+    pub async fn expect_compute_driver(&self, name: &str) -> Result {
+        let info = self
+            .grpc
+            .client()
+            .await?
+            .get_gateway_info(proto::GetGatewayInfoRequest {})
+            .await
+            .map_err(|status| Error::from_error(&status))
+            .context("get gateway info")?
+            .into_inner();
+        let drivers: Vec<(&str, &str)> = info
+            .compute_drivers
+            .iter()
+            .map(|driver| {
+                let reported = driver
+                    .capabilities
+                    .as_ref()
+                    .map_or("", |capabilities| capabilities.driver_name.as_str());
+                (driver.name.as_str(), reported)
+            })
+            .collect();
+        crate::ensure!(
+            matches!(drivers.as_slice(), [(configured, reported)] if *configured == name && *reported == name),
+            "the gateway reports compute drivers (name, driver name) {drivers:?}; expected only {name}"
+        );
+        Ok(())
+    }
+
     /// Fail unless `list` shows the sandbox in `phase`.
     pub async fn expect_listed(&self, sandbox: &Sandbox, phase: SandboxPhase) -> Result {
         let name = sandbox.name();
