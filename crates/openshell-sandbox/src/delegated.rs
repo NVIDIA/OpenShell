@@ -42,6 +42,7 @@ pub async fn spawn_workload(
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     boundary_runtime: Option<Arc<crate::boundary_io::BoundaryRuntimeState>>,
     otlp_relay_active: bool,
+    process_activity_enabled: bool,
 ) -> Result<SpawnedAgent> {
     // Driver-selected workspaces are the sandbox identity's home. This keeps
     // canonical and later exec processes consistent for image WorkingDir and
@@ -85,6 +86,7 @@ pub async fn spawn_workload(
             user_environment,
             boundary_runtime.clone(),
             otlp_relay_active,
+            process_activity_enabled,
             launcher.clone(),
         ));
 
@@ -129,19 +131,25 @@ pub async fn spawn_workload(
         .register_process_group(handle.pid(), terminal.clone(), signal_lock.clone())
         .map_err(|error| miette::miette!(error.to_string()))?;
 
-    ocsf_emit!(
-        ProcessActivityBuilder::new(ocsf_ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Allowed)
-            .disposition(DispositionId::Allowed)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .launch_type(LaunchTypeId::Spawn)
-            .process(OcsfProcess::new(program, i64::from(handle.pid())))
-            .actor_process(crate::process::ocsf_launcher_process())
-            .message(format!("Process started: pid={}", handle.pid()))
-            .build()
-    );
+    let audit = process_activity_enabled
+        .then(|| crate::process_audit::ProcessAudit::capture(program, handle.pid()));
+    if let Some(audit) = &audit {
+        ocsf_emit!(audit.launch_event());
+    } else {
+        ocsf_emit!(
+            ProcessActivityBuilder::new(ocsf_ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Allowed)
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .launch_type(LaunchTypeId::Spawn)
+                .process(OcsfProcess::new(program, i64::from(handle.pid())))
+                .actor_process(crate::process::ocsf_launcher_process())
+                .message(format!("Process started: pid={}", handle.pid()))
+                .build()
+        );
+    }
 
     Ok(SpawnedAgent {
         handle,
@@ -152,6 +160,7 @@ pub async fn spawn_workload(
         boundary_exec,
         loopback_connector,
         boundary_runtime,
+        audit,
     })
 }
 
@@ -165,9 +174,17 @@ pub struct SpawnedAgent {
     boundary_exec: Arc<dyn BoundaryExec>,
     loopback_connector: Arc<dyn BoundaryLoopbackConnector>,
     boundary_runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
+    audit: Option<crate::process_audit::ProcessAudit>,
 }
 
 impl SpawnedAgent {
+    pub(crate) fn process_identity(
+        &self,
+    ) -> Option<openshell_sandbox_backend::boundary_protocol::ProcessIdentityWire> {
+        self.audit
+            .as_ref()
+            .map(crate::process_audit::ProcessAudit::identity)
+    }
     #[must_use]
     pub fn signaler(&self) -> AgentSignaler {
         AgentSignaler {
@@ -213,6 +230,17 @@ impl SpawnedAgent {
         };
         self.boundary_runtime
             .unregister_process_group(self.handle.pid(), &self.terminal);
+        if let Some(audit) = &self.audit {
+            let exit = status.signal().map_or_else(
+                || {
+                    openshell_isolation_interface::contract::BoundaryExitStatus::Exited(
+                        status.code(),
+                    )
+                },
+                openshell_isolation_interface::contract::BoundaryExitStatus::Signaled,
+            );
+            ocsf_emit!(audit.terminate_event(exit));
+        }
         let _ = self.main_session.finish(status.code(), false).await;
         self.main_session.mark_terminal_reported();
         Ok(status)

@@ -28,6 +28,10 @@ use openshell_isolation_interface::contract::{
     MediationTiming, PendingDnsQuery, PendingTcpOpen, ProviderEnvironmentInstallation,
     ResolvedWorkloadIdentity, SandboxContext, TcpOpenDecision, TcpOpenDenial,
 };
+use openshell_ocsf::{
+    ActionId, ActivityId, DispositionId, LaunchTypeId, OcsfEvent, Process, ProcessActivityBuilder,
+    SeverityId, StatusId, ocsf_emit,
+};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
@@ -69,6 +73,79 @@ const NETWORK_STREAM_WAIT_WARNING: Duration = Duration::from_secs(5);
 /// Bound on waiting for a replaced owner's process attachment to be released
 /// after a takeover retires its connection.
 const ADOPTED_ATTACHMENT_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn audited_process(identity: &crate::boundary_protocol::ProcessIdentityWire) -> Process {
+    let mut process = Process::new(&identity.name, i64::from(identity.pid));
+    if let Some(uid) = &identity.uid {
+        process = process.with_uid(uid.clone());
+    }
+    if let Some(time_ms) = identity.created_time_ms {
+        process = process.with_created_time(time_ms);
+    }
+    if let Some(parent_pid) = identity.parent_pid {
+        let mut parent = Process::new("unknown", i64::from(parent_pid));
+        if let Some(uid) = &identity.parent_uid {
+            parent = parent.with_uid(uid.clone());
+        }
+        if let Some(time_ms) = identity.parent_created_time_ms {
+            parent = parent.with_created_time(time_ms);
+        }
+        process = process.with_parent(parent);
+    }
+    process
+}
+
+fn process_start_event(identity: &crate::boundary_protocol::ProcessIdentityWire) -> OcsfEvent {
+    ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Allowed)
+        .disposition(DispositionId::Allowed)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .launch_type(LaunchTypeId::Spawn)
+        .process(audited_process(identity))
+        .actor_process(Process::new(
+            "openshell-supervisor",
+            i64::from(std::process::id()),
+        ))
+        .message(format!("Process started: pid={}", identity.pid))
+        .build()
+}
+
+fn process_exit_event(
+    identity: &crate::boundary_protocol::ProcessIdentityWire,
+    status: ExitStatusWire,
+) -> OcsfEvent {
+    let mut builder = ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Close)
+        .severity(SeverityId::Informational)
+        .process(audited_process(identity))
+        .actor_process(Process::new(
+            "openshell-supervisor",
+            i64::from(std::process::id()),
+        ));
+    if let ExitStatusWire::Exited(code) = status {
+        builder = builder.exit_code(code);
+    }
+    let mut event = builder.build();
+    if let ExitStatusWire::Signaled(signal) = status
+        && let OcsfEvent::ProcessActivity(process_event) = &mut event
+    {
+        process_event.base.unmapped = Some(serde_json::json!({"signal": signal}));
+    }
+    event
+}
+
+fn emit_process_start(identity: &crate::boundary_protocol::ProcessIdentityWire) {
+    ocsf_emit!(process_start_event(identity));
+}
+
+fn emit_process_exit(
+    identity: &crate::boundary_protocol::ProcessIdentityWire,
+    status: ExitStatusWire,
+) {
+    ocsf_emit!(process_exit_event(identity, status));
+}
 
 fn begin_recovery_window(
     deadline: &mut Option<tokio::time::Instant>,
@@ -562,9 +639,15 @@ impl OpenShellRuntimeBackend {
 #[derive(Clone, Debug, Default)]
 struct RecoveredProcesses {
     /// The canonical process, when the previous owner started it.
-    main: Option<String>,
+    main: Option<(
+        String,
+        Option<crate::boundary_protocol::ProcessIdentityWire>,
+    )>,
     /// Exec processes that have not exited.
-    execs: Vec<String>,
+    execs: Vec<(
+        String,
+        Option<crate::boundary_protocol::ProcessIdentityWire>,
+    )>,
 }
 
 impl RecoveredProcesses {
@@ -573,9 +656,14 @@ impl RecoveredProcesses {
         let mut recovered = Self::default();
         for process in &snapshot.processes {
             match process.kind {
-                ProcessKindWire::Main => recovered.main = Some(process.process_id.clone()),
+                ProcessKindWire::Main => {
+                    recovered.main =
+                        Some((process.process_id.clone(), process.process_identity.clone()));
+                }
                 ProcessKindWire::Exec if process.status.is_none() => {
-                    recovered.execs.push(process.process_id.clone());
+                    recovered
+                        .execs
+                        .push((process.process_id.clone(), process.process_identity.clone()));
                 }
                 ProcessKindWire::Exec => {}
             }
@@ -809,16 +897,21 @@ impl ReadyBoundary {
     /// without launching anything.
     pub async fn start_agent(self: Box<Self>) -> Result<Box<RunningBoundary>, BackendError> {
         if let Some(RecoveredProcesses {
-            main: Some(process_id),
+            main: Some((process_id, process_identity)),
             execs,
         }) = &self.recovered
         {
-            let adopted = |process_id: &String| {
+            let adopted = |(process_id, process_identity): &(
+                String,
+                Option<crate::boundary_protocol::ProcessIdentityWire>,
+            )| {
                 Arc::new(BoundaryProcess {
                     exec: true,
                     adopted: true,
                     client: self.client.clone(),
                     process_id: process_id.clone(),
+                    process_identity: process_identity.clone(),
+                    exit_emitted: AtomicBool::new(false),
                 })
             };
             return Ok(Box::new(RunningBoundary {
@@ -827,6 +920,8 @@ impl ReadyBoundary {
                     adopted: true,
                     client: self.client.clone(),
                     process_id: process_id.clone(),
+                    process_identity: process_identity.clone(),
+                    exit_emitted: AtomicBool::new(false),
                 }),
                 adopted_execs: execs.iter().map(adopted).collect(),
                 exec: Arc::new(BoundaryExec {
@@ -883,16 +978,22 @@ impl ReadyBoundary {
         let Response::Started {
             process_id,
             provider_env_generation,
+            process_identity,
             ..
         } = response
         else {
             return Err(unexpected_response("started", &response));
         };
+        if let Some(identity) = &process_identity {
+            emit_process_start(identity);
+        }
         let process = Arc::new(BoundaryProcess {
             exec: false,
             adopted: false,
             client: self.client.clone(),
             process_id,
+            process_identity,
+            exit_emitted: AtomicBool::new(false),
         });
         Ok(Box::new(RunningBoundary {
             process,
@@ -980,6 +1081,8 @@ pub struct BoundaryProcess {
     adopted: bool,
     client: Arc<BoundaryClient>,
     process_id: String,
+    process_identity: Option<crate::boundary_protocol::ProcessIdentityWire>,
+    exit_emitted: AtomicBool,
 }
 
 impl BoundaryProcess {
@@ -1028,6 +1131,11 @@ impl BoundaryProcess {
         let Response::Exited { status } = response else {
             return Err(unexpected_response("exited", &response));
         };
+        if let Some(identity) = &self.process_identity
+            && !self.exit_emitted.swap(true, Ordering::AcqRel)
+        {
+            emit_process_exit(identity, status);
+        }
         Ok(status.into())
     }
 
@@ -1266,9 +1374,17 @@ async fn open_exec_session(
             spec: ExecSpecWire::from(spec),
         })
         .await?;
-    let Response::ExecStarted { process_id, pty } = response else {
+    let Response::ExecStarted {
+        process_id,
+        pty,
+        process_identity,
+    } = response
+    else {
         return Err(unexpected_response("exec_started", &response));
     };
+    if let Some(identity) = &process_identity {
+        emit_process_start(identity);
+    }
     let (network_reader, network_writer) = tokio::io::split(stream);
     let (stdin, stdin_pump) = tokio::io::duplex(64 * 1024);
     let (stdout, stdout_pump) = tokio::io::duplex(64 * 1024);
@@ -1287,7 +1403,18 @@ async fn open_exec_session(
         adopted: false,
         client: client.clone(),
         process_id: process_id.clone(),
+        process_identity,
+        exit_emitted: AtomicBool::new(false),
     });
+    if process.process_identity.is_some() {
+        // SSH and CLI exec can consume the output stream's terminal status
+        // without calling wait on this handle. Observe the canonical status
+        // separately so the exit audit record is still emitted.
+        let observed = process.clone();
+        tokio::spawn(async move {
+            let _ = observed.wait().await;
+        });
+    }
     let terminal: Option<Arc<BoundaryTerminal>> = if pty {
         Some(Arc::new(BoundaryTerminal { client, process_id }))
     } else {
@@ -3066,6 +3193,35 @@ mod tests {
 
     const TEST_BOUNDARY_HANDLE: &str = "opaque-test-boundary";
 
+    #[test]
+    fn process_activity_events_preserve_instance_and_redact_arguments() {
+        let identity = crate::boundary_protocol::ProcessIdentityWire {
+            name: "/bin/sh".to_string(),
+            pid: 57,
+            uid: Some("57:123456".to_string()),
+            created_time_ms: Some(1_793_620_000_120),
+            parent_pid: Some(1),
+            parent_uid: Some("1:34".to_string()),
+            parent_created_time_ms: Some(1_793_619_999_000),
+        };
+        let started = process_start_event(&identity).to_json().unwrap();
+        let exited = process_exit_event(&identity, ExitStatusWire::Exited(7))
+            .to_json()
+            .unwrap();
+        assert_eq!(started["process"], exited["process"]);
+        assert_eq!(started["process"]["uid"], "57:123456");
+        assert_eq!(started["process"]["parent_process"]["uid"], "1:34");
+        assert!(started["process"].get("cmd_line").is_none());
+        assert_eq!(exited["exit_code"], 7);
+
+        let signaled = process_exit_event(&identity, ExitStatusWire::Signaled(9))
+            .to_json()
+            .unwrap();
+        assert_eq!(signaled["process"], started["process"]);
+        assert_eq!(signaled["unmapped"]["signal"], 9);
+        assert!(signaled.get("exit_code").is_none());
+    }
+
     #[derive(Clone)]
     struct TestIsolationBackend {
         metadata: Option<openshell_core::proto::extension::v1::PeerMetadata>,
@@ -3700,6 +3856,7 @@ mod tests {
                             Request::Exec { .. } => Response::ExecStarted {
                                 process_id: "test-generation:exec:1".to_string(),
                                 pty: false,
+                                process_identity: None,
                             },
                             Request::AttachProcess { .. } => {
                                 Response::ProcessAttached { terminal: false }
@@ -3725,6 +3882,7 @@ mod tests {
                                 process_id: "test-generation:main:0".to_string(),
                                 provider_env_revision,
                                 provider_env_generation: provider_environment_generation,
+                                process_identity: None,
                             },
                             Request::AcceptNetwork => Response::Error {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Unavailable,
@@ -4301,6 +4459,7 @@ mod tests {
                 timeout_secs: 5,
                 interactive: false,
                 otlp_relay_active: false,
+                process_activity_enabled: false,
             },
             identity: ResolvedWorkloadIdentity::new(
                 10_001,
@@ -4964,6 +5123,7 @@ mod tests {
                     kind: crate::boundary_protocol::ProcessKindWire::Main,
                     terminal: false,
                     status: None,
+                    process_identity: None,
                     retained_output: crate::boundary_protocol::OutputWindowWire {
                         first_sequence: 0,
                         next_sequence: 9,
@@ -4975,6 +5135,7 @@ mod tests {
                     kind: crate::boundary_protocol::ProcessKindWire::Exec,
                     terminal: false,
                     status: None,
+                    process_identity: None,
                     retained_output: crate::boundary_protocol::OutputWindowWire {
                         first_sequence: 0,
                         next_sequence: 0,
@@ -4986,6 +5147,7 @@ mod tests {
                     kind: crate::boundary_protocol::ProcessKindWire::Exec,
                     terminal: false,
                     status: Some(ExitStatusWire::Exited(0)),
+                    process_identity: None,
                     retained_output: crate::boundary_protocol::OutputWindowWire {
                         first_sequence: 0,
                         next_sequence: 4,
@@ -5045,6 +5207,7 @@ mod tests {
             kind,
             terminal: false,
             status: None,
+            process_identity: None,
             retained_output: crate::boundary_protocol::OutputWindowWire {
                 first_sequence: 0,
                 next_sequence: 0,

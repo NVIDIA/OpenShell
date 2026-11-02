@@ -10,6 +10,16 @@ and produces the ready handle; starting consumes that ready handle. Both the
 in-tree Linux runtime and external backends implement the generated services.
 Linux process helpers remain internal to the runtime server.
 
+## Process activity
+
+When `AgentSpec.process_activity_enabled` is set, the Linux runtime includes
+the directly started process's PID, parent PID, start instance ID, and start
+time in `Started`, `ExecStarted`, and takeover snapshots. These optional fields
+keep older boundary implementations compatible. The supervisor-side client
+uses them to emit OCSF launch and exit events through the existing supervisor
+log path. `BoundaryProcess::wait` emits an exit only once even if callers
+repeat the wait. The protocol carries no arguments or environment.
+
 ## Boundary startup and routing
 
 The supervisor uses the generated `IsolationBackend` control service to

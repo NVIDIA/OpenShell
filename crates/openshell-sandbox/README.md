@@ -10,6 +10,18 @@ the lower-level mechanisms used by that orchestration and the boundary server.
 Unsafe kernel ABI, process-launch, and descriptor-ownership operations stay in
 this runtime crate behind safe APIs where their contracts can be enforced.
 
+When the supervisor passes `process_activity_enabled` in the admitted agent
+spec, the boundary emits OCSF Process Activity launch and termination events
+for its canonical child and for each exec or SSH child. It captures the child
+PID, parent PID, and `/proc/<pid>/stat` start tick before waiting, then retains
+that identity for the exit record and sends it in the existing boundary
+responses. The supervisor emits matching events to its gateway log path.
+`process.uid` is `pid:start_ticks` and
+`process.created_time` is Unix milliseconds derived from the kernel boot time.
+The events omit argv. The setting defaults off, while the existing canonical
+launch event remains enabled. This path does not observe forks or in-place execs
+inside a workload child.
+
 The network broker retains source socket descriptors only while preparing a
 workload endpoint. A successful connection or `listen` releases that reference;
 the kernel then tracks the lifetime through workload-owned descriptors. Native

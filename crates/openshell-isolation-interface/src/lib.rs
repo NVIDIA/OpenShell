@@ -33,6 +33,8 @@ pub struct AgentSpec {
     /// Whether the supervisor serves the OTLP relay for this sandbox. The
     /// boundary points workload SDKs at the relay only while it is active.
     pub otlp_relay_active: bool,
+    /// Whether the boundary emits lifecycle events for processes it starts.
+    pub process_activity_enabled: bool,
 }
 
 pub mod contract;

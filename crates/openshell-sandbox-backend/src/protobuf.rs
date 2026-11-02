@@ -87,6 +87,34 @@ impl WireMessage for w::ExitStatusWire {
         })
     }
 }
+
+impl WireMessage for w::ProcessIdentityWire {
+    type Proto = p::ProcessIdentity;
+
+    fn to_proto(&self) -> Result<Self::Proto, FrameError> {
+        Ok(p::ProcessIdentity {
+            name: self.name.clone(),
+            pid: self.pid,
+            uid: self.uid.clone(),
+            created_time_ms: self.created_time_ms,
+            parent_pid: self.parent_pid,
+            parent_uid: self.parent_uid.clone(),
+            parent_created_time_ms: self.parent_created_time_ms,
+        })
+    }
+
+    fn from_proto(value: Self::Proto) -> Result<Self, FrameError> {
+        Ok(Self {
+            name: value.name,
+            pid: value.pid,
+            uid: value.uid,
+            created_time_ms: value.created_time_ms,
+            parent_pid: value.parent_pid,
+            parent_uid: value.parent_uid,
+            parent_created_time_ms: value.parent_created_time_ms,
+        })
+    }
+}
 impl WireMessage for w::SandboxPolicyWire {
     type Proto = p::SandboxPolicy;
     fn to_proto(&self) -> Result<Self::Proto, FrameError> {
@@ -173,6 +201,7 @@ impl WireMessage for w::AgentSpecWire {
             }),
             interactive: self.interactive,
             otlp_relay_active: self.otlp_relay_active,
+            process_activity_enabled: self.process_activity_enabled,
         })
     }
     fn from_proto(v: Self::Proto) -> Result<Self, FrameError> {
@@ -187,6 +216,7 @@ impl WireMessage for w::AgentSpecWire {
             timeout_secs: u64::try_from(timeout.seconds).map_err(invalid)?,
             interactive: v.interactive,
             otlp_relay_active: v.otlp_relay_active,
+            process_activity_enabled: v.process_activity_enabled,
         })
     }
 }
@@ -392,6 +422,11 @@ impl WireMessage for w::SessionSnapshotWire {
                             next_sequence: v.retained_output.next_sequence,
                             truncated: v.retained_output.truncated,
                         }),
+                        process_identity: v
+                            .process_identity
+                            .as_ref()
+                            .map(WireMessage::to_proto)
+                            .transpose()?,
                     })
                 })
                 .collect::<Result<_, FrameError>>()?,
@@ -424,6 +459,10 @@ impl WireMessage for w::SessionSnapshotWire {
                             next_sequence: output.next_sequence,
                             truncated: output.truncated,
                         },
+                        process_identity: v
+                            .process_identity
+                            .map(w::ProcessIdentityWire::from_proto)
+                            .transpose()?,
                     })
                 })
                 .collect::<Result<_, FrameError>>()?,
@@ -640,10 +679,15 @@ impl WireMessage for w::ResponseEnvelope {
                 process_id,
                 provider_env_revision,
                 provider_env_generation,
+                process_identity,
             } => P::Started(p::Started {
                 process_id: process_id.clone(),
                 provider_env_revision: *provider_env_revision,
                 provider_env_generation: *provider_env_generation,
+                process_identity: process_identity
+                    .as_ref()
+                    .map(WireMessage::to_proto)
+                    .transpose()?,
             }),
             W::ProviderEnvironmentUpdated {
                 revision,
@@ -663,9 +707,17 @@ impl WireMessage for w::ResponseEnvelope {
             W::Signaled => P::Signaled(p::Signaled {}),
             W::Terminated => P::Terminated(p::Terminated {}),
             W::BoundaryTerminated => P::BoundaryTerminated(p::BoundaryTerminated {}),
-            W::ExecStarted { process_id, pty } => P::ExecStarted(p::ExecStarted {
+            W::ExecStarted {
+                process_id,
+                pty,
+                process_identity,
+            } => P::ExecStarted(p::ExecStarted {
                 process_id: process_id.clone(),
                 pty: *pty,
+                process_identity: process_identity
+                    .as_ref()
+                    .map(WireMessage::to_proto)
+                    .transpose()?,
             }),
             W::Resized => P::Resized(p::Resized {}),
             W::LoopbackConnected => P::LoopbackConnected(p::LoopbackConnected {}),
@@ -717,6 +769,10 @@ impl WireMessage for w::ResponseEnvelope {
                 process_id: v.process_id,
                 provider_env_revision: v.provider_env_revision,
                 provider_env_generation: v.provider_env_generation,
+                process_identity: v
+                    .process_identity
+                    .map(w::ProcessIdentityWire::from_proto)
+                    .transpose()?,
             },
             P::ProviderEnvironmentUpdated(v) => W::ProviderEnvironmentUpdated {
                 revision: v.revision,
@@ -735,6 +791,10 @@ impl WireMessage for w::ResponseEnvelope {
             P::ExecStarted(v) => W::ExecStarted {
                 process_id: v.process_id,
                 pty: v.pty,
+                process_identity: v
+                    .process_identity
+                    .map(w::ProcessIdentityWire::from_proto)
+                    .transpose()?,
             },
             P::Resized(_) => W::Resized,
             P::LoopbackConnected(_) => W::LoopbackConnected,
@@ -818,6 +878,74 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_identity_survives_start_exec_and_legacy_responses() {
+        let identity = w::ProcessIdentityWire {
+            name: "/bin/true".to_string(),
+            pid: 42,
+            uid: Some("42:1234".to_string()),
+            created_time_ms: Some(1_793_620_000_000),
+            parent_pid: Some(1),
+            parent_uid: Some("1:2".to_string()),
+            parent_created_time_ms: Some(1_793_619_999_000),
+        };
+        let start = w::ResponseEnvelope {
+            request_id: "start".to_string(),
+            response: w::Response::Started {
+                process_id: "generation:main:0".to_string(),
+                provider_env_revision: 0,
+                provider_env_generation: 0,
+                process_identity: Some(identity.clone()),
+            },
+        };
+        let decoded = w::ResponseEnvelope::from_proto(start.to_proto().unwrap()).unwrap();
+        assert_eq!(decoded, start);
+
+        let exec = w::ResponseEnvelope {
+            request_id: "exec".to_string(),
+            response: w::Response::ExecStarted {
+                process_id: "generation:exec:1".to_string(),
+                pty: false,
+                process_identity: Some(identity.clone()),
+            },
+        };
+        let decoded = w::ResponseEnvelope::from_proto(exec.to_proto().unwrap()).unwrap();
+        assert_eq!(decoded, exec);
+
+        let mut old = exec.to_proto().unwrap();
+        if let Some(p::response_envelope::Response::ExecStarted(value)) = &mut old.response {
+            value.process_identity = None;
+        }
+        assert!(matches!(
+            w::ResponseEnvelope::from_proto(old).unwrap().response,
+            w::Response::ExecStarted {
+                process_identity: None,
+                ..
+            }
+        ));
+
+        let snapshot = w::SessionSnapshotWire {
+            generation: "generation".to_string(),
+            processes: vec![w::ProcessSnapshotWire {
+                process_id: "generation:exec:1".to_string(),
+                kind: w::ProcessKindWire::Exec,
+                terminal: false,
+                status: Some(w::ExitStatusWire::Exited(0)),
+                retained_output: w::OutputWindowWire {
+                    first_sequence: 0,
+                    next_sequence: 0,
+                    truncated: false,
+                },
+                process_identity: Some(identity),
+            }],
+            bound_policy: None,
+        };
+        assert_eq!(
+            w::SessionSnapshotWire::from_proto(snapshot.to_proto().unwrap()).unwrap(),
+            snapshot
+        );
+    }
 
     #[test]
     fn request_validation_rejects_missing_context_and_unknown_signal() {
@@ -934,6 +1062,7 @@ mod tests {
             timeout_secs: 0,
             interactive: false,
             otlp_relay_active: false,
+            process_activity_enabled: false,
         };
         let inactive = spec.to_proto().unwrap();
         assert_eq!(w::AgentSpecWire::from_proto(inactive).unwrap(), spec);
@@ -941,6 +1070,10 @@ mod tests {
         spec.otlp_relay_active = true;
         let decoded = w::AgentSpecWire::from_proto(spec.to_proto().unwrap()).unwrap();
         assert!(decoded.otlp_relay_active);
+
+        spec.process_activity_enabled = true;
+        let decoded = w::AgentSpecWire::from_proto(spec.to_proto().unwrap()).unwrap();
+        assert!(decoded.process_activity_enabled);
     }
 
     #[test]

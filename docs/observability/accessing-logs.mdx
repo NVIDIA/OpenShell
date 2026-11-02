@@ -43,7 +43,14 @@ docker logs <sandbox-container>
 podman logs <sandbox-container>
 ```
 
-The sandbox runtime also emits OCSF shorthand events, including process-launch and Landlock filesystem events, into these container logs when its diagnostic log filter permits them. These runtime-originated events are not pushed to the gateway log stream or included in the supervisor's JSONL file. Collect workload container logs separately from supervisor logs to retain both sources.
+The sandbox runtime also emits OCSF shorthand events, including process-launch
+and Landlock filesystem events, into these container logs when its diagnostic
+log filter permits them. Runtime-originated events are not pushed to the gateway
+log stream or included in the supervisor's JSONL file. When
+`process_activity_enabled` is on, the runtime sends directly started process
+identities to the supervisor, which emits separate launch and exit records into
+those supervisor paths. Collect workload container logs separately from
+supervisor logs to retain both sources.
 
 A main process started with a TTY writes only to its attachment; use `openshell sandbox connect` to view that output. Output from `sandbox exec` and SSH sessions does not reach the container log, and `openshell logs` does not include main process output.
 

@@ -287,7 +287,11 @@ impl Peer {
                     self.terminals.lock().unwrap().insert(process_id.clone(), t);
                 }
                 io = Some((a.stdin, a.stdout, a.stderr, a.process, a.output_status));
-                Response::ExecStarted { process_id, pty }
+                Response::ExecStarted {
+                    process_id,
+                    pty,
+                    process_identity: None,
+                }
             }
             Request::LoopbackConnect { host, port } => {
                 relay = Some(
@@ -777,6 +781,8 @@ pub fn process(process: Arc<dyn BoundaryProcess>) -> Arc<crate::BoundaryProcess>
         process_id: "main".into(),
         exec: false,
         adopted: false,
+        process_identity: None,
+        exit_emitted: std::sync::atomic::AtomicBool::new(false),
     })
 }
 pub fn terminal(terminal: Arc<dyn BoundaryTerminal>) -> Arc<crate::BoundaryTerminal> {

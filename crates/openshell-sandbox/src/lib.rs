@@ -27,6 +27,8 @@ pub mod perf;
 #[cfg(target_os = "linux")]
 pub mod process;
 #[cfg(target_os = "linux")]
+mod process_audit;
+#[cfg(target_os = "linux")]
 mod provider_files;
 #[cfg(target_os = "linux")]
 mod pty;
