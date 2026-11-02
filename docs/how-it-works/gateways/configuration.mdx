@@ -1320,8 +1320,11 @@ socket_path        = "/var/run/docker.sock"
 default_image      = "nvcr.io/nvidia/base/ubuntu:24.04"
 # Canonical values: always | if_not_present | never. `newer` is Podman-only.
 image_pull_policy  = "if_not_present"
-# Value assigned to the openshell.sandbox_namespace label on sandbox containers.
+# Value assigned to the openshell.ai/sandbox-namespace label on sandbox containers.
 sandbox_label      = "docker-dev"
+# Optional: scope Docker containers, volumes, and private state by host UID.
+# Enable on each per-user gateway before creating sandboxes.
+# scope_by_host_uid = true
 # host (default) or bridge networking for the supervisor.
 # Operator-owned; sandbox driver config cannot override this choice.
 supervisor_network_mode = "host"
@@ -1362,6 +1365,20 @@ provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
 ```
 
 Use `sandbox_label` for Docker configurations.
+
+When separate OS users run gateways against one Docker daemon, set
+`scope_by_host_uid = true` under `[openshell.drivers.docker]` on each gateway.
+The driver prefixes `sandbox_label` with the gateway process's effective host
+UID. Container lookups, startup cleanup, named volumes, and private state then
+use that scoped value. The default is `false`, preserving existing resource
+names. The opt-in fails at startup if any OpenShell containers or volumes still
+use the unscoped `sandbox_label`; delete those sandboxes with the old gateway
+before enabling it. Keep the gateway service under the same host UID afterward.
+
+Each gateway still needs a distinct loopback bind port and its own client
+registration. Package-managed port selection is not yet available. This
+separates users through OpenShell's gateway and driver; a user who can access
+the Docker daemon directly can inspect or alter other users' containers.
 
 `supervisor_network_mode` accepts `host` (the default), `bridge`, or `auto`.
 `auto` also selects host; the driver does not infer a mode from the workload runtime.

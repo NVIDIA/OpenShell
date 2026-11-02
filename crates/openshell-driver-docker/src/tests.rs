@@ -2572,6 +2572,115 @@ fn managed_container_label_filters_include_gateway_namespace() {
 }
 
 #[test]
+fn host_uid_scope_separates_docker_resources() {
+    let mut config = DockerComputeConfig::default();
+    assert!(!config.scope_by_host_uid);
+    assert_eq!(docker_sandbox_namespace(&config, 1000), "default");
+
+    config.scope_by_host_uid = true;
+    let alice_namespace = docker_sandbox_namespace(&config, 1000);
+    let bob_namespace = docker_sandbox_namespace(&config, 1001);
+    assert_eq!(alice_namespace, "uid-1000-default");
+    assert_eq!(bob_namespace, "uid-1001-default");
+
+    let sandbox = test_sandbox();
+    let mut alice = runtime_config();
+    alice.sandbox_namespace = alice_namespace.clone();
+    let mut bob = runtime_config();
+    bob.sandbox_namespace = bob_namespace.clone();
+
+    let workload = build_container_create_body(&sandbox, &alice).unwrap();
+    assert_eq!(
+        workload.labels.unwrap().get(LABEL_SANDBOX_NAMESPACE),
+        Some(&alice_namespace)
+    );
+    let supervisor =
+        docker_auxiliary_container_labels(&sandbox, &alice, LABEL_ISOLATION_ROLE_SUPERVISOR);
+    assert_eq!(
+        supervisor.get(LABEL_SANDBOX_NAMESPACE),
+        Some(&alice_namespace)
+    );
+    let resolver = docker_host_gateway_resolver_body("supervisor:test", &alice_namespace);
+    assert_eq!(
+        resolver.labels.unwrap().get(LABEL_SANDBOX_NAMESPACE),
+        Some(&alice_namespace)
+    );
+
+    let alice_filters = managed_container_label_filters(&alice_namespace, []);
+    let bob_filters = managed_container_label_filters(&bob_namespace, []);
+    assert_ne!(alice_filters, bob_filters);
+    assert_ne!(
+        docker_channel_volume_name(&sandbox, &alice),
+        docker_channel_volume_name(&sandbox, &bob)
+    );
+    assert_ne!(
+        docker_supervisor_volume_name(&sandbox, &alice),
+        docker_supervisor_volume_name(&sandbox, &bob)
+    );
+}
+
+#[test]
+fn host_uid_scope_is_opt_in_through_docker_config() {
+    let config: DockerComputeConfig = toml::from_str("scope_by_host_uid = true").unwrap();
+    assert!(config.scope_by_host_uid);
+    assert_eq!(docker_sandbox_namespace(&config, 1000), "uid-1000-default");
+}
+
+#[tokio::test]
+async fn host_uid_scope_rejects_legacy_containers_and_volumes() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    for (containers, volumes, allowed) in [
+        ("[]", r#"{"Volumes":[]}"#, true),
+        (r#"[{"Id":"legacy"}]"#, r#"{"Volumes":[]}"#, false),
+        (
+            "[]",
+            r#"{"Volumes":[{"Name":"legacy","Driver":"local","Mountpoint":"/tmp/legacy","Labels":{},"Options":{},"Scope":"local"}]}"#,
+            false,
+        ),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (path, body) in [("/containers/json", containers), ("/volumes", volumes)] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let length = socket.read(&mut request).await.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..length]).contains(path),
+                    "unexpected Docker API request"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let docker = Docker::connect_with_http(
+            &format!("http://{address}"),
+            2,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        let result = reject_unscoped_docker_resources(&docker, "default").await;
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.is_ok(), allowed);
+        if let Err(error) = result {
+            assert!(
+                error
+                    .to_string()
+                    .contains("empty unscoped Docker namespace"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
 fn build_container_create_body_replaces_inherited_cmd_with_sandbox_bootstrap() {
     let create_body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
 

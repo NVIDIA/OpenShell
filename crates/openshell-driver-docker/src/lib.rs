@@ -195,8 +195,12 @@ pub struct DockerComputeConfig {
     /// Image pull policy for sandbox images.
     pub image_pull_policy: ImagePullPolicy,
 
-    /// Value of the `openshell.sandbox_namespace` label applied to Docker sandboxes.
+    /// Value of the `openshell.ai/sandbox-namespace` label applied to Docker sandboxes.
     pub sandbox_label: String,
+
+    /// Scope Docker-managed resources to the gateway process's host UID.
+    /// Enable only after removing resources in the unscoped namespace.
+    pub scope_by_host_uid: bool,
 
     /// Gateway gRPC endpoint the sandbox connects back to.
     pub grpc_endpoint: String,
@@ -323,6 +327,7 @@ impl Default for DockerComputeConfig {
             default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: ImagePullPolicy::default(),
             sandbox_label: "default".to_string(),
+            scope_by_host_uid: false,
             grpc_endpoint: String::new(),
             supervisor_otlp_endpoint: None,
             supervisor_network_mode: DockerSupervisorNetworkMode::Host,
@@ -345,6 +350,47 @@ impl Default for DockerComputeConfig {
             app_armor_profile: None,
         }
     }
+}
+
+fn docker_sandbox_namespace(config: &DockerComputeConfig, host_uid: u32) -> String {
+    if config.scope_by_host_uid {
+        format!("uid-{host_uid}-{}", config.sandbox_label)
+    } else {
+        config.sandbox_label.clone()
+    }
+}
+
+async fn reject_unscoped_docker_resources(docker: &Docker, namespace: &str) -> CoreResult<()> {
+    let filters = managed_resource_label_filters(namespace, []);
+    let containers = docker
+        .list_containers(Some(
+            ListContainersOptionsBuilder::default()
+                .all(true)
+                .filters(&filters)
+                .build(),
+        ))
+        .await
+        .map_err(|error| {
+            Error::execution(format!(
+                "failed to list unscoped Docker containers: {error}"
+            ))
+        })?;
+    let volumes = docker
+        .list_volumes(Some(
+            ListVolumesOptionsBuilder::default()
+                .filters(&filters)
+                .build(),
+        ))
+        .await
+        .map_err(|error| {
+            Error::execution(format!("failed to list unscoped Docker volumes: {error}"))
+        })?;
+    if !containers.is_empty() || volumes.volumes.is_some_and(|volumes| !volumes.is_empty()) {
+        return Err(Error::config(format!(
+            "scope_by_host_uid requires an empty unscoped Docker namespace '{namespace}'; remove its OpenShell containers and volumes before enabling it"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -914,6 +960,8 @@ impl DockerComputeDriver {
         network_trust: Option<NetworkSupervisorTrustBundle>,
     ) -> CoreResult<Self> {
         docker_config.validate_configuration(gateway_bind_address)?;
+        let sandbox_namespace =
+            docker_sandbox_namespace(docker_config, rustix::process::geteuid().as_raw());
         let socket_path = docker_config
             .socket_path
             .clone()
@@ -933,6 +981,9 @@ impl DockerComputeDriver {
         docker.version().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon version: {err}"))
         })?;
+        if docker_config.scope_by_host_uid {
+            reject_unscoped_docker_resources(&docker, &docker_config.sandbox_label).await?;
+        }
         let info = docker.info().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon info: {err}"))
         })?;
@@ -986,7 +1037,7 @@ impl DockerComputeDriver {
                 matches!(endpoint.host(), Some(url::Host::Domain(host)) if host.eq_ignore_ascii_case(HOST_DOCKER_INTERNAL))
             })
         {
-            Some(resolve_docker_host_gateway(&docker, &supervisor_image_id, &docker_config.sandbox_label).await?)
+            Some(resolve_docker_host_gateway(&docker, &supervisor_image_id, &sandbox_namespace).await?)
         } else {
             docker_supervisor_host_address(&supervisor_grpc_endpoint)
         };
@@ -1021,7 +1072,7 @@ impl DockerComputeDriver {
             config: DockerDriverRuntimeConfig {
                 default_image: docker_config.default_image.clone(),
                 image_pull_policy: docker_config.image_pull_policy,
-                sandbox_namespace: docker_config.sandbox_label.clone(),
+                sandbox_namespace,
                 stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
                 log_level: gateway_log_level.to_string(),
                 sandbox_binary,

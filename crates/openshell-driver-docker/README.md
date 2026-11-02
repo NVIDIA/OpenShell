@@ -25,6 +25,17 @@ label resolver and are denied under enforcement. GPU devices are temporarily
 exempt. Inspect labels again before launch, restart, and during reconciliation.
 See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission).
 
+`scope_by_host_uid = true` under `[openshell.drivers.docker]` derives the
+driver's existing sandbox namespace from the gateway process's effective host
+UID and `sandbox_label` (`uid-<uid>-<sandbox_label>`). The same namespace flows
+through workload, supervisor, staging, and identity container labels; container
+queries and startup cleanup; volume labels and names; and private host state.
+The default remains unscoped for compatibility. Opt-in fails before driver
+reconciliation when OpenShell containers or volumes still have the unscoped
+label, avoiding an invisible legacy sandbox after a config change. Delete old
+sandboxes through the original gateway before enabling the option. The scope
+separates OS users through OpenShell, but Docker daemon access can bypass it.
+
 The driver creates two containers for each sandbox:
 
 - `openshell-sandbox` is PID 1 in the workload container. It owns the workload
