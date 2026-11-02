@@ -17,6 +17,7 @@ fn allowed_decision(intent: EgressIntent) -> EgressDecision {
         identity: ProcessIdentityEvidence::Available,
         endpoint: EndpointDecision::default(),
         binary: Some(PathBuf::from("/usr/bin/curl")),
+        binary_sha256: None,
         binary_pid: Some(42),
         ancestors: vec![PathBuf::from("/usr/bin/sh")],
         cmdline_paths: vec![],
@@ -224,17 +225,20 @@ fn representative_adapter_denials_preserve_ocsf_fields() {
 #[test]
 fn representative_adapter_allows_preserve_ocsf_fields() {
     let peer: SocketAddr = "127.0.0.1:41000".parse().unwrap();
-    let connect = serde_json::to_value(build_connect_allow_ocsf_event(
-        peer,
-        "target.example",
-        8443,
-        "/usr/bin/curl",
-        "42",
-        "/usr/bin/sh",
-        "curl --proxy",
-        "proxy_compatibility",
-        true,
-    ))
+    let connect = serde_json::to_value(build_connect_allow_ocsf_event(ConnectAllowAudit {
+        workload: peer,
+        upstream_socket_local: "127.0.0.1:41001".parse().unwrap(),
+        upstream_socket_peer: "127.0.0.1:8443".parse().unwrap(),
+        host: "target.example",
+        port: 8443,
+        binary: "/usr/bin/curl",
+        binary_sha256: Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        pid: "42",
+        ancestors: "/usr/bin/sh",
+        cmdline: "curl --proxy",
+        policy: "proxy_compatibility",
+        l7_inspection: true,
+    }))
     .unwrap();
     assert_eq!(connect["class_name"], "Network Activity");
     assert_eq!(connect["activity_name"], "Open");
@@ -248,6 +252,18 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
     assert_eq!(connect["firewall_rule"]["name"], "proxy_compatibility");
     assert_eq!(connect["firewall_rule"]["type"], "opa");
     assert_eq!(connect["message"], "CONNECT_L7 allowed target.example:8443");
+    assert_eq!(
+        connect["unmapped"]["upstream_socket_local"],
+        "127.0.0.1:41001"
+    );
+    assert_eq!(
+        connect["unmapped"]["upstream_socket_peer"],
+        "127.0.0.1:8443"
+    );
+    assert_eq!(
+        connect["unmapped"]["binary_sha256"],
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
 
     let forward = serde_json::to_value(build_forward_allow_ocsf_event(
         peer,
@@ -277,6 +293,66 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
         forward["message"],
         "FORWARD allowed GET target.example:8080/v1/items"
     );
+}
+
+#[tokio::test]
+async fn allowed_connect_event_matches_each_receivers_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (mut first_receiver, _) = listener.accept().await.unwrap();
+    let second = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (second_receiver, _) = listener.accept().await.unwrap();
+    let mut first = upstream_proxy::PrefixedStream::without_prefix(first);
+    let second = upstream_proxy::PrefixedStream::without_prefix(second);
+
+    let event_for = |stream: &upstream_proxy::PrefixedStream, binary: &str| {
+        serde_json::to_value(build_connect_allow_ocsf_event(ConnectAllowAudit {
+            workload: "127.0.0.1:40000".parse().unwrap(),
+            upstream_socket_local: stream.local_addr().unwrap(),
+            upstream_socket_peer: stream.peer_addr().unwrap(),
+            host: "host.openshell.internal",
+            port: listener.local_addr().unwrap().port(),
+            binary,
+            binary_sha256: None,
+            pid: "-",
+            ancestors: "/usr/bin/sh",
+            cmdline: "-",
+            policy: "host_proxy",
+            l7_inspection: false,
+        }))
+        .unwrap()
+    };
+    let first_event = event_for(&first, "/usr/bin/curl");
+    let second_event = event_for(&second, "/usr/bin/python3");
+
+    assert_eq!(
+        first_event["unmapped"]["upstream_socket_local"],
+        first_receiver.peer_addr().unwrap().to_string()
+    );
+    assert_eq!(
+        second_event["unmapped"]["upstream_socket_local"],
+        second_receiver.peer_addr().unwrap().to_string()
+    );
+    assert_ne!(
+        first_event["unmapped"]["upstream_socket_local"],
+        second_event["unmapped"]["upstream_socket_local"]
+    );
+    assert_eq!(
+        first_event["unmapped"]["upstream_socket_peer"],
+        first_receiver.local_addr().unwrap().to_string()
+    );
+    assert_eq!(first_event["actor"]["process"]["name"], "/usr/bin/curl");
+    assert_eq!(second_event["actor"]["process"]["name"], "/usr/bin/python3");
+    assert!(first_event["unmapped"].get("binary_sha256").is_none());
+
+    first.write_all(b"request").await.unwrap();
+    let mut received = [0_u8; 7];
+    first_receiver.read_exact(&mut received).await.unwrap();
+    assert_eq!(&received, b"request");
 }
 
 #[test]

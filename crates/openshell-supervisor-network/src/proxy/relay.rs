@@ -376,6 +376,7 @@ mod tests {
             identity: ProcessIdentityEvidence::Available,
             endpoint: EndpointDecision::default(),
             binary: None,
+            binary_sha256: None,
             binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],

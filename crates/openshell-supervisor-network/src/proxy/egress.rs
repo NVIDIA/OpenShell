@@ -162,6 +162,8 @@ pub(super) struct EgressDecision {
     pub(super) endpoint: EndpointDecision,
     /// Resolved binary path.
     pub(super) binary: Option<PathBuf>,
+    /// Digest used to authorize the executable, when identity was available.
+    pub(super) binary_sha256: Option<String>,
     /// PID owning the socket.
     pub(super) binary_pid: Option<u32>,
     /// Ancestor binary paths from process tree walk.
@@ -251,6 +253,7 @@ mod tests {
             identity: ProcessIdentityEvidence::Available,
             endpoint: EndpointDecision::default(),
             binary: None,
+            binary_sha256: None,
             binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],

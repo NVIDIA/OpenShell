@@ -809,6 +809,16 @@ impl PrefixedStream {
         }
     }
 
+    /// Return the local address of the socket connected to the immediate
+    /// upstream peer. The peer sees this address as its remote address when
+    /// the connection is direct.
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        match &self.inner {
+            UpstreamStream::Plain(s) => s.local_addr(),
+            UpstreamStream::Tls(s) => s.get_ref().0.local_addr(),
+        }
+    }
+
     /// Return the HTTP CONNECT target for a proxied tunnel. An IP target is
     /// the exact validated destination selected by the fallback loop; a
     /// hostname target means the corporate proxy performs resolution.

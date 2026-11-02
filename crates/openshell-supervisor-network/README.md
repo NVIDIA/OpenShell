@@ -41,3 +41,15 @@ at debug, and emits no OCSF denial event: a standard OpenTelemetry SDK retries
 for the life of the agent, and one event per retry would flood the OCSF log.
 The supervisor installs its OTLP relay receiver as the handler while the agent
 trace relay is active.
+
+## Upstream socket audit
+
+Allowed CONNECT and transparent TCP `NetworkActivity` events record the
+immediate upstream socket's local and peer addresses in
+`unmapped.upstream_socket_local` and `unmapped.upstream_socket_peer`. The local
+address is captured from the connected `PrefixedStream` before relay starts.
+For a direct connection without address translation, it matches the peer
+address observed by the receiver.
+When an upstream proxy is configured, the peer address names that proxy. These
+events also include `unmapped.binary_sha256` when the executable digest was
+available to the authorization decision. The relay byte stream is unchanged.

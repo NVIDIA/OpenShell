@@ -1372,6 +1372,7 @@ async fn handle_transparent_tcp_connection(
             .into_diagnostic()?;
     drop(dial_span);
     drop(connect_span);
+    let upstream_socket_local = upstream.local_addr().into_diagnostic()?;
     let upstream_socket_peer = upstream.peer_addr().into_diagnostic()?;
     let (connected_real_destination, dial_mode) = match upstream.connect_target() {
         Some(upstream_proxy::ConnectTarget::Ip(ip)) => (
@@ -1414,6 +1415,12 @@ async fn handle_transparent_tcp_connection(
     let pid = decision
         .binary_pid
         .map_or_else(|| "-".to_string(), |pid| pid.to_string());
+    let ancestors = decision
+        .ancestors
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" -> ");
     ocsf_emit!(build_transparent_tcp_allow_ocsf_event(
         TransparentTcpAllowAudit {
             workload: workload_addr,
@@ -1421,6 +1428,7 @@ async fn handle_transparent_tcp_connection(
             normalized_domain: &host,
             approved_real_ip_candidates: &approved_real_ip_candidates,
             connected_real_destination,
+            upstream_socket_local,
             upstream_socket_peer,
             dial_mode,
             mapping_id: mapping.record.mapping_id,
@@ -1428,7 +1436,9 @@ async fn handle_transparent_tcp_connection(
             mapping_policy_generation: mapping.record.policy_generation,
             authorization_policy_generation: decision.policy_generation,
             binary: &binary,
+            binary_sha256: decision.binary_sha256.as_deref(),
             pid: &pid,
+            ancestors: &ancestors,
             policy_name,
         }
     ));
@@ -1443,6 +1453,7 @@ struct TransparentTcpAllowAudit<'a> {
     normalized_domain: &'a str,
     approved_real_ip_candidates: &'a [SocketAddr],
     connected_real_destination: Option<SocketAddr>,
+    upstream_socket_local: SocketAddr,
     upstream_socket_peer: SocketAddr,
     dial_mode: &'a str,
     mapping_id: uuid::Uuid,
@@ -1450,7 +1461,9 @@ struct TransparentTcpAllowAudit<'a> {
     mapping_policy_generation: u64,
     authorization_policy_generation: u64,
     binary: &'a str,
+    binary_sha256: Option<&'a str>,
     pid: &'a str,
+    ancestors: &'a str,
     policy_name: &'a str,
 }
 
@@ -1487,7 +1500,11 @@ fn build_transparent_tcp_allow_ocsf_event(
             audit.synthetic_destination.port(),
         ))
         .src_endpoint_addr(audit.workload.ip(), audit.workload.port())
-        .actor_process(Process::from_bypass(audit.binary, audit.pid, ""))
+        .actor_process(Process::from_bypass(
+            audit.binary,
+            audit.pid,
+            audit.ancestors,
+        ))
         .firewall_rule(audit.policy_name, "opa")
         .unmapped("matched_policy", audit.policy_name)
         .unmapped("normalized_domain", audit.normalized_domain)
@@ -1499,6 +1516,10 @@ fn build_transparent_tcp_allow_ocsf_event(
         .unmapped(
             "approved_real_ip_candidates",
             serde_json::json!(approved_real_ip_candidates),
+        )
+        .unmapped(
+            "upstream_socket_local",
+            audit.upstream_socket_local.to_string(),
         )
         .unmapped(
             "upstream_socket_peer",
@@ -1517,6 +1538,9 @@ fn build_transparent_tcp_allow_ocsf_event(
         .status_detail("transparent_tcp_allowed");
     if let Some(destination) = audit.connected_real_destination {
         builder = builder.unmapped("connected_real_destination", destination.to_string());
+    }
+    if let Some(digest) = audit.binary_sha256 {
+        builder = builder.unmapped("binary_sha256", digest);
     }
     builder.build()
 }
@@ -2002,35 +2026,56 @@ fn emit_denial_simple(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_connect_allow_ocsf_event(
-    peer_addr: SocketAddr,
-    host: &str,
+struct ConnectAllowAudit<'a> {
+    workload: SocketAddr,
+    upstream_socket_local: SocketAddr,
+    upstream_socket_peer: SocketAddr,
+    host: &'a str,
     port: u16,
-    binary: &str,
-    pid: &str,
-    ancestors: &str,
-    cmdline: &str,
-    policy: &str,
+    binary: &'a str,
+    binary_sha256: Option<&'a str>,
+    pid: &'a str,
+    ancestors: &'a str,
+    cmdline: &'a str,
+    policy: &'a str,
     l7_inspection: bool,
-) -> openshell_ocsf::OcsfEvent {
-    let connect_msg = if l7_inspection {
+}
+
+fn build_connect_allow_ocsf_event(audit: ConnectAllowAudit<'_>) -> openshell_ocsf::OcsfEvent {
+    let connect_msg = if audit.l7_inspection {
         "CONNECT_L7"
     } else {
         "CONNECT"
     };
-    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    let mut builder = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Open)
         .action(ActionId::Allowed)
         .disposition(DispositionId::Allowed)
         .severity(SeverityId::Informational)
         .status(StatusId::Success)
-        .dst_endpoint(Endpoint::from_domain(host, port))
-        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
-        .firewall_rule(policy, "opa")
-        .message(format!("{connect_msg} allowed {host}:{port}"))
-        .build()
+        .dst_endpoint(Endpoint::from_domain(audit.host, audit.port))
+        .src_endpoint_addr(audit.workload.ip(), audit.workload.port())
+        .actor_process(
+            Process::from_bypass(audit.binary, audit.pid, audit.ancestors)
+                .with_cmd_line(audit.cmdline),
+        )
+        .firewall_rule(audit.policy, "opa")
+        .unmapped(
+            "upstream_socket_local",
+            audit.upstream_socket_local.to_string(),
+        )
+        .unmapped(
+            "upstream_socket_peer",
+            audit.upstream_socket_peer.to_string(),
+        )
+        .message(format!(
+            "{connect_msg} allowed {}:{}",
+            audit.host, audit.port
+        ));
+    if let Some(digest) = audit.binary_sha256 {
+        builder = builder.unmapped("binary_sha256", digest);
+    }
+    builder.build()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3108,6 +3153,8 @@ async fn handle_mediated_connection(
             .await?;
         return Ok(());
     }
+    let upstream_socket_local = upstream.local_addr().into_diagnostic()?;
+    let upstream_socket_peer = upstream.peer_addr().into_diagnostic()?;
 
     drop(dial_span);
     drop(connect_span);
@@ -3118,17 +3165,20 @@ async fn handle_mediated_connection(
 
     // Log the allowed CONNECT — use CONNECT_L7 when L7 inspection follows,
     // so log consumers can distinguish L4-only decisions from tunnel lifecycle events.
-    ocsf_emit!(build_connect_allow_ocsf_event(
-        workload_addr,
-        &host_lc,
+    ocsf_emit!(build_connect_allow_ocsf_event(ConnectAllowAudit {
+        workload: workload_addr,
+        upstream_socket_local,
+        upstream_socket_peer,
+        host: &host_lc,
         port,
-        &binary_str,
-        &pid_str,
-        &ancestors_str,
-        &cmdline_str,
-        policy_str,
-        should_inspect_l7,
-    ));
+        binary: &binary_str,
+        binary_sha256: decision.binary_sha256.as_deref(),
+        pid: &pid_str,
+        ancestors: &ancestors_str,
+        cmdline: &cmdline_str,
+        policy: policy_str,
+        l7_inspection: should_inspect_l7,
+    }));
     emit_connect_activity_if_l4_only(&activity_tx, l7_route);
 
     // `effective_tls_skip` was resolved before the `200` above (the fail-closed
@@ -3669,6 +3719,7 @@ fn authorize_egress_intent_inner(
             identity,
             endpoint: EndpointDecision::default(),
             binary,
+            binary_sha256: None,
             binary_pid,
             ancestors,
             cmdline_paths,
@@ -3726,6 +3777,7 @@ fn authorize_egress_intent_inner(
             identity: ProcessIdentityEvidence::Available,
             endpoint: EndpointDecision::from_authorization(&authorization),
             binary: Some(bin_path),
+            binary_sha256: Some(input.binary_sha256),
             binary_pid: Some(binary_pid),
             ancestors,
             cmdline_paths,
@@ -3774,6 +3826,7 @@ fn evaluate_endpoint_only_opa_inner(engine: &OpaEngine, intent: EgressIntent) ->
             ),
             endpoint: EndpointDecision::from_authorization(&authorization),
             binary: None,
+            binary_sha256: None,
             binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
@@ -3789,6 +3842,7 @@ fn evaluate_endpoint_only_opa_inner(engine: &OpaEngine, intent: EgressIntent) ->
             ),
             endpoint: EndpointDecision::default(),
             binary: None,
+            binary_sha256: None,
             binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
@@ -3850,6 +3904,7 @@ fn authorize_supplied_identity_with_denial_inner(
         identity: ProcessIdentityEvidence::Unavailable(IdentityUnavailableReason::LookupFailed),
         endpoint: EndpointDecision::default(),
         binary,
+        binary_sha256: None,
         binary_pid: None,
         ancestors,
         cmdline_paths,
@@ -3909,6 +3964,7 @@ fn authorize_supplied_identity_with_denial_inner(
             identity: ProcessIdentityEvidence::Available,
             endpoint: EndpointDecision::from_authorization(&authorization),
             binary: Some(identity.executable.path.clone()),
+            binary_sha256: Some(digest.to_string()),
             binary_pid: None,
             ancestors: ancestor_paths,
             cmdline_paths: identity.cmdline_paths.clone(),
@@ -3946,6 +4002,7 @@ fn authorize_egress_intent_inner(
         ),
         endpoint: EndpointDecision::default(),
         binary: None,
+        binary_sha256: None,
         binary_pid: None,
         ancestors: vec![],
         cmdline_paths: vec![],
@@ -7284,6 +7341,10 @@ process:
         );
 
         assert_eq!(query_allowed_ips(&decision), ["192.0.2.0/24"]);
+        assert_eq!(
+            decision.binary_sha256.as_deref(),
+            Some("00".repeat(32).as_str())
+        );
         hydrate_l7_route(&mut decision);
         let route = decision
             .endpoint
@@ -10555,6 +10616,7 @@ network_policies:
                 "172.18.0.5:6379".parse().unwrap(),
             ],
             connected_real_destination: Some("172.18.0.5:6379".parse().unwrap()),
+            upstream_socket_local: "127.0.0.1:43000".parse().unwrap(),
             upstream_socket_peer: "172.18.0.5:6379".parse().unwrap(),
             dial_mode: "direct",
             mapping_id,
@@ -10562,7 +10624,9 @@ network_policies:
             mapping_policy_generation: 7,
             authorization_policy_generation: 7,
             binary: "/sandbox/.venv/bin/python3",
+            binary_sha256: Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
             pid: "42",
+            ancestors: "/usr/bin/sh",
             policy_name: "redis",
         });
         let json = event.to_json().unwrap();
@@ -10572,7 +10636,10 @@ network_policies:
             json["actor"]["process"]["name"],
             "/sandbox/.venv/bin/python3"
         );
-        assert!(json["actor"]["process"].get("parent_process").is_none());
+        assert_eq!(
+            json["actor"]["process"]["parent_process"]["name"],
+            "/usr/bin/sh"
+        );
         assert_eq!(json["dst_endpoint"]["domain"], "redis.openshell.demo");
         assert_eq!(json["firewall_rule"]["name"], "redis");
         assert_eq!(json["unmapped"]["synthetic_destination"], "198.18.0.7:6379");
@@ -10590,6 +10657,11 @@ network_policies:
         assert_eq!(json["unmapped"]["mapping_policy_generation"], 7);
         assert_eq!(json["unmapped"]["matched_policy"], "redis");
         assert_eq!(json["unmapped"]["dial_mode"], "direct");
+        assert_eq!(json["unmapped"]["upstream_socket_local"], "127.0.0.1:43000");
+        assert_eq!(
+            json["unmapped"]["binary_sha256"],
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
 
         let shorthand = event.format_shorthand();
         assert!(shorthand.contains("/sandbox/.venv/bin/python3(42)"));
@@ -10607,6 +10679,7 @@ network_policies:
             normalized_domain: "redis.openshell.demo",
             approved_real_ip_candidates: &["172.18.0.4:6379".parse().unwrap()],
             connected_real_destination: Some("172.18.0.4:6379".parse().unwrap()),
+            upstream_socket_local: "127.0.0.1:43001".parse().unwrap(),
             upstream_socket_peer: "192.0.2.20:3128".parse().unwrap(),
             dial_mode: "upstream_proxy_validated_ip",
             mapping_id: uuid::Uuid::new_v4(),
@@ -10614,7 +10687,9 @@ network_policies:
             mapping_policy_generation: 7,
             authorization_policy_generation: 7,
             binary: "/usr/bin/redis-cli",
+            binary_sha256: None,
             pid: "43",
+            ancestors: "",
             policy_name: "redis",
         });
         let json = event.to_json().unwrap();
@@ -10624,6 +10699,8 @@ network_policies:
             "172.18.0.4:6379"
         );
         assert_eq!(json["unmapped"]["upstream_socket_peer"], "192.0.2.20:3128");
+        assert_eq!(json["unmapped"]["upstream_socket_local"], "127.0.0.1:43001");
+        assert!(json["unmapped"].get("binary_sha256").is_none());
         assert_eq!(json["unmapped"]["dial_mode"], "upstream_proxy_validated_ip");
         assert!(event.format_shorthand().contains("real=172.18.0.4:6379"));
     }
@@ -11833,6 +11910,7 @@ network_policies:
             identity: ProcessIdentityEvidence::Available,
             endpoint: EndpointDecision::from_authorization(&authorization),
             binary: Some(PathBuf::from("/usr/bin/node")),
+            binary_sha256: None,
             binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
@@ -15453,6 +15531,7 @@ network_policies:
                 identity: ProcessIdentityEvidence::Available,
                 endpoint: EndpointDecision::from_authorization(&authorization),
                 binary: Some(input.binary_path),
+                binary_sha256: None,
                 binary_pid: Some(1),
                 ancestors: vec![],
                 cmdline_paths: vec![],
