@@ -79,3 +79,26 @@ def _check_types(path: Path) -> subprocess.CompletedProcess[str]:
         text=True,
         check=False,
     )
+
+
+def test_async_sdk_consumer_types(tmp_path: Path) -> None:
+    source = """
+from typing import assert_type
+from openshell import AsyncSandboxClient, AsyncPager, SandboxRef, ExecResult, DeletionResult
+
+async def check(client: AsyncSandboxClient) -> None:
+    assert_type(await client.get("worker", workspace="team"), SandboxRef)
+    assert_type(await client.create(workspace="team"), SandboxRef)
+    assert_type(client.list(workspace="team"), AsyncPager[SandboxRef])
+    assert_type(await client.list_all(workspace="team"), list[SandboxRef])
+    assert_type(await client.exec("worker", ["echo"], workspace="team"), ExecResult)
+    assert_type(await client.delete("worker", workspace="team"), DeletionResult)
+"""
+    path = tmp_path / "sdk_consumer.py"
+    path.write_text(source)
+    result = _check_types(path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    path.write_text(source.replace('workspace="team"', "workspace=123"))
+    result = _check_types(path)
+    assert result.returncode != 0
+    assert "invalid-argument-type" in result.stdout

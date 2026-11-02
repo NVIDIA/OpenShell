@@ -187,7 +187,7 @@ class _ClientCallDetails(_ClientCallDetailsBase, grpc.ClientCallDetails):
 
 if TYPE_CHECKING:
     import builtins
-    from collections.abc import Callable, Iterator, Mapping, Sequence
+    from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 
     from .providers import ProviderClient
 
@@ -760,6 +760,7 @@ class SandboxClient:
         self._timeout = timeout
         self._cluster_name = cluster_name
         self._bearer_close = _bearer_close
+        self._owns_channel = True
         if tls is None:
             self._channel = grpc.insecure_channel(endpoint)
         else:
@@ -892,6 +893,20 @@ class SandboxClient:
             _bearer_close=bearer_close,
         )
 
+    @classmethod
+    def from_channel(
+        cls, channel: grpc.Channel, *, timeout: float = 30.0
+    ) -> SandboxClient:
+        """Borrow a caller-configured channel without taking ownership of it."""
+        client = cls.__new__(cls)
+        client._channel = channel
+        client._stub = openshell_pb2_grpc.OpenShellStub(_error_mapping_channel(channel))
+        client._timeout = timeout
+        client._owns_channel = False
+        client._owners = _OwnerCache()
+        client._bearer_close = None
+        return client
+
     def close(self) -> None:
         """Release the gRPC channel and any bearer-auth resources.
 
@@ -900,7 +915,8 @@ class SandboxClient:
         closed here too — otherwise long-lived services that churn
         clients would leak sockets / file descriptors until GC.
         """
-        self._channel.close()
+        if self._owns_channel:
+            self._channel.close()
         if self._bearer_close is not None:
             with contextlib.suppress(Exception):
                 self._bearer_close()
@@ -912,8 +928,11 @@ class SandboxClient:
     def __exit__(self, *args: object) -> None:
         self.close()
 
-    def health(self) -> openshell_pb2.HealthResponse:
-        return self._stub.Health(openshell_pb2.HealthRequest(), timeout=self._timeout)
+    def health(self, *, timeout: float | None = None) -> openshell_pb2.HealthResponse:
+        return self._stub.Health(
+            openshell_pb2.HealthRequest(),
+            timeout=self._timeout if timeout is None else timeout,
+        )
 
     def create(
         self,
@@ -923,6 +942,8 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
+        timeout: float | None = None,
+        request_id: str | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
         response = self._stub.CreateSandbox(
@@ -932,8 +953,9 @@ class SandboxClient:
                 name=name or "",
                 labels=dict(labels) if labels else {},
                 service_exposures=_service_exposure_messages(service_exposures),
+                request_id=request_id or "",
             ),
-            timeout=self._timeout,
+            timeout=self._timeout if timeout is None else timeout,
         )
         sandbox_ref = _sandbox_ref(response.sandbox, response.service_urls)
         if sandbox_ref.id == "":
@@ -949,6 +971,8 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
+        timeout: float | None = None,
+        request_id: str | None = None,
     ) -> SandboxRef:
         if not workload_template.strip():
             raise SandboxError("workload_template is required")
@@ -961,8 +985,9 @@ class SandboxClient:
                 labels=dict(labels) if labels else {},
                 workload_template=workload_template,
                 service_exposures=_service_exposure_messages(service_exposures),
+                request_id=request_id or "",
             ),
-            timeout=self._timeout,
+            timeout=self._timeout if timeout is None else timeout,
         )
         sandbox_ref = _sandbox_ref(response.sandbox, response.service_urls)
         if sandbox_ref.id == "":
@@ -1020,10 +1045,12 @@ class SandboxClient:
 
         return ProviderClient(self._channel, timeout=self._timeout)
 
-    def get(self, name: str, *, workspace: str) -> SandboxRef:
+    def get(
+        self, name: str, *, workspace: str, timeout: float | None = None
+    ) -> SandboxRef:
         response = self._stub.GetSandbox(
             _get_sandbox_request(name, workspace),
-            timeout=self._timeout,
+            timeout=self._timeout if timeout is None else timeout,
         )
         return _sandbox_ref(response.sandbox)
 
@@ -1037,6 +1064,7 @@ class SandboxClient:
         page_size: int = 100,
         page_token: str = "",
         label_selector: str | None = None,
+        timeout: float | None = None,
     ) -> Pager[SandboxRef]:
         def fetch(token: str) -> Page[SandboxRef]:
             response = self._stub.ListSandboxes(
@@ -1046,7 +1074,7 @@ class SandboxClient:
                     page_token=token,
                     label_selector=label_selector or "",
                 ),
-                timeout=self._timeout,
+                timeout=self._timeout if timeout is None else timeout,
             )
             return Page(
                 items=[_sandbox_ref(item) for item in response.sandboxes],
@@ -1076,6 +1104,7 @@ class SandboxClient:
         page_size: int = 100,
         page_token: str = "",
         label_selector: str | None = None,
+        timeout: float | None = None,
     ) -> Pager[SandboxRef]:
         def fetch(token: str) -> Page[SandboxRef]:
             response = self._stub.ListSandboxes(
@@ -1085,7 +1114,7 @@ class SandboxClient:
                     page_token=token,
                     label_selector=label_selector or "",
                 ),
-                timeout=self._timeout,
+                timeout=self._timeout if timeout is None else timeout,
             )
             return Page(
                 items=[_sandbox_ref(item) for item in response.sandboxes],
@@ -1138,41 +1167,66 @@ class SandboxClient:
         ]
 
     def delete(
-        self, name: str, *, workspace: str, allow_missing: bool = False
+        self,
+        name: str,
+        *,
+        workspace: str,
+        allow_missing: bool = False,
+        timeout: float | None = None,
+        request_id: str | None = None,
     ) -> DeletionResult:
         response = self._stub.DeleteSandbox(
             openshell_pb2.DeleteSandboxRequest(
                 workspace_scope=_workspace_scope(workspace),
                 name=name,
                 allow_missing=allow_missing,
+                request_id=request_id or "",
             ),
-            timeout=self._timeout,
+            timeout=self._timeout if timeout is None else timeout,
         )
         return DeletionResult(
             DeletionOutcome(response.outcome), response.sandbox_id or None
         )
 
-    def stop(self, name: str, *, workspace: str) -> SandboxRef:
+    def stop(
+        self,
+        name: str,
+        *,
+        workspace: str,
+        timeout: float | None = None,
+        request_id: str | None = None,
+    ) -> SandboxRef:
         response = self._stub.StopSandbox(
             openshell_pb2.StopSandboxRequest(
                 workspace_scope=_workspace_scope(workspace),
                 name=name,
+                request_id=request_id or "",
             ),
-            timeout=self._timeout,
+            timeout=self._timeout if timeout is None else timeout,
         )
         return _sandbox_ref(response.sandbox)
 
-    def start(self, name: str, *, workspace: str) -> SandboxRef:
+    def start(
+        self,
+        name: str,
+        *,
+        workspace: str,
+        timeout: float | None = None,
+        request_id: str | None = None,
+    ) -> SandboxRef:
         response = self._stub.StartSandbox(
             openshell_pb2.StartSandboxRequest(
                 workspace_scope=_workspace_scope(workspace),
                 name=name,
+                request_id=request_id or "",
             ),
-            timeout=self._timeout,
+            timeout=self._timeout if timeout is None else timeout,
         )
         return _sandbox_ref(response.sandbox)
 
-    def suspend(self, name: str, *, workspace: str) -> SandboxRef:
+    def suspend(
+        self, name: str, *, workspace: str, timeout: float | None = None
+    ) -> SandboxRef:
         """Suspend a ready sandbox, retaining its memory state.
 
         Requires a compute driver and isolation backend that support suspend
@@ -1180,10 +1234,9 @@ class SandboxClient:
         """
         response = self._stub.SuspendSandbox(
             openshell_pb2.SuspendSandboxRequest(
-                workspace_scope=_workspace_scope(workspace),
-                name=name,
+                workspace_scope=_workspace_scope(workspace), name=name
             ),
-            timeout=self._timeout,
+            timeout=self._timeout if timeout is None else timeout,
         )
         return _sandbox_ref(response.sandbox)
 
@@ -1193,6 +1246,7 @@ class SandboxClient:
         *,
         workspace: str,
         restart_if_restore_fails: bool = False,
+        timeout: float | None = None,
     ) -> SandboxRef:
         """Resume a suspended sandbox in a new runtime generation."""
         response = self._stub.ResumeSandbox(
@@ -1201,7 +1255,7 @@ class SandboxClient:
                 name=name,
                 restart_if_restore_fails=restart_if_restore_fails,
             ),
-            timeout=self._timeout,
+            timeout=self._timeout if timeout is None else timeout,
         )
         return _sandbox_ref(response.sandbox)
 
@@ -1312,10 +1366,11 @@ class SandboxClient:
         stdin: bytes | None = None,
         timeout_seconds: int | None = None,
         no_login_shell: bool = False,
+        timeout: float | None = None,
+        request_id: str | None = None,
     ) -> Iterator[ExecChunk | ExecResult]:
         if not command:
             raise SandboxError("command must not be empty")
-
         request = openshell_pb2.ExecSandboxRequest(
             workspace_scope=_workspace_scope(workspace),
             sandbox=sandbox,
@@ -1324,36 +1379,34 @@ class SandboxClient:
             environment=dict(env or {}),
             stdin=stdin or b"",
             no_login_shell=no_login_shell,
+            request_id=request_id or "",
         )
         if timeout_seconds:
             request.execution_timeout.seconds = timeout_seconds
-        # Use whichever is larger: the default client timeout or the command
-        # timeout plus headroom for SSH setup / teardown overhead.
-        grpc_deadline = self._timeout
-        if timeout_seconds and timeout_seconds + 10 > grpc_deadline:
+        grpc_deadline = self._timeout if timeout is None else timeout
+        if timeout is None and timeout_seconds and timeout_seconds + 10 > grpc_deadline:
             grpc_deadline = timeout_seconds + 10
         stream = self._open_exec(request, workspace, grpc_deadline)
-
         stdout_parts: list[bytes] = []
         stderr_parts: list[bytes] = []
         exit_code: int | None = None
-
-        for event in stream:
-            payload = event.WhichOneof("payload")
-            if payload == "stdout":
-                data = bytes(event.stdout.data)
-                stdout_parts.append(data)
-                yield ExecChunk(stream="stdout", data=data)
-            elif payload == "stderr":
-                data = bytes(event.stderr.data)
-                stderr_parts.append(data)
-                yield ExecChunk(stream="stderr", data=data)
-            elif payload == "exit":
-                exit_code = int(event.exit.exit_code)
-
+        try:
+            for event in stream:
+                payload = event.WhichOneof("payload")
+                if payload == "stdout":
+                    data = bytes(event.stdout.data)
+                    stdout_parts.append(data)
+                    yield ExecChunk(stream="stdout", data=data)
+                elif payload == "stderr":
+                    data = bytes(event.stderr.data)
+                    stderr_parts.append(data)
+                    yield ExecChunk(stream="stderr", data=data)
+                elif payload == "exit":
+                    exit_code = int(event.exit.exit_code)
+        finally:
+            stream.close()
         if exit_code is None:
             raise SandboxError("ExecSandbox stream ended without an exit event")
-
         yield ExecResult(
             exit_code=exit_code,
             stdout=b"".join(stdout_parts).decode("utf-8", errors="replace"),
@@ -1383,7 +1436,7 @@ class SandboxClient:
         request: openshell_pb2.ExecSandboxRequest,
         workspace: str,
         timeout: float,
-    ) -> Iterator[openshell_pb2.ExecSandboxEvent]:
+    ) -> Generator[openshell_pb2.ExecSandboxEvent, None, None]:
         """Open ExecSandbox on the owner replica, retrying once unrouted."""
         owner = self._owner_of(workspace, request.sandbox)
         if owner:
@@ -1401,9 +1454,20 @@ class SandboxClient:
             else:
                 if first is not None:
                     yield first
-                yield from events
+                try:
+                    yield from events
+                finally:
+                    events.cancel()
                 return
-        yield from self._stub.ExecSandbox(request, timeout=timeout)
+            finally:
+                events.cancel()
+        events = self._stub.ExecSandbox(request, timeout=timeout)
+        try:
+            yield from events
+        finally:
+            cancel = getattr(events, "cancel", None)
+            if cancel is not None:
+                cancel()
 
     def exec(
         self,
@@ -1498,6 +1562,8 @@ class SandboxTemplateClient:
         gpu_count: int | None = None,
         gpu: bool = False,
         driver_config: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
+        request_id: str | None = None,
     ) -> openshell_pb2.SandboxWorkloadTemplate:
         if template is None:
             if name is None or not name.strip():
@@ -1525,27 +1591,24 @@ class SandboxTemplateClient:
             raise SandboxError(
                 "template cannot be combined with template builder fields"
             )
-
         response = self._stub.CreateSandboxTemplate(
             openshell_pb2.CreateSandboxTemplateRequest(
                 workspace_scope=_workspace_scope(workspace),
                 template=template,
+                request_id=request_id or "",
             ),
-            timeout=self._timeout,
+            timeout=self._timeout if timeout is None else timeout,
         )
         return response.template
 
     def get(
-        self,
-        name: str,
-        *,
-        workspace: str,
+        self, name: str, *, workspace: str, timeout: float | None = None
     ) -> openshell_pb2.SandboxWorkloadTemplate:
         response = self._stub.GetSandboxTemplate(
             openshell_pb2.GetSandboxTemplateRequest(
                 workspace_scope=_workspace_scope(workspace), name=name
             ),
-            timeout=self._timeout,
+            timeout=self._timeout if timeout is None else timeout,
         )
         return response.template
 
@@ -1556,6 +1619,7 @@ class SandboxTemplateClient:
         page_size: int = 100,
         page_token: str = "",
         label_selector: str = "",
+        timeout: float | None = None,
     ) -> Pager[openshell_pb2.SandboxWorkloadTemplate]:
         def fetch(token: str) -> Page[openshell_pb2.SandboxWorkloadTemplate]:
             response = self._stub.ListSandboxTemplates(
@@ -1565,7 +1629,7 @@ class SandboxTemplateClient:
                     page_token=token,
                     label_selector=label_selector,
                 ),
-                timeout=self._timeout,
+                timeout=self._timeout if timeout is None else timeout,
             )
             return Page(
                 items=list(response.templates),
@@ -1595,6 +1659,7 @@ class SandboxTemplateClient:
         page_size: int = 100,
         page_token: str = "",
         label_selector: str = "",
+        timeout: float | None = None,
     ) -> Pager[openshell_pb2.SandboxWorkloadTemplate]:
         def fetch(token: str) -> Page[openshell_pb2.SandboxWorkloadTemplate]:
             response = self._stub.ListSandboxTemplates(
@@ -1604,7 +1669,7 @@ class SandboxTemplateClient:
                     page_token=token,
                     label_selector=label_selector,
                 ),
-                timeout=self._timeout,
+                timeout=self._timeout if timeout is None else timeout,
             )
             return Page(
                 items=list(response.templates),
@@ -1627,15 +1692,22 @@ class SandboxTemplateClient:
         ).all()
 
     def delete(
-        self, name: str, *, workspace: str, allow_missing: bool = False
+        self,
+        name: str,
+        *,
+        workspace: str,
+        allow_missing: bool = False,
+        timeout: float | None = None,
+        request_id: str | None = None,
     ) -> DeletionResult:
         response = self._stub.DeleteSandboxTemplate(
             openshell_pb2.DeleteSandboxTemplateRequest(
                 workspace_scope=_workspace_scope(workspace),
                 name=name,
                 allow_missing=allow_missing,
+                request_id=request_id or "",
             ),
-            timeout=self._timeout,
+            timeout=self._timeout if timeout is None else timeout,
         )
         return DeletionResult(DeletionOutcome(response.outcome))
 
@@ -1672,20 +1744,23 @@ class WorkspaceClient:
         name: str,
         *,
         labels: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        request_id: str | None = None,
     ) -> WorkspaceRef:
         response = self._stub.CreateWorkspace(
             openshell_pb2.CreateWorkspaceRequest(
                 name=name,
                 labels=dict(labels) if labels else {},
+                request_id=request_id or "",
             ),
-            timeout=self._timeout,
+            timeout=self._timeout if timeout is None else timeout,
         )
         return _workspace_ref(response.workspace)
 
-    def get(self, name: str) -> WorkspaceRef:
+    def get(self, name: str, *, timeout: float | None = None) -> WorkspaceRef:
         response = self._stub.GetWorkspace(
             openshell_pb2.GetWorkspaceRequest(name=name),
-            timeout=self._timeout,
+            timeout=self._timeout if timeout is None else timeout,
         )
         return _workspace_ref(response.workspace)
 
@@ -1695,6 +1770,7 @@ class WorkspaceClient:
         page_size: int = 100,
         page_token: str = "",
         label_selector: str | None = None,
+        timeout: float | None = None,
     ) -> Pager[WorkspaceRef]:
         def fetch(token: str) -> Page[WorkspaceRef]:
             response = self._stub.ListWorkspaces(
@@ -1703,7 +1779,7 @@ class WorkspaceClient:
                     page_token=token,
                     label_selector=label_selector or "",
                 ),
-                timeout=self._timeout,
+                timeout=self._timeout if timeout is None else timeout,
             )
             return Page(
                 items=[_workspace_ref(ws) for ws in response.workspaces],
@@ -1725,12 +1801,19 @@ class WorkspaceClient:
             label_selector=label_selector,
         ).all()
 
-    def delete(self, name: str, *, allow_missing: bool = False) -> DeletionResult:
+    def delete(
+        self,
+        name: str,
+        *,
+        allow_missing: bool = False,
+        timeout: float | None = None,
+        request_id: str | None = None,
+    ) -> DeletionResult:
         response = self._stub.DeleteWorkspace(
             openshell_pb2.DeleteWorkspaceRequest(
-                name=name, allow_missing=allow_missing
+                name=name, allow_missing=allow_missing, request_id=request_id or ""
             ),
-            timeout=self._timeout,
+            timeout=self._timeout if timeout is None else timeout,
         )
         return DeletionResult(DeletionOutcome(response.outcome))
 

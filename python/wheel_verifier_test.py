@@ -29,6 +29,8 @@ def _wheel_files() -> set[str]:
     files = {
         "openshell/__init__.py",
         "openshell/sandbox.py",
+        "openshell/aio.py",
+        "openshell/_async_runtime.py",
         "openshell/py.typed",
         "openshell/_proto/__init__.py",
     }

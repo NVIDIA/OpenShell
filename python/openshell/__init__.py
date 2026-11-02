@@ -5,6 +5,14 @@
 
 from __future__ import annotations
 
+from ._async_runtime import AsyncPager
+from .aio import (
+    AsyncProviderClient,
+    AsyncSandboxClient,
+    AsyncSandboxSession,
+    AsyncSandboxTemplateClient,
+    AsyncWorkspaceClient,
+)
 from .errors import ErrorInfo, FieldViolation, GatewayError, from_grpc_error
 from .mutations import DeletionOutcome, DeletionResult
 from .providers import ProviderClient, ProviderCredentialValue
@@ -38,6 +46,12 @@ except Exception:
     __version__ = "0.0.0"
 
 __all__ = [
+    "AsyncPager",
+    "AsyncProviderClient",
+    "AsyncSandboxClient",
+    "AsyncSandboxSession",
+    "AsyncSandboxTemplateClient",
+    "AsyncWorkspaceClient",
     "ClientCredentialsAuth",
     "DeletionOutcome",
     "DeletionResult",

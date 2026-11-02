@@ -57,6 +57,7 @@ class ProviderClient:
         *,
         workspace: str,
         minimum_remaining_lifetime: timedelta | None = None,
+        timeout: float | None = None,
     ) -> dict[str, ProviderCredentialValue]:
         """Export exactly the selected runtime keys, or raise without a result.
 
@@ -69,21 +70,20 @@ class ProviderClient:
             raise ValueError("an explicit canonical workspace is required")
         if not name or name.strip() != name or len(name.encode("utf-8")) > 253:
             raise ValueError("a canonical provider name is required")
-        # Copy the selection so caller mutation cannot change response validation.
         if isinstance(credential_keys, str):
             raise ValueError("select between 1 and 32 unique runtime environment keys")
         keys = list(credential_keys)
         if (
             not 1 <= len(keys) <= 32
             or any(
-                len(key) > 256 or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) is None
+                len(key) > 256 or re.fullmatch("[A-Za-z_][A-Za-z0-9_]*", key) is None
                 for key in keys
             )
             or len(set(keys)) != len(keys)
         ):
             raise ValueError("select between 1 and 32 unique runtime environment keys")
-        if minimum_remaining_lifetime is not None and not (
-            timedelta(0) <= minimum_remaining_lifetime <= timedelta(days=1)
+        if minimum_remaining_lifetime is not None and (
+            not timedelta(0) <= minimum_remaining_lifetime <= timedelta(days=1)
         ):
             raise ValueError(
                 "minimum_remaining_lifetime must be between zero and 24 hours"
@@ -95,17 +95,17 @@ class ProviderClient:
         )
         if minimum_remaining_lifetime is not None:
             request.minimum_remaining_lifetime.FromTimedelta(minimum_remaining_lifetime)
-        response = self._stub.GetProviderCredentials(request, timeout=self._timeout)
+        response = self._stub.GetProviderCredentials(
+            request, timeout=self._timeout if timeout is None else timeout
+        )
         if set(response.credentials) != set(keys):
             raise ValueError("gateway returned an unexpected credential selection")
         return {
             key: ProviderCredentialValue(
                 value=credential.value,
-                expiration_time=(
-                    credential.expiration_time.ToDatetime(tzinfo=UTC)
-                    if credential.HasField("expiration_time")
-                    else None
-                ),
+                expiration_time=credential.expiration_time.ToDatetime(tzinfo=UTC)
+                if credential.HasField("expiration_time")
+                else None,
             )
             for key, credential in response.credentials.items()
         }

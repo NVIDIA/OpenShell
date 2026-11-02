@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from generate_python_async import generate
+
 PROTO_FILES = [
     "proto/openshell.proto",
     "proto/datamodel.proto",
@@ -66,6 +68,10 @@ def main() -> None:
             text = file_path.read_text()
             text = re.sub(pattern, r"from . import \1\2", text, flags=re.MULTILINE)
             file_path.write_text(text)
+
+    # Use the checkout's authored methods, but write into the requested build
+    # tree just like protoc. The generator has no runtime SDK imports.
+    (output_dir.parent / "aio.py").write_text(generate())
 
 
 if __name__ == "__main__":
