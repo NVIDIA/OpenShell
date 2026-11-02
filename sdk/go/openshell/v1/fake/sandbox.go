@@ -43,6 +43,7 @@ func copySandbox(sb *types.Sandbox) *types.Sandbox {
 }
 
 func copySandboxSpec(s types.SandboxSpec) types.SandboxSpec {
+	s.SampledBudget = copySampledBudget(s.SampledBudget)
 	s.Environment = copyStringMap(s.Environment)
 	s.Providers = copyStringSlice(s.Providers)
 	s.Command = copyStringSlice(s.Command)
@@ -234,6 +235,11 @@ func copySandboxStatus(s types.SandboxStatus) types.SandboxStatus {
 		s.Conditions = conds
 	}
 	// Callers may mutate endpoint snapshots without changing the fake's storage.
+	if s.IngressAdmission != nil {
+		admission := *s.IngressAdmission
+		admission.Ports = slices.Clone(admission.Ports)
+		s.IngressAdmission = &admission
+	}
 	s.EndpointStatuses = slices.Clone(s.EndpointStatuses)
 	for i := range s.EndpointStatuses {
 		s.EndpointStatuses[i].Ports = slices.Clone(s.EndpointStatuses[i].Ports)
@@ -408,7 +414,7 @@ func validateTemplateCreateSpec(spec *types.SandboxSpec) error {
 	if spec == nil {
 		return nil
 	}
-	if spec.LogLevel != "" || len(spec.Environment) > 0 || spec.Template != nil || spec.GPU || spec.GPUCount != nil {
+	if spec.LogLevel != "" || len(spec.Environment) > 0 || spec.Template != nil || spec.GPU || spec.GPUCount != nil || spec.SampledBudget != nil {
 		return &types.StatusError{Code: types.ErrorInvalidArgument, Message: "template creates only allow policy, providers, command, and tty in spec"}
 	}
 	return nil
@@ -421,6 +427,9 @@ func sandboxSpecFromWorkloadTemplate(template *types.SandboxWorkloadTemplate) ty
 	}
 
 	workload := template.Spec.Workload
+	if workload.Resources != nil {
+		spec.SampledBudget = copySampledBudget(workload.Resources.SampledBudget)
+	}
 	spec.Environment = copyStringMap(workload.Environment)
 	spec.Template = &types.SandboxTemplate{
 		Image:        workload.Image,
@@ -929,4 +938,20 @@ func (c *fakeSandboxClient) ListAllProviders(ctx context.Context, workspace, san
 		return nil, err
 	}
 	return pager.All(ctx)
+}
+
+func copySampledBudget(budget *types.SampledResourceBudget) *types.SampledResourceBudget {
+	if budget == nil {
+		return nil
+	}
+	result := *budget
+	if budget.CPUTime != nil {
+		value := *budget.CPUTime
+		result.CPUTime = &value
+	}
+	if budget.ResidentBytes != nil {
+		value := *budget.ResidentBytes
+		result.ResidentBytes = &value
+	}
+	return &result
 }

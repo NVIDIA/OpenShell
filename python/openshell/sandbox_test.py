@@ -18,7 +18,7 @@ import pytest
 from google.protobuf.struct_pb2 import Struct
 
 import openshell.sandbox as sandbox_module
-from openshell._proto import openshell_pb2
+from openshell._proto import openshell_pb2, sandbox_pb2
 from openshell.mutations import DeletionOutcome
 from openshell.sandbox import (
     _OIDC_TOKEN_EXPIRY_GRACE_SECONDS,
@@ -2005,10 +2005,18 @@ class _FakeSandboxStub:
         self.delete_template_request: (
             openshell_pb2.DeleteSandboxTemplateRequest | None
         ) = None
+        self.sampled_budget_ack = False
         self._listed = listed or []
         self._listed_pages = listed_pages
         self.list_requests: list[openshell_pb2.ListSandboxesRequest] = []
         self._templates: list[openshell_pb2.SandboxWorkloadTemplate] = []
+
+    def Health(
+        self, request: object, timeout: float | None = None
+    ) -> openshell_pb2.HealthResponse:
+        return openshell_pb2.HealthResponse(
+            supports_sampled_resource_budget=self.sampled_budget_ack
+        )
 
     def GetSandbox(
         self,
@@ -2254,6 +2262,7 @@ def test_create_forwards_service_exposures() -> None:
     ref = client.create(
         workspace="default",
         name="app-server",
+        forward_ports=[8080],
         service_exposures=[
             ServiceExposure(target_port=4500),
             ServiceExposure(
@@ -2265,6 +2274,7 @@ def test_create_forwards_service_exposures() -> None:
     )
 
     assert stub.create_request is not None
+    assert list(stub.create_request.forward_ports) == [8080]
     assert [
         (exposure.service, exposure.target_port, exposure.authorization_mode)
         for exposure in stub.create_request.service_exposures
@@ -2321,6 +2331,7 @@ def test_create_from_template_rejects_empty_workload_template() -> None:
 
 def test_sandbox_template_create_builds_template_from_public_fields() -> None:
     stub = _FakeSandboxStub()
+    stub.sampled_budget_ack = True
     client = _template_client_with_fake_stub(stub)
 
     created = client.create(
@@ -2333,6 +2344,7 @@ def test_sandbox_template_create_builds_template_from_public_fields() -> None:
         cpu="1",
         memory="512Mi",
         gpu_count=2,
+        sampled_budget=sandbox_pb2.SampledResourceBudget(resident_bytes=4096),
         driver_config={"kubernetes": {"runtime_class_name": "kata"}},
     )
 
@@ -2351,6 +2363,40 @@ def test_sandbox_template_create_builds_template_from_public_fields() -> None:
     config = template.spec.driver_config["kubernetes"]
     assert isinstance(config, Struct)
     assert config["runtime_class_name"] == "kata"
+
+    assert template.spec.workload.resources.sampled_budget.resident_bytes == 4096
+
+
+@pytest.mark.parametrize("template", [False, True])
+def test_sampled_budget_requires_gateway_acknowledgement(template: bool) -> None:
+    stub = _FakeSandboxStub()
+    budget = sandbox_pb2.SampledResourceBudget(resident_bytes=4096)
+    if template:
+        client = _template_client_with_fake_stub(stub)
+
+        def write() -> object:
+            return client.create(
+                workspace="default", name="budget", sampled_budget=budget
+            )
+    else:
+        client = _client_with_fake_stub(stub)
+        spec = openshell_pb2.SandboxSpec()
+        spec.resource_requirements.sampled_budget.CopyFrom(budget)
+
+        def write() -> object:
+            return client.create(workspace="default", name="budget", spec=spec)
+
+    with pytest.raises(SandboxError, match="does not acknowledge"):
+        write()
+    assert stub.create_request is None
+    assert stub.create_template_request is None
+    stub.sampled_budget_ack = True
+    write()
+    assert (
+        (stub.create_template_request is not None)
+        if template
+        else (stub.create_request is not None)
+    )
 
 
 def test_sandbox_template_create_materializes_default_workload() -> None:
@@ -2815,6 +2861,13 @@ def test_sandbox_ref_exposes_host_identity_and_accepts_legacy_response() -> None
     assert _sandbox_ref(proto).host_key_fingerprint is None
     proto.host_key_fingerprint = "SHA256:expected"
     assert _sandbox_ref(proto).host_key_fingerprint == "SHA256:expected"
+    assert _sandbox_ref(proto).status.ingress_admission is None
+    proto.status.ingress_admission.scope = 3
+    proto.status.ingress_admission.ports.append(8080)
+    admission = _sandbox_ref(proto).status.ingress_admission
+    assert admission is not None and admission.ports == (8080,) and admission.scope == 3
+    proto.status.ingress_admission.ports[0] = 9090
+    assert admission.ports == (8080,)
 
 
 def test_sandbox_ref_includes_main_process_result() -> None:

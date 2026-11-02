@@ -63,6 +63,44 @@ active driver and negotiated capabilities. See the
 [Extension Driver configuration reference](/how-it-works/gateways/configuration#extension-driver)
 for configuration details.
 
+### Resource Guarantees
+
+`openshell gateway info` reports resource enforcement for the configured compute
+driver. CPU-rate and hard memory limits require aggregate kernel enforcement;
+scheduler requests describe placement admission, not dedicated physical capacity.
+Docker and Podman enforce container limits and reject reservations. Kubernetes
+supports container limits and scheduler requests. VM and MXC reject these
+portable requests until their drivers can enforce them.
+
+Drivers advertising `openshell.compute.resource-contract` must describe the
+mechanism and scope of accepted limits and requests. Missing, unknown, or
+per-process enforcement cannot satisfy an aggregate hard limit. Legacy drivers
+retain their existing behavior and report absent descriptors as unreported.
+
+Sampled budgets are a separate opt-in request. For a driver that supports them:
+
+```shell
+openshell sandbox template create bounded-worker \
+  --cpu-time-budget 30s \
+  --resident-memory-budget-bytes 1073741824
+openshell sandbox create --template bounded-worker
+```
+
+The descriptor reports account-wide observation, the interval between completed
+samples, termination on excess, CPU-time resolution, and any companion
+per-process CPU limit. Collection adds latency; short-lived processes can escape
+observation and overshoot has no fixed bound. These budgets do not satisfy a
+hard CPU-rate or memory quota. First-party container and VM drivers currently
+reject sampled budgets; external drivers may provide them.
+
+Before writing budget-bearing requests or templates, curated SDKs and the CLI
+require `HealthResponse.supports_sampled_resource_budget`. This public protocol
+acknowledgement prevents older gateways from silently discarding the request;
+it does not promise driver support. Raw API callers must check it too. Use a
+homogeneous upgraded gateway deployment: a probe cannot make mixed-version
+load-balancer routing atomic. The gateway and driver remain responsible for
+resource admission before provisioning and on retained launches.
+
 ## Credential Drivers
 
 Credential drivers store provider credentials behind opaque handles. The
@@ -88,3 +126,9 @@ Drivers exchange peer metadata with the gateway and advertise their extension
 family capability. Upgrade both peers together when the protocol version
 changes. Refer to [Extension Protocol Negotiation](/extensibility/overview#protocol-negotiation)
 for the negotiation contract.
+
+## Release compatibility
+
+These API changes target the next minor release and must not be backported into the `0.1.x` patch series. Upgrade gateway replicas together before sending sampled budgets. An older replica can discard budget fields even if another replica acknowledged support.
+
+For raw Rust and TypeScript field changes and defaults, see the [SDK migration notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-sdk/README.md#next-minor-api-migration).

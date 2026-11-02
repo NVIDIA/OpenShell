@@ -91,6 +91,7 @@ pub(super) async fn expose_service_endpoint(
     target_port: u32,
     authorization_mode: ServiceAuthorizationMode,
 ) -> Result<Response<ServiceEndpointResponse>, Status> {
+    state.compute.admit_ingress_port(sandbox, target_port)?;
     let sandbox_name = sandbox.object_name();
 
     let now = crate::persistence::current_time_ms();

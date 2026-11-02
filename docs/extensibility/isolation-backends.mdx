@@ -34,10 +34,46 @@ The supervisor's concrete RPC client, `OpenShellRuntimeBackend`, lives in
 The admission sequence is Attach, Confirm, then StartAgent. No workload code
 runs before StartAgent.
 
+A backend failure during client construction, Attach, or Confirm reports
+`ConfigurationReady: False (ConfigurationInvalid)` before workload execution.
+Sandbox status identifies the failed stage and gives a bounded recovery hint.
+The supervisor log retains detailed backend diagnostics. A policy revision the
+gateway acknowledged this startup created, and which the backend refused, shows
+the safe reason in `openshell policy list`. Deduplicated writes and newer
+operator revisions do not establish startup ownership. Follow the recovery hint
+and wait for cleanup before retrying or recreating the sandbox.
+
 External compute drivers advertise `openshell.compute.isolation-backend` to
 accept an operator-selected `IsolationBackendRegistration`, including its Unix,
 TCP, or vsock endpoint. The driver provisions the resource and delivers the
 backend's trusted launch metadata to the supervisor.
+
+A compute driver can advertise `openshell.compute.proxy-filesystem-baseline`
+with a `ProxyFilesystemBaseline` descriptor. The gateway composes these trusted
+workload-namespace prerequisites into effective proxy-mode policy before compute
+admission. The selected supervisor `BackendSetup` supplies the same baseline;
+an explicit empty baseline suppresses legacy Linux defaults. The descriptor
+and capability must agree, and advertised paths are never filtered against the
+gateway host filesystem. Authored read-only grants remain read-only.
+
+Drivers that negotiate `openshell.compute.launch-policy` receive a bounded,
+hash-verified policy input bound to each `StartSandbox` generation. The gateway
+captures the current effective configuration when it claims that generation;
+retries and recovery reuse it. Management callers can replace static policy
+for live sandboxes while stopped, then start a new generation. Frozen sandboxes
+retain their original accepted snapshot and reject policy changes, including
+while stopped. Running workloads retain the existing restrictions on static
+changes. Live network reload remains separate from this immutable launch input.
+
+Compute drivers that advertise `openshell.compute.ingress-admission` return
+an immutable ingress envelope from `ValidateSandboxCreate`: unsupported,
+isolated loopback, or explicitly admitted shared-host loopback, with all ports
+or an exact port set. The gateway checks create-time forwarding and exposure
+requests before provisioning and retains the envelope in sandbox status.
+Forwarding clients check it before opening local listeners; the gateway also
+checks live TCP relays and HTTP service routing before reusing connections.
+The isolation backend remains responsible for enforcing the target connection.
+Legacy absence is distinct from missing evidence under the negotiated contract.
 
 ## Who Owns What
 
@@ -50,3 +86,13 @@ backend's trusted launch metadata to the supervisor.
 For how `openshell-sandbox` enforces the boundary, refer to [Inside the Sandbox
 Boundary](/about/architecture#inside-the-sandbox-boundary). For driver-specific
 workload behavior, refer to [Runtimes](/how-it-works/sandboxes/runtimes).
+
+## Release compatibility
+
+These API changes target the next minor release and must not be backported into the `0.1.x` patch series. Upgrade gateway replicas and supervisors together before using the new contracts. Older writers can discard refusal metadata, retained launch input or ingress admission.
+
+`SandboxStatus.launch_policy` reports the retained generation, policy document and digest under existing policy-read authorization. It excludes provider credential values and environment data. If retained launch input is missing, stop and explicitly start the sandbox to admit a new generation. Retries and recovery keep the existing generation's input, and frozen sandboxes retain their original accepted policy.
+
+If a driver negotiated ingress admission but an existing sandbox has no retained record, recreate the sandbox with its required ports. A legacy driver that does not negotiate admission can still omit the record.
+
+For raw Rust and TypeScript message changes, see the [SDK migration notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-sdk/README.md#next-minor-api-migration).

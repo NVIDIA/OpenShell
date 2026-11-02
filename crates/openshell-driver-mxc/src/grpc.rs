@@ -70,7 +70,13 @@ impl ComputeDriver for ComputeDriverService {
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.backend.validate_sandbox_create(&sandbox)?;
-        Ok(Response::new(ValidateSandboxCreateResponse {}))
+        Ok(Response::new(ValidateSandboxCreateResponse {
+            ingress_admission: Some(openshell_core::proto::SandboxIngressAdmission {
+                scope: openshell_core::proto::IngressScope::Unsupported as i32,
+                all_ports: false,
+                ports: Vec::new(),
+            }),
+        }))
     }
 
     async fn get_sandbox(

@@ -25,6 +25,19 @@ npm install @nvidia/openshell-sdk
 
 ## Usage
 
+Frozen sandbox creation uses `client.sandbox.createFrozen(spec)` or
+`createFrozenFromTemplate(spec)`, with the existing create spec shape. These
+methods use a distinct optional service and fail on older gateways before
+creating a sandbox. They return the ordinary `SandboxRef`; use
+`getFrozenPolicy(name)` to read the requested mode and optional accepted policy,
+hash and timestamp. An absent policy means the requested freeze is pending.
+After capture, access changes require sandbox recreation.
+
+`client.sandbox.updateGlobalConfig({ policy })` returns the global mutation in
+`update` and workspace-qualified names in `frozenSandboxes` that retain their
+captured policies. Existing configuration result and policy-source types keep
+their original shapes.
+
 ```ts
 import { OpenShellClient } from '@nvidia/openshell-sdk'
 
@@ -333,3 +346,9 @@ mise run e2e:sdk:ts:exec    # public interactive helper against an isolated Dock
 ```
 
 Formatting and linting are handled by [Biome](https://biomejs.dev) (`biome.json`): 2-space indent, single quotes, semicolons, 120-column width. Generated `src/gen/` is excluded. `sdk:ts:lint` runs in CI as part of `sdk:ts:ci`.
+
+## Next minor raw message migration
+
+Raw `ReportSandboxConfigurationRequest` messages add `refusedBeforeStart`, and `UpdateConfigResponse` adds `createdPolicyRevision`. Complete object literals need boolean defaults; use generated message builders when creating partial messages. This change belongs to the next minor release; it is not a patch-source-compatibility claim. Upgrade gateway writers together so older protobuf writers cannot discard the new metadata.
+
+Raw Health responses add `supportsSampledResourceBudget`. Complete object literals need the false default, or use a generated message builder. Resource requirement/capability messages also gain optional enforcement and budget fields. This change belongs to the next minor release; it is not a patch-source-compatibility claim. Upgrade gateway writers together so older protobuf writers cannot discard the new metadata.

@@ -60,6 +60,7 @@ fn selected_workspace(
 
 #[derive(Clone, Default)]
 struct SandboxState {
+    sampled_budget_ack: Arc<AtomicBool>,
     /// Make `ListProviderProfiles` fail while every other RPC keeps working,
     /// so a catalog lookup failure can be told apart from an empty catalog.
     fail_list_provider_profiles: Arc<AtomicBool>,
@@ -165,6 +166,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(HealthResponse {
             status: ServiceStatus::Healthy.into(),
             version: "test".to_string(),
+            supports_sampled_resource_budget: self.state.sampled_budget_ack.load(Ordering::SeqCst),
         }))
     }
 
@@ -1856,6 +1858,50 @@ async fn sandbox_create_tolerates_an_unreachable_profile_catalog() {
 }
 
 #[tokio::test]
+async fn sandbox_create_frozen_rejects_unsupported_gateway_before_creation() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            // This legacy gateway has no frozen-policy service. No ordinary
+            // create is allowed as a fallback for the explicit frozen request.
+            let error = run::sandbox_create_frozen(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("legacy-frozen"),
+                    command: &["/opt/agent".into()],
+                    ..test_config()
+                },
+                "default",
+                &test_tls(&server),
+            )
+            .await
+            .expect_err("an unsupported freeze must stop the client workflow");
+
+            let message = error.to_string();
+            assert!(
+                message.contains(tonic::Code::Unimplemented.description()),
+                "{message}"
+            );
+            assert!(create_requests(&server).await.is_empty());
+            assert_eq!(
+                server
+                    .openshell
+                    .state
+                    .ssh_session_requests
+                    .load(Ordering::SeqCst),
+                0
+            );
+            assert!(deleted_names(&server).await.is_empty());
+            assert_eq!(load_last_sandbox("openshell", "default"), None);
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn sandbox_create_keeps_command_sessions_by_default() {
     let server = run_server().await;
     let fake_ssh_dir = helpers::tempdir().unwrap();
@@ -2330,26 +2376,36 @@ async fn sandbox_template_create_sends_non_default_workspace_in_scope_and_metada
         .run_async(async {
             let tls = test_tls(&server);
 
-            run::sandbox_template_create(
-                &server.endpoint,
-                "gpu-kata",
-                Some("registry.example.com/agent:latest"),
-                Some("2"),
-                Some("4Gi"),
-                Some(GpuResourceRequirements { count: Some(1) }),
-                Some(r#"{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}"#),
-                Some("5m"),
-                Some(3),
-                HashMap::from([("team".to_string(), "runtime".to_string())]),
-                HashMap::from([("owner".to_string(), "platform".to_string())]),
-                HashMap::from([("FEATURE_FLAG".to_string(), "on".to_string())]),
-                "table",
-                "team-a",
-                &tls,
-                true,
-            )
-            .await
-            .expect("template create should succeed");
+            let create = || {
+                run::sandbox_template_create(
+                    &server.endpoint,
+                    "gpu-kata",
+                    Some("registry.example.com/agent:latest"),
+                    Some("2"),
+                    Some("4Gi"),
+                    run::sampled_resource_budget(Some("30s"), Some(1_073_741_824)).unwrap(),
+                    Some(GpuResourceRequirements { count: Some(1) }),
+                    Some(r#"{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}"#),
+                    Some("5m"),
+                    Some(3),
+                    HashMap::from([("team".to_string(), "runtime".to_string())]),
+                    HashMap::from([("owner".to_string(), "platform".to_string())]),
+                    HashMap::from([("FEATURE_FLAG".to_string(), "on".to_string())]),
+                    "table",
+                    "team-a",
+                    &tls,
+                    true,
+                )
+            };
+            let error = create().await.unwrap_err();
+            assert!(format!("{error:?}").contains("does not acknowledge"));
+            assert!(template_create_requests(&server).await.is_empty());
+            server
+                .openshell
+                .state
+                .sampled_budget_ack
+                .store(true, Ordering::SeqCst);
+            create().await.expect("template create should succeed");
 
             let requests = template_create_requests(&server).await;
             let request = requests
@@ -2377,6 +2433,12 @@ async fn sandbox_template_create_sends_non_default_workspace_in_scope_and_metada
                 .resources
                 .as_ref()
                 .expect("resources should be sent");
+            let budget = resources
+                .sampled_budget
+                .as_ref()
+                .expect("sampled budget must survive the CLI request");
+            assert_eq!(budget.cpu_time.as_ref().unwrap().seconds, 30);
+            assert_eq!(budget.resident_bytes, Some(1_073_741_824));
             assert_eq!(resources.cpu, "2");
             assert_eq!(resources.memory, "4Gi");
             assert_eq!(resources.gpu.as_ref().and_then(|gpu| gpu.count), Some(1));
@@ -2468,6 +2530,7 @@ async fn sandbox_template_create_allows_omitted_image() {
             run::sandbox_template_create(
                 &server.endpoint,
                 "base",
+                None,
                 None,
                 None,
                 None,

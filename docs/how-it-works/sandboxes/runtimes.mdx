@@ -89,6 +89,11 @@ Use `--cpu`, `--memory`, and `--gpu` on `openshell sandbox create` to request re
 
 `--driver-config-json` passes driver-specific settings that have no dedicated flag. The value is a JSON object keyed by driver name, and the gateway forwards only the block for the active driver:
 
+Integer-valued settings, such as Kubernetes
+`pod.tolerations[].tolerationSeconds`, retain their integer representation during
+transport. Fractional values are not rounded into integers, and non-finite
+numeric values are rejected.
+
 ```shell
 openshell sandbox create \
   --from registry.example.com/team/claude-code:1.0 \

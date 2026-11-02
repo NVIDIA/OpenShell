@@ -4,6 +4,7 @@
 //! gRPC service implementation.
 
 mod auth_rpc;
+mod frozen_policy;
 pub mod mutation_replay;
 pub mod policy;
 pub mod provider;
@@ -248,7 +249,11 @@ impl openshell_core::proto::sandbox_updates_server::SandboxUpdates for OpenShell
         &self,
         request: Request<openshell_core::proto::UpdateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 }
 
@@ -261,6 +266,7 @@ impl OpenShell for OpenShellService {
         Ok(Response::new(HealthResponse {
             status: ServiceStatus::Healthy.into(),
             version: openshell_core::VERSION.to_string(),
+            supports_sampled_resource_budget: true,
         }))
     }
 
@@ -329,7 +335,11 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn begin_rootfs_tar_staging(
@@ -401,14 +411,22 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<AttachSandboxProviderRequest>,
     ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn detach_sandbox_provider(
         &self,
         request: Request<DetachSandboxProviderRequest>,
     ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn get_sandbox_provider_status(
@@ -436,14 +454,22 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn start_sandbox(
         &self,
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn suspend_sandbox(
@@ -970,14 +996,19 @@ fn public_resource_capabilities(
     resources: openshell_core::proto::compute::v1::ResourceCapabilities,
 ) -> ResourceCapabilities {
     ResourceCapabilities {
+        sampled_budget: resources.sampled_budget,
         cpu: resources.cpu.as_ref().map(|cpu| CpuResourceCapabilities {
             limit_supported: cpu.limit_supported,
+            limit_enforcement: cpu.limit_enforcement,
+            request_enforcement: cpu.request_enforcement,
         }),
         memory: resources
             .memory
             .as_ref()
             .map(|memory| MemoryResourceCapabilities {
                 limit_supported: memory.limit_supported,
+                limit_enforcement: memory.limit_enforcement,
+                request_enforcement: memory.request_enforcement,
             }),
         gpu: resources.gpu.as_ref().map(|gpu| GpuResourceCapabilities {
             default_selection_supported: gpu.default_selection_supported,
@@ -1315,19 +1346,33 @@ mod tests {
         let driver_capabilities = DriverResourceCapabilities {
             cpu: Some(DriverCpuResourceCapabilities {
                 limit_supported: true,
+                limit_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                    kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::KernelLimit
+                        as i32,
+                    scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container
+                        as i32,
+                }),
+                ..Default::default()
             }),
             memory: Some(DriverMemoryResourceCapabilities {
                 limit_supported: false,
+                ..Default::default()
             }),
             gpu: Some(DriverGpuResourceCapabilities {
                 default_selection_supported: true,
                 count_selection_supported: true,
             }),
+            sampled_budget: None,
         };
 
         let capabilities = public_resource_capabilities(driver_capabilities);
 
-        assert!(capabilities.cpu.expect("CPU capabilities").limit_supported);
+        let cpu = capabilities.cpu.expect("CPU capabilities");
+        assert!(cpu.limit_supported);
+        assert_eq!(
+            cpu.limit_enforcement.unwrap().scope,
+            openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container as i32
+        );
         assert!(
             !capabilities
                 .memory

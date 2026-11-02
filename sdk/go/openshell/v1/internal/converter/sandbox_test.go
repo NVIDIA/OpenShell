@@ -19,6 +19,21 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+func TestSandboxIngressAdmissionFromProto(t *testing.T) {
+	for _, scope := range []sandboxpb.IngressScope{sandboxpb.IngressScope_INGRESS_SCOPE_ISOLATED_LOOPBACK, sandboxpb.IngressScope_INGRESS_SCOPE_SHARED_HOST_LOOPBACK, sandboxpb.IngressScope(99)} {
+		wire := &pb.SandboxStatus{IngressAdmission: &sandboxpb.SandboxIngressAdmission{Scope: scope, Ports: []uint32{8080}}}
+		got := sandboxStatusFromProto(wire).IngressAdmission
+		require.NotNil(t, got)
+		assert.Equal(t, []uint32{8080}, got.Ports)
+		if scope == sandboxpb.IngressScope(99) {
+			assert.Equal(t, v1.IngressUnknown, got.Scope)
+		}
+		wire.IngressAdmission.Ports[0] = 9090
+		assert.Equal(t, uint32(8080), got.Ports[0])
+	}
+	assert.Nil(t, sandboxStatusFromProto(&pb.SandboxStatus{}).IngressAdmission)
+}
+
 func TestSandboxConfigurationAdmissionFromProto(t *testing.T) {
 	for _, tc := range []struct {
 		wire pb.ConfigurationAdmissionState
@@ -522,6 +537,7 @@ func TestSandboxToProto_DefaultGPURequest(t *testing.T) {
 
 func TestSandboxWorkloadTemplateRoundTrip(t *testing.T) {
 	gpuCount := uint32(2)
+	resident := uint64(1<<54 + 1)
 	delTime := time.UnixMilli(1700000060000).UTC()
 	original := &v1.SandboxWorkloadTemplate{
 		ID:                "tmpl-1",
@@ -537,9 +553,10 @@ func TestSandboxWorkloadTemplateRoundTrip(t *testing.T) {
 				Image:       "nvcr.io/nvidia/openshell:latest",
 				Environment: map[string]string{"CUDA_VISIBLE_DEVICES": "all"},
 				Resources: &v1.SandboxResources{
-					CPU:    "2",
-					Memory: "8Gi",
-					GPU:    &v1.SandboxGPURequirements{Count: &gpuCount},
+					SampledBudget: &v1.SampledResourceBudget{CPUTime: &v1.ResourceDuration{Seconds: 315576000000, Nanos: 1}, ResidentBytes: &resident},
+					CPU:           "2",
+					Memory:        "8Gi",
+					GPU:           &v1.SandboxGPURequirements{Count: &gpuCount},
 				},
 			},
 			DriverConfig: map[string]any{
@@ -600,6 +617,13 @@ func TestSandboxWorkloadTemplateRoundTrip(t *testing.T) {
 	require.NotNil(t, back.Spec.DesiredServiceLevel.Startup)
 	assert.Equal(t, 30*time.Second, back.Spec.DesiredServiceLevel.Startup.ReadyWithin)
 	assert.Equal(t, uint32(3), back.Spec.DesiredServiceLevel.Startup.MaxBurst)
+	assert.Equal(t, original.Spec.Workload.Resources.SampledBudget, back.Spec.Workload.Resources.SampledBudget)
+	protoTemplate.Spec.Workload.Resources.SampledBudget.CpuTime.Seconds = 1
+	*protoTemplate.Spec.Workload.Resources.SampledBudget.ResidentBytes = 1
+	assert.Equal(t, int64(315576000000), back.Spec.Workload.Resources.SampledBudget.CPUTime.Seconds)
+	assert.Equal(t, resident, *back.Spec.Workload.Resources.SampledBudget.ResidentBytes)
+	assert.Equal(t, int64(315576000000), original.Spec.Workload.Resources.SampledBudget.CPUTime.Seconds)
+
 }
 
 func TestSandboxWorkloadTemplateRoundTrip_DefaultGpuRequest(t *testing.T) {

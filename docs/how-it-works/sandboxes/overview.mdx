@@ -823,6 +823,15 @@ Press `c` in the Sandboxes panel to create a sandbox. In the optional Command fi
 
 ## Port Forwarding
 
+Compute drivers can restrict forwarding to an admitted set of ports. Declare
+forward ports when creating the sandbox; unadmitted targets are rejected before
+provisioning or opening a local listener. `openshell sandbox get <name> -o json`
+shows `ingress_admission` with its scope, port list and `all_ports` flag. A
+`shared_host_loopback` scope refers to an operator-approved host service, rather
+than a service isolated inside the sandbox. If an upgraded driver reports
+unknown or missing admission for an existing sandbox, recreate it with the
+required ports. A legacy driver leaves admission absent.
+
 Forward a local port to a running sandbox to access services inside it, such as a web server or database:
 
 ```shell
@@ -872,6 +881,18 @@ openshell sandbox create --from registry.example.com/your-org/claude-agent:lates
 ```
 
 </Tip>
+
+### Forward a TCP service through the gateway
+
+Use the gateway's TCP relay to forward a loopback service:
+
+```shell
+openshell forward service my-sandbox --target-host 127.0.0.1 --target-port 8080 --local 0
+```
+
+The target host must be a loopback IP address or `localhost`, and the target
+port must be between 1 and 65535. The CLI and TypeScript SDK reject invalid
+targets before opening a local listener. The gateway also validates each target.
 
 ## SSH Config
 

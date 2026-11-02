@@ -127,7 +127,10 @@ impl PodmanSandboxDriverConfig {
             return Ok(Self::default());
         };
 
-        serde_json::from_value(proto_struct::struct_to_json_value(config)).map_err(|err| {
+        let json = proto_struct::struct_to_typed_json_value(config).map_err(|err| {
+            ComputeDriverError::InvalidArgument(format!("invalid podman driver_config: {err}"))
+        })?;
+        serde_json::from_value(json).map_err(|err| {
             ComputeDriverError::InvalidArgument(format!("invalid podman driver_config: {err}"))
         })
     }
@@ -871,8 +874,38 @@ fn build_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
     labels
 }
 
-/// Parse resource limits from the sandbox template, falling back to defaults.
-fn build_resource_limits(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> ResourceLimits {
+/// Reject requests that must not silently become default limits.
+pub fn validate_resource_limits(sandbox: &DriverSandbox) -> Result<(), String> {
+    let resources = sandbox
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.as_ref())
+        .and_then(|t| t.resources.as_ref());
+    if let Some(resources) = resources {
+        if !resources.cpu_request.is_empty() || !resources.memory_request.is_empty() {
+            return Err("podman does not support resource reservations".into());
+        }
+        if !resources.cpu_limit.is_empty()
+            && parse_cpu_to_microseconds(&resources.cpu_limit).is_none()
+        {
+            return Err("invalid podman CPU limit".into());
+        }
+        if !resources.memory_limit.is_empty()
+            && parse_memory_to_bytes(&resources.memory_limit)
+                .is_none_or(|n| n == 0 || i64::try_from(n).is_err())
+        {
+            return Err("invalid podman memory limit".into());
+        }
+    }
+    Ok(())
+}
+
+/// Defaults apply only when a limit was not requested.
+fn build_resource_limits(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+) -> Result<ResourceLimits, ComputeDriverError> {
+    validate_resource_limits(sandbox).map_err(ComputeDriverError::Precondition)?;
     let resources = sandbox
         .spec
         .as_ref()
@@ -889,14 +922,14 @@ fn build_resource_limits(sandbox: &DriverSandbox, config: &PodmanComputeConfig) 
         .and_then(|r| parse_memory_to_bytes(&r.memory_limit))
         .unwrap_or(DEFAULT_MEMORY_LIMIT);
 
-    ResourceLimits {
+    Ok(ResourceLimits {
         cpu: CpuLimits {
             quota: cpu_micros,
             period: DEFAULT_CPU_PERIOD,
         },
         memory: MemoryLimits { limit: mem_bytes },
         pids: podman_pids_limit(config.sandbox_pids_limit).map(|limit| PidsLimits { limit }),
-    }
+    })
 }
 
 fn podman_pids_limit(value: Option<std::num::NonZeroI64>) -> Option<i64> {
@@ -1055,7 +1088,8 @@ fn podman_driver_config(
     let Some(config) = template.driver_config.as_ref() else {
         return Ok(PodmanSandboxDriverConfig::default());
     };
-    let json = Value::Object(proto_struct::struct_to_json_object(config));
+    let json = proto_struct::struct_to_typed_json_value(config)
+        .map_err(|err| format!("invalid podman driver_config: {err}"))?;
     let config: PodmanSandboxDriverConfig = serde_json::from_value(json)
         .map_err(|err| format!("invalid podman driver_config: {err}"))?;
     validate_podman_driver_mounts(&config.mounts, enable_bind_mounts)?;
@@ -1293,7 +1327,7 @@ fn build_base_spec(
             .map(|path| path.display().to_string())
             .unwrap_or_default(),
     );
-    let resource_limits = build_resource_limits(sandbox, config);
+    let resource_limits = build_resource_limits(sandbox, config)?;
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
         .map_err(ComputeDriverError::InvalidArgument)?;
     driver_mounts::validate_workspace_mount_targets(
@@ -1888,15 +1922,19 @@ fn parse_cpu_to_microseconds(quantity: &str) -> Option<u64> {
         millis.checked_mul(100)?
     } else {
         let cores: f64 = quantity.parse().ok()?;
-        if cores <= 0.0 || cores.is_nan() || cores.is_infinite() {
+        if cores <= 0.0 || !cores.is_finite() || cores * 100_000.0 >= 2_f64.powi(63) {
             return None;
         }
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let val = (cores * 100_000.0) as u64;
         val
     };
-    // A quota of 0 microseconds is invalid — treat as no limit.
-    if micros == 0 { None } else { Some(micros) }
+    // OCI CPU quotas are positive signed 64-bit microseconds.
+    if micros == 0 || i64::try_from(micros).is_err() {
+        None
+    } else {
+        Some(micros)
+    }
 }
 
 /// Parse a Kubernetes-style memory quantity to bytes.
@@ -2074,6 +2112,59 @@ mod tests {
         );
         assert!(!error.to_string().contains("tampered contents"));
         let _ = std::fs::remove_file(artifact);
+    }
+
+    #[test]
+    fn resource_limits_reject_invalid_values_and_reservations_without_defaults() {
+        use openshell_core::proto::compute::v1::{
+            DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+        };
+        for resources in [
+            DriverResourceRequirements {
+                cpu_limit: "garbage".into(),
+                ..Default::default()
+            },
+            DriverResourceRequirements {
+                cpu_limit: "1e100".into(),
+                ..Default::default()
+            },
+            DriverResourceRequirements {
+                cpu_limit: "92233720368547759m".into(),
+                ..Default::default()
+            },
+            DriverResourceRequirements {
+                memory_limit: "9223372036854775808".into(),
+                ..Default::default()
+            },
+            DriverResourceRequirements {
+                memory_limit: "garbage".into(),
+                ..Default::default()
+            },
+            DriverResourceRequirements {
+                memory_limit: "0".into(),
+                ..Default::default()
+            },
+            DriverResourceRequirements {
+                cpu_request: "1".into(),
+                ..Default::default()
+            },
+            DriverResourceRequirements {
+                memory_request: "1Gi".into(),
+                ..Default::default()
+            },
+        ] {
+            let sandbox = DriverSandbox {
+                spec: Some(DriverSandboxSpec {
+                    template: Some(DriverSandboxTemplate {
+                        resources: Some(resources),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(build_resource_limits(&sandbox, &test_config()).is_err());
+        }
     }
 
     #[test]
@@ -2323,6 +2414,7 @@ mod tests {
     fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
         ResourceRequirements {
             gpu: Some(GpuResourceRequirements { count }),
+            ..Default::default()
         }
     }
 
@@ -2378,7 +2470,7 @@ mod tests {
             ..Default::default()
         });
         let config = test_config();
-        let limits = build_resource_limits(&sandbox, &config);
+        let limits = build_resource_limits(&sandbox, &config).unwrap();
 
         assert_eq!(limits.cpu.quota, 50_000);
         assert_eq!(limits.memory.limit, 2 * 1024 * 1024 * 1024);
@@ -2396,7 +2488,7 @@ mod tests {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
         config.sandbox_pids_limit = None;
-        let limits = build_resource_limits(&sandbox, &config);
+        let limits = build_resource_limits(&sandbox, &config).unwrap();
 
         assert!(limits.pids.is_none());
     }

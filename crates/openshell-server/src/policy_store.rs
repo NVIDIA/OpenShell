@@ -35,7 +35,7 @@ pub struct AtomicPolicyRevisionWrite {
     pub expected_resource_version: u64,
     pub annotations: HashMap<String, String>,
     /// Populate the create-time baseline, or replace it while startup admission
-    /// is blocked and no workload has consumed the static restrictions.
+    /// is blocked or the sandbox is stopped before a new launch generation.
     pub backfill_policy: Option<ProtoSandboxPolicy>,
 }
 
@@ -96,7 +96,8 @@ pub fn project_policy_revision_onto_sandbox(
     sandbox.set_resource_version(current_resource_version);
 
     let mut changed = false;
-    let startup_blocked = permits_initial_static_policy_repair(&sandbox);
+    let startup_blocked = permits_initial_static_policy_repair(&sandbox)
+        || sandbox.phase() == openshell_core::proto::SandboxPhase::Stopped as i32;
     if let Some(backfill_policy) = write.backfill_policy.as_ref() {
         let spec = sandbox
             .spec

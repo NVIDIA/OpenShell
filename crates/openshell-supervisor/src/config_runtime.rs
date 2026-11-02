@@ -2144,6 +2144,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&settings)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             connector,
         );
@@ -2265,6 +2266,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&settings)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -2312,6 +2314,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -2412,6 +2415,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&settings)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -2470,6 +2474,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -2532,6 +2537,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -2624,6 +2630,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -2792,6 +2799,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_revision),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -2863,6 +2871,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_revision),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             middleware_connector,
         );
@@ -2940,6 +2949,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_revision),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             connector,
         );
@@ -3007,6 +3017,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_revision),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             connector,
         );
@@ -3084,6 +3095,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_v1.clone()),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             Some(1),
         )
@@ -3100,6 +3112,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(empty_loaded),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             Some(1),
         )
@@ -3111,6 +3124,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_v1.clone()),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             Some(1),
         )
@@ -3123,6 +3137,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_v2),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             Some(2),
         )
@@ -3149,6 +3164,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_revision),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3270,6 +3286,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3353,6 +3370,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3427,6 +3445,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3517,6 +3536,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3621,6 +3641,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3660,6 +3681,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3715,6 +3737,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3767,6 +3790,7 @@ mod tests {
                         revision: has_last_valid
                             .then(|| LoadedPolicyRevision::from_snapshot(&initial)),
                         has_last_valid_policy: has_last_valid,
+                        written_at_startup: false,
                     },
                     default_middleware_connector(),
                 );
@@ -3891,6 +3915,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: None,
                 has_last_valid_policy: false,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3936,6 +3961,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3975,6 +4001,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -4068,6 +4095,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );

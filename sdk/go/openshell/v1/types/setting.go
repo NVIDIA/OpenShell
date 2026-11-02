@@ -111,6 +111,9 @@ type ConfigUpdate struct {
 type ConfigUpdateResult struct {
 	// Version is the assigned policy version.
 	Version uint32
+	// CreatedPolicyRevision is true only when this write created a sandbox policy revision.
+	// Deduplicated writes and older gateways leave it false.
+	CreatedPolicyRevision bool
 	// PolicyHash is the SHA-256 of the serialized policy.
 	PolicyHash string
 	// SettingsRevision is the settings revision for the modified scope.

@@ -54,6 +54,7 @@ type ExtensionInfo struct {
 
 // ComputeDriverInfo describes a compute backend available on the gateway.
 type ComputeDriverInfo struct {
+	Resources     *ResourceCapabilities
 	Name          string
 	DriverName    string
 	DriverVersion string
@@ -66,4 +67,39 @@ type CurrentUser struct {
 	Roles            []string
 	Scopes           []string
 	IdentityProvider string
+}
+
+// ResourceCapabilities reports the configured compute driver's guarantees.
+type ResourceCapabilities struct {
+	CPU           *ResourceDomainCapabilities
+	Memory        *ResourceDomainCapabilities
+	GPU           *GPUResourceCapabilities
+	SampledBudget *SampledBudgetCapabilities
+}
+
+type ResourceDomainCapabilities struct {
+	LimitSupported     bool
+	LimitEnforcement   *ResourceEnforcement
+	RequestEnforcement *ResourceEnforcement
+}
+
+type ResourceEnforcement struct {
+	// Unknown enum values are preserved as "Unknown", never inferred as support.
+	Kind  string
+	Scope string
+}
+
+type GPUResourceCapabilities struct {
+	DefaultSelectionSupported bool
+	CountSelectionSupported   bool
+}
+
+type SampledBudgetCapabilities struct {
+	CPUTimeSupported       bool
+	ResidentBytesSupported bool
+	Scope                  string
+	SamplingInterval       *ResourceDuration
+	TerminateOnExcess      bool
+	CPUTimeResolution      *ResourceDuration
+	PerProcessCPULimit     bool
 }

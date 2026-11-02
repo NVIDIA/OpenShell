@@ -53,3 +53,9 @@ type HealthInterface interface {
 	GetGatewayInfo(ctx context.Context) (*GatewayInfo, error)
 	GetCurrentUser(ctx context.Context) (*CurrentUser, error)
 }
+
+type ResourceCapabilities = types.ResourceCapabilities
+type ResourceDomainCapabilities = types.ResourceDomainCapabilities
+type ResourceEnforcement = types.ResourceEnforcement
+type GPUResourceCapabilities = types.GPUResourceCapabilities
+type SampledBudgetCapabilities = types.SampledBudgetCapabilities

@@ -6,6 +6,7 @@ package converter
 import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
+	sb "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
 )
 
 // GatewayInfoFromProto converts a proto GetGatewayInfoResponse to an SDK GatewayInfo.
@@ -83,6 +84,7 @@ func ComputeDriverInfoFromProto(d *pb.ComputeDriverInfo) types.ComputeDriverInfo
 	if caps := d.GetCapabilities(); caps != nil {
 		result.DriverName = caps.GetDriverName()
 		result.DriverVersion = caps.GetDriverVersion()
+		result.Resources = resourceCapabilitiesFromProto(caps.GetResourceCapabilities())
 	}
 	return result
 }
@@ -100,4 +102,61 @@ func CurrentUserFromProto(resp *pb.GetCurrentUserResponse) *types.CurrentUser {
 		Scopes:           CopyStringSlice(resp.GetScopes()),
 		IdentityProvider: resp.GetIdentityProvider(),
 	}
+}
+
+func resourceScope(scope sb.ResourceEnforcementScope) string {
+	switch scope {
+	case sb.ResourceEnforcementScope_RESOURCE_ENFORCEMENT_SCOPE_PROCESS:
+		return "Process"
+	case sb.ResourceEnforcementScope_RESOURCE_ENFORCEMENT_SCOPE_CONTAINER:
+		return "Container"
+	case sb.ResourceEnforcementScope_RESOURCE_ENFORCEMENT_SCOPE_SANDBOX_ACCOUNT:
+		return "SandboxAccount"
+	case sb.ResourceEnforcementScope_RESOURCE_ENFORCEMENT_SCOPE_VIRTUAL_MACHINE:
+		return "VirtualMachine"
+	default:
+		return "Unknown"
+	}
+}
+func resourceEnforcement(e *sb.ResourceEnforcement) *types.ResourceEnforcement {
+	if e == nil {
+		return nil
+	}
+	kind := "Unknown"
+	switch e.Kind {
+	case sb.ResourceEnforcementKind_RESOURCE_ENFORCEMENT_KIND_UNSUPPORTED:
+		kind = "Unsupported"
+	case sb.ResourceEnforcementKind_RESOURCE_ENFORCEMENT_KIND_KERNEL_LIMIT:
+		kind = "KernelLimit"
+	case sb.ResourceEnforcementKind_RESOURCE_ENFORCEMENT_KIND_SCHEDULER_REQUEST:
+		kind = "SchedulerRequest"
+	}
+	return &types.ResourceEnforcement{Kind: kind, Scope: resourceScope(e.Scope)}
+}
+func resourceCapabilitiesFromProto(c *pb.ResourceCapabilities) *types.ResourceCapabilities {
+	if c == nil {
+		return nil
+	}
+	result := &types.ResourceCapabilities{}
+	if d := c.Cpu; d != nil {
+		result.CPU = &types.ResourceDomainCapabilities{
+			LimitSupported: d.LimitSupported, LimitEnforcement: resourceEnforcement(d.LimitEnforcement), RequestEnforcement: resourceEnforcement(d.RequestEnforcement),
+		}
+	}
+	if d := c.Memory; d != nil {
+		result.Memory = &types.ResourceDomainCapabilities{
+			LimitSupported: d.LimitSupported, LimitEnforcement: resourceEnforcement(d.LimitEnforcement), RequestEnforcement: resourceEnforcement(d.RequestEnforcement),
+		}
+	}
+	if d := c.Gpu; d != nil {
+		result.GPU = &types.GPUResourceCapabilities{DefaultSelectionSupported: d.DefaultSelectionSupported, CountSelectionSupported: d.CountSelectionSupported}
+	}
+	if d := c.SampledBudget; d != nil {
+		result.SampledBudget = &types.SampledBudgetCapabilities{
+			CPUTimeSupported: d.CpuTimeSupported, ResidentBytesSupported: d.ResidentBytesSupported,
+			Scope: resourceScope(d.Scope), SamplingInterval: resourceDurationFromProto(d.SamplingInterval), TerminateOnExcess: d.TerminateOnExcess,
+			CPUTimeResolution: resourceDurationFromProto(d.CpuTimeResolution), PerProcessCPULimit: d.PerProcessCpuLimit,
+		}
+	}
+	return result
 }

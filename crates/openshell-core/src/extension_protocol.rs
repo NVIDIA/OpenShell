@@ -19,6 +19,9 @@ pub const PROTOCOL_MINOR: u32 = 0;
 /// configured signer before accepting sandbox creation.
 pub const COMPUTE_LAUNCH_AUTHENTICATION: &str = "openshell.compute.launch-authentication";
 
+/// Driver describes resource guarantees and admits explicit sampled budgets.
+pub const COMPUTE_RESOURCE_CONTRACT: &str = "openshell.compute.resource-contract";
+
 /// Driver stages operator-selected external isolation routes for the supervisor.
 pub const COMPUTE_ISOLATION_BACKEND: &str = "openshell.compute.isolation-backend";
 
@@ -28,6 +31,12 @@ pub const COMPUTE_SUSPEND_RESUME: &str = "openshell.compute.suspend-resume";
 /// Optional stopped-state workload configuration updates retaining the resource and storage.
 pub const COMPUTE_UPDATE_SANDBOX_CONFIGURATION: &str =
     "openshell.compute.update-sandbox-configuration";
+/// Driver declares the proxy prerequisites admitted before runtime signing.
+pub const COMPUTE_PROXY_FILESYSTEM_BASELINE: &str = "openshell.compute.proxy-filesystem-baseline";
+/// Immutable policy input bound to each compute launch generation.
+pub const COMPUTE_LAUNCH_POLICY: &str = "openshell.compute.launch-policy";
+/// Immutable per-sandbox forwarding and service exposure admission.
+pub const COMPUTE_INGRESS_ADMISSION: &str = "openshell.compute.ingress-admission";
 
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
@@ -133,6 +142,10 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
         supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
         supported_capabilities.push(COMPUTE_ISOLATION_BACKEND.to_string());
         supported_capabilities.push(COMPUTE_UPDATE_SANDBOX_CONFIGURATION.to_string());
+        supported_capabilities.push(COMPUTE_PROXY_FILESYSTEM_BASELINE.to_string());
+        supported_capabilities.push(COMPUTE_LAUNCH_POLICY.to_string());
+        supported_capabilities.push(COMPUTE_INGRESS_ADMISSION.to_string());
+        supported_capabilities.push(COMPUTE_RESOURCE_CONTRACT.to_string());
     }
     PeerMetadata {
         protocol_version: Some(ProtocolVersion {

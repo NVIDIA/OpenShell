@@ -46,6 +46,7 @@ struct ComputeDriverInfoView {
 struct ComputeDriverCapabilitiesView {
     driver_name: String,
     driver_version: String,
+    resources: Option<openshell_core::proto::ResourceCapabilities>,
 }
 
 #[derive(Debug, Clone)]
@@ -417,6 +418,7 @@ pub async fn gateway_info(
                     capabilities: ComputeDriverCapabilitiesView {
                         driver_name: capabilities.driver_name,
                         driver_version: capabilities.driver_version,
+                        resources: capabilities.resource_capabilities,
                     },
                 }
             })
@@ -514,7 +516,123 @@ fn print_compute_driver_info(drivers: &[ComputeDriverInfoView]) {
             "Driver version:".dimmed(),
             driver.capabilities.driver_version
         );
+        if let Some(resources) = &driver.capabilities.resources {
+            for (name, supported, limit, request) in [
+                (
+                    "CPU",
+                    resources.cpu.as_ref().map(|c| c.limit_supported),
+                    resources
+                        .cpu
+                        .as_ref()
+                        .and_then(|c| c.limit_enforcement.as_ref()),
+                    resources
+                        .cpu
+                        .as_ref()
+                        .and_then(|c| c.request_enforcement.as_ref()),
+                ),
+                (
+                    "Memory",
+                    resources.memory.as_ref().map(|c| c.limit_supported),
+                    resources
+                        .memory
+                        .as_ref()
+                        .and_then(|c| c.limit_enforcement.as_ref()),
+                    resources
+                        .memory
+                        .as_ref()
+                        .and_then(|c| c.request_enforcement.as_ref()),
+                ),
+            ] {
+                let guarantee = if supported == Some(false) {
+                    "unsupported".into()
+                } else {
+                    enforcement_label(limit)
+                };
+                println!(
+                    "      {name} limits: {guarantee}; requests: {}",
+                    enforcement_label(request)
+                );
+            }
+            if let Some(sampled) = &resources.sampled_budget {
+                println!(
+                    "      Sampled budgets: CPU time={}, resident bytes={}, scope={}; terminate on excess={}",
+                    sampled.cpu_time_supported,
+                    sampled.resident_bytes_supported,
+                    scope_name(sampled.scope),
+                    sampled.terminate_on_excess
+                );
+                let interval = sampled.sampling_interval.map_or_else(
+                    || "unreported".into(),
+                    |d| format!("{}.{:09} s", d.seconds, d.nanos),
+                );
+                println!(
+                    "      Sampling interval: {interval} (plus collection time; overshoot unbounded)"
+                );
+                let resolution = sampled.cpu_time_resolution.map_or_else(
+                    || "unreported".into(),
+                    |d| format!("{}.{:09} s", d.seconds, d.nanos),
+                );
+                println!(
+                    "      CPU-time resolution: {resolution}; per-process CPU limit: {}",
+                    sampled.per_process_cpu_limit
+                );
+            }
+        } else {
+            println!("      Resource guarantees: unreported");
+        }
     }
+}
+
+fn scope_name(scope: i32) -> &'static str {
+    use openshell_core::proto::sandbox::v1::ResourceEnforcementScope as Scope;
+    match Scope::try_from(scope) {
+        Ok(Scope::Process) => "process",
+        Ok(Scope::Container) => "container",
+        Ok(Scope::SandboxAccount) => "sandbox account",
+        Ok(Scope::VirtualMachine) => "virtual machine",
+        _ => "unreported",
+    }
+}
+
+fn enforcement_label(
+    enforcement: Option<&openshell_core::proto::sandbox::v1::ResourceEnforcement>,
+) -> String {
+    use openshell_core::proto::sandbox::v1::ResourceEnforcementKind as Kind;
+    let Some(enforcement) = enforcement else {
+        return "unreported".into();
+    };
+    let kind = match Kind::try_from(enforcement.kind) {
+        Ok(Kind::KernelLimit) => "kernel limit",
+        Ok(Kind::SchedulerRequest) => "scheduler request",
+        Ok(Kind::Unsupported) => "unsupported",
+        _ => "unreported",
+    };
+    format!("{kind} ({})", scope_name(enforcement.scope))
+}
+
+fn resource_capabilities_json(
+    resources: &openshell_core::proto::ResourceCapabilities,
+) -> serde_json::Value {
+    fn enforcement(
+        e: Option<&openshell_core::proto::sandbox::v1::ResourceEnforcement>,
+    ) -> serde_json::Value {
+        e.map_or(
+            serde_json::Value::Null,
+            |e| serde_json::json!({"kind": e.kind, "scope": e.scope}),
+        )
+    }
+    fn duration(d: Option<prost_types::Duration>) -> serde_json::Value {
+        d.map_or(
+            serde_json::Value::Null,
+            |d| serde_json::json!({"seconds": d.seconds.to_string(), "nanos": d.nanos}),
+        )
+    }
+    serde_json::json!({
+        "cpu": resources.cpu.as_ref().map(|c| serde_json::json!({"limit_supported": c.limit_supported, "limit_enforcement": enforcement(c.limit_enforcement.as_ref()), "request_enforcement": enforcement(c.request_enforcement.as_ref())})),
+        "memory": resources.memory.as_ref().map(|c| serde_json::json!({"limit_supported": c.limit_supported, "limit_enforcement": enforcement(c.limit_enforcement.as_ref()), "request_enforcement": enforcement(c.request_enforcement.as_ref())})),
+        "gpu": resources.gpu.as_ref().map(|c| serde_json::json!({"default_selection_supported": c.default_selection_supported, "count_selection_supported": c.count_selection_supported})),
+        "sampled_budget": resources.sampled_budget.as_ref().map(|c| serde_json::json!({"cpu_time_supported": c.cpu_time_supported, "resident_bytes_supported": c.resident_bytes_supported, "scope": c.scope, "sampling_interval": duration(c.sampling_interval), "terminate_on_excess": c.terminate_on_excess, "cpu_time_resolution": duration(c.cpu_time_resolution), "per_process_cpu_limit": c.per_process_cpu_limit})),
+    })
 }
 
 fn gateway_info_to_json(view: &GatewayInfoView) -> serde_json::Value {
@@ -532,6 +650,7 @@ fn gateway_info_to_json(view: &GatewayInfoView) -> serde_json::Value {
                 "capabilities": {
                     "driver_name": &driver.capabilities.driver_name,
                     "driver_version": &driver.capabilities.driver_version,
+                    "resource_capabilities": driver.capabilities.resources.as_ref().map(resource_capabilities_json),
                 },
             }))
             .collect::<Vec<_>>(),
@@ -1905,6 +2024,31 @@ mod tests {
                 capabilities: ComputeDriverCapabilitiesView {
                     driver_name: "podman".to_string(),
                     driver_version: "0.0.75".to_string(),
+                    resources: Some(openshell_core::proto::ResourceCapabilities {
+                        cpu: Some(openshell_core::proto::CpuResourceCapabilities {
+                            limit_supported: true,
+                            limit_enforcement: Some(
+                                openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                                    kind: 2,
+                                    scope: 2,
+                                },
+                            ),
+                            ..Default::default()
+                        }),
+                        sampled_budget: Some(
+                            openshell_core::proto::sandbox::v1::SampledResourceBudgetCapabilities {
+                                resident_bytes_supported: true,
+                                scope: 3,
+                                sampling_interval: Some(prost_types::Duration {
+                                    seconds: 0,
+                                    nanos: 100_000_000,
+                                }),
+                                terminate_on_excess: true,
+                                ..Default::default()
+                            },
+                        ),
+                        ..Default::default()
+                    }),
                 },
             }],
             extensions: vec![ExtensionInfoView {
@@ -1928,6 +2072,16 @@ mod tests {
             json["compute_drivers"][0]["capabilities"]["driver_name"],
             "podman"
         );
+        let resources = &json["compute_drivers"][0]["capabilities"]["resource_capabilities"];
+        assert_eq!(
+            resources["cpu"]["limit_enforcement"],
+            serde_json::json!({"kind": 2, "scope": 2})
+        );
+        assert_eq!(
+            resources["sampled_budget"]["sampling_interval"]["nanos"],
+            100_000_000
+        );
+        assert_eq!(resources["sampled_budget"]["terminate_on_excess"], true);
         assert_eq!(json["extensions"][0]["protocol_version"], "1.0");
         assert_eq!(
             json["compute_drivers"][0]["capabilities"]["driver_version"],

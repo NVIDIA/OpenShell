@@ -11,6 +11,7 @@ import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
+	sandboxpb "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -83,6 +84,7 @@ func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 	}
 
 	if rr := spec.GetResourceRequirements(); rr != nil {
+		result.SampledBudget = SampledBudgetFromProto(rr.GetSampledBudget())
 		if gpu := rr.GetGpu(); gpu != nil {
 			result.GPU = true
 			if gpu.Count != nil {
@@ -131,6 +133,18 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			DestinationPort: observation.GetDestinationPort(),
 			Failure:         endpointFailureFromProto(observation.GetFailure()),
 		}
+	}
+	if admission := status.GetIngressAdmission(); admission != nil {
+		scope := types.IngressUnknown
+		switch admission.GetScope() {
+		case sandboxpb.IngressScope_INGRESS_SCOPE_UNSUPPORTED:
+			scope = types.IngressUnsupported
+		case sandboxpb.IngressScope_INGRESS_SCOPE_ISOLATED_LOOPBACK:
+			scope = types.IngressIsolatedLoopback
+		case sandboxpb.IngressScope_INGRESS_SCOPE_SHARED_HOST_LOOPBACK:
+			scope = types.IngressSharedHostLoopback
+		}
+		result.IngressAdmission = &types.SandboxIngressAdmission{Scope: scope, AllPorts: admission.GetAllPorts(), Ports: slices.Clone(admission.GetPorts())}
 	}
 	result.ExitCode = CopyInt32Ptr(status.ExitCode)
 	if admission := status.GetConfigurationAdmission(); admission != nil {
@@ -336,6 +350,12 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 		}
 	}
 
+	if spec.SampledBudget != nil {
+		if result.ResourceRequirements == nil {
+			result.ResourceRequirements = &pb.ResourceRequirements{}
+		}
+		result.ResourceRequirements.SampledBudget = SampledBudgetToProto(spec.SampledBudget)
+	}
 	result.Command = CopyStringSlice(spec.Command)
 	result.Tty = spec.TTY
 	result.RestartPolicy = SandboxRestartPolicyToProto(spec.RestartPolicy)
@@ -454,9 +474,10 @@ func SandboxResourcesFromProto(resources *pb.SandboxResources) *types.SandboxRes
 		return nil
 	}
 	return &types.SandboxResources{
-		CPU:    resources.GetCpu(),
-		Memory: resources.GetMemory(),
-		GPU:    sandboxResourceGpuFromProto(resources),
+		CPU:           resources.GetCpu(),
+		Memory:        resources.GetMemory(),
+		GPU:           sandboxResourceGpuFromProto(resources),
+		SampledBudget: SampledBudgetFromProto(resources.GetSampledBudget()),
 	}
 }
 
@@ -536,9 +557,10 @@ func SandboxResourcesToProto(resources *types.SandboxResources) *pb.SandboxResou
 		return nil
 	}
 	return &pb.SandboxResources{
-		Cpu:    resources.CPU,
-		Memory: resources.Memory,
-		Gpu:    sandboxResourceGpuToProto(resources),
+		Cpu:           resources.CPU,
+		Memory:        resources.Memory,
+		Gpu:           sandboxResourceGpuToProto(resources),
+		SampledBudget: SampledBudgetToProto(resources.SampledBudget),
 	}
 }
 
@@ -615,4 +637,40 @@ func durationToProto(d time.Duration) *durationpb.Duration {
 		return nil
 	}
 	return durationpb.New(d)
+}
+
+func resourceDurationFromProto(d *durationpb.Duration) *types.ResourceDuration {
+	if d == nil {
+		return nil
+	}
+	return &types.ResourceDuration{Seconds: d.Seconds, Nanos: d.Nanos}
+}
+func resourceDurationToProto(d *types.ResourceDuration) *durationpb.Duration {
+	if d == nil {
+		return nil
+	}
+	return &durationpb.Duration{Seconds: d.Seconds, Nanos: d.Nanos}
+}
+
+func SampledBudgetFromProto(b *sandboxpb.SampledResourceBudget) *types.SampledResourceBudget {
+	if b == nil {
+		return nil
+	}
+	result := &types.SampledResourceBudget{CPUTime: resourceDurationFromProto(b.CpuTime)}
+	if b.ResidentBytes != nil {
+		value := *b.ResidentBytes
+		result.ResidentBytes = &value
+	}
+	return result
+}
+func SampledBudgetToProto(b *types.SampledResourceBudget) *sandboxpb.SampledResourceBudget {
+	if b == nil {
+		return nil
+	}
+	result := &sandboxpb.SampledResourceBudget{CpuTime: resourceDurationToProto(b.CPUTime)}
+	if b.ResidentBytes != nil {
+		value := *b.ResidentBytes
+		result.ResidentBytes = &value
+	}
+	return result
 }
