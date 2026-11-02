@@ -168,7 +168,9 @@
         fail_msg: "Unexpected gateway Service address: {{ k3s_gateway_address.stdout }}"
 
     # Deployment readiness doesn't establish that the controller reconciles
-    # Sandboxes, so the first test would otherwise race it. Tests don't wait.
+    # Sandboxes. This checks the installed cluster; a booted guest restarts the
+    # controller, so the test runner checks again after it boots
+    # (tests/runner/src/wait-k3s-controller.sh). Tests don't wait.
     - name: Verify Agent Sandbox reconciliation
       ansible.builtin.include_tasks: k3s-controller-ready.yaml
 
