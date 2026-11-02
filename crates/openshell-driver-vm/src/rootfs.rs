@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::driver::DEFAULT_SANDBOX_UID;
+use crate::driver::{DEFAULT_SANDBOX_UID, PREPARED_IMAGE_ROOTFS_DIR};
 
 const SANDBOX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-sandbox.zst"));
 const SUPERVISOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-supervisor.zst"));
@@ -808,6 +808,10 @@ fn debugfs_quote_argument(argument: &str) -> Option<String> {
 /// created them. Reading the matching old lower disk lets the driver preserve
 /// that overlay's real ownership contract during an upgrade.
 pub fn sandbox_guest_user_ids_from_image(image_path: &Path) -> Result<Option<(u32, u32)>, String> {
+    if ext4_image_has_directory(image_path, PREPARED_IMAGE_ROOTFS_DIR)? {
+        let passwd = format!("{PREPARED_IMAGE_ROOTFS_DIR}/etc/passwd");
+        return sandbox_guest_user_ids_from_image_path(image_path, &passwd);
+    }
     sandbox_guest_user_ids_from_image_path(image_path, "/etc/passwd")
 }
 
@@ -1769,5 +1773,57 @@ mod tests {
         )
         .expect("write openshell-vm-init");
         fs::write(rootfs.join("opt/openshell/bin/umoci"), b"umoci").expect("write umoci");
+    }
+
+    #[test]
+    fn sandbox_guest_user_ids_reads_prepared_image_rootfs() {
+        if e2fs_command("debugfs").is_err() {
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let source = dir.join("source");
+        fs::create_dir_all(source.join("image-rootfs/etc")).expect("create etc");
+        fs::write(
+            source.join("image-rootfs/etc/passwd"),
+            "sandbox:x:10001:10001::/sandbox:/bin/sh\n",
+        )
+        .expect("write passwd");
+
+        let image = dir.join("prepared.ext4");
+        create_ext4_image_from_dir_with_size(&source, &image, 64 * 1024 * 1024)
+            .expect("create ext4 image");
+
+        assert_eq!(
+            sandbox_guest_user_ids_from_image(&image).expect("read identity"),
+            Some((10001, 10001))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sandbox_guest_user_ids_prepared_image_without_sandbox_user_is_none() {
+        if e2fs_command("debugfs").is_err() {
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let source = dir.join("source");
+        fs::create_dir_all(source.join("image-rootfs/etc")).expect("create etc");
+        fs::write(
+            source.join("image-rootfs/etc/passwd"),
+            "root:x:0:0:root:/root:/bin/sh\n",
+        )
+        .expect("write passwd");
+
+        let image = dir.join("prepared.ext4");
+        create_ext4_image_from_dir_with_size(&source, &image, 64 * 1024 * 1024)
+            .expect("create ext4 image");
+
+        assert_eq!(
+            sandbox_guest_user_ids_from_image(&image).expect("read identity"),
+            None
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
