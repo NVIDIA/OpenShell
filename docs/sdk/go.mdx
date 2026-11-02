@@ -72,6 +72,11 @@ Omit `CAFile` to use system roots. For renewable OIDC service credentials, use
 `oidc.NewClientCredentialsAuth` from
 `github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/oidc`.
 
+When you load a gateway registered by the CLI, the SDK rereads the edge token
+file on each request, so a token refreshed by `openshell gateway login` takes
+effect without a restart. Keep the token file readable. After
+`openshell gateway logout`, RPCs from a running client fail.
+
 ## Create and Use a Sandbox
 
 Resource methods take an explicit workspace. The following example creates a

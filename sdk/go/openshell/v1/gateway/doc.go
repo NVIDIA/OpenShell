@@ -53,7 +53,9 @@
 //	/etc/openshell/gateways/<name>/metadata.json                (system)
 //
 // Token files (edge_token, cf_token, oidc_token.json) sit alongside
-// metadata.json and are loaded lazily on first authentication attempt.
+// metadata.json and are read on each authentication attempt, so tokens
+// refreshed by the CLI are picked up. A missing or empty file surfaces as
+// [ErrTokenLoad] on the RPC that needs it.
 //
 // # Error Handling
 //

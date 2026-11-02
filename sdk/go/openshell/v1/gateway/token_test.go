@@ -117,6 +117,35 @@ func TestLazyEdgeAuth_PicksUpLateToken(t *testing.T) {
 	assert.Equal(t, "Bearer late-token", md["authorization"])
 }
 
+func TestLazyEdgeAuth_TokenRemovedAfterSuccess(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(t *testing.T, dir string)
+	}{
+		{"removed", func(t *testing.T, dir string) {
+			require.NoError(t, os.Remove(filepath.Join(dir, edgeTokenFile)))
+		}},
+		{"empty", func(t *testing.T, dir string) {
+			writeFile(t, dir, edgeTokenFile, "")
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, dir, edgeTokenFile, "tok")
+			auth := &lazyEdgeAuth{dir: dir}
+
+			_, err := auth.GetRequestMetadata(context.Background())
+			require.NoError(t, err)
+
+			tc.mutate(t, dir)
+
+			_, err = auth.GetRequestMetadata(context.Background())
+			require.ErrorIs(t, err, ErrTokenLoad)
+		})
+	}
+}
+
 // --- T015: diskTokenSource tests ---
 
 func TestDiskTokenSource_ValidBundle(t *testing.T) {
