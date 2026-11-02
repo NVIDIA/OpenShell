@@ -131,7 +131,7 @@ descriptions, events, and current/previous container logs. A CNI rollout timeout
 occurs before the listener tests run; use these diagnostics to distinguish image
 pulls, init failures, and readiness failures.
 
-For tmachine Kubernetes conformance failures, inspect the `tmachine-diagnostics-*` artifact. The K3s report includes Agent Sandbox controller state, leader leases, events, and current and previous controller logs. The conformance playbook checks reconciliation after guest boot with a temporary scheduling-gated Sandbox probe before running tests. Distinguish a failed controller probe from a failed conformance scenario; gateway connectivity and controller Deployment availability do not prove reconciliation works.
+For tmachine Kubernetes conformance failures, inspect the `e2e-results-conformance-sandbox-ubuntu-k3s-*` artifact. Its `diagnostics/` holds the K3s report with Agent Sandbox controller state, leader leases, events, and current and previous controller logs. The k3s installers check reconciliation after guest boot with a temporary scheduling-gated Sandbox probe, so a failed probe fails provisioning before any test runs. Distinguish a failed controller probe from a failed conformance scenario; gateway connectivity and controller Deployment availability do not prove reconciliation works.
 
 For the `e2e-suites` lane (`.github/workflows/e2e-suites.yml`), the last lines of the job log give the runner's result: PASS, FAIL (exit 1) after the end of the nextest log (which names the failed tests), or ERROR (exit 2) with the step that broke. FAIL and ERROR also appear as annotations on the run's summary page. Then inspect the `e2e-results-<family>-<package>-<environment>-<installer>` artifact, which holds `junit.xml`, `nextest.log` and, after a failure, the guest's `diagnostics/`.
 
@@ -203,7 +203,7 @@ qualification; stable publication is blocked, while published pre-release
 artifacts remain available. The Pre-release failure notification includes the
 run link. Both callers share `release-build.yml` and `release-publish.yml`.
 Qualification evidence remains in Actions; publishing a copy to OCI storage is best effort.
-Snap Store uploads happen only for stable releases after qualification passes.
+Pre-release uploads snaps to `latest/beta`; stable releases upload to `latest/stable`.
 
 For a release notes preview, dispatch `release.yml` with `notes-only=true` and
 `tag=<stable-tag>`. The generator resolves the previous reachable stable tag;
@@ -220,8 +220,8 @@ and qualification, and keeps the notes only in the `release-notes` artifact.
 This job is advisory: a notes failure emits a warning without failing the
 prerelease run or blocking promotion. Stable publication reuses the promoted
 prerelease's `release-notes` artifact, retagged, and generates notes only when
-that preview is unavailable. The `Select Qualified Prerelease` summary says
-which happened.
+that preview is unavailable. The Release workflow's `Release Notes` job summary
+says which happened, and Publish waits for that job.
 
 For `Codex Compatibility Review`, inspect its job summary and the
 `compatibility-review-run-<run-id>-attempt-<attempt>` artifact. Confirm the
