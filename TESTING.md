@@ -463,7 +463,6 @@ OPENSHELL_BIN="$PWD/target/debug/openshell" \
   cargo nextest run \
     --locked \
     --manifest-path tests/suites/conformance/Cargo.toml \
-    --package sandbox \
     --test-threads 1 \
     --no-fail-fast
 ```

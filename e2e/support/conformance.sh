@@ -37,7 +37,6 @@ e2e_run_openshell_conformance() {
   cargo nextest run \
     --locked \
     --manifest-path "${root}/tests/suites/conformance/Cargo.toml" \
-    --package sandbox \
     --test-threads 1 \
     --no-fail-fast \
     --no-tests fail
