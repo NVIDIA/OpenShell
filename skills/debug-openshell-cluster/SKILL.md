@@ -1734,6 +1734,8 @@ readiness; ambiguous shared ownership must not publish an address.
 
 For discovery troubleshooting, request `GetServiceRouteSnapshot` for an explicit
 active workspace using an identity with `sandbox:read` and workspace user access.
+Both discovery RPCs return `FAILED_PRECONDITION` when
+`supervisor_app_listener.enabled` is false; enable the listener before discovering routes.
 `WatchServiceRoutes` rechecks access every second and ends after one minute;
 clients must reconnect/relist. Compare installation versions separately from
 snapshot revisions: lease renewal changes expiry and the snapshot revision while
