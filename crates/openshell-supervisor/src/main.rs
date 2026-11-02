@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicBool;
 
 use clap::{Parser, ValueEnum};
 use miette::{IntoDiagnostic, Result};
+use openshell_core::sandbox_env::OtlpProtocol;
 use openshell_isolation_interface::contract::BackendDescriptor;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -134,22 +135,33 @@ struct Args {
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
     log_level: String,
 
-    /// OTLP/gRPC collector endpoint for supervisor trace export.
+    /// OTLP collector endpoint for supervisor trace export.
     #[arg(long, env = openshell_core::sandbox_env::OTLP_ENDPOINT)]
     otlp_endpoint: Option<String>,
 
-    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
+    /// OTLP transport for supervisor trace export: `grpc` or
+    /// `http/protobuf`.
+    #[arg(long, env = openshell_core::sandbox_env::OTLP_PROTOCOL, default_value_t)]
+    otlp_protocol: OtlpProtocol,
+
+    /// OTLP collector endpoint for supervisor OCSF event export.
     #[arg(long, env = openshell_core::sandbox_env::OTLP_OCSF_ENDPOINT)]
     otlp_ocsf_endpoint: Option<String>,
 
-    /// OCSF schema version that exported events are downgraded to.
-    #[arg(long, env = openshell_core::sandbox_env::OTLP_OCSF_SCHEMA_VERSION)]
-    otlp_ocsf_schema_version: Option<openshell_ocsf::OcsfSchemaVersion>,
+    /// OTLP transport for supervisor OCSF event export: `grpc` or
+    /// `http/protobuf`.
+    #[arg(long, env = openshell_core::sandbox_env::OTLP_OCSF_PROTOCOL, default_value_t)]
+    otlp_ocsf_protocol: OtlpProtocol,
 
-    /// OTLP/gRPC collector endpoint that workload traces are relayed to.
-    /// Absent keeps the relay inactive.
+    /// OTLP collector endpoint that workload traces are relayed to. Absent
+    /// keeps the relay inactive.
     #[arg(long, env = openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT)]
     otlp_agent_endpoint: Option<String>,
+
+    /// OTLP transport to the relayed trace collector: `grpc` or
+    /// `http/protobuf`.
+    #[arg(long, env = openshell_core::sandbox_env::OTLP_AGENT_PROTOCOL, default_value_t)]
+    otlp_agent_protocol: OtlpProtocol,
 
     /// Name of the gateway that launched this sandbox, for telemetry.
     #[arg(long, env = openshell_core::sandbox_env::GATEWAY_NAME)]
@@ -484,9 +496,12 @@ fn main() -> Result<()> {
             args.gateway_name.as_deref(),
         ),
     };
-    // The tonic exporters must be created inside the runtime that drives them.
+    // The exporters must be created inside the runtime that drives them.
     let (otlp_provider, otlp_setup_error) = runtime.block_on(async {
-        openshell_otel::provider_for(args.otlp_endpoint.as_deref().map(export_config))
+        start_trace_export(
+            args.otlp_endpoint.as_deref().map(export_config),
+            args.otlp_protocol,
+        )
     });
     let ocsf_headers = isolation_inputs
         .as_ref()
@@ -495,8 +510,8 @@ fn main() -> Result<()> {
     let (ocsf_export, ocsf_setup_error) = runtime.block_on(async {
         start_ocsf_export(
             args.otlp_ocsf_endpoint.as_deref().map(export_config),
+            args.otlp_ocsf_protocol,
             ocsf_headers,
-            args.otlp_ocsf_schema_version,
         )
     });
     let otlp_layer_provider = otlp_provider.clone();
@@ -527,14 +542,12 @@ fn main() -> Result<()> {
         let push_layer = log_push_state.as_ref().map(|(layer, _)| layer.clone());
         let _log_push_handle = log_push_state.map(|(_, handle)| handle);
         let ocsf_enabled = Arc::new(AtomicBool::new(false));
-        let ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
 
         let (logging_layers, _logging_guards, file_available) = logging::layers(
             std::io::stderr(),
             Path::new("/var/log"),
             console_filter,
             ocsf_enabled.clone(),
-            ocsf_schema_version.clone(),
         );
         tracing_subscriber::registry()
             .with(logging_layers)
@@ -553,12 +566,12 @@ fn main() -> Result<()> {
         if let Some(error) = otlp_setup_error {
             warn!(%error, "OTLP exporting could not be started; continuing without it");
         } else if let Some(endpoint) = &args.otlp_endpoint {
-            info!(endpoint, "OTLP exporting enabled");
+            info!(endpoint, protocol = %args.otlp_protocol, "OTLP exporting enabled");
         }
         if let Some(error) = ocsf_setup_error {
             warn!(%error, "OTLP OCSF export could not be started; continuing without it");
         } else if let Some(endpoint) = &args.otlp_ocsf_endpoint {
-            info!(endpoint, "OTLP OCSF export enabled");
+            info!(endpoint, protocol = %args.otlp_ocsf_protocol, "OTLP OCSF export enabled");
         }
 
         let workdir = args.workdir.clone();
@@ -640,6 +653,7 @@ fn main() -> Result<()> {
                     takeover: None,
                     supervisor_recovery_timeout_secs: None,
                     otlp_agent_endpoint: args.otlp_agent_endpoint.clone(),
+                    otlp_agent_protocol: args.otlp_agent_protocol,
                 };
                 // Log push already shares these credentials and the logging
                 // layers these OCSF JSON settings.
@@ -648,7 +662,6 @@ fn main() -> Result<()> {
                     gateway_credentials,
                     openshell_ocsf::OcsfJsonSettings {
                         enabled: ocsf_enabled,
-                        target_version: ocsf_schema_version,
                     },
                 );
                 let result = Box::pin(openshell_supervisor::run_sandbox_with_backend(
@@ -700,8 +713,8 @@ fn main() -> Result<()> {
 /// once its tracing subscriber is installed.
 fn start_ocsf_export(
     config: Option<openshell_otel::OtlpExportConfig<'_>>,
+    protocol: OtlpProtocol,
     headers: Option<&str>,
-    schema_version: Option<openshell_ocsf::OcsfSchemaVersion>,
 ) -> (
     Option<openshell_otel::OcsfOtlp>,
     Option<openshell_otel::SetupError>,
@@ -709,17 +722,40 @@ fn start_ocsf_export(
     let Some(config) = config else {
         return (None, None);
     };
-    let started = openshell_otel::OtlpTarget::new(&config).and_then(|target| {
+    let started = target(&config, protocol).and_then(|target| {
         Ok(openshell_otel::OcsfOtlp::start(
             target.log_exporter_with_headers(headers)?,
             target.resource().clone(),
-            schema_version,
         ))
     });
     match started {
         Ok(export) => (Some(export), None),
         Err(error) => (None, Some(error)),
     }
+}
+
+/// Starts supervisor trace export to `config` over `protocol`. A setup
+/// failure disables export and is returned for the caller to report once its
+/// tracing subscriber is installed.
+fn start_trace_export(
+    config: Option<openshell_otel::OtlpExportConfig<'_>>,
+    protocol: OtlpProtocol,
+) -> (
+    Option<openshell_otel::SdkTracerProvider>,
+    Option<openshell_otel::SetupError>,
+) {
+    match config.map(|config| target(&config, protocol)?.tracer_provider()) {
+        None => (None, None),
+        Some(Ok(provider)) => (Some(provider), None),
+        Some(Err(error)) => (None, Some(error)),
+    }
+}
+
+fn target(
+    config: &openshell_otel::OtlpExportConfig<'_>,
+    protocol: OtlpProtocol,
+) -> Result<openshell_otel::OtlpTarget, openshell_otel::SetupError> {
+    Ok(openshell_otel::OtlpTarget::new(config)?.with_protocol(protocol.into()))
 }
 
 /// Resource attributes identifying this supervisor's sandbox and the gateway
@@ -928,27 +964,6 @@ mod tests {
     }
 
     #[test]
-    fn ocsf_export_takes_a_supported_schema_version() {
-        let args = Args::try_parse_from([
-            "openshell-supervisor",
-            "--otlp-ocsf-endpoint",
-            "http://siem:4317",
-            "--otlp-ocsf-schema-version",
-            "1.3",
-        ])
-        .expect("parse OCSF export");
-        assert_eq!(args.otlp_ocsf_endpoint.as_deref(), Some("http://siem:4317"));
-        assert_eq!(
-            args.otlp_ocsf_schema_version,
-            Some(openshell_ocsf::OcsfSchemaVersion::V1_3)
-        );
-        assert!(
-            Args::try_parse_from(["openshell-supervisor", "--otlp-ocsf-schema-version", "1.8"])
-                .is_err()
-        );
-    }
-
-    #[test]
     fn agent_relay_endpoint_is_separate_from_trace_export() {
         let args = Args::try_parse_from([
             "openshell-supervisor",
@@ -973,6 +988,80 @@ mod tests {
         assert_eq!(args.otlp_endpoint, None);
     }
 
+    #[test]
+    fn otlp_protocols_default_to_grpc() {
+        let args = Args::try_parse_from(["openshell-supervisor"]).expect("parse defaults");
+        assert_eq!(
+            [
+                args.otlp_protocol,
+                args.otlp_ocsf_protocol,
+                args.otlp_agent_protocol
+            ],
+            [OtlpProtocol::Grpc; 3]
+        );
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--otlp-protocol",
+            "http/protobuf",
+            "--otlp-ocsf-protocol",
+            "http/protobuf",
+            "--otlp-agent-protocol",
+            "http/protobuf",
+        ])
+        .expect("parse HTTP protocols");
+        assert_eq!(
+            [
+                args.otlp_protocol,
+                args.otlp_ocsf_protocol,
+                args.otlp_agent_protocol
+            ],
+            [OtlpProtocol::HttpProtobuf; 3]
+        );
+        assert!(
+            Args::try_parse_from(["openshell-supervisor", "--otlp-protocol", "http/json"]).is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn supervisor_signals_export_over_their_configured_protocol() {
+        use openshell_ocsf::{ConfigStateChangeBuilder, ocsf_emit};
+        use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+        use tracing_subscriber::prelude::*;
+
+        let mut collector = openshell_otel_test_support::OtlpHttpTestServer::start().await;
+        let config = || openshell_otel::OtlpExportConfig {
+            endpoint: collector.endpoint(),
+            service_name: openshell_otel::ServiceName::Fixed(SERVICE_NAME),
+            service_version: None,
+            resource_attributes: Vec::new(),
+        };
+        let (provider, error) = start_trace_export(Some(config()), OtlpProtocol::HttpProtobuf);
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        let provider = provider.expect("trace export");
+        let (ocsf, error) = start_ocsf_export(Some(config()), OtlpProtocol::HttpProtobuf, None);
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        let ocsf = ocsf.expect("OCSF export");
+
+        provider.tracer("test").in_span("supervisor-span", |_| {});
+        let event = ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+            .message("policy loaded")
+            .build();
+        let subscriber = tracing_subscriber::registry().with(ocsf.layer());
+        tracing::subscriber::with_default(subscriber, || ocsf_emit!(event));
+        tokio::task::spawn_blocking(move || provider.force_flush())
+            .await
+            .unwrap()
+            .expect("trace flush");
+        ocsf.shutdown().await;
+
+        let mut paths = vec![
+            collector.next_export().await.path,
+            collector.next_export().await.path,
+        ];
+        paths.sort();
+        assert_eq!(paths, ["/v1/logs", "/v1/traces"]);
+    }
+
     #[tokio::test]
     async fn ocsf_export_starts_only_with_a_valid_endpoint() {
         let config = |endpoint| openshell_otel::OtlpExportConfig {
@@ -981,17 +1070,18 @@ mod tests {
             service_version: None,
             resource_attributes: Vec::new(),
         };
-        let (export, error) = start_ocsf_export(None, None, None);
+        let (export, error) = start_ocsf_export(None, OtlpProtocol::Grpc, None);
         assert!(export.is_none() && error.is_none());
 
-        let (export, error) = start_ocsf_export(Some(config("not a url")), None, None);
+        let (export, error) =
+            start_ocsf_export(Some(config("not a url")), OtlpProtocol::Grpc, None);
         assert!(export.is_none());
         assert!(error.is_some());
 
         let (export, error) = start_ocsf_export(
             Some(config("http://127.0.0.1:4317")),
+            OtlpProtocol::Grpc,
             Some("authorization=Bearer%20t"),
-            None,
         );
         assert!(error.is_none(), "unexpected setup error: {error:?}");
         export.expect("OCSF export").shutdown().await;

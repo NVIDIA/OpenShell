@@ -123,6 +123,50 @@ or two minutes after the withdrawal, after their owner was told to stop them.
 Pool members still authenticate with the one shared supervisor token, so a
 member identity is asserted by its hello rather than bound to its Pod.
 
+## Optional in-process sandbox updates
+
+`SharedComputeDriver` retains the generated baseline compute-driver trait, and
+`ComputeDriverInstance` retains its existing variants. Existing compiled drivers
+and factories need no new trait implementation or registration method.
+
+A supporting factory overrides `ComputeDriverFactory::build_with_configuration_updates`
+to return its ordinary instance plus a separately registered updater. The default
+calls `build` and returns no updater. External drivers serve
+`ComputeDriverConfigurationUpdates` on their existing endpoint. Workload updates
+require `openshell.compute.update-sandbox-configuration` for image, command, or
+environment changes. Metadata-only replacements use one database CAS and update
+the label index without invoking a driver.
+
+New updates require operator activation and compatible gateway membership.
+Accepted updates recover from private durable intent at startup and in periodic
+reconciliation, including when activation is subsequently disabled. Recovery
+pages through a partial database index of pending private update records instead
+of scanning sandboxes or completed receipts. Acceptance and completion maintain
+the indexed status in the same transaction as the intent and lifecycle interlock.
+Each gateway keeps automatic recovery backoff in memory. Failed attempts wait
+1, 2, 4, 8, then 15 minutes; each failure log includes the attempt and retry delay.
+Replicas retry independently, and a gateway restart resets its backoff. A new
+operation starts without delay. Completed or deleted updates are removed from
+the backoff map as recovery observes them.
+An authorized `UpdateSandbox` with no selected fields and the current resource
+version resumes immediately, bypassing backoff without reconstructing its selections. Completion retains the
+exact operation receipt for idempotent completion across replicas; a newer update
+invalidates it. Ambiguous results retain the baseline provisioning interlock.
+Explicit deletion can supersede a pending update: the driver only patches the
+original immutable resource and never creates a replacement. The Deleting CAS
+prevents delayed completion. Cleanup bypasses the pending-driver guard only when
+the pending operation ID matches the persisted update intent. Final removal
+deletes the sandbox and private intent atomically, retaining that evidence if
+cleanup fails or loses a resource-version race.
+
+Metadata replacement preserves gateway-owned keys, including retention, while
+other user keys under OpenShell domains remain editable. Completion preserves
+later annotation merges accepted through `UpdateConfig`.
+
+A provisioning timeout can be repaired by Stop after its original driver work
+settles and cleanup completes. Stop exposes Stopped without discarding the timeout
+diagnosis or storage. This lifecycle behavior also applies when updates are disabled.
+
 ## Operator credential export
 
 `GetProviderCredentials` exports selected profile-declared runtime environment

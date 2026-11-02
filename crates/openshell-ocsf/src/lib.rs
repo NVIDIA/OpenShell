@@ -60,8 +60,6 @@ pub use objects::{
 // --- Sanitizers ---
 pub use sanitize::sanitize_reason_for_audit;
 
-pub use format::downgrade::OcsfSchemaVersion;
-
 // --- Builders ---
 pub use builders::{
     ApiActivityBuilder, AppLifecycleBuilder, AuthenticationBuilder, BaseEventBuilder,

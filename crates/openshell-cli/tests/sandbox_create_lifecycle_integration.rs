@@ -67,6 +67,7 @@ struct SandboxState {
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
     expose_service_requests: Arc<Mutex<Vec<openshell_core::proto::ExposeServiceRequest>>>,
     fail_delete_sandbox_message: Arc<Mutex<Option<String>>>,
+    stop_response: Arc<Mutex<Option<Sandbox>>>,
     vm_error_after_started: Arc<AtomicBool>,
     vm_error_with_observed_exit: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
@@ -231,7 +232,17 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::StopSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        Err(Status::unimplemented("unused"))
+        let sandbox = self
+            .state
+            .stop_response
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| Status::unimplemented("unused"))?;
+        Ok(Response::new(SandboxResponse {
+            sandbox: Some(sandbox),
+            ..Default::default()
+        }))
     }
 
     async fn start_sandbox(
@@ -1706,6 +1717,57 @@ fn test_config() -> run::SandboxCreateConfig<'static> {
         tty_override: Some(false),
         auto_providers_override: Some(false),
         ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn sandbox_stop_accepts_terminal_results_without_waiting_for_stopped() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+    let config_dir = helpers::tempdir().unwrap();
+    for (phase, exit_code, reason, succeeds) in [
+        (
+            SandboxPhase::Completed,
+            Some(0),
+            "MainProcessCompleted",
+            true,
+        ),
+        (SandboxPhase::Error, Some(17), "MainProcessFailed", true),
+        (SandboxPhase::Stopped, None, "Stopped", true),
+        (
+            SandboxPhase::Error,
+            Some(17),
+            "ComputeResourceMissing",
+            false,
+        ),
+    ] {
+        let sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                phase: phase as i32,
+                exit_code,
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".into(),
+                    status: "False".into(),
+                    reason: reason.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        *server.openshell.state.stop_response.lock().await = Some(sandbox);
+        Environment::new()
+            .set("XDG_CONFIG_HOME", config_dir.path())
+            .run_async(async {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    run::sandbox_stop(&server.endpoint, "terminal-stop-test", "default", &tls),
+                )
+                .await
+                .expect("stop must finish without watching for another phase");
+                assert_eq!(result.is_ok(), succeeds, "{reason}: {result:?}");
+            })
+            .await;
     }
 }
 

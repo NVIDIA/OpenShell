@@ -209,7 +209,9 @@ pub fn build_rustls_config(materials: &TlsMaterials) -> Result<rustls::ClientCon
         .into_diagnostic()?;
     let key = load_private_key(&materials.key)?;
 
-    openshell_crypto::tls::client_builder()
+    openshell_crypto::tls::try_client_builder()
+        .into_diagnostic()
+        .wrap_err("configure gateway TLS client")?
         .with_root_certificates(roots)
         .with_client_auth_cert(cert_chain, key)
         .into_diagnostic()
@@ -256,7 +258,9 @@ impl ServerCertVerifier for InsecureServerCertVerifier {
 }
 
 pub fn build_insecure_rustls_config() -> Result<rustls::ClientConfig> {
-    let config = openshell_crypto::tls::client_builder()
+    let config = openshell_crypto::tls::try_client_builder()
+        .into_diagnostic()
+        .wrap_err("configure gateway TLS client")?
         .dangerous()
         .with_custom_certificate_verifier(std::sync::Arc::new(InsecureServerCertVerifier))
         .with_no_client_auth();

@@ -923,9 +923,11 @@ pub struct SandboxInstanceConfig {
     /// attach: how long it keeps the workload frozen after losing this
     /// supervisor. `None` leaves the runtime default.
     pub supervisor_recovery_timeout_secs: Option<u32>,
-    /// OTLP/gRPC collector for relayed agent traces; `None` keeps the relay
+    /// OTLP collector for relayed agent traces; `None` keeps the relay
     /// inactive.
     pub otlp_agent_endpoint: Option<String>,
+    /// Transport to the relayed agent trace collector.
+    pub otlp_agent_protocol: openshell_core::sandbox_env::OtlpProtocol,
 }
 
 impl SandboxInstanceConfig {
@@ -1085,6 +1087,7 @@ pub async fn run_sandbox_instance(
         takeover,
         supervisor_recovery_timeout_secs,
         otlp_agent_endpoint,
+        otlp_agent_protocol,
     } = config;
     // The owner binds the event context and log sink to the instance's
     // threads; the instance itself uses the rest.
@@ -1305,7 +1308,7 @@ pub async fn run_sandbox_instance(
     // before attach so the agent spec can tell the boundary whether to point
     // workload SDKs at it.
     let (mut otlp_relay, otlp_reserved_destination) =
-        otlp_relay::activate(otlp_agent_endpoint, sandbox_id.clone());
+        otlp_relay::activate(otlp_agent_endpoint, otlp_agent_protocol, sandbox_id.clone());
 
     // Construct the selected client only after shared policy and credential
     // setup has completed. Keep live credentials and later CA publication in
@@ -1599,7 +1602,7 @@ pub async fn run_sandbox_instance(
         let poll_gateway = gateway.clone();
         let poll_engine = engine.clone();
         let poll_ocsf_enabled = ocsf_json.enabled.clone();
-        let poll_ocsf_schema_version = ocsf_json.target_version.clone();
+        let poll_ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
         let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
@@ -4216,6 +4219,7 @@ struct PolicyPollLoopContext {
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<AtomicBool>,
+    /// Last value of the deprecated `ocsf_schema_version` setting.
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     provider_credentials: ProviderCredentialState,
     provider_readiness: ProviderReadinessTracker,
@@ -4657,6 +4661,7 @@ mod tests {
             takeover: None,
             supervisor_recovery_timeout_secs: None,
             otlp_agent_endpoint: None,
+            otlp_agent_protocol: openshell_core::sandbox_env::OtlpProtocol::Grpc,
         };
         let bindings = SandboxInstanceBindings::dedicated(
             &config,

@@ -408,7 +408,9 @@ fn build_server_config(
         .build()
         .map_err(|e| Error::tls(format!("failed to build client verifier: {e}")))?;
 
-        let builder = openshell_crypto::tls::server_builder().with_client_cert_verifier(verifier);
+        let builder = openshell_crypto::tls::try_server_builder()
+            .map_err(|e| Error::tls(format!("configure gateway TLS server: {e}")))?
+            .with_client_cert_verifier(verifier);
         if let Some(resolver) = resolver {
             builder.with_cert_resolver(resolver)
         } else {
@@ -417,7 +419,9 @@ fn build_server_config(
                 .map_err(|e| Error::tls(format!("failed to create TLS config: {e}")))?
         }
     } else {
-        let builder = openshell_crypto::tls::server_builder().with_no_client_auth();
+        let builder = openshell_crypto::tls::try_server_builder()
+            .map_err(|e| Error::tls(format!("configure gateway TLS server: {e}")))?
+            .with_no_client_auth();
         if let Some(resolver) = resolver {
             builder.with_cert_resolver(resolver)
         } else {

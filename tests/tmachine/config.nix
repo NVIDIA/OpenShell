@@ -51,8 +51,24 @@ let
           use_galaxy = true;
           playbooks = [
             "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/test-tools.yaml"
             "ansible/playbooks/docker.yaml"
           ];
+        };
+      }
+      {
+        name = "ubuntu-docker-rootful-keycloak";
+        machine = "ubuntu";
+        setup = {
+          use_galaxy = true;
+          playbooks = [
+            "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/docker.yaml"
+            "ansible/playbooks/keycloak.yaml"
+          ];
+          inputs = {
+            keycloak_realm_file = "../../scripts/keycloak-realm.json";
+          };
         };
       }
       {
@@ -62,6 +78,7 @@ let
           use_galaxy = false;
           playbooks = [
             "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/test-tools.yaml"
             "ansible/playbooks/k3s.yaml"
           ];
         };
@@ -73,6 +90,7 @@ let
           use_galaxy = false;
           playbooks = [
             "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/test-tools.yaml"
             "ansible/playbooks/selinux.yaml"
             "ansible/playbooks/podman-rootful.yaml"
           ];
@@ -85,6 +103,7 @@ let
           use_galaxy = false;
           playbooks = [
             "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/test-tools.yaml"
             "ansible/playbooks/selinux.yaml"
             "ansible/playbooks/podman-rootless.yaml"
           ];
@@ -158,20 +177,6 @@ let
         playbooks = [ "ansible/playbooks/shell.yaml" ];
         inputs = { };
         interactive = true;
-      }
-      {
-        name = "conformance";
-        playbooks = [ "ansible/playbooks/conformance/cli.yaml" ];
-        inputs = {
-          openshell_conformance_test_bundle = "../../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
-        };
-      }
-      {
-        name = "policy-advisor";
-        playbooks = [ "ansible/playbooks/conformance/policy-advisor.yaml" ];
-        inputs = {
-          openshell_conformance_test_bundle = "../../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
-        };
       }
       {
         name = "provider-refresh";

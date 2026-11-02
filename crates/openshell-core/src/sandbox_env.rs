@@ -32,42 +32,227 @@ pub const SSH_SOCKET_PATH: &str = "OPENSHELL_SSH_SOCKET_PATH";
 /// Log level for the sandbox supervisor (e.g. `"debug"`, `"info"`, `"warn"`).
 pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 
-/// OTLP/gRPC collector endpoint for supervisor trace export.
+/// OTLP collector endpoint for supervisor trace export.
 pub const OTLP_ENDPOINT: &str = "OPENSHELL_OTLP_ENDPOINT";
 
-/// OTLP/gRPC collector endpoint for supervisor OCSF event export.
+/// OTLP transport for supervisor trace export. Absent means gRPC.
+pub const OTLP_PROTOCOL: &str = "OPENSHELL_OTLP_PROTOCOL";
+
+/// OTLP collector endpoint for supervisor OCSF event export.
 pub const OTLP_OCSF_ENDPOINT: &str = "OPENSHELL_OTLP_OCSF_ENDPOINT";
 
-/// OTLP/gRPC collector endpoint that supervisors relay workload traces to.
+/// OTLP transport for supervisor OCSF event export. Absent means gRPC.
+pub const OTLP_OCSF_PROTOCOL: &str = "OPENSHELL_OTLP_OCSF_PROTOCOL";
+
+/// OTLP collector endpoint that supervisors relay workload traces to.
 ///
 /// Set only when the gateway enables `[openshell.gateway.otlp.agent]`; absent
 /// keeps the relay inactive and leaves the workload environment unchanged.
 pub const OTLP_AGENT_ENDPOINT: &str = "OPENSHELL_OTLP_AGENT_ENDPOINT";
 
-/// OCSF schema version that supervisors downgrade exported events to.
-pub const OTLP_OCSF_SCHEMA_VERSION: &str = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION";
+/// OTLP transport that supervisors relay workload traces over. Absent means
+/// gRPC.
+pub const OTLP_AGENT_PROTOCOL: &str = "OPENSHELL_OTLP_AGENT_PROTOCOL";
 
 /// Name of the gateway that launched the sandbox, reported as
 /// `openshell.gateway.name` on supervisor telemetry.
 pub const GATEWAY_NAME: &str = "OPENSHELL_GATEWAY_NAME";
 
-/// OCSF event export that a compute driver passes to its supervisors.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OcsfOtlpExport {
-    pub endpoint: String,
-    pub schema_version: Option<String>,
+/// OTLP transport, named with the `OTEL_EXPORTER_OTLP_PROTOCOL` values.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum OtlpProtocol {
+    #[default]
+    #[serde(rename = "grpc")]
+    Grpc,
+    #[serde(rename = "http/protobuf")]
+    HttpProtobuf,
 }
 
-impl OcsfOtlpExport {
-    /// The supervisor environment variables for this export.
+impl OtlpProtocol {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Grpc => "grpc",
+            Self::HttpProtobuf => "http/protobuf",
+        }
+    }
+}
+
+impl std::fmt::Display for OtlpProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for OtlpProtocol {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "grpc" => Ok(Self::Grpc),
+            "http/protobuf" => Ok(Self::HttpProtobuf),
+            other => Err(format!(
+                "unsupported OTLP protocol {other:?}: expected \"grpc\" or \"http/protobuf\""
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "otel")]
+impl From<OtlpProtocol> for openshell_otel::Protocol {
+    fn from(protocol: OtlpProtocol) -> Self {
+        match protocol {
+            OtlpProtocol::Grpc => Self::Grpc,
+            OtlpProtocol::HttpProtobuf => Self::HttpProtobuf,
+        }
+    }
+}
+
+/// One OTLP collector that a supervisor exports to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OtlpExport {
+    pub endpoint: String,
+    pub protocol: OtlpProtocol,
+}
+
+impl OtlpExport {
+    fn environment(
+        &self,
+        endpoint_var: &'static str,
+        protocol_var: &'static str,
+    ) -> impl Iterator<Item = (&'static str, String)> {
+        std::iter::once((endpoint_var, self.endpoint.clone())).chain(
+            (self.protocol != OtlpProtocol::Grpc)
+                .then(|| (protocol_var, self.protocol.to_string())),
+        )
+    }
+}
+
+/// The OTLP exports that a compute driver passes to its supervisors.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SupervisorOtlp {
+    /// The supervisor's own spans.
+    pub traces: Option<OtlpExport>,
+    /// OCSF events, as log records.
+    pub ocsf: Option<OtlpExport>,
+    /// Relayed workload traces.
+    pub agent: Option<OtlpExport>,
+}
+
+impl SupervisorOtlp {
+    /// Whether no export is configured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.traces.is_none() && self.ocsf.is_none() && self.agent.is_none()
+    }
+
+    /// The supervisor environment variables for these exports.
     pub fn environment(&self) -> Vec<(&'static str, String)> {
-        std::iter::once((OTLP_OCSF_ENDPOINT, self.endpoint.clone()))
-            .chain(
-                self.schema_version
-                    .clone()
-                    .map(|version| (OTLP_OCSF_SCHEMA_VERSION, version)),
-            )
-            .collect()
+        let traces = self
+            .traces
+            .iter()
+            .flat_map(|export| export.environment(OTLP_ENDPOINT, OTLP_PROTOCOL));
+        let ocsf = self
+            .ocsf
+            .iter()
+            .flat_map(|export| export.environment(OTLP_OCSF_ENDPOINT, OTLP_OCSF_PROTOCOL));
+        let agent = self
+            .agent
+            .iter()
+            .flat_map(|export| export.environment(OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL));
+        traces.chain(ocsf).chain(agent).collect()
+    }
+
+    /// Applies `rewrite` to every collector endpoint, for drivers whose
+    /// supervisors reach the gateway host under another name.
+    #[must_use]
+    pub fn map_endpoints(self, rewrite: impl Fn(String) -> String) -> Self {
+        let map = |export: Option<OtlpExport>| {
+            export.map(|export| OtlpExport {
+                endpoint: rewrite(export.endpoint),
+                ..export
+            })
+        };
+        Self {
+            traces: map(self.traces),
+            ocsf: map(self.ocsf),
+            agent: map(self.agent),
+        }
+    }
+}
+
+/// Compute-driver flags for the collectors given to supervisors, without the
+/// leading `--`. The driver flags read the same environment variables that
+/// supervisors do.
+pub const OTLP_ENDPOINT_FLAG: &str = "otlp-endpoint";
+pub const OTLP_PROTOCOL_FLAG: &str = "otlp-protocol";
+pub const OTLP_OCSF_ENDPOINT_FLAG: &str = "otlp-ocsf-endpoint";
+pub const OTLP_OCSF_PROTOCOL_FLAG: &str = "otlp-ocsf-protocol";
+pub const OTLP_AGENT_ENDPOINT_FLAG: &str = "otlp-agent-endpoint";
+pub const OTLP_AGENT_PROTOCOL_FLAG: &str = "otlp-agent-protocol";
+
+/// The OTLP flags every compute driver takes, flattened into its arguments.
+#[cfg(feature = "clap")]
+#[derive(Clone, Debug, Default, clap::Args)]
+pub struct SupervisorOtlpArgs {
+    /// OTLP collector endpoint for the driver's and supervisors' spans.
+    #[arg(long = OTLP_ENDPOINT_FLAG, env = OTLP_ENDPOINT)]
+    pub endpoint: Option<String>,
+
+    /// Transport to the trace collector: `grpc` or `http/protobuf`.
+    #[arg(long = OTLP_PROTOCOL_FLAG, env = OTLP_PROTOCOL, default_value_t)]
+    pub protocol: OtlpProtocol,
+
+    /// OTLP collector endpoint for supervisor OCSF event export.
+    #[arg(long = OTLP_OCSF_ENDPOINT_FLAG, env = OTLP_OCSF_ENDPOINT)]
+    pub ocsf_endpoint: Option<String>,
+
+    /// Transport to the OCSF collector: `grpc` or `http/protobuf`.
+    #[arg(long = OTLP_OCSF_PROTOCOL_FLAG, env = OTLP_OCSF_PROTOCOL, default_value_t)]
+    pub ocsf_protocol: OtlpProtocol,
+
+    /// Deprecated and ignored: `OpenShell` emits OCSF 1.8.0 only.
+    #[arg(
+        long = "otlp-ocsf-schema-version",
+        env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION",
+        hide = true
+    )]
+    pub ocsf_schema_version: Option<String>,
+
+    /// OTLP collector endpoint that supervisors relay workload traces to.
+    /// Absent keeps the agent trace relay off.
+    #[arg(long = OTLP_AGENT_ENDPOINT_FLAG, env = OTLP_AGENT_ENDPOINT)]
+    pub agent_endpoint: Option<String>,
+
+    /// Transport to the agent trace relay's collector: `grpc` or `http/protobuf`.
+    #[arg(long = OTLP_AGENT_PROTOCOL_FLAG, env = OTLP_AGENT_PROTOCOL, default_value_t)]
+    pub agent_protocol: OtlpProtocol,
+}
+
+#[cfg(feature = "clap")]
+impl SupervisorOtlpArgs {
+    /// The exports these flags configure.
+    #[must_use]
+    pub fn supervisor_otlp(&self) -> SupervisorOtlp {
+        let export = |endpoint: &Option<String>, protocol| {
+            endpoint
+                .clone()
+                .map(|endpoint| OtlpExport { endpoint, protocol })
+        };
+        SupervisorOtlp {
+            traces: export(&self.endpoint, self.protocol),
+            ocsf: export(&self.ocsf_endpoint, self.ocsf_protocol),
+            agent: export(&self.agent_endpoint, self.agent_protocol),
+        }
+    }
+
+    /// Logs a warning when the deprecated schema version flag is set.
+    pub fn warn_deprecated(&self) {
+        if self.ocsf_schema_version.is_some() {
+            tracing::warn!(
+                "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION is deprecated and ignored; OpenShell emits OCSF 1.8.0"
+            );
+        }
     }
 }
 
@@ -397,24 +582,119 @@ mod otlp_relay_address_tests {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "clap")]
     #[test]
-    fn ocsf_export_environment_carries_the_schema_version_only_when_set() {
-        let mut export = OcsfOtlpExport {
-            endpoint: "http://siem:4317".into(),
-            schema_version: None,
+    fn driver_flags_build_supervisor_otlp() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct Driver {
+            #[command(flatten)]
+            otlp: SupervisorOtlpArgs,
+        }
+
+        let driver = Driver::try_parse_from([
+            "driver",
+            "--otlp-endpoint",
+            "http://traces:4317",
+            "--otlp-ocsf-endpoint",
+            "http://siem:4318",
+            "--otlp-ocsf-protocol",
+            "http/protobuf",
+            "--otlp-ocsf-schema-version",
+            "2.0",
+            "--otlp-agent-endpoint",
+            "http://agents:4318",
+            "--otlp-agent-protocol",
+            "http/protobuf",
+        ])
+        .expect("OTLP flags should parse");
+
+        assert_eq!(driver.otlp.ocsf_schema_version.as_deref(), Some("2.0"));
+        assert_eq!(
+            driver.otlp.supervisor_otlp(),
+            SupervisorOtlp {
+                traces: Some(OtlpExport {
+                    endpoint: "http://traces:4317".into(),
+                    protocol: OtlpProtocol::Grpc,
+                }),
+                ocsf: Some(OtlpExport {
+                    endpoint: "http://siem:4318".into(),
+                    protocol: OtlpProtocol::HttpProtobuf,
+                }),
+                agent: Some(OtlpExport {
+                    endpoint: "http://agents:4318".into(),
+                    protocol: OtlpProtocol::HttpProtobuf,
+                }),
+            }
+        );
+        assert_eq!(
+            Driver::try_parse_from(["driver"])
+                .unwrap()
+                .otlp
+                .supervisor_otlp(),
+            SupervisorOtlp::default()
+        );
+    }
+
+    #[test]
+    fn otlp_protocol_uses_the_otel_exporter_protocol_values() {
+        for (value, protocol) in [
+            ("grpc", OtlpProtocol::Grpc),
+            ("http/protobuf", OtlpProtocol::HttpProtobuf),
+        ] {
+            assert_eq!(value.parse::<OtlpProtocol>(), Ok(protocol));
+            assert_eq!(protocol.as_str(), value);
+        }
+        assert_eq!(OtlpProtocol::default(), OtlpProtocol::Grpc);
+        assert!("http/json".parse::<OtlpProtocol>().is_err());
+        assert!("HTTP".parse::<OtlpProtocol>().is_err());
+    }
+
+    #[test]
+    fn supervisor_otlp_environment_names_each_lane() {
+        let export = |endpoint: &str, protocol| {
+            Some(OtlpExport {
+                endpoint: endpoint.into(),
+                protocol,
+            })
+        };
+        assert!(SupervisorOtlp::default().environment().is_empty());
+        let otlp = SupervisorOtlp {
+            traces: export("http://traces:4317", OtlpProtocol::Grpc),
+            ocsf: export("http://siem:4318", OtlpProtocol::HttpProtobuf),
+            agent: export("http://agents:4318", OtlpProtocol::HttpProtobuf),
         };
         assert_eq!(
-            export.environment(),
-            [(OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string())]
-        );
-        export.schema_version = Some("1.3".into());
-        assert_eq!(
-            export.environment(),
+            otlp.environment(),
             [
-                (OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string()),
-                (OTLP_OCSF_SCHEMA_VERSION, "1.3".to_string()),
+                (OTLP_ENDPOINT, "http://traces:4317".to_string()),
+                (OTLP_OCSF_ENDPOINT, "http://siem:4318".to_string()),
+                (OTLP_OCSF_PROTOCOL, "http/protobuf".to_string()),
+                (OTLP_AGENT_ENDPOINT, "http://agents:4318".to_string()),
+                (OTLP_AGENT_PROTOCOL, "http/protobuf".to_string()),
             ]
         );
+        assert!(!otlp.is_empty());
+    }
+
+    #[test]
+    fn supervisor_otlp_rewrites_every_endpoint_and_keeps_protocols() {
+        let export = |endpoint: &str| {
+            Some(OtlpExport {
+                endpoint: endpoint.into(),
+                protocol: OtlpProtocol::HttpProtobuf,
+            })
+        };
+        let otlp = SupervisorOtlp {
+            traces: export("http://127.0.0.1:4317"),
+            ocsf: None,
+            agent: export("http://127.0.0.1:4318"),
+        }
+        .map_endpoints(|endpoint| endpoint.replace("127.0.0.1", "host.internal"));
+        assert_eq!(otlp.traces, export("http://host.internal:4317"));
+        assert_eq!(otlp.ocsf, None);
+        assert_eq!(otlp.agent, export("http://host.internal:4318"));
     }
 
     #[test]

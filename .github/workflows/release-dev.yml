@@ -118,19 +118,13 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/integration-runner.yml
+    uses: ./.github/workflows/e2e-suites.yml
     with:
-      category: conformance
+      family: conformance
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
-      test-matrix: >-
-        [
-          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
-          {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
-          {"environment":"ubuntu-k3s","installer":"k3s-ha","testsuite":"conformance"},
-          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
-          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
-        ]
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   feature-specific-integration:
     needs: prepare-integration

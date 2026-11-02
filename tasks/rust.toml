@@ -40,6 +40,8 @@ run = [
   "cargo clippy --manifest-path tests/tmachine/Cargo.toml --all-targets -- -D warnings",
   "cargo clippy --manifest-path tests/runner/Cargo.toml --all-targets -- -D warnings",
   "cargo clippy --manifest-path tests/suites/conformance/Cargo.toml -p sandbox --all-targets -- -D warnings",
+  "cargo clippy --manifest-path tests/suites/features/Cargo.toml -p keycloak-provider-refresh --all-targets -- -D warnings",
+  "cargo clippy --manifest-path tests/support/Cargo.toml --all-targets -- -D warnings",
 ]
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 lint native"
 hide = true
@@ -56,6 +58,8 @@ run = [
   "cargo fmt --manifest-path tests/tmachine/Cargo.toml --all",
   "cargo fmt --manifest-path tests/runner/Cargo.toml --all",
   "cargo fmt --manifest-path tests/suites/conformance/Cargo.toml -p sandbox",
+  "cargo fmt --manifest-path tests/suites/features/Cargo.toml -p keycloak-provider-refresh",
+  "cargo fmt --manifest-path tests/support/Cargo.toml --all",
 ]
 hide = true
 
@@ -71,16 +75,24 @@ run = [
   "cargo fmt --manifest-path tests/tmachine/Cargo.toml --all -- --check",
   "cargo fmt --manifest-path tests/runner/Cargo.toml --all -- --check",
   "cargo fmt --manifest-path tests/suites/conformance/Cargo.toml -p sandbox -- --check",
+  "cargo fmt --manifest-path tests/suites/features/Cargo.toml -p keycloak-provider-refresh -- --check",
+  "cargo fmt --manifest-path tests/support/Cargo.toml --all -- --check",
 ]
 hide = true
 
 ["rust:deny"]
 description = "Check dependencies for all cargo-deny rules"
+depends = ["rust:deny:crypto-test"]
 run = "cargo deny check"
 
 ["rust:deny:policy"]
 description = "Check dependencies for license violations, bans, and source restrictions"
+depends = ["rust:deny:crypto-test"]
 run = "cargo deny check licenses bans sources"
+
+["rust:deny:crypto-test"]
+description = "Verify cargo-deny rejects crypto dependencies that bypass the facade"
+run = "uv run --no-project python tasks/scripts/test-crypto-dependency-policy.py"
 
 
 ["rust:verify:telemetry-off"]
