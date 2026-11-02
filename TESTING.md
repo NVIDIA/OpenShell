@@ -245,9 +245,10 @@ A flaky or broken test is marked `#[ignore = "<issue link>"]`, which takes it
 out of every environment until it's fixed.
 
 **CI.** `.github/workflows/e2e-suites.yml` lists the environments and suites as
-an explicit matrix and runs the runner once per row. Branch E2E calls it when
-the `test:e2e` label is set, and a failure fails the Core E2E result. To run
-a suite in another environment on CI, add a row.
+an explicit matrix and runs the runner once per row. Branch E2E calls it once
+per family when the `test:e2e` label is set, and a failure fails the Core E2E
+result. Release Dev and Release Qualification run the conformance and feature
+families. To run a suite in another environment on CI, add a row.
 
 ### Adding a feature suite
 

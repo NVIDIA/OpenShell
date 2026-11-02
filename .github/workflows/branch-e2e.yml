@@ -255,23 +255,21 @@ jobs:
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-  # Run feature-specific integration tests:
+  # Run the testkit feature suites (tests/suites/features) on tmachine. The
+  # environments and suites are listed in e2e-suites.yml.
   feature-specific-integration:
     needs: prepare-integration
     permissions:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/integration-runner.yml
+    uses: ./.github/workflows/e2e-suites.yml
     with:
-      category: feature-specific
+      family: features
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
-      test-matrix: >-
-        [
-          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
-          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"}
-        ]
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   # Run driver-specific integration tests:
   # These suites require the binary installer's CLI path, local HTTP gateway,
@@ -293,24 +291,6 @@ jobs:
           {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"e2e-podman"},
           {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"driver-podman"}
         ]
-
-  # Run the testkit feature suites in tests/suites/ on tmachine. The
-  # environments and suites are listed in e2e-suites.yml; the conformance rows
-  # run in conformance-integration.
-  e2e-suites:
-    needs: [pr_metadata, prepare-integration]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
-    permissions:
-      actions: read
-      contents: read
-      packages: read
-    uses: ./.github/workflows/e2e-suites.yml
-    with:
-      family: features
-      source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
-      integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
-    secrets:
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   docker-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -570,7 +550,6 @@ jobs:
     needs:
       - pr_metadata
       - conformance-integration
-      - e2e-suites
       - feature-specific-integration
       - driver-specific-integration
       - docker-e2e

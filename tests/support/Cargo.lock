@@ -1496,7 +1496,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "keycloak"
+name = "keycloak-support"
 version = "0.0.0"
 dependencies = [
  "openshell-testkit",

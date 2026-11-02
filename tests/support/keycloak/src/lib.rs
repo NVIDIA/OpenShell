@@ -26,7 +26,7 @@
 //! ```ignore
 //! #[testkit::test]
 //! async fn example(cx: &mut testkit::Context) -> testkit::Result {
-//!     let kc = keycloak::KeycloakContext::new(cx).await?;
+//!     let kc = keycloak_support::KeycloakContext::new(cx).await?;
 //!     let grant = kc.keycloak().password_grant().await?;
 //!     kc.cli(["status"]).await?.success()?; // Context methods still work
 //!     Ok(())
@@ -224,7 +224,7 @@ fn required(name: &str) -> Result<String> {
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             Error::msg(format!(
-                "{name} is not set; this suite needs a Keycloak realm (see the keycloak crate docs)"
+                "{name} is not set; this suite needs a Keycloak realm (see the keycloak-support crate docs)"
             ))
         })
 }

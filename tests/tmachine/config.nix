@@ -31,6 +31,45 @@ let
     openshell_sandbox_image = "../../artifacts/images/openshell-sandbox-tmachine.tar";
     openshell_supervisor_image = "../../artifacts/images/openshell-supervisor-tmachine.tar";
   };
+  # A fedora-podman-<podman> environment ("rootful" or "rootless") with more
+  # setup playbooks after the base ones.
+  fedoraPodman =
+    {
+      name,
+      podman,
+      playbooks,
+      inputs,
+    }:
+    {
+      inherit name;
+      machine = "fedora";
+      setup = {
+        use_galaxy = false;
+        playbooks = [
+          "ansible/playbooks/nextest.yaml"
+          "ansible/playbooks/test-tools.yaml"
+          "ansible/playbooks/selinux.yaml"
+          "ansible/playbooks/podman-${podman}.yaml"
+        ]
+        ++ playbooks;
+        inherit inputs;
+      };
+    };
+  # fedora-podman-{rootful,rootless}-keycloak run Keycloak for the
+  # keycloak-provider-refresh suite.
+  keycloakEnvironments = map (
+    podman:
+    fedoraPodman {
+      name = "fedora-podman-${podman}-keycloak";
+      inherit podman;
+      playbooks = [ "ansible/playbooks/keycloak.yaml" ];
+      inputs.keycloak_realm_file = "../../scripts/keycloak-realm.json";
+    }
+  ) podmanModes;
+  podmanModes = [
+    "rootful"
+    "rootless"
+  ];
   config = (pkgs.formats.yaml { }).generate "tmachine-config.yaml" {
     machines = [
       {
@@ -109,7 +148,8 @@ let
           ];
         };
       }
-    ];
+    ]
+    ++ keycloakEnvironments;
 
     installers = [
       {
@@ -177,14 +217,6 @@ let
         playbooks = [ "ansible/playbooks/shell.yaml" ];
         inputs = { };
         interactive = true;
-      }
-      {
-        name = "provider-refresh";
-        playbooks = [ "ansible/playbooks/features/provider-refresh/keycloak.yaml" ];
-        inputs = {
-          keycloak_realm_file = "../../scripts/keycloak-realm.json";
-          provider_refresh_keycloak_test_bundle = "../../artifacts/test-archives/${muslTarget}/provider-refresh-keycloak-tests.tar";
-        };
       }
       {
         name = "e2e-podman";

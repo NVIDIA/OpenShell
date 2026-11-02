@@ -82,14 +82,6 @@ let
       '';
     };
 
-  providerRefreshKeycloakArchive = mkTestArchive {
-    name = "provider-refresh-keycloak";
-    workspacePath = "tests/suites/features";
-    manifestPath = "tests/suites/features/Cargo.toml";
-    package = "openshell-test-feature-provider-refresh-keycloak";
-    target = muslToolchain.target;
-    output = "artifacts/test-archives/${muslToolchain.target}/provider-refresh-keycloak-tests.tar";
-  };
   # Follow-up: binaries that do not yet run in the rootless tmachine guest. Each
   # entry says what it needs. Entries marked "wrapper lane" still run in the
   # wrapper-based Podman lane (`mise run e2e:podman:ci`), so they are covered
@@ -186,7 +178,6 @@ let
 in
 rec {
   inherit
-    providerRefreshKeycloakArchive
     podmanDriverArchive
     podmanE2eArchive
     podmanE2eCiTests
@@ -297,12 +288,10 @@ rec {
   testArchives = pkgs.writeShellApplication {
     name = "build-artifacts-test-archives";
     runtimeInputs = [
-      providerRefreshKeycloakArchive
       podmanDriverArchive
       podmanE2eArchive
     ];
     text = ''
-      build-provider-refresh-keycloak-test-archive
       build-podman-driver-test-archive
       build-podman-e2e-test-archive
     '';
