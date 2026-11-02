@@ -41,10 +41,10 @@ use openshell_core::proto::{
 
 use crate::headers::{self, HeaderAuthority};
 use crate::{
-    ChainRunner, DescribedChainEntry, HttpHookVersion, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
-    MAX_MIDDLEWARE_PAYLOAD_BYTES, MiddlewareDenial, MiddlewareDiagnosticPolicy,
-    MiddlewareInvocation, MiddlewareSessionPermit, NamespacedFinding, OnError,
-    TransformedBodyPolicy, middleware_denial_reason, safe_reason,
+    ChainRunner, DescribedChainEntry, HttpHookVersion, HttpRequestFailureKind,
+    MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_PAYLOAD_BYTES, MiddlewareDenial,
+    MiddlewareDiagnosticPolicy, MiddlewareInvocation, MiddlewareSessionPermit, NamespacedFinding,
+    OnError, TransformedBodyPolicy, middleware_denial_reason, safe_reason,
 };
 
 /// Largest normalized body chunk a stage sends or receives.
@@ -197,6 +197,8 @@ pub enum HttpStageOutcome {
 /// Audit record for one stage and phase. Carries no service-provided text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpStageInvocation {
+    /// Failure cause retained without service text or status metadata.
+    pub failure_kind: Option<HttpRequestFailureKind>,
     pub config_name: String,
     pub implementation: String,
     pub outcome: HttpStageOutcome,
@@ -213,6 +215,8 @@ pub struct HttpStageInvocation {
 /// Findings, metadata, and invocations for one exchange.
 #[derive(Debug, Default)]
 pub struct HttpStageDiagnostics {
+    /// Terminal cause, including failures with no failed stage invocation.
+    pub failure_kind: Option<HttpRequestFailureKind>,
     pub findings: Vec<NamespacedFinding>,
     pub metadata: BTreeMap<String, BTreeMap<String, String>>,
     pub invocations: Vec<HttpStageInvocation>,
@@ -221,6 +225,7 @@ pub struct HttpStageDiagnostics {
 impl HttpStageDiagnostics {
     /// Append `other`, keeping chain order.
     pub fn extend(&mut self, other: Self) {
+        self.failure_kind = other.failure_kind.or(self.failure_kind);
         self.findings.extend(other.findings);
         self.metadata.extend(other.metadata);
         self.invocations.extend(other.invocations);
@@ -248,6 +253,7 @@ impl HttpStageDiagnostics {
                 .iter_mut()
                 .find(|(existing, _)| existing.name == invocation.config_name)
             {
+                existing.failure_kind = invocation.failure_kind.or(existing.failure_kind);
                 existing.failed |= invocation.failed;
                 existing.transformed |= invocation.transformed;
                 if denied {
@@ -258,6 +264,7 @@ impl HttpStageDiagnostics {
             }
             applied.push((
                 MiddlewareInvocation {
+                    failure_kind: invocation.failure_kind,
                     name: invocation.config_name.clone(),
                     implementation: invocation.implementation.clone(),
                     decision: if denied {
@@ -286,6 +293,8 @@ impl HttpStageDiagnostics {
 /// The exchange failed closed or was denied.
 #[derive(Debug)]
 pub struct HttpMiddlewareFailure {
+    /// Cause preserved independently of sandbox failure codes and diagnostics.
+    pub kind: Option<HttpRequestFailureKind>,
     /// Platform-owned reason: `middleware_denied:<config>[:<code>]` for a
     /// denial, `middleware_failed: <reason>` for a failure, and
     /// `middleware_cancelled: <reason>` when the input producer went away.
@@ -1558,13 +1567,17 @@ async fn run_checkpoint(
             .ok()
             .flatten()
             .is_none_or(|previous| previous != body);
-        if replaced && let Some(reason) = transformed_body_denial(body_policy, &body) {
+        if replaced && let Some((reason, kind)) = transformed_body_denial(body_policy, &body) {
             return Err(TaskError::Failed(HttpMiddlewareFailure {
+                kind,
                 reason,
                 denial: None,
                 failure: None,
                 end_reason: MiddlewareSessionEndReason::PolicyDenial,
-                diagnostics: Box::default(),
+                diagnostics: Box::new(HttpStageDiagnostics {
+                    failure_kind: kind,
+                    ..Default::default()
+                }),
             }));
         }
         let (header_mutations, output_body_bytes) = start.expect("a started stage output");
@@ -2009,15 +2022,21 @@ async fn drive_buffered(
 }
 
 /// The body policy's verdict on a replaced body, or `None` when it passes.
-fn transformed_body_denial(policy: TransformedBodyPolicy<'_>, body: &[u8]) -> Option<String> {
+fn transformed_body_denial(
+    policy: TransformedBodyPolicy<'_>,
+    body: &[u8],
+) -> Option<(String, Option<HttpRequestFailureKind>)> {
     let TransformedBodyPolicy::Reevaluate(validate) = policy else {
         return None;
     };
     match validate(body) {
-        Ok(reason) => reason,
-        Err(error) => Some(format!(
-            "transformed_body_policy_evaluation_failed: {}",
-            safe_reason(&error.to_string())
+        Ok(reason) => reason.map(|reason| (reason, None)),
+        Err(error) => Some((
+            format!(
+                "transformed_body_policy_evaluation_failed: {}",
+                safe_reason(&error.to_string())
+            ),
+            Some(HttpRequestFailureKind::PolicyEvaluation),
         )),
     }
 }
@@ -2179,7 +2198,16 @@ async fn drive_stream(
                     held.send_replace(false);
                 }
                 StageResult::OutputChunk(chunk) if started => {
-                    if chunk.data.is_empty() || chunk.data.len() > chunk_limit {
+                    if chunk.data.len() > chunk_limit {
+                        return Err(entry_failure_with_code(
+                            entry,
+                            "stream_output_chunk_invalid",
+                            HttpFailureCode::LifecycleViolation,
+                            HttpRequestFailureKind::Capacity,
+                        )
+                        .into());
+                    }
+                    if chunk.data.is_empty() {
                         return Err(entry_failure(entry, "stream_output_chunk_invalid").into());
                     }
                     output_bytes = output_bytes.saturating_add(chunk.data.len());
@@ -2266,19 +2294,27 @@ pub(super) fn classify_result(
 /// Classify an RPC status. Every status fails the exchange closed; the reason
 /// is platform-owned for external services.
 fn status_failure(entry: &DescribedChainEntry, status: &tonic::Status) -> HttpMiddlewareFailure {
-    match status.code() {
-        tonic::Code::DeadlineExceeded => entry_failure(entry, "middleware_timeout"),
-        // The service does not implement the HTTP hook RPC its binding
-        // selected.
-        tonic::Code::Unimplemented => entry_failure(entry, "middleware_unimplemented"),
-        // The reason may carry an in-process service's status text, so the
-        // sandbox sees only that the middleware failed.
-        _ => entry_failure_with_code(
-            entry,
-            &diagnostic_policy(entry).error_reason(status),
+    let (reason, code) = match status.code() {
+        tonic::Code::DeadlineExceeded => {
+            ("middleware_timeout".to_string(), HttpFailureCode::Timeout)
+        }
+        // The service does not implement the HTTP hook RPC its binding selected.
+        tonic::Code::Unimplemented => (
+            "middleware_unimplemented".to_string(),
+            HttpFailureCode::LifecycleViolation,
+        ),
+        // In-process status text stays in diagnostics, never the sandbox code.
+        _ => (
+            diagnostic_policy(entry).error_reason(status),
             HttpFailureCode::Unavailable,
         ),
-    }
+    };
+    entry_failure_with_code(
+        entry,
+        &reason,
+        code,
+        HttpRequestFailureKind::RemoteStatus(status.code()),
+    )
 }
 
 fn diagnostic_policy(entry: &DescribedChainEntry) -> MiddlewareDiagnosticPolicy {
@@ -2298,6 +2334,7 @@ fn mutation_failure(
         entry,
         &diagnostic_policy(entry).header_mutation_error_reason(error),
         HttpFailureCode::HeaderMutation(error.code()),
+        HttpRequestFailureKind::HeaderMutation,
     )
 }
 
@@ -2413,6 +2450,7 @@ pub(super) fn denial(
         .invocations
         .push(invocation(entry, HttpStageOutcome::Deny, reason_code));
     HttpMiddlewareFailure {
+        kind: None,
         reason: middleware_denial_reason(&denial.config_name, denial.reason_code.as_deref()),
         denial: Some(denial),
         failure: None,
@@ -2423,7 +2461,12 @@ pub(super) fn denial(
 
 /// The stage failed and the exchange fails closed.
 pub fn entry_failure(entry: &DescribedChainEntry, reason: &str) -> HttpMiddlewareFailure {
-    entry_failure_with_code(entry, reason, HttpFailureCode::of_reason(reason))
+    entry_failure_with_code(
+        entry,
+        reason,
+        HttpFailureCode::of_reason(reason),
+        HttpRequestFailureKind::of_platform_reason(reason),
+    )
 }
 
 /// The stage failed with `reason`, which the sandbox sees as `code`.
@@ -2431,14 +2474,20 @@ fn entry_failure_with_code(
     entry: &DescribedChainEntry,
     reason: &str,
     code: HttpFailureCode,
+    kind: HttpRequestFailureKind,
 ) -> HttpMiddlewareFailure {
-    let mut diagnostics = HttpStageDiagnostics::default();
+    let mut diagnostics = HttpStageDiagnostics {
+        failure_kind: Some(kind),
+        ..Default::default()
+    };
     diagnostics.invocations.push(HttpStageInvocation {
+        failure_kind: Some(kind),
         failed: true,
         failure_reason: Some(reason.to_string()),
         ..invocation(entry, HttpStageOutcome::FailClosed, None)
     });
     HttpMiddlewareFailure {
+        kind: Some(kind),
         reason: format!("middleware_failed: {reason}"),
         denial: None,
         failure: Some(Box::new(MiddlewareFailureDetail {
@@ -2452,22 +2501,32 @@ fn entry_failure_with_code(
 
 /// The exchange failed for a reason no single stage owns.
 pub fn platform_failure(reason: &str) -> HttpMiddlewareFailure {
+    let kind = HttpRequestFailureKind::InvalidResult;
     HttpMiddlewareFailure {
+        kind: Some(kind),
         reason: format!("middleware_failed: {reason}"),
         denial: None,
         failure: None,
         end_reason: MiddlewareSessionEndReason::MiddlewareFailure,
-        diagnostics: Box::default(),
+        diagnostics: Box::new(HttpStageDiagnostics {
+            failure_kind: Some(kind),
+            ..Default::default()
+        }),
     }
 }
 
 fn cancelled(reason: &str) -> HttpMiddlewareFailure {
+    let kind = HttpRequestFailureKind::Cancelled;
     HttpMiddlewareFailure {
+        kind: Some(kind),
         reason: format!("middleware_cancelled: {reason}"),
         denial: None,
         failure: None,
         end_reason: MiddlewareSessionEndReason::Cancellation,
-        diagnostics: Box::default(),
+        diagnostics: Box::new(HttpStageDiagnostics {
+            failure_kind: Some(kind),
+            ..Default::default()
+        }),
     }
 }
 
@@ -2477,6 +2536,7 @@ pub fn invocation(
     reason_code: Option<String>,
 ) -> HttpStageInvocation {
     HttpStageInvocation {
+        failure_kind: None,
         config_name: entry.entry.name.clone(),
         implementation: entry.entry.implementation.clone(),
         outcome,
@@ -2491,6 +2551,7 @@ pub fn invocation(
 
 pub fn fail_open_invocation(entry: &DescribedChainEntry, reason: &str) -> HttpStageInvocation {
     HttpStageInvocation {
+        failure_kind: Some(HttpRequestFailureKind::of_platform_reason(reason)),
         failed: true,
         failure_reason: Some(reason.to_string()),
         ..invocation(entry, HttpStageOutcome::FailOpen, None)

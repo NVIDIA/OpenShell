@@ -957,7 +957,7 @@ async fn reject_live_request_body<C: AsyncRead + AsyncWrite + Unpin>(
                 .await?;
             }
         }
-        crate::l7::rest::LiveRequestFailure::ClientTimeout => {
+        crate::l7::rest::LiveRequestFailure::ClientTimeout { .. } => {
             crate::l7::rest::send_request_timeout_response(
                 &rejected,
                 &ctx.policy_name,
@@ -7974,6 +7974,7 @@ network_policies:
             body_length: crate::l7::provider::BodyLength::None,
         };
         let outcome = ChainOutcome {
+            failure_kind: None,
             allowed: true,
             reason: String::new(),
             // The transformed body still holds the raw secret; emission must never
@@ -7992,6 +7993,7 @@ network_policies:
             }],
             metadata: BTreeMap::new(),
             applied: vec![MiddlewareInvocation {
+                failure_kind: None,
                 name: "regex-redactor".into(),
                 implementation: "openshell/regex".into(),
                 decision: openshell_core::proto::Decision::Allow,
@@ -8067,6 +8069,7 @@ network_policies:
         );
 
         let denied_outcome = ChainOutcome {
+            failure_kind: None,
             allowed: false,
             reason: "middleware_denied:content-guard:content_match".into(),
             body: Vec::new(),
@@ -8074,6 +8077,7 @@ network_policies:
             findings: Vec::new(),
             metadata: BTreeMap::new(),
             applied: vec![MiddlewareInvocation {
+                failure_kind: None,
                 name: "content-guard".into(),
                 implementation: "example/content-guard".into(),
                 decision: openshell_core::proto::Decision::Deny,
