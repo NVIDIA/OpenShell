@@ -138,9 +138,7 @@ class PlanningTests(unittest.TestCase):
 
     def test_repeated_routing_is_idempotent(self):
         self.assertEqual(
-            routing.plan_review_requests(
-                {"alice"}, **reviewers(requested=("alice",))
-            ),
+            routing.plan_review_requests({"alice"}, **reviewers(requested=("alice",))),
             routing.ReviewPlan((), ()),
         )
 
@@ -152,15 +150,15 @@ class PlanningTests(unittest.TestCase):
             [{"user": {"login": "General"}}, {"user": None}],
             [{"user": {"login": "Inline"}}],
         )
-        self.assertEqual(result, {state.lower() for state in states} | {"general", "inline"})
+        self.assertEqual(
+            result, {state.lower() for state in states} | {"general", "inline"}
+        )
 
 
 class TimelineTests(unittest.TestCase):
     def test_distinguishes_human_and_bot_requests(self):
         events = [event(1, "Alice", human=True), event(2, "Bob")]
-        self.assertEqual(
-            routing.manual_reviewers(events, {"alice", "bob"}), {"alice"}
-        )
+        self.assertEqual(routing.manual_reviewers(events, {"alice", "bob"}), {"alice"})
 
     def test_unknown_actor_and_missing_history_are_preserved(self):
         unknown = event(1, "alice")
@@ -239,7 +237,9 @@ class ReconciliationTests(unittest.TestCase):
     def run_routing(self, categories, *, snapshots, responses, apply=True):
         with (
             mock.patch.object(routing, "_api", side_effect=responses) as api,
-            mock.patch.object(routing, "_load_reviewers", side_effect=snapshots) as load,
+            mock.patch.object(
+                routing, "_load_reviewers", side_effect=snapshots
+            ) as load,
             mock.patch.object(
                 routing, "_eligible_reviewers", side_effect=lambda _repo, logins: logins
             ) as eligible,
@@ -328,17 +328,22 @@ class ReconciliationTests(unittest.TestCase):
                 self.subTest(after=after),
                 mock.patch.object(routing, "_api", side_effect=[before, after]) as api,
                 mock.patch.object(
-                    routing, "_load_reviewers",
+                    routing,
+                    "_load_reviewers",
                     return_value=reviewers(requested=("alice", "dave")),
                 ),
-                mock.patch.object(routing, "_eligible_reviewers", return_value={"dave"}),
+                mock.patch.object(
+                    routing, "_eligible_reviewers", return_value={"dave"}
+                ),
             ):
                 with self.assertRaisesRegex(ValueError, "routing changed"):
                     routing.check_review_readiness(CATEGORIES, REPO, 42, apply=True)
-                self.assertTrue(all(
-                    call.kwargs.get("method", "GET") == "GET"
-                    for call in api.call_args_list
-                ))
+                self.assertTrue(
+                    all(
+                        call.kwargs.get("method", "GET") == "GET"
+                        for call in api.call_args_list
+                    )
+                )
 
     def test_new_commit_and_unrelated_label_do_not_interrupt_routing(self):
         before = pr("area:build", requested=("alice", "dave"))
@@ -354,7 +359,8 @@ class ReconciliationTests(unittest.TestCase):
         before = pr("area:build", requested=("alice",))
         after = pr("area:build", requested=("alice", "dave"))
         snapshots = [
-            reviewers(requested=("alice",)), reviewers(requested=("alice", "dave"))
+            reviewers(requested=("alice",)),
+            reviewers(requested=("alice", "dave")),
         ]
         with self.assertRaises(subprocess.CalledProcessError):
             self.run_routing(
@@ -366,9 +372,9 @@ class ReconciliationTests(unittest.TestCase):
             CATEGORIES, snapshots=[snapshots[1]] * 2, responses=[after, after, None]
         )
         self.assertEqual(plan, routing.ReviewPlan((), ("alice",)))
-        self.assertFalse(any(
-            call.kwargs.get("method") == "POST" for call in api.call_args_list
-        ))
+        self.assertFalse(
+            any(call.kwargs.get("method") == "POST" for call in api.call_args_list)
+        )
 
 
 class CliTests(unittest.TestCase):
@@ -379,16 +385,24 @@ class CliTests(unittest.TestCase):
             output = io.StringIO()
             with (
                 mock.patch.object(
-                    routing, "check_review_readiness",
+                    routing,
+                    "check_review_readiness",
                     return_value=routing.ReviewPlan(("alice",), ()),
                 ) as check,
                 contextlib.redirect_stdout(output),
             ):
                 self.assertEqual(
-                    routing.main([
-                        "--reviewers", str(path), "--repo", REPO,
-                        "--pr", "42", "--apply",
-                    ]),
+                    routing.main(
+                        [
+                            "--reviewers",
+                            str(path),
+                            "--repo",
+                            REPO,
+                            "--pr",
+                            "42",
+                            "--apply",
+                        ]
+                    ),
                     0,
                 )
             self.assertEqual(
@@ -409,9 +423,16 @@ class CliTests(unittest.TestCase):
                 contextlib.redirect_stderr(errors),
             ):
                 self.assertEqual(
-                    routing.main([
-                        "--reviewers", str(path), "--repo", REPO, "--pr", "42",
-                    ]),
+                    routing.main(
+                        [
+                            "--reviewers",
+                            str(path),
+                            "--repo",
+                            REPO,
+                            "--pr",
+                            "42",
+                        ]
+                    ),
                     1,
                 )
             api.assert_not_called()

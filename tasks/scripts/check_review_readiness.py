@@ -198,11 +198,15 @@ def _eligible_reviewers(repository: str, logins: set[str]) -> set[str]:
 
 
 def _routing_key(pr: dict):
-    return pr["state"], pr["draft"], {
-        label["name"]
-        for label in pr["labels"]
-        if label["name"].startswith(("area:", "topic:"))
-    }
+    return (
+        pr["state"],
+        pr["draft"],
+        {
+            label["name"]
+            for label in pr["labels"]
+            if label["name"].startswith(("area:", "topic:"))
+        },
+    )
 
 
 def check_review_readiness(
@@ -255,7 +259,11 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, UnicodeError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"Review readiness: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps(asdict(plan) if plan is not None else {"skipped": "closed or draft PR"}))
+    print(
+        json.dumps(
+            asdict(plan) if plan is not None else {"skipped": "closed or draft PR"}
+        )
+    )
     return 0
 
 
