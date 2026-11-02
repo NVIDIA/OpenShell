@@ -283,6 +283,7 @@ type DetachProviderResult struct {
 // IngressScope describes the network namespace of admitted service targets.
 type IngressScope string
 
+// IngressScope values identify the admitted loopback namespace.
 const (
 	IngressUnknown            IngressScope = "unknown"
 	IngressUnsupported        IngressScope = "unsupported"

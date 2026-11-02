@@ -38,7 +38,8 @@ use crate::pagination::Pagination;
 #[cfg(test)]
 use crate::persistence::ObjectType;
 use crate::persistence::{
-    DraftChunkRecord, ObjectId, ObjectListQuery, ObjectName, ObjectWorkspace, PolicyRecord, Store,
+    DraftChunkRecord, GetResourceVersion, ObjectId, ObjectListQuery, ObjectName, ObjectWorkspace,
+    PolicyRecord, Store,
 };
 use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
@@ -4728,6 +4729,15 @@ async fn handle_update_config_inner(
     {
         return Err(Status::aborted(
             "sandbox scope changed while waiting for policy update; retry explicitly",
+        ));
+    }
+    let current_version = current.get_resource_version();
+    if req.expected_resource_version != 0 && req.expected_resource_version != current_version {
+        return Err(super::persistence_error_to_status(
+            crate::persistence::PersistenceError::Conflict {
+                current_resource_version: Some(current_version),
+            },
+            "update sandbox policy",
         ));
     }
     let sandbox = current;

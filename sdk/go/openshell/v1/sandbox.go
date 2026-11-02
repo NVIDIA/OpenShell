@@ -122,6 +122,7 @@ type SandboxSuspendResumeInterface interface {
 	// WaitSuspended polls until the sandbox reaches the Suspended phase.
 	WaitSuspended(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
 }
+
 // ResourceDuration preserves protobuf duration precision and range.
 type ResourceDuration = types.ResourceDuration
 

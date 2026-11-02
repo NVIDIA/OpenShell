@@ -77,23 +77,27 @@ type ResourceCapabilities struct {
 	SampledBudget *SampledBudgetCapabilities
 }
 
+// ResourceDomainCapabilities describes resource limit and request enforcement.
 type ResourceDomainCapabilities struct {
 	LimitSupported     bool
 	LimitEnforcement   *ResourceEnforcement
 	RequestEnforcement *ResourceEnforcement
 }
 
+// ResourceEnforcement identifies the mechanism and scope of a resource guarantee.
 type ResourceEnforcement struct {
 	// Unknown enum values are preserved as "Unknown", never inferred as support.
 	Kind  string
 	Scope string
 }
 
+// GPUResourceCapabilities describes supported GPU selection methods.
 type GPUResourceCapabilities struct {
 	DefaultSelectionSupported bool
 	CountSelectionSupported   bool
 }
 
+// SampledBudgetCapabilities describes supported sampled workload budgets.
 type SampledBudgetCapabilities struct {
 	CPUTimeSupported       bool
 	ResidentBytesSupported bool
