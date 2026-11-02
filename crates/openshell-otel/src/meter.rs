@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OTLP/gRPC metric export, and a `metrics` recorder that feeds it.
+//! OTLP metric export, over gRPC or HTTP/protobuf, and a `metrics` recorder
+//! that feeds it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,18 +15,28 @@ use metrics::{
 use metrics_util::registry::{Registry, Storage};
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Meter;
-use opentelemetry_otlp::MetricExporter;
+use opentelemetry_otlp::{MetricExporter, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 
-use crate::{OtlpTarget, SetupError};
+use crate::{OtlpHttpClient, OtlpTarget, Protocol, SetupError};
 
 impl OtlpTarget {
     /// Build a meter provider that exports metrics to this target on the
     /// SDK's periodic interval (`OTEL_METRIC_EXPORT_INTERVAL`).
     pub fn meter_provider(&self) -> Result<SdkMeterProvider, SetupError> {
-        let exporter = self
-            .configure(MetricExporter::builder().with_tonic())
-            .build()?;
+        let exporter = match self.protocol {
+            Protocol::Grpc => self
+                .configure(MetricExporter::builder().with_tonic())
+                .build()?,
+            Protocol::HttpProtobuf => MetricExporter::builder()
+                .with_http()
+                .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+                .with_endpoint(self.http_signal_url("v1/metrics")?)
+                .with_http_client(OtlpHttpClient::new(crate::transport::export_timeout(
+                    "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
+                ))?)
+                .build()?,
+        };
         Ok(SdkMeterProvider::builder()
             .with_reader(PeriodicReader::builder(exporter).build())
             .with_resource(self.resource().clone())
@@ -396,5 +407,26 @@ mod tests {
         })
         .unwrap();
         target.meter_provider().expect("meter provider");
+    }
+
+    #[tokio::test]
+    async fn target_builds_an_http_meter_provider_but_not_over_tls() {
+        let target = |endpoint| {
+            OtlpTarget::new(&OtlpExportConfig {
+                endpoint,
+                service_name: ServiceName::Fixed("openshell-gateway"),
+                service_version: None,
+                resource_attributes: Vec::new(),
+            })
+            .unwrap()
+            .with_protocol(Protocol::HttpProtobuf)
+        };
+        target("http://127.0.0.1:4318")
+            .meter_provider()
+            .expect("meter provider");
+        assert!(matches!(
+            target("https://collector.example:4318").meter_provider(),
+            Err(SetupError::HttpsUnsupported)
+        ));
     }
 }

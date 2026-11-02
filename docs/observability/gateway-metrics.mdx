@@ -140,8 +140,9 @@ curl -s http://localhost:9090/metrics | grep '^openshell_server_supervisor_sessi
 
 ## Push Metrics over OTLP
 
-The gateway can also push the same metrics to an OTLP collector over gRPC. It
-is off by default and does not replace the scrape endpoint. Enable it in
+The gateway can also push the same metrics to an OTLP collector, over gRPC or
+HTTP/protobuf. It is
+off by default and does not replace the scrape endpoint. Enable it in
 `gateway.toml`:
 
 ```toml
@@ -152,8 +153,8 @@ metrics  = true
 
 `metrics = true` sends metrics to the `endpoint`. To send them to another
 collector, use a `[openshell.gateway.otlp.metrics]` table with `enabled = true`
-and its own `endpoint`. Counters, gauges, and histograms keep their names and
-labels, and histograms use the latency buckets in seconds. The gateway pushes
+and its own `endpoint`, and `protocol = "http/protobuf"` to use OTLP/HTTP.
+Counters, gauges, and histograms keep their names and labels, and histograms use the latency buckets in seconds. The gateway pushes
 every 60 seconds. For the interval and other export tuning, refer to
 [Tuning](/how-it-works/gateways/configuration#tuning).
 

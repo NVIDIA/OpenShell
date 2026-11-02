@@ -196,6 +196,25 @@ verifies this, and `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix
 re-locks a workspace from the root lockfile. Add new testkit workspaces to
 `ALIGNED_WORKSPACES` in that script.
 
+#### What a conformance test may assert
+
+Conformance tests run on every compute driver, so they check the public
+contract and nothing a driver is free to change.
+
+- Assert only what the public contract promises: the comments in `proto/` and
+  the published docs.
+- Assert on `phase` and `exit_code`. Don't assert on condition reasons or
+  messages.
+- To check that something did not happen, read the state that shows it. Don't
+  sleep and hope.
+- If a behavior isn't documented, open an issue to document it. Don't write a
+  test for it. A behavior that only some drivers have belongs in
+  `tests/suites/features` or `tests/suites/drivers`.
+- The only way to skip a test is `#[ignore = "<issue link>"]`, for a broken or
+  flaky test.
+
+Adapted from the handover notes in NVIDIA/OpenShell#4629 by Evan Lezar.
+
 ### Running suites in a tmachine environment (`tests/runner/`)
 
 `openshell-test-runner` runs a test family inside a tmachine VM, against the
@@ -229,6 +248,63 @@ out of every environment until it's fixed.
 an explicit matrix and runs the runner once per row. Branch E2E calls it when
 the `test:e2e` label is set, and a failure fails the Core E2E result. To run
 a suite in another environment on CI, add a row.
+
+### Adding a feature suite
+
+Feature suites live in the `tests/suites/features` workspace, one crate per
+suite, with a name that says what the suite tests.
+`tests/suites/features/keycloak-provider-refresh` is the example to copy.
+
+1. Add a crate under `tests/suites/features/<name>` that depends on
+   `openshell-testkit`, and add it to `members` in
+   `tests/suites/features/Cargo.toml`.
+2. Write the tests in `tests/*.rs` as `#[testkit::test]` functions.
+3. Re-lock the workspace: `cargo metadata --manifest-path
+   tests/suites/features/Cargo.toml`, then
+   `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`.
+4. Add `cargo fmt` and `cargo clippy` lines for the package (`-p <name>`) to
+   `tasks/rust.toml` and to the Format and Lint steps in
+   `.github/workflows/branch-checks.yml`.
+5. Add a row for the suite to the matrix in `.github/workflows/e2e-suites.yml`.
+
+If the feature only needs the gateway, run the suite in an existing
+environment such as `ubuntu-docker-rootful`, and skip the rest of this
+section.
+
+**Suites that need a service.** A feature that needs something besides the
+gateway, such as an OIDC issuer, runs in a tmachine environment that provides
+it. The environment and the suite share a contract: a set of
+`OPENSHELL_TEST_<SERVICE>_*` environment variables that say how to reach the
+service.
+
+- **Environment.** Add an environment to `tests/tmachine/config.nix` whose
+  setup playbook starts the service (with a restart policy, since setup is
+  cached as a disk) and writes the variables as `KEY=VALUE` lines to
+  `/etc/openshell-test/env.d/<service>.env`. Pass files the playbook needs
+  through the environment's setup `inputs`, and add them to the tmachine disk
+  cache key in `e2e-suites.yml`. The runner rejects names without the
+  `OPENSHELL_TEST_` prefix, and the tests get the variables in the guest, so
+  values never appear in a runner command. Values are taken literally, without
+  quoting.
+- **Fixture.** Put the service's fixture in a support crate under
+  `tests/support/<service>`, so any suite can depend on it, or reuse the
+  existing one. It defines the variable names as constants and a
+  `<Service>Context::new(cx)` that reads them, waits for the service, and
+  wraps the testkit `Context`. Each test calls it on its first line.
+  Nextest runs each test in its own process, so the fixture builds its
+  clients there from the variables. A missing variable fails the test; it
+  never skips it.
+- **Documentation.** Document the variables in the fixture's module docs, so
+  anyone can run the suite against their own deployment by setting them.
+
+The Keycloak fixture is `tests/support/keycloak`. Run the suite that uses it
+with:
+
+```shell
+nix run .#openshell-test-runner -- \
+  --environment ubuntu-docker-rootful-keycloak --installer deb \
+  --family features --package keycloak-provider-refresh
+```
 
 ### Python E2E (`e2e/python/`)
 
@@ -339,9 +415,8 @@ Suites:
 - CLI conformance (`tests/suites/conformance`) - portable Cargo tests for
   lifecycle, mechanistic drafts, file transfer, and the sandbox-local API,
   including agent-authored permission requests. Driver E2E runs the complete
-  Cargo test package. The installed-artifact conformance suite runs the same
-  tests from a nextest archive and offers a focused `policy-advisor` testsuite
-  for manual integration runs.
+  Cargo test package. The installed-artifact conformance lanes run the `sandbox`
+  package through `openshell-test-runner` (see below).
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
   `e2e-vm`) - CLI conformance plus the common and driver-specific coverage for
   the selected deployment.
@@ -451,7 +526,9 @@ rebuilds only the RPMs. Run conformance against the installed RPMs:
 
 ```shell
 nix run .#build-artifacts
-nix run .#tmachine -- test fedora-podman-rootful rpm conformance
+nix run .#openshell-test-runner -- \
+  --environment fedora-podman-rootful --installer rpm \
+  --family conformance --package sandbox
 ```
 
 Run the portable subset in a disposable rootless Podman guest:
