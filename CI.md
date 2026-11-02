@@ -188,7 +188,7 @@ push-triggered workflow jobs themselves.
 
 ### K3s conformance version baseline
 
-The tmachine `ubuntu-k3s` conformance lanes pin Agent Sandbox v0.5.0 as the
+The `ubuntu-k3s` conformance lanes pin Agent Sandbox v0.5.0 as the
 compatibility baseline for the v1beta1 Sandbox API. They do not track the local
 K3s development default, currently v1.0.3. OpenShell also supports v0.4.6 through
 its v1alpha1 fallback, so v0.5.0 is not the overall minimum supported version.
@@ -198,26 +198,26 @@ recreating the Service requires reprovisioning the fixture. The `k3s` lane runs
 one plaintext gateway. The `k3s-ha` lane runs the supported HA configuration:
 three gateway replicas sharing PostgreSQL, serving TLS, with the CLI connecting
 over mTLS. Before conformance, every installer waits up to five minutes for a
-connected gateway; interactive shells skip the wait. K3s failures upload
-diagnostics as `tmachine-diagnostics-*` artifacts.
+connected gateway; interactive shells skip the wait. Each lane uploads its
+JUnit report, nextest log and, after a failure, the guest's diagnostics as an
+`e2e-results-*` artifact.
 
-### Run only the policy advisor conformance tests
+### Run a subset of the conformance tests
 
-Manually dispatch `Integration Tests` on the candidate branch with an
-`artifact-run-id` from a build of the same commit. When a `Release` or `Pre-release` run was
-dispatched from a different commit, also set `source-sha` to the release tag's
-resolved commit so runtime images and test inputs match the candidate binaries.
-Otherwise, `source-sha` defaults to the artifact run's head SHA. Set `category`
-to `policy-advisor` and `test-matrix` to:
+The conformance lanes run the `sandbox` package of `tests/suites/conformance`
+through `.github/workflows/e2e-suites.yml`, which keeps the list of
+environments. To run one suite in one environment from a checkout, build the
+candidate inputs (see [TESTING.md](TESTING.md)) and narrow the tests with a
+nextest filterset:
 
-```json
-[{"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"policy-advisor"}]
+```shell
+nix run .#openshell-test-runner -- \
+  --environment ubuntu-docker-rootful --installer deb \
+  --family conformance --package sandbox \
+  --filter 'binary_id(=sandbox::policy_advisor)'
 ```
 
-This runs the `mechanistic-proposal`, `new-hostname-proposal`, and
-`policy-local` conformance tests in the installed-artifact suite. The artifact run must contain the candidate CLI and
-gateway binaries and runtime images. This manual run does not replace the
-required PR E2E gate.
+A local run does not replace the required PR E2E gate.
 
 ## Informational security reports
 
