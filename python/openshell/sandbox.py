@@ -1086,7 +1086,11 @@ class SandboxClient:
         allow_missing: bool = False,
         timeout: float | None = None,
     ) -> DeletionResult:
-        """Delete a sandbox, waiting up to `timeout` (default: client timeout)."""
+        """Delete a sandbox.
+
+        `timeout` is the gRPC deadline in seconds for this call (default: the
+        client timeout).
+        """
         response = self._stub.DeleteSandbox(
             openshell_pb2.DeleteSandboxRequest(
                 workspace_scope=_workspace_scope(workspace),

@@ -162,15 +162,19 @@ def test_context_cleanup_handles_absence_and_intercepted_errors(
 
 
 @pytest.mark.parametrize(
-    ("delete_timeout_seconds", "expect_deadline"), [(None, True), (5, False)]
+    ("client_timeout", "delete_timeout_seconds", "expect_deadline"),
+    [(0.2, None, True), (0.2, 5, False), (5, 0.2, True)],
 )
 def test_context_cleanup_delete_timeout_is_opt_in(
-    cleanup_client, monkeypatch, delete_timeout_seconds, expect_deadline
+    cleanup_client,
+    monkeypatch,
+    client_timeout,
+    delete_timeout_seconds,
+    expect_deadline,
 ):
     client, state = cleanup_client
     state.exists = True
     state.delete_delay = 0.5
-    client._timeout = 0.2
     monkeypatch.setattr(
         SandboxClient,
         "from_active_cluster",
@@ -184,11 +188,15 @@ def test_context_cleanup_delete_timeout_is_opt_in(
     )
     expected = pytest.raises(GatewayError) if expect_deadline else nullcontext()
     with expected as caught, managed:
+        # Only the exit delete runs under the short deadline.
+        client._timeout = client_timeout
         state.exists = False
     if caught is not None:
         assert caught.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+    assert state.calls == ["GetSandbox", "GetSandbox", "DeleteSandbox"]
     assert state.closed == [True]
     assert managed._client is None
+    assert managed._session is None
 
 
 class _EntryFailureClient:
