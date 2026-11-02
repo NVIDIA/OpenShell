@@ -17,4 +17,4 @@ The current maintainers of OpenShell are listed below.
 | Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
 | Mrunal Patel | [@mrunalp](https://github.com/mrunalp) | Red Hat |
 | Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
-| Divesh | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
+| Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
