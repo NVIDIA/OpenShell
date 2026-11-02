@@ -393,9 +393,62 @@ async fn reject_unscoped_docker_resources(docker: &Docker, namespace: &str) -> C
     Ok(())
 }
 
+async fn remove_owned_pending_container(
+    docker: &Docker,
+    name: &str,
+    sandbox_id: &str,
+    namespace: &str,
+) -> Result<bool, Status> {
+    let inspected = match docker.inspect_container(name, None).await {
+        Ok(container) => container,
+        Err(error) if is_not_found_error(&error) => return Ok(false),
+        Err(error) => return Err(internal_status("inspect pending Docker container", error)),
+    };
+    let labels = inspected
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.as_ref());
+    let owned = labels.is_some_and(|labels| {
+        labels.get(LABEL_MANAGED_BY).map(String::as_str) == Some(LABEL_MANAGED_BY_VALUE)
+            && labels.get(LABEL_SANDBOX_NAMESPACE).map(String::as_str) == Some(namespace)
+            && labels.get(LABEL_SANDBOX_ID).map(String::as_str) == Some(sandbox_id)
+            && labels.get(LABEL_ISOLATION_ROLE).map(String::as_str)
+                == Some(LABEL_ISOLATION_ROLE_SANDBOX)
+            && labels.get(LABEL_ISOLATION_BACKEND).map(String::as_str)
+                == Some(LABEL_ISOLATION_BACKEND_OPEN_SHELL)
+    });
+    if !owned {
+        return Err(Status::failed_precondition(format!(
+            "Docker container '{name}' is not owned by this sandbox namespace; refusing to remove it"
+        )));
+    }
+    let container_id = inspected
+        .id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Status::failed_precondition("pending Docker container has no ID"))?;
+    match docker
+        .remove_container(
+            container_id,
+            Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+        )
+        .await
+    {
+        Ok(()) => Ok(true),
+        Err(error) if is_not_found_error(&error) => Ok(false),
+        Err(error) => Err(internal_status("delete pending Docker container", error)),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DockerGuestTlsPaths {
     pub(crate) ca: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DockerContainerNaming {
+    Legacy,
+    ScopedByHostUid,
 }
 
 #[derive(Debug, Clone)]
@@ -405,6 +458,7 @@ struct DockerDriverRuntimeConfig {
     default_image: String,
     image_pull_policy: ImagePullPolicy,
     sandbox_namespace: String,
+    container_naming: DockerContainerNaming,
     stop_timeout_secs: u32,
     log_level: String,
     sandbox_binary: Arc<Vec<u8>>,
@@ -430,6 +484,17 @@ struct DockerDriverRuntimeConfig {
     /// Immutable gateway-normalized additional destination trust. This is
     /// deliberately separate from `DockerComputeConfig` and sandbox input.
     network_trust: Option<NetworkSupervisorTrustBundle>,
+}
+
+impl DockerDriverRuntimeConfig {
+    fn container_name(&self, sandbox: &DriverSandbox) -> String {
+        if matches!(self.container_naming, DockerContainerNaming::Legacy) {
+            return container_name_for_sandbox(sandbox);
+        }
+        let digest = format!("{:x}", Sha256::digest(self.sandbox_namespace.as_bytes()));
+        let prefix = format!("{CONTAINER_NAME_PREFIX}{}-", &digest[..24]);
+        container_name_for_sandbox_with_prefix(sandbox, &prefix)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1073,6 +1138,11 @@ impl DockerComputeDriver {
                 default_image: docker_config.default_image.clone(),
                 image_pull_policy: docker_config.image_pull_policy,
                 sandbox_namespace,
+                container_naming: if docker_config.scope_by_host_uid {
+                    DockerContainerNaming::ScopedByHostUid
+                } else {
+                    DockerContainerNaming::Legacy
+                },
                 stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
                 log_level: gateway_log_level.to_string(),
                 sandbox_binary,
@@ -1770,7 +1840,7 @@ impl DockerComputeDriver {
             ));
         }
 
-        let container_name = container_name_for_sandbox(sandbox);
+        let container_name = self.config.container_name(sandbox);
         let gpu_devices = match self
             .resolve_gpu_cdi_devices(
                 validated.gpu_requirements,
@@ -2350,41 +2420,32 @@ impl DockerComputeDriver {
             .await?
         else {
             if let Some(record) = pending {
-                let container_name = container_name_for_sandbox(&record.sandbox);
-                match self
-                    .docker
-                    .remove_container(
-                        &container_name,
-                        Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+                let container_name = self.config.container_name(&record.sandbox);
+                let removed = remove_owned_pending_container(
+                    &self.docker,
+                    &container_name,
+                    &record.sandbox.id,
+                    &self.config.sandbox_namespace,
+                )
+                .await?;
+                self.clear_runtime_failure(&record.sandbox.id).await;
+                if removed {
+                    remove_docker_channel_volume_by_id(
+                        &self.docker,
+                        &record.sandbox.id,
+                        &self.config,
                     )
-                    .await
-                {
-                    Ok(()) => {
-                        self.clear_runtime_failure(&record.sandbox.id).await;
-                        remove_docker_channel_volume_by_id(
-                            &self.docker,
-                            &record.sandbox.id,
-                            &self.config,
-                        )
-                        .await?;
-                        cleanup_docker_boundary_state(&record.sandbox, &self.config);
-                        return Ok(true);
-                    }
-                    Err(err) if is_not_found_error(&err) => {
-                        self.clear_runtime_failure(&record.sandbox.id).await;
-                        let _ = remove_docker_channel_volume_by_id(
-                            &self.docker,
-                            &record.sandbox.id,
-                            &self.config,
-                        )
-                        .await;
-                        cleanup_docker_boundary_state(&record.sandbox, &self.config);
-                        return Ok(true);
-                    }
-                    Err(err) => {
-                        return Err(internal_status("delete docker sandbox container", err));
-                    }
+                    .await?;
+                } else {
+                    let _ = remove_docker_channel_volume_by_id(
+                        &self.docker,
+                        &record.sandbox.id,
+                        &self.config,
+                    )
+                    .await;
                 }
+                cleanup_docker_boundary_state(&record.sandbox, &self.config);
+                return Ok(true);
             }
             if !sandbox_id.is_empty() {
                 self.stop_control_process(sandbox_id).await;
@@ -5112,7 +5173,7 @@ async fn stage_docker_supervisor_bundle(
     config: &DockerDriverRuntimeConfig,
     archive: Vec<u8>,
 ) -> Result<(), Status> {
-    let stager_name = format!("{}-supervisor-stage", container_name_for_sandbox(sandbox));
+    let stager_name = format!("{}-supervisor-stage", config.container_name(sandbox));
     let _ = docker
         .remove_container(
             &stager_name,
@@ -5422,7 +5483,7 @@ async fn spawn_docker_control_process(
     let workspace_root = tokio::fs::read_to_string(directory.join(WORKSPACE_ROOT_FILE))
         .await
         .map_err(|error| Status::internal(format!("read Docker workspace root: {error}")))?;
-    let supervisor_name = format!("{}-supervisor", container_name_for_sandbox(sandbox));
+    let supervisor_name = format!("{}-supervisor", config.container_name(sandbox));
     let _ = docker
         .remove_container(
             &supervisor_name,
@@ -6797,27 +6858,27 @@ const MAX_CONTAINER_NAME_LEN: usize = 200;
 const CONTAINER_NAME_PREFIX: &str = "openshell-";
 
 fn container_name_for_sandbox(sandbox: &DriverSandbox) -> String {
+    container_name_for_sandbox_with_prefix(sandbox, CONTAINER_NAME_PREFIX)
+}
+
+fn container_name_for_sandbox_with_prefix(sandbox: &DriverSandbox, prefix: &str) -> String {
     let id_suffix = sanitize_docker_name(&sandbox.id);
     let workspace = sanitize_docker_name(&sandbox.workspace);
     let name = sanitize_docker_name(&sandbox.name);
 
-    // Format: openshell-{workspace}--{name}-{id}
-    // The workspace and id are never truncated — they ensure uniqueness.
-    // Only the sandbox name portion is truncated when the total exceeds
-    // MAX_CONTAINER_NAME_LEN.
-
+    // The sandbox name portion is truncated to fit Docker's name limit.
     if name.is_empty() {
-        let mut base = format!("{CONTAINER_NAME_PREFIX}{workspace}---{id_suffix}");
+        let mut base = format!("{prefix}{workspace}---{id_suffix}");
         if base.len() > MAX_CONTAINER_NAME_LEN {
             base.truncate(MAX_CONTAINER_NAME_LEN);
         }
         return trim_container_name_tail(base);
     }
 
-    // Reserve space for fixed parts: prefix + workspace + "--" + "-" + id
-    let reserved = CONTAINER_NAME_PREFIX.len() + workspace.len() + 2 + 1 + id_suffix.len();
+    // Reserve space for fixed parts: prefix + workspace + "--" + "-" + id.
+    let reserved = prefix.len() + workspace.len() + 2 + 1 + id_suffix.len();
     if reserved >= MAX_CONTAINER_NAME_LEN {
-        let mut base = format!("{CONTAINER_NAME_PREFIX}{workspace}---{id_suffix}");
+        let mut base = format!("{prefix}{workspace}---{id_suffix}");
         base.truncate(MAX_CONTAINER_NAME_LEN);
         return trim_container_name_tail(base);
     }
@@ -6828,7 +6889,7 @@ fn container_name_for_sandbox(sandbox: &DriverSandbox) -> String {
     } else {
         name
     };
-    format!("{CONTAINER_NAME_PREFIX}{workspace}--{truncated_name}-{id_suffix}")
+    format!("{prefix}{workspace}--{truncated_name}-{id_suffix}")
 }
 
 /// Normalize an image reference for a pull request by appending `:latest`

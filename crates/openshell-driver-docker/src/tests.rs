@@ -319,6 +319,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         default_image: "image:latest".to_string(),
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         sandbox_namespace: "default".to_string(),
+        container_naming: DockerContainerNaming::Legacy,
         stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
         log_level: "info".to_string(),
         sandbox_binary: Arc::new(b"\x7fELFtest".to_vec()),
@@ -2620,6 +2621,23 @@ fn host_uid_scope_separates_docker_resources() {
 }
 
 #[test]
+fn scoped_container_names_separate_identical_sandbox_ids() {
+    let sandbox = test_sandbox();
+    let mut alice = runtime_config();
+    alice.sandbox_namespace = "uid-1000-default".to_string();
+    alice.container_naming = DockerContainerNaming::ScopedByHostUid;
+    let mut bob = runtime_config();
+    bob.sandbox_namespace = "uid-1001-default".to_string();
+    bob.container_naming = DockerContainerNaming::ScopedByHostUid;
+
+    assert_ne!(alice.container_name(&sandbox), bob.container_name(&sandbox));
+    assert_eq!(
+        runtime_config().container_name(&sandbox),
+        container_name_for_sandbox(&sandbox)
+    );
+}
+
+#[test]
 fn host_uid_scope_is_opt_in_through_docker_config() {
     let config: DockerComputeConfig = toml::from_str("scope_by_host_uid = true").unwrap();
     assert!(config.scope_by_host_uid);
@@ -2646,9 +2664,30 @@ async fn host_uid_scope_rejects_legacy_containers_and_volumes() {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = [0_u8; 4096];
                 let length = socket.read(&mut request).await.unwrap();
-                assert!(
-                    String::from_utf8_lossy(&request[..length]).contains(path),
-                    "unexpected Docker API request"
+                let request = String::from_utf8_lossy(&request[..length]);
+                assert!(request.contains(path), "unexpected Docker API request");
+                let request_path = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                let url = Url::parse(&format!("http://localhost{request_path}")).unwrap();
+                let filters: HashMap<String, Vec<String>> = serde_json::from_str(
+                    url.query_pairs()
+                        .find(|(key, _)| key == "filters")
+                        .expect("Docker label filters")
+                        .1
+                        .as_ref(),
+                )
+                .unwrap();
+                assert_eq!(
+                    filters.get("label"),
+                    Some(&vec![
+                        format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}"),
+                        format!("{LABEL_SANDBOX_NAMESPACE}=default"),
+                    ])
                 );
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -2678,6 +2717,154 @@ async fn host_uid_scope_rejects_legacy_containers_and_volumes() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn pending_delete_uses_inspected_container_id() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for (method, path, status, body) in [
+            (
+                "GET",
+                "/containers/pending-owned/json",
+                "200 OK",
+                r#"{"Id":"immutable-owned-id","Config":{"Labels":{"openshell.ai/managed-by":"openshell","openshell.ai/sandbox-id":"pending-owned","openshell.ai/sandbox-namespace":"uid-1000-default","openshell.ai/isolation-role":"sandbox","openshell.ai/isolation-backend":"openshell-sandbox"}}}"#,
+            ),
+            (
+                "DELETE",
+                "/containers/immutable-owned-id?",
+                "204 No Content",
+                "",
+            ),
+        ] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4096];
+            let length = socket.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..length]);
+            let first_line = request.lines().next().unwrap();
+            assert!(first_line.starts_with(method), "{first_line}");
+            assert!(first_line.contains(path), "{first_line}");
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let docker = Docker::connect_with_http(
+        &format!("http://{address}"),
+        2,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .unwrap();
+    assert!(
+        remove_owned_pending_container(
+            &docker,
+            "pending-owned",
+            "pending-owned",
+            "uid-1000-default"
+        )
+        .await
+        .unwrap()
+    );
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn pending_delete_rejects_container_from_another_namespace() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_sender, mut stop_receiver) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        loop {
+            let accepted = tokio::select! {
+                _ = &mut stop_receiver => break,
+                accepted = listener.accept() => accepted.unwrap(),
+            };
+            let (mut socket, _) = accepted;
+            let mut buffer = [0_u8; 4096];
+            let length = socket.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..length]);
+            let first_line = request.lines().next().unwrap().to_string();
+            let (status, body) = if first_line.contains("/containers/json?") {
+                ("200 OK", "[]")
+            } else if first_line.starts_with("GET ") && first_line.contains("/json") {
+                (
+                    "200 OK",
+                    r#"{"Id":"foreign-id","Config":{"Labels":{"openshell.ai/managed-by":"openshell","openshell.ai/sandbox-id":"pending-foreign","openshell.ai/sandbox-namespace":"uid-1001-default","openshell.ai/isolation-role":"sandbox","openshell.ai/isolation-backend":"openshell-sandbox"}}}"#,
+                )
+            } else if first_line.starts_with("DELETE ") && first_line.contains("/containers/") {
+                ("204 No Content", "")
+            } else if first_line.starts_with("DELETE ") && first_line.contains("/volumes/") {
+                ("404 Not Found", r#"{"message":"No such volume"}"#)
+            } else {
+                panic!("unexpected Docker API request: {first_line}");
+            };
+            requests.push(first_line);
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+        requests
+    });
+
+    let mut config = runtime_config();
+    config.sandbox_namespace = "uid-1000-default".to_string();
+    config.container_naming = DockerContainerNaming::ScopedByHostUid;
+    let mut driver = test_driver_with_config(config);
+    driver.docker = Arc::new(
+        Docker::connect_with_http(
+            &format!("http://{address}"),
+            2,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap(),
+    );
+    let mut sandbox = test_sandbox();
+    sandbox.id = "pending-foreign".to_string();
+    driver.pending.lock().await.insert(
+        sandbox.id.clone(),
+        PendingSandboxRecord {
+            sandbox: sandbox.clone(),
+            task: None,
+        },
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        driver.delete_sandbox_inner(&sandbox.id, &sandbox.name),
+    )
+    .await
+    .unwrap();
+    let _ = stop_sender.send(());
+    let requests = server.await.unwrap();
+    assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("/containers/json?"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("/containers/") && request.contains("/json"))
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.starts_with("DELETE ") && request.contains("/containers/"))
+    );
 }
 
 #[test]

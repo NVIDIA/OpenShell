@@ -1373,7 +1373,8 @@ UID. Container lookups, startup cleanup, named volumes, and private state then
 use that scoped value. The default is `false`, preserving existing resource
 names. The opt-in fails at startup if any OpenShell containers or volumes still
 use the unscoped `sandbox_label`; delete those sandboxes with the old gateway
-before enabling it. Keep the gateway service under the same host UID afterward.
+and stop it before enabling the option. Keep the gateway service under the same
+host UID afterward.
 
 Each gateway still needs a distinct loopback bind port and its own client
 registration. Package-managed port selection is not yet available. This
