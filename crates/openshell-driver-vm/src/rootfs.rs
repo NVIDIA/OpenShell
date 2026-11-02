@@ -30,6 +30,8 @@ const SANDBOX_VM_INIT_PATH: &str = "/opt/openshell/bin/openshell-vm-init";
 const ROOTFS_IMAGE_MIN_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 const ROOTFS_IMAGE_MIN_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 const EXT4_IMAGE_MIN_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
+const OVERLAY_RECOVERY_MIN_AVAILABLE_BYTES: u64 = 32 * 1024 * 1024;
+const OVERLAY_RECOVERY_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
 static INJECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub const fn sandbox_guest_init_path() -> &'static str {
@@ -367,23 +369,202 @@ pub fn set_rootfs_image_file_mode(
     )
 }
 
-/// Replay the ext4 journal and repair automatically correctable filesystem
-/// state before the driver mutates a preserved guest disk offline.
+/// Repair a preserved overlay before the driver mutates it offline. A full
+/// overlay needs space for guest init even when the workload has stopped.
 pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
+    let initial_space = ext4_image_space(image_path).ok();
+    let full_overlay = initial_space
+        .is_some_and(|space| space.available_bytes < OVERLAY_RECOVERY_MIN_AVAILABLE_BYTES);
     let mut command = e2fs_command("e2fsck")?;
     let path = PathBuf::from(command.get_program());
-    let output = command.arg("-p").arg("-f").arg(image_path).output();
-    match output {
-        Ok(output) if matches!(output.status.code(), Some(0..=2)) => Ok(()),
-        Ok(output) => Err(format!(
+    let output = command
+        .env("LC_ALL", "C")
+        .arg("-p")
+        .arg("-f")
+        .arg(image_path)
+        .output()
+        .map_err(|error| {
+            if full_overlay {
+                format!(
+                    "OverlayDiskFull: [openshell.drivers.vm] overlay_disk_mib sizes new overlays; run {}: {error}",
+                    path.display()
+                )
+            } else {
+                format!("run {}: {error}", path.display())
+            }
+        })?;
+    if !matches!(output.status.code(), Some(0..=3)) {
+        let error = format!(
             "{} failed with status {}\nstdout: {}\nstderr: {}",
             path.display(),
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
-        )),
-        Err(error) => Err(format!("run {}: {error}", path.display())),
+        );
+        // Preen refuses some orphaned inodes left by a failed full-disk boot.
+        // Restrict noninteractive repair to overlays that were already short
+        // of usable space before fsck; other corruption still requires review.
+        if !full_overlay
+            || !matches!(output.status.code(), Some(4..=7))
+            || !String::from_utf8_lossy(&output.stdout).contains("Unattached inode")
+        {
+            return Err(if full_overlay {
+                format!(
+                    "OverlayDiskFull: filesystem repair needs review; [openshell.drivers.vm] overlay_disk_mib sizes new overlays: {error}"
+                )
+            } else {
+                error
+            });
+        }
+        let repair = Command::new(&path)
+            .env("LC_ALL", "C")
+            .arg("-y")
+            .arg("-f")
+            .arg(image_path)
+            .output()
+            .map_err(|error| {
+                format!(
+                    "OverlayDiskFull: [openshell.drivers.vm] overlay_disk_mib sizes new overlays; run {}: {error}",
+                    path.display()
+                )
+            })?;
+        if !matches!(repair.status.code(), Some(0..=3)) {
+            return Err(format!(
+                "OverlayDiskFull: filesystem repair failed; [openshell.drivers.vm] overlay_disk_mib sizes new overlays. {error}\nrepair stdout: {}\nrepair stderr: {}",
+                String::from_utf8_lossy(&repair.stdout),
+                String::from_utf8_lossy(&repair.stderr)
+            ));
+        }
     }
+
+    let space = ext4_image_space(image_path)?;
+    if space.available_bytes >= OVERLAY_RECOVERY_MIN_AVAILABLE_BYTES {
+        return Ok(());
+    }
+    grow_full_overlay(image_path, space).map_err(|error| {
+        format!(
+            "OverlayDiskFull: cannot provide space for guest init; [openshell.drivers.vm] overlay_disk_mib sizes new overlays: {error}"
+        )
+    })
+}
+
+#[derive(Clone, Copy)]
+struct Ext4ImageSpace {
+    available_bytes: u64,
+    filesystem_bytes: u64,
+}
+
+fn ext4_image_space(image_path: &Path) -> Result<Ext4ImageSpace, String> {
+    // ext4's primary superblock starts 1024 bytes into the image. Read only
+    // its fixed-width counters; e2fsck validates the filesystem itself.
+    let mut image = File::open(image_path)
+        .map_err(|error| format!("open overlay {}: {error}", image_path.display()))?;
+    image
+        .seek(SeekFrom::Start(1024))
+        .map_err(|error| format!("seek overlay superblock {}: {error}", image_path.display()))?;
+    let mut superblock = [0_u8; 0x15c];
+    image
+        .read_exact(&mut superblock)
+        .map_err(|error| format!("read overlay superblock {}: {error}", image_path.display()))?;
+    let u32_at = |offset: usize| {
+        u32::from_le_bytes([
+            superblock[offset],
+            superblock[offset + 1],
+            superblock[offset + 2],
+            superblock[offset + 3],
+        ])
+    };
+    if u16::from_le_bytes([superblock[0x38], superblock[0x39]]) != 0xef53 {
+        return Err(format!("overlay {} is not ext4", image_path.display()));
+    }
+    let block_size = 1024_u64
+        .checked_shl(u32_at(0x18))
+        .filter(|size| *size <= 65_536)
+        .ok_or_else(|| format!("invalid ext4 block size in {}", image_path.display()))?;
+    let has_64bit_counts = u32_at(0x60) & 0x80 != 0;
+    let count = |low: usize, high: usize| {
+        u64::from(u32_at(low))
+            | if has_64bit_counts {
+                u64::from(u32_at(high)) << 32
+            } else {
+                0
+            }
+    };
+    let blocks = count(0x04, 0x150);
+    let reserved = count(0x08, 0x154);
+    let free = count(0x0c, 0x158);
+    if blocks == 0 || reserved > blocks || free > blocks {
+        return Err(format!(
+            "invalid ext4 block counts in {}",
+            image_path.display()
+        ));
+    }
+    let filesystem_bytes = blocks
+        .checked_mul(block_size)
+        .ok_or_else(|| format!("ext4 size overflows in {}", image_path.display()))?;
+    let image_bytes = image
+        .metadata()
+        .map_err(|error| format!("stat overlay {}: {error}", image_path.display()))?
+        .len();
+    if filesystem_bytes > image_bytes {
+        return Err(format!(
+            "ext4 exceeds overlay image {}",
+            image_path.display()
+        ));
+    }
+    let available_bytes = free
+        .saturating_sub(reserved)
+        .checked_mul(block_size)
+        .ok_or_else(|| format!("ext4 free space overflows in {}", image_path.display()))?;
+    Ok(Ext4ImageSpace {
+        available_bytes,
+        filesystem_bytes,
+    })
+}
+
+fn grow_full_overlay(image_path: &Path, space: Ext4ImageSpace) -> Result<(), String> {
+    let image = fs::OpenOptions::new()
+        .write(true)
+        .open(image_path)
+        .map_err(|error| format!("open overlay {} for growth: {error}", image_path.display()))?;
+    let current_size = image
+        .metadata()
+        .map_err(|error| format!("stat overlay {}: {error}", image_path.display()))?
+        .len();
+    let target_size = space
+        .filesystem_bytes
+        .checked_add(OVERLAY_RECOVERY_GROWTH_BYTES)
+        .ok_or_else(|| "overlay recovery size overflows".to_string())?;
+    if current_size < target_size {
+        image
+            .set_len(target_size)
+            .and_then(|()| image.sync_all())
+            .map_err(|error| format!("extend overlay {}: {error}", image_path.display()))?;
+    }
+    drop(image);
+
+    let mut command = e2fs_command("resize2fs")?;
+    let path = PathBuf::from(command.get_program());
+    let output = command
+        .arg(image_path)
+        .output()
+        .map_err(|error| format!("run {}: {error}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} failed with status {}\nstdout: {}\nstderr: {}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    if ext4_image_space(image_path)?.available_bytes < OVERLAY_RECOVERY_MIN_AVAILABLE_BYTES {
+        return Err(format!(
+            "overlay {} remains short of free space after resize",
+            image_path.display()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1566,6 +1747,104 @@ mod tests {
             .expect("create ext4 image");
 
         recover_rootfs_image(&image).expect("recover clean ext4 image");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_rootfs_image_grows_nearly_full_overlay_and_keeps_files() {
+        if ["e2fsck", "debugfs", "resize2fs"]
+            .iter()
+            .any(|tool| e2fs_command(tool).is_err())
+        {
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let source = dir.join("source");
+        let image = dir.join("overlay.ext4");
+        fs::create_dir_all(source.join("upper")).expect("create source upperdir");
+        fs::create_dir_all(source.join("work")).expect("create source workdir");
+        fs::write(source.join("upper/work.txt"), b"important work\n").expect("write work");
+        fs::write(source.join("upper/fill"), vec![b'X'; 44 * 1024 * 1024]).expect("write filler");
+        create_ext4_image_from_dir_with_size(&source, &image, 64 * 1024 * 1024)
+            .expect("create nearly full ext4 image");
+
+        recover_rootfs_image(&image).expect("recover nearly full overlay");
+        recover_rootfs_image(&image).expect("restart recovered overlay");
+
+        assert_eq!(
+            fs::metadata(&image).expect("stat recovered image").len(),
+            128 * 1024 * 1024
+        );
+        let output = e2fs_command("debugfs")
+            .expect("debugfs")
+            .arg("-R")
+            .arg("cat /upper/work.txt")
+            .arg(&image)
+            .output()
+            .expect("read work from image");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"important work\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_rootfs_image_repairs_unattached_inode_on_full_overlay() {
+        if ["e2fsck", "debugfs", "resize2fs"]
+            .iter()
+            .any(|tool| e2fs_command(tool).is_err())
+        {
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let source = dir.join("source");
+        let image = dir.join("overlay.ext4");
+        fs::create_dir_all(source.join("upper")).expect("create source upperdir");
+        fs::create_dir_all(source.join("work")).expect("create source workdir");
+        fs::write(source.join("upper/work.txt"), b"important work\n").expect("write work");
+        fs::write(source.join("upper/orphan.txt"), b"orphaned work\n").expect("write orphan");
+        fs::write(source.join("upper/fill"), vec![b'X'; 44 * 1024 * 1024]).expect("write filler");
+        create_ext4_image_from_dir_with_size(&source, &image, 64 * 1024 * 1024)
+            .expect("create nearly full ext4 image");
+        let unlink = e2fs_command("debugfs")
+            .expect("debugfs")
+            .arg("-w")
+            .arg("-R")
+            .arg("unlink /upper/orphan.txt")
+            .arg(&image)
+            .output()
+            .expect("unlink image file");
+        assert!(unlink.status.success(), "{unlink:?}");
+        let probe_image = dir.join("probe.ext4");
+        clone_or_copy_sparse_file(&image, &probe_image).expect("copy image for preen probe");
+        let preen = e2fs_command("e2fsck")
+            .expect("e2fsck")
+            .env("LC_ALL", "C")
+            .arg("-p")
+            .arg("-f")
+            .arg(&probe_image)
+            .output()
+            .expect("check orphaned image");
+        assert_eq!(preen.status.code(), Some(4), "{preen:?}");
+        assert!(
+            String::from_utf8_lossy(&preen.stdout).contains("Unattached inode"),
+            "{preen:?}"
+        );
+
+        recover_rootfs_image(&image).expect("repair full overlay with orphaned inode");
+
+        let work = e2fs_command("debugfs")
+            .expect("debugfs")
+            .arg("-R")
+            .arg("cat /upper/work.txt")
+            .arg(&image)
+            .output()
+            .expect("read saved work");
+        assert!(work.status.success(), "{work:?}");
+        assert_eq!(work.stdout, b"important work\n");
 
         let _ = fs::remove_dir_all(&dir);
     }

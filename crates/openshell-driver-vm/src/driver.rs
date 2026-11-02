@@ -1815,7 +1815,11 @@ impl VmDriver {
             self.fail_provisioning(
                 &sandbox_id,
                 &state_dir,
-                "ProvisioningFailed",
+                if err.message().contains("OverlayDiskFull:") {
+                    "OverlayDiskFull"
+                } else {
+                    "ProvisioningFailed"
+                },
                 err.message(),
                 overlay_preparation == OverlayPreparation::Fresh,
             )
@@ -1932,6 +1936,10 @@ impl VmDriver {
                 "Preparing writable VM overlay disk".to_string(),
             ),
         );
+        let previous_overlay_size = tokio::fs::metadata(&overlay_disk)
+            .await
+            .ok()
+            .map(|m| m.len());
         let sandbox_owner_state = self
             .prepare_overlay_in_worker(
                 &sandbox.id,
@@ -1944,6 +1952,26 @@ impl VmDriver {
             )
             .await
             .map_err(|err| Status::internal(format!("prepare guest overlay disk failed: {err}")))?;
+        if let Some(previous_size) = previous_overlay_size {
+            let recovered_size = tokio::fs::metadata(&overlay_disk)
+                .await
+                .map_err(|error| Status::internal(format!("stat recovered overlay: {error}")))?
+                .len();
+            if recovered_size > previous_size {
+                self.publish_platform_event(
+                    sandbox.id.clone(),
+                    platform_event(
+                        "vm",
+                        "Warning",
+                        "OverlayDiskFull",
+                        format!(
+                            "VM overlay was nearly full and grew by {} MiB for recovery; remove files or increase [openshell.drivers.vm] overlay_disk_mib for new sandboxes",
+                            (recovered_size - previous_size) / (1024 * 1024)
+                        ),
+                    ),
+                );
+            }
+        }
         self.ensure_provisioning_active(&sandbox.id).await?;
 
         if let Err(err) =
@@ -7598,12 +7626,12 @@ fn prepare_sandbox_overlay_image(
 ) -> Result<(), String> {
     if preparation == OverlayPreparation::PreserveExisting {
         match fs::metadata(overlay_disk) {
-            Ok(metadata) if metadata.is_file() && metadata.len() == expected_size_bytes => {
+            Ok(metadata) if metadata.is_file() && metadata.len() >= expected_size_bytes => {
                 return Ok(());
             }
             Ok(metadata) if metadata.is_file() => {
                 return Err(format!(
-                    "existing overlay disk '{}' has size {}, expected {}",
+                    "existing overlay disk '{}' has size {}, expected at least {}",
                     overlay_disk.display(),
                     metadata.len(),
                     expected_size_bytes
@@ -11315,6 +11343,30 @@ mod tests {
 
         assert_eq!(std::fs::read(&overlay).unwrap(), b"saved-overlay");
 
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn prepare_sandbox_overlay_preserves_recovery_growth_on_later_starts() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let template = base.join("template.ext4");
+        let overlay = base.join("overlay.ext4");
+        std::fs::write(&template, b"fresh-overlay").unwrap();
+        std::fs::write(&overlay, b"saved-overlay-with-recovery-space").unwrap();
+
+        prepare_sandbox_overlay_image(
+            &template,
+            &overlay,
+            OverlayPreparation::PreserveExisting,
+            "saved-overlay".len() as u64,
+        )
+        .expect("preserve grown overlay");
+
+        assert_eq!(
+            std::fs::read(&overlay).unwrap(),
+            b"saved-overlay-with-recovery-space"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 

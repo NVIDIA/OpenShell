@@ -247,6 +247,19 @@ the overlay while cached image disks remain unchanged. The overlay disk must be
 large enough to hold the compressed payload, unpacked rootfs, and sandbox writes
 during the first prepare.
 
+On restart, the driver checks a preserved overlay with `e2fsck` before writing
+new launch files. If fewer than 32 MiB are available to the sandbox after the
+check, it grows the sparse disk and ext4 filesystem by 64 MiB before booting.
+If preen stops on an unattached inode in a nearly full overlay, the driver runs
+noninteractive repair. Failures without that signal still stop startup.
+The driver retains the overlay image and publishes an `OverlayDiskFull`
+warning when it grows the disk. Repeated full-disk restarts can add another
+64 MiB each time. `overlay_disk_mib` sets the initial size of new overlays; it
+is not a hard cap on recovery growth, and changing it does not resize existing
+overlays. Recovery requires `resize2fs` on the gateway host. If repair or
+growth fails, the start error names `OverlayDiskFull` and the config key, and
+the existing overlay is retained for another attempt.
+
 The driver also writes the accepted `DriverSandbox` launch request to
 `<state-dir>/sandboxes/<id>/sandbox.pb`. If the gateway restarts, it starts a
 new VM driver process. During graceful shutdown, the gateway first sends the
@@ -297,7 +310,7 @@ create TAP devices or install nftables/iptables rules.
 
 - macOS on Apple Silicon, or Linux on aarch64/x86_64 with KVM
 - Rust toolchain
-- e2fsprogs (`mke2fs` or `mkfs.ext4`, plus `debugfs`) for root and overlay disk image creation and QEMU environment injection
+- e2fsprogs (`mke2fs` or `mkfs.ext4`, `debugfs`, `e2fsck`, and `resize2fs`) for root and overlay disk image creation and recovery
 - Guest-sandbox cross-compile toolchain (needed on macOS, and on Linux when host arch differs from the guest):
   - Matching static guest target: `rustup target add aarch64-unknown-linux-musl` (or `x86_64-unknown-linux-musl` for an amd64 guest)
   - `cargo install --locked cargo-zigbuild` and `brew install zig` (or distro equivalent). `vm:supervisor` cross-compiles the Linux guest `openshell-sandbox` and its matching `openshell-supervisor`.
