@@ -60,6 +60,15 @@ pub fn main() -> ExitCode {
 pub fn main_with(tests: &'static [Test]) -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
     let program = program_name(&args);
+    // A suite crate that the program never names is not linked, and its
+    // tests are silently missing. Fail instead of passing with nothing.
+    if tests.is_empty() {
+        eprintln!(
+            "{program}: no tests are linked into this program; it must name each suite crate \
+             it runs, for example with `use <suite> as _;`"
+        );
+        return ExitCode::from(ERROR_EXIT);
+    }
     if let Err(error) = validate(tests) {
         eprintln!("{program}: {error}");
         return ExitCode::from(ERROR_EXIT);

@@ -106,10 +106,19 @@ In a tmachine VM, the test runner (`tests/runner/`) does the same: it sets
 cargo or nextest:
 
 ```rust
+use conformance as _;
+
 fn main() -> std::process::ExitCode {
     testkit::main()
 }
 ```
+
+The program must name each suite crate it runs, as `use conformance as _;` does
+above: Rust doesn't link a dependency that is never named, and its tests would
+be missing. A program that links no tests exits 2 with an error under every
+command. `openshell-conformance`, a binary in the conformance crate, is the
+program for the conformance suite; see
+[its README](../suites/conformance/README.md).
 
 | Command | What it does |
 |---|---|

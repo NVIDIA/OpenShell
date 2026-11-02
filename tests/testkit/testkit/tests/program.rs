@@ -10,13 +10,15 @@
 //! - `fixtures`: tests that pass, fail, hang, ignore `SIGTERM`, or leave
 //!   processes behind, which the checks run through the program's
 //!   subcommands;
-//! - `registered`: `testkit::main()` over the `#[testkit::test]`s below.
+//! - `registered`: `testkit::main()` over the `#[testkit::test]`s below;
+//! - `empty`: a program with no tests.
 
 #[cfg(unix)]
 fn main() -> std::process::ExitCode {
     match std::env::var("TESTKIT_FIXTURE").as_deref() {
         Ok("fixtures") => testkit::program::main_with(&unix::FIXTURES),
         Ok("registered") => testkit::main(),
+        Ok("empty") => testkit::program::main_with(&[]),
         _ => testkit::program::main_with(&unix::CHECKS),
     }
 }
@@ -135,7 +137,7 @@ mod unix {
         },
     ];
 
-    pub static CHECKS: [Test; 11] = [
+    pub static CHECKS: [Test; 12] = [
         check("nextest_interface", || {
             Box::pin(async { nextest_interface() })
         }),
@@ -146,6 +148,9 @@ mod unix {
             Box::pin(async { run_reports_every_outcome() })
         }),
         check("run_exit_codes", || Box::pin(async { run_exit_codes() })),
+        check("a_program_without_tests_fails", || {
+            Box::pin(async { a_program_without_tests_fails() })
+        }),
         check("timeout_kills_the_process_group", || {
             Box::pin(async { timeout_kills_the_process_group() })
         }),
@@ -308,6 +313,24 @@ mod unix {
         }
         let usage = output(program("fixtures", &["run", "--timeout", "0"]));
         assert_eq!(usage.status.code(), Some(2));
+    }
+
+    /// A program whose suites were not linked fails rather than passing with
+    /// no tests, under every interface.
+    fn a_program_without_tests_fails() {
+        for args in [
+            &["list"][..],
+            &["run"],
+            &["--list", "--format", "terse"],
+            &[],
+        ] {
+            let empty = output(program("empty", args));
+            assert_eq!(empty.status.code(), Some(2), "{args:?}");
+            assert!(
+                stderr(&empty).contains("no tests are linked into this program"),
+                "{args:?}"
+            );
+        }
     }
 
     fn is_alive(pid: libc::pid_t) -> bool {

@@ -3,7 +3,8 @@
 The `conformance` crate holds the testkit suites for sandbox behavior that every
 compute driver must provide. The family is this one crate, its own workspace.
 It is a library: each module in `src/` is one suite, and `cargo test` and
-nextest run the tests as the library's unit tests.
+nextest run the tests as the library's unit tests. The crate also builds the
+`openshell-conformance` program, which runs the same tests.
 
 | Suite | Covers |
 |---|---|
@@ -27,11 +28,31 @@ environments).
 [TESTING.md](../../../TESTING.md) covers running it against a local Docker
 gateway and in a tmachine VM, as CI does.
 
+### The `openshell-conformance` program
+
+`openshell-conformance` runs the suite against a gateway without cargo or
+nextest, so a driver author or operator can check their own gateway. It finds
+the gateway and the CLI as the tests do. Build it and run it with:
+
+```shell
+cargo build --locked --manifest-path tests/suites/conformance/Cargo.toml --bin openshell-conformance
+tests/suites/conformance/target/debug/openshell-conformance list
+tests/suites/conformance/target/debug/openshell-conformance ready
+tests/suites/conformance/target/debug/openshell-conformance run --junit conformance.xml
+```
+
+The program runs only this suite: passing it means a gateway meets the
+conformance contract below. Feature and driver suites are not part of it. The
+[testkit README](../../testkit/README.md#test-programs) describes the commands
+and exit codes. `tasks/scripts/check-conformance-program.sh` checks that it
+lists the same tests as nextest.
+
 ## Adding a test
 
 Add a `#[testkit::test]` function to a suite, or for a new area, a new file in
 `src/` and a `mod` line for it in `src/lib.rs`. No playbook, test archive or
-workflow entry is needed: the runner builds and runs every test in the crate.
+workflow entry is needed: the runner builds and runs every test in the
+crate, and `openshell-conformance` includes it.
 
 ## What a test may assert
 

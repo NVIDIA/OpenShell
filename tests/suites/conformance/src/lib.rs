@@ -5,8 +5,8 @@
 //! provide. Each module is one suite.
 //!
 //! `cargo test` and nextest run the tests as this library's unit tests.
-//! `#[testkit::test]` also registers them, so a test program runs them by
-//! linking this crate.
+//! `#[testkit::test]` also registers them, so the `openshell-conformance`
+//! program in `src/main.rs` runs them by linking this library.
 
 mod cli;
 mod file_transfer;
