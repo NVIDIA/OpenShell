@@ -5180,6 +5180,7 @@ dependencies = [
 name = "openshell-supervisor"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "bytes",
  "clap",
  "futures",

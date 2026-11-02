@@ -278,6 +278,7 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         probe: probe.clone(),
     };
     let config = SandboxInstanceConfig {
+        app_router: None,
         command: vec!["true".into()],
         workdir: None,
         timeout_secs: 0,
