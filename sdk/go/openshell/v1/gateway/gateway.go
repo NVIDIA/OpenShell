@@ -111,6 +111,7 @@ func loadConfigInternal(name string) (*Config, error) {
 // directories. User gateways appear first. If the same name exists in
 // both directories, only the user gateway is returned (user precedence).
 // Returns an empty slice (not an error) when no gateways are configured.
+// Active also reflects the system default when no user selection exists.
 //
 // ListGateways is safe for concurrent use from multiple goroutines.
 func ListGateways() ([]Info, error) {

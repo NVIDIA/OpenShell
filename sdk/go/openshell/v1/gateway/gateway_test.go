@@ -479,3 +479,19 @@ func TestListGateways_ActiveStatus(t *testing.T) {
 		}
 	}
 }
+
+func TestListGateways_SystemActiveStatus(t *testing.T) {
+	user, system := t.TempDir(), t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", user)
+	t.Setenv(systemGatewayDirEnv, system)
+	require.NoError(t, os.MkdirAll(filepath.Join(user, "openshell", "gateways", "mine"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(system, "gateways", "corp"), 0o755))
+	writeFile(t, system, "active_gateway", "corp")
+
+	gateways, err := ListGateways()
+	require.NoError(t, err)
+	require.Len(t, gateways, 2)
+
+	assert.Equal(t, Info{Name: "mine", Active: false, Source: SourceUser}, gateways[0])
+	assert.Equal(t, Info{Name: "corp", Active: true, Source: SourceSystem}, gateways[1])
+}
