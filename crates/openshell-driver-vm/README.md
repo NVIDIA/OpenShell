@@ -250,8 +250,9 @@ during the first prepare.
 On restart, the driver checks a preserved overlay with `e2fsck` before writing
 new launch files. If fewer than 32 MiB are available to the sandbox after the
 check, it grows the sparse disk and ext4 filesystem by 64 MiB before booting.
-If preen stops on an unattached inode in a nearly full overlay, the driver runs
-noninteractive repair. Failures without that signal still stop startup.
+If preen stops on an unattached inode in a nearly full overlay, the driver
+retries preen with orphan reconnection enabled. Other repairs that require
+interaction still stop startup.
 The driver retains the overlay image and publishes an `OverlayDiskFull`
 warning when it grows the disk. Repeated full-disk restarts can add another
 64 MiB each time. `overlay_disk_mib` sets the initial size of new overlays; it

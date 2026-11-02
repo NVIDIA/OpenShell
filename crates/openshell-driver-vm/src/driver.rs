@@ -3690,7 +3690,9 @@ impl VmDriver {
             && overlay_metadata.as_ref().is_ok_and(fs::Metadata::is_file);
         let publish_new_overlay = preparation == OverlayPreparation::Fresh
             || matches!(overlay_metadata, Err(error) if error.kind() == std::io::ErrorKind::NotFound);
-        if !overlay_template_image_ready(&template_path, overlay_size_bytes).await? {
+        if publish_new_overlay
+            && !overlay_template_image_ready(&template_path, overlay_size_bytes).await?
+        {
             let _cache_guard = self.image_cache_lock.lock().await;
             let template_path = template_path.clone();
             let staging_dir = self.image_staging_dir("overlay-template");
@@ -7626,16 +7628,8 @@ fn prepare_sandbox_overlay_image(
 ) -> Result<(), String> {
     if preparation == OverlayPreparation::PreserveExisting {
         match fs::metadata(overlay_disk) {
-            Ok(metadata) if metadata.is_file() && metadata.len() >= expected_size_bytes => {
-                return Ok(());
-            }
             Ok(metadata) if metadata.is_file() => {
-                return Err(format!(
-                    "existing overlay disk '{}' has size {}, expected at least {}",
-                    overlay_disk.display(),
-                    metadata.len(),
-                    expected_size_bytes
-                ));
+                return Ok(());
             }
             Ok(_) => {
                 return Err(format!(
@@ -7653,6 +7647,15 @@ fn prepare_sandbox_overlay_image(
         }
     }
 
+    let template_metadata = fs::metadata(template_path)
+        .map_err(|error| format!("stat overlay template {}: {error}", template_path.display()))?;
+    if !template_metadata.is_file() || template_metadata.len() != expected_size_bytes {
+        return Err(format!(
+            "overlay template '{}' must be a {} byte file",
+            template_path.display(),
+            expected_size_bytes
+        ));
+    }
     create_sandbox_overlay_image_from_template(template_path, overlay_disk)
 }
 
@@ -11367,6 +11370,62 @@ mod tests {
             std::fs::read(&overlay).unwrap(),
             b"saved-overlay-with-recovery-space"
         );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn overlay_recovery_preserves_smaller_disk_after_default_increase() {
+        if ["mke2fs", "e2fsck", "debugfs"]
+            .iter()
+            .any(|tool| openshell_core::e2fsprogs::resolve(&[tool]).is_err())
+        {
+            return;
+        }
+
+        let base = unique_temp_dir();
+        let source = base.join("source");
+        let overlay = base.join("overlay.ext4");
+        std::fs::create_dir_all(source.join("upper")).unwrap();
+        std::fs::create_dir_all(source.join("work")).unwrap();
+        std::fs::write(source.join("upper/work.txt"), b"saved work\n").unwrap();
+        create_ext4_image_from_dir_with_size(&source, &overlay, 64 * 1024 * 1024).unwrap();
+        write_sandbox_owner_state(
+            &base,
+            SandboxOwnerIdentity {
+                uid: 1000,
+                gid: 1001,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = base.clone();
+        driver.config.overlay_disk_mib = 128;
+        let template = overlay_template_image(&base, 128 * 1024 * 1024);
+        driver
+            .prepare_runtime_overlay(
+                &base,
+                &overlay,
+                Path::new("/must-not-read-image"),
+                OverlayPreparation::PreserveExisting,
+                None,
+            )
+            .await
+            .expect("start disk created under smaller default");
+
+        assert_eq!(std::fs::metadata(&overlay).unwrap().len(), 64 * 1024 * 1024);
+        assert!(!template.exists());
+        let output =
+            std::process::Command::new(openshell_core::e2fsprogs::resolve(&["debugfs"]).unwrap())
+                .arg("-R")
+                .arg("cat /upper/work.txt")
+                .arg(&overlay)
+                .output()
+                .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"saved work\n");
+
         let _ = std::fs::remove_dir_all(base);
     }
 

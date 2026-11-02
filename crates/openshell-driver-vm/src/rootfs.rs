@@ -402,8 +402,8 @@ pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&output.stderr)
         );
         // Preen refuses some orphaned inodes left by a failed full-disk boot.
-        // Restrict noninteractive repair to overlays that were already short
-        // of usable space before fsck; other corruption still requires review.
+        // Permit only orphan reconnection on a full overlay; any other repair
+        // that preen cannot do safely still requires review.
         if !full_overlay
             || !matches!(output.status.code(), Some(4..=7))
             || !String::from_utf8_lossy(&output.stdout).contains("Unattached inode")
@@ -416,9 +416,16 @@ pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
                 error
             });
         }
+        let mut config = tempfile::NamedTempFile::new()
+            .map_err(|error| format!("create e2fsck recovery config: {error}"))?;
+        config
+            .write_all(b"[problems]\n0x040002 = {\n    preen_ok = true\n}\n")
+            .and_then(|()| config.flush())
+            .map_err(|error| format!("write e2fsck recovery config: {error}"))?;
         let repair = Command::new(&path)
             .env("LC_ALL", "C")
-            .arg("-y")
+            .env("E2FSCK_CONFIG", config.path())
+            .arg("-p")
             .arg("-f")
             .arg(image_path)
             .output()
@@ -430,7 +437,7 @@ pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
             })?;
         if !matches!(repair.status.code(), Some(0..=3)) {
             return Err(format!(
-                "OverlayDiskFull: filesystem repair failed; [openshell.drivers.vm] overlay_disk_mib sizes new overlays. {error}\nrepair stdout: {}\nrepair stderr: {}",
+                "OverlayDiskFull: filesystem repair needs review; [openshell.drivers.vm] overlay_disk_mib sizes new overlays. {error}\nretry stdout: {}\nretry stderr: {}",
                 String::from_utf8_lossy(&repair.stdout),
                 String::from_utf8_lossy(&repair.stderr)
             ));
@@ -1847,6 +1854,48 @@ mod tests {
         assert_eq!(work.stdout, b"important work\n");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overlay_recovery_refuses_unrelated_repairs_after_unattached_inode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if let Some(directory) = std::env::var_os("OPENSHELL_ROOTFS_TOOL_TEST_ROOT") {
+            let directory = PathBuf::from(directory);
+            let error = recover_rootfs_image(&directory.join("overlay.ext4"))
+                .expect_err("unrelated corruption needs review");
+            assert!(error.contains("filesystem repair needs review"), "{error}");
+            assert!(!directory.join("broad-repair").exists());
+            return;
+        }
+        if e2fs_command("mke2fs").is_err() {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("tool fixture");
+        let source = directory.path().join("source");
+        fs::create_dir_all(source.join("upper")).expect("create upperdir");
+        fs::create_dir_all(source.join("work")).expect("create workdir");
+        fs::write(source.join("upper/fill"), vec![b'X'; 44 * 1024 * 1024]).expect("write filler");
+        create_ext4_image_from_dir_with_size(
+            &source,
+            &directory.path().join("overlay.ext4"),
+            64 * 1024 * 1024,
+        )
+        .expect("create nearly full ext4 image");
+
+        let tool = directory.path().join("e2fsck");
+        fs::write(
+            &tool,
+            "#!/bin/sh\nif [ \"$1\" = \"-y\" ]; then\n  printf repaired > \"$OPENSHELL_ROOTFS_TOOL_TEST_ROOT/broad-repair\"\n  exit 0\nfi\nif [ -n \"$E2FSCK_CONFIG\" ]; then\n  echo 'Unrelated corruption'\n  exit 4\nfi\necho 'Unattached inode 15'\nexit 4\n",
+        )
+        .expect("write repair fixture");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755))
+            .expect("make repair fixture executable");
+        run_tool_fixture_test(
+            "rootfs::tests::overlay_recovery_refuses_unrelated_repairs_after_unattached_inode",
+            directory.path(),
+        );
     }
 
     #[test]
