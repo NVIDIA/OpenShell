@@ -7785,6 +7785,13 @@ fn apply_driver_snapshot(
     if let Some(status) = status.as_mut() {
         status.phase = phase as i32;
         status.endpoint_statuses = endpoint_statuses;
+        if old_phase == SandboxPhase::Stopped && phase == SandboxPhase::Stopped {
+            // An update changes the desired image while stopped. A delayed
+            // snapshot of the old container cannot identify the new image.
+            if let Some(runtime) = status.runtime.as_mut() {
+                runtime.workload_image = None;
+            }
+        }
         let image_reference = sandbox
             .spec
             .as_ref()

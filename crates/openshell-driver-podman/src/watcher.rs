@@ -490,7 +490,7 @@ pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverS
         deleting,
     );
     if let Some(status) = sandbox.status.as_mut() {
-        status.workload_image_id.clone_from(&inspect.config.image);
+        status.workload_image_id.clone_from(&inspect.image);
     }
     Some(sandbox)
 }
@@ -1002,6 +1002,7 @@ mod tests {
         let inspect: ContainerInspect = serde_json::from_value(serde_json::json!({
             "Id": "container-1",
             "Name": "openshell-demo",
+            "Image": "sha256:pinned-image",
             "State": {"Status": "running", "Running": true, "ExitCode": 0},
             "Config": {
                 "Labels": {
@@ -1009,7 +1010,7 @@ mod tests {
                     "openshell.ai/sandbox-name": "demo",
                     "openshell.ai/sandbox-workspace": "default"
                 },
-                "Image": "sha256:pinned-image"
+                "Image": "example/agent:latest"
             }
         }))
         .unwrap();
@@ -1017,6 +1018,17 @@ mod tests {
         assert_eq!(
             sandbox.status.unwrap().workload_image_id,
             "sha256:pinned-image"
+        );
+
+        let mut without_id = inspect;
+        without_id.image.clear();
+        assert!(
+            driver_sandbox_from_inspect(&without_id)
+                .unwrap()
+                .status
+                .unwrap()
+                .workload_image_id
+                .is_empty()
         );
     }
 
