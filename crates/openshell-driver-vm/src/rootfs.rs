@@ -546,6 +546,17 @@ fn prepare_sandbox_rootfs(
     sandbox_uid: Option<u32>,
     sandbox_gid: Option<u32>,
 ) -> Result<(), String> {
+    fs::create_dir_all(rootfs).map_err(|e| format!("create {}: {e}", rootfs.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(rootfs, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", rootfs.display()))?;
+    }
+    for relative in ["srv", "opt/openshell/bin", "etc"] {
+        create_guest_rootfs_directory(rootfs, relative)?;
+    }
+
     for relative in ["opt/openshell/.initialized", "opt/openshell/.rootfs-type"] {
         remove_rootfs_path(rootfs, relative)?;
     }
@@ -582,6 +593,31 @@ fn prepare_sandbox_rootfs(
     create_sandbox_mountpoint(&rootfs.join("overlay"))?;
     create_sandbox_mountpoint(&rootfs.join("newroot"))?;
 
+    Ok(())
+}
+
+/// Give only newly created guest directories traversal permissions. Existing
+/// image directories retain their authored modes.
+fn create_guest_rootfs_directory(rootfs: &Path, relative: &str) -> Result<(), String> {
+    let mut path = rootfs.to_path_buf();
+    for component in relative.split('/') {
+        path.push(component);
+        if path.exists() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+            fs::DirBuilder::new()
+                .mode(0o755)
+                .create(&path)
+                .map_err(|e| format!("create {}: {e}", path.display()))?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+        }
+        #[cfg(not(unix))]
+        fs::create_dir(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -1039,19 +1075,25 @@ fn ensure_sandbox_guest_user(
         &etc_dir.join("group"),
         &format!("sandbox:x:{sandbox_gid}:"),
         |line| line.starts_with("sandbox:"),
+        0o644,
     )?;
-    replace_or_append_line(&etc_dir.join("gshadow"), "sandbox:!::", |line| {
-        line.starts_with("sandbox:")
-    })?;
+    replace_or_append_line(
+        &etc_dir.join("gshadow"),
+        "sandbox:!::",
+        |line| line.starts_with("sandbox:"),
+        0o600,
+    )?;
     replace_or_append_line(
         &etc_dir.join("passwd"),
         &format!("sandbox:x:{sandbox_uid}:{sandbox_gid}:OpenShell Sandbox:/sandbox:/bin/bash"),
         |line| line.starts_with("sandbox:"),
+        0o644,
     )?;
     replace_or_append_line(
         &etc_dir.join("shadow"),
         "sandbox:!:20123:0:99999:7:::",
         |line| line.starts_with("sandbox:"),
+        0o600,
     )?;
 
     Ok(())
@@ -1061,7 +1103,13 @@ fn replace_or_append_line(
     path: &Path,
     line: &str,
     matches: impl Fn(&str) -> bool,
+    mode: u32,
 ) -> Result<(), String> {
+    let new_file = match fs::symlink_metadata(path) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => return Err(format!("stat {}: {error}", path.display())),
+    };
     let contents = if path.exists() {
         fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?
     } else {
@@ -1086,7 +1134,16 @@ fn replace_or_append_line(
         output.push('\n');
     }
 
-    fs::write(path, output).map_err(|e| format!("write {}: {e}", path.display()))
+    fs::write(path, output).map_err(|e| format!("write {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    if new_file {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (new_file, mode);
+    Ok(())
 }
 
 fn ensure_supervisor_binary(rootfs: &Path) -> Result<(), String> {
@@ -1226,6 +1283,63 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepared_rootfs_modes_ignore_restrictive_umask() {
+        const CHILD_ENV: &str = "OPENSHELL_VM_ROOTFS_UMASK_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg("umask 077; exec \"$@\"")
+                .arg("sh")
+                .arg(std::env::current_exe().expect("test binary"))
+                .arg("--exact")
+                .arg("rootfs::tests::prepared_rootfs_modes_ignore_restrictive_umask")
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("run test under umask 0077");
+            assert!(
+                output.status.success(),
+                "child test failed:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("test directory");
+        let rootfs = directory.path().join("rootfs");
+        fs::create_dir_all(rootfs.join("opt/openshell/bin")).expect("image runtime directory");
+        for (relative, mode) in [
+            ("opt", 0o711),
+            ("opt/openshell", 0o755),
+            ("opt/openshell/bin", 0o755),
+        ] {
+            fs::set_permissions(rootfs.join(relative), fs::Permissions::from_mode(mode))
+                .expect("set image-authored mode");
+        }
+        write_fake_runtime_binaries(&rootfs);
+
+        prepare_sandbox_rootfs(&rootfs, Some(1000), Some(1000)).expect("prepare rootfs");
+        for (relative, expected) in [
+            ("", 0o755),
+            ("srv", 0o755),
+            ("etc", 0o755),
+            ("etc/passwd", 0o644),
+            ("etc/group", 0o644),
+            ("etc/shadow", 0o600),
+            ("etc/gshadow", 0o600),
+            ("opt", 0o711),
+        ] {
+            let actual = fs::metadata(rootfs.join(relative))
+                .expect("stat guest path")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(actual, expected, "{relative}");
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

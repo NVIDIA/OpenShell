@@ -92,7 +92,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd as _, OwnedFd};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Component, Path, PathBuf};
@@ -7569,12 +7569,10 @@ fn create_empty_sandbox_overlay_image(overlay_disk: &Path, size_bytes: u64) -> R
     }
 
     let result = (|| {
-        fs::create_dir_all(staging_dir.join("upper"))
-            .map_err(|err| format!("create overlay upper dir: {err}"))?;
-        fs::create_dir_all(staging_dir.join("work"))
-            .map_err(|err| format!("create overlay work dir: {err}"))?;
-        fs::create_dir_all(staging_dir.join("config"))
-            .map_err(|err| format!("create overlay config dir: {err}"))?;
+        create_disk_staging_dir(&staging_dir, 0o700)?;
+        create_disk_staging_dir(&staging_dir.join("upper"), 0o755)?;
+        create_disk_staging_dir(&staging_dir.join("work"), 0o700)?;
+        create_disk_staging_dir(&staging_dir.join("config"), 0o700)?;
 
         create_ext4_image_from_dir_with_size(&staging_dir, overlay_disk, size_bytes)
     })();
@@ -7858,18 +7856,26 @@ fn create_image_prep_disk(
     }
 
     let result = (|| {
-        fs::create_dir_all(staging_dir.join("upper").join("srv"))
-            .map_err(|err| format!("create image-prep env dir: {err}"))?;
-        fs::create_dir_all(staging_dir.join("work"))
-            .map_err(|err| format!("create image-prep work dir: {err}"))?;
-        fs::create_dir_all(staging_dir.join("config"))
-            .map_err(|err| format!("create image-prep config dir: {err}"))?;
+        create_disk_staging_dir(&staging_dir, 0o700)?;
+        create_disk_staging_dir(&staging_dir.join("upper"), 0o755)?;
+        create_disk_staging_dir(&staging_dir.join("upper/srv"), 0o755)?;
+        create_disk_staging_dir(&staging_dir.join("work"), 0o700)?;
+        create_disk_staging_dir(&staging_dir.join("config"), 0o700)?;
         stage_guest_image_payload(&staging_dir, payload)?;
         create_ext4_image_from_dir_with_size(&staging_dir, image_path, size_bytes)
     })();
 
     let _ = fs::remove_dir_all(&staging_dir);
     result
+}
+
+fn create_disk_staging_dir(path: &Path, mode: u32) -> Result<(), String> {
+    fs::DirBuilder::new()
+        .mode(mode)
+        .create(path)
+        .map_err(|err| format!("create {}: {err}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|err| format!("chmod {}: {err}", path.display()))
 }
 
 fn stage_guest_image_payload(
@@ -8361,6 +8367,80 @@ mod tests {
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    #[test]
+    fn guest_disk_directories_ignore_restrictive_umask() {
+        const CHILD_ENV: &str = "OPENSHELL_VM_UMASK_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("umask 077; exec \"$@\"")
+                .arg("sh")
+                .arg(std::env::current_exe().expect("test binary"))
+                .arg("--exact")
+                .arg("driver::tests::guest_disk_directories_ignore_restrictive_umask")
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("run test under umask 0077");
+            assert!(
+                output.status.success(),
+                "child test failed:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("test directory");
+        let overlay_disk = directory.path().join("overlay.ext4");
+        create_empty_sandbox_overlay_image(&overlay_disk, 32 * 1024 * 1024)
+            .expect("create guest overlay disk");
+
+        let image_archive = directory.path().join("source.tar");
+        fs::write(&image_archive, b"test archive").expect("write image payload");
+        let prep_disk = directory.path().join("image-prep.ext4");
+        let payload = GuestImagePayload {
+            image_ref: "example.test/image:latest".to_string(),
+            image_identity: "test-image".to_string(),
+            source: GuestImagePayloadSource::LocalDocker {
+                rootfs_archive: image_archive,
+            },
+        };
+        create_image_prep_disk(&prep_disk, 32 * 1024 * 1024, &payload)
+            .expect("create image preparation disk");
+
+        let assert_disk_mode = |disk: &Path, path: &str, expected: &str| {
+            let output = std::process::Command::new(
+                openshell_core::e2fsprogs::resolve(&["debugfs"]).expect("debugfs"),
+            )
+            .arg("-R")
+            .arg(format!("stat {path}"))
+            .arg(disk)
+            .output()
+            .expect("inspect guest disk");
+            assert!(output.status.success(), "{output:?}");
+            let metadata = String::from_utf8(output.stdout).expect("debugfs output");
+            let mode = metadata
+                .split("Mode:")
+                .nth(1)
+                .expect("inode mode")
+                .split_whitespace()
+                .next()
+                .expect("mode value");
+            assert_eq!(mode, expected, "{}:{path}", disk.display());
+        };
+        for disk in [&overlay_disk, &prep_disk] {
+            for (path, expected) in [
+                ("/", "0755"),
+                ("/upper", "0755"),
+                ("/work", "0700"),
+                ("/config", "0700"),
+            ] {
+                assert_disk_mode(disk, path, expected);
+            }
+        }
+        assert_disk_mode(&prep_disk, "/upper/srv", "0755");
+    }
 
     #[test]
     fn vm_console_diagnostic_is_bounded_to_the_tail() {
