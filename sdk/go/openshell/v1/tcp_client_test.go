@@ -1201,6 +1201,7 @@ func TestTCPListen_ConcurrentTunnelSetup(t *testing.T) {
 	const numConns = 4
 	var arrived atomic.Int32
 	allArrived := make(chan struct{})
+	gateErrs := make(chan error, numConns)
 
 	// Each setup waits for all the others, which only completes when the
 	// accept loop does not serialize tunnel setup.
@@ -1212,9 +1213,12 @@ func TestTCPListen_ConcurrentTunnelSetup(t *testing.T) {
 		case <-allArrived:
 			return nil
 		case <-ctx.Done():
+			gateErrs <- ctx.Err()
 			return ctx.Err()
 		case <-time.After(2 * time.Second):
-			return errors.New("tunnel setup was serialized")
+			err := errors.New("tunnel setup was serialized")
+			gateErrs <- err
+			return err
 		}
 	}}
 	client, cleanup := setupTCPTestWithResolver(t, newMockTCPServer(), resolver)
@@ -1228,9 +1232,26 @@ func TestTCPListen_ConcurrentTunnelSetup(t *testing.T) {
 	for i := range numConns {
 		go func() { errCh <- echoOnce(ln.Addr().String(), fmt.Sprintf("msg-%d", i)) }()
 	}
+	var echoErrs []error
 	for range numConns {
-		require.NoError(t, <-errCh)
+		echoErrs = append(echoErrs, <-errCh)
 	}
+	select {
+	case err := <-gateErrs:
+		t.Fatalf("gate failed: %v", err)
+	default:
+	}
+	for _, err := range echoErrs {
+		require.NoError(t, err)
+	}
+}
+
+// requireEOF requires that the next read on conn reports io.EOF.
+func requireEOF(t *testing.T, conn net.Conn, timeout time.Duration) {
+	t.Helper()
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(timeout)))
+	_, err := conn.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF)
 }
 
 func TestTCPListen_HungSetupDoesNotBlockOthers(t *testing.T) {
@@ -1264,4 +1285,22 @@ func TestTCPListen_HungSetupDoesNotBlockOthers(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Close did not return while a tunnel setup was hung")
 	}
+	requireEOF(t, hung, time.Second)
+}
+
+func TestTCPListen_FailedSetupClosesConn(t *testing.T) {
+	resolver := &flippableResolver{
+		failErr: &StatusError{Code: ErrorUnavailable, Message: "sandbox unreachable"},
+	}
+	client, cleanup := setupTCPTestWithResolver(t, newMockTCPServer(), resolver)
+	defer cleanup()
+
+	ln, err := client.Listen(context.Background(), "default", "my-sandbox", 8080, 0)
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	requireEOF(t, c, 2*time.Second)
 }
