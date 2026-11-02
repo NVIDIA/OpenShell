@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use openshell_core::jwt::SecretOtlpHeaders;
 use openshell_core::sandbox_env::OtlpProtocol;
 use openshell_isolation_interface::contract::BoundaryDuplexStream;
 use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
@@ -227,6 +228,8 @@ pub struct OtlpRelayConfig {
     pub endpoint: String,
     /// Transport to the collector (`OPENSHELL_OTLP_AGENT_PROTOCOL`).
     pub protocol: OtlpProtocol,
+    /// Headers sent with every export, from the launch bundle.
+    pub headers: Option<SecretOtlpHeaders>,
     /// Sandbox identifier attached to every forwarded resource.
     pub sandbox_id: String,
 }
@@ -327,7 +330,16 @@ pub fn start(config: OtlpRelayConfig) -> Result<(OtlpRelay, ReservedDestination)
     {
         return Err(StartError::UnsupportedScheme(scheme.to_string()));
     }
-    let exporter = Exporter::new(endpoint, config.protocol).map_err(StartError::Transport)?;
+    let exporter = Exporter::new(
+        endpoint,
+        config.protocol,
+        config
+            .headers
+            .as_ref()
+            .map(|headers| openshell_otel::parse_otlp_headers(headers.expose_secret()))
+            .unwrap_or_default(),
+    )
+    .map_err(StartError::Transport)?;
     if config.sandbox_id.len() > enrichment::MAX_SANDBOX_ID_BYTES {
         // The attribution growth bound assumes a shorter id; batches near
         // the wire limit with many entries will be refused with 413.
@@ -362,6 +374,7 @@ pub fn start(config: OtlpRelayConfig) -> Result<(OtlpRelay, ReservedDestination)
 pub fn activate(
     endpoint: Option<String>,
     protocol: OtlpProtocol,
+    headers: Option<SecretOtlpHeaders>,
     sandbox_id: Option<String>,
 ) -> (Option<OtlpRelay>, Option<ReservedDestination>) {
     let Some(endpoint) = endpoint else {
@@ -390,6 +403,7 @@ pub fn activate(
     match start(OtlpRelayConfig {
         endpoint: endpoint.clone(),
         protocol,
+        headers,
         sandbox_id,
     }) {
         Ok((relay, reserved)) => (Some(relay), Some(reserved)),
@@ -727,7 +741,7 @@ mod tests {
 
     fn gated(endpoint: &str) -> (OtlpRelay, ReservedDestination, watch::Sender<bool>) {
         let (gate_tx, gate_rx) = watch::channel(false);
-        let exporter = Exporter::new(endpoint, OtlpProtocol::Grpc).unwrap();
+        let exporter = Exporter::new(endpoint, OtlpProtocol::Grpc, http::HeaderMap::new()).unwrap();
         let (relay, reserved) = assemble(exporter, "sb-test".into(), Some(gate_rx));
         (relay, reserved, gate_tx)
     }
@@ -749,11 +763,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relays_to_an_otlp_http_collector_when_configured() {
+    async fn relays_to_an_otlp_http_collector_with_its_headers() {
         let mut collector = OtlpHttpTestServer::start().await;
         let (_relay, reserved) = start(OtlpRelayConfig {
             endpoint: collector.endpoint().to_string(),
             protocol: OtlpProtocol::HttpProtobuf,
+            headers: Some(SecretOtlpHeaders::new(
+                "x-mlflow-experiment-id=7".to_string(),
+            )),
             sandbox_id: "sb-http".into(),
         })
         .unwrap();
@@ -769,6 +786,7 @@ mod tests {
 
         let export = collector.next_export().await;
         assert_eq!(export.path, "/v1/traces");
+        assert_eq!(export.headers["x-mlflow-experiment-id"], "7");
         let decoded =
             opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest::decode(
                 export.body,
@@ -795,6 +813,7 @@ mod tests {
         let (relay, reserved) = start(OtlpRelayConfig {
             endpoint: collector.endpoint().to_string(),
             protocol: OtlpProtocol::Grpc,
+            headers: None,
             sandbox_id: "sb-test".into(),
         })
         .unwrap();
@@ -864,6 +883,7 @@ mod tests {
         let error = start(OtlpRelayConfig {
             endpoint: "not a uri".into(),
             protocol: OtlpProtocol::Grpc,
+            headers: None,
             sandbox_id: "sb-test".into(),
         })
         .err()
@@ -873,6 +893,7 @@ mod tests {
             let error = start(OtlpRelayConfig {
                 endpoint: blank.into(),
                 protocol: OtlpProtocol::Grpc,
+                headers: None,
                 sandbox_id: "sb-test".into(),
             })
             .err()
@@ -897,6 +918,7 @@ mod tests {
         let (relay, _reserved) = start(OtlpRelayConfig {
             endpoint: format!("  {}\n", collector.endpoint()),
             protocol: OtlpProtocol::Grpc,
+            headers: None,
             sandbox_id: "sb-test".into(),
         })
         .expect("a padded endpoint starts the relay");
@@ -912,7 +934,7 @@ mod tests {
         let before = tokio::runtime::Handle::current()
             .metrics()
             .num_alive_tasks();
-        let (relay, reserved) = activate(None, OtlpProtocol::Grpc, Some("sb-test".into()));
+        let (relay, reserved) = activate(None, OtlpProtocol::Grpc, None, Some("sb-test".into()));
         assert!(relay.is_none());
         assert!(reserved.is_none());
         let after = tokio::runtime::Handle::current()
@@ -934,6 +956,7 @@ mod tests {
             Some(collector.endpoint().to_string()),
             OtlpProtocol::Grpc,
             None,
+            None,
         );
         assert!(relay.is_none());
         assert!(reserved.is_none());
@@ -954,6 +977,7 @@ mod tests {
         let error = start(OtlpRelayConfig {
             endpoint: "https://collector.example:4317".into(),
             protocol: OtlpProtocol::Grpc,
+            headers: None,
             sandbox_id: "sb-test".into(),
         })
         .err()
@@ -967,6 +991,7 @@ mod tests {
             start(OtlpRelayConfig {
                 endpoint: "HTTP://collector.example:4317".into(),
                 protocol: OtlpProtocol::Grpc,
+                headers: None,
                 sandbox_id: "sb-test".into(),
             })
             .is_ok()

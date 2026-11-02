@@ -20,6 +20,9 @@ use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::Subscriber
 
 mod logging;
 mod shared;
+#[cfg(test)]
+#[path = "../../../tests/support/environment.rs"]
+mod test_environment;
 
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 const HEALTH_SUBCOMMAND: &str = "health";
@@ -497,21 +500,19 @@ fn main() -> Result<()> {
         ),
     };
     // The exporters must be created inside the runtime that drives them.
+    let headers = bundle_otlp_headers(isolation_inputs.as_ref().map(|(_, _, auth, _, _)| auth));
     let (otlp_provider, otlp_setup_error) = runtime.block_on(async {
         start_trace_export(
             args.otlp_endpoint.as_deref().map(export_config),
             args.otlp_protocol,
+            headers.traces,
         )
     });
-    let ocsf_headers = isolation_inputs
-        .as_ref()
-        .and_then(|(_, _, auth, _, _)| auth.ocsf_otlp_headers.as_ref())
-        .map(openshell_core::jwt::SecretOtlpHeaders::expose_secret);
     let (ocsf_export, ocsf_setup_error) = runtime.block_on(async {
         start_ocsf_export(
             args.otlp_ocsf_endpoint.as_deref().map(export_config),
             args.otlp_ocsf_protocol,
-            ocsf_headers,
+            headers.ocsf,
         )
     });
     let otlp_layer_provider = otlp_provider.clone();
@@ -708,6 +709,27 @@ fn main() -> Result<()> {
     std::process::exit(exit_code?);
 }
 
+/// The headers for the supervisor's own exports, from its launch bundle.
+#[derive(Debug, Default, PartialEq)]
+struct BundleOtlpHeaders<'a> {
+    traces: Option<&'a str>,
+    ocsf: Option<&'a str>,
+}
+
+fn bundle_otlp_headers(
+    auth: Option<&openshell_core::jwt::SupervisorAuthBundle>,
+) -> BundleOtlpHeaders<'_> {
+    fn expose(headers: &Option<openshell_core::jwt::SecretOtlpHeaders>) -> Option<&str> {
+        headers
+            .as_ref()
+            .map(openshell_core::jwt::SecretOtlpHeaders::expose_secret)
+    }
+    auth.map_or_else(BundleOtlpHeaders::default, |auth| BundleOtlpHeaders {
+        traces: expose(&auth.traces_otlp_headers),
+        ocsf: expose(&auth.ocsf_otlp_headers),
+    })
+}
+
 /// Start OCSF event export to an OTLP collector.
 ///
 /// A setup failure disables export and is returned for the caller to report
@@ -723,9 +745,9 @@ fn start_ocsf_export(
     let Some(config) = config else {
         return (None, None);
     };
-    let started = target(&config, protocol).and_then(|target| {
+    let started = target(&config, protocol, headers).and_then(|target| {
         Ok(openshell_otel::OcsfOtlp::start(
-            target.log_exporter_with_headers(headers)?,
+            target.log_exporter()?,
             target.resource().clone(),
         ))
     });
@@ -741,11 +763,12 @@ fn start_ocsf_export(
 fn start_trace_export(
     config: Option<openshell_otel::OtlpExportConfig<'_>>,
     protocol: OtlpProtocol,
+    headers: Option<&str>,
 ) -> (
     Option<openshell_otel::SdkTracerProvider>,
     Option<openshell_otel::SetupError>,
 ) {
-    match config.map(|config| target(&config, protocol)?.tracer_provider()) {
+    match config.map(|config| target(&config, protocol, headers)?.tracer_provider()) {
         None => (None, None),
         Some(Ok(provider)) => (Some(provider), None),
         Some(Err(error)) => (None, Some(error)),
@@ -755,8 +778,15 @@ fn start_trace_export(
 fn target(
     config: &openshell_otel::OtlpExportConfig<'_>,
     protocol: OtlpProtocol,
+    headers: Option<&str>,
 ) -> Result<openshell_otel::OtlpTarget, openshell_otel::SetupError> {
-    Ok(openshell_otel::OtlpTarget::new(config)?.with_protocol(protocol.into()))
+    Ok(openshell_otel::OtlpTarget::new(config)?
+        .with_protocol(protocol.into())
+        .with_headers(
+            headers
+                .map(openshell_otel::parse_otlp_headers)
+                .unwrap_or_default(),
+        ))
 }
 
 /// Resource attributes identifying this supervisor's sandbox and the gateway
@@ -1024,43 +1054,103 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn supervisor_signals_export_over_their_configured_protocol() {
-        use openshell_ocsf::{ConfigStateChangeBuilder, ocsf_emit};
-        use opentelemetry::trace::{Tracer as _, TracerProvider as _};
-        use tracing_subscriber::prelude::*;
+    async fn supervisor_signals_export_with_their_protocol_and_headers() {
+        test_environment::Environment::new()
+            .remove("OTEL_EXPORTER_OTLP_HEADERS")
+            .remove("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+            .remove("OTEL_EXPORTER_OTLP_LOGS_HEADERS")
+            .run_async(async {
+                use openshell_ocsf::{ConfigStateChangeBuilder, ocsf_emit};
+                use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+                use tracing_subscriber::prelude::*;
 
-        let mut collector = openshell_otel_test_support::OtlpHttpTestServer::start().await;
-        let config = || openshell_otel::OtlpExportConfig {
-            endpoint: collector.endpoint(),
-            service_name: openshell_otel::ServiceName::Fixed(SERVICE_NAME),
-            service_version: None,
-            resource_attributes: Vec::new(),
+                let mut collector = openshell_otel_test_support::OtlpHttpTestServer::start().await;
+                let config = || openshell_otel::OtlpExportConfig {
+                    endpoint: collector.endpoint(),
+                    service_name: openshell_otel::ServiceName::Fixed(SERVICE_NAME),
+                    service_version: None,
+                    resource_attributes: Vec::new(),
+                };
+                let (provider, error) = start_trace_export(
+                    Some(config()),
+                    OtlpProtocol::HttpProtobuf,
+                    Some("authorization=traces"),
+                );
+                assert!(error.is_none(), "unexpected setup error: {error:?}");
+                let provider = provider.expect("trace export");
+                let (ocsf, error) = start_ocsf_export(
+                    Some(config()),
+                    OtlpProtocol::HttpProtobuf,
+                    Some("authorization=logs"),
+                );
+                assert!(error.is_none(), "unexpected setup error: {error:?}");
+                let ocsf = ocsf.expect("OCSF export");
+
+                provider.tracer("test").in_span("supervisor-span", |_| {});
+                let event = ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                    .message("policy loaded")
+                    .build();
+                let subscriber = tracing_subscriber::registry().with(ocsf.layer());
+                tracing::subscriber::with_default(subscriber, || ocsf_emit!(event));
+                tokio::task::spawn_blocking(move || provider.force_flush())
+                    .await
+                    .unwrap()
+                    .expect("trace flush");
+                ocsf.shutdown().await;
+
+                let mut exports = [collector.next_export().await, collector.next_export().await]
+                    .map(|export| {
+                        let authorization = export
+                            .headers
+                            .get("authorization")
+                            .map(|value| value.to_str().unwrap().to_string());
+                        (export.path, authorization)
+                    });
+                exports.sort();
+                assert_eq!(
+                    exports,
+                    [
+                        ("/v1/logs".to_string(), Some("logs".to_string())),
+                        ("/v1/traces".to_string(), Some("traces".to_string())),
+                    ]
+                );
+            })
+            .await;
+    }
+
+    #[test]
+    fn each_export_takes_its_own_headers_from_the_launch_bundle() {
+        use openshell_core::jwt::{
+            CredentialEpoch, SecretJwt, SecretOtlpHeaders, SessionRotation, SupervisorAuthBundle,
         };
-        let (provider, error) = start_trace_export(Some(config()), OtlpProtocol::HttpProtobuf);
-        assert!(error.is_none(), "unexpected setup error: {error:?}");
-        let provider = provider.expect("trace export");
-        let (ocsf, error) = start_ocsf_export(Some(config()), OtlpProtocol::HttpProtobuf, None);
-        assert!(error.is_none(), "unexpected setup error: {error:?}");
-        let ocsf = ocsf.expect("OCSF export");
 
-        provider.tracer("test").in_span("supervisor-span", |_| {});
-        let event = ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-            .message("policy loaded")
-            .build();
-        let subscriber = tracing_subscriber::registry().with(ocsf.layer());
-        tracing::subscriber::with_default(subscriber, || ocsf_emit!(event));
-        tokio::task::spawn_blocking(move || provider.force_flush())
-            .await
-            .unwrap()
-            .expect("trace flush");
-        ocsf.shutdown().await;
+        let secret = |value: &str| Some(SecretOtlpHeaders::new(value.to_string()));
+        let bundle = SupervisorAuthBundle {
+            session_id: openshell_core::SandboxSessionId::new(),
+            runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                "generation-1",
+            )
+            .unwrap(),
+            session_rotation: SessionRotation::new(1).unwrap(),
+            auth_epoch: CredentialEpoch::new(1).unwrap(),
+            gateway_token: SecretJwt::parse("test-gateway-token").unwrap(),
+            gateway_expires_at: 0,
+            sandbox_token: SecretJwt::parse("test-sandbox-token").unwrap(),
+            sandbox_expires_at: 0,
+            ssh_host_private_key: None,
+            traces_otlp_headers: secret("lane=traces"),
+            ocsf_otlp_headers: secret("lane=ocsf"),
+            agent_otlp_headers: secret("lane=agent"),
+        };
 
-        let mut paths = vec![
-            collector.next_export().await.path,
-            collector.next_export().await.path,
-        ];
-        paths.sort();
-        assert_eq!(paths, ["/v1/logs", "/v1/traces"]);
+        assert_eq!(
+            bundle_otlp_headers(Some(&bundle)),
+            BundleOtlpHeaders {
+                traces: Some("lane=traces"),
+                ocsf: Some("lane=ocsf"),
+            }
+        );
+        assert_eq!(bundle_otlp_headers(None), BundleOtlpHeaders::default());
     }
 
     #[tokio::test]

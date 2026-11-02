@@ -74,6 +74,7 @@ impl ComputeDriverTracing {
         self,
         endpoint: Option<&str>,
         protocol: crate::Protocol,
+        headers: &http::HeaderMap,
         service_version: &'static str,
         gateway_name: Option<&str>,
         compute_driver: Option<&str>,
@@ -89,6 +90,7 @@ impl ComputeDriverTracing {
                 ),
             })?
             .with_protocol(protocol)
+            .with_headers(headers.clone())
             .tracer_provider()
         });
         match provider {
@@ -225,6 +227,7 @@ pub fn install_driver_tracing(
     let (provider, setup_error) = descriptor.provider_for(
         config.endpoint,
         config.protocol,
+        &http::HeaderMap::new(),
         config.service_version,
         config.gateway_name,
         Some(descriptor.compute_driver()),
@@ -259,25 +262,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn driver_provider_exports_over_the_configured_protocol() {
-        use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+    async fn driver_provider_exports_with_the_configured_protocol_and_headers() {
+        crate::test_environment::Environment::new()
+            .remove("OTEL_EXPORTER_OTLP_HEADERS")
+            .remove("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+            .remove("OTEL_EXPORTER_OTLP_LOGS_HEADERS")
+            .run_async(async {
+                use opentelemetry::trace::{Tracer as _, TracerProvider as _};
 
-        const TRACING: ComputeDriverTracing = crate::compute_driver_tracing!();
-        let mut collector = openshell_otel_test_support::OtlpHttpTestServer::start().await;
-        let (provider, error) = TRACING.provider_for(
-            Some(collector.endpoint()),
-            crate::Protocol::HttpProtobuf,
-            "1.2.3",
-            Some("test-gateway"),
-            Some("docker"),
-        );
-        assert!(error.is_none(), "unexpected setup error: {error:?}");
-        let provider = provider.expect("provider");
-        provider.tracer("test").in_span("driver-span", |_| {});
-        let flush = tokio::task::spawn_blocking(move || provider.force_flush());
+                const TRACING: ComputeDriverTracing = crate::compute_driver_tracing!();
+                let mut collector = openshell_otel_test_support::OtlpHttpTestServer::start().await;
+                let (provider, error) = TRACING.provider_for(
+                    Some(collector.endpoint()),
+                    crate::Protocol::HttpProtobuf,
+                    &crate::parse_otlp_headers("authorization=driver"),
+                    "1.2.3",
+                    Some("test-gateway"),
+                    Some("docker"),
+                );
+                assert!(error.is_none(), "unexpected setup error: {error:?}");
+                let provider = provider.expect("provider");
+                provider.tracer("test").in_span("driver-span", |_| {});
+                let flush = tokio::task::spawn_blocking(move || provider.force_flush());
 
-        assert_eq!(collector.next_export().await.path, "/v1/traces");
-        flush.await.unwrap().expect("flush succeeds");
+                let export = collector.next_export().await;
+                assert_eq!(export.path, "/v1/traces");
+                assert_eq!(export.headers["authorization"], "driver");
+                flush.await.unwrap().expect("flush succeeds");
+            })
+            .await;
     }
 
     #[tokio::test]
