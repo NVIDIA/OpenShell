@@ -181,6 +181,12 @@ by `OPENSHELL_BIN`. See
 [tests/testkit/README.md](tests/testkit/README.md) for how to write and run
 tests.
 
+The conformance crate also builds `openshell-conformance`, a program that
+runs the conformance suite against a gateway without cargo or nextest
+(`openshell-conformance list`, `ready`, `run`). It covers only the
+conformance suite. See
+[tests/suites/conformance/README.md](tests/suites/conformance/README.md).
+
 Suites live under `tests/suites/`, in Cargo workspaces with their own
 lockfiles: `conformance`, `features`, and one workspace per driver suite under
 `drivers/<driver>`. Run the `conformance` suites against a local Docker
