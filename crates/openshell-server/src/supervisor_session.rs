@@ -17,6 +17,7 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use openshell_core::jwt::CredentialEpoch;
 use openshell_core::proto::{
     GatewayMessage, GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse,
     PeerNotifyConfigUpdateRequest, PeerNotifyConfigUpdateResponse, PeerRelayFrame, PeerRelayInit,
@@ -39,7 +40,7 @@ use crate::gateway_metrics::{
 use crate::grpc::provider_readiness::ProviderReadinessEvidence;
 use crate::persistence::{ObjectId, ObjectWorkspace};
 use crate::supervisor_owner::{
-    OWNER_TTL, OwnerError, OwnerGuard, SupervisorOwnerIndex, can_supersede,
+    OWNER_TTL, OwnerError, OwnerGuard, SupervisorOwnerIndex, can_supersede, term_order,
 };
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
@@ -306,6 +307,8 @@ struct LiveSession {
     /// Uniquely identifies this session instance. Used by cleanup to avoid
     /// removing a session that has since been superseded by a reconnect.
     session_id: String,
+    /// Ownership term of the session, when known.
+    auth_epoch: Option<CredentialEpoch>,
     tx: mpsc::Sender<GatewayMessage>,
     /// Present only for sessions that apply streamed configuration.
     config: Option<ConfigSessionState>,
@@ -351,6 +354,17 @@ pub(crate) struct EndpointReportCursor {
     /// Digest of the accepted request, used to reject a different body that
     /// reuses an already committed sequence number.
     pub(crate) report_digest: [u8; 32],
+}
+
+/// Outcome of registering a supervisor session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Registration {
+    /// No session was registered for the sandbox.
+    New,
+    /// The previous session was replaced and told to close.
+    Superseded,
+    /// A session of a later ownership term holds the sandbox.
+    Refused,
 }
 
 /// Holds a oneshot sender that will deliver the upgraded relay stream or a
@@ -461,17 +475,42 @@ impl SupervisorSessionRegistry {
         shutdown: oneshot::Sender<()>,
         mode: SessionMode,
     ) -> bool {
+        self.register_term(sandbox_id, session_id, None, tx, shutdown, mode)
+            == Registration::Superseded
+    }
+
+    /// Register a session of ownership term `auth_epoch`.
+    ///
+    /// The owner record admits sessions in term order, but a session can
+    /// register after a later term replaced its record. A registered session
+    /// of a later term therefore keeps the sandbox and this one is refused.
+    /// Otherwise any previous session is replaced and told to close.
+    pub(crate) fn register_term(
+        &self,
+        sandbox_id: String,
+        session_id: String,
+        auth_epoch: Option<CredentialEpoch>,
+        tx: mpsc::Sender<GatewayMessage>,
+        shutdown: oneshot::Sender<()>,
+        mode: SessionMode,
+    ) -> Registration {
         let config = match mode {
             SessionMode::Push => Some(ConfigSessionState::new(tx.clone())),
             SessionMode::Poll => None,
         };
         let mut sessions = self.sessions.lock().unwrap();
+        if sessions.get(&sandbox_id).is_some_and(|current| {
+            term_order(auth_epoch, current.auth_epoch) == Some(std::cmp::Ordering::Less)
+        }) {
+            return Registration::Refused;
+        }
         let previous = sessions.remove(&sandbox_id);
         sessions.insert(
             sandbox_id.clone(),
             LiveSession {
                 sandbox_id,
                 session_id,
+                auth_epoch,
                 tx,
                 config,
                 shutdown: Some(shutdown),
@@ -489,9 +528,9 @@ impl SupervisorSessionRegistry {
                 if let Some(shutdown) = prev.shutdown {
                     let _ = shutdown.send(());
                 }
-                true
+                Registration::Superseded
             }
-            None => false,
+            None => Registration::New,
         }
     }
 
@@ -2170,6 +2209,8 @@ struct SessionSetup {
     sandbox_id: String,
     instance_id: String,
     connection_epoch: u64,
+    /// Ownership term: the credential epoch of the session's bearer.
+    auth_epoch: Option<CredentialEpoch>,
     supports_session_redirect: bool,
     mode: SessionMode,
     bootstrap: Option<config_session::SessionBootstrap>,
@@ -2186,6 +2227,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         sandbox_id,
         instance_id,
         connection_epoch,
+        auth_epoch,
         supports_session_redirect,
         mode,
         bootstrap,
@@ -2244,29 +2286,43 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
     );
     let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
     let owner_guard = owner_index
-        .publish(
+        .publish_term(
             &sandbox_id,
             &session_id,
             &instance_id,
             connection_epoch,
+            auth_epoch,
             &state.replica_id,
             &owner_peer_endpoint,
         )
         .await
         .map_err(owner_error_to_status)?;
-    let superseded = state.supervisor_sessions.register_with_mode(
+    match state.supervisor_sessions.register_term(
         sandbox_id.clone(),
         session_id.clone(),
+        auth_epoch,
         session_tx.clone(),
         shutdown_tx,
         mode,
-    );
-    if superseded {
-        info!(
+    ) {
+        Registration::New => {}
+        Registration::Superseded => info!(
             sandbox_id = %sandbox_id,
             session_id = %session_id,
             "supervisor session: superseded previous session"
-        );
+        ),
+        Registration::Refused => {
+            info!(
+                sandbox_id = %sandbox_id,
+                session_id = %session_id,
+                auth_epoch = auth_epoch.map_or(0, CredentialEpoch::get),
+                "supervisor session: refused; a later ownership term holds the sandbox"
+            );
+            abandon_session_setup(&state, &owner_index, &owner_guard, "registration").await;
+            return Err(Status::unavailable(
+                "a later supervisor ownership term holds this sandbox",
+            ));
+        }
     }
     if let Some(bootstrap) = bootstrap_in_flight {
         state.supervisor_sessions.begin_config_bootstrap(
@@ -2386,6 +2442,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         session_id = %session_id,
         instance_id = %instance_id,
         connection_epoch,
+        auth_epoch = auth_epoch.map_or(0, CredentialEpoch::get),
         replica_id = %state.replica_id,
         config_push = pushes_config,
         "supervisor session: accepted"
@@ -2474,9 +2531,13 @@ pub async fn handle_connect_supervisor(
     if sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
-    if let Some(principal) = principal.as_ref() {
-        crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?;
-    }
+    // The bearer's credential epoch is the session's ownership term.
+    let auth_epoch = match principal.as_ref() {
+        Some(principal) => {
+            crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?.auth_epoch()
+        }
+        None => None,
+    };
     // Configuration is pushed only in push mode and only to supervisors that
     // apply it; the rest keep polling.
     let pushes_config = state.config.config_delivery_mode
@@ -2514,6 +2575,7 @@ pub async fn handle_connect_supervisor(
                     &owner,
                     &hello.instance_id,
                     hello.connection_epoch,
+                    auth_epoch,
                     OWNER_TTL,
                 ),
                 Ok(None) => true,
@@ -2565,6 +2627,7 @@ pub async fn handle_connect_supervisor(
         sandbox_id,
         instance_id: hello.instance_id,
         connection_epoch: hello.connection_epoch,
+        auth_epoch,
         supports_session_redirect: hello.supports_session_redirect,
         mode,
         bootstrap,
@@ -2875,6 +2938,13 @@ async fn run_session_loop(
             msg = tokio_stream::StreamExt::next(inbound) => {
                 match msg.transpose() {
                     Ok(Some(msg)) => {
+                        // The shutdown signal can lose this select, so check
+                        // that no reconnect or later ownership term replaced
+                        // this session before acting on its message.
+                        if !state.supervisor_sessions.is_current_session(sandbox_id, session_id) {
+                            info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: replaced; dropping its message and closing");
+                            break;
+                        }
                         if matches!(msg.payload.as_ref(), Some(supervisor_message::Payload::Heartbeat(_)))
                             && !renew_supervisor_owner(state, sandbox_id, session_id, owner_guard).await
                         {
@@ -3657,6 +3727,7 @@ mod tests {
             sandbox_id: sandbox_id.to_string(),
             source: SandboxIdentitySource::BootstrapJwt {
                 issuer: "openshell-gateway:test".to_string(),
+                auth_epoch: None,
             },
             trust_domain: Some("openshell".to_string()),
         })
@@ -4713,6 +4784,7 @@ mod tests {
             session_id: "session-a".to_string(),
             supervisor_instance_id: "instance-a".to_string(),
             connection_epoch: 1,
+            auth_epoch: None,
             owner_replica_id: replica.to_string(),
             owner_peer_endpoint: format!("http://{replica}:8080"),
             connected_at_ms: 0,
@@ -5510,5 +5582,566 @@ mod tests {
     fn ring_redirect_serves_locally_for_placeholder_endpoints() {
         assert!(ring_redirect("gw-0", "gw-1", Some(String::new())).is_none());
         assert!(ring_redirect("gw-0", "gw-1", Some("local://gw-1".to_string())).is_none());
+    }
+
+    // ---- ownership terms ----
+
+    fn term(value: u64) -> CredentialEpoch {
+        CredentialEpoch::new(value).unwrap()
+    }
+
+    #[test]
+    fn registry_refuses_an_earlier_term_while_a_later_term_is_registered() {
+        let registry = SupervisorSessionRegistry::new();
+        let (later_tx, _later_rx) = mpsc::channel(1);
+        let (earlier_tx, _earlier_rx) = mpsc::channel(1);
+        let (later_shutdown, mut later_closed) = oneshot::channel();
+        assert_eq!(
+            registry.register_term(
+                "sbx".into(),
+                "s-later".into(),
+                Some(term(2)),
+                later_tx,
+                later_shutdown,
+                SessionMode::Poll,
+            ),
+            Registration::New
+        );
+
+        assert_eq!(
+            registry.register_term(
+                "sbx".into(),
+                "s-earlier".into(),
+                Some(term(1)),
+                earlier_tx,
+                make_shutdown(),
+                SessionMode::Poll,
+            ),
+            Registration::Refused
+        );
+        assert!(registry.is_current_session("sbx", "s-later"));
+        assert!(
+            later_closed.try_recv().is_err(),
+            "the later term must stay open"
+        );
+    }
+
+    #[test]
+    fn registry_later_term_replaces_and_closes_an_earlier_term() {
+        let registry = SupervisorSessionRegistry::new();
+        let (earlier_tx, _earlier_rx) = mpsc::channel(1);
+        let (later_tx, _later_rx) = mpsc::channel(1);
+        let (earlier_shutdown, mut earlier_closed) = oneshot::channel();
+        registry.register_term(
+            "sbx".into(),
+            "s-earlier".into(),
+            Some(term(1)),
+            earlier_tx,
+            earlier_shutdown,
+            SessionMode::Poll,
+        );
+
+        assert_eq!(
+            registry.register_term(
+                "sbx".into(),
+                "s-later".into(),
+                Some(term(2)),
+                later_tx,
+                make_shutdown(),
+                SessionMode::Poll,
+            ),
+            Registration::Superseded
+        );
+        assert!(registry.is_current_session("sbx", "s-later"));
+        assert!(
+            earlier_closed.try_recv().is_ok(),
+            "the earlier term must be told to close"
+        );
+    }
+
+    #[test]
+    fn registry_replaces_sessions_of_equal_or_unknown_terms_as_before() {
+        for (first, second) in [
+            (Some(term(1)), Some(term(1))),
+            (None, Some(term(1))),
+            (Some(term(2)), None),
+            (None, None),
+        ] {
+            let registry = SupervisorSessionRegistry::new();
+            let (tx, _rx) = mpsc::channel(1);
+            registry.register_term(
+                "sbx".into(),
+                "s1".into(),
+                first,
+                tx.clone(),
+                make_shutdown(),
+                SessionMode::Poll,
+            );
+            assert_eq!(
+                registry.register_term(
+                    "sbx".into(),
+                    "s2".into(),
+                    second,
+                    tx,
+                    make_shutdown(),
+                    SessionMode::Poll,
+                ),
+                Registration::Superseded,
+                "{first:?} then {second:?}"
+            );
+            assert!(registry.is_current_session("sbx", "s2"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_replaced_by_a_later_term_acts_on_none_of_its_messages() {
+        use futures::StreamExt as _;
+
+        let state = crate::grpc::test_support::test_server_state().await;
+        let mut owner_guard = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+            .publish_term(
+                "sb-replaced",
+                "session-a",
+                "instance-a",
+                1,
+                Some(term(1)),
+                &state.replica_id,
+                "local://this",
+            )
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        state.supervisor_sessions.register_term(
+            "sb-replaced".into(),
+            "session-a".into(),
+            Some(term(1)),
+            tx.clone(),
+            make_shutdown(),
+            SessionMode::Poll,
+        );
+        let (channel_id, _relay_rx) = state
+            .supervisor_sessions
+            .open_relay("sb-replaced", Duration::from_secs(1))
+            .await
+            .unwrap();
+        rx.recv().await.expect("RelayOpen reaches the first term");
+        let (later_tx, _later_rx) = mpsc::channel(4);
+        state.supervisor_sessions.register_term(
+            "sb-replaced".into(),
+            "session-b".into(),
+            Some(term(2)),
+            later_tx,
+            make_shutdown(),
+            SessionMode::Poll,
+        );
+
+        // The replaced supervisor answers before it sees its stream close.
+        let failure = SupervisorMessage {
+            payload: Some(supervisor_message::Payload::RelayOpenResult(
+                openshell_core::proto::RelayOpenResult {
+                    channel_id: channel_id.clone(),
+                    success: false,
+                    error: "target refused".into(),
+                },
+            )),
+        };
+        let mut inbound = futures::stream::iter([Ok(failure)]).chain(futures::stream::pending());
+        let session = AcceptedSession {
+            state: Arc::clone(&state),
+            sandbox_id: "sb-replaced".into(),
+            session_id: "session-a".into(),
+            instance_id: "instance-a".into(),
+            tx,
+            supports_session_redirect: false,
+            pushes_config: false,
+        };
+        let exit = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session_loop(
+                &session,
+                &mut inbound,
+                oneshot::channel().1,
+                &mut owner_guard,
+            ),
+        )
+        .await
+        .expect("a replaced session closes on its next message");
+
+        assert_eq!(exit, SessionLoopExit::Other);
+        assert!(
+            state
+                .supervisor_sessions
+                .pending_relays
+                .lock()
+                .unwrap()
+                .contains_key(&channel_id),
+            "the replaced session must not fail a relay its replacement serves"
+        );
+        assert!(
+            state
+                .supervisor_sessions
+                .is_current_session("sb-replaced", "session-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn renewal_closes_a_session_whose_record_a_later_term_took_on_another_replica() {
+        use futures::StreamExt as _;
+
+        let state = crate::grpc::test_support::test_server_state().await;
+        let mut sandbox = sandbox_record("sb-moved", "sb-moved");
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+        let owners = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+        let mut owner_guard = owners
+            .publish_term(
+                "sb-moved",
+                "session-replaced",
+                "instance-a",
+                1,
+                Some(term(1)),
+                &state.replica_id,
+                "local://this",
+            )
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        state.supervisor_sessions.register_term(
+            "sb-moved".into(),
+            "session-replaced".into(),
+            Some(term(1)),
+            tx.clone(),
+            make_shutdown(),
+            SessionMode::Poll,
+        );
+
+        // The takeover's supervisor connects to another replica while this
+        // one still renews the previous term's fresh record.
+        owners
+            .publish_term(
+                "sb-moved",
+                "session-takeover",
+                "instance-b",
+                0,
+                Some(term(2)),
+                "gateway-b",
+                "http://gateway-b:8080",
+            )
+            .await
+            .expect("a later term replaces a fresh record of another replica");
+
+        let heartbeat = SupervisorMessage {
+            payload: Some(supervisor_message::Payload::Heartbeat(
+                openshell_core::proto::SupervisorHeartbeat {},
+            )),
+        };
+        let mut inbound = futures::stream::iter([Ok(heartbeat)]).chain(futures::stream::pending());
+        let session = AcceptedSession {
+            state: Arc::clone(&state),
+            sandbox_id: "sb-moved".into(),
+            session_id: "session-replaced".into(),
+            instance_id: "instance-a".into(),
+            tx,
+            supports_session_redirect: false,
+            pushes_config: false,
+        };
+        let exit = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session_loop(
+                &session,
+                &mut inbound,
+                oneshot::channel().1,
+                &mut owner_guard,
+            ),
+        )
+        .await
+        .expect("the next renewal finds the record taken");
+        assert_eq!(exit, SessionLoopExit::Other);
+        drop(session);
+        finish_supervisor_session(&state, "sb-moved", "session-replaced", exit, &owner_guard).await;
+
+        assert!(!state.supervisor_sessions.has_session("sb-moved"));
+        let owner = owners.read("sb-moved").await.unwrap().unwrap();
+        assert_eq!(owner.session_id, "session-takeover");
+        assert_eq!(owner.auth_epoch, Some(term(2)));
+        // The takeover's live record keeps the sandbox Ready.
+        assert_eq!(sandbox_phase(&state, "sb-moved").await, SandboxPhase::Ready);
+    }
+
+    /// A `ConnectSupervisor` stream of one supervisor process.
+    struct TermStream {
+        server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        _outbound: mpsc::Sender<SupervisorMessage>,
+        inbound: tonic::Streaming<GatewayMessage>,
+    }
+
+    impl Drop for TermStream {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    /// Connect as supervisor `instance_id` holding a gateway credential of
+    /// epoch `auth_epoch`, and return the stream with its accepted session ID.
+    async fn connect_term(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        instance_id: &str,
+        connection_epoch: u64,
+        auth_epoch: u64,
+    ) -> Result<(TermStream, String), Status> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let principal =
+            crate::auth::principal::test_support::sandbox_with_epoch(sandbox_id, auth_epoch);
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(
+                    openshell_core::proto::open_shell_server::OpenShellServer::with_interceptor(
+                        crate::grpc::OpenShellService::new(Arc::clone(state)),
+                        move |mut request: Request<()>| {
+                            request.extensions_mut().insert(principal.clone());
+                            Ok(request)
+                        },
+                    ),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let mut client = open_shell_client::OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        let (outbound, rx) = mpsc::channel(4);
+        outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+                    sandbox_id: sandbox_id.into(),
+                    instance_id: instance_id.into(),
+                    connection_epoch,
+                    ..Default::default()
+                })),
+            })
+            .await
+            .unwrap();
+        let inbound = match client.connect_supervisor(ReceiverStream::new(rx)).await {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                server.abort();
+                return Err(status);
+            }
+        };
+        let mut stream = TermStream {
+            server,
+            _outbound: outbound,
+            inbound,
+        };
+        let accepted = tokio::time::timeout(Duration::from_secs(5), stream.inbound.message())
+            .await
+            .expect("gateway response before timeout")?
+            .expect("stream open");
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) = accepted.payload else {
+            panic!("expected SessionAccepted");
+        };
+        Ok((stream, accepted.session_id))
+    }
+
+    #[tokio::test]
+    async fn a_later_term_takes_over_a_live_session_of_another_supervisor_at_once() {
+        let state = state_with_sandbox("sb-takeover").await;
+        let (mut replaced, _) = connect_term(&state, "sb-takeover", "instance-a", 3, 1)
+            .await
+            .expect("the first term connects");
+
+        let (_current, current_session) = connect_term(&state, "sb-takeover", "instance-b", 0, 2)
+            .await
+            .expect("a later term must not wait out the previous owner's record");
+
+        assert!(
+            state
+                .supervisor_sessions
+                .is_current_session("sb-takeover", &current_session)
+        );
+        let owner = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+            .read("sb-takeover")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner.session_id, current_session);
+        assert_eq!(owner.supervisor_instance_id, "instance-b");
+        assert_eq!(owner.auth_epoch, Some(term(2)));
+        // The gateway ends the replaced supervisor's stream.
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Ok(Some(_)) = replaced.inbound.message().await {}
+        })
+        .await;
+        assert!(closed.is_ok(), "the replaced term's stream must close");
+    }
+
+    #[tokio::test]
+    async fn an_earlier_term_is_refused_while_a_later_term_holds_the_sandbox() {
+        let state = state_with_sandbox("sb-fenced").await;
+        let (_current, current_session) = connect_term(&state, "sb-fenced", "instance-b", 0, 2)
+            .await
+            .expect("the later term connects");
+
+        // Neither the replaced process nor an earlier-term connection that
+        // would otherwise count as a reconnect may reclaim the sandbox.
+        for instance in ["instance-a", "instance-b"] {
+            let Err(status) = connect_term(&state, "sb-fenced", instance, 1, 1).await else {
+                panic!("{instance} at an earlier term must be refused");
+            };
+            assert_eq!(status.code(), tonic::Code::Unavailable, "{instance}");
+        }
+        assert!(
+            state
+                .supervisor_sessions
+                .is_current_session("sb-fenced", &current_session)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_equal_term_still_refuses_another_supervisor_instance() {
+        let state = state_with_sandbox("sb-same-term").await;
+        let (_owner, owner_session) = connect_term(&state, "sb-same-term", "instance-a", 0, 1)
+            .await
+            .expect("the owner connects");
+
+        let Err(status) = connect_term(&state, "sb-same-term", "instance-b", 1, 1).await else {
+            panic!("another instance of the same term must wait for the owner's record");
+        };
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(
+            state
+                .supervisor_sessions
+                .is_current_session("sb-same-term", &owner_session)
+        );
+    }
+
+    /// Authenticate `token` for `ReportMainProcessExit` as the gateway router
+    /// does, then run the handler as the resulting principal.
+    async fn report_main_process_exit_as(
+        state: &Arc<ServerState>,
+        authenticator: &crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator,
+        token: &str,
+        sandbox_id: &str,
+    ) -> Result<Principal, Status> {
+        use crate::auth::authenticator::{Authentication, Authenticator as _};
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let principal = match authenticator
+            .authenticate(&headers, "/openshell.v1.OpenShell/ReportMainProcessExit")
+            .await
+        {
+            Ok(Authentication::Accepted(principal)) => principal,
+            Ok(_) => return Err(Status::unauthenticated("bearer was not accepted")),
+            Err(rejection) => return Err(rejection.status),
+        };
+        let mut request = Request::new(ReportMainProcessExitRequest {
+            sandbox_id: sandbox_id.into(),
+            instance_id: "instance-a".into(),
+            exit_code: 1,
+        });
+        request.extensions_mut().insert(principal.clone());
+        handle_report_main_process_exit(state, request).await?;
+        Ok(principal)
+    }
+
+    #[tokio::test]
+    async fn a_replaced_term_cannot_report_the_main_process_exit() {
+        use crate::auth::sandbox_session::{
+            PersistedSandboxIdentity, TakeoverIdentity, advance_identity_for_takeover,
+        };
+
+        let state = crate::grpc::test_support::test_server_state().await;
+        let launch = PersistedSandboxIdentity::new().unwrap();
+        let mut sandbox = sandbox_record("sb-exit", "sb-exit");
+        launch.write(&mut sandbox.metadata.as_mut().unwrap().annotations);
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+        let material = openshell_bootstrap::jwt::generate_jwt_key().unwrap();
+        let authority = Arc::new(
+            crate::auth::sandbox_jwt::SandboxSessionJwtAuthority::from_pem(
+                material.signing_key_pem.as_bytes(),
+                material.public_key_pem.as_bytes(),
+                material.kid,
+                "test-gateway",
+                Some(Duration::from_mins(15)),
+            )
+            .unwrap(),
+        );
+        let authenticator = crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator::new(
+            Arc::clone(&authority),
+            state.store.clone(),
+        );
+        let replaced = authority
+            .mint_persisted_launch("sb-exit", &launch)
+            .unwrap()
+            .supervisor
+            .gateway_token;
+
+        // A takeover moves the instance to another supervisor process.
+        let takeover_epoch = CredentialEpoch::new(launch.auth_epoch.get() + 1).unwrap();
+        assert_eq!(
+            advance_identity_for_takeover(
+                &state.store,
+                "sb-exit",
+                launch.runtime_generation.as_str(),
+                takeover_epoch,
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap(),
+            TakeoverIdentity::Advanced
+        );
+        let before = state
+            .store
+            .get_message::<Sandbox>("sb-exit")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let error = report_main_process_exit_as(
+            &state,
+            &authenticator,
+            replaced.expose_secret(),
+            "sb-exit",
+        )
+        .await
+        .expect_err("the replaced term's credential is revoked");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        let unchanged = state
+            .store
+            .get_message::<Sandbox>("sb-exit")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged, before);
+
+        // The current term's credential carries its epoch and is accepted.
+        let current =
+            PersistedSandboxIdentity::read(&before.metadata.unwrap().annotations).unwrap();
+        let token = authority
+            .mint_persisted_launch("sb-exit", &current)
+            .unwrap()
+            .supervisor
+            .gateway_token;
+        let principal =
+            report_main_process_exit_as(&state, &authenticator, token.expose_secret(), "sb-exit")
+                .await
+                .expect("the current term reports the exit");
+        let Principal::Sandbox(principal) = principal else {
+            panic!("expected a sandbox principal");
+        };
+        assert_eq!(principal.auth_epoch(), Some(takeover_epoch));
+        let reported = state
+            .store
+            .get_message::<Sandbox>("sb-exit")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reported.status.unwrap().exit_code, Some(1));
     }
 }

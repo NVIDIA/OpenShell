@@ -3,7 +3,7 @@
 
 //! Builder for API Activity [6003] events.
 
-use crate::builders::{EventContext, EventOrigin};
+use crate::builders::{ContextRef, EventOrigin};
 use crate::enums::{ActionId, DispositionId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{ApiActivityEvent, OcsfEvent};
@@ -28,7 +28,7 @@ fn sanitize_model_name(name: &str) -> String {
 
 /// Builder for API Activity [6003] events.
 pub struct ApiActivityBuilder<'a> {
-    ctx: &'a EventContext,
+    ctx: ContextRef<'a>,
     severity: SeverityId,
     status: Option<StatusId>,
     message: Option<String>,
@@ -49,9 +49,9 @@ pub struct ApiActivityBuilder<'a> {
 
 impl<'a> ApiActivityBuilder<'a> {
     #[must_use]
-    pub fn new(ctx: &'a EventContext, operation: impl Into<String>) -> Self {
+    pub fn new(ctx: impl Into<ContextRef<'a>>, operation: impl Into<String>) -> Self {
         Self {
-            ctx,
+            ctx: ctx.into(),
             severity: SeverityId::Informational,
             status: None,
             message: None,
@@ -231,10 +231,6 @@ mod tests {
     use crate::builders::{test_gateway_context, test_sandbox_context};
     use crate::enums::{HttpMethod, UserTypeId};
     use crate::objects::Url;
-    use crate::validation::schema::{
-        load_class_schema, load_object_schema, validate_enum_value, validate_known_fields,
-        validate_required_fields,
-    };
 
     fn gateway_denial() -> serde_json::Value {
         let ctx = test_gateway_context();
@@ -261,41 +257,8 @@ mod tests {
 
     #[test]
     fn gateway_denial_matches_vendored_schema() {
-        let json = gateway_denial();
-
-        let class = load_class_schema("api_activity");
-        validate_required_fields(&json, &class);
-        validate_known_fields(&json, &class);
-        for field in [
-            "activity_id",
-            "action_id",
-            "disposition_id",
-            "severity_id",
-            "status_id",
-        ] {
-            validate_enum_value(&json, field, &class);
-        }
-
-        let actor = load_object_schema("actor");
-        validate_required_fields(&json["actor"], &actor);
-        validate_known_fields(&json["actor"], &actor);
-        let user = load_object_schema("user");
-        validate_required_fields(&json["actor"]["user"], &user);
-        validate_known_fields(&json["actor"]["user"], &user);
-
-        let api = load_object_schema("api");
-        validate_required_fields(&json["api"], &api);
-        validate_known_fields(&json["api"], &api);
-        let service = load_object_schema("service");
-        validate_required_fields(&json["api"]["service"], &service);
-
-        let resource = load_object_schema("resource_details");
-        validate_required_fields(&json["resources"][0], &resource);
-        validate_known_fields(&json["resources"][0], &resource);
-
-        let metadata = load_object_schema("metadata");
-        validate_required_fields(&json["metadata"], &metadata);
-        validate_known_fields(&json["metadata"], &metadata);
+        openshell_ocsf_validate::validate_event(&gateway_denial())
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[test]

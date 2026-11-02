@@ -68,8 +68,8 @@ fn membership_filter_subject<'a>(
             }
         }
         Principal::Sandbox(_) | Principal::Operator(_) => Ok(None),
-        Principal::Peer(_) => Err(Status::permission_denied(
-            "gateway peer principals cannot list workspaces",
+        Principal::Peer(_) | Principal::Supervisor(_) => Err(Status::permission_denied(
+            "gateway peer and supervisor principals cannot list workspaces",
         )),
         Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
     }

@@ -16,7 +16,7 @@ use miette::Result;
 use openshell_ocsf::{ActivityId, AppLifecycleBuilder, SeverityId, StatusId, ocsf_emit};
 
 #[cfg(unix)]
-fn ocsf_ctx() -> &'static openshell_ocsf::EventContext {
+fn ocsf_ctx() -> openshell_ocsf::ContextRef<'static> {
     openshell_ocsf::ctx::ctx()
 }
 
@@ -82,7 +82,7 @@ impl Drop for BoundaryAccess {
 #[allow(clippy::too_many_arguments)]
 pub async fn start_boundary_access(
     sandbox_id: Option<&str>,
-    openshell_endpoint: Option<&str>,
+    gateway: Option<&openshell_core::grpc_client::GatewayEndpoint>,
     ssh_socket_path: Option<&str>,
     shared_ssh_socket: bool,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
@@ -116,10 +116,10 @@ pub async fn start_boundary_access(
     // Gateway authentication, forwarding, and readiness do not depend on SSH
     // or the host OS. Acceptance remains false until the gateway authenticates
     // this supervisor, and reconnects retain main's retry behavior.
-    let (session_task, session_readiness) = match (openshell_endpoint, sandbox_id) {
-        (Some(endpoint), Some(id)) => {
+    let (session_task, session_readiness) = match (gateway, sandbox_id) {
+        (Some(gateway), Some(id)) => {
             let (task, accepted) = crate::supervisor_session::spawn_with_readiness(
-                endpoint.to_string(),
+                gateway.clone(),
                 id.to_string(),
                 ssh_socket_path.unwrap_or_default(),
                 port_forward,
@@ -223,7 +223,7 @@ async fn start_optional_ssh(
 
 /// Report the canonical process exit until the gateway acknowledges it.
 pub async fn report_main_process_exit(
-    endpoint: &str,
+    gateway: &openshell_core::grpc_client::GatewayEndpoint,
     sandbox_id: &str,
     instance_id: &str,
     exit_code: i32,
@@ -231,7 +231,7 @@ pub async fn report_main_process_exit(
     let mut delay = Duration::from_millis(250);
     loop {
         match crate::supervisor_session::report_main_process_exit(
-            endpoint,
+            gateway,
             sandbox_id,
             instance_id,
             exit_code,
@@ -249,11 +249,15 @@ pub async fn report_main_process_exit(
 }
 
 /// Finalize canonical process terminal delivery until acknowledged.
-pub async fn finalize_main_process_exit(endpoint: &str, sandbox_id: &str, instance_id: &str) {
+pub async fn finalize_main_process_exit(
+    gateway: &openshell_core::grpc_client::GatewayEndpoint,
+    sandbox_id: &str,
+    instance_id: &str,
+) {
     let mut delay = Duration::from_millis(250);
     loop {
         match crate::supervisor_session::finalize_main_process_exit(
-            endpoint,
+            gateway,
             sandbox_id,
             instance_id,
         )
@@ -352,9 +356,14 @@ mod tests {
     #[tokio::test]
     async fn no_ssh_access_retains_main_attachment_and_session_readiness() {
         let boundary = Arc::new(AccessBoundary);
+        let gateway = openshell_core::grpc_client::GatewayEndpoint::new(
+            "http://127.0.0.1:1",
+            openshell_core::grpc_client::GatewayCredentials::from_gateway_token("test-token")
+                .expect("test credentials"),
+        );
         let access = start_boundary_access(
             Some("sandbox"),
-            Some("http://127.0.0.1:1"),
+            Some(&gateway),
             None,
             false,
             None,

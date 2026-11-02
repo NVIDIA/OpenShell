@@ -3,6 +3,7 @@
 
 //! Capability-free in-workload sandbox boundary.
 
+pub mod binary_pins;
 #[cfg(target_os = "linux")]
 pub mod boundary_exec;
 #[cfg(target_os = "linux")]

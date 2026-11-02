@@ -52,6 +52,11 @@ CLI_BIN="${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}"
 E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
 # Unset or empty selects Rust defaults; e2e-conformance-only skips Rust tests.
 E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm}"
+ADDITIONAL_CA_MODE="${OPENSHELL_E2E_ADDITIONAL_CA:-0}"
+if [ "${E2E_TEST_OVERRIDE}" = "additional_ca" ]; then
+  ADDITIONAL_CA_MODE=1
+  E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm,e2e-additional-ca}"
+fi
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
 
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
@@ -169,8 +174,13 @@ s.close()')"
 # basename short — see the SUN_LEN comment above.
 RUN_STATE_DIR="${STATE_DIR_ROOT}/os-vm-e2e-${HOST_PORT}-$$"
 mkdir -p "${RUN_STATE_DIR}"
+# Keep every gateway-created artifact, including normalized additional CA
+# material, under this invocation's disposable state root. Set this before
+# starting either fixture or gateway so no host-global XDG fallback is used.
 export XDG_CONFIG_HOME="${RUN_STATE_DIR}/config"
 export XDG_DATA_HOME="${RUN_STATE_DIR}/data"
+export XDG_STATE_HOME="${RUN_STATE_DIR}/state"
+mkdir -p "${XDG_CONFIG_HOME}" "${XDG_DATA_HOME}" "${XDG_STATE_HOME}"
 
 GATEWAY_LOG="$(mktemp /tmp/openshell-gateway-e2e.XXXXXX)"
 GATEWAY_PID_FILE="${RUN_STATE_DIR}/gateway.pid"
@@ -183,6 +193,10 @@ GATEWAY_NAME="openshell-e2e-vm-${HOST_PORT}"
 DRIVER_PID=""
 DRIVER_LOG="${RUN_STATE_DIR}/vm-driver.log"
 DRIVER_SOCKET="${RUN_STATE_DIR}/compute-driver.sock"
+ADDITIONAL_CA_SERVER_PID=""
+ADDITIONAL_CA_SERVER_LOG="${RUN_STATE_DIR}/additional-ca-server.log"
+ADDITIONAL_CA_DIR="${RUN_STATE_DIR}/additional-ca"
+ADDITIONAL_CA_PORT=""
 
 # ── Cleanup (trap) ───────────────────────────────────────────────────
 
@@ -207,6 +221,7 @@ cleanup() {
     wait "${gateway_pid}" 2>/dev/null || true
   fi
   e2e_stop_process "${DRIVER_PID}" "external VM compute driver"
+  e2e_stop_process "${ADDITIONAL_CA_SERVER_PID}" "additional CA HTTPS fixture"
 
   # On failure, keep the VM console log for debugging. We deliberately
   # print it instead of leaving it on disk because the state dir gets
@@ -241,6 +256,19 @@ cleanup() {
 trap cleanup EXIT
 
 # ── Launch the gateway + VM driver ───────────────────────────────────
+
+start_additional_ca_fixture() {
+  e2e_start_additional_ca_fixture \
+    "${ADDITIONAL_CA_DIR}" "${ADDITIONAL_CA_SERVER_LOG}" \
+    ADDITIONAL_CA_SERVER_PID ADDITIONAL_CA_PORT
+}
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+    echo "ERROR: additional CA e2e requires the gateway-managed VM driver." >&2
+    exit 2
+  fi
+  start_additional_ca_fixture
+fi
 
 echo "==> Starting openshell-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STATE_DIR})"
 
@@ -280,6 +308,15 @@ gateway_id = "${GATEWAY_NAME}"
 # Local VM e2e gateways exercise the single-player default: sandbox JWTs
 # identify the supervisor and do not expire.
 
+EOF
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  cat >>"${GATEWAY_CONFIG}" <<EOF
+[openshell.supervisor.network]
+additional_ca_bundle = "${ADDITIONAL_CA_DIR}/ca.crt"
+
+EOF
+fi
+cat >>"${GATEWAY_CONFIG}" <<EOF
 [openshell.drivers.vm]
 EOF
 # A rootless Linux libkrun refuses file creation on read-write bind mounts by
@@ -393,6 +430,27 @@ fi
 
 export OPENSHELL_E2E_DRIVER="vm"
 export OPENSHELL_E2E_VM_STATE_DIR="${RUN_STATE_DIR}"
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  additional_ca_artifact_dir="${XDG_STATE_HOME}/openshell/network-supervisor"
+  additional_ca_artifacts=("${additional_ca_artifact_dir}"/additional-ca-*.crt)
+  if [ "${#additional_ca_artifacts[@]}" -ne 1 ] || [ ! -f "${additional_ca_artifacts[0]}" ]; then
+    echo "ERROR: expected exactly one content-addressed additional CA artifact under XDG_STATE_HOME" >&2
+    exit 1
+  fi
+  # Both paths exist after gateway initialization; plain `realpath` is
+  # portable across GNU and BSD/macOS implementations.
+  state_root="$(realpath "${XDG_STATE_HOME}")"
+  artifact_path="$(realpath "${additional_ca_artifacts[0]}")"
+  case "${artifact_path}" in
+    "${state_root}"/*) ;;
+    *)
+      echo "ERROR: normalized additional CA artifact escaped XDG_STATE_HOME" >&2
+      exit 1
+      ;;
+  esac
+  export OPENSHELL_E2E_ADDITIONAL_CA_ARTIFACT="${artifact_path}"
+  export OPENSHELL_E2E_GATEWAY_CONFIG="${GATEWAY_CONFIG}"
+fi
 e2e_export_gateway_restart_metadata \
   "${GATEWAY_BIN}" \
   "${GATEWAY_ARGS_FILE}" \

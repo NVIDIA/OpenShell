@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use tracing::info;
 
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_core::sandbox_env::SupervisorOtlpArgs;
 use openshell_core::{AppArmorProfile, ImagePullPolicy, VERSION};
 use openshell_driver_podman::config::{DEFAULT_NETWORK_NAME, DEFAULT_PODMAN_STOP_TIMEOUT_SECS};
 use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanComputeDriver};
@@ -39,20 +40,8 @@ struct Args {
     #[arg(long, env = "OPENSHELL_LOG_LEVEL", default_value = "info")]
     log_level: String,
 
-    #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
-    otlp_endpoint: Option<String>,
-
-    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
-    #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
-    otlp_ocsf_endpoint: Option<String>,
-
-    /// OCSF schema version that supervisors downgrade exported events to.
-    #[arg(
-        long,
-        env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION",
-        requires = "otlp_ocsf_endpoint"
-    )]
-    otlp_ocsf_schema_version: Option<String>,
+    #[command(flatten)]
+    otlp: SupervisorOtlpArgs,
 
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
@@ -220,60 +209,62 @@ async fn main() -> Result<()> {
     let _tracing = openshell_otel::install_driver_tracing(
         openshell_driver_podman::otel_tracing::TRACING,
         openshell_otel::DriverTracingConfig {
-            endpoint: args.otlp_endpoint.as_deref(),
+            endpoint: args.otlp.endpoint.as_deref(),
+            protocol: args.otlp.protocol.into(),
             gateway_name: args.gateway_name.as_deref(),
             service_version: VERSION,
             log_level: &args.log_level,
         },
     );
+    args.otlp.warn_deprecated();
 
-    let driver = PodmanComputeDriver::new(PodmanComputeConfig {
-        allow_driver_config: args.admission_config_json.allow_driver_config,
-        resource_admission: args.admission_config_json.resource_admission.clone(),
-        socket_path: args.podman_socket,
-        default_image: args.sandbox_image.unwrap_or_default(),
-        image_pull_policy: args.sandbox_image_pull_policy,
-        grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
-        supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
-        supervisor_gateway_name: args.gateway_name.clone(),
-        supervisor_ocsf_export: args.otlp_ocsf_endpoint.clone().map(|endpoint| {
-            openshell_core::sandbox_env::OcsfOtlpExport {
-                endpoint,
-                schema_version: args.otlp_ocsf_schema_version.clone(),
-            }
-        }),
-        gateway_port: args.gateway_port,
-        host_gateway_ip: args
-            .host_gateway_ip
-            .unwrap_or_else(PodmanComputeConfig::default_host_gateway_ip),
-        ssh_socket_path: args.sandbox_ssh_socket_path,
-        network_name: args.network_name,
-        stop_timeout_secs: args.stop_timeout,
-        sandbox_runtime_image: args
-            .sandbox_runtime_image
-            .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image),
-        supervisor_image: args
-            .supervisor_image
-            .unwrap_or_else(openshell_core::config::default_supervisor_image),
-        guest_tls_ca: args.podman_tls_ca,
-        guest_tls_cert: args.podman_tls_cert,
-        guest_tls_key: args.podman_tls_key,
-        provider_spiffe_workload_api_socket: args.provider_spiffe_workload_api_socket,
-        app_armor_profile: args.app_armor_profile,
-        sandbox_pids_limit: args.sandbox_pids_limit,
-        health_check_interval_secs: args.health_check_interval_secs,
-        https_proxy: args.sandbox_https_proxy,
-        no_proxy: args.sandbox_no_proxy,
-        proxy_auth_file: args.sandbox_proxy_auth_file,
-        proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
-        proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
-        proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
-        additional_ca_bundle: args.sandbox_additional_ca_bundle,
-        userns: args.userns,
-        uidmap: args.uidmap,
-        gidmap: args.gidmap,
-        enable_bind_mounts: args.enable_bind_mounts,
-    })
+    let supervisor_otlp = args.otlp.supervisor_otlp();
+    // External drivers have no gateway-local staged artifact. Do not accept
+    // a path or silently emulate destination-CA delivery outside the gateway.
+    let driver = PodmanComputeDriver::new(
+        PodmanComputeConfig {
+            allow_driver_config: args.admission_config_json.allow_driver_config,
+            resource_admission: args.admission_config_json.resource_admission.clone(),
+            socket_path: args.podman_socket,
+            default_image: args.sandbox_image.unwrap_or_default(),
+            image_pull_policy: args.sandbox_image_pull_policy,
+            grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
+            supervisor_otlp,
+            supervisor_gateway_name: args.gateway_name.clone(),
+            gateway_port: args.gateway_port,
+            host_gateway_ip: args
+                .host_gateway_ip
+                .unwrap_or_else(PodmanComputeConfig::default_host_gateway_ip),
+            ssh_socket_path: args.sandbox_ssh_socket_path,
+            network_name: args.network_name,
+            stop_timeout_secs: args.stop_timeout,
+            sandbox_runtime_image: args
+                .sandbox_runtime_image
+                .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image),
+            supervisor_image: args
+                .supervisor_image
+                .unwrap_or_else(openshell_core::config::default_supervisor_image),
+            guest_tls_ca: args.podman_tls_ca,
+            guest_tls_cert: args.podman_tls_cert,
+            guest_tls_key: args.podman_tls_key,
+            provider_spiffe_workload_api_socket: args.provider_spiffe_workload_api_socket,
+            app_armor_profile: args.app_armor_profile,
+            sandbox_pids_limit: args.sandbox_pids_limit,
+            health_check_interval_secs: args.health_check_interval_secs,
+            https_proxy: args.sandbox_https_proxy,
+            no_proxy: args.sandbox_no_proxy,
+            proxy_auth_file: args.sandbox_proxy_auth_file,
+            proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
+            proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
+            proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
+            additional_ca_bundle: args.sandbox_additional_ca_bundle,
+            userns: args.userns,
+            uidmap: args.uidmap,
+            gidmap: args.gidmap,
+            enable_bind_mounts: args.enable_bind_mounts,
+        },
+        None,
+    )
     .await
     .into_diagnostic()?;
 
@@ -363,7 +354,7 @@ mod tests {
         .expect("OTLP configuration should be accepted");
 
         assert_eq!(
-            args.otlp_endpoint.as_deref(),
+            args.otlp.endpoint.as_deref(),
             Some("http://collector.internal:4317")
         );
         assert_eq!(args.gateway_name.as_deref(), Some("production-us-west"));

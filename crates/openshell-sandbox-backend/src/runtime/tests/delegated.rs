@@ -34,6 +34,8 @@ async fn external_backend(
                     mediation_ready: false,
                     provider_environment_generation: 0,
                     confirmation,
+                    attach_snapshots: Arc::default(),
+                    received: Arc::default(),
                 };
                 tonic::transport::Server::builder()
                     .add_service(IsolationBackendServer::new(TestIsolationBackend {

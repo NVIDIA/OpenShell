@@ -450,6 +450,14 @@ impl compute_driver_server::ComputeDriver for DriverService {
         }
         Ok(Response::new(StopSandboxResponse {}))
     }
+    async fn suspend_sandbox(
+        &self,
+        _: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SuspendSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "the V8 example compute driver does not support sandbox suspend",
+        ))
+    }
     async fn delete_sandbox(
         &self,
         q: Request<DeleteSandboxRequest>,
@@ -471,6 +479,11 @@ impl compute_driver_server::ComputeDriver for DriverService {
         q: Request<StartSandboxRequest>,
     ) -> Result<Response<StartSandboxResponse>, Status> {
         let q = q.into_inner();
+        if q.resume {
+            return Err(Status::unimplemented(
+                "the V8 example compute driver does not support sandbox resume",
+            ));
+        }
         let mut entry = self.entry.lock().await;
         let current = entry
             .as_mut()

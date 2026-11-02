@@ -11,7 +11,7 @@ on:
         required: true
         type: string
       expected-source-sha:
-        description: Qualified source commit that the release tag must resolve to
+        description: Expected source commit that the release tag must resolve to
         required: false
         default: ""
         type: string
@@ -89,7 +89,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -n "${EXPECTED_SOURCE_SHA}" && "$(git rev-parse HEAD)" != "${EXPECTED_SOURCE_SHA}" ]]; then
-            echo "Release tag ${RELEASE_TAG} does not match the qualified commit ${EXPECTED_SOURCE_SHA}." >&2
+            echo "Release tag ${RELEASE_TAG} does not match the expected commit ${EXPECTED_SOURCE_SHA}." >&2
             exit 1
           fi
           if [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$ ]]; then

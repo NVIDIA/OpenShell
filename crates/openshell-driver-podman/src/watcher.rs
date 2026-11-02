@@ -681,15 +681,42 @@ mod tests {
     }
 
     fn podman_event(action: &str, sandbox_id: &str, time_nano: i64) -> PodmanEvent {
+        podman_event_for_container(action, sandbox_id, "container-1", time_nano)
+    }
+
+    fn podman_event_for_container(
+        action: &str,
+        sandbox_id: &str,
+        container_id: &str,
+        time_nano: i64,
+    ) -> PodmanEvent {
         PodmanEvent {
             event_type: "container".to_string(),
             action: action.to_string(),
             actor: crate::client::EventActor {
-                id: "container-1".to_string(),
+                id: container_id.to_string(),
                 attributes: HashMap::from([(LABEL_SANDBOX_ID.to_string(), sandbox_id.to_string())]),
             },
             time_nano,
         }
+    }
+
+    #[tokio::test]
+    async fn unrelated_remove_deletes_the_sandbox() {
+        let fences = LifecycleEventFences::default();
+        let client = PodmanClient::new(crate::test_utils::unique_socket_path("watch-removals"));
+
+        let event = map_podman_event(
+            &podman_event_for_container("remove", "sandbox-1", "external-container", 2),
+            &client,
+            &fences,
+        )
+        .await
+        .expect("an unrelated remove must still delete the sandbox");
+        assert!(matches!(
+            event.payload,
+            Some(watch_sandboxes_event::Payload::Deleted(_))
+        ));
     }
 
     #[test]

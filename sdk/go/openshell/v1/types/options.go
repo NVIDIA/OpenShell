@@ -83,6 +83,14 @@ type WatchOptions struct {
 	StopOnTerminal bool
 }
 
+// ResumeOptions configures how a suspended sandbox resumes.
+type ResumeOptions struct {
+	// RestartIfRestoreFails lets the isolation backend boot the workload
+	// cleanly when it cannot restore the retained memory state. When false,
+	// resume fails instead.
+	RestartIfRestoreFails bool
+}
+
 // WaitOptions configures wait behavior. Use context for timeout control.
 type WaitOptions struct {
 	PollInterval time.Duration

@@ -61,6 +61,11 @@ endpoint. Authorization is stripped by default. Select `BearerPassthrough` only
 when the sandbox application validates its own bearer credential. The returned
 `SandboxRef::service_urls` map contains each routed URL under the same name.
 
+`exec` sends the sandbox's owner replica in the `x-openshell-replica` header so
+an edge proxy with replica routing can skip the peer relay. The owner is cached
+for 30 seconds, and a call is retried once without the header if the owner's
+route has no ready endpoints.
+
 Curated calls without a workspace argument explicitly select the `default`
 workspace. Cross-workspace listing uses the separate `*_all_workspaces`
 methods and requires Platform Admin access.

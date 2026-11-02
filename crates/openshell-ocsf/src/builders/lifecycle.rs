@@ -3,7 +3,7 @@
 
 //! Builder for Application Lifecycle [6002] events.
 
-use crate::builders::EventContext;
+use crate::builders::ContextRef;
 use crate::enums::{ActivityId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{ApplicationLifecycleEvent, OcsfEvent};
@@ -11,7 +11,7 @@ use crate::objects::Product;
 
 /// Builder for Application Lifecycle [6002] events.
 pub struct AppLifecycleBuilder<'a> {
-    ctx: &'a EventContext,
+    ctx: ContextRef<'a>,
     activity: ActivityId,
     severity: SeverityId,
     status: Option<StatusId>,
@@ -20,9 +20,9 @@ pub struct AppLifecycleBuilder<'a> {
 
 impl<'a> AppLifecycleBuilder<'a> {
     #[must_use]
-    pub fn new(ctx: &'a EventContext) -> Self {
+    pub fn new(ctx: impl Into<ContextRef<'a>>) -> Self {
         Self {
-            ctx,
+            ctx: ctx.into(),
             activity: ActivityId::Unknown,
             severity: SeverityId::Informational,
             status: None,

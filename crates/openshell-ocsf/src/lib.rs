@@ -34,9 +34,6 @@ pub mod sanitize;
 pub mod tracing_layers;
 
 #[cfg(any(test, feature = "test-support"))]
-pub mod validation;
-
-#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
 // --- Core event types ---
@@ -48,9 +45,9 @@ pub use events::{
 
 // --- Enum types ---
 pub use enums::{
-    ActionId, ActivityId, AuthProtocolId, AuthTypeId, ConfidenceId, DeviceTypeId, DispositionId,
-    HttpMethod, LaunchTypeId, OcsfEnum, OsTypeId, RiskLevelId, SecurityLevelId, SeverityId,
-    StateId, StatusId, UserTypeId,
+    ActionId, ActivityId, AuthProtocolId, AuthTypeId, ConfidenceId, ConnectionDirectionId,
+    DeviceTypeId, DispositionId, HttpMethod, LaunchTypeId, OcsfEnum, OsTypeId, RiskLevelId,
+    SecurityLevelId, SeverityId, StateId, StatusId, UserTypeId,
 };
 
 // --- Object types ---
@@ -63,17 +60,16 @@ pub use objects::{
 // --- Sanitizers ---
 pub use sanitize::sanitize_reason_for_audit;
 
-pub use format::downgrade::OcsfSchemaVersion;
-
 // --- Builders ---
 pub use builders::{
     ApiActivityBuilder, AppLifecycleBuilder, AuthenticationBuilder, BaseEventBuilder,
-    ConfigStateChangeBuilder, DetectionFindingBuilder, EventContext, EventOrigin,
+    ConfigStateChangeBuilder, ContextRef, DetectionFindingBuilder, EventContext, EventOrigin,
     HttpActivityBuilder, NetworkActivityBuilder, ProcessActivityBuilder, SshActivityBuilder,
 };
 
 // --- Tracing layers ---
 pub use tracing_layers::{
-    OCSF_TARGET, OcsfJsonlLayer, OcsfShorthandLayer, clear_current_event, clone_current_event,
-    emit_ocsf_event, emit_ocsf_event_routed, set_current_event,
+    OCSF_TARGET, OcsfJsonSettings, OcsfJsonlLayer, OcsfShorthandLayer, bind_thread_json_settings,
+    clear_current_event, clone_current_event, emit_ocsf_event, emit_ocsf_event_routed,
+    set_current_event,
 };

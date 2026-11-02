@@ -47,8 +47,8 @@ pub(super) fn http_context(
     decision: &EgressDecision,
     provider_credentials: Option<openshell_core::provider_credentials::ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
+    policy_local: Option<&crate::policy_local::PolicyLocalContext>,
     agent_proposals: openshell_core::proposals::AgentProposals,
-    workspace: String,
     signals: RelaySignals,
 ) -> L7EvalContext {
     // Provider-backed credentials must be acquired from the live state for
@@ -58,9 +58,14 @@ pub(super) fn http_context(
         .is_none()
         .then_some(secret_resolver)
         .flatten();
+    // Grants use the owning sandbox instance's resolver; without one they fail closed.
     let token_grant_resolver = provider_credentials
         .as_ref()
-        .map(|_| crate::l7::token_grant_injection::default_resolver());
+        .and(policy_local)
+        .and_then(crate::policy_local::PolicyLocalContext::token_grant_resolver);
+    let workspace = policy_local
+        .map(crate::policy_local::PolicyLocalContext::workspace)
+        .unwrap_or_default();
     let policy_name = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.clone().unwrap_or_default(),
         NetworkAction::Deny { .. } => String::new(),
@@ -466,9 +471,10 @@ mod tests {
     #[tokio::test]
     async fn tls_http_relay_reuses_then_sends_close_notify_after_complete_response() {
         use crate::l7::tls::{CertCache, ProxyTlsState, SandboxCa, tls_terminate_client};
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
         let ca = SandboxCa::generate().unwrap();
         let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut ca.cert_pem().as_bytes()) {
+        for cert in CertificateDer::pem_reader_iter(&mut ca.cert_pem().as_bytes()) {
             roots.add(cert.unwrap()).unwrap();
         }
         let config = Arc::new(

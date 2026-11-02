@@ -36,10 +36,12 @@ inputs:
 runs:
   using: composite
   steps:
+    # Per-binary caches are large and other branches can restore main's, so
+    # saving them elsewhere mostly evicts main's from the shared quota.
     - uses: ./.github/actions/setup-rust
       with:
         cache-key: binaries-v2-${{ inputs.binary }}-${{ inputs.triple }}
-        save-cache: "true"
+        save-cache: ${{ github.ref == 'refs/heads/main' }}
 
     - name: Set version
       shell: nix develop -c bash -euo pipefail {0}

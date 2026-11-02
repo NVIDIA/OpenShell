@@ -25,6 +25,7 @@ pub mod principal;
 pub mod sandbox_jwt;
 pub mod sandbox_methods;
 pub mod sandbox_session;
+pub mod supervisor_token;
 pub mod workspace_authz;
 
 pub use http::router;

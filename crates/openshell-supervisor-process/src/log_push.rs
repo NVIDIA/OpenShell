@@ -7,12 +7,54 @@
 //! channel to a background task. The task batches lines and streams them to
 //! the server using the `PushSandboxLogs` client-streaming RPC.
 
-use openshell_core::grpc_client::CachedOpenShellClient;
+use openshell_core::grpc_client::{CachedOpenShellClient, GatewayEndpoint};
 use openshell_core::proto::{PushSandboxLogsRequest, SandboxLogLine};
+use std::cell::RefCell;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
+
+/// One sandbox's push queue. Lines are labelled with this sandbox and sent
+/// only with the credentials of the task that drains the queue.
+#[derive(Clone)]
+pub struct LogSink {
+    sandbox_id: Arc<str>,
+    tx: mpsc::Sender<SandboxLogLine>,
+}
+
+impl LogSink {
+    #[must_use]
+    pub fn new(sandbox_id: impl Into<Arc<str>>, tx: mpsc::Sender<SandboxLogLine>) -> Self {
+        Self {
+            sandbox_id: sandbox_id.into(),
+            tx,
+        }
+    }
+}
+
+std::thread_local! {
+    /// Sink of the hosted sandbox instance whose runtime owns this thread.
+    static THREAD_SINK: RefCell<Option<LogSink>> = const { RefCell::new(None) };
+}
+
+/// Route events emitted on the calling thread to a hosted sandbox instance's
+/// sink.
+///
+/// Hosted instances bind every thread of their runtime. Unbound threads push
+/// nothing, so an event cannot reach another sandbox's log stream.
+pub fn bind_thread_sink(sink: Option<LogSink>) {
+    THREAD_SINK.with(|current| *current.borrow_mut() = sink);
+}
+
+#[derive(Clone)]
+enum Route {
+    /// The process supervises one sandbox; every event belongs to it.
+    Fixed(LogSink),
+    /// Events belong to the sandbox instance bound to the emitting thread, if any.
+    ThreadBound,
+}
 
 /// Tracing layer that pushes log events to the `OpenShell` server.
 ///
@@ -20,19 +62,24 @@ use tracing_subscriber::layer::Context;
 /// event is dropped. Logging must never block the sandbox.
 #[derive(Clone)]
 pub struct LogPushLayer {
-    sandbox_id: String,
-    tx: mpsc::Sender<SandboxLogLine>,
+    route: Route,
     max_level: tracing::Level,
 }
 
 impl LogPushLayer {
     pub fn new(sandbox_id: String, tx: mpsc::Sender<SandboxLogLine>) -> Self {
+        Self::with_route(Route::Fixed(LogSink::new(sandbox_id, tx)))
+    }
+
+    /// Push each event to the sink bound to its emitting thread.
+    #[must_use]
+    pub fn thread_bound() -> Self {
+        Self::with_route(Route::ThreadBound)
+    }
+
+    fn with_route(route: Route) -> Self {
         let max_level = parse_max_level(std::env::var("OPENSHELL_LOG_PUSH_LEVEL").ok().as_deref());
-        Self {
-            sandbox_id,
-            tx,
-            max_level,
-        }
+        Self { route, max_level }
     }
 }
 
@@ -50,47 +97,61 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
         if *meta.level() > self.max_level {
             return;
         }
-
-        // OCSF events carry their payload in a thread-local; extract the
-        // shorthand representation for the push message. Non-OCSF events
-        // use the original visitor-based extraction.
-        let (msg, fields) = if meta.target() == openshell_ocsf::OCSF_TARGET {
-            if let Some(ocsf_event) = openshell_ocsf::clone_current_event() {
-                (
-                    ocsf_event.format_shorthand(),
-                    std::collections::HashMap::new(),
-                )
-            } else {
-                return;
-            }
-        } else {
-            let mut visitor = LogVisitor::default();
-            event.record(&mut visitor);
-            visitor.into_parts(meta.name())
-        };
-
-        let ts = openshell_core::time::now_ms();
-
-        let is_ocsf = meta.target() == openshell_ocsf::OCSF_TARGET;
-
-        let log = SandboxLogLine {
-            sandbox_id: self.sandbox_id.clone(),
-            event_time: openshell_core::time::timestamp_from_millis(ts).ok(),
-            level: if is_ocsf {
-                "OCSF".to_string()
-            } else {
-                meta.level().to_string()
-            },
-            target: meta.target().to_string(),
-            message: msg,
-            source: "sandbox".to_string(),
-            fields,
-        };
-
-        // Best-effort: drop if the channel is full (don't block tracing).
-        let _ = self.tx.try_send(log);
+        match &self.route {
+            Route::Fixed(sink) => push_event(sink, event),
+            Route::ThreadBound => THREAD_SINK.with(|sink| {
+                if let Some(sink) = sink.borrow().as_ref() {
+                    push_event(sink, event);
+                }
+            }),
+        }
     }
 }
+
+fn push_event(sink: &LogSink, event: &Event<'_>) {
+    let meta = event.metadata();
+    // OCSF events carry their payload in a thread-local; extract the
+    // shorthand representation for the push message. Non-OCSF events
+    // use the original visitor-based extraction.
+    let (msg, fields) = if meta.target() == openshell_ocsf::OCSF_TARGET {
+        if let Some(ocsf_event) = openshell_ocsf::clone_current_event() {
+            (
+                ocsf_event.format_shorthand(),
+                std::collections::HashMap::new(),
+            )
+        } else {
+            return;
+        }
+    } else {
+        let mut visitor = LogVisitor::default();
+        event.record(&mut visitor);
+        visitor.into_parts(meta.name())
+    };
+
+    let ts = openshell_core::time::now_ms();
+
+    let is_ocsf = meta.target() == openshell_ocsf::OCSF_TARGET;
+
+    let log = SandboxLogLine {
+        sandbox_id: sink.sandbox_id.to_string(),
+        event_time: openshell_core::time::timestamp_from_millis(ts).ok(),
+        level: if is_ocsf {
+            "OCSF".to_string()
+        } else {
+            meta.level().to_string()
+        },
+        target: meta.target().to_string(),
+        message: msg,
+        source: "sandbox".to_string(),
+        fields,
+    };
+
+    // Best-effort: drop if the channel is full (don't block tracing).
+    let _ = sink.tx.try_send(log);
+}
+
+/// Lines a sandbox's push queue holds before the layer starts dropping them.
+pub const LOG_PUSH_QUEUE_LINES: usize = 1024;
 
 /// Spawn a background task that batches and pushes log lines to the server.
 ///
@@ -98,27 +159,36 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
 /// task handle. The task runs until the sender is dropped or the gRPC stream
 /// breaks.
 pub fn spawn_log_push_task(
-    endpoint: String,
+    gateway: GatewayEndpoint,
     sandbox_id: String,
 ) -> (mpsc::Sender<SandboxLogLine>, tokio::task::JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel::<SandboxLogLine>(1024);
+    let (tx, rx) = mpsc::channel::<SandboxLogLine>(LOG_PUSH_QUEUE_LINES);
+    (tx, start_log_push(gateway, sandbox_id, rx))
+}
 
-    let handle = tokio::spawn(run_push_loop(endpoint, sandbox_id, rx));
-
-    (tx, handle)
+/// Push lines from a queue created before the caller's runtime, with the
+/// owning sandbox's gateway credentials.
+pub fn start_log_push(
+    gateway: GatewayEndpoint,
+    sandbox_id: String,
+    lines: mpsc::Receiver<SandboxLogLine>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_push_loop(gateway, sandbox_id, lines))
 }
 
 /// Maximum backoff delay between reconnection attempts.
 const MAX_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 /// Initial backoff delay after a connection failure.
 const INITIAL_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_secs(1);
+/// Lines per regular or reconnect-replay batch, below the gateway's ingest cap.
+const LOG_PUSH_BATCH_LINES: usize = 50;
 
 async fn run_push_loop(
-    endpoint: String,
+    gateway: GatewayEndpoint,
     sandbox_id: String,
     mut rx: mpsc::Receiver<SandboxLogLine>,
 ) {
-    let mut batch = Vec::with_capacity(50);
+    let mut batch = Vec::with_capacity(LOG_PUSH_BATCH_LINES);
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
 
@@ -127,7 +197,7 @@ async fn run_push_loop(
         attempt += 1;
 
         // --- Connect ---
-        let client = match CachedOpenShellClient::connect(&endpoint).await {
+        let client = match CachedOpenShellClient::connect(&gateway).await {
             Ok(c) => {
                 if attempt > 1 {
                     eprintln!("openshell: log push reconnected (attempt {attempt})");
@@ -168,20 +238,13 @@ async fn run_push_loop(
         });
 
         // --- Flush any lines buffered during reconnect ---
-        if !batch.is_empty() {
-            let lines = std::mem::take(&mut batch);
-            if push_tx
-                .send(PushSandboxLogsRequest {
-                    sandbox_id: sandbox_id.clone(),
-                    logs: lines,
-                })
-                .await
-                .is_err()
-            {
-                // RPC died immediately — go back to reconnect.
-                backoff = INITIAL_BACKOFF;
-                continue;
-            }
+        if flush_reconnect_buffer(&push_tx, &sandbox_id, &mut batch)
+            .await
+            .is_err()
+        {
+            // RPC died immediately — go back to reconnect.
+            backoff = INITIAL_BACKOFF;
+            continue;
         }
 
         // --- Batch and send loop (runs until stream breaks) ---
@@ -206,7 +269,7 @@ async fn run_push_loop(
                         return;
                     };
                     batch.push(line);
-                    if batch.len() >= 50 {
+                    if batch.len() >= LOG_PUSH_BATCH_LINES {
                         let lines = std::mem::take(&mut batch);
                         if push_tx.send(PushSandboxLogsRequest {
                             sandbox_id: sandbox_id.clone(),
@@ -246,6 +309,24 @@ async fn run_push_loop(
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     }
+}
+
+async fn flush_reconnect_buffer(
+    tx: &mpsc::Sender<PushSandboxLogsRequest>,
+    sandbox_id: &str,
+    batch: &mut Vec<SandboxLogLine>,
+) -> Result<(), mpsc::error::SendError<PushSandboxLogsRequest>> {
+    // The reconnect buffer can hold 200 lines, but the gateway only ingests
+    // the first 100 of each request. Replay using the regular batch size.
+    while !batch.is_empty() {
+        let count = batch.len().min(LOG_PUSH_BATCH_LINES);
+        tx.send(PushSandboxLogsRequest {
+            sandbox_id: sandbox_id.to_string(),
+            logs: batch.drain(..count).collect(),
+        })
+        .await?;
+    }
+    Ok(())
 }
 
 /// Drain incoming log lines during a backoff delay so the tracing layer's
@@ -339,8 +420,7 @@ mod tests {
     fn capture(capacity: usize, f: impl FnOnce()) -> Vec<SandboxLogLine> {
         let (tx, mut rx) = mpsc::channel::<SandboxLogLine>(capacity);
         let layer = LogPushLayer {
-            sandbox_id: "sb-test".to_string(),
-            tx,
+            route: Route::Fixed(LogSink::new("sb-test", tx)),
             max_level: tracing::Level::INFO,
         };
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -455,6 +535,87 @@ mod tests {
             source: "sandbox".to_string(),
             fields: std::collections::HashMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn reconnect_replay_retains_all_buffered_lines_at_the_gateway_ingest_cap() {
+        let expected: Vec<_> = (0..200).map(|i| test_line(&format!("line {i}"))).collect();
+        let (tx, mut rx) = mpsc::channel(LOG_PUSH_QUEUE_LINES);
+        for line in &expected {
+            tx.try_send(line.clone()).unwrap();
+        }
+        drop(tx);
+
+        let mut batch = Vec::new();
+        drain_during_backoff(&mut rx, &mut batch, INITIAL_BACKOFF).await;
+        assert_eq!(batch, expected);
+
+        let (push_tx, mut push_rx) = mpsc::channel(32);
+        flush_reconnect_buffer(&push_tx, "sb-test", &mut batch)
+            .await
+            .unwrap();
+        drop(push_tx);
+
+        let mut received = Vec::new();
+        let mut batch_sizes = Vec::new();
+        while let Some(request) = push_rx.recv().await {
+            assert_eq!(request.sandbox_id, "sb-test");
+            batch_sizes.push(request.logs.len());
+            // Match handle_push_sandbox_logs in openshell-server/src/grpc/policy.rs.
+            received.extend(request.logs.into_iter().take(100));
+        }
+        eprintln!(
+            "reconnect replay: batches={batch_sizes:?}, retained={}/{}",
+            received.len(),
+            expected.len()
+        );
+        assert_eq!(
+            received.len(),
+            expected.len(),
+            "the gateway ingest cap must not truncate reconnect-buffered logs"
+        );
+        assert_eq!(received, expected, "replay must preserve order and fields");
+        assert!(batch.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconnect_replay_preserves_empty_and_partial_batches() {
+        for count in [0, 1, 49, 50, 51, 100, 101, 199] {
+            let expected: Vec<_> = (0..count)
+                .map(|i| test_line(&format!("line {i}")))
+                .collect();
+            let mut batch = expected.clone();
+            let (tx, mut rx) = mpsc::channel(32);
+            flush_reconnect_buffer(&tx, "sb-test", &mut batch)
+                .await
+                .unwrap();
+            drop(tx);
+
+            let mut received = Vec::new();
+            while let Some(request) = rx.recv().await {
+                assert_eq!(request.sandbox_id, "sb-test");
+                assert!(!request.logs.is_empty());
+                assert!(request.logs.len() <= LOG_PUSH_BATCH_LINES);
+                received.extend(request.logs);
+            }
+            assert_eq!(received, expected, "replay of {count} lines");
+            assert!(batch.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_replay_returns_an_error_if_the_stream_closes() {
+        let mut batch: Vec<_> = (0..200).map(|i| test_line(&format!("line {i}"))).collect();
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        let error = flush_reconnect_buffer(&tx, "sb-test", &mut batch)
+            .await
+            .expect_err("a closed stream must return to the reconnect loop");
+
+        assert_eq!(error.0.logs.len(), LOG_PUSH_BATCH_LINES);
+        assert_eq!(batch.len(), 200 - LOG_PUSH_BATCH_LINES);
+        assert_eq!(batch[0].message, "line 50");
     }
 
     #[tokio::test]

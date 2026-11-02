@@ -4,35 +4,57 @@
 {{- range .Values.imagePullSecrets -}}
 {{- $imagePullSecrets = append $imagePullSecrets .name -}}
 {{- end -}}
-{{- if eq (get $kubernetes "supervisor_topology" | default "") "gateway" }}
+{{- if include "openshell.supervisorEnabled" . }}
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+{{- $shared := get $kubernetes "shared_supervisor" }}
+{{- $name := include "openshell.supervisorName" . }}
+{{- $endpoint := get $kubernetes "grpc_endpoint" }}
+{{- $endpointUrl := urlParse $endpoint }}
+{{- $gatewayTls := and (not .Values.server.disableTls) .Values.server.tls.clientTlsSecretName }}
+# One supervisor process per replica hosts a sandbox instance for each sandbox
+# generation placed on it. The process dials the gateway over TLS with the
+# supervisor token the gateway mints for it and receives its assignments from
+# it; nothing but sandbox runtimes and kubelet probes connect to it. The Pod
+# holds no Kubernetes identity of its own: each instance acts only with the
+# credentials the gateway issued for its generation.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "openshell.fullname" . }}-supervisor
+  name: {{ $name }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
     app.kubernetes.io/component: supervisor
 spec:
-  replicas: 1
+  # The replicas form a high-availability pool. Each instance lives in the
+  # process hosting it; the pool rolls one member at a time, starting a new
+  # member before an old one leaves, and the gateway hands a failed or leaving
+  # member's instances to the remaining members. One replica has no failover
+  # but scales like any other count: only the replica count depends on the
+  # pool's size, so scaling changes nothing else here or in the gateway
+  # configuration.
+  {{- if ne (include "openshell.supervisorAutoscalingEnabled" .) "true" }}
+  replicas: {{ include "openshell.supervisorReplicas" . }}
+  {{- end }}
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
-      app.kubernetes.io/name: openshell-supervisor
-      app.kubernetes.io/instance: {{ .Release.Name }}
-      app.kubernetes.io/component: supervisor
+      {{- include "openshell.supervisorSelectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: openshell-supervisor
-        app.kubernetes.io/instance: {{ .Release.Name }}
-        app.kubernetes.io/component: supervisor
+        {{- include "openshell.supervisorSelectorLabels" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 30
+      enableServiceLinks: false
+      # A stopping member announces that it is leaving, and the gateway moves
+      # its instances to the remaining members before it exits.
+      terminationGracePeriodSeconds: 60
       {{- with ($imagePullSecrets | uniq) }}
       imagePullSecrets:
         {{- range . }}
@@ -43,6 +65,10 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.supervisor.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: supervisor
           image: {{ get $kubernetes "supervisor_image" | quote }}
@@ -50,11 +76,44 @@ spec:
           args:
             - --mode=shared
             - --gateway-endpoint
-            - {{ include "openshell.grpcEndpoint" . | quote }}
+            - {{ $endpoint | quote }}
             - --address
             - 0.0.0.0:5501
+            - --token-file
+            - /etc/openshell/supervisor-token/token
+            - --runtime-listen
+            - 0.0.0.0:{{ get $shared "runtime_port" }}
+            - --session-root
+            - /run/openshell/sessions
+          env:
+            - name: OPENSHELL_ENDPOINT
+              value: {{ $endpoint | quote }}
+            - name: OPENSHELL_LOG_LEVEL
+              value: info
+            {{- if $gatewayTls }}
+            - name: OPENSHELL_TLS_CA
+              value: /var/run/secrets/openshell-tls/ca.crt
+            {{- end }}
+            {{- if eq (get $endpointUrl "scheme") "https" }}
+            - name: OPENSHELL_GATEWAY_TLS_SERVER_NAME
+              value: {{ get $endpointUrl "hostname" | quote }}
+            {{- end }}
+            # Pool membership: the Pod name is this member's stable ID, and
+            # other members redirect the runtimes of its instances to its Pod
+            # IP.
+            - name: OPENSHELL_SUPERVISOR_POOL_MEMBER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           ports:
-            - name: supervisor
+            - name: runtime
+              containerPort: {{ get $shared "runtime_port" }}
+              protocol: TCP
+            - name: health
               containerPort: 5501
               protocol: TCP
           securityContext:
@@ -64,14 +123,46 @@ spec:
               drop: [ALL]
           resources:
             requests:
-              cpu: 10m
-              memory: 32Mi
+              cpu: 50m
+              memory: 64Mi
             limits:
-              memory: 128Mi
+              memory: 1Gi
+          # Process health only: the health listener accepts and closes probe
+          # connections. Each instance's readiness is reported to the gateway
+          # over the supervisor's own connection to it.
           readinessProbe:
             tcpSocket:
-              port: supervisor
+              port: health
           livenessProbe:
             tcpSocket:
-              port: supervisor
+              port: health
+          volumeMounts:
+            - name: run
+              mountPath: /run/openshell
+            - name: logs
+              mountPath: /var/log
+            - name: supervisor-token
+              mountPath: /etc/openshell/supervisor-token
+              readOnly: true
+            {{- if $gatewayTls }}
+            - name: gateway-ca
+              mountPath: /var/run/secrets/openshell-tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+        - name: supervisor-token
+          secret:
+            secretName: {{ $name }}-token
+        {{- if $gatewayTls }}
+        - name: gateway-ca
+          secret:
+            secretName: {{ .Values.server.tls.clientTlsSecretName }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+        {{- end }}
 {{- end }}

@@ -4,6 +4,7 @@
 {
   pkgs,
   toolchains,
+  rustToolchain,
   qemuPkgs ? pkgs,
   firmwarePkgs ? pkgs,
 }:
@@ -16,6 +17,9 @@ let
     inherit pkgs qemuPkgs firmwarePkgs;
   };
   tmachine = pkgs.callPackage ./. {
+    OVMF = firmwarePkgs.OVMF;
+  };
+  testRunnerUnwrapped = pkgs.callPackage ../runner {
     OVMF = firmwarePkgs.OVMF;
   };
   qemu = qemuPkgs.qemu.override { hostCpuOnly = true; };
@@ -47,8 +51,24 @@ let
           use_galaxy = true;
           playbooks = [
             "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/test-tools.yaml"
             "ansible/playbooks/docker.yaml"
           ];
+        };
+      }
+      {
+        name = "ubuntu-docker-rootful-keycloak";
+        machine = "ubuntu";
+        setup = {
+          use_galaxy = true;
+          playbooks = [
+            "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/docker.yaml"
+            "ansible/playbooks/keycloak.yaml"
+          ];
+          inputs = {
+            keycloak_realm_file = "../../scripts/keycloak-realm.json";
+          };
         };
       }
       {
@@ -58,6 +78,7 @@ let
           use_galaxy = false;
           playbooks = [
             "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/test-tools.yaml"
             "ansible/playbooks/k3s.yaml"
           ];
         };
@@ -69,6 +90,7 @@ let
           use_galaxy = false;
           playbooks = [
             "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/test-tools.yaml"
             "ansible/playbooks/selinux.yaml"
             "ansible/playbooks/podman-rootful.yaml"
           ];
@@ -81,6 +103,7 @@ let
           use_galaxy = false;
           playbooks = [
             "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/test-tools.yaml"
             "ansible/playbooks/selinux.yaml"
             "ansible/playbooks/podman-rootless.yaml"
           ];
@@ -156,20 +179,6 @@ let
         interactive = true;
       }
       {
-        name = "conformance";
-        playbooks = [ "ansible/playbooks/conformance/cli.yaml" ];
-        inputs = {
-          openshell_conformance_test_bundle = "../../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
-        };
-      }
-      {
-        name = "policy-advisor";
-        playbooks = [ "ansible/playbooks/conformance/policy-advisor.yaml" ];
-        inputs = {
-          openshell_conformance_test_bundle = "../../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
-        };
-      }
-      {
         name = "provider-refresh";
         playbooks = [ "ansible/playbooks/features/provider-refresh/keycloak.yaml" ];
         inputs = {
@@ -232,9 +241,36 @@ let
       exec ${tmachine}/bin/tmachine --config ${config} "$@"
     '';
   };
+
+  # Runs a test family in a tmachine environment with tests/runner
+  # (`nix run .#openshell-test-runner -- --environment ubuntu-docker-rootful
+  # --installer deb --family conformance`). It cross-builds guest test bundles
+  # and drives tmachine sessions, so it needs the toolchains and the VM tools.
+  testRunner = pkgs.writeShellApplication {
+    name = "openshell-test-runner";
+    runtimeInputs = [
+      qemu
+      pkgs.ansible
+      pkgs.cargo-nextest
+      pkgs.coreutils
+      pkgs.git
+      pkgs.sshpass
+      rustToolchain
+    ];
+    runtimeEnv =
+      pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (builtins.attrValues toolchains)
+      // {
+        TMACHINE_CONFIG = "${config}";
+      };
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      export ANSIBLE_CONFIG="$root/tests/tmachine/ansible/ansible.cfg"
+      exec ${testRunnerUnwrapped}/bin/openshell-test-runner "$@"
+    '';
+  };
 in
 {
   package = runner;
   unwrapped = tmachine;
-  inherit config;
+  inherit config testRunner;
 }
