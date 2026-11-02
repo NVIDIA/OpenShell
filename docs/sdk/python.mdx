@@ -217,6 +217,40 @@ Import supported protobuf-backed inputs and results from `openshell.types`,
 including `SandboxSpec`, `SandboxTemplate`, `SandboxPolicy`, `SandboxPhase`,
 `ServiceEndpointResponse`, and `GetSandboxLogsResponse`.
 
+## Observe a Sandbox
+
+`watch()` streams status snapshots and optionally logs and platform events. It
+returns complete `SandboxStreamEvent` messages, including warnings and draft
+policy notifications. Use `contextlib.closing()` for sync iteration or
+`contextlib.aclosing()` for async iteration to cancel promptly on early exit:
+
+```python
+from contextlib import aclosing
+
+async def observe(client):
+    async with aclosing(client.watch("worker", workspace="default", follow_logs=True)) as events:
+        async for event in events:
+            kind = event.WhichOneof("payload")
+            if kind == "log":
+                print(event.log.message)
+            elif kind == "warning":
+                print(event.warning.message)
+```
+
+Watch streams have no deadline unless `timeout` is supplied. To resume logs and
+platform events, retain the greatest nonempty cursor you have processed on that
+stream and pass it as `resume_after_cursor`. Status and warning messages may
+have no cursor. The SDK does not reconnect or reset cursors automatically;
+`OUT_OF_RANGE` means the cursor is no longer usable and requires an explicit
+decision to start a new watch. Preserve warnings as evidence of event gaps.
+
+Use `wait_completed()` for a job running as the sandbox's canonical main process.
+It returns the completed `SandboxRef`, raises on error, stopping, or deletion,
+and detects a same-name replacement. Supply `expected_sandbox_id=sandbox.id`
+from creation to pin the target before the first poll. Its `timeout_seconds`
+bounds polling RPCs and sleeps; `poll_interval` controls the polling frequency.
+Use `exec()` to wait for a separately executed command instead.
+
 ## Call Generated RPCs
 
 The generated gRPC stubs include concrete request and response types for synchronous `grpc.Channel` and asynchronous `grpc.aio.Channel` connections. Install the dependency type stubs in your development environment for editor signatures and type checking:

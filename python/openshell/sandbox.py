@@ -831,6 +831,56 @@ class SandboxSession:
             timeout=timeout,
         )
 
+    def watch(
+        self,
+        *,
+        follow_status: bool = True,
+        follow_logs: bool = False,
+        follow_events: bool = False,
+        log_tail_lines: int = 0,
+        event_tail: int = 0,
+        stop_on_terminal: bool = False,
+        since: datetime | None = None,
+        log_sources: Sequence[str] = (),
+        log_min_level: str = "",
+        resume_after_cursor: str = "",
+        timeout: float | None = None,
+    ) -> Generator[openshell_pb2.SandboxStreamEvent, None, None]:
+        stream = self._client.watch(
+            self.sandbox.name,
+            workspace=self._workspace,
+            follow_status=follow_status,
+            follow_logs=follow_logs,
+            follow_events=follow_events,
+            log_tail_lines=log_tail_lines,
+            event_tail=event_tail,
+            stop_on_terminal=stop_on_terminal,
+            since=since,
+            log_sources=log_sources,
+            log_min_level=log_min_level,
+            resume_after_cursor=resume_after_cursor,
+            timeout=timeout,
+        )
+        try:
+            yield from stream
+        finally:
+            stream.close()
+
+    def wait_completed(
+        self,
+        *,
+        timeout_seconds: float = 300.0,
+        poll_interval: float = 1.0,
+        expected_sandbox_id: str | None = None,
+    ) -> SandboxRef:
+        return self._client.wait_completed(
+            self.sandbox.name,
+            workspace=self._workspace,
+            timeout_seconds=timeout_seconds,
+            poll_interval=poll_interval,
+            expected_sandbox_id=expected_sandbox_id,
+        )
+
 
 class SandboxClient:
     """gRPC client for sandbox CRUD and command execution."""
@@ -1800,6 +1850,97 @@ class SandboxClient:
         return self._stub.GetSandboxLogs(
             request, timeout=self._timeout if timeout is None else timeout
         )
+
+    def watch(
+        self,
+        sandbox: str,
+        *,
+        workspace: str,
+        follow_status: bool = True,
+        follow_logs: bool = False,
+        follow_events: bool = False,
+        log_tail_lines: int = 0,
+        event_tail: int = 0,
+        stop_on_terminal: bool = False,
+        since: datetime | None = None,
+        log_sources: Sequence[str] = (),
+        log_min_level: str = "",
+        resume_after_cursor: str = "",
+        timeout: float | None = None,
+    ) -> Generator[openshell_pb2.SandboxStreamEvent, None, None]:
+        """Stream complete status, log, event, warning, and draft-policy messages.
+
+        No deadline is imposed unless ``timeout`` is supplied. The caller owns
+        reconnects and cursor persistence; OUT_OF_RANGE is never silently reset.
+        Close this iterator on early exit to cancel the RPC.
+        """
+        request = openshell_pb2.WatchSandboxRequest(
+            workspace_scope=_workspace_scope(workspace),
+            sandbox=sandbox,
+            follow_status=follow_status,
+            follow_logs=follow_logs,
+            follow_events=follow_events,
+            log_tail_lines=log_tail_lines,
+            event_tail=event_tail,
+            stop_on_terminal=stop_on_terminal,
+            log_sources=log_sources,
+            log_min_level=log_min_level,
+            resume_after_cursor=resume_after_cursor,
+        )
+        if since is not None:
+            _require_aware_datetime(since)
+            request.since_time.FromDatetime(since)
+        stream = self._stub.WatchSandbox(request, timeout=timeout)
+        try:
+            yield from stream
+        finally:
+            stream.cancel()
+
+    def wait_completed(
+        self,
+        name: str,
+        *,
+        workspace: str,
+        timeout_seconds: float = 300.0,
+        poll_interval: float = 1.0,
+        expected_sandbox_id: str | None = None,
+    ) -> SandboxRef:
+        """Wait for the canonical main process to complete successfully.
+
+        ERROR, STOPPED, DELETING, or a same-name replacement raise SandboxError.
+        Suspension does not imply completion. Exec child processes are not
+        observed by this method. Every RPC and sleep is bounded by the remaining
+        overall timeout. Pass the create result's ID to pin identity immediately.
+        """
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and greater than zero")
+        if not math.isfinite(poll_interval) or poll_interval <= 0:
+            raise ValueError("poll_interval must be finite and greater than zero")
+        deadline = time.monotonic() + timeout_seconds
+        identity = expected_sandbox_id
+        while time.monotonic() < deadline:
+            sandbox = self.get(
+                name,
+                workspace=workspace,
+                timeout=max(0.0, min(self._timeout, deadline - time.monotonic())),
+            )
+            if identity is not None and sandbox.id != identity:
+                raise SandboxError(
+                    f"sandbox {name} was replaced while waiting for completion"
+                )
+            identity = sandbox.id
+            if sandbox.phase == openshell_pb2.SANDBOX_PHASE_COMPLETED:
+                return sandbox
+            if sandbox.phase in (
+                openshell_pb2.SANDBOX_PHASE_ERROR,
+                openshell_pb2.SANDBOX_PHASE_STOPPED,
+                openshell_pb2.SANDBOX_PHASE_DELETING,
+            ):
+                raise SandboxError(
+                    f"sandbox {name} entered {openshell_pb2.SandboxPhase.Name(sandbox.phase)} before completion"
+                )
+            time.sleep(max(0.0, min(poll_interval, deadline - time.monotonic())))
+        raise SandboxError(f"sandbox {name} did not complete within timeout")
 
 
 class SandboxTemplateClient:

@@ -28,6 +28,7 @@ from openshell._proto import openshell_pb2_grpc as rpc
 class Gateway(rpc.OpenShellServicer):
     def __init__(self):
         self.requests = []
+        self.snapshots = []
         self.started = asyncio.Event()
         self.cancelled = asyncio.Event()
 
@@ -41,14 +42,19 @@ class Gateway(rpc.OpenShellServicer):
                 await asyncio.Future()
             finally:
                 self.cancelled.set()
+        identity, phase = (
+            self.snapshots.pop(0)
+            if self.snapshots
+            else ("identity", pb.SANDBOX_PHASE_READY)
+        )
         return pb.SandboxResponse(
             sandbox=pb.Sandbox(
                 metadata=dm.ObjectMeta(
-                    id="identity",
+                    id=identity,
                     name=request.name,
                     workspace=request.workspace_scope.workspace,
                 ),
-                status=pb.SandboxStatus(phase=pb.SANDBOX_PHASE_READY, exit_code=0),
+                status=pb.SandboxStatus(phase=phase, exit_code=0),
             )
         )
 
@@ -126,6 +132,23 @@ class Gateway(rpc.OpenShellServicer):
             ],
             buffer_total=42,
         )
+
+    async def WatchSandbox(self, request, context):
+        self.requests.append((request, context.invocation_metadata()))
+        if request.resume_after_cursor == "expired":
+            await context.abort(grpc.StatusCode.OUT_OF_RANGE, "cursor expired")
+        yield pb.SandboxStreamEvent(
+            log=pb.SandboxLogLine(message="log"), cursor="cursor-1"
+        )
+        yield pb.SandboxStreamEvent(
+            warning=pb.SandboxStreamWarning(message="events dropped")
+        )
+        if request.sandbox == "blocked":
+            self.started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                self.cancelled.set()
 
 
 @asynccontextmanager
@@ -309,3 +332,67 @@ async def test_services_logs_and_session_scope(asynchronous):
                 await invoke(session.get_logs, since=datetime(2026, 1, 1))
         finally:
             await invoke(client.close)
+
+
+async def test_watch_preserves_cursors_warnings_and_cancels():
+    async with (
+        gateway() as (service, target),
+        AsyncSandboxClient(target, bearer_token="watch-token") as client,
+    ):
+        stream = client.watch(
+            "blocked",
+            workspace="team",
+            follow_logs=True,
+            resume_after_cursor="previous",
+        )
+        event = await anext(stream)
+        assert event.cursor == "cursor-1"
+        warning = await anext(stream)
+        assert warning.WhichOneof("payload") == "warning"
+        assert warning.cursor == ""
+        await asyncio.wait_for(service.started.wait(), 2)
+        await stream.aclose()
+        await asyncio.wait_for(service.cancelled.wait(), 2)
+        request, metadata = service.requests[-1]
+        assert request.resume_after_cursor == "previous"
+        assert ("authorization", "Bearer watch-token") in metadata
+        with pytest.raises(GatewayError) as failure:
+            async for _ in client.watch(
+                "worker", workspace="team", resume_after_cursor="expired"
+            ):
+                pass
+        assert failure.value.code() == grpc.StatusCode.OUT_OF_RANGE
+        assert len(service.requests) == 2  # No hidden reconnect or cursor reset.
+
+
+async def test_wait_completed_pins_identity_and_checks_terminal_outcomes():
+    async with gateway() as (service, target), AsyncSandboxClient(target) as client:
+        service.snapshots = [
+            ("one", pb.SANDBOX_PHASE_READY),
+            ("one", pb.SANDBOX_PHASE_COMPLETED),
+        ]
+        completed = await client.wait_completed(
+            "worker", workspace="team", timeout_seconds=1, poll_interval=0.001
+        )
+        assert completed.id == "one"
+        assert completed.status.exit_code == 0
+        service.snapshots = [("replacement", pb.SANDBOX_PHASE_COMPLETED)]
+        with pytest.raises(SandboxError, match="replaced"):
+            await client.wait_completed(
+                "worker", workspace="team", expected_sandbox_id="one"
+            )
+        for phase in (
+            pb.SANDBOX_PHASE_ERROR,
+            pb.SANDBOX_PHASE_STOPPED,
+            pb.SANDBOX_PHASE_DELETING,
+        ):
+            service.snapshots = [("one", phase)]
+            with pytest.raises(SandboxError, match="before completion"):
+                await client.wait_completed("worker", workspace="team")
+        with pytest.raises(ValueError, match="poll_interval"):
+            await client.wait_completed("worker", workspace="team", poll_interval=0)
+        with pytest.raises(GatewayError) as failure:
+            await client.wait_completed(
+                "blocked", workspace="team", timeout_seconds=0.05
+            )
+        assert failure.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
