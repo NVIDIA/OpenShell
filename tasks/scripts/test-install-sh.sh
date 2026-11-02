@@ -851,9 +851,17 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  openshell-0.1.
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  openshell-gateway-0.1.5-1.x86_64.rpm
 EOF
 
+# gawk warns on bad regex escapes; mawk does not. Prefer gawk when present.
+rpm_path="$PATH"
+if gawk_bin="$(command -v gawk)"; then
+  mkdir "${tmpdir}/gawk-bin"
+  ln -s "$gawk_bin" "${tmpdir}/gawk-bin/awk"
+  rpm_path="${tmpdir}/gawk-bin:${PATH}"
+fi
+
 rpm_err="${tmpdir}/rpm_err"
-if [ "$(find_rpm_asset "${tmpdir}/checksums" x86_64 openshell 2>"$rpm_err")" != "openshell-0.1.5-1.x86_64.rpm" ] ||
-  [ "$(find_rpm_asset "${tmpdir}/checksums" x86_64 openshell-gateway 2>>"$rpm_err")" != "openshell-gateway-0.1.5-1.x86_64.rpm" ]; then
+if [ "$(PATH="$rpm_path" find_rpm_asset "${tmpdir}/checksums" x86_64 openshell 2>"$rpm_err")" != "openshell-0.1.5-1.x86_64.rpm" ] ||
+  [ "$(PATH="$rpm_path" find_rpm_asset "${tmpdir}/checksums" x86_64 openshell-gateway 2>>"$rpm_err")" != "openshell-gateway-0.1.5-1.x86_64.rpm" ]; then
   echo "FAIL: RPM fallback must match a literal dot" >&2
   exit 1
 fi
