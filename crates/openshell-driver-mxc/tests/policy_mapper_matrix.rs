@@ -1114,6 +1114,7 @@ fn handled_fields_inventory() {
             include_workdir: false,
             read_only: vec!["/usr".into()],
             read_write: vec!["/work".into()],
+            audit_paths: Vec::new(),
         }),
         landlock: Some(LandlockPolicy {
             compatibility: "best_effort".into(),

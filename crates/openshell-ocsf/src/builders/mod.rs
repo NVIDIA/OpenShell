@@ -96,6 +96,7 @@ mod api_activity;
 mod authentication;
 mod base;
 mod config;
+mod file;
 mod finding;
 mod http;
 mod lifecycle;
@@ -107,6 +108,7 @@ pub use api_activity::ApiActivityBuilder;
 pub use authentication::AuthenticationBuilder;
 pub use base::BaseEventBuilder;
 pub use config::ConfigStateChangeBuilder;
+pub use file::FileActivityBuilder;
 pub use finding::DetectionFindingBuilder;
 pub use http::HttpActivityBuilder;
 pub use lifecycle::AppLifecycleBuilder;
@@ -292,6 +294,16 @@ pub(crate) fn sample_events(ctx: &EventContext) -> Vec<(&'static str, crate::Ocs
 
     let peer = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5));
     vec![
+        (
+            "file_activity",
+            FileActivityBuilder::new(
+                ctx,
+                "/sandbox/project/.env",
+                Process::new("python3", 42).with_path("/usr/bin/python3"),
+                "read",
+            )
+            .build(),
+        ),
         (
             "network_activity",
             NetworkActivityBuilder::new(ctx)

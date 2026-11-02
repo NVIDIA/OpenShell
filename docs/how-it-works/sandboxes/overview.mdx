@@ -206,6 +206,11 @@ openshell sandbox create --from localhost/my-image:latest
 For a remote gateway, push the image to a registry that the gateway can pull
 from and use that registry image reference.
 
+If the image starts code outside its workspace, include the code directory in
+`filesystem_policy.read_only` before creating the sandbox. See [Sandbox User
+Identity](/how-it-works/sandboxes/runtimes#sandbox-user-identity) for an
+`/app/agent.py` example and how Docker and Podman use an image's `WORKDIR`.
+
 <Warning>
 **Pre-0.1.0 breaking change:** `openshell sandbox create --from ./Dockerfile`
 and directory sources no longer build images. Bare catalog names are no longer

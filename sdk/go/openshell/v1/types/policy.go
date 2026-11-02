@@ -151,8 +151,7 @@ type MiddlewareEndpointSelector struct {
 	Exclude []string
 }
 
-// FilesystemPolicy controls which directories the sandbox can access
-// in read-only or read-write mode.
+// FilesystemPolicy controls directory access and optional watched file opens.
 type FilesystemPolicy struct {
 	// IncludeWorkdir auto-includes the working directory as read-write.
 	IncludeWorkdir bool
@@ -162,6 +161,9 @@ type FilesystemPolicy struct {
 	// ReadWrite is the list of read-write directory paths.
 	// Nil means no read-write directories; an empty slice is distinct from nil.
 	ReadWrite []string
+	// AuditPaths contains absolute globs for observed file open attempts.
+	// Nil disables file activity events; an empty slice is distinct from nil.
+	AuditPaths []string
 }
 
 // LandlockPolicy configures the Linux Landlock LSM for filesystem restriction enforcement.

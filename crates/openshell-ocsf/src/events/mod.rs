@@ -9,6 +9,7 @@ mod authentication;
 pub(crate) mod base_event;
 mod config_state_change;
 mod detection_finding;
+mod file_activity;
 mod http_activity;
 mod network_activity;
 mod process_activity;
@@ -21,6 +22,7 @@ pub use authentication::AuthenticationEvent;
 pub use base_event::{BaseEvent, BaseEventData};
 pub use config_state_change::DeviceConfigStateChangeEvent;
 pub use detection_finding::DetectionFindingEvent;
+pub use file_activity::FileActivityEvent;
 pub use http_activity::HttpActivityEvent;
 pub use network_activity::NetworkActivityEvent;
 pub use process_activity::ProcessActivityEvent;
@@ -43,6 +45,8 @@ pub enum OcsfEvent {
     SshActivity(SshActivityEvent),
     /// Process Activity [1007]
     ProcessActivity(ProcessActivityEvent),
+    /// File System Activity [1001]
+    FileActivity(FileActivityEvent),
     /// Authentication [3002]
     Authentication(AuthenticationEvent),
     /// Detection Finding [2004]
@@ -64,6 +68,7 @@ impl Serialize for OcsfEvent {
             Self::HttpActivity(e) => e.serialize(serializer),
             Self::SshActivity(e) => e.serialize(serializer),
             Self::ProcessActivity(e) => e.serialize(serializer),
+            Self::FileActivity(e) => e.serialize(serializer),
             Self::Authentication(e) => e.serialize(serializer),
             Self::DetectionFinding(e) => e.serialize(serializer),
             Self::ApplicationLifecycle(e) => e.serialize(serializer),
@@ -96,6 +101,9 @@ impl<'de> Deserialize<'de> for OcsfEvent {
                 .map_err(serde::de::Error::custom),
             1007 => serde_json::from_value::<ProcessActivityEvent>(value)
                 .map(Self::ProcessActivity)
+                .map_err(serde::de::Error::custom),
+            1001 => serde_json::from_value::<FileActivityEvent>(value)
+                .map(Self::FileActivity)
                 .map_err(serde::de::Error::custom),
             3002 => serde_json::from_value::<AuthenticationEvent>(value)
                 .map(Self::Authentication)
@@ -131,6 +139,7 @@ impl OcsfEvent {
             Self::HttpActivity(_) => 4002,
             Self::SshActivity(_) => 4007,
             Self::ProcessActivity(_) => 1007,
+            Self::FileActivity(_) => 1001,
             Self::Authentication(_) => 3002,
             Self::DetectionFinding(_) => 2004,
             Self::ApplicationLifecycle(_) => 6002,
@@ -148,6 +157,7 @@ impl OcsfEvent {
             Self::HttpActivity(e) => &e.base,
             Self::SshActivity(e) => &e.base,
             Self::ProcessActivity(e) => &e.base,
+            Self::FileActivity(e) => &e.base,
             Self::Authentication(e) => &e.base,
             Self::DetectionFinding(e) => &e.base,
             Self::ApplicationLifecycle(e) => &e.base,

@@ -45,6 +45,17 @@ podman logs <sandbox-container>
 
 The sandbox runtime also emits OCSF shorthand events, including process-launch and Landlock filesystem events, into these container logs when its diagnostic log filter permits them. These runtime-originated events are not pushed to the gateway log stream or included in the supervisor's JSONL file. Collect workload container logs separately from supervisor logs to retain both sources.
 
+With `filesystem_policy.audit_paths` configured, matching open attempts appear
+here as `FILE:OPEN` events. `OBSERVED` means the runtime saw the syscall request;
+the event does not report whether Landlock or the filesystem allowed it.
+The path is workload-supplied text, not a resolved path. A rate-limit summary
+appears as a Base Event with `unmapped.dropped_count` when matching events are
+suppressed.
+
+```text
+FILE:OPEN [INFO] OBSERVED python3(42) /sandbox/project/.env [access:read path:requested]
+```
+
 A main process started with a TTY writes only to its attachment; use `openshell sandbox connect` to view that output. Output from `sandbox exec` and SSH sessions does not reach the container log, and `openshell logs` does not include main process output.
 
 When the container runtime falls behind reading the log, the main process blocks on writes, as with any container.

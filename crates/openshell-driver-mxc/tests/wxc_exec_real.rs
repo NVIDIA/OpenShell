@@ -292,6 +292,7 @@ fn dryrun_accepts_split_policy_output() {
             include_workdir: false,
             read_only: Vec::new(),
             read_write: vec![temp_path.clone()],
+            audit_paths: Vec::new(),
         }),
         ..Default::default()
     };
@@ -724,6 +725,7 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
             include_workdir: false,
             read_only: Vec::new(),
             read_write: vec![output_dir_string],
+            audit_paths: Vec::new(),
         }),
         network_policies: std::collections::HashMap::from([(
             "https_example".to_string(),

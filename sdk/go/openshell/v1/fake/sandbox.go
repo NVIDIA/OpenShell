@@ -69,6 +69,7 @@ func copySandboxPolicy(p *types.SandboxPolicy) *types.SandboxPolicy {
 		fs := *p.Filesystem
 		fs.ReadOnly = copyStringSlice(p.Filesystem.ReadOnly)
 		fs.ReadWrite = copyStringSlice(p.Filesystem.ReadWrite)
+		fs.AuditPaths = copyStringSlice(p.Filesystem.AuditPaths)
 		cp.Filesystem = &fs
 	}
 	if p.Landlock != nil {

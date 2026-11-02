@@ -598,6 +598,7 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
             include_workdir: fs.include_workdir,
             read_only: fs.read_only,
             read_write: fs.read_write,
+            audit_paths: fs.audit_paths,
         }),
         landlock: raw.landlock.map(|ll| LandlockPolicy {
             compatibility: match ll.compatibility {
@@ -623,6 +624,7 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
         include_workdir: fs.include_workdir,
         read_only: fs.read_only.clone(),
         read_write: fs.read_write.clone(),
+        audit_paths: fs.audit_paths.clone(),
     });
 
     let landlock = match policy.landlock.as_ref() {
@@ -984,6 +986,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
                 "/var/log".into(),
             ],
             read_write: vec!["/tmp".into(), "/dev/null".into()],
+            audit_paths: Vec::new(),
         }),
         landlock: Some(LandlockPolicy {
             compatibility: "best_effort".into(),
@@ -1016,6 +1019,9 @@ pub fn ensure_sandbox_process_identity(policy: &mut SandboxPolicy) {
 /// Maximum number of filesystem paths (`read_only` + `read_write` combined).
 const MAX_FILESYSTEM_PATHS: usize = 256;
 
+/// Maximum number of watched filesystem path globs.
+const MAX_AUDIT_PATHS: usize = 64;
+
 /// Maximum length of any single filesystem path string.
 const MAX_PATH_LENGTH: usize = 4096;
 
@@ -1034,6 +1040,10 @@ pub enum PolicyViolation {
     FieldTooLong { path: String, length: usize },
     /// Too many filesystem paths in the policy.
     TooManyPaths { count: usize },
+    /// Too many watched path globs in the filesystem policy.
+    TooManyAuditPaths { count: usize },
+    /// A watched path glob has invalid syntax.
+    InvalidAuditPattern { path: String },
     /// A network endpoint uses a TLD wildcard (e.g. `*.com`).
     TldWildcard { policy_name: String, host: String },
     /// A network endpoint has no hostname.
@@ -1145,6 +1155,12 @@ impl fmt::Display for PolicyViolation {
                     f,
                     "too many filesystem paths ({count} > {MAX_FILESYSTEM_PATHS})"
                 )
+            }
+            Self::TooManyAuditPaths { count } => {
+                write!(f, "too many audit paths ({count} > {MAX_AUDIT_PATHS})")
+            }
+            Self::InvalidAuditPattern { path } => {
+                write!(f, "invalid filesystem audit path glob: {path}")
             }
             Self::TldWildcard { policy_name, host } => {
                 write!(
@@ -1404,6 +1420,41 @@ pub fn validate_filesystem_paths(
     }
 }
 
+/// Validate opt-in path globs without resolving them against the host filesystem.
+/// Matching uses the raw path text supplied to open(2), not a canonical path.
+pub fn validate_audit_paths(paths: &[String]) -> std::result::Result<(), Vec<PolicyViolation>> {
+    let mut violations = Vec::new();
+    if paths.len() > MAX_AUDIT_PATHS {
+        violations.push(PolicyViolation::TooManyAuditPaths { count: paths.len() });
+    }
+    for path in paths {
+        if path.len() > MAX_PATH_LENGTH {
+            violations.push(PolicyViolation::FieldTooLong {
+                path: truncate_for_display(path),
+                length: path.len(),
+            });
+        } else if !path.starts_with('/') {
+            violations.push(PolicyViolation::RelativePath { path: path.clone() });
+        } else if Path::new(path)
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            violations.push(PolicyViolation::PathTraversal { path: path.clone() });
+        } else if globset::GlobBuilder::new(path)
+            .literal_separator(true)
+            .build()
+            .is_err()
+        {
+            violations.push(PolicyViolation::InvalidAuditPattern { path: path.clone() });
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum McpVersionPresence {
     RequireMaterialized,
@@ -1447,6 +1498,11 @@ fn validate_sandbox_policy_with_mcp_presence(
 
     if let Some(ref fs) = policy.filesystem
         && let Err(errors) = validate_filesystem_paths(&fs.read_only, &fs.read_write)
+    {
+        violations.extend(errors);
+    }
+    if let Some(ref fs) = policy.filesystem
+        && let Err(errors) = validate_audit_paths(&fs.audit_paths)
     {
         violations.extend(errors);
     }
@@ -1978,6 +2034,29 @@ mod tests {
             !yaml.contains("\nfilesystem:"),
             "unexpected bare `filesystem:` key in YAML output"
         );
+    }
+
+    #[test]
+    fn audit_paths_round_trip_through_authored_and_proto_policies() {
+        let source = "version: 1\nfilesystem_policy:\n  audit_paths: [/sandbox/**/.env]\n";
+        let policy = parse_sandbox_policy(source).unwrap();
+        let paths = &policy.filesystem.as_ref().unwrap().audit_paths;
+        assert_eq!(paths, &["/sandbox/**/.env"]);
+        let rendered = serialize_sandbox_policy(&policy).unwrap();
+        let reparsed = parse_sandbox_policy(&rendered).unwrap();
+        assert_eq!(reparsed.filesystem.unwrap().audit_paths, *paths);
+    }
+
+    #[test]
+    fn audit_paths_reject_relative_traversal_and_invalid_globs() {
+        for (path, expected) in [
+            ("project/.env", "path must be absolute"),
+            ("/sandbox/../secret", "traversal"),
+            ("/sandbox/[", "invalid filesystem audit path glob"),
+        ] {
+            let error = validate_audit_paths(&[path.to_string()]).unwrap_err();
+            assert!(error[0].to_string().contains(expected), "{error:?}");
+        }
     }
 
     /// Verify that JSON serialization uses the same canonical schema keys as YAML.
@@ -3446,6 +3525,7 @@ network_policies:
             include_workdir: true,
             read_only: vec!["/usr/../etc/shadow".into()],
             read_write: vec!["/tmp".into()],
+            audit_paths: Vec::new(),
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(
@@ -3462,6 +3542,7 @@ network_policies:
             include_workdir: true,
             read_only: vec!["usr/lib".into()],
             read_write: vec!["/tmp".into()],
+            audit_paths: Vec::new(),
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(
@@ -3478,6 +3559,7 @@ network_policies:
             include_workdir: true,
             read_only: vec!["/usr".into()],
             read_write: vec!["/".into()],
+            audit_paths: Vec::new(),
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(
@@ -3739,6 +3821,7 @@ network_policies:
             include_workdir: true,
             read_only: many_paths,
             read_write: vec!["/tmp".into()],
+            audit_paths: Vec::new(),
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(
@@ -3756,6 +3839,7 @@ network_policies:
             include_workdir: true,
             read_only: vec![long_path],
             read_write: vec!["/tmp".into()],
+            audit_paths: Vec::new(),
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(

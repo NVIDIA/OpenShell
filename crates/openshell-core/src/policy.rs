@@ -28,6 +28,9 @@ pub struct FilesystemPolicy {
     /// Read-write directory allow list.
     pub read_write: Vec<PathBuf>,
 
+    /// Path globs for observed workload open attempts.
+    pub audit_paths: Vec<String>,
+
     /// Automatically include the workdir as read-write.
     pub include_workdir: bool,
 }
@@ -37,6 +40,7 @@ impl Default for FilesystemPolicy {
         Self {
             read_only: Vec::new(),
             read_write: Vec::new(),
+            audit_paths: Vec::new(),
             include_workdir: true,
         }
     }
@@ -150,6 +154,7 @@ impl From<ProtoFilesystemPolicy> for FilesystemPolicy {
                 .into_iter()
                 .map(|p| PathBuf::from(normalize_path(&p)))
                 .collect(),
+            audit_paths: proto.audit_paths,
             include_workdir: proto.include_workdir,
         }
     }

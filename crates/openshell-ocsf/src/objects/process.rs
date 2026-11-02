@@ -13,6 +13,10 @@ pub struct Process {
     /// Process name (e.g., "python3").
     pub name: String,
 
+    /// Executable path, when observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+
     /// Process ID.
     pub pid: i64,
 
@@ -31,6 +35,7 @@ impl Process {
     pub fn new(name: &str, pid: i64) -> Self {
         Self {
             name: name.to_string(),
+            path: None,
             pid,
             cmd_line: None,
             parent_process: None,
@@ -41,6 +46,13 @@ impl Process {
     #[must_use]
     pub fn with_cmd_line(mut self, cmd_line: &str) -> Self {
         self.cmd_line = Some(cmd_line.to_string());
+        self
+    }
+
+    /// Set the executable path without recording its command line.
+    #[must_use]
+    pub fn with_path(mut self, path: &str) -> Self {
+        self.path = Some(path.to_string());
         self
     }
 

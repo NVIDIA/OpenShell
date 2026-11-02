@@ -1283,6 +1283,8 @@ pub struct SandboxPolicyWire {
     pub version: u32,
     pub read_only: Vec<PathBuf>,
     pub read_write: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_paths: Vec<String>,
     pub include_workdir: bool,
     pub network: NetworkModeWire,
     pub proxy_addr: Option<std::net::SocketAddr>,
@@ -1306,6 +1308,7 @@ impl From<SandboxPolicy> for SandboxPolicyWire {
         let FilesystemPolicy {
             read_only,
             read_write,
+            audit_paths,
             include_workdir,
         } = filesystem;
         let NetworkPolicy { mode, proxy } = network;
@@ -1318,6 +1321,7 @@ impl From<SandboxPolicy> for SandboxPolicyWire {
             version,
             read_only,
             read_write,
+            audit_paths,
             include_workdir,
             network: NetworkModeWire::from(mode),
             proxy_addr: proxy.and_then(|proxy| proxy.http_addr),
@@ -1338,6 +1342,7 @@ impl From<SandboxPolicyWire> for SandboxPolicy {
             filesystem: FilesystemPolicy {
                 read_only: policy.read_only,
                 read_write: policy.read_write,
+                audit_paths: policy.audit_paths,
                 include_workdir: policy.include_workdir,
             },
             network: NetworkPolicy {

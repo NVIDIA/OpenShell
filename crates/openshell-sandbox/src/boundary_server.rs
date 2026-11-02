@@ -3692,6 +3692,15 @@ mod linux {
             }
             let accepted = match &*state {
                 RuntimeState::AwaitingAttach => {
+                    if let Err(error) = self
+                        .network_broker
+                        .configure_file_audit(&policy.audit_paths)
+                    {
+                        return guest_error(
+                            BoundaryErrorKind::Invalid,
+                            format!("invalid filesystem audit configuration: {error}"),
+                        );
+                    }
                     let prepared = match PreparedBoundary::establish(self.network_broker.clone()) {
                         Ok(prepared) => prepared,
                         Err(error) => return guest_error(BoundaryErrorKind::Process, error),

@@ -310,6 +310,8 @@ message SandboxPolicy {
   LandlockCompatibility landlock = 7;
   optional string run_as_user = 8;
   optional string run_as_group = 9;
+  // Path globs whose attempted opens are reported by the sandbox boundary.
+  repeated string audit_paths = 10;
 }
 enum NetworkMode {
   NETWORK_MODE_UNSPECIFIED = 0;

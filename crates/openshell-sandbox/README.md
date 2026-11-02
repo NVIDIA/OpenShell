@@ -1,5 +1,21 @@
 # Sandbox runtime
 
+## Watched file opens
+
+The boundary's existing seccomp open listener observes paths in
+`filesystem_policy.audit_paths`. The watch list is bound at attach, before the
+workload starts. An empty list keeps the ordinary provider-file prefix fast
+path. With a watch list, the broker reads each open path from task memory and
+matches the workload-supplied text against the configured globs. It emits an
+OCSF File System Activity with action Observed; the kernel's later Landlock
+decision is not visible to this listener. Relative paths and symlink aliases
+may not match an absolute watch pattern.
+
+The broker emits at most 100 watched opens per second per sandbox. A timer
+emits one counted Base Event for suppressed matches in each elapsed window.
+These events use the sandbox runtime's OCSF shorthand layer and appear in
+workload container logs, not the supervisor's JSONL file.
+
 `openshell-sandbox` owns the Linux workload isolation mechanisms and their kernel
 qualification probes. The `linux` module contains seccomp notifications and child
 filters, task-memory access, process-signal mediation, procfs descriptor lookup,

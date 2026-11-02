@@ -869,6 +869,7 @@ func TestFakeSandboxCreateWithPolicy(t *testing.T) {
 				IncludeWorkdir: true,
 				ReadOnly:       []string{"/etc", "/usr/share"},
 				ReadWrite:      []string{"/tmp"},
+				AuditPaths:     []string{"/sandbox/**/.env"},
 			},
 			Landlock: &types.LandlockPolicy{
 				Compatibility: "best_effort",
@@ -907,6 +908,7 @@ func TestFakeSandboxCreateWithPolicy(t *testing.T) {
 	assert.True(t, p.Filesystem.IncludeWorkdir)
 	assert.Equal(t, []string{"/etc", "/usr/share"}, p.Filesystem.ReadOnly)
 	assert.Equal(t, []string{"/tmp"}, p.Filesystem.ReadWrite)
+	assert.Equal(t, []string{"/sandbox/**/.env"}, p.Filesystem.AuditPaths)
 
 	require.NotNil(t, p.Landlock)
 	assert.Equal(t, "best_effort", p.Landlock.Compatibility)
@@ -926,19 +928,23 @@ func TestFakeSandboxCreateWithPolicy(t *testing.T) {
 	// Deep-copy isolation: mutate input spec, verify stored copy unchanged
 	spec.Policy.Version = 99
 	spec.Policy.Filesystem.ReadOnly[0] = "mutated"
+	spec.Policy.Filesystem.AuditPaths[0] = "mutated"
 	spec.Policy.NetworkPolicies["web"] = types.NetworkPolicyRule{Name: "mutated"}
 
 	got2, err := sc.Get(ctx, "default", "policy-sb")
 	require.NoError(t, err)
 	assert.Equal(t, uint32(3), got2.Spec.Policy.Version)
 	assert.Equal(t, "/etc", got2.Spec.Policy.Filesystem.ReadOnly[0])
+	assert.Equal(t, "/sandbox/**/.env", got2.Spec.Policy.Filesystem.AuditPaths[0])
 	assert.Equal(t, "web", got2.Spec.Policy.NetworkPolicies["web"].Name)
 
 	// Deep-copy isolation: mutate returned object, verify store unchanged
 	got.Spec.Policy.Filesystem.ReadWrite[0] = "mutated"
+	got.Spec.Policy.Filesystem.AuditPaths[0] = "mutated"
 	got3, err := sc.Get(ctx, "default", "policy-sb")
 	require.NoError(t, err)
 	assert.Equal(t, "/tmp", got3.Spec.Policy.Filesystem.ReadWrite[0])
+	assert.Equal(t, "/sandbox/**/.env", got3.Spec.Policy.Filesystem.AuditPaths[0])
 }
 
 func TestFakeSandboxCreateWithNilPolicy(t *testing.T) {

@@ -233,6 +233,37 @@ impl OcsfEvent {
         let sev = severity_tag(base.severity.as_u8());
 
         match self {
+            Self::FileActivity(event) => {
+                let action = event.action.map_or("", |value| value.label());
+                let actor = event
+                    .actor
+                    .process
+                    .as_ref()
+                    .map(|process| format!("{}({})", process.name, process.pid))
+                    .unwrap_or_default();
+                let path = event
+                    .base
+                    .unmapped
+                    .as_ref()
+                    .and_then(|value| value.get("requested_path"))
+                    .and_then(serde_json::Value::as_str)
+                    .or(event.file.path.as_deref())
+                    .unwrap_or(&event.file.name);
+                let access = event
+                    .base
+                    .unmapped
+                    .as_ref()
+                    .and_then(|value| value.get("access_type"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                format!(
+                    "FILE:OPEN {sev} {} {} {} [access:{} path:requested]",
+                    action.to_uppercase(),
+                    escape_context_field(&actor),
+                    escape_context_field(path),
+                    escape_context_field(access),
+                )
+            }
             Self::NetworkActivity(e) => {
                 let activity = e.base.activity_name.to_uppercase();
                 let action = e.action.map_or(String::new(), |a| a.label().to_uppercase());

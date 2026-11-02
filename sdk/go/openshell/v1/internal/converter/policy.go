@@ -235,6 +235,7 @@ func filesystemPolicyFromProto(f *sbv1.FilesystemPolicy) *types.FilesystemPolicy
 		IncludeWorkdir: f.GetIncludeWorkdir(),
 		ReadOnly:       CopyStringSlice(f.GetReadOnly()),
 		ReadWrite:      CopyStringSlice(f.GetReadWrite()),
+		AuditPaths:     CopyStringSlice(f.GetAuditPaths()),
 	}
 }
 
@@ -246,6 +247,7 @@ func filesystemPolicyToProto(f *types.FilesystemPolicy) *sbv1.FilesystemPolicy {
 		IncludeWorkdir: f.IncludeWorkdir,
 		ReadOnly:       CopyStringSlice(f.ReadOnly),
 		ReadWrite:      CopyStringSlice(f.ReadWrite),
+		AuditPaths:     CopyStringSlice(f.AuditPaths),
 	}
 }
 

@@ -7,9 +7,8 @@
 //! sandbox logging.
 //!
 //! This crate provides:
-//! - **8 OCSF event classes**: Network Activity, HTTP Activity, SSH Activity,
-//!   Process Activity, Detection Finding, Application Lifecycle, Device Config
-//!   State Change, and Base Event
+//! - OCSF event classes for filesystem, network, HTTP, SSH, process, findings,
+//!   lifecycle, configuration, API, authentication, and base events
 //! - **Typed enums and objects**: All OCSF enum and object types used by the
 //!   event classes
 //! - **Builders**: Ergonomic per-class builders with `EventContext` for shared
@@ -39,8 +38,8 @@ pub mod test_support;
 // --- Core event types ---
 pub use events::{
     ApiActivityEvent, ApplicationLifecycleEvent, AuthenticationEvent, BaseEvent, BaseEventData,
-    DetectionFindingEvent, DeviceConfigStateChangeEvent, HttpActivityEvent, NetworkActivityEvent,
-    OcsfEvent, ProcessActivityEvent, SshActivityEvent,
+    DetectionFindingEvent, DeviceConfigStateChangeEvent, FileActivityEvent, HttpActivityEvent,
+    NetworkActivityEvent, OcsfEvent, ProcessActivityEvent, SshActivityEvent,
 };
 
 // --- Enum types ---
@@ -52,7 +51,7 @@ pub use enums::{
 
 // --- Object types ---
 pub use objects::{
-    Actor, AiModel, Api, Attack, ConnectionInfo, Container, Device, Endpoint, Evidence,
+    Actor, AiModel, Api, Attack, ConnectionInfo, Container, Device, Endpoint, Evidence, File,
     FindingInfo, FirewallRule, HttpRequest, HttpResponse, Image, Metadata, OsInfo, Process,
     Product, Remediation, ResourceDetails, Service, Tactic, Technique, Url, User,
 };
@@ -64,7 +63,8 @@ pub use sanitize::sanitize_reason_for_audit;
 pub use builders::{
     ApiActivityBuilder, AppLifecycleBuilder, AuthenticationBuilder, BaseEventBuilder,
     ConfigStateChangeBuilder, ContextRef, DetectionFindingBuilder, EventContext, EventOrigin,
-    HttpActivityBuilder, NetworkActivityBuilder, ProcessActivityBuilder, SshActivityBuilder,
+    FileActivityBuilder, HttpActivityBuilder, NetworkActivityBuilder, ProcessActivityBuilder,
+    SshActivityBuilder,
 };
 
 // --- Tracing layers ---

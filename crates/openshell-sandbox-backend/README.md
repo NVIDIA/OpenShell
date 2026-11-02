@@ -1,5 +1,10 @@
 # OpenShell sandbox backend
 
+The boundary attach policy carries optional `audit_paths` globs for the
+built-in runtime's watched file opens. The field is omitted from the JSON wire
+form when empty and uses a new protobuf field number, so existing attach
+policies retain their previous encoding and behavior.
+
 This crate implements the concrete supervisor-side RPC client and the versioned
 control protocol shared with `openshell-sandbox`.
 

@@ -16067,6 +16067,7 @@ mod tests {
                 include_workdir: true,
                 read_only: vec!["/usr".into()],
                 read_write: vec!["/tmp".into()],
+                audit_paths: vec![],
             }),
             landlock: Some(LandlockPolicy {
                 compatibility: "best_effort".into(),

@@ -43,6 +43,8 @@ message FilesystemPolicy {
   repeated string read_only = 2;
   // Read-write directory allow list.
   repeated string read_write = 3;
+  // Path globs whose attempted opens are reported by the sandbox boundary.
+  repeated string audit_paths = 4;
 }
 
 // Landlock policy configuration.

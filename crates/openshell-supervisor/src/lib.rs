@@ -2321,6 +2321,7 @@ mod baseline_tests {
         policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
             read_only: vec!["/tmp".to_string(), "/proc".to_string()],
             read_write: vec![],
+            audit_paths: vec![],
             include_workdir: false,
         });
         policy.network_policies.insert(
@@ -2464,6 +2465,7 @@ mod baseline_tests {
             filesystem: FilesystemPolicy {
                 read_only: vec![PathBuf::from("/tmp")],
                 read_write: vec![],
+                audit_paths: vec![],
                 include_workdir: false,
             },
             network: NetworkPolicy {

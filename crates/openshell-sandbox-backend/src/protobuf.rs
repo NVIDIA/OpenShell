@@ -102,6 +102,7 @@ impl WireMessage for w::SandboxPolicyWire {
                 .iter()
                 .map(|v| path(v))
                 .collect::<Result<_, _>>()?,
+            audit_paths: self.audit_paths.clone(),
             include_workdir: self.include_workdir,
             network: self.network.to_proto()? as i32,
             proxy_addr: self.proxy_addr.map(|v| v.to_string()),
@@ -115,6 +116,7 @@ impl WireMessage for w::SandboxPolicyWire {
             version: v.version,
             read_only: v.read_only.into_iter().map(PathBuf::from).collect(),
             read_write: v.read_write.into_iter().map(PathBuf::from).collect(),
+            audit_paths: v.audit_paths,
             include_workdir: v.include_workdir,
             network: w::NetworkModeWire::from_proto(enum_value(v.network)?)?,
             proxy_addr: v.proxy_addr.map(|v| parse(&v)).transpose()?,
@@ -818,6 +820,34 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_paths_survive_boundary_wire_and_older_json_omits_them() {
+        let policy = openshell_core::policy::SandboxPolicy {
+            version: 1,
+            filesystem: openshell_core::policy::FilesystemPolicy {
+                audit_paths: vec!["/sandbox/**/.env".into()],
+                ..Default::default()
+            },
+            network: openshell_core::policy::NetworkPolicy::default(),
+            landlock: openshell_core::policy::LandlockPolicy::default(),
+            process: openshell_core::policy::ProcessPolicy::default(),
+        };
+        let wire = w::SandboxPolicyWire::from(policy.clone());
+        let decoded = w::SandboxPolicyWire::from_proto(wire.to_proto().unwrap()).unwrap();
+        assert_eq!(decoded, wire);
+        assert_eq!(decoded.audit_paths, ["/sandbox/**/.env"]);
+        let restored: openshell_core::policy::SandboxPolicy = decoded.into();
+        assert_eq!(
+            restored.filesystem.audit_paths,
+            policy.filesystem.audit_paths
+        );
+
+        let mut older_json = serde_json::to_value(wire).unwrap();
+        older_json.as_object_mut().unwrap().remove("audit_paths");
+        let decoded: w::SandboxPolicyWire = serde_json::from_value(older_json).unwrap();
+        assert!(decoded.audit_paths.is_empty());
+    }
 
     #[test]
     fn request_validation_rejects_missing_context_and_unknown_signal() {

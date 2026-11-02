@@ -210,6 +210,9 @@ pub struct FilesystemPolicy {
     pub read_only: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_write: Vec<String>,
+    /// Path globs whose attempted opens are recorded by the sandbox boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -751,7 +754,7 @@ fn inspect_document(root: &serde_yml::Value) -> InspectionResult {
     inspect_named(
         root.get("filesystem_policy"),
         "filesystem_policy",
-        &["include_workdir", "read_only", "read_write"],
+        &["include_workdir", "read_only", "read_write", "audit_paths"],
     )?;
     inspect_named(root.get("landlock"), "landlock", &["compatibility"])?;
     inspect_named(
@@ -1085,6 +1088,7 @@ impl PolicyDocument {
                 include_workdir: true,
                 read_only: Vec::new(),
                 read_write: Vec::new(),
+                audit_paths: Vec::new(),
             })
     }
 }
@@ -1207,6 +1211,17 @@ mod tests {
         let empty = parse_policy("version: 1\nfilesystem_policy: {}\n").unwrap();
         assert!(absent.effective_filesystem_policy().include_workdir);
         assert!(!empty.effective_filesystem_policy().include_workdir);
+    }
+
+    #[test]
+    fn accepts_opt_in_filesystem_audit_paths() {
+        let policy = parse_policy(
+            "version: 1\nfilesystem_policy:\n  audit_paths:\n    - /sandbox/**/.env\n",
+        )
+        .unwrap();
+        let output = serde_yml::to_string(&policy).unwrap();
+        assert!(output.contains("audit_paths:"));
+        assert!(output.contains("/sandbox/**/.env"));
     }
 
     #[test]

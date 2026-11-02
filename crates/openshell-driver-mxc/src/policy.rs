@@ -206,6 +206,7 @@ mod tests {
                 include_workdir: false,
                 read_only: ro.iter().map(ToString::to_string).collect(),
                 read_write: rw.iter().map(ToString::to_string).collect(),
+                audit_paths: Vec::new(),
             }),
             ..Default::default()
         }
