@@ -889,11 +889,10 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
     if contents.trim().is_empty() {
         return Err(ConfigFileError::MissingVersion);
     }
-    let mut file: ConfigFile =
-        toml::from_str(contents).map_err(|source| ConfigFileError::Parse {
-            path: path.to_path_buf(),
-            source: Box::new(source),
-        })?;
+    let file: ConfigFile = toml::from_str(contents).map_err(|source| ConfigFileError::Parse {
+        path: path.to_path_buf(),
+        source: Box::new(source),
+    })?;
 
     match file.openshell.version {
         Some(SCHEMA_VERSION) => {}
@@ -957,7 +956,6 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
     {
         return Err(ConfigFileError::InvalidDriverTable { name: name.clone() });
     }
-    normalize_legacy_podman_ca_bundle(&mut file)?;
     if file
         .openshell
         .supervisor
@@ -993,8 +991,14 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
 /// Preserve the v0.1.5 Podman TOML key while routing it through the shared
 /// startup validation and staging path. Remove it before driver decoding:
 /// Podman's standalone JSON configuration deliberately rejects this field.
-fn normalize_legacy_podman_ca_bundle(file: &mut ConfigFile) -> Result<(), ConfigFileError> {
+pub(crate) fn normalize_legacy_podman_ca_bundle(
+    file: &mut ConfigFile,
+    selected_driver: &str,
+) -> Result<(), ConfigFileError> {
     const LEGACY_FIELD: &str = "openshell.drivers.podman.additional_ca_bundle";
+    if selected_driver != "podman" {
+        return Ok(());
+    }
     let Some(value) = file
         .openshell
         .drivers
@@ -1770,7 +1774,8 @@ additional_ca_bundle = "/etc/openshell/ca-bundle.crt"
             let tmp = write_tmp(&format!(
                 "{supervisor}[openshell.drivers.podman]\nadditional_ca_bundle = '/etc/ca.pem'\nsocket_path = '/run/podman.sock'\n"
             ));
-            let file = load(tmp.path()).expect("legacy alias accepted");
+            let mut file = load(tmp.path()).expect("legacy alias loads without interpretation");
+            normalize_legacy_podman_ca_bundle(&mut file, "podman").unwrap();
             assert!(file.legacy_podman_ca_bundle_seen);
             assert_eq!(
                 file.openshell.supervisor.network.additional_ca_bundle,
@@ -1796,7 +1801,9 @@ additional_ca_bundle = "/etc/old-ca.pem"
 additional_ca_bundle = "/etc/new-ca.pem"
 "#,
         );
-        let error = load(tmp.path()).expect_err("different trust paths must not be ignored");
+        let mut file = load(tmp.path()).unwrap();
+        let error = normalize_legacy_podman_ca_bundle(&mut file, "podman")
+            .expect_err("different trust paths must not be ignored");
         assert!(
             error
                 .to_string()
@@ -1815,7 +1822,9 @@ additional_ca_bundle = "/etc/new-ca.pem"
             let tmp = write_tmp(&format!(
                 "[openshell.drivers.podman]\nadditional_ca_bundle = {value}\n"
             ));
-            let error = load(tmp.path()).expect_err("invalid alias must fail");
+            let mut file = load(tmp.path()).unwrap();
+            let error = normalize_legacy_podman_ca_bundle(&mut file, "podman")
+                .expect_err("invalid selected alias must fail");
             assert!(
                 error
                     .to_string()
