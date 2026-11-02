@@ -119,6 +119,17 @@ Ensure OpenShell is easy to contribute to for humans and agents.
 | Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
 | Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
 
+### topic:extensions
+
+Extension APIs and integration points, including consistency, general-purpose design, and support for external use cases.
+
+| Name | GitHub ID | Company/Organization |
+| --- | --- | --- |
+| Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
+| Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
+| Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
+| Artem Lytvyn | [@letv1nnn](https://github.com/letv1nnn) | Independent |
+
 ### topic:gpu
 
 GPU scheduling, Kubernetes Dynamic Resource Allocation (DRA), Container Device Interface (CDI) configuration, Multi-Instance GPU (MIG) support, and hardware-accelerated runtime integration.
