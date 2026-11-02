@@ -60,8 +60,23 @@ impl CacheLease {
 /// A shared lease covers the driver and its image workers. Prune takes the
 /// exclusive lease, so it cannot remove a disk being prepared or attached.
 pub fn lock_cache(state_dir: &Path, mode: LockMode) -> io::Result<CacheLease> {
-    fs::create_dir_all(state_dir)?;
+    lock_cache_inner(state_dir, mode, true)
+}
+
+/// Cache commands use an existing state directory, so a typo cannot create a
+/// new empty cache and report a misleading successful inspection.
+pub fn lock_existing_cache(state_dir: &Path, mode: LockMode) -> io::Result<CacheLease> {
+    lock_cache_inner(state_dir, mode, false)
+}
+
+fn lock_cache_inner(state_dir: &Path, mode: LockMode, create: bool) -> io::Result<CacheLease> {
+    if create {
+        fs::create_dir_all(state_dir)?;
+    }
     let state_dir = fs::canonicalize(state_dir)?;
+    if !fs::metadata(&state_dir)?.is_dir() {
+        return Err(io::Error::other("VM driver state path is not a directory"));
+    }
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -126,7 +141,7 @@ fn refuse_live_legacy_driver(state_dir: &Path) -> io::Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CacheMetadata {
-    image_ref: String,
+    image_ref: Option<String>,
     last_used_unix_ms: u64,
 }
 
@@ -149,14 +164,14 @@ pub struct PruneReport {
 
 /// Metadata is best effort: a full disk must not prevent an otherwise ready
 /// sandbox from starting. It is never used to decide whether pruning is safe.
-pub fn record_use(state_dir: &Path, id: &str, image_ref: &str) -> io::Result<()> {
+pub fn record_use(state_dir: &Path, id: &str, image_ref: Option<&str>) -> io::Result<()> {
     let dir = image_cache_dir(state_dir, id);
     require_regular_file(&dir.join(IMAGE_CACHE_ROOTFS_IMAGE))?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?;
     let metadata = CacheMetadata {
-        image_ref: image_ref.to_owned(),
+        image_ref: image_ref.map(str::to_owned),
         last_used_unix_ms: u64::try_from(timestamp.as_millis()).map_err(io::Error::other)?,
     };
     let sequence = METADATA_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -223,7 +238,7 @@ fn list(state_dir: &Path) -> io::Result<Vec<CacheEntry>> {
                 .split_once("-openshell-")
                 .map_or_else(|| "unknown".to_owned(), |(version, _)| version.to_owned()),
             id,
-            image_ref: metadata.as_ref().map(|value| value.image_ref.clone()),
+            image_ref: metadata.as_ref().and_then(|value| value.image_ref.clone()),
             allocated_bytes: disk_metadata.blocks().saturating_mul(512),
             apparent_bytes: disk_metadata.len(),
             last_used_unix_ms: metadata.map(|value| value.last_used_unix_ms),
@@ -418,7 +433,7 @@ mod tests {
             cache_disk(root, id);
         }
         sandbox(root, "kept-stopped", Some(used), Some(bootstrap));
-        record_use(root, unused, "example/agent:v1").unwrap();
+        record_use(root, unused, Some("example/agent:v1")).unwrap();
         let entries = list_locked(root).unwrap();
         assert_eq!(entries.len(), 3);
         let unused_entry = entries.iter().find(|entry| entry.id == unused).unwrap();
@@ -491,6 +506,22 @@ mod tests {
         symlink(&outside, dir.join(IMAGE_CACHE_ROOTFS_IMAGE)).unwrap();
         assert!(prune_locked(root, false).is_err());
         assert_eq!(fs::read(outside).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn live_legacy_driver_socket_blocks_prune() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let unused = "sandbox-prepared-rootfs-ext4-v4-openshell-unused";
+        cache_disk(root, unused);
+        let run_dir = root.join("run");
+        fs::create_dir(&run_dir).unwrap();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(run_dir.join("compute-driver.sock")).unwrap();
+
+        let error = prune_locked(root, false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(image_cache_dir(root, unused).exists());
     }
 
     #[test]

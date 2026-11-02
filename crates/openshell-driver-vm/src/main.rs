@@ -117,12 +117,8 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_BOOTSTRAP_IMAGE", default_value = "")]
     bootstrap_image: String,
 
-    #[arg(
-        long,
-        env = "OPENSHELL_VM_DRIVER_STATE_DIR",
-        default_value = "target/openshell-vm-driver"
-    )]
-    state_dir: PathBuf,
+    #[arg(long, env = "OPENSHELL_VM_DRIVER_STATE_DIR")]
+    state_dir: Option<PathBuf>,
 
     #[arg(long = "guest-tls-ca", env = "OPENSHELL_VM_TLS_CA")]
     guest_tls_ca: Option<PathBuf>,
@@ -306,8 +302,8 @@ fn run_cache_command(state_dir: &Path, command: &CacheCommand) -> Result<()> {
         CacheCommand::ImageCache {
             action: ImageCacheAction::List,
         } => {
-            let lease =
-                image_cache_admin::lock_cache(state_dir, LockMode::Shared).into_diagnostic()?;
+            let lease = image_cache_admin::lock_existing_cache(state_dir, LockMode::Shared)
+                .into_diagnostic()?;
             println!(
                 "ENTRY\tIMAGE\tALLOCATED_BYTES\tAPPARENT_BYTES\tLAST_USED_UNIX_MS\tCACHE_VERSION\tSANDBOXES"
             );
@@ -344,7 +340,8 @@ fn run_cache_command(state_dir: &Path, command: &CacheCommand) -> Result<()> {
             } else {
                 LockMode::Exclusive
             };
-            let lease = image_cache_admin::lock_cache(state_dir, mode).into_diagnostic()?;
+            let lease =
+                image_cache_admin::lock_existing_cache(state_dir, mode).into_diagnostic()?;
             let report = lease.prune_unused(*dry_run).into_diagnostic()?;
             let action = if *dry_run { "would remove" } else { "removed" };
             println!(
@@ -361,8 +358,15 @@ fn run_cache_command(state_dir: &Path, command: &CacheCommand) -> Result<()> {
 async fn main() -> Result<()> {
     let args = Args::parse();
     if let Some(command) = &args.cache_command {
-        return run_cache_command(&args.state_dir, command);
+        let state_dir = args.state_dir.as_deref().ok_or_else(|| {
+            miette::miette!("image-cache requires --state-dir or OPENSHELL_VM_DRIVER_STATE_DIR")
+        })?;
+        return run_cache_command(state_dir, command);
     }
+    let state_dir = args
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("target/openshell-vm-driver"));
     if let Some(request) = args.internal_prepare_image {
         openshell_driver_vm::driver::run_image_preparation_worker(&request)
             .await
@@ -379,7 +383,7 @@ async fn main() -> Result<()> {
     }
 
     let _cache_lease =
-        image_cache_admin::lock_cache(&args.state_dir, LockMode::Shared).into_diagnostic()?;
+        image_cache_admin::lock_cache(&state_dir, LockMode::Shared).into_diagnostic()?;
 
     let _tracing = openshell_otel::install_driver_tracing(
         openshell_driver_vm::otel_tracing::TRACING,
@@ -416,7 +420,7 @@ async fn main() -> Result<()> {
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
         supervisor_otlp,
         supervisor_gateway_name: args.gateway_name.clone(),
-        state_dir: args.state_dir.clone(),
+        state_dir,
         launcher_bin: None,
         default_image: args.default_image.clone(),
         bootstrap_image: args.bootstrap_image.clone(),
@@ -890,7 +894,7 @@ mod tests {
                 action: ImageCacheAction::List
             })
         ));
-        assert_eq!(list.state_dir, PathBuf::from("/tmp/vm-state"));
+        assert_eq!(list.state_dir, Some(PathBuf::from("/tmp/vm-state")));
 
         assert!(Args::try_parse_from(["openshell-driver-vm", "image-cache", "prune"]).is_err());
         let prune = Args::try_parse_from([

@@ -1497,7 +1497,8 @@ Use the VM driver logs and host diagnostics available in the user's environment.
 If the VM host reports `No space left on device`, inspect committed image disks
 with `openshell-driver-vm --state-dir <configured-state-dir> image-cache list`.
 Preview cleanup with `image-cache prune --unused --dry-run` using the same
-`--state-dir`. Stop the VM gateway before running `image-cache prune --unused`
+`--state-dir`. The state directory must already exist. Stop the VM gateway and
+any older standalone VM driver before running `image-cache prune --unused`
 without `--dry-run`; the driver protects persisted sandbox references and
 refuses cleanup while its process holds the cache lease.
 

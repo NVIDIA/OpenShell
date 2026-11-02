@@ -166,7 +166,7 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | Configuration key | Default | Purpose |
 |---|---|---|
 | `grpc_endpoint` | empty | Required. URL the native host supervisor uses to reach the gateway. Host loopback such as `http://127.0.0.1:<port>` is valid. Legacy guest aliases are normalized to host loopback. This endpoint is never sent into the VM. |
-| `state_dir` | `target/openshell-vm-driver` | Per-sandbox overlay disks, console logs, image cache, and private `run/compute-driver.sock` UDS. Relative paths are resolved to absolute paths at driver startup. |
+| `state_dir` | OpenShell state directory under `vm-driver` (fallback: `target/openshell-vm-driver`) | Per-sandbox overlay disks, console logs, image cache, and private `run/compute-driver.sock` UDS. Relative paths are resolved to absolute paths at driver startup. |
 | `driver_dir` | unset | Override the directory searched for `openshell-driver-vm`. |
 | `default_image` | OpenShell base image | Sandbox image used when a create request omits one. |
 | `bootstrap_image` | unset | VM runtime image used as the immutable bootstrap root disk. Falls back only to the operator-configured `default_image`; the driver refuses to start when both are empty. |
@@ -241,8 +241,8 @@ At startup, the driver reclaims inactive attempts in this directory. It preserve
 
 ### Inspect and prune image disks
 
-Run the VM driver binary on the gateway host with the same `state_dir` configured
-for the gateway:
+Run the VM driver binary on the gateway host. Pass the gateway's existing
+`state_dir` explicitly; cache commands reject an omitted or missing state directory:
 
 ```shell
 openshell-driver-vm --state-dir /path/to/vm-driver-state image-cache list
@@ -252,8 +252,10 @@ openshell-driver-vm --state-dir /path/to/vm-driver-state image-cache prune --unu
 `list` reports each committed root disk's cache ID, image reference, allocated
 and apparent bytes, last-use Unix timestamp in milliseconds, cache layout
 version, and persisted sandbox IDs that reference it. Older entries without
-cache metadata show `-` for the image reference and last use. New cache uses
-record this metadata without changing the disk contents.
+cache metadata show `-` for the image reference and last use. Disks prepared
+from a rootfs tar show `-` for image reference because no container image
+produced them. New cache uses record this metadata without changing the disk
+contents.
 
 Stop the VM gateway before removing entries, then run:
 
@@ -265,10 +267,11 @@ Prune removes only committed disks that no persisted sandbox references. It
 leaves disks referenced by stopped sandboxes in place. For sandboxes created
 before bootstrap identities were persisted, it conservatively preserves all
 bootstrap disks. Prune refuses to run while a current driver holds the state
-lock or an older driver is reachable at the default state socket. The reported
-bytes are the disks' allocated bytes before removal; filesystem snapshots and
-shared blocks can make actual free space differ. Nothing is removed
-automatically.
+lock or an older driver is reachable at the default state socket. Stop older
+standalone drivers that use a custom socket explicitly; their socket is outside
+this check. The reported bytes are the disks' allocated bytes before removal.
+Filesystem snapshots and shared blocks can make actual free space differ.
+Nothing is removed automatically.
 
 Each sandbox gets its own sparse writable
 `<state-dir>/sandboxes/<id>/overlay.ext4`. Guest init mounts overlayfs as `/`

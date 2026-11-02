@@ -234,19 +234,21 @@ The driver looks up sandbox images in local Docker or Podman before pulling from
 
 Registry downloads must match the resolved image digest, including the selected platform for multi-platform images. A mismatch fails image preparation. After upgrading, the driver rebuilds older bootstrap and prepared-image cache entries on first use, so the first sandbox start can take longer.
 
-The VM driver keeps old prepared disks until you prune them. On the gateway
-host, use the VM driver binary with the gateway's configured `state_dir` to
-inspect the cache and preview unused entries:
+The VM driver keeps old image disks until you prune them. On the gateway
+host, pass the gateway's existing `state_dir` explicitly to the VM driver
+binary to inspect the cache and preview unused entries:
 
 ```shell
 openshell-driver-vm --state-dir /path/to/vm-driver-state image-cache list
 openshell-driver-vm --state-dir /path/to/vm-driver-state image-cache prune --unused --dry-run
 ```
 
-Stop the VM gateway before running `image-cache prune --unused` without
-`--dry-run`. Prune preserves disks referenced by kept sandboxes, including
+Stop the VM gateway and any older standalone VM driver using the same
+state directory before running `image-cache prune --unused` without `--dry-run`.
+Prune preserves disks referenced by kept sandboxes, including
 stopped ones. Older entries can lack an image reference or last-use timestamp
-in the listing.
+in the listing. Disks prepared from a rootfs tar have no container image
+reference in the listing.
 
 VM sandboxes have no network interface. All traffic flows through the OpenShell supervisor on the host. For networks that require a corporate proxy, the VM driver accepts the same `https_proxy` and `proxy_*` options as Podman. To reach a proxy on the gateway host, use `http://host.openshell.internal:<port>`.
 
