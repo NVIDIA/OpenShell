@@ -21,12 +21,19 @@
 //!
 //! Tests find the gateway the same way the `openshell` CLI does (see
 //! [`gateway`]).
+//!
+//! `#[testkit::test]` also registers each test, so a binary that calls
+//! [`main`] is a test program that lists, runs, and reports its tests without
+//! Cargo (see [`program`]).
 
 mod cli;
 mod context;
 mod error;
 pub mod gateway;
 mod poll;
+pub mod program;
+mod ready;
+mod registry;
 mod run;
 
 pub use cli::{BIN_ENV, CLI_TIMEOUT, Cli, CliOutput};
@@ -38,10 +45,15 @@ pub use error::{Error, Result, ResultExt};
 pub use gateway::Gateway;
 pub use openshell_sdk as sdk;
 pub use poll::{Poll, poll_until};
+pub use program::main;
+pub use ready::check as check_ready;
+pub use registry::Test;
 pub use run::{TestInfo, run};
 pub use testkit_macros::test;
 
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::registry::TESTS;
+    pub use linkme;
     pub use tokio;
 }

@@ -243,6 +243,23 @@ mod tests {
 
     use super::Gateway;
 
+    #[test]
+    fn unsupported_auth_modes_are_named() {
+        let error = Gateway::registered(
+            "edge".to_string(),
+            "https://gateway.example".to_string(),
+            Some("oidc"),
+            "/nonexistent".into(),
+            "default".to_string(),
+            false,
+        )
+        .expect_err("OIDC is not supported");
+        assert!(
+            error.to_string().contains("gateway edge uses oidc auth"),
+            "{error}"
+        );
+    }
+
     /// A peer that accepts connections and never answers must not hang the
     /// readiness wait: the timeout covers the connect and health calls too.
     #[tokio::test]
