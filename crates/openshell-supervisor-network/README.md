@@ -58,9 +58,10 @@ trace relay is active.
 Allowed CONNECT and transparent TCP `NetworkActivity` events record the
 immediate upstream socket's local and peer addresses in
 `unmapped.upstream_socket_local` and `unmapped.upstream_socket_peer` when both
-socket address lookups succeed. A lookup failure omits the tuple without
-stopping the allowed connection. The local address is captured from the
-connected `PrefixedStream` before relay starts.
+socket address lookups succeed. A local lookup failure omits the local
+address but preserves the existing transparent TCP peer field. A peer lookup
+failure omits the tuple. Neither failure stops the allowed connection. The
+local address is captured from the connected `PrefixedStream` before relay starts.
 For a direct connection without address translation, it matches the peer
 address observed by the receiver.
 When the destination uses an upstream proxy, the peer address names that

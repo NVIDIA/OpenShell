@@ -1426,7 +1426,7 @@ async fn handle_transparent_tcp_connection(
             normalized_domain: &host,
             approved_real_ip_candidates: &approved_real_ip_candidates,
             connected_real_destination,
-            upstream_socket_tuple: upstream_socket_audit.tuple,
+            upstream_socket_audit,
             dial_mode,
             mapping_id: mapping.record.mapping_id,
             mapping_generation: mapping.record.mapping_generation,
@@ -1450,7 +1450,7 @@ struct TransparentTcpAllowAudit<'a> {
     normalized_domain: &'a str,
     approved_real_ip_candidates: &'a [SocketAddr],
     connected_real_destination: Option<SocketAddr>,
-    upstream_socket_tuple: Option<UpstreamSocketTuple>,
+    upstream_socket_audit: UpstreamSocketAudit,
     dial_mode: &'a str,
     mapping_id: uuid::Uuid,
     mapping_generation: u64,
@@ -1524,10 +1524,13 @@ fn build_transparent_tcp_allow_ocsf_event(
         )
         .message(message)
         .status_detail("transparent_tcp_allowed");
-    if let Some(tuple) = audit.upstream_socket_tuple {
+    if let Some(tuple) = audit.upstream_socket_audit.tuple {
         builder = builder
             .unmapped("upstream_socket_local", tuple.local.to_string())
             .unmapped("upstream_socket_peer", tuple.peer.to_string());
+    } else if let Some(peer) = audit.upstream_socket_audit.peer {
+        // Preserve the field emitted before local socket capture was added.
+        builder = builder.unmapped("upstream_socket_peer", peer.to_string());
     }
     if let Some(destination) = audit.connected_real_destination {
         builder = builder.unmapped("connected_real_destination", destination.to_string());
@@ -10638,10 +10641,13 @@ network_policies:
                 "172.18.0.5:6379".parse().unwrap(),
             ],
             connected_real_destination: Some("172.18.0.5:6379".parse().unwrap()),
-            upstream_socket_tuple: Some(UpstreamSocketTuple {
-                local: "127.0.0.1:43000".parse().unwrap(),
-                peer: "172.18.0.5:6379".parse().unwrap(),
-            }),
+            upstream_socket_audit: UpstreamSocketAudit {
+                peer: Some("172.18.0.5:6379".parse().unwrap()),
+                tuple: Some(UpstreamSocketTuple {
+                    local: "127.0.0.1:43000".parse().unwrap(),
+                    peer: "172.18.0.5:6379".parse().unwrap(),
+                }),
+            },
             dial_mode: "direct",
             mapping_id,
             mapping_generation: 4,
@@ -10698,6 +10704,11 @@ network_policies:
         assert!(shorthand.contains("synthetic=198.18.0.7:6379"));
         assert!(shorthand.contains("real=172.18.0.5:6379"));
         assert!(shorthand.contains(&format!("mapping_id={mapping_id}")));
+        assert!(!shorthand.contains("127.0.0.1:43000"));
+        assert!(
+            !shorthand.contains("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+        assert!(!shorthand.contains("/opt/parent -> helper"));
     }
 
     #[test]
@@ -10708,10 +10719,13 @@ network_policies:
             normalized_domain: "redis.openshell.demo",
             approved_real_ip_candidates: &["172.18.0.4:6379".parse().unwrap()],
             connected_real_destination: Some("172.18.0.4:6379".parse().unwrap()),
-            upstream_socket_tuple: Some(UpstreamSocketTuple {
-                local: "127.0.0.1:43001".parse().unwrap(),
-                peer: "192.0.2.20:3128".parse().unwrap(),
-            }),
+            upstream_socket_audit: UpstreamSocketAudit {
+                peer: Some("192.0.2.20:3128".parse().unwrap()),
+                tuple: Some(UpstreamSocketTuple {
+                    local: "127.0.0.1:43001".parse().unwrap(),
+                    peer: "192.0.2.20:3128".parse().unwrap(),
+                }),
+            },
             dial_mode: "upstream_proxy_validated_ip",
             mapping_id: uuid::Uuid::new_v4(),
             mapping_generation: 4,
@@ -10744,7 +10758,10 @@ network_policies:
             normalized_domain: "redis.openshell.demo",
             approved_real_ip_candidates: &["172.18.0.4:6379".parse().unwrap()],
             connected_real_destination: None,
-            upstream_socket_tuple: None,
+            upstream_socket_audit: UpstreamSocketAudit {
+                peer: None,
+                tuple: None,
+            },
             dial_mode: "direct",
             mapping_id: uuid::Uuid::new_v4(),
             mapping_generation: 4,
@@ -10767,6 +10784,39 @@ network_policies:
                 .unwrap()
                 .contains("real=unavailable")
         );
+    }
+
+    #[test]
+    fn transparent_tcp_keeps_existing_peer_when_local_lookup_fails() {
+        let peer = "192.0.2.20:3128".parse().unwrap();
+        let tuple = capture_upstream_socket_tuple(
+            Err(std::io::Error::other("local lookup failed")),
+            Ok(peer),
+        );
+        let event = build_transparent_tcp_allow_ocsf_event(TransparentTcpAllowAudit {
+            workload: "127.0.0.1:45123".parse().unwrap(),
+            synthetic_destination: "198.18.0.7:6379".parse().unwrap(),
+            normalized_domain: "redis.openshell.demo",
+            approved_real_ip_candidates: &["172.18.0.4:6379".parse().unwrap()],
+            connected_real_destination: Some("172.18.0.4:6379".parse().unwrap()),
+            upstream_socket_audit: UpstreamSocketAudit {
+                peer: Some(peer),
+                tuple,
+            },
+            dial_mode: "upstream_proxy_validated_ip",
+            mapping_id: uuid::Uuid::new_v4(),
+            mapping_generation: 4,
+            mapping_policy_generation: 7,
+            authorization_policy_generation: 7,
+            binary: "/usr/bin/redis-cli",
+            binary_sha256: None,
+            pid: "43",
+            ancestors: &[],
+            policy_name: "redis",
+        });
+        let json = event.to_json().unwrap();
+        assert_eq!(json["unmapped"]["upstream_socket_peer"], peer.to_string());
+        assert!(json["unmapped"].get("upstream_socket_local").is_none());
     }
 
     #[cfg(target_os = "linux")]
