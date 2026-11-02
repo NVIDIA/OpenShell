@@ -23,6 +23,7 @@ from openshell import (
 from openshell._proto import datamodel_pb2 as dm
 from openshell._proto import openshell_pb2 as pb
 from openshell._proto import openshell_pb2_grpc as rpc
+from openshell._proto import sandbox_pb2 as sb
 
 
 class Gateway(rpc.OpenShellServicer):
@@ -53,6 +54,8 @@ class Gateway(rpc.OpenShellServicer):
                     id=identity,
                     name=request.name,
                     workspace=request.workspace_scope.workspace,
+                    resource_version=7,
+                    annotations={"owner": "helix"},
                 ),
                 status=pb.SandboxStatus(phase=phase, exit_code=0),
             )
@@ -149,6 +152,71 @@ class Gateway(rpc.OpenShellServicer):
                 await asyncio.Future()
             finally:
                 self.cancelled.set()
+
+    async def AttachSandboxProvider(self, request, context):
+        self.requests.append((request, context.invocation_metadata()))
+        if request.expected_resource_version not in (0, 7):
+            await context.abort(grpc.StatusCode.ABORTED, "resource version changed")
+        return pb.AttachSandboxProviderResponse(
+            attached=True,
+            receipt=pb.ProviderMutationReceipt(
+                receipt_id="receipt-1", mutation_id="mutation-1"
+            ),
+            sandbox=pb.Sandbox(metadata=dm.ObjectMeta(resource_version=8)),
+        )
+
+    async def DetachSandboxProvider(self, request, context):
+        self.requests.append((request, context.invocation_metadata()))
+        return pb.DetachSandboxProviderResponse(
+            detached=True, receipt=pb.ProviderMutationReceipt(receipt_id="detach-1")
+        )
+
+    async def ListSandboxProviders(self, request, context):
+        self.requests.append((request, context.invocation_metadata()))
+        return pb.ListSandboxProvidersResponse(
+            providers=[dm.Provider(metadata=dm.ObjectMeta(name="github"))]
+        )
+
+    async def GetSandboxProviderStatus(self, request, context):
+        self.requests.append((request, context.invocation_metadata()))
+        return pb.GetSandboxProviderStatusResponse(
+            status=pb.ProviderReadinessStatus(
+                receipt=pb.ProviderMutationReceipt(receipt_id=request.receipt_id),
+                state=pb.PROVIDER_READINESS_STATE_PENDING,
+            )
+        )
+
+    async def GetSandboxConfig(self, request, context):
+        self.requests.append((request, context.invocation_metadata()))
+        return sb.GetSandboxConfigResponse(
+            config_revision=9, configuration_admitted=True
+        )
+
+    async def UpdateConfig(self, request, context):
+        self.requests.append((request, context.invocation_metadata()))
+        return pb.UpdateConfigResponse(
+            version=3,
+            policy_hash="policy-hash",
+            settings_revision=4,
+            annotations=request.annotations,
+        )
+
+    async def GetSandboxPolicyStatus(self, request, context):
+        self.requests.append((request, context.invocation_metadata()))
+        return pb.GetSandboxPolicyStatusResponse(
+            revision=pb.SandboxPolicyRevision(
+                version=request.version, status=pb.POLICY_STATUS_PENDING
+            ),
+            active_version=2,
+        )
+
+    async def ListSandboxPolicies(self, request, context):
+        self.requests.append((request, context.invocation_metadata()))
+        return pb.ListSandboxPoliciesResponse(
+            revisions=[
+                pb.SandboxPolicyRevision(version=1, status=pb.POLICY_STATUS_FAILED)
+            ]
+        )
 
 
 @asynccontextmanager
@@ -396,3 +464,85 @@ async def test_wait_completed_pins_identity_and_checks_terminal_outcomes():
                 "blocked", workspace="team", timeout_seconds=0.05
             )
         assert failure.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_provider_receipts_versions_and_configuration(asynchronous):
+    from openshell import SandboxClient
+    from openshell.types import SandboxPolicy, SettingValue
+
+    async with gateway() as (service, target):
+        client = AsyncSandboxClient(target) if asynchronous else SandboxClient(target)
+
+        async def invoke(method, *args, **kwargs):
+            if asynchronous:
+                return await method(*args, **kwargs)
+            return await asyncio.to_thread(method, *args, **kwargs)
+
+        try:
+            session = await invoke(client.get_session, "worker", workspace="team")
+            assert session.sandbox.resource_version == 7
+            assert session.sandbox.annotations == {"owner": "helix"}
+            attached = await invoke(
+                session.attach_provider,
+                "github",
+                expected_resource_version=7,
+                request_id="attach-1",
+            )
+            assert attached.receipt.receipt_id == "receipt-1"
+            assert attached.receipt.mutation_id == "mutation-1"
+            assert attached.sandbox.metadata.resource_version == 8
+            status = await invoke(
+                session.get_provider_status,
+                "github",
+                receipt_id=attached.receipt.receipt_id,
+            )
+            assert status.state == pb.PROVIDER_READINESS_STATE_PENDING
+            assert status.receipt.receipt_id == "receipt-1"
+            assert [
+                p.metadata.name for p in await invoke(session.list_all_providers)
+            ] == ["github"]
+            detached = await invoke(
+                session.detach_provider, "github", expected_resource_version=8
+            )
+            assert detached.receipt.receipt_id == "detach-1"
+            count = len(service.requests)
+            with pytest.raises(GatewayError) as failure:
+                await invoke(
+                    session.attach_provider, "github", expected_resource_version=1
+                )
+            assert failure.value.code() == grpc.StatusCode.ABORTED
+            assert len(service.requests) == count + 1
+            config = await invoke(session.get_config)
+            assert config.configuration_admitted
+            result = await invoke(
+                session.set_policy,
+                SandboxPolicy(version=1),
+                expected_resource_version=8,
+                annotations={"review": "approved"},
+                request_id="policy-1",
+            )
+            assert result.policy_hash == "policy-hash"
+            request = service.requests[-1][0]
+            assert not getattr(request, "global")
+            assert request.request_id == "policy-1"
+            assert request.expected_resource_version == 8
+            assert dict(result.annotations) == {"review": "approved"}
+            await invoke(
+                session.set_setting,
+                "example",
+                SettingValue(bool_value=False),
+                request_id="setting-1",
+            )
+            request = service.requests[-1][0]
+            assert request.setting_value.WhichOneof("value") == "bool_value"
+            assert not request.setting_value.bool_value
+            status = await invoke(session.get_policy_status, version=result.version)
+            assert status.revision.status == pb.POLICY_STATUS_PENDING
+            assert status.active_version == 2
+            revisions = await invoke(session.list_all_policies)
+            assert revisions[0].status == pb.POLICY_STATUS_FAILED
+            for request, _ in service.requests:
+                assert request.workspace_scope.workspace == "team"
+        finally:
+            await invoke(client.close)

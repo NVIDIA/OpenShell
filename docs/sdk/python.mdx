@@ -251,6 +251,43 @@ from creation to pin the target before the first poll. Its `timeout_seconds`
 bounds polling RPCs and sleeps; `poll_interval` controls the polling frequency.
 Use `exec()` to wait for a separately executed command instead.
 
+## Manage Provider Attachments and Configuration
+
+Use `attach_provider()`, `detach_provider()`, and `list_providers()` on either
+sandbox client or a bound session. Attachment mutations return the complete
+response, including the updated sandbox and a receipt. Persisting an attachment
+does not mean its credentials are installed:
+
+```python
+with SandboxClient.from_active_cluster() as client:
+    sandbox = client.get("worker", workspace="default")
+    result = client.attach_provider(
+        sandbox.name,
+        "github",
+        workspace="default",
+        expected_resource_version=sandbox.resource_version,
+    )
+    status = client.get_provider_status(
+        sandbox.name,
+        "github",
+        workspace="default",
+        receipt_id=result.receipt.receipt_id,
+    )
+    print(status.state)
+```
+
+Use `get_config()` to inspect effective configuration and admission state.
+`set_policy()` and `set_setting()` return the submitted revision details;
+`get_policy_status(version=...)` and `list_policies()` expose application status
+and history. A successful update RPC does not establish that the policy is loaded.
+Sandbox policy changes may alter network policies only; static fields must match
+the create-time policy. These helpers always use sandbox scope.
+
+Mutation helpers accept `expected_resource_version` where the protocol supports
+it. Read it from `SandboxRef.resource_version`; a conflicting change raises
+`GatewayError` with `ABORTED`. The SDK never retries a conflict automatically.
+`SandboxRef.annotations` exposes the gateway's current annotations.
+
 ## Call Generated RPCs
 
 The generated gRPC stubs include concrete request and response types for synchronous `grpc.Channel` and asynchronous `grpc.aio.Channel` connections. Install the dependency type stubs in your development environment for editor signatures and type checking:

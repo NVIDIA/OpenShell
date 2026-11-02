@@ -28,6 +28,7 @@ from ._proto import (
     datamodel_pb2,
     openshell_pb2,
     openshell_pb2_grpc,
+    sandbox_pb2,
 )
 from .errors import _error_mapping_channel, from_grpc_error
 from .mutations import DeletionOutcome, DeletionResult
@@ -590,10 +591,15 @@ class SandboxRef:
     )
     # Stable SSH host identity; absent on older runtimes.
     host_key_fingerprint: str | None = None
+    resource_version: int = 0
+    annotations: Mapping[str, str] = field(
+        default_factory=_ImmutableLabels, compare=False
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "labels", _ImmutableLabels(self.labels))
         object.__setattr__(self, "service_urls", _ImmutableLabels(self.service_urls))
+        object.__setattr__(self, "annotations", _ImmutableLabels(self.annotations))
 
     @property
     def phase(self) -> int:
@@ -645,6 +651,8 @@ class SandboxSession:
         stdin: bytes | None = None,
         timeout_seconds: int | None = None,
         no_login_shell: bool = False,
+        request_id: str | None = None,
+        timeout: float | None = None,
     ) -> ExecResult:
         return self._client.exec(
             self.sandbox.name,
@@ -656,6 +664,8 @@ class SandboxSession:
             stdin=stdin,
             timeout_seconds=timeout_seconds,
             no_login_shell=no_login_shell,
+            request_id=request_id,
+            timeout=timeout,
         )
 
     def exec_python(
@@ -668,6 +678,8 @@ class SandboxSession:
         workdir: str | None = None,
         env: Mapping[str, str] | None = None,
         timeout_seconds: int | None = None,
+        request_id: str | None = None,
+        timeout: float | None = None,
     ) -> ExecResult:
         return self._client.exec_python(
             self.sandbox.name,
@@ -679,32 +691,61 @@ class SandboxSession:
             workdir=workdir,
             env=env,
             timeout_seconds=timeout_seconds,
+            request_id=request_id,
+            timeout=timeout,
         )
 
-    def delete(self, *, allow_missing: bool = False) -> DeletionResult:
+    def delete(
+        self,
+        *,
+        allow_missing: bool = False,
+        request_id: str | None = None,
+        timeout: float | None = None,
+    ) -> DeletionResult:
         return self._client.delete(
-            self.sandbox.name, workspace=self._workspace, allow_missing=allow_missing
+            self.sandbox.name,
+            workspace=self._workspace,
+            allow_missing=allow_missing,
+            request_id=request_id,
+            timeout=timeout,
         )
 
-    def stop(self) -> SandboxRef:
-        self.sandbox = self._client.stop(self.sandbox.name, workspace=self._workspace)
+    def stop(
+        self, *, request_id: str | None = None, timeout: float | None = None
+    ) -> SandboxRef:
+        self.sandbox = self._client.stop(
+            self.sandbox.name,
+            workspace=self._workspace,
+            request_id=request_id,
+            timeout=timeout,
+        )
         return self.sandbox
 
-    def start(self) -> SandboxRef:
-        self.sandbox = self._client.start(self.sandbox.name, workspace=self._workspace)
+    def start(
+        self, *, request_id: str | None = None, timeout: float | None = None
+    ) -> SandboxRef:
+        self.sandbox = self._client.start(
+            self.sandbox.name,
+            workspace=self._workspace,
+            request_id=request_id,
+            timeout=timeout,
+        )
         return self.sandbox
 
-    def suspend(self) -> SandboxRef:
+    def suspend(self, *, timeout: float | None = None) -> SandboxRef:
         self.sandbox = self._client.suspend(
-            self.sandbox.name, workspace=self._workspace
+            self.sandbox.name, workspace=self._workspace, timeout=timeout
         )
         return self.sandbox
 
-    def resume(self, *, restart_if_restore_fails: bool = False) -> SandboxRef:
+    def resume(
+        self, *, restart_if_restore_fails: bool = False, timeout: float | None = None
+    ) -> SandboxRef:
         self.sandbox = self._client.resume(
             self.sandbox.name,
             workspace=self._workspace,
             restart_if_restore_fails=restart_if_restore_fails,
+            timeout=timeout,
         )
         return self.sandbox
 
@@ -879,6 +920,168 @@ class SandboxSession:
             timeout_seconds=timeout_seconds,
             poll_interval=poll_interval,
             expected_sandbox_id=expected_sandbox_id,
+        )
+
+    def attach_provider(
+        self,
+        provider: str,
+        *,
+        expected_resource_version: int = 0,
+        request_id: str | None = None,
+        timeout: float | None = None,
+    ) -> openshell_pb2.AttachSandboxProviderResponse:
+        return self._client.attach_provider(
+            self.sandbox.name,
+            provider,
+            workspace=self._workspace,
+            expected_resource_version=expected_resource_version,
+            request_id=request_id,
+            timeout=timeout,
+        )
+
+    def detach_provider(
+        self,
+        provider: str,
+        *,
+        expected_resource_version: int = 0,
+        request_id: str | None = None,
+        timeout: float | None = None,
+    ) -> openshell_pb2.DetachSandboxProviderResponse:
+        return self._client.detach_provider(
+            self.sandbox.name,
+            provider,
+            workspace=self._workspace,
+            expected_resource_version=expected_resource_version,
+            request_id=request_id,
+            timeout=timeout,
+        )
+
+    def list_providers(
+        self,
+        *,
+        page_size: int = 100,
+        page_token: str = "",
+        timeout: float | None = None,
+    ) -> Pager[datamodel_pb2.Provider]:
+        return self._client.list_providers(
+            self.sandbox.name,
+            workspace=self._workspace,
+            page_size=page_size,
+            page_token=page_token,
+            timeout=timeout,
+        )
+
+    def list_all_providers(
+        self,
+        *,
+        page_size: int = 100,
+        page_token: str = "",
+        timeout: float | None = None,
+    ) -> builtins.list[datamodel_pb2.Provider]:
+        return self._client.list_all_providers(
+            self.sandbox.name,
+            workspace=self._workspace,
+            page_size=page_size,
+            page_token=page_token,
+            timeout=timeout,
+        )
+
+    def get_provider_status(
+        self, provider: str, *, receipt_id: str = "", timeout: float | None = None
+    ) -> openshell_pb2.ProviderReadinessStatus:
+        return self._client.get_provider_status(
+            self.sandbox.name,
+            provider,
+            workspace=self._workspace,
+            receipt_id=receipt_id,
+            timeout=timeout,
+        )
+
+    def get_config(
+        self, *, timeout: float | None = None
+    ) -> sandbox_pb2.GetSandboxConfigResponse:
+        return self._client.get_config(
+            self.sandbox.name, workspace=self._workspace, timeout=timeout
+        )
+
+    def set_policy(
+        self,
+        policy: sandbox_pb2.SandboxPolicy,
+        *,
+        expected_resource_version: int = 0,
+        annotations: Mapping[str, str] | None = None,
+        request_id: str | None = None,
+        timeout: float | None = None,
+    ) -> openshell_pb2.UpdateConfigResponse:
+        return self._client.set_policy(
+            self.sandbox.name,
+            policy,
+            workspace=self._workspace,
+            expected_resource_version=expected_resource_version,
+            annotations=annotations,
+            request_id=request_id,
+            timeout=timeout,
+        )
+
+    def set_setting(
+        self,
+        key: str,
+        value: sandbox_pb2.SettingValue,
+        *,
+        expected_resource_version: int = 0,
+        annotations: Mapping[str, str] | None = None,
+        request_id: str | None = None,
+        timeout: float | None = None,
+    ) -> openshell_pb2.UpdateConfigResponse:
+        return self._client.set_setting(
+            self.sandbox.name,
+            key,
+            value,
+            workspace=self._workspace,
+            expected_resource_version=expected_resource_version,
+            annotations=annotations,
+            request_id=request_id,
+            timeout=timeout,
+        )
+
+    def get_policy_status(
+        self, *, version: int = 0, timeout: float | None = None
+    ) -> openshell_pb2.GetSandboxPolicyStatusResponse:
+        return self._client.get_policy_status(
+            self.sandbox.name,
+            workspace=self._workspace,
+            version=version,
+            timeout=timeout,
+        )
+
+    def list_policies(
+        self,
+        *,
+        page_size: int = 100,
+        page_token: str = "",
+        timeout: float | None = None,
+    ) -> Pager[openshell_pb2.SandboxPolicyRevision]:
+        return self._client.list_policies(
+            self.sandbox.name,
+            workspace=self._workspace,
+            page_size=page_size,
+            page_token=page_token,
+            timeout=timeout,
+        )
+
+    def list_all_policies(
+        self,
+        *,
+        page_size: int = 100,
+        page_token: str = "",
+        timeout: float | None = None,
+    ) -> builtins.list[openshell_pb2.SandboxPolicyRevision]:
+        return self._client.list_all_policies(
+            self.sandbox.name,
+            workspace=self._workspace,
+            page_size=page_size,
+            page_token=page_token,
+            timeout=timeout,
         )
 
 
@@ -1176,6 +1379,8 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
+        request_id: str | None = None,
+        timeout: float | None = None,
     ) -> SandboxSession:
         return SandboxSession(
             self,
@@ -1185,6 +1390,8 @@ class SandboxClient:
                 name=name,
                 labels=labels,
                 service_exposures=service_exposures,
+                request_id=request_id,
+                timeout=timeout,
             ),
         )
 
@@ -1197,6 +1404,8 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
+        request_id: str | None = None,
+        timeout: float | None = None,
     ) -> SandboxSession:
         return SandboxSession(
             self,
@@ -1207,6 +1416,8 @@ class SandboxClient:
                 name=name,
                 labels=labels,
                 service_exposures=service_exposures,
+                request_id=request_id,
+                timeout=timeout,
             ),
         )
 
@@ -1228,8 +1439,12 @@ class SandboxClient:
         )
         return _sandbox_ref(response.sandbox)
 
-    def get_session(self, name: str, *, workspace: str) -> SandboxSession:
-        return SandboxSession(self, self.get(name, workspace=workspace))
+    def get_session(
+        self, name: str, *, workspace: str, timeout: float | None = None
+    ) -> SandboxSession:
+        return SandboxSession(
+            self, self.get(name, workspace=workspace, timeout=timeout)
+        )
 
     def list(
         self,
@@ -1264,12 +1479,14 @@ class SandboxClient:
         page_size: int = 100,
         page_token: str = "",
         label_selector: str | None = None,
+        timeout: float | None = None,
     ) -> builtins.list[SandboxRef]:
         return self.list(
             workspace=workspace,
             page_size=page_size,
             page_token=page_token,
             label_selector=label_selector,
+            timeout=timeout,
         ).all()
 
     def list_for_all_workspaces(
@@ -1303,11 +1520,13 @@ class SandboxClient:
         page_size: int = 100,
         page_token: str = "",
         label_selector: str | None = None,
+        timeout: float | None = None,
     ) -> builtins.list[SandboxRef]:
         return self.list_for_all_workspaces(
             page_size=page_size,
             page_token=page_token,
             label_selector=label_selector,
+            timeout=timeout,
         ).all()
 
     def list_ids(
@@ -1316,6 +1535,7 @@ class SandboxClient:
         workspace: str,
         page_size: int = 100,
         label_selector: str | None = None,
+        timeout: float | None = None,
     ) -> builtins.list[str]:
         return [
             item.id
@@ -1323,6 +1543,7 @@ class SandboxClient:
                 workspace=workspace,
                 page_size=page_size,
                 label_selector=label_selector,
+                timeout=timeout,
             )
         ]
 
@@ -1331,12 +1552,12 @@ class SandboxClient:
         *,
         page_size: int = 100,
         label_selector: str | None = None,
+        timeout: float | None = None,
     ) -> builtins.list[str]:
         return [
             item.id
             for item in self.list_all_for_all_workspaces(
-                page_size=page_size,
-                label_selector=label_selector,
+                page_size=page_size, label_selector=label_selector, timeout=timeout
             )
         ]
 
@@ -1655,6 +1876,8 @@ class SandboxClient:
         stdin: bytes | None = None,
         timeout_seconds: int | None = None,
         no_login_shell: bool = False,
+        request_id: str | None = None,
+        timeout: float | None = None,
     ) -> ExecResult:
         result: ExecResult | None = None
         stream = self.exec_stream(
@@ -1666,6 +1889,8 @@ class SandboxClient:
             stdin=stdin,
             timeout_seconds=timeout_seconds,
             no_login_shell=no_login_shell,
+            request_id=request_id,
+            timeout=timeout,
         )
         try:
             for item in stream:
@@ -1696,12 +1921,12 @@ class SandboxClient:
         workdir: str | None = None,
         env: Mapping[str, str] | None = None,
         timeout_seconds: int | None = None,
+        request_id: str | None = None,
+        timeout: float | None = None,
     ) -> ExecResult:
         exec_env = dict(env or {})
         exec_env["OPENSHELL_PYFUNC_B64"] = _serialize_python_callable(
-            function,
-            args=args,
-            kwargs=kwargs,
+            function, args=args, kwargs=kwargs
         )
         return self.exec(
             sandbox,
@@ -1711,6 +1936,8 @@ class SandboxClient:
             workdir=workdir,
             env=exec_env,
             timeout_seconds=timeout_seconds,
+            request_id=request_id,
+            timeout=timeout,
         )
 
     def expose_service(
@@ -1942,6 +2169,244 @@ class SandboxClient:
             time.sleep(max(0.0, min(poll_interval, deadline - time.monotonic())))
         raise SandboxError(f"sandbox {name} did not complete within timeout")
 
+    def attach_provider(
+        self,
+        sandbox: str,
+        provider: str,
+        *,
+        workspace: str,
+        expected_resource_version: int = 0,
+        request_id: str | None = None,
+        timeout: float | None = None,
+    ) -> openshell_pb2.AttachSandboxProviderResponse:
+        """Persist an attachment and return its receipt; this does not establish readiness."""
+        return self._stub.AttachSandboxProvider(
+            openshell_pb2.AttachSandboxProviderRequest(
+                workspace_scope=_workspace_scope(workspace),
+                sandbox=sandbox,
+                provider=provider,
+                expected_resource_version=expected_resource_version,
+                request_id=request_id or "",
+            ),
+            timeout=self._timeout if timeout is None else timeout,
+        )
+
+    def detach_provider(
+        self,
+        sandbox: str,
+        provider: str,
+        *,
+        workspace: str,
+        expected_resource_version: int = 0,
+        request_id: str | None = None,
+        timeout: float | None = None,
+    ) -> openshell_pb2.DetachSandboxProviderResponse:
+        """Persist detachment; use the returned receipt to observe completed revocation."""
+        return self._stub.DetachSandboxProvider(
+            openshell_pb2.DetachSandboxProviderRequest(
+                workspace_scope=_workspace_scope(workspace),
+                sandbox=sandbox,
+                provider=provider,
+                expected_resource_version=expected_resource_version,
+                request_id=request_id or "",
+            ),
+            timeout=self._timeout if timeout is None else timeout,
+        )
+
+    def list_providers(
+        self,
+        sandbox: str,
+        *,
+        workspace: str,
+        page_size: int = 100,
+        page_token: str = "",
+        timeout: float | None = None,
+    ) -> Pager[datamodel_pb2.Provider]:
+        """List the providers attached to this sandbox."""
+        scope = _workspace_scope(workspace)
+
+        def fetch(token: str) -> Page[datamodel_pb2.Provider]:
+            response = self._stub.ListSandboxProviders(
+                openshell_pb2.ListSandboxProvidersRequest(
+                    workspace_scope=scope,
+                    sandbox=sandbox,
+                    page_size=page_size,
+                    page_token=token,
+                ),
+                timeout=self._timeout if timeout is None else timeout,
+            )
+            return Page(list(response.providers), response.next_page_token)
+
+        return Pager(fetch, page_token)
+
+    def list_all_providers(
+        self,
+        sandbox: str,
+        *,
+        workspace: str,
+        page_size: int = 100,
+        page_token: str = "",
+        timeout: float | None = None,
+    ) -> builtins.list[datamodel_pb2.Provider]:
+        return self.list_providers(
+            sandbox,
+            workspace=workspace,
+            page_size=page_size,
+            page_token=page_token,
+            timeout=timeout,
+        ).all()
+
+    def get_provider_status(
+        self,
+        sandbox: str,
+        provider: str,
+        *,
+        workspace: str,
+        receipt_id: str = "",
+        timeout: float | None = None,
+    ) -> openshell_pb2.ProviderReadinessStatus:
+        """Query a mutation receipt or the current desired state when no receipt is supplied."""
+        response = self._stub.GetSandboxProviderStatus(
+            openshell_pb2.GetSandboxProviderStatusRequest(
+                workspace_scope=_workspace_scope(workspace),
+                sandbox=sandbox,
+                provider=provider,
+                receipt_id=receipt_id,
+            ),
+            timeout=self._timeout if timeout is None else timeout,
+        )
+        return response.status
+
+    def get_config(
+        self,
+        name: str,
+        *,
+        workspace: str,
+        timeout: float | None = None,
+    ) -> sandbox_pb2.GetSandboxConfigResponse:
+        """Read effective configuration, including admission and provider revisions."""
+        return self._stub.GetSandboxConfig(
+            sandbox_pb2.GetSandboxConfigRequest(
+                workspace_scope=_workspace_scope(workspace), name=name
+            ),
+            timeout=self._timeout if timeout is None else timeout,
+        )
+
+    def set_policy(
+        self,
+        sandbox: str,
+        policy: sandbox_pb2.SandboxPolicy,
+        *,
+        workspace: str,
+        expected_resource_version: int = 0,
+        annotations: Mapping[str, str] | None = None,
+        request_id: str | None = None,
+        timeout: float | None = None,
+    ) -> openshell_pb2.UpdateConfigResponse:
+        """Submit a sandbox policy revision; inspect get_policy_status() for application.
+
+        Only network_policies may differ from the create-time policy. This
+        method never performs a global policy update or retries a conflict.
+        """
+        return self._stub.UpdateConfig(
+            openshell_pb2.UpdateConfigRequest(
+                workspace_scope=_workspace_scope(workspace),
+                sandbox=sandbox,
+                policy=policy,
+                expected_resource_version=expected_resource_version,
+                annotations=dict(annotations or {}),
+                request_id=request_id or "",
+            ),
+            timeout=self._timeout if timeout is None else timeout,
+        )
+
+    def set_setting(
+        self,
+        sandbox: str,
+        key: str,
+        value: sandbox_pb2.SettingValue,
+        *,
+        workspace: str,
+        expected_resource_version: int = 0,
+        annotations: Mapping[str, str] | None = None,
+        request_id: str | None = None,
+        timeout: float | None = None,
+    ) -> openshell_pb2.UpdateConfigResponse:
+        """Upsert a sandbox-scoped setting, retaining typed false/zero/empty values."""
+        return self._stub.UpdateConfig(
+            openshell_pb2.UpdateConfigRequest(
+                workspace_scope=_workspace_scope(workspace),
+                sandbox=sandbox,
+                setting_key=key,
+                setting_value=value,
+                expected_resource_version=expected_resource_version,
+                annotations=dict(annotations or {}),
+                request_id=request_id or "",
+            ),
+            timeout=self._timeout if timeout is None else timeout,
+        )
+
+    def get_policy_status(
+        self,
+        sandbox: str,
+        *,
+        workspace: str,
+        version: int = 0,
+        timeout: float | None = None,
+    ) -> openshell_pb2.GetSandboxPolicyStatusResponse:
+        """Inspect a particular revision, or the latest when version is zero."""
+        return self._stub.GetSandboxPolicyStatus(
+            openshell_pb2.GetSandboxPolicyStatusRequest(
+                workspace_scope=_workspace_scope(workspace),
+                sandbox=sandbox,
+                version=version,
+            ),
+            timeout=self._timeout if timeout is None else timeout,
+        )
+
+    def list_policies(
+        self,
+        sandbox: str,
+        *,
+        workspace: str,
+        page_size: int = 100,
+        page_token: str = "",
+        timeout: float | None = None,
+    ) -> Pager[openshell_pb2.SandboxPolicyRevision]:
+        """List revision history without discarding failed historical projections."""
+        scope = _workspace_scope(workspace)
+
+        def fetch(token: str) -> Page[openshell_pb2.SandboxPolicyRevision]:
+            response = self._stub.ListSandboxPolicies(
+                openshell_pb2.ListSandboxPoliciesRequest(
+                    workspace_scope=scope,
+                    sandbox=sandbox,
+                    page_size=page_size,
+                    page_token=token,
+                ),
+                timeout=self._timeout if timeout is None else timeout,
+            )
+            return Page(list(response.revisions), response.next_page_token)
+
+        return Pager(fetch, page_token)
+
+    def list_all_policies(
+        self,
+        sandbox: str,
+        *,
+        workspace: str,
+        page_size: int = 100,
+        page_token: str = "",
+        timeout: float | None = None,
+    ) -> builtins.list[openshell_pb2.SandboxPolicyRevision]:
+        return self.list_policies(
+            sandbox,
+            workspace=workspace,
+            page_size=page_size,
+            page_token=page_token,
+            timeout=timeout,
+        ).all()
+
 
 class SandboxTemplateClient:
     """gRPC client for reusable sandbox template lifecycle operations."""
@@ -2052,12 +2517,14 @@ class SandboxTemplateClient:
         page_size: int = 100,
         page_token: str = "",
         label_selector: str = "",
+        timeout: float | None = None,
     ) -> builtins.list[openshell_pb2.SandboxWorkloadTemplate]:
         return self.list(
             workspace=workspace,
             page_size=page_size,
             page_token=page_token,
             label_selector=label_selector,
+            timeout=timeout,
         ).all()
 
     def list_for_all_workspaces(
@@ -2091,11 +2558,13 @@ class SandboxTemplateClient:
         page_size: int = 100,
         page_token: str = "",
         label_selector: str = "",
+        timeout: float | None = None,
     ) -> builtins.list[openshell_pb2.SandboxWorkloadTemplate]:
         return self.list_for_all_workspaces(
             page_size=page_size,
             page_token=page_token,
             label_selector=label_selector,
+            timeout=timeout,
         ).all()
 
     def delete(
@@ -2201,11 +2670,13 @@ class WorkspaceClient:
         page_size: int = 100,
         page_token: str = "",
         label_selector: str | None = None,
+        timeout: float | None = None,
     ) -> builtins.list[WorkspaceRef]:
         return self.list(
             page_size=page_size,
             page_token=page_token,
             label_selector=label_selector,
+            timeout=timeout,
         ).all()
 
     def delete(
@@ -2507,6 +2978,8 @@ def _sandbox_ref(
         created_from_workload_template=provenance,
         service_urls=service_urls or {},
         host_key_fingerprint=sandbox.host_key_fingerprint or None,
+        resource_version=sandbox.metadata.resource_version,
+        annotations=sandbox.metadata.annotations,
     )
 
 
