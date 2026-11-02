@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from google.protobuf.struct_pb2 import Struct
 
 import openshell.sandbox as sandbox_module
 from openshell._proto import openshell_pb2
@@ -427,14 +428,14 @@ class _FakeStub:
 
 
 def _client_with_fake_stub(stub: object) -> SandboxClient:
-    client = cast("SandboxClient", object.__new__(SandboxClient))
+    client = object.__new__(SandboxClient)
     client._timeout = 30.0
     client._stub = cast("Any", stub)
     return client
 
 
 def _template_client_with_fake_stub(stub: object) -> SandboxTemplateClient:
-    client = cast("SandboxTemplateClient", object.__new__(SandboxTemplateClient))
+    client = object.__new__(SandboxTemplateClient)
     client._timeout = 30.0
     client._stub = cast("Any", stub)
     return client
@@ -2347,7 +2348,9 @@ def test_sandbox_template_create_builds_template_from_public_fields() -> None:
     assert template.spec.workload.resources.cpu == "1"
     assert template.spec.workload.resources.memory == "512Mi"
     assert template.spec.workload.resources.gpu.count == 2
-    assert template.spec.driver_config["kubernetes"]["runtime_class_name"] == "kata"
+    config = template.spec.driver_config["kubernetes"]
+    assert isinstance(config, Struct)
+    assert config["runtime_class_name"] == "kata"
 
 
 def test_sandbox_template_create_materializes_default_workload() -> None:
@@ -2380,7 +2383,9 @@ def test_sandbox_template_create_materializes_workload_with_driver_config_only()
     assert template.HasField("spec")
     assert template.spec.HasField("workload")
     assert template.spec.workload.image == ""
-    assert template.spec.driver_config["kubernetes"]["runtime_class_name"] == "kata"
+    config = template.spec.driver_config["kubernetes"]
+    assert isinstance(config, Struct)
+    assert config["runtime_class_name"] == "kata"
 
 
 def test_sandbox_template_create_rejects_missing_public_name() -> None:
@@ -2486,12 +2491,9 @@ def test_sandbox_template_client_crud_forwards_requests() -> None:
         stub.create_template_request.template.spec.workload.image
         == "ghcr.io/test/gpu-kata:latest"
     )
-    assert (
-        stub.create_template_request.template.spec.driver_config["kubernetes"][
-            "runtime_class_name"
-        ]
-        == "kata"
-    )
+    config = stub.create_template_request.template.spec.driver_config["kubernetes"]
+    assert isinstance(config, Struct)
+    assert config["runtime_class_name"] == "kata"
 
     got = client.get("gpu-kata", workspace="default")
     assert got.metadata.name == "gpu-kata"
@@ -2892,7 +2894,7 @@ def test_returned_labels_are_immutable() -> None:
     ref = _sandbox_ref(proto)
 
     with pytest.raises(TypeError):
-        ref.labels["mutated"] = "nope"  # type: ignore[index]
+        ref.labels["mutated"] = "nope"  # ty: ignore[invalid-assignment]
 
 
 def test_direct_sandbox_ref_construction_defaults_labels() -> None:
@@ -2953,7 +2955,7 @@ def test_direct_sandbox_ref_copies_and_freezes_labels() -> None:
 
     assert dict(ref.labels) == {"aiq": "deep-research"}
     with pytest.raises(TypeError):
-        ref.labels["mutated"] = "nope"  # type: ignore[index]
+        ref.labels["mutated"] = "nope"  # ty: ignore[invalid-assignment]
 
 
 def test_high_level_creation_forwards_name_and_labels(

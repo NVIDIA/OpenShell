@@ -11,9 +11,13 @@
 use base64::Engine as _;
 use openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES;
 use openshell_core::{Error, NetworkSupervisorTrustBundle, Result};
+use rustls::pki_types::{
+    CertificateDer,
+    pem::{PemObject, SectionKind},
+};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{Cursor, ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config_file::SupervisorNetworkFileSection;
@@ -166,7 +170,7 @@ fn stage_normalized_in(
 }
 
 fn normalize_source(source_path: &Path, source: &[u8]) -> Result<(Vec<u8>, usize)> {
-    // `rustls_pemfile` intentionally skips text outside PEM blocks. The
+    // Rustls's PEM parser intentionally skips text outside PEM blocks. The
     // gateway contract is stricter: a configured file must not contain a
     // valid subset hidden among unrelated or malformed material.
     if source
@@ -177,20 +181,20 @@ fn normalize_source(source_path: &Path, source: &[u8]) -> Result<(Vec<u8>, usize
     }
 
     let mut certificates = Vec::new();
-    for item in rustls_pemfile::read_all(&mut Cursor::new(source)) {
+    for item in <(SectionKind, Vec<u8>)>::pem_slice_iter(source) {
         let item = item.map_err(|error| {
             config_error(
                 source_path,
                 format_args!("contains malformed PEM data: {error}"),
             )
         })?;
-        let rustls_pemfile::Item::X509Certificate(certificate) = item else {
+        let (SectionKind::Certificate, certificate) = item else {
             return Err(config_error(
                 source_path,
                 "contains a non-certificate PEM block",
             ));
         };
-        certificates.push(certificate);
+        certificates.push(CertificateDer::from(certificate));
     }
 
     if certificates.is_empty() {
@@ -413,6 +417,7 @@ fn verify_existing_artifact(path: &Path, normalized: &[u8], digest: &str) -> Res
         })
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn set_artifact_directory_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -429,6 +434,7 @@ fn set_artifact_directory_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn set_artifact_file_permissions(file: &fs::File, path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -449,6 +455,7 @@ fn set_artifact_file_permissions(file: &fs::File, path: &Path) -> Result<()> {
 /// Durably record a successful hard-link publication on platforms that permit
 /// syncing directories. This follows the same `File::open(...).sync_all()`
 /// pattern used for other atomic state writes in the repository.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn sync_artifact_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {

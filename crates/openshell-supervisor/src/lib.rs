@@ -23,6 +23,7 @@ mod config_runtime;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
+mod otlp_relay;
 mod provider_readiness;
 pub mod sandbox_instance_host;
 pub mod shared_host;
@@ -743,6 +744,7 @@ pub async fn run_network_proxy(
         None,
         None,
         None,
+        None,
     )
     .await?;
 
@@ -917,6 +919,9 @@ pub struct SandboxInstanceConfig {
     /// attach: how long it keeps the workload frozen after losing this
     /// supervisor. `None` leaves the runtime default.
     pub supervisor_recovery_timeout_secs: Option<u32>,
+    /// OTLP/gRPC collector for relayed agent traces; `None` keeps the relay
+    /// inactive.
+    pub otlp_agent_endpoint: Option<String>,
 }
 
 impl SandboxInstanceConfig {
@@ -1070,6 +1075,7 @@ pub async fn run_sandbox_instance(
         proxy_tls,
         takeover,
         supervisor_recovery_timeout_secs,
+        otlp_agent_endpoint,
     } = config;
     // The owner binds the event context and log sink to the instance's
     // threads; the instance itself uses the rest.
@@ -1285,6 +1291,13 @@ pub async fn run_sandbox_instance(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
+    // The agent trace relay must exist before networking starts so the
+    // handler is installed when the first staged connection arrives, and
+    // before attach so the agent spec can tell the boundary whether to point
+    // workload SDKs at it.
+    let (mut otlp_relay, otlp_reserved_destination) =
+        otlp_relay::activate(otlp_agent_endpoint, sandbox_id.clone());
+
     // Construct the selected client only after shared policy and credential
     // setup has completed. Keep live credentials and later CA publication in
     // supervisor-owned handles shared with the backend.
@@ -1306,6 +1319,7 @@ pub async fn run_sandbox_instance(
                 workdir: workspace,
                 timeout_secs,
                 interactive,
+                otlp_relay_active: otlp_relay.is_some(),
             },
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.attach"))
@@ -1429,6 +1443,7 @@ pub async fn run_sandbox_instance(
             None,
             remote_network_source,
             proxy_listener,
+            otlp_reserved_destination,
         )
         .await
     });
@@ -1575,7 +1590,7 @@ pub async fn run_sandbox_instance(
         let poll_gateway = gateway.clone();
         let poll_engine = engine.clone();
         let poll_ocsf_enabled = ocsf_json.enabled.clone();
-        let poll_ocsf_schema_version = ocsf_json.target_version.clone();
+        let poll_ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
         let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
@@ -1770,6 +1785,12 @@ pub async fn run_sandbox_instance(
             instance_readiness.release();
             drop(running);
             drop(boundary_access);
+            // The workload is frozen, so no new spans arrive. Export what the
+            // relay already acknowledged; the agent will not resend it after
+            // resume. Bounded; never fails.
+            if let Some(relay) = otlp_relay.take() {
+                relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
+            }
             drop(networking);
             info!(backend = %backend_name, "Isolation boundary suspended; supervisor instance exiting");
             return Ok(0);
@@ -1780,6 +1801,17 @@ pub async fn run_sandbox_instance(
         boundary_access
             .publish_main_exit(exit_code, await_main_process_attachment)
             .await;
+        // Flush relayed agent traces before the exit is reported so the last
+        // spans of a short run are not lost. Bounded; never fails. When the
+        // access plane is retained for exec sessions, the relay keeps serving
+        // them and shuts down at final teardown instead.
+        if retain_access {
+            if let Some(relay) = otlp_relay.as_ref() {
+                relay.flush(otlp_relay::FLUSH_TIMEOUT).await;
+            }
+        } else if let Some(relay) = otlp_relay.take() {
+            relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
+        }
         // `shutdown_requested` has already completed when shutdown won the
         // lifecycle select above and must not be polled again.
         let mut completion_cancelled = !retain_access;
@@ -1823,6 +1855,11 @@ pub async fn run_sandbox_instance(
         if retain_access {
             info!(backend = %backend_name, "Canonical process exited; retaining control-mode access plane");
             retain_remote_access_plane(&mut proxy_exited, &mut shutdown_requested).await?;
+        }
+        // Exec sessions served after the main exit may have exported traces;
+        // flush those too before the relay goes away.
+        if let Some(relay) = otlp_relay.take() {
+            relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
         }
         drop(instance_readiness);
         drop(running);
@@ -4170,6 +4207,7 @@ struct PolicyPollLoopContext {
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<AtomicBool>,
+    /// Last value of the deprecated `ocsf_schema_version` setting.
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     provider_credentials: ProviderCredentialState,
     provider_readiness: ProviderReadinessTracker,
@@ -4609,6 +4647,7 @@ mod tests {
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
             takeover: None,
             supervisor_recovery_timeout_secs: None,
+            otlp_agent_endpoint: None,
         };
         let bindings = SandboxInstanceBindings::dedicated(
             &config,

@@ -646,7 +646,7 @@ discovery endpoint or its TLS CA.
 | server.ocsfLog.queueCapacity | int | `10000` | Maximum records waiting for the file writer. |
 | server.ocsfLog.queueMaxBytes | int | `16777216` | Maximum encoded bytes waiting for the file writer. |
 | server.ocsfLog.rotation | string | `"daily"` | Rotate the active file daily in UTC, or never. |
-| server.ocsfLog.schemaVersion | string | `""` | Optional OCSF downgrade target. Empty emits native OCSF 1.8.0. Supported values: "1.1", "1.3". |
+| server.ocsfLog.schemaVersion | string | `""` | Deprecated and ignored: the gateway emits native OCSF 1.8.0 and logs a warning at startup when this is set. |
 | server.oidc.adminRole | string | `""` | Role name for admin access. Leave empty (with userRole also empty) for authentication-only mode. Both must be set or both empty. |
 | server.oidc.audience | string | `"openshell-cli"` | Expected audience claim for the API resource server. This should match the server's --oidc-audience, NOT the CLI client ID. |
 | server.oidc.caConfigMapName | string | `""` | Name of a ConfigMap containing a CA certificate bundle (key: ca.crt) for verifying the OIDC issuer's TLS certificate. Required when the issuer uses a non-public CA (e.g. OpenShift ingress, private PKI). |
@@ -704,7 +704,7 @@ discovery endpoint or its TLS CA.
 | supervisor.podSecurityContext.runAsNonRoot | bool | `true` | Require the shared supervisor to run as a non-root user. |
 | supervisor.podSecurityContext.runAsUser | int | `65534` | UID assigned to the shared supervisor pod. |
 | supervisor.podSecurityContext.seccompProfile.type | string | `"RuntimeDefault"` | Seccomp profile applied to the shared supervisor pod. |
-| supervisor.recoveryTimeoutSeconds | int | `60` | Seconds a sandbox workload stays frozen after losing its pool member's supervision before the sandbox runtime terminates it, rendered as [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an integer from 10 to 300. Null leaves the gateway's pool default of 60 seconds. |
+| supervisor.recoveryTimeoutSeconds | int | `60` | Seconds a sandbox workload stays frozen after losing its pool member's supervision before the sandbox runtime terminates it, rendered as [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an integer from 30 to 300. Null leaves the gateway's pool default of 60 seconds. |
 | supervisor.replicas | int | `1` | Shared supervisor pool members, used only when gatewayConfig selects supervisor_topology = "gateway". The gateway always coordinates the shared supervisor as a high-availability pool: when a member fails or leaves, another member takes over its sandboxes without restarting their workloads. 1 has no failover; use 2 or more to survive losing a member. Only the supervisor Deployment's replica count depends on this value, so changing it neither restarts the gateway nor replaces running members. Ignored when supervisor.autoscaling.enabled is true. |
 | supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |

@@ -37,6 +37,8 @@ PODMAN_CI_TESTS=(
   live_policy_update
   local_driver_token_restart
   no_proxy
+  ocsf_jsonl_conformance
+  otlp_relay
   podman_corporate_proxy
   podman_gateway_start
   podman_host_gateway
@@ -98,6 +100,16 @@ fi
 # An empty selector runs the full Podman suite, including provider_token_exchange.
 if [ "${#SELECTED_TESTS[@]}" -eq 0 ] || [[ " ${SELECTED_TESTS[*]} " == *" provider_token_exchange "* ]]; then
   export OPENSHELL_E2E_SPIFFE_FIXTURE="${OPENSHELL_E2E_SPIFFE_FIXTURE:-1}"
+fi
+
+# When the selection includes otlp_relay, enable OTLP export in the generated
+# gateway config so the test can bind a collector stub on this port. All
+# selected tests share the gateway, so they run with the relay enabled too.
+# Containers reach the host through host.containers.internal. Set the
+# variable to an empty string to disable export and run the relay's inert
+# case instead.
+if [ "${#SELECTED_TESTS[@]}" -eq 0 ] || [[ " ${SELECTED_TESTS[*]} " == *" otlp_relay "* ]]; then
+  export OPENSHELL_E2E_OTLP_ENDPOINT="${OPENSHELL_E2E_OTLP_ENDPOINT-http://host.containers.internal:4317}"
 fi
 
 if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ] && [ -z "${OPENSHELL_BIN:-}" ]; then

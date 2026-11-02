@@ -48,6 +48,10 @@ test creates, such as providers, in the test itself.
 - `cx.sandbox(suffix)` to build and create a sandbox with a run-unique name.
   The returned `Sandbox` can wait for ready or finished, stop, start, exec,
   read its config and draft policy, set a setting, and delete.
+- `cx.track(name)` to register a sandbox created some other way, such as
+  through the CLI, for cleanup. Call it before the
+  create, so a create that fails after the gateway accepted it is still cleaned
+  up. `cx.adopt(name)` returns a `Sandbox` handle for one the CLI created.
 - `cx.expect_listed` and `cx.expect_absent` to check a sandbox in list and get.
 - `cx.cli([...])` to run the installed CLI against the same gateway, with
   `success()`, `failure()`, and `json()` on the output.
@@ -88,6 +92,12 @@ time or the CLI does not report it connected.
 `e2e/with-docker-gateway.sh` and `e2e/with-podman-gateway.sh` start an
 ephemeral gateway and export `OPENSHELL_GATEWAY` and `OPENSHELL_BIN`, so a
 suite runs under them unchanged.
+
+`mise run e2e:testkit` does this for the suites in `tests/suites/conformance`.
+In a tmachine VM, the test runner (`tests/runner/`) does the same: it sets
+`OPENSHELL_GATEWAY` to the gateway the installer registered and
+`OPENSHELL_BIN` to the installed CLI, then runs the suites with nextest. See
+[TESTING.md](../../TESTING.md).
 
 ## Checks
 

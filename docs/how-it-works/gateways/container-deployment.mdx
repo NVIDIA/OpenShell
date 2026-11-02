@@ -214,13 +214,13 @@ systemctl --user enable --now podman.socket
 
 Running the gateway as a rootless Podman container needs five settings beyond the Docker commands above:
 
-1. **Writable state directory.** The image runs as user `1000` and cannot write to its default home directory. Mount a host directory, set `HOME` and `XDG_DATA_HOME` to it, and add `--userns=keep-id:uid=1000,gid=1000`.
+1. **Writable state directory.** The image runs as user `1000` and cannot write to its default home directory. Mount a host directory, set `HOME` and `XDG_DATA_HOME` to it, and add `--userns=keep-id:uid=1000,gid=1000` so the container can read and write it.
 
 2. **Same-path data directory.** The driver bind-mounts files from the data directory into each sandbox, and the host Podman resolves the path on the host. Mount the directory at the same absolute path inside the container. A named volume does not work.
 
 3. **Signing keys and TLS certificates.** Generate them with `generate-certs` and set `OPENSHELL_LOCAL_TLS_DIR` to the output directory. The gateway then serves HTTPS and requires client certificates.
 
-4. **SELinux type.** On SELinux hosts, add `--security-opt label=type:container_runtime_t`. Without it, the container cannot connect to the Podman socket. Podman ignores the option on other hosts. The gateway can start containers as your user through that socket, so run only the published gateway image.
+4. **SELinux type.** On SELinux hosts, add `--security-opt label=type:container_runtime_t`. Without it, the container cannot read the data directory or connect to the Podman socket. Podman ignores the option on other hosts. The gateway can start containers as your user through that socket, so run only the published gateway image.
 
 5. **Matching ports.** Supervisor containers call back to `127.0.0.1` on the gateway's in-container port. Publish the same port number on the host, or set `grpc_endpoint` as described below.
 
@@ -258,7 +258,7 @@ podman run -d \
   ghcr.io/nvidia/openshell/gateway:latest
 ```
 
-If the gateway container exits at startup with `--tls-cert is required when TLS is enabled`, `OPENSHELL_LOCAL_TLS_DIR` is unset or points at a directory without the generated certificates. Set it, and run `generate-certs` first.
+If the gateway container exits at startup with `--tls-cert is required when TLS is enabled`, the gateway cannot read its certificates. `OPENSHELL_LOCAL_TLS_DIR` is unset, or it points at a directory that is empty or that the container cannot read. Run `generate-certs`, set the variable, and check `--userns=keep-id:uid=1000,gid=1000` and, on SELinux hosts, `--security-opt label=type:container_runtime_t`. Disabling TLS, as the error message suggests, would remove authentication.
 
 The gateway takes a few seconds to start listening. Register it with the CLI and confirm the connection:
 

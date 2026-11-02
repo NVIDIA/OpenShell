@@ -51,6 +51,10 @@ pub struct PodmanComputeConfig {
     /// export; driver TOML cannot set it.
     #[serde(skip)]
     pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+    /// OTLP/gRPC collector that supervisors relay workload traces to. The
+    /// gateway supplies it from `[otlp.agent]`; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_otlp_agent_endpoint: Option<String>,
 
     /// Gateway name passed to supervisors for their telemetry. The gateway
     /// supplies its own name; driver TOML cannot set it.
@@ -549,6 +553,7 @@ impl Default for PodmanComputeConfig {
             grpc_endpoint: String::new(),
             supervisor_otlp_endpoint: None,
             supervisor_ocsf_export: None,
+            supervisor_otlp_agent_endpoint: None,
             supervisor_gateway_name: None,
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),

@@ -91,7 +91,9 @@ When the gateway exports OTLP traces, the driver sets
 `OPENSHELL_OTLP_ENDPOINT` on the supervisor Pod to the gateway's endpoint and
 `TRACEPARENT` to the trace context of the operation that created the Pod. The
 supervisor exports its spans there and parents its startup span on that
-context. The endpoint is not configurable in driver TOML.
+context. When `[openshell.gateway.otlp.agent]` is enabled, the driver also
+sets `OPENSHELL_OTLP_AGENT_ENDPOINT`, which starts the supervisor's agent trace
+relay. Neither endpoint is configurable in driver TOML.
 
 The driver creates one namespace-wide `NetworkPolicy` before it releases any
 workload Pod. It selects every OpenShell workload, denies all workload egress,
@@ -257,8 +259,9 @@ fails closed.
 
 The topology does not support upstream proxies or provider SPIFFE identity, and
 the shared supervisor is a single point of failure for the sandboxes it hosts.
-Shared sandbox instances export no supervisor OTLP traces or OCSF events; the driver
-warns at startup when the gateway configures that export.
+Shared sandbox instances export no supervisor OTLP traces or OCSF events and do
+not relay agent traces; the driver warns at startup when the gateway configures
+any of them.
 When the setting is removed, reconciliation suspends shared generations, and a
 restart creates the dedicated generation's boundary Service the shared one never
 had.
@@ -298,6 +301,36 @@ only lifecycle operation that removes the Sandbox resource and its owned
 storage. The driver confirms the stop from both the published `Suspended`
 condition and deletion of the backing pod. Legacy `v1alpha1` controllers omit
 a usable stopped condition, so pod deletion alone confirms their stop.
+
+The optional `openshell.compute.update-sandbox-configuration` capability supports
+image, command, and environment updates while stopped. External drivers serve
+`ComputeDriverConfigurationUpdates` separately from the baseline driver service;
+linked factories opt in through `build_with_configuration_updates`.
+The request identifies the sandbox, original resource UID, expected image,
+operation ID, and monotonic revision. The driver checks the suspended state,
+completed bootstrap, current resource UID, and absence of workload and supervisor
+Pods by directly reading the controller-recorded workload name, the Sandbox
+resource name, and the stable dedicated-supervisor name. Duplicate names are
+read once, and terminating Pods block updates. These checks make at most three
+Pod reads regardless of namespace size; they do not discover unexpectedly named
+Pods. The driver revalidates
+external-resource admission before patching the existing resource with a
+`resourceVersion` condition. The patch includes the verified UID; Kubernetes
+immutable-UID validation also rejects a same-name replacement. No resource or
+PVC is recreated. Existing workspace contents are not reseeded.
+
+A retry verifies durable operation evidence and the live selected targets before
+returning success without another patch. Different parameters or older revisions
+fail closed, including when later operations return to an earlier image.
+
+The service reconciles workload argv and effective user environment with the image
+in the same conditional patch. The
+main-process annotation and agent environment supply the next runtime generation;
+the trusted container launcher and runtime environment remain intact. Retry
+records identify selected fields and verify their live target values without
+copying environment values into operation evidence. Top-level public sandbox
+labels and annotations remain gateway metadata; this operation does not change
+Kubernetes pod metadata.
 
 The workspace PVC size defaults to `workspace_default_storage_size`. Set
 `workspace_storage_class` to pin the PVC to a specific `StorageClass`; an empty

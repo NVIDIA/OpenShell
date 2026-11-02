@@ -15,6 +15,11 @@
 
 include!(concat!(env!("OUT_DIR"), "/openshell.storage.v1.rs"));
 
+mod sandbox_image {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.image.v1.rs"));
+}
+pub(crate) use sandbox_image::{StoredSandboxImageState, StoredSandboxImageUpdate};
+
 pub(crate) const STORAGE_FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/storage_descriptor.bin"));
 
@@ -163,12 +168,21 @@ mod tests {
     // and SUSPENDED values to the shared
     // SandboxPhase enum. Stored rows never carried those values, so prior
     // payloads decode unchanged.
+
+    // Image updates add a separate public service/request and a new private
+    // image-state format. Existing public status and frozen storage.v1 stay
+    // unchanged; only the private durable closure grows.
+    // Configuration updates add presence-aware argv/map wrappers shared with
+    // private durable intent. Existing image-only payloads decode with all four
+    // selections absent; storage.v1 remains frozen. Public field 3 retains its
+    // image wire identity, now with explicit presence. Compute configuration
+    // updates use a separate capability/service and add one classified RPC.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "f24c9b77a85f59ae9ab60f783d45654d78bf566fcf260f9131f1aba39fa4b59b";
+        "be99bb3fcc7894eb85d774f54b642173e70dd37bc8e5fcaf3fdff2454ae689e1";
     const DURABLE_SCHEMA_SHA256: &str =
-        "ffb20595e36032a9476d1c6956e2dcdc814f85286fc4735751e5ec6f499ea9ed";
+        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "ac1ffc4b5b81467de27270a4e33f6db1e31eeb2c52f79750dbaaf19515eadbb2";
+        "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -229,6 +243,7 @@ mod tests {
         ".openshell.storage.v1.StoredConfigUpdateOperation",
         ".openshell.storage.v1.StoredProviderCredentialRefreshStateV2",
         ".openshell.storage.v1.StoredProviderProfile",
+        ".openshell.storage.image.v1.StoredSandboxImageState",
         ".openshell.v1.Sandbox",
         ".openshell.v1.SandboxWorkloadTemplate",
         ".openshell.v1.ServiceEndpoint",
@@ -471,7 +486,12 @@ mod tests {
         let public = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET)
             .expect("public descriptor set must decode");
         for file in public.file {
-            assert_ne!(file.package.as_deref(), Some("openshell.storage.v1"));
+            assert!(
+                !file
+                    .package
+                    .as_deref()
+                    .is_some_and(|package| package.starts_with("openshell.storage."))
+            );
             for message in file.message_type {
                 let name = message.name.expect("message name");
                 assert!(
@@ -576,7 +596,8 @@ mod tests {
                 }
                 if !matches!(
                     (package, service_name),
-                    ("openshell.v1", "OpenShell") | ("openshell.inference.v1", "Inference")
+                    ("openshell.v1", "OpenShell" | "SandboxUpdates")
+                        | ("openshell.inference.v1", "Inference")
                 ) {
                     continue;
                 }
@@ -631,7 +652,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            106 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            108 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -641,7 +662,7 @@ mod tests {
         );
         assert_eq!(
             methods.len(),
-            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            81 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
@@ -702,9 +723,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (330, 31),
-                (95, 22),
-                (83, 22),
+                (334, 31),
+                (100, 22),
+                (86, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
