@@ -5373,79 +5373,143 @@ network_policies:
     #[cfg(target_os = "windows")]
     #[test]
     fn from_proto_matches_windows_equivalent_binary_path() {
-        let mut proto = openshell_policy::restrictive_default_policy();
-        proto.network_policies.insert(
-            "windows_binary".to_string(),
-            NetworkPolicyRule {
-                name: "windows_binary".to_string(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "example.com".to_string(),
-                    port: 443,
-                    ..Default::default()
-                }],
-                binaries: vec![NetworkBinary {
-                    path: r"C:\WINDOWS\SYSTEM32\CURL.EXE".to_string(),
-                }],
-            },
-        );
-        let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
+        for configured in [
+            r"C:\Windows\System32\curl.exe",
+            "C:/Windows/System32/curl.exe",
+            r"C:\WINDOWS\SYSTEM32\CURL.EXE",
+            "c:/windows/system32/curl.exe",
+        ] {
+            let mut proto = openshell_policy::restrictive_default_policy();
+            proto.network_policies.insert(
+                "windows_binary".to_string(),
+                NetworkPolicyRule {
+                    name: "windows_binary".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "example.com".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: configured.to_string(),
+                    }],
+                },
+            );
+            let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
 
-        let equivalent = NetworkInput {
-            host: "example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("c:/windows/system32/curl.exe"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-        let decision = engine.evaluate_network(&equivalent).unwrap();
-        assert!(
-            decision.allowed,
-            "Windows-equivalent binary path should be allowed: {}",
-            decision.reason
-        );
+            let equivalent = NetworkInput {
+                host: "example.com".into(),
+                port: 443,
+                binary_path: PathBuf::from(r"C:\Windows\System32\curl.exe"),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let decision = engine.evaluate_network(&equivalent).unwrap();
+            assert!(
+                decision.allowed,
+                "Windows-equivalent proto binary {configured} should be allowed: {}",
+                decision.reason
+            );
 
-        let different_binary = NetworkInput {
-            binary_path: PathBuf::from("c:/windows/system32/powershell.exe"),
-            ..equivalent
-        };
-        let decision = engine.evaluate_network(&different_binary).unwrap();
-        assert!(
-            !decision.allowed,
-            "normalization must not allow a different binary"
-        );
+            let different_binary = NetworkInput {
+                binary_path: PathBuf::from("c:/windows/system32/powershell.exe"),
+                ..equivalent
+            };
+            let decision = engine.evaluate_network(&different_binary).unwrap();
+            assert!(
+                !decision.allowed,
+                "normalization must not allow a different binary"
+            );
+        }
     }
 
     #[cfg(target_os = "windows")]
     #[test]
     fn from_strings_matches_windows_equivalent_binary_path() {
-        let engine = OpaEngine::from_strings(
-            TEST_POLICY,
-            r#"
+        for configured in [
+            r"C:\Windows\System32\curl.exe",
+            "C:/Windows/System32/curl.exe",
+            r"C:\WINDOWS\SYSTEM32\CURL.EXE",
+            "c:/windows/system32/curl.exe",
+        ] {
+            let engine = OpaEngine::from_strings(
+                TEST_POLICY,
+                &format!(
+                    r#"
 network_policies:
   windows_binary:
     endpoints:
-      - { host: example.com, port: 443 }
+      - {{ host: example.com, port: 443 }}
     binaries:
-      - { path: 'C:\WINDOWS\SYSTEM32\CURL.EXE' }
-"#,
-        )
-        .expect("Failed to create engine from YAML");
-        let input = NetworkInput {
-            host: "example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("c:/windows/system32/curl.exe"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+      - {{ path: '{configured}' }}
+"#
+                ),
+            )
+            .expect("Failed to create engine from YAML");
+            let input = NetworkInput {
+                host: "example.com".into(),
+                port: 443,
+                binary_path: PathBuf::from(r"C:\Windows\System32\curl.exe"),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
 
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(
-            decision.allowed,
-            "Windows-equivalent YAML binary path should be allowed: {}",
-            decision.reason
-        );
+            let decision = engine.evaluate_network(&input).unwrap();
+            assert!(
+                decision.allowed,
+                "Windows-equivalent YAML binary {configured} should be allowed: {}",
+                decision.reason
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_binary_globs_accept_mixed_separators_without_preprocessing() {
+        // Native glob matching already supports either separator. Preserve that
+        // behavior independently of exact-path normalization and case evidence.
+        for configured in [r"C:\Windows\System32\*.exe", "C:/Windows/System32/*.exe"] {
+            let mut engine = new_regorus_engine().unwrap();
+            engine
+                .add_policy("policy.rego".into(), TEST_POLICY.into())
+                .unwrap();
+            engine
+                .add_data_json(
+                    &serde_json::json!({
+                        "network_policies": {
+                            "windows_binary": {
+                                "endpoints": [{"host": "example.com", "ports": [443]}],
+                                "binaries": [{"path": configured}],
+                            },
+                        },
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            for (runtime, allowed) in [
+                (r"C:\Windows\System32\curl.exe", true),
+                ("C:/Windows/System32/curl.exe", true),
+                (r"C:\WINDOWS\SYSTEM32\CURL.EXE", false),
+            ] {
+                engine
+                    .set_input_json(
+                        &serde_json::json!({
+                            "network": {"host": "example.com", "port": 443},
+                            "exec": {"path": runtime, "ancestors": [], "cmdline_paths": []},
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    engine
+                        .eval_rule("data.openshell.sandbox.allow_network".into())
+                        .unwrap(),
+                    regorus::Value::from(allowed),
+                    "raw glob {configured} against {runtime}"
+                );
+            }
+        }
     }
 
     #[cfg(target_os = "windows")]
