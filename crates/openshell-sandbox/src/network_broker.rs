@@ -2939,6 +2939,16 @@ mod tests {
             };
             assert_eq!(queued_other, -1);
             assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+            let queued_trusted = unsafe {
+                libc::syscall(
+                    libc::SYS_rt_sigqueueinfo,
+                    -trusted_group,
+                    0,
+                    &raw const info,
+                )
+            };
+            assert_eq!(queued_trusted, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
             let queued_broadcast =
                 unsafe { libc::syscall(libc::SYS_rt_sigqueueinfo, -1, 0, &raw const info) };
             assert_eq!(queued_broadcast, -1);
@@ -3076,6 +3086,94 @@ mod tests {
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn terminating_group_signal_reaches_members_before_caller() {
+        use std::io::Write as _;
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+
+        const CHILD_MARKER: &str = "OPENSHELL_TERMINATING_GROUP_SIGNAL_CHILD";
+        const MEMBER_PREFIX: &str = "OPENSHELL_GROUP_MEMBER=";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let mut sibling = std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn group member");
+            // SAFETY: these calls only inspect the disposable child group.
+            assert_eq!(unsafe { libc::getpgrp() }, unsafe { libc::getpid() });
+            assert_eq!(
+                unsafe { libc::getpgid(i32::try_from(sibling.id()).unwrap()) },
+                unsafe { libc::getpgrp() }
+            );
+            println!("{MEMBER_PREFIX}{}", sibling.id());
+            io::stdout().flush().unwrap();
+            // SAFETY: this child owns a dedicated disposable process group.
+            unsafe { libc::kill(0, libc::SIGKILL) };
+            let _ = sibling.kill();
+            let _ = sibling.wait();
+            panic!("group SIGKILL returned to caller");
+        }
+
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let output = launcher
+            .execute(move || {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "network_broker::tests::terminating_group_signal_reaches_members_before_caller",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_MARKER, "1")
+                    .process_group(0);
+                let mut filter = crate::linux::child_seccomp::prepare(std::process::id(), true)?;
+                // SAFETY: installation uses the prebuilt, allocation-free child filter.
+                unsafe { command.pre_exec(move || filter.install()) };
+                command.output()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGKILL),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let sibling_pid = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(MEMBER_PREFIX))
+            .expect("child reported member PID")
+            .parse::<u32>()
+            .unwrap();
+        let sibling_stat = format!("/proc/{sibling_pid}/stat");
+        let sibling_exited = (0..100).any(|_| match std::fs::read_to_string(&sibling_stat) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+            Err(error) => panic!("read group member stat: {error}"),
+            Ok(stat) => {
+                let exited = stat.rsplit_once(") ").is_some_and(|(_, fields)| {
+                    matches!(fields.chars().next(), Some('Z' | 'X' | 'x'))
+                });
+                if !exited {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                exited
+            }
+        });
+        if !sibling_exited {
+            // SAFETY: this is the disposable member reported by the test child.
+            unsafe { libc::kill(i32::try_from(sibling_pid).unwrap(), libc::SIGKILL) };
+        }
+        assert!(
+            sibling_exited,
+            "group member remained live after caller died"
         );
     }
 

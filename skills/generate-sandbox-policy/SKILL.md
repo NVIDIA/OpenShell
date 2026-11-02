@@ -534,7 +534,8 @@ to the same ID on image files, mounted volumes, or devices.
 
 Keep `process.allow_process_group_signals` omitted by default. If the user
 requests shell job control or Ctrl-Z support, set it to `true` and explain that
-the sandbox allows signals only to workload groups in the caller's session.
+the sandbox allows all valid signals, including termination signals, only to
+workload groups in the caller's session.
 The field is fixed when the sandbox starts; a live policy update cannot change
 it.
 

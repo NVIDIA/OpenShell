@@ -197,6 +197,7 @@ fn retain_group_signal_targets(
     }
 
     let mut retained = Vec::new();
+    let mut caller_member = None;
     for entry in std::fs::read_dir("/proc")? {
         let entry = entry?;
         let Some(pid) = entry
@@ -234,6 +235,16 @@ fn retain_group_signal_targets(
         {
             return Err(io::Error::from_raw_os_error(libc::EPERM));
         }
+        if pid == calling_process {
+            caller_member = Some(member);
+        } else {
+            retained.push(member);
+        }
+    }
+    // A terminating signal to the blocked caller invalidates its seccomp
+    // notification. Deliver to other checked members first so validation
+    // before each send cannot abandon the rest of the group.
+    if let Some(member) = caller_member {
         retained.push(member);
     }
     if retained.is_empty() {
@@ -461,5 +472,69 @@ mod tests {
         );
         assert_eq!(requested_group(0, 20).unwrap(), 20);
         assert_eq!(requested_group(-21, 20).unwrap(), 21);
+    }
+
+    #[test]
+    fn group_targets_put_the_blocked_caller_last() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::process::CommandExt as _;
+
+        const CHILD_MARKER: &str = "OPENSHELL_GROUP_TARGET_ORDER_CHILD";
+        const MEMBER_PREFIX: &str = "OPENSHELL_GROUP_MEMBER=";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let mut sibling = std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            println!("{MEMBER_PREFIX}{}", sibling.id());
+            io::stdout().flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            let _ = sibling.wait();
+            return;
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "linux::process_signal::tests::group_targets_put_the_blocked_caller_last",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let caller_pid = child.id();
+        // SAFETY: getpgid only inspects the live child created for this test.
+        assert_eq!(
+            unsafe { libc::getpgid(i32::try_from(caller_pid).unwrap()) },
+            i32::try_from(caller_pid).unwrap()
+        );
+        let reader = io::BufReader::new(child.stdout.take().unwrap());
+        let _sibling_pid = reader
+            .lines()
+            .map(|line| line.unwrap())
+            .find_map(|line| line.strip_prefix(MEMBER_PREFIX).map(str::to_owned))
+            .expect("child reported group member")
+            .parse::<u32>()
+            .unwrap();
+
+        let last_pid =
+            retain_group_signal_targets(caller_pid, 0, std::process::id()).and_then(|members| {
+                assert_eq!(members.len(), 2);
+                let last_fd = members.last().unwrap().as_raw_fd();
+                let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{last_fd}"))?;
+                fdinfo
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Pid:")?.trim().parse::<u32>().ok())
+                    .ok_or_else(|| io::Error::other("pidfd has no Pid field"))
+            });
+        // SAFETY: this signal targets only the disposable test process group.
+        unsafe { libc::kill(-i32::try_from(caller_pid).unwrap(), libc::SIGKILL) };
+        child.wait().unwrap();
+        assert_eq!(last_pid.unwrap(), caller_pid);
     }
 }

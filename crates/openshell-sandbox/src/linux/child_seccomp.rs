@@ -535,6 +535,50 @@ mod tests {
     }
 
     #[test]
+    fn enabled_filter_still_denies_broadcast_and_pgid_one() {
+        // PGID 1 and the broadcast form have the same numeric target, -1.
+        // Exercise the child filter without a notification broker so a
+        // widened static allowlist cannot be hidden by broker denial.
+        // SAFETY: the child only installs a prepared filter, makes raw syscalls,
+        // and exits without running copied Rust cleanup state.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", io::Error::last_os_error());
+        if child == 0 {
+            let sandbox_tgid = unsafe { libc::getppid() };
+            let Ok(mut filter) = prepare(u32::try_from(sandbox_tgid).unwrap_or(0), true) else {
+                unsafe { libc::_exit(1) };
+            };
+            if filter.install().is_err() {
+                unsafe { libc::_exit(2) };
+            }
+            if unsafe { libc::kill(-1, 0) } != -1
+                || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+            {
+                unsafe { libc::_exit(3) };
+            }
+            if unsafe {
+                libc::syscall(
+                    libc::SYS_rt_sigqueueinfo,
+                    -1,
+                    0,
+                    std::ptr::null::<libc::siginfo_t>(),
+                )
+            } != -1
+                || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+            {
+                unsafe { libc::_exit(4) };
+            }
+            unsafe { libc::_exit(0) };
+        }
+
+        let mut status = 0;
+        // SAFETY: child is our live direct child and status is writable.
+        assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
     fn filter_preserves_thread_and_process_creation() {
         if std::env::var_os("OPENSHELL_CHILD_SECCOMP_CREATION_PROBE").is_some() {
             let mut filter = prepare(std::process::id().saturating_add(1), false)

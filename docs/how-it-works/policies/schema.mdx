@@ -88,7 +88,7 @@ were applied and skipped.
 |---|---|---|---|
 | `run_as_user` | string | Driver default | `sandbox` or a numeric UID for the workload. |
 | `run_as_group` | string | Driver default | `sandbox` or a numeric GID for the workload. |
-| `allow_process_group_signals` | boolean | `false` | Allow job-control signals to workload groups in the caller's session. |
+| `allow_process_group_signals` | boolean | `false` | Allow process-group signals to workload groups in the caller's session. |
 
 A numeric ID must be from `1` through `4294967294`, so OpenShell rejects root.
 Each field is independent, so you can set one and let the compute driver choose the other. Docker and Podman use these fields to select the workload identity from the policy passed at creation; omitted fields use the image's `USER`. Kubernetes uses the identity configured for its driver.
@@ -105,8 +105,10 @@ process:
 When enabled, `kill(0, signal)` and `kill(-pgid, signal)` can signal a workload
 group in the caller's session. OpenShell checks every group member before
 delivery. It rejects groups containing trusted sandbox processes, groups from
-another workload launch or session, and `kill(-1, signal)`. The setting applies
-when a sandbox starts; policy updates cannot change it on a running sandbox.
+another workload launch or session, and `kill(-1, signal)`. This covers all valid
+signal numbers, including termination signals such as `SIGKILL` and `SIGTERM`.
+The setting is fixed when a sandbox starts; policy updates cannot change it on
+a running sandbox.
 
 ## Network Policies
 

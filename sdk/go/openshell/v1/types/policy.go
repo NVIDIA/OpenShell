@@ -176,7 +176,7 @@ type ProcessPolicy struct {
 	RunAsUser string
 	// RunAsGroup is the group name for sandboxed processes.
 	RunAsGroup string
-	// AllowProcessGroupSignals permits job-control signals within the caller's workload session.
+	// AllowProcessGroupSignals permits all process-group signals within the caller's workload session.
 	// It is disabled by default and fixed when the sandbox starts.
 	AllowProcessGroupSignals bool
 }

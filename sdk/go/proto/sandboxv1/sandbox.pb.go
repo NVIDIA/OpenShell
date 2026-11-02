@@ -619,7 +619,7 @@ type ProcessPolicy struct {
 	RunAsUser string `protobuf:"bytes,1,opt,name=run_as_user,json=runAsUser,proto3" json:"run_as_user,omitempty"`
 	// Group name to run the sandboxed process as.
 	RunAsGroup string `protobuf:"bytes,2,opt,name=run_as_group,json=runAsGroup,proto3" json:"run_as_group,omitempty"`
-	// Allow job-control signals within workload process groups in the caller's session.
+	// Allow process-group signals within workload groups in the caller's session.
 	AllowProcessGroupSignals bool `protobuf:"varint,3,opt,name=allow_process_group_signals,json=allowProcessGroupSignals,proto3" json:"allow_process_group_signals,omitempty"`
 	unknownFields            protoimpl.UnknownFields
 	sizeCache                protoimpl.SizeCache
