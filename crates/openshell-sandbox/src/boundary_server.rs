@@ -2106,6 +2106,7 @@ mod linux {
                         response: Response::ExecStarted {
                             process_id: started.process_id.clone(),
                             pty: started.terminal,
+                            process_identity: started.process_identity,
                         },
                     },
                 ) {
@@ -2606,6 +2607,7 @@ mod linux {
     struct StartedExec {
         process_id: String,
         terminal: bool,
+        process_identity: Option<openshell_sandbox_backend::boundary_protocol::ProcessIdentityWire>,
         attachment: MainAttachment,
     }
 
@@ -3495,6 +3497,7 @@ mod linux {
                 return Ok(StartedExec {
                     process_id: process_id.clone(),
                     terminal: handle.terminal.is_some(),
+                    process_identity: handle.process.process_identity(),
                     attachment: acquire_exec_attachment(handle)?,
                 });
             }
@@ -3575,11 +3578,13 @@ mod linux {
                 status,
             };
             let terminal = handle.terminal.is_some();
+            let process_identity = handle.process.process_identity();
             let attachment = acquire_exec_attachment(&handle)?;
             handles.insert(process_id.clone(), handle);
             Ok(StartedExec {
                 process_id,
                 terminal,
+                process_identity,
                 attachment,
             })
         }
@@ -3748,6 +3753,7 @@ mod linux {
                         kind: ProcessKindWire::Main,
                         terminal: process.main_session().terminal(),
                         status: process.exit_status(),
+                        process_identity: process.process_identity(),
                         retained_output: OutputWindowWire {
                             first_sequence,
                             next_sequence,
@@ -3763,6 +3769,7 @@ mod linux {
                     kind: ProcessKindWire::Exec,
                     terminal: handle.terminal.is_some(),
                     status: *lock(&handle.status),
+                    process_identity: handle.process.process_identity(),
                     retained_output: OutputWindowWire {
                         first_sequence,
                         next_sequence,
@@ -3909,6 +3916,7 @@ mod linux {
                         process_id: process.process_id(),
                         provider_env_revision: process.provider_credentials.snapshot().revision,
                         provider_env_generation: *lock(&process.provider_environment_generation),
+                        process_identity: process.process_identity(),
                     }
                 } else {
                     guest_error(
@@ -3979,6 +3987,7 @@ mod linux {
                 Err(error) => return guest_error(BoundaryErrorKind::Process, error),
             };
             let process_id = process.process_id();
+            let process_identity = process.process_identity();
             *lock(&self.started_agent) = Some(requested);
             *state = RuntimeState::Running(process);
             openshell_ocsf::ocsf_emit!(
@@ -3994,6 +4003,7 @@ mod linux {
                 process_id,
                 provider_env_revision,
                 provider_env_generation: 0,
+                process_identity,
             }
         }
 
@@ -4330,6 +4340,7 @@ mod linux {
 
     struct ManagedProcess {
         process_id: String,
+        process_identity: Option<openshell_sandbox_backend::boundary_protocol::ProcessIdentityWire>,
         signaler: AgentSignaler,
         exit: SharedProcessExit,
         boundary_exec: Arc<dyn BoundaryExec>,
@@ -4405,9 +4416,11 @@ mod linux {
                     ca_file_paths,
                     Some(boundary_runtime.clone()),
                     spec.otlp_relay_active,
+                    spec.process_activity_enabled,
                 ))
                 .map_err(|error| format!("start process supervisor leaf: {error:?}"))?;
             let signaler = spawned.signaler();
+            let process_identity = spawned.process_identity();
             let boundary_exec = spawned.boundary_exec();
             let loopback_connector = spawned.loopback_connector();
             let main_session = spawned.main_session();
@@ -4425,6 +4438,7 @@ mod linux {
             });
             Ok(Self {
                 process_id,
+                process_identity,
                 signaler,
                 exit,
                 boundary_exec,
@@ -4439,6 +4453,12 @@ mod linux {
 
         fn process_id(&self) -> String {
             self.process_id.clone()
+        }
+
+        fn process_identity(
+            &self,
+        ) -> Option<openshell_sandbox_backend::boundary_protocol::ProcessIdentityWire> {
+            self.process_identity.clone()
         }
 
         fn wait(&self) -> ProcessExit {
@@ -5418,6 +5438,7 @@ mod linux {
                 timeout_secs: 0,
                 interactive: true,
                 otlp_relay_active: false,
+                process_activity_enabled: false,
             })
             .expect("resolve scratch command");
 
@@ -8031,6 +8052,7 @@ mod linux {
                 timeout_secs: 60,
                 interactive: false,
                 otlp_relay_active: false,
+                process_activity_enabled: true,
             };
 
             assert!(matches!(
@@ -8053,10 +8075,18 @@ mod linux {
                 process_id,
                 provider_env_revision: 0,
                 provider_env_generation: 0,
+                process_identity: Some(process_identity),
             } = start()
             else {
                 panic!("initial start did not succeed");
             };
+            assert_eq!(process_identity.name, "/bin/sleep");
+            assert!(
+                process_identity
+                    .uid
+                    .as_deref()
+                    .is_some_and(|uid| uid.starts_with(&format!("{}:", process_identity.pid)))
+            );
 
             let update = RequestEnvelope::new(Request::UpdateProviderEnvironment {
                 provider_files: std::collections::HashMap::new(),
@@ -8140,6 +8170,7 @@ mod linux {
                     process_id: process_id.clone(),
                     provider_env_revision: 7,
                     provider_env_generation: 1,
+                    process_identity: Some(process_identity.clone()),
                 }
             );
 
@@ -8259,6 +8290,12 @@ mod linux {
                 )
                 .expect("exec after reconnect");
             let exec_id = exec.process_id.clone();
+            let exec_identity = exec
+                .process_identity
+                .clone()
+                .expect("exec identity is captured");
+            assert_eq!(exec_identity.name, "/bin/sh");
+            assert!(exec_identity.uid.is_some());
             let mut output = String::new();
             let mut cursor = exec.attachment.session.subscribe();
             process_runtime.block_on(async {
@@ -8291,12 +8328,15 @@ mod linux {
             };
             assert_eq!(snapshot.generation, "generation-reconnect");
             assert!(snapshot.processes.iter().any(|process| {
-                process.process_id == process_id && process.kind == ProcessKindWire::Main
+                process.process_id == process_id
+                    && process.kind == ProcessKindWire::Main
+                    && process.process_identity.as_ref() == Some(&process_identity)
             }));
             assert!(snapshot.processes.iter().any(|process| {
                 process.process_id == exec_id
                     && process.kind == ProcessKindWire::Exec
                     && process.status == Some(ExitStatusWire::Exited(0))
+                    && process.process_identity.as_ref() == Some(&exec_identity)
                     && process.retained_output.next_sequence > 0
             }));
             assert_eq!(boundary.terminate(&process_id), Response::Terminated);
@@ -8473,6 +8513,7 @@ mod linux {
                     timeout_secs: 120,
                     interactive: false,
                     otlp_relay_active: false,
+                    process_activity_enabled: false,
                 },
                 None,
                 None,
@@ -8959,6 +9000,7 @@ mod linux {
                     timeout_secs: 120,
                     interactive: false,
                     otlp_relay_active: false,
+                    process_activity_enabled: false,
                 },
                 None,
                 None,
@@ -9566,6 +9608,7 @@ mod linux {
                         timeout_secs: 120,
                         interactive: false,
                         otlp_relay_active: false,
+                        process_activity_enabled: false,
                     },
                     None,
                     None,
@@ -9703,6 +9746,7 @@ mod linux {
                 timeout_secs: 5,
                 interactive: false,
                 otlp_relay_active: false,
+                process_activity_enabled: false,
             };
             let wire_policy = SandboxPolicyWire::from(policy.clone());
             let process = Arc::new(
@@ -9782,6 +9826,7 @@ mod linux {
                     process_id: process.process_id(),
                     provider_env_revision: 0,
                     provider_env_generation: 0,
+                    process_identity: None,
                 }
             );
 
@@ -9885,6 +9930,7 @@ mod linux {
                     process_id: process.process_id(),
                     provider_env_revision: 1,
                     provider_env_generation: 2,
+                    process_identity: None,
                 },
                 "a replacement control must resume from the boundary's current revision"
             );

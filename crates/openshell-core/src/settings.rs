@@ -84,6 +84,10 @@ impl RegisteredSetting {
 /// still applies when this flag is on.
 pub const AGENT_POLICY_PROPOSALS_ENABLED_KEY: &str = "agent_policy_proposals_enabled";
 
+/// Opt in to launch and exit events for processes started by the Linux
+/// sandbox boundary. The value is captured when the sandbox starts.
+pub const PROCESS_ACTIVITY_ENABLED_KEY: &str = "process_activity_enabled";
+
 /// Approval mode for agent-authored policy proposals.
 ///
 /// `"manual"` (the default when unset): every proposal lands in the draft
@@ -112,6 +116,11 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     // Defaults to false; shorthand output remains unchanged.
     RegisteredSetting {
         key: "ocsf_json_enabled",
+        kind: SettingValueKind::Bool,
+        allowed_string_values: None,
+    },
+    RegisteredSetting {
+        key: PROCESS_ACTIVITY_ENABLED_KEY,
         kind: SettingValueKind::Bool,
         allowed_string_values: None,
     },
@@ -185,6 +194,13 @@ mod tests {
     #[test]
     fn setting_for_key_rejects_removed_providers_v2_enabled() {
         assert!(setting_for_key("providers_v2_enabled").is_none());
+    }
+
+    #[test]
+    fn process_activity_is_an_opt_in_boolean_setting() {
+        let setting = setting_for_key("process_activity_enabled")
+            .expect("process activity setting should be registered");
+        assert_eq!(setting.kind, SettingValueKind::Bool);
     }
 
     // ---- RegisteredSetting::validate_string_value ----

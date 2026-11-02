@@ -333,6 +333,14 @@ fn read_proc_stat(pid: u32) -> Option<ProcStat> {
     })
 }
 
+/// Return a process's namespace parent PID and kernel start tick while it is
+/// still owned by its caller. Used to identify audited process instances.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_parent_and_start(pid: u32) -> Option<(u32, u64)> {
+    let stat = read_proc_stat(pid)?;
+    Some((stat.parent, stat.start_time))
+}
+
 /// Whether orphaned descendants are reparented to this sandbox process.
 #[cfg(target_os = "linux")]
 fn sandbox_owns_process_tree() -> bool {

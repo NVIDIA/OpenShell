@@ -1526,6 +1526,16 @@ pub fn agent_proposals_enabled_from_settings(
     .unwrap_or(false)
 }
 
+pub fn process_activity_enabled_from_settings(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) -> bool {
+    extract_bool_setting(
+        settings,
+        openshell_core::settings::PROCESS_ACTIVITY_ENABLED_KEY,
+    )
+    .unwrap_or(false)
+}
+
 fn apply_agent_proposals_enabled(
     agent_proposals: &AgentProposals,
     enabled: bool,
@@ -1752,6 +1762,17 @@ mod tests {
         let settings = std::collections::HashMap::new();
 
         assert!(!agent_proposals_enabled_from_settings(&settings));
+    }
+
+    #[test]
+    fn process_activity_setting_is_opt_in() {
+        let mut settings = std::collections::HashMap::new();
+        assert!(!process_activity_enabled_from_settings(&settings));
+        settings.insert(
+            openshell_core::settings::PROCESS_ACTIVITY_ENABLED_KEY.to_string(),
+            effective_bool(true),
+        );
+        assert!(process_activity_enabled_from_settings(&settings));
     }
 
     // ---- Policy disk discovery tests ----
