@@ -153,15 +153,23 @@ pub async fn handle_issue_sandbox_token(
     // Bind bootstrap credentials to the execution for which the driver result
     // was accepted, so that old Pod credentials cannot mint a new epoch token.
     let execution_id = crate::auth::sandbox_session::sandbox_execution_id(&sandbox_record)
-        .map_err(|_| Status::permission_denied("sandbox execution identity is unavailable"))?;
+        .map_err(|_| {
+            reject(
+                AuthFailureReason::UnknownIdentity,
+                Status::permission_denied("sandbox execution identity is unavailable"),
+            )
+        })?;
     if metadata
         .annotations
         .get(crate::compute::COMPUTE_BOOTSTRAP_EXECUTION_ANNOTATION)
         .map(String::as_str)
         != Some(execution_id.as_str())
     {
-        return Err(Status::permission_denied(
-            "compute runtime identity is not bound to the current sandbox execution",
+        return Err(reject(
+            AuthFailureReason::StaleIdentity,
+            Status::permission_denied(
+                "compute runtime identity is not bound to the current sandbox execution",
+            ),
         ));
     }
 
@@ -1452,7 +1460,7 @@ mod tests {
         .await;
         let err = result.expect_err("no recorded identity to mint from");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        assert_eq!(err.message(), "sandbox runtime identity is invalid");
+        assert_eq!(err.message(), "sandbox execution identity is unavailable");
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["status_detail"], "unknown_identity");
         assert_eq!(events[0]["auth_protocol"], "compute_driver");

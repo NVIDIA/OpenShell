@@ -1150,12 +1150,15 @@ identity returns `InvalidArgument`. Older gateways return `Unimplemented`;
 the CLI never falls back to an unconditional stop.
 
 The execution identity represents a gateway-authenticated runtime launch epoch.
-It changes on explicit start, automatic restart, and gateway recovery starts,
-including another driver launch attempt while a sandbox is already `Starting`.
-Each launch attempt rotates the runtime generation and authorization epoch;
-credential refresh preserves them and the execution identity. The execution
-identity is distinct from the sandbox ID, a Kubernetes Pod UID, and a token's
-`jti`.
+It changes on explicit start, including resume, automatic restart, and a new
+gateway recovery launch. Replaying an already admitted `Starting` driver
+operation retains its identity and resume intent. Credential refresh also
+preserves the identity. The execution identity is distinct from the sandbox
+ID, a Kubernetes Pod UID, and a token's `jti`.
+
+A matching conditional stop can stop a suspended sandbox and discard its
+retained memory state. An observation from before resume cannot stop the
+resumed execution.
 
 Conditional stop returns a receipt identifying the targeted execution and the
 phase recorded by that operation. The CLI does not poll or stop local forwards

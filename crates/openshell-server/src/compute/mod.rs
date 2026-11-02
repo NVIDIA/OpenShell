@@ -2094,12 +2094,12 @@ impl ComputeRuntime {
                 "sandbox name changed while the {verb} request was waiting; retry explicitly"
             )));
         }
-        if let Some(expected) = expected_execution_id {
-            if crate::auth::sandbox_session::sandbox_execution_id(&current)? != expected {
-                return Err(Status::failed_precondition(
-                    "sandbox execution has changed; the requested execution was not stopped",
-                ));
-            }
+        if let Some(expected) = expected_execution_id
+            && crate::auth::sandbox_session::sandbox_execution_id(&current)? != expected
+        {
+            return Err(Status::failed_precondition(
+                "sandbox execution has changed; the requested execution was not stopped",
+            ));
         }
 
         let mut attempt = 1;
@@ -2166,13 +2166,12 @@ impl ComputeRuntime {
                             "sandbox name changed during {verb}; retry explicitly"
                         )));
                     }
-                    if let Some(expected) = expected_execution_id {
-                        if crate::auth::sandbox_session::sandbox_execution_id(&current)? != expected
-                        {
-                            return Err(Status::failed_precondition(
-                                "sandbox execution has changed; the requested execution was not stopped",
-                            ));
-                        }
+                    if let Some(expected) = expected_execution_id
+                        && crate::auth::sandbox_session::sandbox_execution_id(&current)? != expected
+                    {
+                        return Err(Status::failed_precondition(
+                            "sandbox execution has changed; the requested execution was not stopped",
+                        ));
                     }
                 }
                 Err(error) => {
@@ -4349,6 +4348,48 @@ impl ComputeRuntime {
                 failed += 1;
                 continue;
             }
+            let sandbox = if phase == SandboxPhase::Starting {
+                // Replaying the persisted driver operation retains its launch
+                // identity and resume intent.
+                sandbox
+            } else {
+                // A new startup sweep can reconstruct compute. Commit a new
+                // execution before minting credentials for that launch.
+                let next_identity = match next_runtime_identity(&sandbox) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        warn!(sandbox_id, %error, "Failed to advance recovery execution identity");
+                        authentication_failed(sandbox.object_id());
+                        failed += 1;
+                        continue;
+                    }
+                };
+                let sandbox = match self
+                    .store
+                    .update_message_cas::<Sandbox, _>(
+                        &sandbox_id,
+                        sandbox_resource_version(&sandbox),
+                        |sandbox| {
+                            if let Some(metadata) = sandbox.metadata.as_mut() {
+                                next_identity.write(&mut metadata.annotations);
+                            }
+                            project_execution_identity(sandbox);
+                        },
+                    )
+                    .await
+                {
+                    Ok(sandbox) => sandbox,
+                    Err(error) => {
+                        warn!(sandbox_id, %error, "Failed to commit recovery execution identity");
+                        authentication_failed(sandbox.object_id());
+                        failed += 1;
+                        continue;
+                    }
+                };
+                self.sandbox_index.update_from_sandbox(&sandbox);
+                self.sandbox_watch_bus.notify(&sandbox_id);
+                sandbox
+            };
             let launch_authentication = match launch_authentication_for(&sandbox).await {
                 Ok(authentication) => authentication,
                 Err(err) => {
@@ -20865,10 +20906,10 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             .unwrap()
             .unwrap();
         assert_eq!(expired.phase(), i32::from(SandboxPhase::Error));
-        assert_ne!(
+        assert_eq!(
             crate::auth::sandbox_session::sandbox_execution_id(&expired).unwrap(),
             original_execution,
-            "recovery rotates execution identity without renewing the provisioning deadline"
+            "retrying the persisted driver operation retains its execution identity"
         );
         let status = expired.status.as_ref().unwrap();
         let record = status.provisioning.as_ref().unwrap();

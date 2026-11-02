@@ -1770,7 +1770,13 @@ async fn sandbox_stop_accepts_terminal_results_without_waiting_for_stopped() {
             .run_async(async {
                 let result = tokio::time::timeout(
                     Duration::from_secs(5),
-                    run::sandbox_stop(&server.endpoint, "terminal-stop-test", "default", &tls),
+                    run::sandbox_stop(
+                        &server.endpoint,
+                        "terminal-stop-test",
+                        "default",
+                        None,
+                        &tls,
+                    ),
                 )
                 .await
                 .expect("stop must finish without watching for another phase");

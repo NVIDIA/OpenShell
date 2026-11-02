@@ -648,8 +648,13 @@ mod tests {
         )
         .unwrap();
         validate_execution_id(&initial).unwrap();
-        let refreshed =
-            identity.next_gateway_token(RefreshRequestHash::from_extension_services(&[]), 123, 30);
+        let refreshed = identity
+            .next_gateway_token(
+                RefreshRequestHash::from_extension_services(&[]).unwrap(),
+                123,
+                30,
+            )
+            .unwrap();
         assert_eq!(
             initial,
             execution_id(
@@ -696,8 +701,7 @@ mod tests {
             assert_eq!(
                 validate_execution_id(invalid).unwrap_err().code(),
                 tonic::Code::InvalidArgument
-            )
-            .unwrap();
+            );
         }
     }
 

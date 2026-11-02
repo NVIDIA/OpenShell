@@ -180,9 +180,9 @@ mod tests {
     // Conditional stop adds two public messages and a status execution ID;
     // stored statuses without that additive field decode with an empty ID.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "be99bb3fcc7894eb85d774f54b642173e70dd37bc8e5fcaf3fdff2454ae689e1";
+        "bccd6a8a4e6e4752c19da92bd8a46d55b83788b17670a01ea12a6775803c77b6";
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "5911cc0899c44e4e9ec5bdc150d0d34182a00d91b40a5a4c377c6ed7e767e788";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these

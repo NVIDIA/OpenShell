@@ -616,6 +616,8 @@ supervisor JWT claim. Do not substitute a fresh status identity for a delayed
 event. Conditional stop returns an execution receipt and does not manage local
 forwards or poll by name. It currently requires a single SQLite gateway;
 PostgreSQL/multi-replica deployments reject it with `FailedPrecondition`.
+A matching stop of a suspended execution discards its retained memory;
+an observation from before resume cannot stop the resumed execution.
 
 ---
 
