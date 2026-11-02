@@ -265,7 +265,7 @@ const IMAGE_PREP_INIT_MODE: &str = "image-prep";
 const IMAGE_PREP_CONSOLE_LOG: &str = "image-prep-console.log";
 /// Directory the guest image-prep init writes at the root of the prepared disk
 /// once preparation succeeds (`image_root` in `openshell-vm-sandbox-init.sh`).
-const PREPARED_IMAGE_ROOTFS_DIR: &str = "/image-rootfs";
+pub(crate) const PREPARED_IMAGE_ROOTFS_DIR: &str = "/image-rootfs";
 static IMAGE_CACHE_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 static OWNER_STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static NETWORK_TRUST_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
