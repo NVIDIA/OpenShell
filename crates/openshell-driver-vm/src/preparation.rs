@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 use tonic::Status;
 
 use super::{
-    OverlayPreparation, RuntimeImagePlan, SandboxOwnerIdentity, VmDriverConfig,
+    ImageRootfsLayout, OverlayPreparation, RuntimeImagePlan, SandboxOwnerIdentity, VmDriverConfig,
     WorkloadIdentityRequest,
 };
 
@@ -52,6 +52,7 @@ pub(super) struct Request {
 #[serde(deny_unknown_fields)]
 pub(super) struct OverlayRequest {
     pub source_disk: PathBuf,
+    pub source_layout: ImageRootfsLayout,
     pub preparation: OverlayPreparation,
     pub requested_identity: Option<WorkloadIdentitySelectors>,
 }

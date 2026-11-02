@@ -13,7 +13,13 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::driver::DEFAULT_SANDBOX_UID;
+use crate::driver::{DEFAULT_SANDBOX_UID, PREPARED_IMAGE_ROOTFS_DIR};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ImageRootfsLayout {
+    Root,
+    Prepared,
+}
 
 const SANDBOX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-sandbox.zst"));
 const SUPERVISOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-supervisor.zst"));
@@ -802,13 +808,24 @@ fn debugfs_quote_argument(argument: &str) -> Option<String> {
     Some(quoted)
 }
 
-/// Read the sandbox account identity directly from an ext4 rootfs image.
+/// Read the sandbox account identity from an ext4 image using its known layout.
 ///
 /// Persisted VM overlays may outlive the prepared-image cache layout that
 /// created them. Reading the matching old lower disk lets the driver preserve
 /// that overlay's real ownership contract during an upgrade.
-pub fn sandbox_guest_user_ids_from_image(image_path: &Path) -> Result<Option<(u32, u32)>, String> {
-    sandbox_guest_user_ids_from_image_path(image_path, "/etc/passwd")
+///
+/// A disk prepared in the guest keeps the image rootfs under
+/// `PREPARED_IMAGE_ROOTFS_DIR`. The caller supplies the layout selected for
+/// the VM, since an image can itself contain a directory with that name.
+pub fn sandbox_guest_user_ids_from_image(
+    image_path: &Path,
+    layout: ImageRootfsLayout,
+) -> Result<Option<(u32, u32)>, String> {
+    let passwd_path = match layout {
+        ImageRootfsLayout::Root => "/etc/passwd".to_string(),
+        ImageRootfsLayout::Prepared => format!("{PREPARED_IMAGE_ROOTFS_DIR}/etc/passwd"),
+    };
+    sandbox_guest_user_ids_from_image_path(image_path, &passwd_path)
 }
 
 /// Read a sandbox account copied into an overlay upper layer.
@@ -1610,6 +1627,56 @@ mod tests {
         assert_eq!(
             sandbox_guest_user_ids(&rootfs).expect("read sandbox user"),
             Some((998, 997))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sandbox_guest_user_ids_from_image_uses_selected_layout() {
+        if e2fs_command("debugfs").is_err() {
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let prepared_source = dir.join("prepared-source");
+        fs::create_dir_all(prepared_source.join("image-rootfs/etc")).expect("create image etc");
+        fs::create_dir_all(prepared_source.join("upper")).expect("create upperdir");
+        fs::write(
+            prepared_source.join("image-rootfs/etc/passwd"),
+            "ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\nsandbox:x:998:998::/sandbox:/bin/bash\n",
+        )
+        .expect("write image passwd");
+        let prepared = dir.join("prepared.ext4");
+        create_ext4_image_from_dir_with_size(&prepared_source, &prepared, 64 * 1024 * 1024)
+            .expect("create prepared image");
+        assert_eq!(
+            sandbox_guest_user_ids_from_image(&prepared, ImageRootfsLayout::Prepared)
+                .expect("read prepared image account"),
+            Some((998, 998))
+        );
+
+        let root_source = dir.join("root-source");
+        fs::create_dir_all(root_source.join("etc")).expect("create root etc");
+        fs::create_dir_all(root_source.join("image-rootfs/etc"))
+            .expect("create unrelated image-rootfs etc");
+        fs::write(
+            root_source.join("etc/passwd"),
+            "sandbox:x:1500:1501:Sandbox:/sandbox:/bin/sh\n",
+        )
+        .expect("write root passwd");
+        fs::write(
+            root_source.join("image-rootfs/etc/passwd"),
+            "sandbox:x:2500:2501:Unrelated:/sandbox:/bin/sh\n",
+        )
+        .expect("write unrelated passwd");
+        let root = dir.join("root.ext4");
+        create_ext4_image_from_dir_with_size(&root_source, &root, 64 * 1024 * 1024)
+            .expect("create root image");
+        assert_eq!(
+            sandbox_guest_user_ids_from_image(&root, ImageRootfsLayout::Root)
+                .expect("read root image account"),
+            Some((1500, 1501))
         );
 
         let _ = fs::remove_dir_all(&dir);

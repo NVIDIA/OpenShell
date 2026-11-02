@@ -19,12 +19,12 @@ use crate::lifecycle::{
     RestoreContext, extension_state_dir,
 };
 use crate::rootfs::{
-    clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
-    ext4_image_has_directory, extract_host_supervisor, extract_rootfs_archive_to,
-    prepare_sandbox_rootfs_from_image_root, recover_rootfs_image, remove_rootfs_image_file,
-    sandbox_guest_init_path, sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
-    sandbox_guest_user_ids_from_overlay_image, set_rootfs_image_file_mode,
-    validate_host_supervisor, write_rootfs_image_file,
+    ImageRootfsLayout, clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size,
+    create_rootfs_image_from_dir, ext4_image_has_directory, extract_host_supervisor,
+    extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, recover_rootfs_image,
+    remove_rootfs_image_file, sandbox_guest_init_path, sandbox_guest_runtime_identity,
+    sandbox_guest_user_ids_from_image, sandbox_guest_user_ids_from_overlay_image,
+    set_rootfs_image_file_mode, validate_host_supervisor, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -265,7 +265,7 @@ const IMAGE_PREP_INIT_MODE: &str = "image-prep";
 const IMAGE_PREP_CONSOLE_LOG: &str = "image-prep-console.log";
 /// Directory the guest image-prep init writes at the root of the prepared disk
 /// once preparation succeeds (`image_root` in `openshell-vm-sandbox-init.sh`).
-const PREPARED_IMAGE_ROOTFS_DIR: &str = "/image-rootfs";
+pub(crate) const PREPARED_IMAGE_ROOTFS_DIR: &str = "/image-rootfs";
 static IMAGE_CACHE_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 static OWNER_STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static NETWORK_TRUST_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1908,6 +1908,11 @@ impl VmDriver {
         let disk_paths = sandbox_runtime_disk_paths(&state_dir);
         let root_disk = image_plan.root_disk;
         let image_disk = image_plan.image_disk;
+        let owner_source_layout = if image_disk.is_some() {
+            ImageRootfsLayout::Prepared
+        } else {
+            ImageRootfsLayout::Root
+        };
         let owner_source_disk = image_disk.as_ref().unwrap_or(&root_disk).clone();
         let overlay_disk = disk_paths.overlay_disk;
         let boundary_generation =
@@ -1936,6 +1941,7 @@ impl VmDriver {
             .prepare_overlay_in_worker(
                 &sandbox.id,
                 &owner_source_disk,
+                owner_source_layout,
                 overlay_preparation,
                 sandbox
                     .spec
@@ -3336,11 +3342,13 @@ impl VmDriver {
         &self,
         sandbox_id: &str,
         owner_source_disk: &Path,
+        owner_source_layout: ImageRootfsLayout,
         preparation: OverlayPreparation,
         requested_identity: Option<&WorkloadIdentityRequest>,
     ) -> Result<SandboxOwnerIdentity, Status> {
         let overlay = preparation::OverlayRequest {
             source_disk: owner_source_disk.to_path_buf(),
+            source_layout: owner_source_layout,
             preparation,
             requested_identity: requested_identity
                 .map(preparation::WorkloadIdentitySelectors::from),
@@ -3381,6 +3389,7 @@ impl VmDriver {
             &state_dir,
             &overlay_disk,
             &overlay.source_disk,
+            overlay.source_layout,
             overlay.preparation,
             requested_identity.as_ref(),
         )
@@ -3621,6 +3630,7 @@ impl VmDriver {
         state_dir: &Path,
         overlay_disk: &Path,
         owner_source_disk: &Path,
+        owner_source_layout: ImageRootfsLayout,
         preparation: OverlayPreparation,
         requested_identity: Option<&WorkloadIdentityRequest>,
     ) -> Result<SandboxOwnerIdentity, String> {
@@ -3640,6 +3650,7 @@ impl VmDriver {
             state_dir,
             &overlay_disk,
             owner_source_disk,
+            owner_source_layout,
             &self.config,
             preparation,
         )
@@ -6932,6 +6943,7 @@ async fn sandbox_owner_state_for_launch(
     state_dir: &Path,
     overlay_disk: &Path,
     owner_source_disk: &Path,
+    owner_source_layout: ImageRootfsLayout,
     config: &VmDriverConfig,
     preparation: OverlayPreparation,
 ) -> Result<(SandboxOwnerIdentity, bool), String> {
@@ -6986,7 +6998,7 @@ async fn sandbox_owner_state_for_launch(
         if let Some((uid, gid)) = configured_sandbox_identity(config) {
             return Ok((SandboxOwnerIdentity { uid, gid }, true));
         }
-        return sandbox_owner_identity_from_image(owner_source_disk)
+        return sandbox_owner_identity_from_image(owner_source_disk, owner_source_layout)
             .await
             .map(|identity| (identity, true));
     }
@@ -6994,7 +7006,7 @@ async fn sandbox_owner_state_for_launch(
     if let Some((uid, gid)) = configured_sandbox_identity(config) {
         return Ok((SandboxOwnerIdentity { uid, gid }, true));
     }
-    sandbox_owner_identity_from_image(owner_source_disk)
+    sandbox_owner_identity_from_image(owner_source_disk, owner_source_layout)
         .await
         .map(|identity| (identity, true))
 }
@@ -7014,7 +7026,8 @@ async fn persisted_sandbox_owner_identity(
     if !prior_identity.is_empty() {
         let prior_disk = image_cache_rootfs_image(&config.state_dir, prior_identity.trim());
         if tokio::fs::metadata(&prior_disk).await.is_ok() {
-            match sandbox_owner_identity_from_image(&prior_disk).await {
+            let prior_layout = image_rootfs_layout_from_cache_identity(prior_identity.trim());
+            match sandbox_owner_identity_from_image(&prior_disk, prior_layout).await {
                 Ok(identity) => return Ok(Some(identity)),
                 Err(error) => warn!(
                     image_path = %prior_disk.display(),
@@ -7059,10 +7072,11 @@ async fn read_persisted_workload_identity(
 
 async fn sandbox_owner_identity_from_image(
     image_path: &Path,
+    layout: ImageRootfsLayout,
 ) -> Result<SandboxOwnerIdentity, String> {
     let image_path = image_path.to_path_buf();
     let identity =
-        tokio::task::spawn_blocking(move || sandbox_guest_user_ids_from_image(&image_path))
+        tokio::task::spawn_blocking(move || sandbox_guest_user_ids_from_image(&image_path, layout))
             .await
             .map_err(|error| format!("read sandbox identity task failed: {error}"))??;
     let (uid, gid) = identity.unwrap_or((DEFAULT_SANDBOX_UID, DEFAULT_SANDBOX_UID));
@@ -7327,6 +7341,16 @@ fn prepared_image_cache_identity(image_identity: &str, config: &VmDriverConfig) 
         "{PREPARED_IMAGE_CACHE_LAYOUT_VERSION}:openshell-{}:{identity}:{image_identity}",
         openshell_core::VERSION
     )
+}
+
+/// Old prepared cache versions retain this prefix, so a persisted overlay can
+/// recover its original lower disk layout after a cache version change.
+fn image_rootfs_layout_from_cache_identity(image_identity: &str) -> ImageRootfsLayout {
+    if image_identity.starts_with("sandbox-prepared-rootfs-ext4-umoci-v") {
+        ImageRootfsLayout::Prepared
+    } else {
+        ImageRootfsLayout::Root
+    }
 }
 
 fn registry_layer_download_concurrency() -> usize {
@@ -9432,6 +9456,7 @@ mod tests {
                 Path::new("/unused"),
                 Path::new("/unused"),
                 Path::new("/unused"),
+                ImageRootfsLayout::Root,
                 OverlayPreparation::Fresh,
                 None,
             )
@@ -10044,6 +10069,7 @@ mod tests {
                 directory.path(),
                 &overlay,
                 Path::new("/must-not-read-image"),
+                ImageRootfsLayout::Root,
                 OverlayPreparation::PreserveExisting,
                 Some(&request),
             )
@@ -10090,6 +10116,7 @@ mod tests {
             };
             let request = preparation::OverlayRequest {
                 source_disk: image_cache_root_dir(directory.path()).join("must-not-read-image"),
+                source_layout: ImageRootfsLayout::Root,
                 preparation: OverlayPreparation::PreserveExisting,
                 requested_identity: Some(preparation::WorkloadIdentitySelectors::from(
                     &requested_identity,
@@ -10187,16 +10214,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unmarked_overlay_uses_current_image_instead_of_blind_legacy_identity() {
+    async fn unmarked_overlay_uses_current_rootfs_with_unrelated_image_rootfs_directory() {
         let dir = unique_temp_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let overlay = dir.join(SANDBOX_OVERLAY_IMAGE);
         std::fs::write(&overlay, b"unreadable partial overlay").unwrap();
         let source = dir.join("current-rootfs-source");
         std::fs::create_dir_all(source.join("etc")).unwrap();
+        std::fs::create_dir_all(source.join("image-rootfs/etc")).unwrap();
         std::fs::write(
             source.join("etc/passwd"),
             "root:x:0:0:root:/root:/bin/sh\nsandbox:x:4242:4343:Sandbox:/sandbox:/bin/sh\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("image-rootfs/etc/passwd"),
+            "sandbox:x:5000:5001:Unrelated:/sandbox:/bin/sh\n",
         )
         .unwrap();
         let current_rootfs = dir.join("current-rootfs.ext4");
@@ -10210,6 +10243,7 @@ mod tests {
             &dir,
             &overlay,
             &current_rootfs,
+            ImageRootfsLayout::Root,
             &config,
             OverlayPreparation::PreserveExisting,
         )
@@ -10242,6 +10276,7 @@ mod tests {
             &dir,
             &overlay,
             Path::new("/missing-current-rootfs"),
+            ImageRootfsLayout::Root,
             &config,
             OverlayPreparation::PreserveExisting,
         )
@@ -10268,6 +10303,7 @@ mod tests {
             &dir,
             &dir.join(SANDBOX_OVERLAY_IMAGE),
             Path::new("/missing-current-rootfs"),
+            ImageRootfsLayout::Root,
             &config,
             OverlayPreparation::Fresh,
         )
@@ -10302,6 +10338,7 @@ mod tests {
             &dir,
             &dir.join(SANDBOX_OVERLAY_IMAGE),
             &rootfs,
+            ImageRootfsLayout::Root,
             &config,
             OverlayPreparation::Fresh,
         )
@@ -10315,6 +10352,38 @@ mod tests {
                 gid: DEFAULT_SANDBOX_UID,
             }
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn fresh_prepared_image_uses_nested_sandbox_account() {
+        let dir = unique_temp_dir();
+        let source = dir.join("prepared-source");
+        std::fs::create_dir_all(source.join("image-rootfs/etc")).unwrap();
+        std::fs::write(
+            source.join("image-rootfs/etc/passwd"),
+            "sandbox:x:998:999:Sandbox:/sandbox:/bin/sh\n",
+        )
+        .unwrap();
+        let prepared = dir.join("prepared.ext4");
+        create_ext4_image_from_dir_with_size(&source, &prepared, 32 * 1024 * 1024).unwrap();
+        let config = VmDriverConfig {
+            state_dir: dir.clone(),
+            ..Default::default()
+        };
+
+        let (identity, _) = sandbox_owner_state_for_launch(
+            &dir,
+            &dir.join(SANDBOX_OVERLAY_IMAGE),
+            &prepared,
+            ImageRootfsLayout::Prepared,
+            &config,
+            OverlayPreparation::Fresh,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(identity, SandboxOwnerIdentity { uid: 998, gid: 999 });
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -10335,6 +10404,7 @@ mod tests {
             &dir,
             &overlay,
             Path::new("/missing-current-rootfs"),
+            ImageRootfsLayout::Root,
             &config,
             OverlayPreparation::PreserveExisting,
         )
@@ -10381,7 +10451,7 @@ mod tests {
         .unwrap();
         let image = dir.join("rootfs.ext4");
         create_ext4_image_from_dir_with_size(&image_source, &image, 32 * 1024 * 1024).unwrap();
-        let image_error = sandbox_owner_identity_from_image(&image)
+        let image_error = sandbox_owner_identity_from_image(&image, ImageRootfsLayout::Root)
             .await
             .expect_err("root image identity must be rejected");
         assert!(image_error.contains("uid 0 is outside the allowed range"));
@@ -10423,6 +10493,7 @@ mod tests {
             &dir,
             &overlay,
             Path::new("/missing-rootfs"),
+            ImageRootfsLayout::Root,
             &config,
             OverlayPreparation::PreserveExisting,
         )
@@ -10470,6 +10541,7 @@ mod tests {
             &dir,
             &overlay,
             Path::new("/missing-current-rootfs"),
+            ImageRootfsLayout::Root,
             &config,
             OverlayPreparation::PreserveExisting,
         )
@@ -10506,6 +10578,7 @@ mod tests {
             &dir,
             &overlay,
             Path::new("/missing-current-rootfs"),
+            ImageRootfsLayout::Root,
             &config,
             OverlayPreparation::PreserveExisting,
         )
@@ -10554,6 +10627,7 @@ mod tests {
             &state_dir,
             &overlay,
             Path::new("/missing-current-rootfs"),
+            ImageRootfsLayout::Root,
             &config,
             OverlayPreparation::PreserveExisting,
         )
@@ -10567,6 +10641,47 @@ mod tests {
                 gid: 4343,
             }
         );
+        assert!(write_marker);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unmarked_overlay_recovers_identity_from_old_prepared_cache() {
+        let root = unique_temp_dir();
+        let state_dir = root.join("sandboxes/sandbox-1");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let overlay = state_dir.join(SANDBOX_OVERLAY_IMAGE);
+        std::fs::write(&overlay, b"legacy overlay").unwrap();
+        let prior_identity =
+            "sandbox-prepared-rootfs-ext4-umoci-v3:openshell-0.1.6:image-account:abc";
+        std::fs::write(state_dir.join(IMAGE_IDENTITY_FILE), prior_identity).unwrap();
+
+        let source = root.join("legacy-prepared-source");
+        std::fs::create_dir_all(source.join("image-rootfs/etc")).unwrap();
+        std::fs::write(
+            source.join("image-rootfs/etc/passwd"),
+            "sandbox:x:998:999:Sandbox:/sandbox:/bin/sh\n",
+        )
+        .unwrap();
+        let prior_disk = image_cache_rootfs_image(&root, prior_identity);
+        create_ext4_image_from_dir_with_size(&source, &prior_disk, 32 * 1024 * 1024).unwrap();
+        let config = VmDriverConfig {
+            state_dir: root.clone(),
+            ..Default::default()
+        };
+
+        let (identity, write_marker) = sandbox_owner_state_for_launch(
+            &state_dir,
+            &overlay,
+            Path::new("/missing-current-rootfs"),
+            ImageRootfsLayout::Root,
+            &config,
+            OverlayPreparation::PreserveExisting,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(identity, SandboxOwnerIdentity { uid: 998, gid: 999 });
         assert!(write_marker);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -10989,6 +11104,7 @@ mod tests {
                 .prepare_overlay_in_worker(
                     "warm-b",
                     &plan.root_disk,
+                    ImageRootfsLayout::Root,
                     OverlayPreparation::Fresh,
                     None,
                 )
@@ -12733,6 +12849,10 @@ mod tests {
                 openshell_core::VERSION
             )
         );
+        assert_eq!(
+            image_rootfs_layout_from_cache_identity(&image_account),
+            ImageRootfsLayout::Prepared
+        );
 
         let identities = [
             VmDriverConfig {
@@ -12770,6 +12890,10 @@ mod tests {
     #[test]
     fn bootstrap_image_cache_identity_includes_rootfs_layout_version_and_guest_runtime() {
         let identity = bootstrap_image_cache_identity("sha256:bootstrap-image");
+        assert_eq!(
+            image_rootfs_layout_from_cache_identity(&identity),
+            ImageRootfsLayout::Root
+        );
         assert!(identity.starts_with(&format!(
             "sandbox-bootstrap-rootfs-ext4-v6:openshell-{}:guest-",
             openshell_core::VERSION

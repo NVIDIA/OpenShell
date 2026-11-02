@@ -78,6 +78,7 @@ fn worker_overlay_case(interrupt_retry: bool) {
             "bootstrap_only": false,
             "overlay": {
                 "source_disk": source,
+                "source_layout": "Root",
                 "preparation": if interrupt_retry { "PreserveExisting" } else { "Fresh" },
             },
             "lease_fd": fd,
@@ -274,6 +275,7 @@ fn spawn_overlay_fixture(
             "config": config, "sandbox_id": id, "image_ref": "", "rootfs_tar": null,
             "bootstrap_only": false,
             "overlay": { "source_disk": root.join("images/test-image/rootfs.ext4"),
+                         "source_layout": "Root",
                          "preparation": "Fresh", "requested_identity": null },
             "lease_fd": fd, "parent_pid": std::process::id(),
         }))
