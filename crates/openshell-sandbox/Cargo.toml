@@ -36,6 +36,7 @@ async-trait = "0.1"
 bytes = { workspace = true }
 hex = "0.4"
 ipnet = "2"
+globset = { workspace = true }
 rand = "0.10"
 
 # Async runtime

@@ -1102,6 +1102,13 @@ fn validate_filesystem_additive(
     baseline: Option<&openshell_core::proto::FilesystemPolicy>,
     new: Option<&openshell_core::proto::FilesystemPolicy>,
 ) -> Result<(), Status> {
+    let baseline_audit_paths = baseline.map_or(&[][..], |fs| fs.audit_paths.as_slice());
+    let new_audit_paths = new.map_or(&[][..], |fs| fs.audit_paths.as_slice());
+    if baseline_audit_paths != new_audit_paths {
+        return Err(Status::invalid_argument(
+            "filesystem audit_paths cannot be changed on a live sandbox (bound at startup)",
+        ));
+    }
     match (baseline, new) {
         (Some(base), Some(upd)) => {
             if base.include_workdir != upd.include_workdir {
@@ -2143,6 +2150,7 @@ mod tests {
                 include_workdir: true,
                 read_only: vec!["/usr".into()],
                 read_write: vec!["/tmp".into()],
+                audit_paths: vec![],
             }),
             process: Some(ProcessPolicy {
                 run_as_user: "root".into(),
@@ -2165,6 +2173,7 @@ mod tests {
                 include_workdir: true,
                 read_only: vec!["/usr/../etc/shadow".into()],
                 read_write: vec!["/tmp".into()],
+                audit_paths: vec![],
             }),
             ..Default::default()
         };
@@ -2183,6 +2192,7 @@ mod tests {
                 include_workdir: true,
                 read_only: vec!["/usr".into()],
                 read_write: vec!["/".into()],
+                audit_paths: vec![],
             }),
             ..Default::default()
         };
@@ -2320,6 +2330,7 @@ mod tests {
                 include_workdir: true,
                 read_only: vec!["/usr".into()],
                 read_write: vec!["/tmp".into()],
+                audit_paths: vec![],
             }),
             landlock: Some(LandlockPolicy {
                 compatibility: "best_effort".into(),
@@ -2409,6 +2420,7 @@ mod tests {
             filesystem: Some(FilesystemPolicy {
                 read_only: vec!["/usr".into(), "/lib".into(), "/etc".into()],
                 read_write: vec!["/sandbox".into(), "/tmp".into()],
+                audit_paths: vec![],
                 include_workdir: true,
             }),
             ..Default::default()
@@ -2437,6 +2449,28 @@ mod tests {
         let result = validate_static_fields_unchanged(&baseline, &changed);
         assert!(result.is_err());
         assert!(result.unwrap_err().message().contains("include_workdir"));
+    }
+
+    #[test]
+    fn validate_static_fields_rejects_audit_path_changes() {
+        use openshell_core::proto::FilesystemPolicy;
+
+        let baseline = ProtoSandboxPolicy {
+            filesystem: Some(FilesystemPolicy {
+                audit_paths: vec!["/sandbox/**/.env".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut changed = baseline.clone();
+        changed.filesystem.as_mut().unwrap().audit_paths = vec!["/sandbox/.ssh/**".into()];
+        let error = validate_static_fields_unchanged(&baseline, &changed).unwrap_err();
+        assert!(error.message().contains("audit_paths cannot be changed"));
+
+        let mut removed = baseline.clone();
+        removed.filesystem.as_mut().unwrap().audit_paths.clear();
+        let error = validate_static_fields_unchanged(&baseline, &removed).unwrap_err();
+        assert!(error.message().contains("audit_paths cannot be changed"));
     }
 
     // ---- Exec validation ----

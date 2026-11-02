@@ -15,6 +15,8 @@ pub mod container_log;
 #[cfg(target_os = "linux")]
 pub(crate) mod delegated;
 #[cfg(target_os = "linux")]
+mod file_audit;
+#[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "linux")]
 pub mod main_session;
@@ -26,6 +28,8 @@ mod network_broker;
 pub mod perf;
 #[cfg(target_os = "linux")]
 pub mod process;
+#[cfg(target_os = "linux")]
+mod process_audit;
 #[cfg(target_os = "linux")]
 mod provider_files;
 #[cfg(target_os = "linux")]

@@ -598,6 +598,7 @@ mod tests {
             filesystem: FilesystemPolicy {
                 read_only,
                 read_write,
+                audit_paths: Vec::new(),
                 include_workdir: false,
             },
             network: NetworkPolicy::default(),

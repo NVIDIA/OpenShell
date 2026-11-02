@@ -287,6 +287,7 @@ The `class_uid` field identifies the event type:
 | `class_uid` | Class | Shorthand prefix |
 |---|---|---|
 | 0 | Base Event | `EVENT` |
+| 1001 | File System Activity | `FILE:` |
 | 4001 | Network Activity | `NET:` |
 | 4002 | HTTP Activity | `HTTP:` |
 | 4007 | SSH Activity | `SSH:` |
@@ -296,6 +297,11 @@ The `class_uid` field identifies the event type:
 | 5019 | Device Config State Change | `CONFIG:` |
 | 6002 | Application Lifecycle | `LIFECYCLE:` |
 | 6003 | API Activity | `API:` |
+
+The built-in sandbox runtime emits watched-path File System Activity as
+shorthand in workload container logs. These runtime events do not enter the
+supervisor JSONL file or gateway log stream. See [Main Process
+Output](/observability/accessing-logs#main-process-output) for collection.
 
 HTTP Activity records include request or response details. Rejections that have
 parsed a request, including early credential-binding failures, include safe

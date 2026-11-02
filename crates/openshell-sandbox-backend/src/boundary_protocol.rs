@@ -1003,6 +1003,8 @@ pub enum Response {
         process_id: String,
         provider_env_revision: u64,
         provider_env_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_identity: Option<ProcessIdentityWire>,
     },
     ProviderEnvironmentUpdated {
         revision: u64,
@@ -1022,6 +1024,8 @@ pub enum Response {
     ExecStarted {
         process_id: String,
         pty: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_identity: Option<ProcessIdentityWire>,
     },
     Resized,
     LoopbackConnected,
@@ -1067,6 +1071,21 @@ pub struct ProcessSnapshotWire {
     pub terminal: bool,
     pub status: Option<ExitStatusWire>,
     pub retained_output: OutputWindowWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_identity: Option<ProcessIdentityWire>,
+}
+
+/// Identity captured by the runtime before a process can be reaped. Arguments
+/// are intentionally excluded from this protocol and from audit events.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessIdentityWire {
+    pub name: String,
+    pub pid: u32,
+    pub uid: Option<String>,
+    pub created_time_ms: Option<i64>,
+    pub parent_pid: Option<u32>,
+    pub parent_uid: Option<String>,
+    pub parent_created_time_ms: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1263,6 +1282,9 @@ pub struct AgentSpecWire {
     /// relay is unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub otlp_relay_active: bool,
+    /// Omitted while false to preserve existing request digests.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub process_activity_enabled: bool,
 }
 
 impl From<AgentSpec> for AgentSpecWire {
@@ -1274,6 +1296,7 @@ impl From<AgentSpec> for AgentSpecWire {
             timeout_secs: spec.timeout_secs,
             interactive: spec.interactive,
             otlp_relay_active: spec.otlp_relay_active,
+            process_activity_enabled: spec.process_activity_enabled,
         }
     }
 }
@@ -1283,6 +1306,8 @@ pub struct SandboxPolicyWire {
     pub version: u32,
     pub read_only: Vec<PathBuf>,
     pub read_write: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_paths: Vec<String>,
     pub include_workdir: bool,
     pub network: NetworkModeWire,
     pub proxy_addr: Option<std::net::SocketAddr>,
@@ -1306,6 +1331,7 @@ impl From<SandboxPolicy> for SandboxPolicyWire {
         let FilesystemPolicy {
             read_only,
             read_write,
+            audit_paths,
             include_workdir,
         } = filesystem;
         let NetworkPolicy { mode, proxy } = network;
@@ -1318,6 +1344,7 @@ impl From<SandboxPolicy> for SandboxPolicyWire {
             version,
             read_only,
             read_write,
+            audit_paths,
             include_workdir,
             network: NetworkModeWire::from(mode),
             proxy_addr: proxy.and_then(|proxy| proxy.http_addr),
@@ -1338,6 +1365,7 @@ impl From<SandboxPolicyWire> for SandboxPolicy {
             filesystem: FilesystemPolicy {
                 read_only: policy.read_only,
                 read_write: policy.read_write,
+                audit_paths: policy.audit_paths,
                 include_workdir: policy.include_workdir,
             },
             network: NetworkPolicy {
@@ -1697,6 +1725,7 @@ mod tests {
             timeout_secs: 0,
             interactive: false,
             otlp_relay_active: false,
+            process_activity_enabled: false,
         };
         let encoded = serde_json::to_value(&spec).unwrap();
         assert!(
@@ -1710,6 +1739,17 @@ mod tests {
         let decoded: AgentSpecWire =
             serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
         assert!(decoded.otlp_relay_active);
+
+        assert!(
+            serde_json::to_value(&spec)
+                .unwrap()
+                .get("process_activity_enabled")
+                .is_none()
+        );
+        spec.process_activity_enabled = true;
+        let decoded: AgentSpecWire =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert!(decoded.process_activity_enabled);
     }
 
     #[test]
@@ -1728,6 +1768,7 @@ mod tests {
                     timeout_secs: 5,
                     interactive: false,
                     otlp_relay_active: false,
+                    process_activity_enabled: false,
                 },
                 ca_cert: Some("test certificate".to_string()),
                 ca_bundle: Some("test bundle".to_string()),
@@ -1886,6 +1927,7 @@ mod tests {
                 timeout_secs: 5,
                 interactive: false,
                 otlp_relay_active: false,
+                process_activity_enabled: false,
             },
             ca_cert: Some("A".repeat(16 * 1024)),
             ca_bundle: Some("B".repeat(400 * 1024)),

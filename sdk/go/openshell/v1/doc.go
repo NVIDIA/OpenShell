@@ -306,6 +306,7 @@
 //	        Filesystem: &v1.FilesystemPolicy{
 //	            IncludeWorkdir: true,
 //	            ReadOnly:       []string{"/usr", "/lib"},
+//	            AuditPaths:     []string{"/sandbox/**/.env"},
 //	        },
 //	        Process: &v1.ProcessPolicy{
 //	            RunAsUser:  "sandbox",

@@ -205,6 +205,7 @@ message Started {
   string process_id = 1;
   uint64 provider_env_revision = 2;
   uint64 provider_env_generation = 3;
+  ProcessIdentity process_identity = 4;
 }
 message ProviderEnvironmentUpdated {
   uint64 revision = 1;
@@ -223,6 +224,7 @@ message BoundaryTerminated {}
 message ExecStarted {
   string process_id = 1;
   bool pty = 2;
+  ProcessIdentity process_identity = 3;
 }
 message Resized {}
 message LoopbackConnected {}
@@ -275,6 +277,8 @@ message AgentSpec {
   // point workload SDKs at the relay by default. False keeps the workload
   // environment unchanged.
   bool otlp_relay_active = 6;
+  // Opt in to launch and exit events for boundary-started workload processes.
+  bool process_activity_enabled = 7;
 }
 message ExecSpec {
   string program = 1;
@@ -310,6 +314,8 @@ message SandboxPolicy {
   LandlockCompatibility landlock = 7;
   optional string run_as_user = 8;
   optional string run_as_group = 9;
+  // Path globs whose attempted opens are reported by the sandbox boundary.
+  repeated string audit_paths = 10;
 }
 enum NetworkMode {
   NETWORK_MODE_UNSPECIFIED = 0;
@@ -360,6 +366,17 @@ message ProcessSnapshot {
   bool terminal = 3;
   ExitStatus status = 4;
   OutputWindow retained_output = 5;
+  ProcessIdentity process_identity = 6;
+}
+// Runtime-captured identity; no argv, environment, or full command line.
+message ProcessIdentity {
+  string name = 1;
+  uint32 pid = 2;
+  optional string uid = 3;
+  google.protobuf.Timestamp created_time = 4;
+  optional uint32 parent_pid = 5;
+  optional string parent_uid = 6;
+  google.protobuf.Timestamp parent_created_time = 7;
 }
 enum ProcessKind {
   PROCESS_KIND_UNSPECIFIED = 0;

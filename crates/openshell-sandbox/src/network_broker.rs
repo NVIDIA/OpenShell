@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::file_audit::FileAudit;
 use crate::linux::seccomp_notify::{Notification, NotificationListener};
 use crate::linux::socket_registry::{
     InetFamily, InetKind, SocketIdentity, SocketMetadata, SocketRegistry, SocketState,
@@ -205,6 +206,7 @@ fn register_dns_socket(
 #[derive(Clone)]
 struct NotificationQueues {
     provider_files: crate::provider_files::ProviderFiles,
+    file_audit: FileAudit,
     workload_frozen: Arc<AtomicBool>,
     protected_control_port: Option<u16>,
     identity_resolver: ProcfsIdentityResolver,
@@ -219,6 +221,7 @@ struct NotificationQueues {
 #[derive(Clone)]
 pub struct NetworkBroker {
     provider_files: crate::provider_files::ProviderFiles,
+    file_audit: FileAudit,
     workload_frozen: Arc<AtomicBool>,
     pending: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingTcpOpen>>>,
     pending_dns: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingDnsQuery>>>,
@@ -273,9 +276,11 @@ impl NetworkBroker {
         let descriptor_soft_limit = descriptor_soft_limit()?;
         let registry = Arc::new(Mutex::new(SocketRegistry::new(1, SOCKET_CAPACITY)?));
         let provider_files = crate::provider_files::ProviderFiles::default();
+        let file_audit = FileAudit::default();
         let workload_frozen = Arc::new(AtomicBool::new(false));
         let queues = NotificationQueues {
             provider_files: provider_files.clone(),
+            file_audit: file_audit.clone(),
             workload_frozen: workload_frozen.clone(),
             protected_control_port,
             identity_resolver: ProcfsIdentityResolver::for_pid_namespace(),
@@ -288,9 +293,11 @@ impl NetworkBroker {
         let healthy = Arc::new(AtomicBool::new(true));
         let broker_healthy = healthy.clone();
         let broker_registry = Arc::clone(&registry);
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         std::thread::Builder::new()
             .name("openshell-network-broker".to_string())
             .spawn(move || {
+                let _subscriber = tracing::dispatcher::set_default(&dispatch);
                 while broker_healthy.load(Ordering::Acquire) {
                     let notification = match listener.receive() {
                         Ok(notification) => notification,
@@ -351,6 +358,7 @@ impl NetworkBroker {
             .map_err(|error| io::Error::other(format!("start network broker: {error}")))?;
         Ok(Self {
             provider_files,
+            file_audit,
             workload_frozen,
             pending: Arc::new(tokio::sync::Mutex::new(pending_rx)),
             pending_dns: Arc::new(tokio::sync::Mutex::new(pending_dns_rx)),
@@ -413,6 +421,10 @@ impl NetworkBroker {
 
     pub(crate) fn provider_files(&self) -> &crate::provider_files::ProviderFiles {
         &self.provider_files
+    }
+
+    pub(crate) fn configure_file_audit(&self, paths: &[String]) -> io::Result<()> {
+        self.file_audit.configure(paths)
     }
 }
 
@@ -591,10 +603,12 @@ fn dispatch_notification(
 ) -> io::Result<()> {
     let syscall = i64::from(notification.syscall);
     if syscall == libc::SYS_openat || syscall == libc::SYS_openat2 {
+        queues.file_audit.observe_open(&listener, notification);
         return queues.provider_files.handle_open(&listener, notification);
     }
     #[cfg(target_arch = "x86_64")]
     if syscall == libc::SYS_open {
+        queues.file_audit.observe_open(&listener, notification);
         return queues.provider_files.handle_open(&listener, notification);
     }
     if matches!(syscall, libc::SYS_kill | libc::SYS_rt_sigqueueinfo) {
@@ -1937,6 +1951,49 @@ mod tests {
                 "broker source leaked across exec"
             );
         }
+    }
+
+    #[test]
+    fn watched_open_emits_observed_file_activity_and_continues() {
+        let directory = tempfile::tempdir().unwrap();
+        let watched = directory.path().join("watched.env");
+        let unwatched = directory.path().join("unwatched.txt");
+        std::fs::write(&watched, "watched content").unwrap();
+        std::fs::write(&unwatched, "other content").unwrap();
+
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _capture = capture.install();
+        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let broker = NetworkBroker::start_for_test(listener).unwrap();
+        broker
+            .configure_file_audit(&[watched.to_str().unwrap().to_string()])
+            .unwrap();
+
+        let content = launcher
+            .execute({
+                let watched = watched.clone();
+                move || std::fs::read_to_string(watched)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(content, "watched content");
+        let content = launcher
+            .execute(move || std::fs::read_to_string(unwatched))
+            .unwrap()
+            .unwrap();
+        assert_eq!(content, "other content");
+
+        let events: Vec<_> = capture
+            .json_events()
+            .into_iter()
+            .filter(|event| event["class_uid"] == 1001)
+            .collect();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["action_id"], 3);
+        assert_eq!(events[0]["file"]["path"], watched.to_str().unwrap());
+        assert_eq!(events[0]["unmapped"]["path_source"], "syscall_argument");
+        assert_eq!(events[0]["unmapped"]["access_type"], "read");
+        assert!(events[0]["actor"]["process"]["pid"].as_i64().is_some());
     }
 
     #[test]

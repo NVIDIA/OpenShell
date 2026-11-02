@@ -370,4 +370,11 @@ MicroVM persists the resolved UID:GID with the writable overlay and retains it a
 
 On Docker and Podman, the image's `WORKDIR` becomes the workspace. Images with no `WORKDIR`, `/`, or `/sandbox` use `/sandbox`. Any other `WORKDIR` must exist in the image and be writable by the sandbox user. Kubernetes and MicroVM always use `/sandbox`.
 
+If an image keeps its program outside the workspace, add that directory to
+`filesystem_policy.read_only` in the sandbox policy. For example, an image with
+`/app/agent.py` and workspace `/sandbox` needs `/app` in `read_only`; otherwise
+Landlock can return `Permission denied` when the sandbox starts the program.
+For a Docker or Podman image whose `WORKDIR` is `/app`, `include_workdir: true`
+also covers `/app`, but makes it writable by the workload.
+
 Custom Docker and Podman workspaces use the workload container's writable layer, not a managed named volume. Files survive stop/start of the same container, but removing or replacing that container removes its workspace changes. Export files you need to retain before deleting the sandbox.

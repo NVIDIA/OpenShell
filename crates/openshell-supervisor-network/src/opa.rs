@@ -1403,6 +1403,7 @@ fn parse_filesystem_policy(val: &regorus::Value) -> FilesystemPolicy {
             .into_iter()
             .map(PathBuf::from)
             .collect(),
+        audit_paths: get_str_array(val, "audit_paths"),
         include_workdir: get_bool(val, "include_workdir").unwrap_or(true),
     }
 }
@@ -1525,6 +1526,12 @@ fn validate_opa_static_settings(data: &mut serde_json::Value) -> Result<()> {
                     violations.iter().map(redacted_policy_violation_category),
                 ))
             })?;
+        openshell_policy::validate_audit_paths(&settings.audit_paths).map_err(|violations| {
+            miette::miette!(render_bounded_validation_diagnostics(
+                "invalid filesystem policy settings",
+                violations.iter().map(redacted_policy_violation_category),
+            ))
+        })?;
         // A present stanza defaults to false; an absent stanza must stay absent
         // so Rego's undefined result retains the runtime workdir default.
         filesystem["include_workdir"] = settings.include_workdir.into();
@@ -1565,6 +1572,8 @@ fn redacted_policy_violation_category(violation: &PolicyViolation) -> &'static s
         | PolicyViolation::OverlyBroadPath { .. }
         | PolicyViolation::FieldTooLong { .. } => "invalid filesystem path",
         PolicyViolation::TooManyPaths { .. } => "filesystem path limit exceeded",
+        PolicyViolation::TooManyAuditPaths { .. } => "filesystem audit path limit exceeded",
+        PolicyViolation::InvalidAuditPattern { .. } => "invalid filesystem audit path glob",
         PolicyViolation::TldWildcard { .. }
         | PolicyViolation::TcpEndpointIpLiteral { .. }
         | PolicyViolation::InvalidTcpEndpointHost { .. }
@@ -2260,6 +2269,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                 "include_workdir": true,
                 "read_only": [],
                 "read_write": [],
+                "audit_paths": [],
             })
         },
         |fs| {
@@ -2267,6 +2277,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                 "include_workdir": fs.include_workdir,
                 "read_only": fs.read_only,
                 "read_write": fs.read_write,
+                "audit_paths": fs.audit_paths,
             })
         },
     );
@@ -3362,6 +3373,7 @@ mod tests {
                 include_workdir: true,
                 read_only: vec!["/usr".to_string(), "/lib".to_string()],
                 read_write: vec!["/sandbox".to_string(), "/tmp".to_string()],
+                audit_paths: vec![],
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -4374,6 +4386,24 @@ process:
             !versionless.filesystem.include_workdir,
             "raw OPA loading of a versionless empty filesystem stanza"
         );
+    }
+
+    #[test]
+    fn yaml_and_proto_filesystem_audit_paths_reach_the_boundary_config() {
+        let data = "version: 1\nfilesystem_policy:\n  audit_paths: [/sandbox/**/.env]\n";
+        let proto = openshell_policy::parse_sandbox_policy(data).unwrap();
+        for config in [
+            OpaEngine::from_proto(&proto)
+                .unwrap()
+                .query_sandbox_config()
+                .unwrap(),
+            OpaEngine::from_strings(TEST_POLICY, data)
+                .unwrap()
+                .query_sandbox_config()
+                .unwrap(),
+        ] {
+            assert_eq!(config.filesystem.audit_paths, ["/sandbox/**/.env"]);
+        }
     }
 
     #[test]
@@ -5724,6 +5754,7 @@ process:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                audit_paths: vec![],
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -6347,6 +6378,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                audit_paths: vec![],
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -6418,6 +6450,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                audit_paths: vec![],
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -6494,6 +6527,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                audit_paths: vec![],
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -8237,6 +8271,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                audit_paths: vec![],
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -8294,6 +8329,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                audit_paths: vec![],
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -8352,6 +8388,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                audit_paths: vec![],
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -8412,6 +8449,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                audit_paths: vec![],
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -8471,6 +8509,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                audit_paths: vec![],
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -9982,6 +10021,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                audit_paths: vec![],
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -10052,6 +10092,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                audit_paths: vec![],
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -10282,6 +10323,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                audit_paths: vec![],
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -11930,6 +11972,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                audit_paths: vec![],
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -12093,6 +12136,7 @@ process:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                audit_paths: vec![],
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),

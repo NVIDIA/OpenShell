@@ -233,6 +233,37 @@ impl OcsfEvent {
         let sev = severity_tag(base.severity.as_u8());
 
         match self {
+            Self::FileActivity(event) => {
+                let action = event.action.map_or("", |value| value.label());
+                let actor = event
+                    .actor
+                    .process
+                    .as_ref()
+                    .map(|process| format!("{}({})", process.name, process.pid))
+                    .unwrap_or_default();
+                let path = event
+                    .base
+                    .unmapped
+                    .as_ref()
+                    .and_then(|value| value.get("requested_path"))
+                    .and_then(serde_json::Value::as_str)
+                    .or(event.file.path.as_deref())
+                    .unwrap_or(&event.file.name);
+                let access = event
+                    .base
+                    .unmapped
+                    .as_ref()
+                    .and_then(|value| value.get("access_type"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                format!(
+                    "FILE:OPEN {sev} {} {} {} [access:{} path:requested]",
+                    action.to_uppercase(),
+                    escape_context_field(&actor),
+                    escape_context_field(path),
+                    escape_context_field(access),
+                )
+            }
             Self::NetworkActivity(e) => {
                 let activity = e.base.activity_name.to_uppercase();
                 let action = e.action.map_or(String::new(), |a| a.label().to_uppercase());
@@ -517,7 +548,45 @@ impl OcsfEvent {
 
             Self::ProcessActivity(e) => {
                 let activity = e.base.activity_name.to_uppercase();
-                let proc_str = format!("{}({})", e.process.name, e.process.pid);
+                let proc_str = format!(
+                    "{}({})",
+                    escape_context_field(&truncate_with_ellipsis(&e.process.name, MAX_REASON_LEN)),
+                    e.process.pid
+                );
+                let parent_ctx = e
+                    .process
+                    .parent_process
+                    .as_ref()
+                    .map(|parent| format!(" [ppid:{}]", parent.pid))
+                    .unwrap_or_default();
+                let start_ctx = e
+                    .process
+                    .created_time
+                    .map(|time| format!(" [start:{time}]"))
+                    .unwrap_or_default();
+                let uid_ctx = e
+                    .process
+                    .uid
+                    .as_ref()
+                    .map(|uid| {
+                        format!(
+                            " [process_uid:{}]",
+                            escape_context_field(&truncate_with_ellipsis(uid, MAX_REASON_LEN))
+                        )
+                    })
+                    .unwrap_or_default();
+                let parent_uid_ctx = e
+                    .process
+                    .parent_process
+                    .as_ref()
+                    .and_then(|parent| parent.uid.as_ref())
+                    .map(|uid| {
+                        format!(
+                            " [parent_uid:{}]",
+                            escape_context_field(&truncate_with_ellipsis(uid, MAX_REASON_LEN))
+                        )
+                    })
+                    .unwrap_or_default();
                 let exit_ctx = e
                     .exit_code
                     .map(|c| format!(" [exit:{c}]"))
@@ -529,7 +598,17 @@ impl OcsfEvent {
                     .map(|c| format!(" [cmd:{c}]"))
                     .unwrap_or_default();
 
-                format!("PROC:{activity} {sev} {proc_str}{exit_ctx}{cmd_ctx}")
+                let signal_ctx = e
+                    .base
+                    .unmapped
+                    .as_ref()
+                    .and_then(|fields| fields.get("signal"))
+                    .and_then(serde_json::Value::as_i64)
+                    .map(|signal| format!(" [signal:{signal}]"))
+                    .unwrap_or_default();
+                format!(
+                    "PROC:{activity} {sev} {proc_str}{parent_ctx}{start_ctx}{uid_ctx}{parent_uid_ctx}{exit_ctx}{signal_ctx}{cmd_ctx}"
+                )
             }
 
             Self::DetectionFinding(e) => {
@@ -1234,6 +1313,36 @@ mod tests {
 
         let shorthand = event.format_shorthand();
         assert_eq!(shorthand, "PROC:TERMINATE [INFO] python3(42) [exit:0]");
+    }
+
+    #[test]
+    fn process_activity_shorthand_shows_parent_start_and_signal() {
+        let mut base = base(
+            1007,
+            "Process Activity",
+            1,
+            "System Activity",
+            2,
+            "Terminate",
+        );
+        base.unmapped = Some(serde_json::json!({"signal": 9, "other": "hidden"}));
+        let event = OcsfEvent::ProcessActivity(ProcessActivityEvent {
+            base,
+            process: Process::new("sleep\nspoof", 42)
+                .with_uid("42:1234")
+                .with_created_time(1_234_000)
+                .with_parent(Process::new("openshell-sandbox", 1)),
+            actor: None,
+            launch_type: None,
+            exit_code: None,
+            action: None,
+            disposition: None,
+        });
+
+        assert_eq!(
+            event.format_shorthand(),
+            "PROC:TERMINATE [INFO] sleep\\u{a}spoof(42) [ppid:1] [start:1234000] [process_uid:42:1234] [signal:9]"
+        );
     }
 
     #[test]

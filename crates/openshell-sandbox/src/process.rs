@@ -1902,6 +1902,7 @@ mod tests {
         policy.filesystem = FilesystemPolicy {
             read_only: vec![root.clone()],
             read_write: Vec::new(),
+            audit_paths: Vec::new(),
             include_workdir: false,
         };
         policy.landlock = LandlockPolicy {

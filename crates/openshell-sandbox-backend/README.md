@@ -1,5 +1,10 @@
 # OpenShell sandbox backend
 
+The boundary attach policy carries optional `audit_paths` globs for the
+built-in runtime's watched file opens. The field is omitted from the JSON wire
+form when empty and uses a new protobuf field number, so existing attach
+policies retain their previous encoding and behavior.
+
 This crate implements the concrete supervisor-side RPC client and the versioned
 control protocol shared with `openshell-sandbox`.
 
@@ -9,6 +14,16 @@ RPCs. Confirmation consumes the bound handle, validates enforcement evidence,
 and produces the ready handle; starting consumes that ready handle. Both the
 in-tree Linux runtime and external backends implement the generated services.
 Linux process helpers remain internal to the runtime server.
+
+## Process activity
+
+When `AgentSpec.process_activity_enabled` is set, the Linux runtime includes
+the directly started process's PID, parent PID, start instance ID, and start
+time in `Started`, `ExecStarted`, and takeover snapshots. These optional fields
+keep older boundary implementations compatible. The supervisor-side client
+uses them to emit OCSF launch and exit events through the existing supervisor
+log path. `BoundaryProcess::wait` emits an exit only once even if callers
+repeat the wait. The protocol carries no arguments or environment.
 
 ## Boundary startup and routing
 

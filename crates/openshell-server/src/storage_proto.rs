@@ -177,10 +177,13 @@ mod tests {
     // selections absent; storage.v1 remains frozen. Public field 3 retains its
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
+    // FilesystemPolicy.audit_paths is an additive repeated field in the shared
+    // public and durable policy schema. Older stored policies decode with an
+    // empty watch list and retain their previous filesystem behavior.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "be99bb3fcc7894eb85d774f54b642173e70dd37bc8e5fcaf3fdff2454ae689e1";
+        "5b19a0d1a4daad0b12d6090b22058cfcbf562b0047de05d8f0e4d108e98d1594";
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "7758e21d4d40f76e8b1bb46bbb2ed624956abbe1eb2dbf096fc306611e97306c";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -500,6 +503,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn legacy_filesystem_policy_decodes_without_audit_paths() {
+        let legacy = [
+            8, 1, 18, 4, b'/', b'u', b's', b'r', 26, 4, b'/', b't', b'm', b'p',
+        ];
+        let decoded = openshell_core::proto::FilesystemPolicy::decode(&legacy[..]).unwrap();
+        assert!(decoded.include_workdir);
+        assert_eq!(decoded.read_only, ["/usr"]);
+        assert_eq!(decoded.read_write, ["/tmp"]);
+        assert!(decoded.audit_paths.is_empty());
     }
 
     #[test]

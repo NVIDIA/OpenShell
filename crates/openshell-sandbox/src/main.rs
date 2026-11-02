@@ -307,6 +307,7 @@ fn run_capability_landlock_child(args: &[String]) -> Result<()> {
         filesystem: FilesystemPolicy {
             read_only: vec![allowed.to_path_buf()],
             read_write: Vec::new(),
+            audit_paths: Vec::new(),
             include_workdir: false,
         },
         network: NetworkPolicy::default(),

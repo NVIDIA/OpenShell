@@ -510,7 +510,9 @@ type FilesystemPolicy struct {
 	// Read-only directory allow list.
 	ReadOnly []string `protobuf:"bytes,2,rep,name=read_only,json=readOnly,proto3" json:"read_only,omitempty"`
 	// Read-write directory allow list.
-	ReadWrite     []string `protobuf:"bytes,3,rep,name=read_write,json=readWrite,proto3" json:"read_write,omitempty"`
+	ReadWrite []string `protobuf:"bytes,3,rep,name=read_write,json=readWrite,proto3" json:"read_write,omitempty"`
+	// Path globs whose attempted opens are reported by the sandbox boundary.
+	AuditPaths    []string `protobuf:"bytes,4,rep,name=audit_paths,json=auditPaths,proto3" json:"audit_paths,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -562,6 +564,13 @@ func (x *FilesystemPolicy) GetReadOnly() []string {
 func (x *FilesystemPolicy) GetReadWrite() []string {
 	if x != nil {
 		return x.ReadWrite
+	}
+	return nil
+}
+
+func (x *FilesystemPolicy) GetAuditPaths() []string {
+	if x != nil {
+		return x.AuditPaths
 	}
 	return nil
 }
@@ -2620,12 +2629,14 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\v2'.openshell.sandbox.v1.NetworkPolicyRuleR\x05value:\x028\x01\x1at\n" +
 	"\x17NetworkMiddlewaresEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12C\n" +
-	"\x05value\x18\x02 \x01(\v2-.openshell.sandbox.v1.NetworkMiddlewareConfigR\x05value:\x028\x01\"w\n" +
+	"\x05value\x18\x02 \x01(\v2-.openshell.sandbox.v1.NetworkMiddlewareConfigR\x05value:\x028\x01\"\x98\x01\n" +
 	"\x10FilesystemPolicy\x12'\n" +
 	"\x0finclude_workdir\x18\x01 \x01(\bR\x0eincludeWorkdir\x12\x1b\n" +
 	"\tread_only\x18\x02 \x03(\tR\breadOnly\x12\x1d\n" +
 	"\n" +
-	"read_write\x18\x03 \x03(\tR\treadWrite\"6\n" +
+	"read_write\x18\x03 \x03(\tR\treadWrite\x12\x1f\n" +
+	"\vaudit_paths\x18\x04 \x03(\tR\n" +
+	"auditPaths\"6\n" +
 	"\x0eLandlockPolicy\x12$\n" +
 	"\rcompatibility\x18\x01 \x01(\tR\rcompatibility\"Q\n" +
 	"\rProcessPolicy\x12\x1e\n" +

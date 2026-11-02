@@ -242,7 +242,7 @@ fn comm_target(path: &str, caller_tid: u32, caller_group: u32) -> Option<u32> {
 }
 
 /// Thread group (process) ID of a thread, from its procfs status.
-fn thread_group_of(tid: u32) -> Option<u32> {
+pub fn thread_group_of(tid: u32) -> Option<u32> {
     std::fs::read_to_string(format!("/proc/{tid}/status"))
         .ok()?
         .lines()
@@ -252,7 +252,7 @@ fn thread_group_of(tid: u32) -> Option<u32> {
         .ok()
 }
 
-fn read_path(tid: u32, mut address: u64) -> io::Result<String> {
+pub fn read_path(tid: u32, mut address: u64) -> io::Result<String> {
     if address == 0 {
         return Err(io::Error::from_raw_os_error(libc::EFAULT));
     }

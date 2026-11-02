@@ -252,6 +252,7 @@ fn no_network_policy() -> proto::SandboxPolicy {
                 "/var/log",
             ]),
             read_write: paths(&["/sandbox", "/tmp", "/dev/null"]),
+            audit_paths: Vec::new(),
         }),
         landlock: Some(proto::LandlockPolicy {
             compatibility: "best_effort".to_string(),

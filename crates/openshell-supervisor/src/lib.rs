@@ -28,7 +28,10 @@ mod provider_readiness;
 pub mod sandbox_instance_host;
 pub mod shared_host;
 
-use config_runtime::{agent_proposals_enabled_from_settings, run_policy_poll_loop};
+use config_runtime::{
+    agent_proposals_enabled_from_settings, process_activity_enabled_from_settings,
+    run_policy_poll_loop,
+};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
 use std::io::Write as _;
@@ -692,7 +695,7 @@ pub async fn run_network_proxy(
     }
 
     let extension_credentials = openshell_extension_core::ExtensionCredentialStore::new();
-    let (mut policy, opa_engine, _, _, _, initial_agent_proposals_enabled, _, _) = load_policy(
+    let (mut policy, opa_engine, _, _, _, initial_agent_proposals_enabled, _, _, _) = load_policy(
         None,
         None,
         None,
@@ -1186,6 +1189,7 @@ pub async fn run_sandbox_instance(
         middleware_registry_status,
         loaded_policy_origin,
         initial_agent_proposals_enabled,
+        initial_process_activity_enabled,
         initial_extension_authentication_enabled,
         captured_provider_environment,
     ) = load_policy_with_gateway(
@@ -1323,6 +1327,7 @@ pub async fn run_sandbox_instance(
                 timeout_secs,
                 interactive,
                 otlp_relay_active: otlp_relay.is_some(),
+                process_activity_enabled: initial_process_activity_enabled,
             },
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.attach"))
@@ -2324,6 +2329,7 @@ mod baseline_tests {
         policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
             read_only: vec!["/tmp".to_string(), "/proc".to_string()],
             read_write: vec![],
+            audit_paths: vec![],
             include_workdir: false,
         });
         policy.network_policies.insert(
@@ -2467,6 +2473,7 @@ mod baseline_tests {
             filesystem: FilesystemPolicy {
                 read_only: vec![PathBuf::from("/tmp")],
                 read_write: vec![],
+                audit_paths: vec![],
                 include_workdir: false,
             },
             network: NetworkPolicy {
@@ -2752,6 +2759,7 @@ async fn load_policy(
     LoadedPolicyOrigin,
     bool,
     bool,
+    bool,
     Option<CapturedProviderEnvironment>,
 )> {
     load_policy_with_gateway(
@@ -2792,6 +2800,7 @@ async fn load_policy_with_gateway(
     Option<openshell_core::proto::SandboxPolicy>,
     MiddlewareRegistryStatus,
     LoadedPolicyOrigin,
+    bool,
     bool,
     bool,
     Option<CapturedProviderEnvironment>,
@@ -2858,6 +2867,7 @@ async fn load_policy_with_gateway(
             None,
             MiddlewareRegistryStatus::Synchronized,
             LoadedPolicyOrigin::LocalOverride,
+            false,
             false,
             false,
             None,
@@ -3230,6 +3240,7 @@ async fn load_policy_with_gateway(
                     has_last_valid_policy,
                 },
                 agent_proposals_enabled_from_settings(&snapshot.settings),
+                process_activity_enabled_from_settings(&snapshot.settings),
                 snapshot.extension_authentication_enabled,
                 Some(CapturedProviderEnvironment::new(
                     captured_provider_credentials,
@@ -5562,7 +5573,7 @@ network_policies:
             .unwrap()
             .expect("repair returns one launch bundle");
         assert!(
-            bundle.7.is_some(),
+            bundle.8.is_some(),
             "launch bundle retains matching provider state"
         );
     }
@@ -6790,6 +6801,7 @@ network_policies:
             registry,
             origin,
             proposals,
+            process_activity_enabled,
             extension_authentication_enabled,
             provider_credentials,
         ) = startup().await.expect("load valid local policy");
@@ -6797,7 +6809,7 @@ network_policies:
         assert!(proto.is_none());
         assert!(matches!(origin, LoadedPolicyOrigin::LocalOverride));
         assert!(matches!(registry, MiddlewareRegistryStatus::Synchronized));
-        assert!(!proposals && !extension_authentication_enabled);
+        assert!(!proposals && !extension_authentication_enabled && !process_activity_enabled);
         let engine = engine.expect("local startup installs OPA");
         assert!(engine.binary_identity_required());
         // Installing the built-in registry creates the first active generation.

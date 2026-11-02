@@ -13,8 +13,20 @@ pub struct Process {
     /// Process name (e.g., "python3").
     pub name: String,
 
+    /// Executable path, when observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+
     /// Process ID.
     pub pid: i64,
+
+    /// Stable process instance ID, when the source can identify one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+
+    /// Process start time in Unix epoch milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_time: Option<i64>,
 
     /// Full command line.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -31,7 +43,10 @@ impl Process {
     pub fn new(name: &str, pid: i64) -> Self {
         Self {
             name: name.to_string(),
+            path: None,
             pid,
+            uid: None,
+            created_time: None,
             cmd_line: None,
             parent_process: None,
         }
@@ -41,6 +56,27 @@ impl Process {
     #[must_use]
     pub fn with_cmd_line(mut self, cmd_line: &str) -> Self {
         self.cmd_line = Some(cmd_line.to_string());
+        self
+    }
+
+    /// Set the executable path without recording its command line.
+    #[must_use]
+    pub fn with_path(mut self, path: &str) -> Self {
+        self.path = Some(path.to_string());
+        self
+    }
+
+    /// Set a stable identifier for this process instance.
+    #[must_use]
+    pub fn with_uid(mut self, uid: impl Into<String>) -> Self {
+        self.uid = Some(uid.into());
+        self
+    }
+
+    /// Set the process start time in Unix epoch milliseconds.
+    #[must_use]
+    pub fn with_created_time(mut self, time_ms: i64) -> Self {
+        self.created_time = Some(time_ms);
         self
     }
 
@@ -128,6 +164,19 @@ mod tests {
         let parent = proc.parent_process.as_ref().unwrap();
         assert_eq!(parent.name, "bash");
         assert_eq!(parent.pid, 1);
+    }
+
+    #[test]
+    fn process_uid_distinguishes_reused_pids() {
+        let first = Process::new("sleep", 42)
+            .with_uid("42:100")
+            .with_created_time(1_000);
+        let second = Process::new("sleep", 42)
+            .with_uid("42:200")
+            .with_created_time(2_000);
+        assert_ne!(first.uid, second.uid);
+        assert_eq!(serde_json::to_value(first).unwrap()["uid"], "42:100");
+        assert_eq!(serde_json::to_value(second).unwrap()["uid"], "42:200");
     }
 
     #[test]

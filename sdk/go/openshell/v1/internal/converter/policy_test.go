@@ -192,6 +192,7 @@ func TestSandboxPolicyRoundTrip(t *testing.T) {
 			IncludeWorkdir: true,
 			ReadOnly:       []string{"/etc", "/usr/share"},
 			ReadWrite:      []string{"/tmp", "/workspace"},
+			AuditPaths:     []string{"/sandbox/**/.env"},
 		},
 		Landlock: &v1.LandlockPolicy{
 			Compatibility: "best_effort",
@@ -229,6 +230,7 @@ func TestSandboxPolicyRoundTrip(t *testing.T) {
 	assert.Equal(t, original.Filesystem.IncludeWorkdir, roundTrip.Filesystem.IncludeWorkdir)
 	assert.Equal(t, original.Filesystem.ReadOnly, roundTrip.Filesystem.ReadOnly)
 	assert.Equal(t, original.Filesystem.ReadWrite, roundTrip.Filesystem.ReadWrite)
+	assert.Equal(t, original.Filesystem.AuditPaths, roundTrip.Filesystem.AuditPaths)
 
 	// Landlock
 	require.NotNil(t, roundTrip.Landlock)
@@ -260,6 +262,7 @@ func TestSandboxPolicyDeepCopy(t *testing.T) {
 			IncludeWorkdir: true,
 			ReadOnly:       []string{"/original"},
 			ReadWrite:      []string{"/tmp"},
+			AuditPaths:     []string{"/sandbox/**/.env"},
 		},
 		NetworkPolicies: map[string]*sbv1.NetworkPolicyRule{
 			"rule1": {
@@ -278,6 +281,7 @@ func TestSandboxPolicyDeepCopy(t *testing.T) {
 	proto.Version = 99
 	proto.Filesystem.ReadOnly[0] = "mutated"
 	proto.Filesystem.ReadWrite[0] = "mutated"
+	proto.Filesystem.AuditPaths[0] = "mutated"
 	proto.NetworkPolicies["rule1"].Name = "mutated"
 	proto.NetworkPolicies["rule1"].Endpoints[0].Host = "mutated.host"
 
@@ -285,6 +289,7 @@ func TestSandboxPolicyDeepCopy(t *testing.T) {
 	assert.Equal(t, uint32(1), sdk.Version)
 	assert.Equal(t, "/original", sdk.Filesystem.ReadOnly[0])
 	assert.Equal(t, "/tmp", sdk.Filesystem.ReadWrite[0])
+	assert.Equal(t, "/sandbox/**/.env", sdk.Filesystem.AuditPaths[0])
 	assert.Equal(t, "rule1", sdk.NetworkPolicies["rule1"].Name)
 	assert.Equal(t, "original.host", sdk.NetworkPolicies["rule1"].Endpoints[0].Host)
 
@@ -294,9 +299,11 @@ func TestSandboxPolicyDeepCopy(t *testing.T) {
 
 	// Mutate SDK after ToProto conversion.
 	sdk.Filesystem.ReadOnly[0] = "sdk-mutated"
+	sdk.Filesystem.AuditPaths[0] = "sdk-mutated"
 
 	// Proto output must be unaffected.
 	assert.Equal(t, "/original", protoOut.Filesystem.ReadOnly[0])
+	assert.Equal(t, "/sandbox/**/.env", protoOut.Filesystem.AuditPaths[0])
 }
 
 func TestSandboxPolicyPartialSubPolicies(t *testing.T) {
@@ -376,6 +383,7 @@ func TestFilesystemPolicyRoundTrip(t *testing.T) {
 		IncludeWorkdir: true,
 		ReadOnly:       []string{"/etc", "/usr/lib"},
 		ReadWrite:      []string{"/tmp", "/var/run"},
+		AuditPaths:     []string{"/sandbox/**/.env"},
 	}
 
 	proto := filesystemPolicyToProto(original)
@@ -387,6 +395,7 @@ func TestFilesystemPolicyRoundTrip(t *testing.T) {
 	assert.Equal(t, original.IncludeWorkdir, roundTrip.IncludeWorkdir)
 	assert.Equal(t, original.ReadOnly, roundTrip.ReadOnly)
 	assert.Equal(t, original.ReadWrite, roundTrip.ReadWrite)
+	assert.Equal(t, original.AuditPaths, roundTrip.AuditPaths)
 }
 
 func TestFilesystemPolicyNil(t *testing.T) {

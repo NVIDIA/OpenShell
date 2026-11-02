@@ -1319,6 +1319,7 @@ mod lifecycle_tests {
                 include_workdir: false,
                 read_only: Vec::new(),
                 read_write: read_write.iter().map(ToString::to_string).collect(),
+                audit_paths: Vec::new(),
             }),
             ..Default::default()
         }
