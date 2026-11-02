@@ -85,11 +85,14 @@ impl Userns {
 }
 
 /// The UID map, normalized by [`normalize_uid_map`], of a container Podman
-/// runs from `image` in `userns`. `image` must already be in the engine's
-/// store, e.g. because a sandbox was created from it: the container doesn't
-/// pull it.
+/// runs from `image` in `userns`, pulling `image` if the engine's store
+/// doesn't have it. The container is removed before this returns.
+///
+/// In `auto` mode Podman gives each running container its own range, so call
+/// this before creating the sandbox it is compared with. The sandbox then gets
+/// the range the removed reference container released.
 pub async fn reference_uid_map(engine: &Engine, userns: Userns, image: &str) -> Result<String> {
-    let mut args = vec!["run", "--rm", "--pull", "never"];
+    let mut args = vec!["run", "--rm", "--pull", "missing"];
     args.extend(userns.podman_args());
     args.extend(["--entrypoint", "/bin/cat", image, "/proc/self/uid_map"]);
     let output = engine

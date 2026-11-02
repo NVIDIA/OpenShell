@@ -66,9 +66,30 @@ let
       inputs.keycloak_realm_file = "../../scripts/keycloak-realm.json";
     }
   ) podmanModes;
+  # fedora-podman-{rootful,rootless}-userns-{default,auto,keep-id,private}
+  # configure the Podman gateway's user-namespace mode, for the Podman driver
+  # suite. Only the binaries installer applies the mode.
+  podmanUsernsEnvironments = pkgs.lib.concatMap (
+    podman:
+    map (
+      userns:
+      fedoraPodman {
+        name = "fedora-podman-${podman}-userns-${userns}";
+        inherit podman;
+        playbooks = [ "ansible/playbooks/drivers/podman/userns.yaml" ];
+        inputs.podman_userns_mode = userns;
+      }
+    ) podmanUsernsModes
+  ) podmanModes;
   podmanModes = [
     "rootful"
     "rootless"
+  ];
+  podmanUsernsModes = [
+    "default"
+    "auto"
+    "keep-id"
+    "private"
   ];
   config = (pkgs.formats.yaml { }).generate "tmachine-config.yaml" {
     machines = [
@@ -149,7 +170,8 @@ let
         };
       }
     ]
-    ++ keycloakEnvironments;
+    ++ keycloakEnvironments
+    ++ podmanUsernsEnvironments;
 
     installers = [
       {
@@ -224,28 +246,6 @@ let
         inputs = {
           openshell_podman_e2e_test_bundle = "../../artifacts/test-archives/${muslTarget}/openshell-podman-e2e-tests.tar";
           openshell_podman_e2e_workload_image = "../../artifacts/images/openshell-e2e-python-dev.tar";
-        };
-      }
-      {
-        name = "driver-podman";
-        playbooks = [
-          "ansible/playbooks/drivers/podman/default-userns-baseline.yaml"
-          "ansible/playbooks/drivers/podman/tests.yaml"
-          "ansible/playbooks/drivers/podman/userns-auto.yaml"
-          "ansible/playbooks/drivers/podman/tests.yaml"
-          "ansible/playbooks/drivers/podman/userns-keep-id.yaml"
-          "ansible/playbooks/drivers/podman/tests.yaml"
-          "ansible/playbooks/drivers/podman/userns-private.yaml"
-          "ansible/playbooks/drivers/podman/tests.yaml"
-        ];
-        inputs = {
-          openshell_podman_test_bundle = "../../artifacts/test-archives/${muslTarget}/openshell-podman-tests.tar";
-          # Match OpenShell's compiled-in default so direct Podman and
-          # OpenShell containers resolve the same workload image metadata.
-          openshell_podman_reference_image = "nvcr.io/nvidia/base/ubuntu:24.04";
-          openshell_podman_userns_auto_config = "../suites/drivers/podman/fixtures/userns-auto.toml";
-          openshell_podman_userns_keep_id_config = "../suites/drivers/podman/fixtures/userns-keep-id.toml";
-          openshell_podman_userns_private_config = "../suites/drivers/podman/fixtures/userns-private.toml";
         };
       }
     ];

@@ -8,4 +8,7 @@ image_pull_policy = "if_not_present"
 network_name = "tmachine"
 health_check_interval_secs = 10
 stop_timeout_secs = 15
+{% if openshell_gateway_podman_driver_settings %}
+{{ openshell_gateway_podman_driver_settings }}
+{% endif %}
 {% endblock %}

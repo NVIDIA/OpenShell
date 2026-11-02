@@ -157,14 +157,6 @@ let
     '';
   };
 
-  podmanDriverArchive = mkTestArchive {
-    name = "podman-driver";
-    workspacePath = "tests/suites/drivers";
-    manifestPath = "tests/suites/drivers/Cargo.toml";
-    package = "openshell-test-suite-podman";
-    target = muslToolchain.target;
-    output = "artifacts/test-archives/${muslToolchain.target}/openshell-podman-tests.tar";
-  };
   podmanE2eArchive = mkTestArchive {
     name = "podman-e2e";
     workspacePath = "e2e/rust";
@@ -178,7 +170,6 @@ let
 in
 rec {
   inherit
-    podmanDriverArchive
     podmanE2eArchive
     podmanE2eCiTests
     ;
@@ -288,11 +279,9 @@ rec {
   testArchives = pkgs.writeShellApplication {
     name = "build-artifacts-test-archives";
     runtimeInputs = [
-      podmanDriverArchive
       podmanE2eArchive
     ];
     text = ''
-      build-podman-driver-test-archive
       build-podman-e2e-test-archive
     '';
   };
