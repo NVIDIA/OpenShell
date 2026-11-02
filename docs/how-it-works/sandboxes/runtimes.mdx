@@ -26,6 +26,7 @@ the sandbox record and driver-supported persistent storage.
 ## Select a Compute Driver
 
 Set `compute_driver` in the gateway TOML file. A gateway uses one driver at a time.
+When changing the driver, see [Gateway Configuration File](/how-it-works/gateways/configuration) for how the gateway retains sandboxes created by the previous driver.
 
 ```toml
 [openshell]

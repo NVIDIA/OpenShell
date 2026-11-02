@@ -470,6 +470,9 @@ impl super::ComputeRuntime {
         for record in records {
             let candidate =
                 Sandbox::decode(record.payload.as_slice()).map_err(|error| error.to_string())?;
+            if self.other_driver_owner(&candidate).is_some() {
+                continue;
+            }
             if !matches!(
                 SandboxPhase::try_from(candidate.phase()),
                 Ok(SandboxPhase::Provisioning | SandboxPhase::Starting)
@@ -517,6 +520,9 @@ impl super::ComputeRuntime {
             else {
                 continue;
             };
+            if self.other_driver_owner(&current).is_some() {
+                continue;
+            }
             let previous = current.clone();
             refresh_configuration(&self.store, &mut current, now_ms).await?;
             if current != previous {
@@ -574,6 +580,9 @@ impl super::ComputeRuntime {
     ) -> Result<Option<openshell_core::proto::Sandbox>, String> {
         use openshell_core::ObjectId;
         use openshell_core::proto::{Sandbox, SandboxCondition, SandboxPhase};
+        if self.other_driver_owner(current).is_some() {
+            return Ok(None);
+        }
         if !matches!(
             SandboxPhase::try_from(current.phase()),
             Ok(SandboxPhase::Provisioning | SandboxPhase::Starting)
@@ -668,6 +677,9 @@ impl super::ComputeRuntime {
         let Some(current) = current else {
             return Ok(());
         };
+        if self.other_driver_owner(&current).is_some() {
+            return Ok(());
+        }
         let expected_attempt = expired
             .status
             .as_ref()

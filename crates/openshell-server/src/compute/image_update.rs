@@ -61,6 +61,7 @@ impl ComputeRuntime {
             .await
             .map_err(|_| Status::internal("fetch sandbox failed"))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        self.validate_compute_driver_binding(&current)?;
         ensure_image_update_stopped(&current)?;
         if current.get_resource_version() != expected_resource_version {
             return Err(crate::grpc::persistence_error_to_status(
@@ -454,6 +455,9 @@ impl ComputeRuntime {
             self.update_recovery_backoff.lock().await.remove(id);
             return Ok(());
         };
+        if self.other_driver_owner(&sandbox).is_some() {
+            return Ok(());
+        }
         if sandbox.phase() == SandboxPhase::Deleting as i32 {
             self.update_recovery_backoff.lock().await.remove(id);
             return Ok(());
@@ -689,6 +693,79 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn foreign_driver_update_is_not_sent_or_recovered() {
+        let (runtime, driver, original) = fixture(true).await;
+        let mut foreign = original.clone();
+        foreign.metadata.as_mut().unwrap().annotations.insert(
+            crate::compute::CREATED_BY_DRIVER_ANNOTATION.into(),
+            "vm".into(),
+        );
+        runtime.store.put_message(&foreign).await.unwrap();
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(foreign.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        driver.clear_calls();
+
+        let error = runtime
+            .update_sandbox_image(
+                current.object_id(),
+                "example/workload:new".into(),
+                current.get_resource_version(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("compute driver 'vm'"));
+        assert!(image_calls(&driver).is_empty());
+
+        runtime
+            .store
+            .begin_sandbox_image_update(
+                current.object_id(),
+                current.get_resource_version(),
+                0,
+                &SandboxImageUpdate {
+                    operation_id: "foreign-operation".into(),
+                    previous_image: "example/workload:old".into(),
+                    image: "example/workload:new".into(),
+                    revision: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let pending = runtime
+            .store
+            .get_message::<Sandbox>(foreign.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        runtime.recover_pending_sandbox_updates().await.unwrap();
+        drop(runtime.update_recovery_sweep.acquire().await.unwrap());
+        let retained = runtime
+            .store
+            .get_message::<Sandbox>(foreign.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained, pending);
+        assert!(image_calls(&driver).is_empty());
+        assert!(
+            runtime
+                .store
+                .get_sandbox_image_state(foreign.object_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .pending
+                .is_some()
+        );
     }
 
     #[tokio::test]
