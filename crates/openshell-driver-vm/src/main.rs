@@ -7,7 +7,7 @@ use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 #[cfg(target_os = "macos")]
-use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
+use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, VM_RUNTIME_REEXEC_ENV, configured_runtime_dir};
 use openshell_driver_vm::{
     VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, VmMount, VsockPortMap, procguard, run_vm,
 };
@@ -748,9 +748,9 @@ fn parse_vm_mount_arg(arg: &str) -> std::result::Result<VmMount, String> {
 fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
     use std::os::unix::process::CommandExt as _;
 
-    const REEXEC_ENV: &str = "__OPENSHELL_DRIVER_VM_REEXEC";
-
-    if std::env::var_os(REEXEC_ENV).is_some() {
+    if std::env::var_os(VM_RUNTIME_REEXEC_ENV).is_some()
+        || std::env::var_os(VM_RUNTIME_DIR_ENV).is_some()
+    {
         return Ok(());
     }
 
@@ -783,7 +783,7 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
         .args(&args)
         .env("DYLD_LIBRARY_PATH", &joined)
         .env(VM_RUNTIME_DIR_ENV, runtime_dir)
-        .env(REEXEC_ENV, "1")
+        .env(VM_RUNTIME_REEXEC_ENV, "1")
         .exec();
     // `exec()` only returns on failure.
     Err(miette::miette!("failed to re-exec with runtime env: {err}"))

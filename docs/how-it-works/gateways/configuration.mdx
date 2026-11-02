@@ -1586,6 +1586,8 @@ gateway_id       = "openshell"
 state_dir        = "/var/lib/openshell/vm"
 # Where the gateway looks for the openshell-driver-vm subprocess binary.
 driver_dir       = "/usr/local/libexec/openshell"
+# For an organization-signed macOS VM driver, set OPENSHELL_VM_RUNTIME_DIR in
+# the gateway service environment. It is not a gateway.toml field.
 default_image    = "nvcr.io/nvidia/base/ubuntu:24.04"
 # Optional override. When omitted, the gateway derives
 # https://host.openshell.internal:<gateway-port> for the VM driver.

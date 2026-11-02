@@ -214,6 +214,49 @@ Podman also supports `image` mounts, which mount a container image read-only at 
 
 The MicroVM driver runs each sandbox in its own lightweight VM. It requires host virtualization: Apple Hypervisor on macOS or KVM on Linux.
 
+### Re-sign the macOS VM driver
+
+For a managed Mac, place the matching `libkrun.dylib` and
+`libkrunfw.5.dylib` in an administrator-owned runtime directory. Sign both
+libraries and `openshell-driver-vm` with the same Developer ID Application
+identity and the hardened runtime. Give the driver only the
+`com.apple.security.hypervisor` entitlement. The repository's
+[VM driver entitlement file](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/entitlements.plist)
+contains that entitlement.
+
+This example stages the two libraries from the VM runtime archive matching the
+driver build. Replace the identity, archive, and paths for your package:
+
+```shell
+mkdir -p runtime
+zstd -dc vm-runtime-darwin-aarch64.tar.zst |
+  tar -xf - -C runtime ./libkrun.dylib ./libkrunfw.5.dylib
+
+identity='Developer ID Application: Your Organization (TEAMID)'
+codesign --force --options runtime --timestamp -s "$identity" runtime/libkrunfw.5.dylib
+codesign --force --options runtime --timestamp -s "$identity" runtime/libkrun.dylib
+codesign --force --options runtime --timestamp \
+  --entitlements crates/openshell-driver-vm/entitlements.plist \
+  -s "$identity" openshell-driver-vm
+
+codesign --verify --strict runtime/libkrunfw.5.dylib
+codesign --verify --strict runtime/libkrun.dylib
+codesign --verify --strict openshell-driver-vm
+```
+
+Set `OPENSHELL_VM_RUNTIME_DIR` to the absolute path of that directory in the
+gateway's service environment, for example:
+
+```shell
+OPENSHELL_VM_RUNTIME_DIR=/opt/example/openshell/runtime \
+  openshell-gateway --config /etc/openshell/gateway.toml
+```
+
+The managed VM driver inherits the setting. With this override, the VM worker
+loads the signed libraries from that directory and resolves firmware without
+`DYLD_*` environment variables. Without it, the driver uses its embedded
+runtime as before. Keep the runtime directory writable only by administrators.
+
 The VM driver is opt-in. Enable it in the gateway TOML file:
 
 ```toml
