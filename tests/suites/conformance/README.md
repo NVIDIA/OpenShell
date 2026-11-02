@@ -2,7 +2,8 @@
 
 The `conformance` crate holds the testkit suites for sandbox behavior that every
 compute driver must provide. The family is this one crate, its own workspace.
-Each file in `tests/` is one suite.
+It is a library: each module in `src/` is one suite, and `cargo test` and
+nextest run the tests as the library's unit tests.
 
 | Suite | Covers |
 |---|---|
@@ -28,9 +29,8 @@ gateway and in a tmachine VM, as CI does.
 
 ## Adding a test
 
-Add a `#[testkit::test]` function to a suite, or a new file in `tests/` for a new
-area. No playbook, test archive or workflow entry is needed: the runner builds
-and runs every test in the crate.
+Add a `#[testkit::test]` function to a suite, or for a new area, a new file in
+`src/` and a `mod` line for it in `src/lib.rs`.
 
 ## What a test may assert
 

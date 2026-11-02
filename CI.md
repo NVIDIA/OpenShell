@@ -218,7 +218,7 @@ nextest filterset:
 nix run .#openshell-test-runner -- \
   --environment ubuntu-docker-rootful --installer deb \
   --family conformance --package conformance \
-  --filter 'binary_id(=conformance::policy_advisor)'
+  --filter 'test(/^policy_advisor::/)'
 ```
 
 A local run does not replace the required PR E2E gate.
