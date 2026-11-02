@@ -32,7 +32,9 @@ passed but publication failed, rerun the failed jobs before promoting the candid
 Release creates `vX.Y.Z` at that exact commit, then rebuilds and publishes all
 stable artifacts without rerunning qualification. Embedded versions change, so
 stable artifacts are not byte-identical to the qualified prerelease. An existing
-stable tag may be retried only if it already points to the selected commit.
+stable tag may be retried only if it already points to the selected commit. A retry
+publishes only missing artifacts; published images, charts, release assets, npm,
+and PyPI versions are kept, while the snap is uploaded again.
 Stable images are saved as OCI archives during the build and pushed under the
 stable version tags during publication. Their SBOMs are verified before updating
 `latest`; the qualified prerelease's commit-SHA image tags remain unchanged.
