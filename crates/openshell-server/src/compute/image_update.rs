@@ -474,7 +474,7 @@ impl ComputeRuntime {
         let recover = async {
             ensure_image_update_stopped(&sandbox)?;
             self.ensure_configuration_update_supported()?;
-            self.complete_image_update(sandbox, intent.clone()).await?;
+            Box::pin(self.complete_image_update(sandbox, intent.clone())).await?;
             Ok(())
         };
         let result = tokio::time::timeout_at(deadline, recover)

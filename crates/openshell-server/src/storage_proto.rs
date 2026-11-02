@@ -177,12 +177,15 @@ mod tests {
     // selections absent; storage.v1 remains frozen. Public field 3 retains its
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
+    // Runtime evidence adds three messages to public SandboxStatus, which is
+    // also stored. Older rows decode without runtime evidence; the gateway
+    // adds it from later driver snapshots and supervisor sessions.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "be99bb3fcc7894eb85d774f54b642173e70dd37bc8e5fcaf3fdff2454ae689e1";
+        "1f1920dc8c7595dc045be76dbeb8a707c93c1b134b538a943e8c7b47197bea12";
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "af9e064adeec114fadc961aa0023e2990ccf4459bba6b0202027a889f255e351";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
+        "485af9f31298aca07326762280c32baea01a72e3710f671a9375ec2e8db3f33d";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -723,9 +726,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (334, 31),
-                (100, 22),
-                (86, 22),
+                (337, 31),
+                (103, 22),
+                (89, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256

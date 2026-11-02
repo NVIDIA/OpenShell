@@ -22,8 +22,8 @@ import (
 )
 
 func TestSandboxStatusRetainsBaselinePublicShape(t *testing.T) {
-	// Freeze the pre-image-update fields and tags: private operation state must
-	// not enlarge the public Rust struct or leak into generated SDK messages.
+	// Freeze the pre-image-update fields and tags. Runtime evidence is a
+	// separate additive public field; private image-update state stays private.
 	fields := []string{
 		"agent_pod", "agent_fd", "sandbox_fd", "conditions", "phase",
 		"current_policy_version", "main_process_instance_id", "exit_code",
@@ -32,12 +32,13 @@ func TestSandboxStatusRetainsBaselinePublicShape(t *testing.T) {
 		"main_process_started_time", "last_token_grant_failure",
 	}
 	descriptor := (&pb.SandboxStatus{}).ProtoReflect().Descriptor()
-	require.Equal(t, len(fields), descriptor.Fields().Len())
+	require.Equal(t, len(fields)+1, descriptor.Fields().Len())
 	for i, name := range fields {
 		field := descriptor.Fields().ByName(protoreflect.Name(name))
 		require.NotNil(t, field, name)
 		require.Equal(t, protoreflect.FieldNumber(i+2), field.Number(), name)
 	}
+	require.Equal(t, protoreflect.FieldNumber(18), descriptor.Fields().ByName("runtime").Number())
 	require.Nil(t, pb.File_openshell_proto.Messages().ByName("SandboxImageUpdate"))
 	legacy := pb.File_openshell_proto.Services().ByName("OpenShell")
 	require.Nil(t, legacy.Methods().ByName("UpdateSandbox"))

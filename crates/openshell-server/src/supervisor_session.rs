@@ -2208,6 +2208,7 @@ struct SessionSetup {
     state: Arc<ServerState>,
     sandbox_id: String,
     instance_id: String,
+    supervisor_version: String,
     connection_epoch: u64,
     /// Ownership term: the credential epoch of the session's bearer.
     auth_epoch: Option<CredentialEpoch>,
@@ -2226,6 +2227,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         state,
         sandbox_id,
         instance_id,
+        supervisor_version,
         connection_epoch,
         auth_epoch,
         supports_session_redirect,
@@ -2415,7 +2417,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
     // reaches Ready.
     if let Err(err) = state
         .compute
-        .supervisor_session_connected(&sandbox_id, &instance_id)
+        .supervisor_session_connected_with_version(&sandbox_id, &instance_id, &supervisor_version)
         .await
     {
         abandon_session_setup(&state, &owner_index, &owner_guard, "lifecycle persistence").await;
@@ -2626,6 +2628,7 @@ pub async fn handle_connect_supervisor(
         state: Arc::clone(state),
         sandbox_id,
         instance_id: hello.instance_id,
+        supervisor_version: hello.version,
         connection_epoch: hello.connection_epoch,
         auth_epoch,
         supports_session_redirect: hello.supports_session_redirect,

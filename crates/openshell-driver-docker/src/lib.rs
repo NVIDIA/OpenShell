@@ -6589,6 +6589,7 @@ fn driver_status_from_summary(
             transition_time: None,
         }],
         deleting,
+        workload_image_id: summary.image_id.clone().unwrap_or_default(),
         ..Default::default()
     }
 }

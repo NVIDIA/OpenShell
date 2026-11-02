@@ -480,7 +480,7 @@ pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverS
     let condition = condition_from_state(&inspect.state);
     let deleting = inspect.state.status == "removing";
 
-    Some(build_driver_sandbox(
+    let mut sandbox = build_driver_sandbox(
         sandbox_id,
         sandbox_name,
         workspace,
@@ -488,7 +488,11 @@ pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverS
         short_id(&inspect.id),
         condition,
         deleting,
-    ))
+    );
+    if let Some(status) = sandbox.status.as_mut() {
+        status.workload_image_id.clone_from(&inspect.config.image);
+    }
+    Some(sandbox)
 }
 
 /// Build a `DriverSandbox` from a container list entry (no inspect needed).
@@ -990,6 +994,30 @@ mod tests {
         assert_eq!(cond.status, "True");
         assert_eq!(cond.reason, "ContainerRunning");
         assert!(!status.deleting);
+        assert!(status.workload_image_id.is_empty());
+    }
+
+    #[test]
+    fn inspected_workload_reports_the_pinned_image_id() {
+        let inspect: ContainerInspect = serde_json::from_value(serde_json::json!({
+            "Id": "container-1",
+            "Name": "openshell-demo",
+            "State": {"Status": "running", "Running": true, "ExitCode": 0},
+            "Config": {
+                "Labels": {
+                    "openshell.ai/sandbox-id": "sandbox-1",
+                    "openshell.ai/sandbox-name": "demo",
+                    "openshell.ai/sandbox-workspace": "default"
+                },
+                "Image": "sha256:pinned-image"
+            }
+        }))
+        .unwrap();
+        let sandbox = driver_sandbox_from_inspect(&inspect).unwrap();
+        assert_eq!(
+            sandbox.status.unwrap().workload_image_id,
+            "sha256:pinned-image"
+        );
     }
 
     #[test]

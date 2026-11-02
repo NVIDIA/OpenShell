@@ -90,6 +90,10 @@ non-root UID, primary GID, and supplementary-group set. Docker launches
 for every canonical and exec process. UID or GID zero and unresolved symbolic
 identities are rejected.
 
+Driver status reports the workload container's image ID to the gateway. The
+public `Sandbox.status.runtime.workload_image` combines that observed ID with
+the effective template reference and labels its digest kind `image_id`.
+
 An absolute OCI working directory becomes the workspace. An empty, root (`/`),
 or explicit `/sandbox` declaration uses `/sandbox`. Any other workdir must
 already exist without symlink components. The resolved identity must be able to

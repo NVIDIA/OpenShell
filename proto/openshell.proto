@@ -1258,6 +1258,34 @@ message SandboxStatus {
   // failures before a configured endpoint or credential could be selected.
   // Matching grant success or a policy, provider, or supervisor reset clears it.
   TokenGrantFailureObservation last_token_grant_failure = 17;
+  // Runtime evidence observed by the driver and authenticated supervisor.
+  // Absent fields mean that the source has not reported the value.
+  SandboxRuntime runtime = 18;
+}
+
+// Per-sandbox runtime evidence. The gateway does not accept these values from
+// the sandbox workload.
+message SandboxRuntime {
+  // Build reported by the supervisor on its authenticated control session.
+  SandboxSupervisorBuild supervisor = 1;
+  // Workload image identity observed by the compute driver.
+  SandboxWorkloadImage workload_image = 2;
+}
+
+message SandboxSupervisorBuild {
+  // Version of the supervisor serving this sandbox, independent of the gateway.
+  string version = 1;
+  // Git commit when included in the supervisor's development version.
+  optional string build_commit = 2;
+}
+
+message SandboxWorkloadImage {
+  // Image reference in the effective sandbox template. A tag may move.
+  string reference = 1;
+  // Immutable identifier observed by the compute driver for the running image.
+  string digest = 2;
+  // Identifies the digest's meaning; currently "image_id" for container drivers.
+  string digest_kind = 3;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -3242,6 +3270,8 @@ message SupervisorHello {
   // ConfigUpdate payloads, and answers each with its result and admission.
   // Gateways push configuration only to supervisors that set this.
   bool supports_config_push = 7;
+  // Version of the authenticated supervisor process, when known.
+  string version = 8;
 }
 
 // Gateway accepts the supervisor session.

@@ -21,6 +21,15 @@ type SandboxTemplate = types.SandboxTemplate
 // SandboxStatus holds the observed state of a sandbox.
 type SandboxStatus = types.SandboxStatus
 
+// SandboxRuntime holds per-sandbox evidence reported by the driver and supervisor.
+type SandboxRuntime = types.SandboxRuntime
+
+// SandboxSupervisorBuild is the version reported on the authenticated supervisor session.
+type SandboxSupervisorBuild = types.SandboxSupervisorBuild
+
+// SandboxWorkloadImage identifies the image observed by the compute driver.
+type SandboxWorkloadImage = types.SandboxWorkloadImage
+
 // SandboxCondition describes an observed condition of a sandbox.
 type SandboxCondition = types.SandboxCondition
 

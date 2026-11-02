@@ -93,6 +93,11 @@ supplementary groups. Root and unresolved identities fail before provisioning.
 Images must not prepopulate the reserved `/.openshell` hierarchy; this prevents
 image-controlled symlinks from aliasing private control state into user mounts.
 
+An inspected workload container reports its pinned image ID in driver status.
+The gateway exposes it as `Sandbox.status.runtime.workload_image`, with digest
+kind `image_id`. A list observation without an image ID retains an earlier ID
+only for the same container and effective image reference.
+
 `sandbox_runtime_image` supplies the statically linked musl
 `/openshell-sandbox` binary. Podman's read-only image volume delivers it to the
 workload; user-namespace modes that cannot use image volumes retain the trusted

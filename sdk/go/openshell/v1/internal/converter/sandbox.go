@@ -132,6 +132,23 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			Failure:         endpointFailureFromProto(observation.GetFailure()),
 		}
 	}
+	if runtime := status.GetRuntime(); runtime != nil {
+		result.Runtime = &types.SandboxRuntime{}
+		if build := runtime.GetSupervisor(); build != nil {
+			result.Runtime.Supervisor = &types.SandboxSupervisorBuild{Version: build.GetVersion()}
+			if build.BuildCommit != nil {
+				commit := build.GetBuildCommit()
+				result.Runtime.Supervisor.BuildCommit = &commit
+			}
+		}
+		if image := runtime.GetWorkloadImage(); image != nil {
+			result.Runtime.WorkloadImage = &types.SandboxWorkloadImage{
+				Reference:  image.GetReference(),
+				Digest:     image.GetDigest(),
+				DigestKind: image.GetDigestKind(),
+			}
+		}
+	}
 	result.ExitCode = CopyInt32Ptr(status.ExitCode)
 	if admission := status.GetConfigurationAdmission(); admission != nil {
 		state := types.ConfigurationAdmissionUnknown

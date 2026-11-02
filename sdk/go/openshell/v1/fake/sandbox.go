@@ -244,6 +244,22 @@ func copySandboxStatus(s types.SandboxStatus) types.SandboxStatus {
 		observation.Failure = copyEndpointFailure(observation.Failure)
 		s.LastTokenGrantFailure = &observation
 	}
+	if s.Runtime != nil {
+		runtime := *s.Runtime
+		if runtime.Supervisor != nil {
+			build := *runtime.Supervisor
+			if build.BuildCommit != nil {
+				commit := *build.BuildCommit
+				build.BuildCommit = &commit
+			}
+			runtime.Supervisor = &build
+		}
+		if runtime.WorkloadImage != nil {
+			image := *runtime.WorkloadImage
+			runtime.WorkloadImage = &image
+		}
+		s.Runtime = &runtime
+	}
 	return s
 }
 

@@ -9,6 +9,14 @@ The server owns control-plane RPCs, authentication, provider credential delivery
 and sandbox lifecycle orchestration. The `openshell-gateway` crate composes the
 server with selected compute drivers.
 
+`Sandbox.status.runtime` joins two existing observation paths: an image ID in
+the compute driver's status and a build version in a dedicated supervisor's
+authenticated session hello. The gateway retains the last accepted supervisor
+version across driver snapshots. An image ID survives a lightweight driver
+snapshot only while the container instance and effective image reference match.
+Missing evidence remains absent; the VM's `resolved_identity.resource_digest`
+is a rootfs cache identity, so it is not presented as an image digest.
+
 ## Sandbox launch identity
 
 A new start, including an automatic restart, commits a fresh runtime generation

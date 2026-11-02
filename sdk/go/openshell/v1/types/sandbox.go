@@ -132,10 +132,31 @@ type SandboxStatus struct {
 	// clears it. Policy, provider, and session resets also clear it.
 	// Nil means no retained cause.
 	LastTokenGrantFailure  *TokenGrantFailureObservation
+	Runtime                *SandboxRuntime
 	ConfigurationAdmission *SandboxConfigurationAdmission
 	RestartCount           uint32
 	NextRestartAtMs        int64
 	MainProcessStartedAtMs int64
+}
+
+// SandboxRuntime holds per-sandbox evidence reported by the driver and supervisor.
+type SandboxRuntime struct {
+	Supervisor    *SandboxSupervisorBuild
+	WorkloadImage *SandboxWorkloadImage
+}
+
+// SandboxSupervisorBuild is the version reported on the authenticated supervisor session.
+type SandboxSupervisorBuild struct {
+	Version     string
+	BuildCommit *string
+}
+
+// SandboxWorkloadImage identifies the image observed by the compute driver.
+// DigestKind names the identifier's meaning; container drivers use "image_id".
+type SandboxWorkloadImage struct {
+	Reference  string
+	Digest     string
+	DigestKind string
 }
 
 // TokenGrantFailureObservation records a refused grant's destination and cause.

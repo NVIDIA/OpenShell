@@ -397,6 +397,9 @@ message DriverSandboxStatus {
   ResolvedWorkloadIdentity resolved_identity = 7;
   // Immutable backend and outer-fence evidence for this generation.
   DriverFenceEvidence fence_evidence = 8;
+  // Immutable workload image ID observed from the compute platform. Empty if
+  // the driver cannot report the ID for this snapshot.
+  string workload_image_id = 9;
 }
 
 // Raw compute-platform condition.

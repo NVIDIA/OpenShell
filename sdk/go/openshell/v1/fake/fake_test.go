@@ -261,6 +261,34 @@ func TestFakeClient_SandboxGrantFailures_DeepCopy(t *testing.T) {
 	assert.Equal(t, uint32(401), *stored.Status.LastTokenGrantFailure.Failure.UpstreamHTTPStatus)
 }
 
+func TestFakeClient_SandboxRuntime_DeepCopy(t *testing.T) {
+	fc := NewClient()
+	ctx := context.Background()
+	commit := "abcdef123"
+	sb := &types.Sandbox{Name: "runtime-sandbox", Status: types.SandboxStatus{
+		Runtime: &types.SandboxRuntime{
+			Supervisor:    &types.SandboxSupervisorBuild{Version: "0.1.6-dev+gabcdef123", BuildCommit: &commit},
+			WorkloadImage: &types.SandboxWorkloadImage{Reference: "example/agent:latest", Digest: "sha256:pinned", DigestKind: "image_id"},
+		},
+	}}
+	fc.AddSandbox("default", sb)
+
+	commit = "changed"
+	sb.Status.Runtime.WorkloadImage.Digest = "changed"
+	got, err := fc.Sandboxes().Get(ctx, "default", "runtime-sandbox")
+	require.NoError(t, err)
+	got.Status.Runtime.Supervisor.Version = "changed"
+	*got.Status.Runtime.Supervisor.BuildCommit = "changed"
+	got.Status.Runtime.WorkloadImage.Reference = "changed"
+
+	stored, err := fc.Sandboxes().Get(ctx, "default", "runtime-sandbox")
+	require.NoError(t, err)
+	assert.Equal(t, "0.1.6-dev+gabcdef123", stored.Status.Runtime.Supervisor.Version)
+	assert.Equal(t, "abcdef123", *stored.Status.Runtime.Supervisor.BuildCommit)
+	assert.Equal(t, "example/agent:latest", stored.Status.Runtime.WorkloadImage.Reference)
+	assert.Equal(t, "sha256:pinned", stored.Status.Runtime.WorkloadImage.Digest)
+}
+
 func TestFakeClient_AddProvider(t *testing.T) {
 	fc := NewClient()
 	ctx := context.Background()
