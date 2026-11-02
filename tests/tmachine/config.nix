@@ -187,13 +187,6 @@ let
         };
       }
       {
-        name = "oci-image";
-        playbooks = [ "ansible/playbooks/features/oci-image.yaml" ];
-        inputs = {
-          oci_image_test_bundle = "../../artifacts/test-archives/${muslTarget}/oci-image-tests.tar";
-        };
-      }
-      {
         name = "e2e-podman";
         playbooks = [ "ansible/playbooks/drivers/podman/e2e.yaml" ];
         inputs = {

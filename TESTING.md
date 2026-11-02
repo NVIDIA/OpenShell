@@ -261,11 +261,9 @@ suite, with a name that says what the suite tests.
 2. Write the tests in `tests/*.rs` as `#[testkit::test]` functions.
 3. Re-lock the workspace: `cargo metadata --manifest-path
    tests/suites/features/Cargo.toml`, then
-   `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`.
-4. Add `cargo fmt` and `cargo clippy` lines for the package (`-p <name>`) to
-   `tasks/rust.toml` and to the Format and Lint steps in
-   `.github/workflows/branch-checks.yml`.
-5. Add a row for the suite to the matrix in `.github/workflows/e2e-suites.yml`.
+   `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`. `cargo fmt`
+   and `cargo clippy` already cover every package in the workspace.
+4. Add a row for the suite to the matrix in `.github/workflows/e2e-suites.yml`.
 
 If the feature only needs the gateway, run the suite in an existing
 environment such as `ubuntu-docker-rootful`, and skip the rest of this
@@ -531,13 +529,15 @@ binary. `tests/tmachine/artifacts.nix` keeps the follow-up exclusions explicit a
 the same filter for the generated inventory, so excluded binaries cannot appear
 as false passes or silently re-enter the archive.
 
-The `oci-image` feature testsuite (`tests/suites/features/oci-image`) checks
-OCI image identity and working-directory behavior shared by the Docker and
-Podman drivers against installed deb packages on Ubuntu and rpm packages on
-Fedora. CI runs it on Docker rootful, Podman rootful, and Podman rootless guests:
+The `oci-image` feature suite (`tests/suites/features/oci-image`) checks OCI
+image identity and working-directory behavior shared by the Docker and Podman
+drivers against installed deb packages on Ubuntu and rpm packages on Fedora.
+CI runs it on Docker rootful, Podman rootful, and Podman rootless guests:
 
 ```shell
-nix run .#tmachine -- test ubuntu-docker-rootful deb oci-image
+nix run .#openshell-test-runner -- \
+  --environment ubuntu-docker-rootful --installer deb \
+  --family features --package oci-image
 ```
 
 The shared suite also runs in the existing ARM64 Docker E2E workflow for

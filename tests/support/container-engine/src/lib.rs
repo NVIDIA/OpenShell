@@ -30,11 +30,10 @@ pub const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
 /// containers apart.
 pub const ISOLATION_ROLE_LABEL: &str = "openshell.ai/isolation-role";
 
-/// The gateway's container engine, and the images a test built with it.
-#[derive(Debug)]
+/// The gateway's container engine.
+#[derive(Clone, Debug)]
 pub struct Engine {
     command: Vec<String>,
-    images: Vec<String>,
 }
 
 /// An image built for a test: its tag and the image ID it had when built.
@@ -62,15 +61,13 @@ impl Engine {
             !command.is_empty(),
             "{ENGINE_ENV} is not set; this suite needs the gateway's container engine, such as docker, podman or `sudo -n podman` (see the container-engine-support crate docs)"
         );
-        Ok(Self {
-            command,
-            images: Vec::new(),
-        })
+        Ok(Self { command })
     }
 
-    /// Build `containerfile` as `tag` and record the image for
-    /// [`Engine::remove_images`]. The build context is empty.
-    pub async fn build_image(&mut self, tag: &str, containerfile: &str) -> Result<Image> {
+    /// Build `containerfile` as `tag`. The build context is empty. Remove
+    /// the image with [`Engine::remove_image`], for example in a cleanup
+    /// hook registered right after the build.
+    pub async fn build_image(&self, tag: &str, containerfile: &str) -> Result {
         let context = tempfile::tempdir()
             .map_err(|error| Error::from_error(&error))
             .context("create build context")?;
@@ -86,9 +83,12 @@ impl Engine {
             tag,
             utf8(context.path())?,
         ])
-        .await?;
-        // A failed build leaves no tag to remove.
-        self.images.push(tag.to_string());
+        .await
+        .map(drop)
+    }
+
+    /// Image `tag` and the ID it has now.
+    pub async fn image(&self, tag: &str) -> Result<Image> {
         let id = self
             .output(["image", "inspect", "--format", "{{.Id}}", tag])
             .await?;
@@ -98,18 +98,11 @@ impl Engine {
         })
     }
 
-    /// Remove every image built with [`Engine::build_image`], returning one
-    /// error per failed removal. Removal isn't forced: delete the sandboxes
-    /// that use an image first, so an image still in use is reported rather
-    /// than pulled from under the gateway.
-    pub async fn remove_images(&mut self) -> Vec<String> {
-        let mut errors = Vec::new();
-        for tag in std::mem::take(&mut self.images) {
-            if let Err(error) = self.output(["image", "rm", tag.as_str()]).await {
-                errors.push(format!("remove image {tag}: {error}"));
-            }
-        }
-        errors
+    /// Remove image `tag`. Removal isn't forced: delete the sandboxes that
+    /// use the image first, so an image still in use is reported rather than
+    /// pulled from under the gateway.
+    pub async fn remove_image(&self, tag: &str) -> Result {
+        self.output(["image", "rm", tag]).await.map(drop)
     }
 
     /// The one container with isolation `role` (`sandbox` or `supervisor`)

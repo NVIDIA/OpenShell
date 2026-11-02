@@ -90,15 +90,6 @@ let
     target = muslToolchain.target;
     output = "artifacts/test-archives/${muslToolchain.target}/provider-refresh-keycloak-tests.tar";
   };
-  ociImageArchive = mkTestArchive {
-    name = "oci-image";
-    workspacePath = "tests/suites/features";
-    manifestPath = "tests/suites/features/Cargo.toml";
-    package = "openshell-test-feature-oci-image";
-    target = muslToolchain.target;
-    output = "artifacts/test-archives/${muslToolchain.target}/oci-image-tests.tar";
-  };
-
   # Follow-up: binaries that do not yet run in the rootless tmachine guest. Each
   # entry says what it needs. Entries marked "wrapper lane" still run in the
   # wrapper-based Podman lane (`mise run e2e:podman:ci`), so they are covered
@@ -196,7 +187,6 @@ in
 rec {
   inherit
     providerRefreshKeycloakArchive
-    ociImageArchive
     podmanDriverArchive
     podmanE2eArchive
     podmanE2eCiTests
@@ -308,13 +298,11 @@ rec {
     name = "build-artifacts-test-archives";
     runtimeInputs = [
       providerRefreshKeycloakArchive
-      ociImageArchive
       podmanDriverArchive
       podmanE2eArchive
     ];
     text = ''
       build-provider-refresh-keycloak-test-archive
-      build-oci-image-test-archive
       build-podman-driver-test-archive
       build-podman-e2e-test-archive
     '';
