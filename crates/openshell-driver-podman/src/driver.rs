@@ -1640,7 +1640,7 @@ impl PodmanComputeDriver {
             .inspect_container(existing_workload_container_id)
             .await
             .map_err(ComputeDriverError::from)?;
-        let pinned_image = workload.config.image;
+        let pinned_image = workload.image;
         if pinned_image.is_empty() {
             return Err(ComputeDriverError::Precondition(
                 "retained Podman workload does not record its pinned image ID".into(),
@@ -2777,7 +2777,7 @@ mod tests {
                 // created from an immutable image ID.
                 StubResponse::new(
                     StatusCode::OK,
-                    r#"{"Id":"ctr-retained","Name":"workload","State":{"Status":"exited","Running":false},"Config":{"Image":"sha256:pinned-image-id"}}"#,
+                    r#"{"Id":"ctr-retained","Name":"workload","Image":"sha256:pinned-image-id","State":{"Status":"exited","Running":false},"Config":{"Image":"app:test"}}"#,
                 ),
                 // Inspection of the pinned image by ID, not by its tag.
                 StubResponse::new(

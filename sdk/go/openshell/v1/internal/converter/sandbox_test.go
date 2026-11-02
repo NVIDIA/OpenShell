@@ -46,6 +46,32 @@ func TestSandboxConfigurationAdmissionFromProto(t *testing.T) {
 	assert.Nil(t, sandboxStatusFromProto(&pb.SandboxStatus{}).ConfigurationAdmission)
 }
 
+func TestSandboxStatusRuntimeFromProto(t *testing.T) {
+	commit := "abcdef123"
+	wire := &pb.SandboxStatus{Runtime: &pb.SandboxRuntime{
+		Supervisor: &pb.SandboxSupervisorBuild{Version: "0.1.6-dev+gabcdef123", BuildCommit: &commit},
+		WorkloadImage: &pb.SandboxWorkloadImage{
+			Reference: "example/agent:latest", Digest: "sha256:pinned", DigestKind: "image_id",
+		},
+	}}
+	got := sandboxStatusFromProto(wire)
+	assert.Equal(t, &v1.SandboxRuntime{
+		Supervisor: &v1.SandboxSupervisorBuild{Version: "0.1.6-dev+gabcdef123", BuildCommit: &commit},
+		WorkloadImage: &v1.SandboxWorkloadImage{
+			Reference: "example/agent:latest", Digest: "sha256:pinned", DigestKind: "image_id",
+		},
+	}, got.Runtime)
+
+	commit = "changed"
+	wire.Runtime.Supervisor.Version = "changed"
+	wire.Runtime.WorkloadImage.Digest = "changed"
+	assert.Equal(t, "abcdef123", *got.Runtime.Supervisor.BuildCommit)
+	assert.Equal(t, "0.1.6-dev+gabcdef123", got.Runtime.Supervisor.Version)
+	assert.Equal(t, "sha256:pinned", got.Runtime.WorkloadImage.Digest)
+	assert.Nil(t, sandboxStatusFromProto(&pb.SandboxStatus{}).Runtime)
+	assert.Equal(t, &v1.SandboxRuntime{}, sandboxStatusFromProto(&pb.SandboxStatus{Runtime: &pb.SandboxRuntime{}}).Runtime)
+}
+
 func TestSandboxFromProto(t *testing.T) {
 	userNS := true
 	gpuCount := uint32(2)

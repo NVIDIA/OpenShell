@@ -186,6 +186,7 @@ fn project_begin(
     if template.image != intent.previous_image {
         return Err(conflict(Some(current_version)));
     }
+    let image_changed = template.image != intent.image;
     template.image.clone_from(&intent.image);
     openshell_core::sandbox_update::apply_configuration(
         &mut sandbox,
@@ -202,6 +203,16 @@ fn project_begin(
         .status
         .as_mut()
         .ok_or_else(|| conflict(Some(current_version)))?;
+    if image_changed {
+        // The desired reference has changed. The previous container's image ID
+        // must not be presented beside it while the stopped update is pending.
+        if let Some(runtime) = status.runtime.as_mut() {
+            runtime.workload_image = None;
+            if runtime.supervisor.is_none() {
+                status.runtime = None;
+            }
+        }
+    }
     let operation = status
         .provisioning
         .get_or_insert_with(|| SandboxProvisioning {

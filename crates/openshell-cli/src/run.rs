@@ -3066,6 +3066,23 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
                 "failure": observation.failure.as_ref().map(endpoint_failure_to_json),
             })
         });
+    let runtime = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.runtime.as_ref())
+        .map(|runtime| {
+            serde_json::json!({
+                "supervisor": runtime.supervisor.as_ref().map(|build| serde_json::json!({
+                    "version": build.version,
+                    "build_commit": build.build_commit,
+                })),
+                "workload_image": runtime.workload_image.as_ref().map(|image| serde_json::json!({
+                    "reference": image.reference,
+                    "digest": image.digest,
+                    "digest_kind": image.digest_kind,
+                })),
+            })
+        });
     let admission = sandbox
         .status
         .as_ref()
@@ -3123,6 +3140,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "conditions": conditions,
         "endpoint_statuses": endpoint_statuses,
         "last_token_grant_failure": last_token_grant_failure,
+        "runtime": runtime,
         "configuration_admission": admission,
         "provisioning": provisioning,
         "created_from_workload_template": created_from_workload_template,
@@ -7219,11 +7237,11 @@ mod tests {
     use openshell_core::proto::{
         EndpointResult, EndpointStatus, GetSandboxConfigResponse, GpuResourceRequirements,
         PolicySource, PolicyStatus, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
-        SandboxPolicy, SandboxPolicyRevision, SandboxResources, SandboxRestartPolicy, SandboxSpec,
-        SandboxStatus, SandboxWorkloadConfig, SandboxWorkloadTemplate,
-        SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
-        ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember, WorkspaceRole,
-        datamodel::v1::ObjectMeta,
+        SandboxPolicy, SandboxPolicyRevision, SandboxResources, SandboxRestartPolicy,
+        SandboxRuntime, SandboxSpec, SandboxStatus, SandboxSupervisorBuild, SandboxWorkloadConfig,
+        SandboxWorkloadImage, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
+        SandboxWorkloadTemplateSpec, ServiceAuthorizationMode, ServiceEndpoint,
+        ServiceEndpointResponse, WorkspaceMember, WorkspaceRole, datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -8891,6 +8909,39 @@ mod tests {
             json["created_from_workload_template"]["resource_version"],
             "7"
         );
+    }
+
+    #[test]
+    fn sandbox_json_reports_runtime_evidence_without_guessing_missing_values() {
+        let sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                runtime: Some(SandboxRuntime {
+                    supervisor: Some(SandboxSupervisorBuild {
+                        version: "0.1.6".into(),
+                        build_commit: None,
+                    }),
+                    workload_image: Some(SandboxWorkloadImage {
+                        reference: "example/agent:latest".into(),
+                        digest: "sha256:pinned".into(),
+                        digest_kind: "image_id".into(),
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::sandbox_to_json(&sandbox)["runtime"],
+            serde_json::json!({
+                "supervisor": {"version": "0.1.6", "build_commit": null},
+                "workload_image": {
+                    "reference": "example/agent:latest",
+                    "digest": "sha256:pinned",
+                    "digest_kind": "image_id"
+                }
+            })
+        );
+        assert!(super::sandbox_to_json(&Sandbox::default())["runtime"].is_null());
     }
 
     #[test]

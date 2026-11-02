@@ -3,6 +3,11 @@
 This crate manages workload processes and SSH sessions through the admitted
 isolation backend.
 
+The dedicated supervisor sends its build version in `SupervisorHello` on its
+authenticated gateway session. The gateway stores the last accepted version
+per sandbox in `Sandbox.status.runtime.supervisor`; development versions that
+include a Git commit expose it separately as `build_commit`.
+
 ## Bounded streaming uploads
 
 The CLI's built-in uploads use the `openshell-upload-v1` SSH subsystem. Russh

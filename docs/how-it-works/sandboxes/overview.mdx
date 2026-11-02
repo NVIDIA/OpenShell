@@ -731,6 +731,30 @@ For automation, use `--output json` or `--output yaml` to get machine-readable s
 openshell sandbox get my-sandbox --output json
 ```
 
+For a running Docker or Podman sandbox, the `runtime` block reports the image
+reference from its effective template and the image ID observed by the driver.
+The reference may be a moving tag; compare the `digest` to the image ID you
+expect. This is an image ID, not a registry manifest digest. Dedicated
+supervisors also report their own version through the authenticated gateway
+session. The `build_commit` is present for development versions that include a
+Git commit. Values that an older component or driver has not reported are
+`null` or absent.
+
+```shell
+openshell sandbox get my-sandbox --output json | jq '.runtime'
+```
+
+```json
+{
+  "supervisor": {"version": "0.1.6", "build_commit": null},
+  "workload_image": {
+    "reference": "example/agent:latest",
+    "digest": "sha256:...",
+    "digest_kind": "image_id"
+  }
+}
+```
+
 Print only the policy YAML for scripting (same effective policy, no metadata):
 
 ```shell

@@ -474,7 +474,7 @@ impl ComputeRuntime {
         let recover = async {
             ensure_image_update_stopped(&sandbox)?;
             self.ensure_configuration_update_supported()?;
-            self.complete_image_update(sandbox, intent.clone()).await?;
+            Box::pin(self.complete_image_update(sandbox, intent.clone())).await?;
             Ok(())
         };
         let result = tokio::time::timeout_at(deadline, recover)
@@ -1767,6 +1767,85 @@ BEGIN SELECT RAISE(ABORT, 'injected sandbox deletion failure'); END",
                 .unwrap()
                 .unwrap(),
             original
+        );
+    }
+
+    #[tokio::test]
+    async fn image_change_clears_old_id_before_status_reconciliation() {
+        let (runtime, driver, mut original) = fixture(true).await;
+        original.status.as_mut().unwrap().runtime = Some(openshell_core::proto::SandboxRuntime {
+            workload_image: Some(openshell_core::proto::SandboxWorkloadImage {
+                reference: "example/workload:old".into(),
+                digest: "sha256:old".into(),
+                digest_kind: "image_id".into(),
+            }),
+            ..Default::default()
+        });
+        runtime.store.put_message(&original).await.unwrap();
+        let original = runtime
+            .store
+            .get_message::<Sandbox>(original.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+
+        driver.set_image_update_error(Some(Code::Unavailable));
+        runtime
+            .update_sandbox_image(
+                original.object_id(),
+                "example/workload:new".into(),
+                original.get_resource_version(),
+            )
+            .await
+            .unwrap_err();
+        let mut pending = runtime
+            .store
+            .get_message::<Sandbox>(original.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pending
+                .spec
+                .as_ref()
+                .unwrap()
+                .template
+                .as_ref()
+                .unwrap()
+                .image,
+            "example/workload:new"
+        );
+        assert!(
+            pending
+                .status
+                .as_ref()
+                .unwrap()
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.workload_image.as_ref())
+                .is_none()
+        );
+
+        let incoming = DriverSandbox {
+            id: original.object_id().into(),
+            name: original.object_name().into(),
+            status: Some(DriverSandboxStatus {
+                instance_id: "old-container".into(),
+                workload_image_id: "sha256:old".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply_driver_snapshot(&mut pending, &incoming, false, false);
+        assert!(
+            pending
+                .status
+                .as_ref()
+                .unwrap()
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.workload_image.as_ref())
+                .is_none()
         );
     }
 

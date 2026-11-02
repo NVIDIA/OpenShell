@@ -123,6 +123,7 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 		"conditions":                true,
 		"endpoint_statuses":         true,
 		"last_token_grant_failure":  true,
+		"runtime":                   true,
 		"current_policy_version":    true,
 		"exit_code":                 true,
 		"configuration_admission":   true,

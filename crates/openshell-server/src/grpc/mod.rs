@@ -1114,6 +1114,7 @@ pub mod test_support {
                     supports_provider_readiness: false,
                     redirected: false,
                     supports_session_redirect: false,
+                    version: String::new(),
                 })),
             })
             .await

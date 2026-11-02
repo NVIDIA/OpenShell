@@ -3729,6 +3729,7 @@ fn build_container_create_body_uses_runtime_namespace_label() {
 fn driver_status_keeps_running_sandboxes_provisioning_with_stable_message() {
     let running = ContainerSummary {
         id: Some("cid".to_string()),
+        image_id: Some("sha256:first-image".to_string()),
         names: Some(vec!["/openshell-demo".to_string()]),
         labels: Some(HashMap::from([
             (LABEL_SANDBOX_ID.to_string(), "sbx-1".to_string()),
@@ -3757,6 +3758,16 @@ fn driver_status_keeps_running_sandboxes_provisioning_with_stable_message() {
     assert_eq!(running_status.conditions[0].reason, "BackendReady");
     assert_eq!(running_status.conditions[0].message, "Container is running");
     assert_eq!(running_status.conditions, running_later_status.conditions);
+    assert_eq!(running_status.workload_image_id, "sha256:first-image");
+
+    let moved_tag = ContainerSummary {
+        image_id: Some("sha256:second-image".to_string()),
+        ..running
+    };
+    assert_eq!(
+        driver_status_from_summary(&moved_tag, "demo").workload_image_id,
+        "sha256:second-image"
+    );
 
     let exited_status = driver_status_from_summary(&exited, "demo");
     assert_eq!(exited_status.conditions[0].status, "False");

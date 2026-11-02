@@ -611,6 +611,7 @@ async fn run_single_session(
             redirected,
             supports_session_redirect: true,
             supports_config_push: true,
+            version: openshell_core::VERSION.to_string(),
         })),
     })
     .await

@@ -47,8 +47,8 @@ use openshell_core::proto::compute::v1::{
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy as ProtoSandboxPolicy,
-    SandboxRestartPolicy, SandboxSpec, SandboxStatus, SandboxTemplate, SandboxWorkloadTemplate,
-    ServiceEndpoint, SshSession,
+    SandboxRestartPolicy, SandboxRuntime, SandboxSpec, SandboxStatus, SandboxSupervisorBuild,
+    SandboxTemplate, SandboxWorkloadImage, SandboxWorkloadTemplate, ServiceEndpoint, SshSession,
 };
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{ObjectLabels, ObjectWorkspace, SetResourceVersion};
@@ -952,6 +952,8 @@ impl fmt::Debug for ComputeRuntime {
 enum SupervisorSessionStateUpdate<'a> {
     Connected {
         instance_id: &'a str,
+        /// `Some("")` clears a build from an older supervisor on reconnect.
+        supervisor_version: Option<&'a str>,
         admission: Option<&'a openshell_core::proto::SandboxConfigurationAdmission>,
         /// The session's workload runs. Without this, only the admission is
         /// recorded.
@@ -5570,7 +5572,7 @@ impl ComputeRuntime {
             && (driver_snapshot_confirms_stopped(&incoming)
                 || driver_snapshot_reports_runtime_restart(&incoming));
         if existing_phase != SandboxPhase::Starting && !ready_container_exit {
-            return self.apply_sandbox_update_locked(incoming, existing).await;
+            return Box::pin(self.apply_sandbox_update_locked(incoming, existing)).await;
         }
 
         // Any snapshot can already be queued when StartSandbox moves the
@@ -5619,7 +5621,7 @@ impl ComputeRuntime {
             Ok(Some(_) | None) | Err(_) => {}
         }
 
-        self.apply_sandbox_update_locked(incoming, existing).await
+        Box::pin(self.apply_sandbox_update_locked(incoming, existing)).await
     }
 
     async fn apply_sandbox_update_locked(
@@ -5704,10 +5706,21 @@ impl ComputeRuntime {
         sandbox_id: &str,
         instance_id: &str,
     ) -> Result<(), String> {
+        self.supervisor_session_connected_with_version(sandbox_id, instance_id, "")
+            .await
+    }
+
+    pub async fn supervisor_session_connected_with_version(
+        &self,
+        sandbox_id: &str,
+        instance_id: &str,
+        supervisor_version: &str,
+    ) -> Result<(), String> {
         self.set_supervisor_session_state(
             sandbox_id,
             SupervisorSessionStateUpdate::Connected {
                 instance_id,
+                supervisor_version: Some(supervisor_version),
                 admission: None,
                 runtime_ready: true,
             },
@@ -5739,6 +5752,7 @@ impl ComputeRuntime {
             sandbox_id,
             SupervisorSessionStateUpdate::Connected {
                 instance_id,
+                supervisor_version: None,
                 admission: Some(admission),
                 runtime_ready,
             },
@@ -5790,6 +5804,7 @@ impl ComputeRuntime {
                 sandbox_id,
                 SupervisorSessionStateUpdate::Connected {
                     instance_id: &instance_id,
+                    supervisor_version: None,
                     admission: None,
                     runtime_ready: true,
                 },
@@ -5848,17 +5863,31 @@ impl ComputeRuntime {
         update: SupervisorSessionStateUpdate<'_>,
         mut existing: Option<Sandbox>,
     ) -> Result<(), String> {
-        let (connected, instance_id, admission, terminal_delivery_finalized, runtime_ready) =
-            match update {
-                SupervisorSessionStateUpdate::Connected {
-                    instance_id,
-                    admission,
-                    runtime_ready,
-                } => (true, Some(instance_id), admission, false, runtime_ready),
-                SupervisorSessionStateUpdate::Disconnected {
-                    terminal_delivery_finalized,
-                } => (false, None, None, terminal_delivery_finalized, false),
-            };
+        let (
+            connected,
+            instance_id,
+            supervisor_version,
+            admission,
+            terminal_delivery_finalized,
+            runtime_ready,
+        ) = match update {
+            SupervisorSessionStateUpdate::Connected {
+                instance_id,
+                supervisor_version,
+                admission,
+                runtime_ready,
+            } => (
+                true,
+                Some(instance_id),
+                supervisor_version,
+                admission,
+                false,
+                runtime_ready,
+            ),
+            SupervisorSessionStateUpdate::Disconnected {
+                terminal_delivery_finalized,
+            } => (false, None, None, None, terminal_delivery_finalized, false),
+        };
         for attempt in 1..=SUPERVISOR_SESSION_CAS_RETRY_LIMIT {
             let Some(current) = existing else {
                 return Ok(());
@@ -5933,6 +5962,16 @@ impl ComputeRuntime {
                             // An admission-only update leaves restart state to
                             // the instance that last connected.
                             if runtime_ready {
+                                if let Some(version) = supervisor_version {
+                                    let runtime =
+                                        status.runtime.get_or_insert_with(SandboxRuntime::default);
+                                    runtime.supervisor = supervisor_build(version);
+                                    if runtime.supervisor.is_none()
+                                        && runtime.workload_image.is_none()
+                                    {
+                                        status.runtime = None;
+                                    }
+                                }
                                 let same_instance =
                                     Some(status.main_process_instance_id.as_str()) == instance_id;
                                 status.main_process_instance_id =
@@ -7546,7 +7585,65 @@ fn public_status_from_driver(
         next_restart_time: None,
         main_process_started_time: None,
         last_token_grant_failure: None,
+        runtime: (!status.workload_image_id.trim().is_empty()).then(|| SandboxRuntime {
+            workload_image: Some(SandboxWorkloadImage {
+                reference: String::new(),
+                digest: status.workload_image_id.clone(),
+                digest_kind: "image_id".to_string(),
+            }),
+            ..Default::default()
+        }),
     }
+}
+
+fn merge_runtime_evidence(
+    status: &mut SandboxStatus,
+    previous: Option<&SandboxStatus>,
+    image_reference: &str,
+) {
+    let runtime = status.runtime.get_or_insert_with(SandboxRuntime::default);
+    if let Some(image) = runtime.workload_image.as_mut() {
+        image.reference = image_reference.to_string();
+    }
+    if let Some(previous) = previous {
+        let old_runtime = previous.runtime.as_ref();
+        // Some drivers publish a lightweight list observation before an inspect.
+        // Keep its known image ID only while the instance and image intent match.
+        if runtime.workload_image.is_none()
+            && !status.agent_pod.is_empty()
+            && status.agent_pod == previous.agent_pod
+        {
+            runtime.workload_image = old_runtime
+                .and_then(|runtime| runtime.workload_image.as_ref())
+                .filter(|image| image.reference == image_reference)
+                .cloned();
+        }
+        runtime.supervisor = old_runtime.and_then(|runtime| runtime.supervisor.clone());
+    }
+    if runtime.workload_image.is_none() && runtime.supervisor.is_none() {
+        status.runtime = None;
+    }
+}
+
+fn supervisor_build(version: &str) -> Option<SandboxSupervisorBuild> {
+    let version = version.trim();
+    if version.is_empty()
+        || version.len() > 128
+        || !version.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return None;
+    }
+    let build_commit = version
+        .rsplit_once("+g")
+        .map(|(_, commit)| commit)
+        .filter(|commit| {
+            (7..=40).contains(&commit.len()) && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .map(str::to_string);
+    Some(SandboxSupervisorBuild {
+        version: version.to_string(),
+        build_commit,
+    })
 }
 
 fn apply_driver_snapshot(
@@ -7688,6 +7785,19 @@ fn apply_driver_snapshot(
     if let Some(status) = status.as_mut() {
         status.phase = phase as i32;
         status.endpoint_statuses = endpoint_statuses;
+        if old_phase == SandboxPhase::Stopped && phase == SandboxPhase::Stopped {
+            // An update changes the desired image while stopped. A delayed
+            // snapshot of the old container cannot identify the new image.
+            if let Some(runtime) = status.runtime.as_mut() {
+                runtime.workload_image = None;
+            }
+        }
+        let image_reference = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+            .map_or("", |template| template.image.as_str());
+        merge_runtime_evidence(status, sandbox.status.as_ref(), image_reference);
     }
 
     if let (Some(status), Some(current_status)) = (status.as_mut(), sandbox.status.as_ref()) {
@@ -12173,6 +12283,128 @@ mod tests {
             .unwrap();
         assert_eq!(identity.reason, "DriverResolved");
         assert_eq!(identity.message, "Resolved workload UID:GID is 1000:1001");
+        // The VM's resource_digest is a cache identity, not an image digest.
+        assert!(status.runtime.is_none());
+    }
+
+    #[test]
+    fn driver_image_id_tracks_the_container_when_a_tag_moves() {
+        let mut sandbox = sandbox_record("sb-1", "demo", SandboxPhase::Provisioning);
+        sandbox.spec = Some(SandboxSpec {
+            template: Some(SandboxTemplate {
+                image: "example/agent:latest".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut incoming = ready_driver_sandbox("sb-1", "demo");
+        incoming.status.as_mut().unwrap().workload_image_id = "sha256:first".into();
+        apply_driver_snapshot(&mut sandbox, &incoming, true, true);
+        let image = sandbox
+            .status
+            .as_ref()
+            .unwrap()
+            .runtime
+            .as_ref()
+            .unwrap()
+            .workload_image
+            .as_ref()
+            .unwrap();
+        assert_eq!(image.reference, "example/agent:latest");
+        assert_eq!(image.digest, "sha256:first");
+        assert_eq!(image.digest_kind, "image_id");
+
+        // A lightweight list observation cannot erase evidence for the same
+        // container, but a replacement must not inherit its predecessor's ID.
+        incoming.status.as_mut().unwrap().workload_image_id.clear();
+        apply_driver_snapshot(&mut sandbox, &incoming, true, true);
+        assert_eq!(
+            sandbox
+                .status
+                .as_ref()
+                .unwrap()
+                .runtime
+                .as_ref()
+                .unwrap()
+                .workload_image
+                .as_ref()
+                .unwrap()
+                .digest,
+            "sha256:first"
+        );
+        incoming.status.as_mut().unwrap().instance_id = "replacement".into();
+        apply_driver_snapshot(&mut sandbox, &incoming, true, true);
+        assert!(sandbox.status.as_ref().unwrap().runtime.is_none());
+
+        incoming.status.as_mut().unwrap().workload_image_id = "sha256:second".into();
+        apply_driver_snapshot(&mut sandbox, &incoming, true, true);
+        let image = sandbox
+            .status
+            .as_ref()
+            .unwrap()
+            .runtime
+            .as_ref()
+            .unwrap()
+            .workload_image
+            .as_ref()
+            .unwrap();
+        assert_eq!(image.reference, "example/agent:latest");
+        assert_eq!(image.digest, "sha256:second");
+    }
+
+    #[tokio::test]
+    async fn supervisor_build_follows_the_authenticated_session() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        runtime
+            .store
+            .put_message(&sandbox_record("sb-1", "demo", SandboxPhase::Provisioning))
+            .await
+            .unwrap();
+        runtime
+            .supervisor_session_connected_with_version(
+                "sb-1",
+                "supervisor-1",
+                "0.1.5-dev.2+gabcdef123",
+            )
+            .await
+            .unwrap();
+        let first = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let build = first.status.unwrap().runtime.unwrap().supervisor.unwrap();
+        assert_eq!(build.version, "0.1.5-dev.2+gabcdef123");
+        assert_eq!(build.build_commit.as_deref(), Some("abcdef123"));
+
+        runtime
+            .supervisor_session_connected_with_version("sb-1", "supervisor-2", "0.1.6")
+            .await
+            .unwrap();
+        let second = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let build = second.status.unwrap().runtime.unwrap().supervisor.unwrap();
+        assert_eq!(build.version, "0.1.6");
+        assert!(build.build_commit.is_none());
+
+        // A supervisor from an older release omits the field. Do not keep a
+        // version reported by the previous session.
+        runtime
+            .supervisor_session_connected_with_version("sb-1", "supervisor-3", "")
+            .await
+            .unwrap();
+        let third = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(third.status.unwrap().runtime.is_none());
     }
 
     fn ready_driver_sandbox(id: &str, name: &str) -> DriverSandbox {
@@ -16245,6 +16477,7 @@ mod tests {
                 "sb-1",
                 SupervisorSessionStateUpdate::Connected {
                     instance_id: "test-generation",
+                    supervisor_version: None,
                     admission: None,
                     runtime_ready: true,
                 },
