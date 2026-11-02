@@ -609,19 +609,20 @@ async fn wait_for_home(
     .and_then(|home| (*home).clone())
 }
 
-/// The peer endpoint the shared host moves to, once it changes to one other
-/// than `current`. Pending forever without a shared host.
+/// The peer endpoint of the shared host, once it is one other than `current`,
+/// including a move that landed before this is first polled. Pending forever
+/// without a shared host.
 async fn home_moved(home: Option<&mut watch::Receiver<Option<String>>>, current: &str) -> String {
     let Some(home) = home else {
         return std::future::pending().await;
     };
     loop {
-        if home.changed().await.is_err() {
-            return std::future::pending().await;
-        }
         let endpoint = home.borrow_and_update().clone();
         if let Some(endpoint) = endpoint.filter(|endpoint| endpoint != current) {
             return endpoint;
+        }
+        if home.changed().await.is_err() {
+            return std::future::pending().await;
         }
     }
 }
@@ -768,9 +769,6 @@ async fn run_single_session(
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));
     heartbeat_interval.tick().await; // skip immediate tick
     let mut home = config.gateway_home.clone();
-    if let Some(home) = home.as_mut() {
-        home.mark_unchanged();
-    }
 
     loop {
         tokio::select! {
@@ -1743,9 +1741,21 @@ mod ocsf_event_tests {
     }
 
     #[tokio::test]
+    async fn a_host_move_during_session_setup_is_followed() {
+        let (tx, mut home) = watch::channel(Some("https://gw-a:8443".to_string()));
+        // The session dialed A; the host moved to B before it was accepted,
+        // and the move was already observed.
+        tx.send_replace(Some("https://gw-b:8443".to_string()));
+        home.mark_unchanged();
+        assert_eq!(
+            home_moved(Some(&mut home), "https://gw-a:8443").await,
+            "https://gw-b:8443"
+        );
+    }
+
+    #[tokio::test]
     async fn an_established_session_follows_its_host_to_another_gateway() {
         let (tx, mut home) = watch::channel(Some("https://gw-a:8443".to_string()));
-        home.mark_unchanged();
         let moved =
             tokio::spawn(async move { home_moved(Some(&mut home), "https://gw-a:8443").await });
 
