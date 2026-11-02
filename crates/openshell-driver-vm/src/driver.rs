@@ -4193,13 +4193,6 @@ impl VmDriver {
                 return Err(err);
             }
         };
-        self.publish_workload_image_ready(
-            sandbox_id,
-            image_ref,
-            "local_docker",
-            false,
-            Some(exported_bytes),
-        );
 
         let payload = GuestImagePayload {
             image_ref: image_ref.to_string(),
@@ -4214,6 +4207,7 @@ impl VmDriver {
             bootstrap_root_disk,
             &staging_dir,
             &payload,
+            Some(exported_bytes),
         )
         .await?;
 
@@ -4348,13 +4342,6 @@ impl VmDriver {
             .await
             .ok()
             .map(|meta| meta.len());
-        self.publish_workload_image_ready(
-            sandbox_id,
-            &tar_display,
-            "rootfs_tar",
-            false,
-            staged_bytes,
-        );
 
         let payload = GuestImagePayload {
             image_ref: tar_display.clone(),
@@ -4369,6 +4356,7 @@ impl VmDriver {
             bootstrap_root_disk,
             &staging_dir,
             &payload,
+            staged_bytes,
         )
         .await?;
 
@@ -4504,13 +4492,6 @@ impl VmDriver {
 
         write_oci_layout_for_manifest(&layout_dir, GUEST_IMAGE_OCI_REF, &manifest)
             .map_err(|err| Status::internal(format!("write OCI layout failed: {err}")))?;
-        self.publish_workload_image_ready(
-            sandbox_id,
-            image_ref,
-            "registry",
-            false,
-            u64::try_from(total_bytes).ok().filter(|bytes| *bytes > 0),
-        );
 
         let payload = GuestImagePayload {
             image_ref: image_ref.to_string(),
@@ -4525,6 +4506,7 @@ impl VmDriver {
             bootstrap_root_disk,
             &staging_dir,
             &payload,
+            u64::try_from(total_bytes).ok().filter(|bytes| *bytes > 0),
         )
         .await?;
 
@@ -4562,6 +4544,7 @@ impl VmDriver {
         bootstrap_root_disk: &Path,
         staging_dir: &Path,
         payload: &GuestImagePayload,
+        image_bytes: Option<u64>,
     ) -> Result<(), Status> {
         let cache_dir = image_cache_dir(&self.config.state_dir, image_identity);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, image_identity);
@@ -4585,20 +4568,38 @@ impl VmDriver {
         })?
         .map_err(Status::internal)?;
 
+        let driver_for_progress = self.clone();
+        let progress_sandbox_id = sandbox_id.to_string();
+        let progress_image_ref = image_ref.to_string();
+        let progress_image_source = image_source.to_string();
+        let progress_image_identity = image_identity.to_string();
         let payload_for_disk = payload.clone();
         let prepared_image_for_disk = prepared_image.clone();
-        self.publish_vm_progress(
-            sandbox_id,
-            "CreatingRootDisk",
-            "Formatting prepared VM image disk".to_string(),
-            HashMap::from([
-                ("image_ref".to_string(), image_ref.to_string()),
-                ("image_source".to_string(), image_source.to_string()),
-                ("image_identity".to_string(), image_identity.to_string()),
-            ]),
-        );
         tokio::task::spawn_blocking(move || {
-            create_image_prep_disk(&prepared_image_for_disk, image_size, &payload_for_disk)
+            create_image_prep_disk(
+                &prepared_image_for_disk,
+                image_size,
+                &payload_for_disk,
+                |_| {
+                    driver_for_progress.publish_workload_image_ready(
+                        &progress_sandbox_id,
+                        &progress_image_ref,
+                        &progress_image_source,
+                        false,
+                        image_bytes,
+                    );
+                    driver_for_progress.publish_vm_progress(
+                        &progress_sandbox_id,
+                        "CreatingRootDisk",
+                        "Formatting prepared VM image disk".to_string(),
+                        HashMap::from([
+                            ("image_ref".to_string(), progress_image_ref),
+                            ("image_source".to_string(), progress_image_source),
+                            ("image_identity".to_string(), progress_image_identity),
+                        ]),
+                    );
+                },
+            )
         })
         .await
         .map_err(|err| Status::internal(format!("prepared image disk build panicked: {err}")))?
@@ -7957,6 +7958,7 @@ fn create_image_prep_disk(
     image_path: &Path,
     size_bytes: u64,
     payload: &GuestImagePayload,
+    on_payload_staged: impl FnOnce(&Path),
 ) -> Result<(), String> {
     let staging_dir = overlay_staging_dir(image_path);
     if staging_dir.exists() {
@@ -7972,6 +7974,7 @@ fn create_image_prep_disk(
         fs::create_dir_all(staging_dir.join("config"))
             .map_err(|err| format!("create image-prep config dir: {err}"))?;
         stage_guest_image_payload(&staging_dir, payload)?;
+        on_payload_staged(&staging_dir);
         create_ext4_image_from_dir_with_size(&staging_dir, image_path, size_bytes)
     })();
 
@@ -13196,6 +13199,98 @@ mod tests {
         assert!(!base.join("dest.tar").exists());
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn prepared_image_ready_event_requires_payload_staging() {
+        let base = unique_temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        let mut driver = rootfs_tar_test_driver(&base, None);
+        driver.config.state_dir = base.clone();
+        driver.launcher_bin = base.join("missing-launcher");
+        let mut events = driver.events.subscribe();
+
+        let image_identity = "test-image";
+        let staging_dir = driver.image_staging_dir(image_identity);
+        fs::create_dir_all(&staging_dir).unwrap();
+        let archive = staging_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
+        fs::write(&archive, b"payload").unwrap();
+        let payload = GuestImagePayload {
+            image_ref: "local:1".to_string(),
+            image_identity: image_identity.to_string(),
+            source: GuestImagePayloadSource::LocalDocker {
+                rootfs_archive: archive,
+            },
+        };
+
+        let error = driver
+            .build_prepared_image_disk(
+                "sb-local",
+                "local:1",
+                "local_docker",
+                image_identity,
+                Path::new("unused"),
+                &staging_dir,
+                &payload,
+                Some(7),
+            )
+            .await
+            .expect_err("test launcher must fail after staging");
+        assert!(error.message().contains("failed to run image-prep vm"));
+
+        let mut reasons = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let Some(watch_sandboxes_event::Payload::PlatformEvent(platform)) = event.payload {
+                let event = platform.event.expect("platform event body");
+                if event.reason == "Pulled" {
+                    assert_eq!(
+                        progress_value(&event, PROGRESS_COMPLETE_STEP_KEY),
+                        Some(PROGRESS_STEP_PULLING_IMAGE)
+                    );
+                }
+                reasons.push(event.reason);
+            }
+        }
+        assert_eq!(
+            reasons,
+            vec![
+                "Pulled".to_string(),
+                "CreatingRootDisk".to_string(),
+                "PreparingRootfs".to_string()
+            ]
+        );
+
+        let bad_staging_dir = driver.image_staging_dir("bad-image");
+        fs::create_dir_all(&bad_staging_dir).unwrap();
+        let source_dir = base.join("source-dir");
+        fs::create_dir_all(&source_dir).unwrap();
+        let bad_payload = GuestImagePayload {
+            image_ref: "local:1".to_string(),
+            image_identity: "bad-image".to_string(),
+            source: GuestImagePayloadSource::LocalDocker {
+                rootfs_archive: source_dir,
+            },
+        };
+        let error = driver
+            .build_prepared_image_disk(
+                "sb-local",
+                "local:1",
+                "local_docker",
+                "bad-image",
+                Path::new("unused"),
+                &bad_staging_dir,
+                &bad_payload,
+                None,
+            )
+            .await
+            .expect_err("directory source must fail staging");
+        assert!(error.message().contains("stage guest image rootfs archive"));
+        assert!(
+            events.try_recv().is_err(),
+            "failed staging completed image step"
+        );
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
