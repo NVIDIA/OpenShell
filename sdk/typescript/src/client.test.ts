@@ -12,6 +12,7 @@ import type { MessageInitShape } from '@bufbuild/protobuf';
 import { Code, ConnectError, createRouterTransport, type ServiceImpl, type Transport } from '@connectrpc/connect';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  __setSshCleanupTimeoutMsForTests,
   __setWatchLogsBackoffSleepForTests,
   errorCode,
   Pager,
@@ -2271,6 +2272,44 @@ describe('forward', () => {
 
     await handle.close();
     expect(revoked).toEqual(['open-tok']);
+  });
+
+  it('close() resolves within the cleanup bound when revoke never resolves', async () => {
+    __setSshCleanupTimeoutMsForTests(100);
+    try {
+      const sandbox = client({
+        getSandbox: () => readySandbox('sb', 'sb-id-stall'),
+        createSshSession: () => ({
+          sandboxId: 'sb-id-stall',
+          token: 'stall-tok',
+          gatewayHost: 'gw',
+          gatewayPort: 443,
+          gatewayScheme: 'https',
+          hostKeyFingerprint: '',
+          expirationTime: undefined,
+        }),
+        revokeSshSession: () => new Promise(() => {}),
+        forwardTcp: async function* (requests) {
+          for await (const frame of requests) {
+            if (frame.payload.case === 'data') yield { payload: { case: 'data', value: frame.payload.value } };
+          }
+        },
+      });
+
+      const handle = await sandbox.forward('sb', { targetPort: 9000 });
+      const socket = net.connect(handle.localPort, handle.localHost);
+      socket.on('error', () => {});
+      await new Promise<void>((resolve) => {
+        socket.once('data', () => resolve());
+        socket.write('ping');
+      });
+
+      const start = Date.now();
+      await handle.close();
+      expect(Date.now() - start).toBeLessThan(2_000);
+    } finally {
+      __setSshCleanupTimeoutMsForTests();
+    }
   });
 
   it('rejects when the sandbox is not ready', async () => {
