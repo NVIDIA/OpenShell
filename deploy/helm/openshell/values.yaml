@@ -390,9 +390,11 @@ server:
   name: ""
   # -- Gateway log level.
   logLevel: info
-  # OpenTelemetry trace export over OTLP/gRPC. Leave endpoint empty to disable.
+  # OpenTelemetry trace export over OTLP. Leave endpoint empty to disable.
   otlp:
-    # -- OTLP/gRPC collector endpoint, conventionally using port 4317.
+    # -- OTLP/gRPC collector endpoint, conventionally port 4317. For an
+    # `http/protobuf` collector, also set protocol under
+    # gatewayConfig."openshell.gateway.otlp".
     endpoint: ""
     # -- Gateway OpenTelemetry service name. Empty uses openshell-gateway.
     serviceName: ""

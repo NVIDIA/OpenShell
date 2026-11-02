@@ -919,9 +919,11 @@ pub struct SandboxInstanceConfig {
     /// attach: how long it keeps the workload frozen after losing this
     /// supervisor. `None` leaves the runtime default.
     pub supervisor_recovery_timeout_secs: Option<u32>,
-    /// OTLP/gRPC collector for relayed agent traces; `None` keeps the relay
+    /// OTLP collector for relayed agent traces; `None` keeps the relay
     /// inactive.
     pub otlp_agent_endpoint: Option<String>,
+    /// Transport to the relayed agent trace collector.
+    pub otlp_agent_protocol: openshell_core::sandbox_env::OtlpProtocol,
 }
 
 impl SandboxInstanceConfig {
@@ -1076,6 +1078,7 @@ pub async fn run_sandbox_instance(
         takeover,
         supervisor_recovery_timeout_secs,
         otlp_agent_endpoint,
+        otlp_agent_protocol,
     } = config;
     // The owner binds the event context and log sink to the instance's
     // threads; the instance itself uses the rest.
@@ -1296,7 +1299,7 @@ pub async fn run_sandbox_instance(
     // before attach so the agent spec can tell the boundary whether to point
     // workload SDKs at it.
     let (mut otlp_relay, otlp_reserved_destination) =
-        otlp_relay::activate(otlp_agent_endpoint, sandbox_id.clone());
+        otlp_relay::activate(otlp_agent_endpoint, otlp_agent_protocol, sandbox_id.clone());
 
     // Construct the selected client only after shared policy and credential
     // setup has completed. Keep live credentials and later CA publication in
@@ -4648,6 +4651,7 @@ mod tests {
             takeover: None,
             supervisor_recovery_timeout_secs: None,
             otlp_agent_endpoint: None,
+            otlp_agent_protocol: openshell_core::sandbox_env::OtlpProtocol::Grpc,
         };
         let bindings = SandboxInstanceBindings::dedicated(
             &config,
