@@ -373,10 +373,10 @@ message ProcessIdentity {
   string name = 1;
   uint32 pid = 2;
   optional string uid = 3;
-  optional int64 created_time_ms = 4;
+  google.protobuf.Timestamp created_time = 4;
   optional uint32 parent_pid = 5;
   optional string parent_uid = 6;
-  optional int64 parent_created_time_ms = 7;
+  google.protobuf.Timestamp parent_created_time = 7;
 }
 enum ProcessKind {
   PROCESS_KIND_UNSPECIFIED = 0;

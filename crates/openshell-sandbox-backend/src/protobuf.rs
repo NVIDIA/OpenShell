@@ -96,10 +96,13 @@ impl WireMessage for w::ProcessIdentityWire {
             name: self.name.clone(),
             pid: self.pid,
             uid: self.uid.clone(),
-            created_time_ms: self.created_time_ms,
+            created_time: self.created_time_ms.map(timestamp_i64_ms).transpose()?,
             parent_pid: self.parent_pid,
             parent_uid: self.parent_uid.clone(),
-            parent_created_time_ms: self.parent_created_time_ms,
+            parent_created_time: self
+                .parent_created_time_ms
+                .map(timestamp_i64_ms)
+                .transpose()?,
         })
     }
 
@@ -108,10 +111,10 @@ impl WireMessage for w::ProcessIdentityWire {
             name: value.name,
             pid: value.pid,
             uid: value.uid,
-            created_time_ms: value.created_time_ms,
+            created_time_ms: value.created_time.map(millis_i64).transpose()?,
             parent_pid: value.parent_pid,
             parent_uid: value.parent_uid,
-            parent_created_time_ms: value.parent_created_time_ms,
+            parent_created_time_ms: value.parent_created_time.map(millis_i64).transpose()?,
         })
     }
 }
@@ -491,6 +494,14 @@ fn millis(v: prost_types::Timestamp) -> Result<u64, FrameError> {
     Ok(u64::try_from(v.seconds).map_err(invalid)? * 1000
         + u64::try_from(v.nanos).map_err(invalid)? / 1_000_000)
 }
+fn timestamp_i64_ms(value: i64) -> Result<prost_types::Timestamp, FrameError> {
+    timestamp(u64::try_from(value).map_err(invalid)?)
+}
+
+fn millis_i64(value: prost_types::Timestamp) -> Result<i64, FrameError> {
+    i64::try_from(millis(value)?).map_err(invalid)
+}
+
 impl WireMessage for w::RequestEnvelope {
     type Proto = p::RequestEnvelope;
     fn to_proto(&self) -> Result<Self::Proto, FrameError> {
@@ -907,6 +918,42 @@ mod tests {
         older_json.as_object_mut().unwrap().remove("audit_paths");
         let decoded: w::SandboxPolicyWire = serde_json::from_value(older_json).unwrap();
         assert!(decoded.audit_paths.is_empty());
+    }
+
+    #[test]
+    fn process_identity_uses_well_known_timestamps() {
+        let identity = w::ProcessIdentityWire {
+            name: "/bin/true".to_string(),
+            pid: 42,
+            uid: None,
+            created_time_ms: Some(1_793_620_000_123),
+            parent_pid: Some(1),
+            parent_uid: None,
+            parent_created_time_ms: Some(1_793_619_999_456),
+        };
+        let encoded = identity.to_proto().unwrap();
+        assert_eq!(
+            encoded.created_time,
+            Some(prost_types::Timestamp {
+                seconds: 1_793_620_000,
+                nanos: 123_000_000,
+            })
+        );
+        assert_eq!(
+            encoded.parent_created_time,
+            Some(prost_types::Timestamp {
+                seconds: 1_793_619_999,
+                nanos: 456_000_000,
+            })
+        );
+        assert_eq!(
+            w::ProcessIdentityWire::from_proto(encoded.clone()).unwrap(),
+            identity
+        );
+
+        let mut invalid_time = encoded;
+        invalid_time.created_time.as_mut().unwrap().nanos = 123_000_001;
+        assert!(w::ProcessIdentityWire::from_proto(invalid_time).is_err());
     }
 
     #[test]
