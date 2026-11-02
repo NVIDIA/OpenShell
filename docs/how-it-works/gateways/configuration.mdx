@@ -1704,6 +1704,8 @@ Without `--path`, the command validates a nonempty `OPENSHELL_GATEWAY_CONFIG`. O
 
 Config preflight validates configuration without loading launch-signing keys, so a successful result does not confirm that the key files exist or form a usable pair. Gateway startup validates configured or discovered signing bundles. Sandbox creation checks the selected driver's launch-signing requirement before image preparation.
 
+When `allow_unauthenticated_users = true`, preflight prints a warning to stderr and still exits 0.
+
 To validate the exact daemon arguments that a wrapper will pass, place them after
 `--` instead of using `--path`:
 
