@@ -3,6 +3,10 @@
 
 //! Shared OTLP collector fixture for `OpenShell` tracing tests.
 
+mod http;
+
+pub use http::{HttpExport, OtlpHttpTestServer};
+
 /// Helpers for tests that exercise the supervisor's agent trace relay from
 /// the agent side: the attribution keys the relay sets and a builder for the
 /// protobuf export request an SDK would send.
@@ -104,6 +108,7 @@ pub async fn assert_compute_driver_tracing(
     let collector = OtlpTestServer::start().await;
     let (provider, error) = descriptor.provider_for(
         Some(collector.endpoint()),
+        openshell_otel::Protocol::Grpc,
         service_version,
         Some("test-gateway"),
         Some(descriptor.compute_driver()),
