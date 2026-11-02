@@ -56,10 +56,16 @@ class AsyncMethods(ast.NodeTransformer):
         return node
 
     def visit_Subscript(self, node: ast.Subscript):
-        if isinstance(node.value, ast.Name) and node.value.id == "Iterator":
+        if isinstance(node.value, ast.Name) and node.value.id in {
+            "Iterator",
+            "Generator",
+        }:
+            item_type = (
+                node.slice.elts[0] if isinstance(node.slice, ast.Tuple) else node.slice
+            )
             return ast.Subscript(
                 ast.Name("AsyncGenerator", ast.Load()),
-                ast.Tuple([self.visit(node.slice), ast.Constant(None)], ast.Load()),
+                ast.Tuple([self.visit(item_type), ast.Constant(None)], ast.Load()),
                 ast.Load(),
             )
         return self.generic_visit(node)
@@ -110,6 +116,17 @@ class AsyncMethods(ast.NodeTransformer):
                 node.target, node.iter, node.body, node.orelse, node.type_comment
             )
         return node
+
+    def visit_Expr(self, node: ast.Expr):
+        if isinstance(node.value, ast.YieldFrom):
+            return ast.AsyncFor(
+                ast.Name("item", ast.Store()),
+                self.visit(node.value.value),
+                [ast.Expr(ast.Yield(ast.Name("item", ast.Load())))],
+                [],
+                None,
+            )
+        return self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
         self.generic_visit(node)

@@ -187,6 +187,36 @@ Async task cancellation propagates to the active RPC. For early exit from
 `exec_stream()`, use `contextlib.aclosing()` so the stream is cancelled promptly.
 Gateway RPC failures raise `GatewayError`, preserving the gRPC status and details.
 
+## Manage Services and Read Logs
+
+Both sandbox clients expose service creation, lookup, pagination, and deletion.
+Use `get_logs()` for structured gateway and supervisor logs:
+
+```python
+from openshell import SandboxClient
+
+with SandboxClient.from_active_cluster() as client:
+    session = client.get_session("worker", workspace="default")
+    endpoint = session.expose_service(name="api", target_port=8000)
+    print(endpoint.url)
+    for page in session.list_services():
+        for service in page.items:
+            print(service.endpoint.name, service.url)
+    logs = session.get_logs(lines=100, sources=["sandbox"])
+    for entry in logs.logs:
+        print(entry.message, dict(entry.fields))
+    session.delete_service(name="api", allow_missing=True)
+```
+
+`get_logs()` preserves `buffer_total`, the unfiltered count of buffered entries.
+Its optional `since` argument takes a timezone-aware `datetime`. These logs do
+not include arbitrary workload output written to files; use exec to read those
+files. Service and log results retain their complete generated protobuf fields.
+
+Import supported protobuf-backed inputs and results from `openshell.types`,
+including `SandboxSpec`, `SandboxTemplate`, `SandboxPolicy`, `SandboxPhase`,
+`ServiceEndpointResponse`, and `GetSandboxLogsResponse`.
+
 ## Call Generated RPCs
 
 The generated gRPC stubs include concrete request and response types for synchronous `grpc.Channel` and asynchronous `grpc.aio.Channel` connections. Install the dependency type stubs in your development environment for editor signatures and type checking:

@@ -187,7 +187,8 @@ class _ClientCallDetails(_ClientCallDetailsBase, grpc.ClientCallDetails):
 
 if TYPE_CHECKING:
     import builtins
-    from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+    from collections.abc import Callable, Generator, Mapping, Sequence
+    from datetime import datetime
 
     from .providers import ProviderClient
 
@@ -706,6 +707,129 @@ class SandboxSession:
             restart_if_restore_fails=restart_if_restore_fails,
         )
         return self.sandbox
+
+    def exec_stream(
+        self,
+        command: Sequence[str],
+        *,
+        workdir: str | None = None,
+        env: Mapping[str, str] | None = None,
+        stdin: bytes | None = None,
+        timeout_seconds: int | None = None,
+        no_login_shell: bool = False,
+        timeout: float | None = None,
+        request_id: str | None = None,
+    ) -> Generator[ExecChunk | ExecResult, None, None]:
+        stream = self._client.exec_stream(
+            self.sandbox.name,
+            command,
+            workspace=self._workspace,
+            workdir=workdir,
+            env=env,
+            stdin=stdin,
+            timeout_seconds=timeout_seconds,
+            no_login_shell=no_login_shell,
+            timeout=timeout,
+            request_id=request_id,
+        )
+        try:
+            yield from stream
+        finally:
+            stream.close()
+
+    def expose_service(
+        self,
+        *,
+        name: str = "",
+        target_port: int,
+        domain: bool = False,
+        authorization_mode: ServiceAuthorizationMode = ServiceAuthorizationMode.STRIP,
+        request_id: str | None = None,
+        timeout: float | None = None,
+    ) -> openshell_pb2.ServiceEndpointResponse:
+        return self._client.expose_service(
+            self.sandbox.name,
+            workspace=self._workspace,
+            name=name,
+            target_port=target_port,
+            domain=domain,
+            authorization_mode=authorization_mode,
+            request_id=request_id,
+            timeout=timeout,
+        )
+
+    def get_service(
+        self, *, name: str = "", timeout: float | None = None
+    ) -> openshell_pb2.ServiceEndpointResponse:
+        return self._client.get_service(
+            self.sandbox.name, workspace=self._workspace, name=name, timeout=timeout
+        )
+
+    def list_services(
+        self,
+        *,
+        page_size: int = 100,
+        page_token: str = "",
+        timeout: float | None = None,
+    ) -> Pager[openshell_pb2.ServiceEndpointResponse]:
+        return self._client.list_services(
+            self.sandbox.name,
+            workspace=self._workspace,
+            page_size=page_size,
+            page_token=page_token,
+            timeout=timeout,
+        )
+
+    def list_all_services(
+        self,
+        *,
+        page_size: int = 100,
+        page_token: str = "",
+        timeout: float | None = None,
+    ) -> builtins.list[openshell_pb2.ServiceEndpointResponse]:
+        return self._client.list_all_services(
+            self.sandbox.name,
+            workspace=self._workspace,
+            page_size=page_size,
+            page_token=page_token,
+            timeout=timeout,
+        )
+
+    def delete_service(
+        self,
+        *,
+        name: str = "",
+        allow_missing: bool = False,
+        request_id: str | None = None,
+        timeout: float | None = None,
+    ) -> DeletionResult:
+        return self._client.delete_service(
+            self.sandbox.name,
+            workspace=self._workspace,
+            name=name,
+            allow_missing=allow_missing,
+            request_id=request_id,
+            timeout=timeout,
+        )
+
+    def get_logs(
+        self,
+        *,
+        lines: int = 2000,
+        since: datetime | None = None,
+        sources: Sequence[str] = (),
+        min_level: str = "",
+        timeout: float | None = None,
+    ) -> openshell_pb2.GetSandboxLogsResponse:
+        return self._client.get_logs(
+            self.sandbox.name,
+            workspace=self._workspace,
+            lines=lines,
+            since=since,
+            sources=sources,
+            min_level=min_level,
+            timeout=timeout,
+        )
 
 
 class SandboxClient:
@@ -1368,7 +1492,7 @@ class SandboxClient:
         no_login_shell: bool = False,
         timeout: float | None = None,
         request_id: str | None = None,
-    ) -> Iterator[ExecChunk | ExecResult]:
+    ) -> Generator[ExecChunk | ExecResult, None, None]:
         if not command:
             raise SandboxError("command must not be empty")
         request = openshell_pb2.ExecSandboxRequest(
@@ -1483,7 +1607,7 @@ class SandboxClient:
         no_login_shell: bool = False,
     ) -> ExecResult:
         result: ExecResult | None = None
-        for item in self.exec_stream(
+        stream = self.exec_stream(
             sandbox,
             command,
             workspace=workspace,
@@ -1492,16 +1616,20 @@ class SandboxClient:
             stdin=stdin,
             timeout_seconds=timeout_seconds,
             no_login_shell=no_login_shell,
-        ):
-            if stream_output and isinstance(item, ExecChunk):
-                if item.stream == "stdout":
-                    sys.stdout.buffer.write(item.data)
-                    sys.stdout.flush()
-                else:
-                    sys.stderr.buffer.write(item.data)
-                    sys.stderr.flush()
-            if isinstance(item, ExecResult):
-                result = item
+        )
+        try:
+            for item in stream:
+                if stream_output and isinstance(item, ExecChunk):
+                    if item.stream == "stdout":
+                        sys.stdout.buffer.write(item.data)
+                        sys.stdout.flush()
+                    else:
+                        sys.stderr.buffer.write(item.data)
+                        sys.stderr.flush()
+                if isinstance(item, ExecResult):
+                    result = item
+        finally:
+            stream.close()
         if result is None:
             raise SandboxError("ExecSandbox did not return a result")
         return result
@@ -1533,6 +1661,144 @@ class SandboxClient:
             workdir=workdir,
             env=exec_env,
             timeout_seconds=timeout_seconds,
+        )
+
+    def expose_service(
+        self,
+        sandbox: str,
+        *,
+        workspace: str,
+        name: str = "",
+        target_port: int,
+        domain: bool = False,
+        authorization_mode: ServiceAuthorizationMode = ServiceAuthorizationMode.STRIP,
+        request_id: str | None = None,
+        timeout: float | None = None,
+    ) -> openshell_pb2.ServiceEndpointResponse:
+        """Create or update an HTTP endpoint, retaining its routing metadata and URL."""
+        return self._stub.ExposeService(
+            openshell_pb2.ExposeServiceRequest(
+                workspace_scope=_workspace_scope(workspace),
+                sandbox=sandbox,
+                name=name,
+                target_port=target_port,
+                domain=domain,
+                authorization_mode=f"SERVICE_AUTHORIZATION_MODE_{authorization_mode.name}",
+                request_id=request_id or "",
+            ),
+            timeout=self._timeout if timeout is None else timeout,
+        )
+
+    def get_service(
+        self,
+        sandbox: str,
+        *,
+        workspace: str,
+        name: str = "",
+        timeout: float | None = None,
+    ) -> openshell_pb2.ServiceEndpointResponse:
+        """Fetch an endpoint. An empty name selects the unnamed service."""
+        return self._stub.GetService(
+            openshell_pb2.GetServiceRequest(
+                workspace_scope=_workspace_scope(workspace),
+                sandbox=sandbox,
+                name=name,
+            ),
+            timeout=self._timeout if timeout is None else timeout,
+        )
+
+    def list_services(
+        self,
+        sandbox: str = "",
+        *,
+        workspace: str,
+        page_size: int = 100,
+        page_token: str = "",
+        timeout: float | None = None,
+    ) -> Pager[openshell_pb2.ServiceEndpointResponse]:
+        """List one sandbox's endpoints, or every endpoint in the named workspace."""
+        scope = _workspace_scope(workspace)
+
+        def fetch(token: str) -> Page[openshell_pb2.ServiceEndpointResponse]:
+            response = self._stub.ListServices(
+                openshell_pb2.ListServicesRequest(
+                    workspace_scope=scope,
+                    sandbox=sandbox,
+                    page_size=page_size,
+                    page_token=token,
+                ),
+                timeout=self._timeout if timeout is None else timeout,
+            )
+            return Page(list(response.services), response.next_page_token)
+
+        return Pager(fetch, page_token)
+
+    def list_all_services(
+        self,
+        sandbox: str = "",
+        *,
+        workspace: str,
+        page_size: int = 100,
+        page_token: str = "",
+        timeout: float | None = None,
+    ) -> builtins.list[openshell_pb2.ServiceEndpointResponse]:
+        return self.list_services(
+            sandbox,
+            workspace=workspace,
+            page_size=page_size,
+            page_token=page_token,
+            timeout=timeout,
+        ).all()
+
+    def delete_service(
+        self,
+        sandbox: str,
+        *,
+        workspace: str,
+        name: str = "",
+        allow_missing: bool = False,
+        request_id: str | None = None,
+        timeout: float | None = None,
+    ) -> DeletionResult:
+        response = self._stub.DeleteService(
+            openshell_pb2.DeleteServiceRequest(
+                workspace_scope=_workspace_scope(workspace),
+                sandbox=sandbox,
+                name=name,
+                allow_missing=allow_missing,
+                request_id=request_id or "",
+            ),
+            timeout=self._timeout if timeout is None else timeout,
+        )
+        return DeletionResult(DeletionOutcome(response.outcome))
+
+    def get_logs(
+        self,
+        sandbox: str,
+        *,
+        workspace: str,
+        lines: int = 2000,
+        since: datetime | None = None,
+        sources: Sequence[str] = (),
+        min_level: str = "",
+        timeout: float | None = None,
+    ) -> openshell_pb2.GetSandboxLogsResponse:
+        """Fetch correlated gateway/supervisor logs and the unfiltered buffer size.
+
+        These are not arbitrary workload stdout. ``since`` must be timezone-aware.
+        """
+        request = openshell_pb2.GetSandboxLogsRequest(
+            workspace_scope=_workspace_scope(workspace),
+            sandbox=sandbox,
+            lines=lines,
+            sources=sources,
+            min_level=min_level,
+        )
+        if since is not None:
+            _require_aware_datetime(since)
+            request.since_time.FromDatetime(since)
+        return self._stub.GetSandboxLogs(
+            request, timeout=self._timeout if timeout is None else timeout
         )
 
 
@@ -2745,3 +3011,8 @@ def _resolve_active_cluster() -> str:
     if value == "":
         raise SandboxError("no active gateway configured")
     return value
+
+
+def _require_aware_datetime(value: datetime) -> None:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("timestamp must be timezone-aware")

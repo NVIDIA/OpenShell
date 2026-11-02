@@ -82,6 +82,51 @@ class Gateway(rpc.OpenShellServicer):
         event.exit.exit_code = 0
         yield event
 
+    async def ExposeService(self, request, context):
+        self.requests.append((request, context.invocation_metadata()))
+        return pb.ServiceEndpointResponse(
+            endpoint=pb.ServiceEndpoint(
+                name=request.name,
+                sandbox=request.sandbox,
+                target_port=request.target_port,
+                authorization_mode=request.authorization_mode,
+            ),
+            url="https://service.example/",
+        )
+
+    async def GetService(self, request, context):
+        self.requests.append((request, context.invocation_metadata()))
+        return pb.ServiceEndpointResponse(
+            endpoint=pb.ServiceEndpoint(name=request.name),
+            url="https://service.example/",
+        )
+
+    async def ListServices(self, request, context):
+        self.requests.append((request, context.invocation_metadata()))
+        return pb.ListServicesResponse(
+            services=[
+                pb.ServiceEndpointResponse(
+                    endpoint=pb.ServiceEndpoint(name=request.page_token or "first")
+                )
+            ],
+            next_page_token="second" if not request.page_token else "",
+        )
+
+    async def DeleteService(self, request, context):
+        self.requests.append((request, context.invocation_metadata()))
+        return pb.DeleteServiceResponse(outcome=pb.DELETION_OUTCOME_ALREADY_ABSENT)
+
+    async def GetSandboxLogs(self, request, context):
+        self.requests.append((request, context.invocation_metadata()))
+        return pb.GetSandboxLogsResponse(
+            logs=[
+                pb.SandboxLogLine(
+                    message="denied", fields={"action": "deny"}, source="sandbox"
+                )
+            ],
+            buffer_total=42,
+        )
+
 
 @asynccontextmanager
 async def gateway():
@@ -203,3 +248,64 @@ def test_async_methods_are_real_coroutines():
     assert not inspect.iscoroutinefunction(AsyncSandboxClient.list)
     client = create_autospec(AsyncSandboxClient, instance=True)
     assert isinstance(client.create, AsyncMock)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_services_logs_and_session_scope(asynchronous):
+    from datetime import UTC, datetime
+
+    from openshell import DeletionOutcome, SandboxClient, ServiceAuthorizationMode
+
+    async with gateway() as (service, target):
+        client = AsyncSandboxClient(target) if asynchronous else SandboxClient(target)
+
+        async def invoke(method, *args, **kwargs):
+            if asynchronous:
+                return await method(*args, **kwargs)
+            return await asyncio.to_thread(method, *args, **kwargs)
+
+        try:
+            session = await invoke(client.get_session, "worker", workspace="team")
+            endpoint = await invoke(
+                session.expose_service,
+                name="api",
+                target_port=8080,
+                authorization_mode=ServiceAuthorizationMode.BEARER_PASSTHROUGH,
+                request_id="expose-1",
+            )
+            assert endpoint.url == "https://service.example/"
+            request = service.requests[-1][0]
+            assert request.workspace_scope.workspace == "team"
+            assert request.sandbox == "worker"
+            assert request.request_id == "expose-1"
+            assert (
+                endpoint.endpoint.authorization_mode
+                == pb.SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH
+            )
+            assert (
+                await invoke(session.get_service, name="api")
+            ).endpoint.name == "api"
+            endpoints = await invoke(session.list_all_services)
+            assert [item.endpoint.name for item in endpoints] == ["first", "second"]
+            result = await invoke(
+                session.delete_service,
+                name="api",
+                allow_missing=True,
+                request_id="delete-1",
+            )
+            assert result.outcome == DeletionOutcome.ALREADY_ABSENT
+            since = datetime(2026, 1, 1, tzinfo=UTC)
+            logs = await invoke(
+                session.get_logs,
+                lines=10,
+                since=since,
+                sources=["sandbox"],
+                min_level="WARN",
+            )
+            assert logs.buffer_total == 42
+            assert logs.logs[0].fields["action"] == "deny"
+            assert service.requests[-1][0].since_time.ToDatetime(tzinfo=UTC) == since
+            with pytest.raises(ValueError, match="timezone-aware"):
+                await invoke(session.get_logs, since=datetime(2026, 1, 1))
+        finally:
+            await invoke(client.close)
