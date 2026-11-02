@@ -3,9 +3,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import os
+import subprocess
 import sys
 from pathlib import Path
+
+import pytest
+import yaml
 
 
 def _load_release_module():
@@ -92,3 +98,109 @@ def test_dev_versions_ignore_exact_prerelease_tag(monkeypatch) -> None:
     assert versions.python == "0.0.38.dev108+g152d05940"
     assert versions.cargo == "0.0.38-dev.108+g152d05940"
     assert versions.git_tag == "v0.0.37"
+
+
+def _stable_workflow_step(name: str) -> dict:
+    workflow = Path(__file__).resolve().parents[1] / ".github/workflows/release.yml"
+    jobs = yaml.load(workflow.read_text(), Loader=yaml.BaseLoader)["jobs"]
+    return next(
+        step
+        for job in jobs.values()
+        for step in job.get("steps", [])
+        if step.get("name") == name
+    )
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_error"),
+    [
+        ("valid", None),
+        ("wrong-commit", "points to"),
+        ("no-wheel", "Expected exactly one Python wheel"),
+        ("multiple-wheels", "Expected exactly one Python wheel"),
+        ("wrong-version", "is not an openshell"),
+        ("wrong-project", "is not an openshell"),
+        ("missing-checksum", "missing from the release checksums"),
+        ("tampered-wheel", "FAILED"),
+        ("release-download-fails", None),
+    ],
+)
+def test_pypi_upload_validates_the_release_wheel(tmp_path, scenario, expected_error):
+    wheel_name = "openshell-1.2.3-py3-none-any.whl"
+    if scenario == "wrong-version":
+        wheel_name = "openshell-1.2.4-py3-none-any.whl"
+    elif scenario == "wrong-project":
+        wheel_name = "other-1.2.3-py3-none-any.whl"
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    payload = b"release wheel"
+    if scenario != "no-wheel":
+        (dist / wheel_name).write_bytes(payload)
+    if scenario == "multiple-wheels":
+        (dist / "openshell-1.2.3-py3-none-linux_x86_64.whl").write_bytes(payload)
+    if scenario == "tampered-wheel":
+        (dist / wheel_name).write_bytes(b"changed wheel")
+    digest = hashlib.sha256(payload).hexdigest()
+    checksum_name = "other.whl" if scenario == "missing-checksum" else wheel_name
+    (tmp_path / "release-checksums.txt").write_text(f"{digest}  {checksum_name}\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/bin/bash\n"
+        'if [[ "$1" == api ]]; then\n'
+        '  echo "${TAG_SHA}"\n'
+        'elif [[ "$1 $2" == "release download" ]]; then\n'
+        '  [[ "${DOWNLOAD_FAIL}" == false ]] || exit 1\n'
+        "  mkdir checksums\n"
+        "  cp release-checksums.txt checksums/openshell-checksums-sha256.txt\n"
+        "else\n"
+        "  exit 1\n"
+        "fi\n"
+    )
+    gh.chmod(0o755)
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            _stable_workflow_step("Verify wheel against the stable release")["run"],
+        ],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "GITHUB_REPOSITORY": "NVIDIA/OpenShell",
+            "RELEASE_TAG": "v1.2.3",
+            "SOURCE_SHA": "source-commit",
+            "TAG_SHA": "other-commit"
+            if scenario == "wrong-commit"
+            else "source-commit",
+            "PYTHON_VERSION": "1.2.3",
+            "DOWNLOAD_FAIL": "true"
+            if scenario == "release-download-fails"
+            else "false",
+        },
+        capture_output=True,
+        text=True,
+    )
+    if scenario == "valid":
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0
+        if expected_error:
+            assert expected_error in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("result", ["success", "failure", "skipped", "cancelled"])
+def test_stable_publication_requires_pypi_success(result):
+    outcome = subprocess.run(
+        [
+            "bash",
+            "-c",
+            _stable_workflow_step("Require every stable publisher to succeed")["run"],
+        ],
+        env={**os.environ, "NEEDS": '{"publish-pypi":{"result":"' + result + '"}}'},
+        capture_output=True,
+        text=True,
+    )
+    assert (outcome.returncode == 0) == (result == "success")

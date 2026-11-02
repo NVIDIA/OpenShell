@@ -83,3 +83,11 @@ updating a Snap Store support track. Docs retain an
 immutable version and advance latest only for a newer version.
 
 Watch the stable release run and report its result.
+
+## PyPI publishing
+
+Stable releases publish the built Python wheel directly to PyPI from the `publish-pypi` job in `release.yml`, after the other release publishers succeed. The job checks the stable tag's source commit and the wheel's release checksum. It uses Trusted Publishing with the `pypi` GitHub environment. Configure the `openshell` PyPI project's GitHub publisher with owner `NVIDIA`, repository `OpenShell`, workflow `release.yml`, and environment `pypi`. No PyPI API token or GitLab trigger credentials are required.
+
+The environment must allow the branch used to dispatch Release. For a support release, explicitly allow its support branch before dispatching. Required reviewers, if configured, must approve the PyPI job. Stable docs publish after PyPI succeeds. An existing wheel on PyPI is skipped when retrying Release; PyPI does not allow replacing a published wheel.
+
+Development and prerelease wheels remain GitHub Release assets and do not publish to PyPI.
