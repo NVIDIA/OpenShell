@@ -547,12 +547,24 @@ fn with_runtime_cwd<T>(
     runtime_dir: &Path,
     load: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
+    use std::os::fd::AsRawFd as _;
+
     let previous = std::env::current_dir().map_err(|e| format!("read working directory: {e}"))?;
+    // A deployment can rename the launcher's original directory while libkrun
+    // loads. Keep an open handle so restoration does not depend on its pathname.
+    // Opening "." can fail for an execute-only directory; retain the path as a
+    // fallback so that case keeps working.
+    let previous_fd = std::fs::File::open(".").ok();
     std::env::set_current_dir(runtime_dir)
         .map_err(|e| format!("enter VM runtime directory {}: {e}", runtime_dir.display()))?;
     let result = load();
-    std::env::set_current_dir(&previous)
-        .map_err(|e| format!("restore working directory {}: {e}", previous.display()))?;
+    let restored = previous_fd
+        .as_ref()
+        .is_some_and(|fd| unsafe { libc::fchdir(fd.as_raw_fd()) == 0 });
+    if !restored {
+        std::env::set_current_dir(&previous)
+            .map_err(|e| format!("restore working directory {}: {e}", previous.display()))?;
+    }
     result
 }
 
@@ -870,6 +882,41 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("external_runtime_cwd_restores_after_load_error")
             .env(PROBE_ENV, runtime_dir.path())
+            .output()
+            .expect("run cwd probe");
+        assert!(
+            output.status.success(),
+            "cwd probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[test]
+    fn external_runtime_cwd_restores_after_original_dir_is_renamed() {
+        const PROBE_ENV: &str = "__OPENSHELL_TEST_RENAMED_CWD";
+
+        if let Some(root) = std::env::var_os(PROBE_ENV) {
+            let root = PathBuf::from(root);
+            let previous = root.join("previous");
+            let moved = root.join("moved");
+            let runtime = root.join("runtime");
+            std::env::set_current_dir(&previous).expect("enter original directory");
+            let result = with_runtime_cwd(&runtime, || {
+                std::fs::rename(&previous, &moved).expect("rename original directory");
+                Ok::<(), String>(())
+            });
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(std::env::current_dir().unwrap(), moved);
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("test root");
+        std::fs::create_dir(root.path().join("previous")).unwrap();
+        std::fs::create_dir(root.path().join("runtime")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("external_runtime_cwd_restores_after_original_dir_is_renamed")
+            .env(PROBE_ENV, root.path())
             .output()
             .expect("run cwd probe");
         assert!(
