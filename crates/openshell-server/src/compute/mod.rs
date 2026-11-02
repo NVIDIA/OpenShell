@@ -3596,22 +3596,27 @@ impl ComputeRuntime {
                     .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
                     .ok_or_else(|| Status::not_found("sandbox not found"))?,
             };
-            // Explicit deletion can supersede a configuration update: the
-            // driver only patches an existing immutable resource and cannot
-            // recreate it after deletion. Keep the interlock until removal so
-            // a failed delete can safely restore the pending update.
-            let pending_update = self
-                .store
-                .get_sandbox_image_state(sandbox_id)
-                .await
-                .map_err(|_| Status::unavailable("cannot read pending sandbox update"))?
-                .and_then(|state| state.pending);
-            if failed_create.is_none()
-                && let Some(intent) = pending_update
-            {
-                image_update::ensure_image_update_interlock(&sandbox, &intent)?;
-            } else {
-                provisioning_operation::ensure_operation_settled(&sandbox)?;
+            // A foreign driver's pending operation cannot be settled by this
+            // gateway. Explicit deletion only removes the local record.
+            // Failed-create compensation still owns its original operation.
+            if failed_create.is_some() || self.other_driver_owner(&sandbox).is_none() {
+                // Explicit deletion can supersede a configuration update: the
+                // driver only patches an existing immutable resource and cannot
+                // recreate it after deletion. Keep the interlock until removal so
+                // a failed delete can safely restore the pending update.
+                let pending_update = self
+                    .store
+                    .get_sandbox_image_state(sandbox_id)
+                    .await
+                    .map_err(|_| Status::unavailable("cannot read pending sandbox update"))?
+                    .and_then(|state| state.pending);
+                if failed_create.is_none()
+                    && let Some(intent) = pending_update
+                {
+                    image_update::ensure_image_update_interlock(&sandbox, &intent)?;
+                } else {
+                    provisioning_operation::ensure_operation_settled(&sandbox)?;
+                }
             }
 
             // Failed-create compensation owns only its original attempt.
@@ -3768,9 +3773,10 @@ impl ComputeRuntime {
 
         let mut delete_resource_version = record.resource_version;
         let mut sandbox = decode_sandbox_record(&record)?;
-        if self
-            .pending_driver_operation_blocks_cleanup(&sandbox)
-            .await?
+        if self.other_driver_owner(&sandbox).is_none()
+            && self
+                .pending_driver_operation_blocks_cleanup(&sandbox)
+                .await?
         {
             return Ok(false);
         }
@@ -5848,6 +5854,15 @@ impl ComputeRuntime {
         terminal_delivery_finalized: bool,
     ) -> Result<(), String> {
         let _guard = self.lock_sandbox_local(sandbox_id).await;
+        let existing = self
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(sandbox) = existing.as_ref() {
+            self.validate_compute_driver_binding(sandbox)
+                .map_err(|error| error.message().to_string())?;
+        }
 
         // A replacement session may already belong to another gateway. Do not
         // let cleanup from this replica overwrite the replacement's Ready state.
@@ -5855,11 +5870,6 @@ impl ComputeRuntime {
             return Ok(());
         }
 
-        let existing = self
-            .store
-            .get_message::<Sandbox>(sandbox_id)
-            .await
-            .map_err(|error| error.to_string())?;
         self.set_supervisor_session_state_from_snapshot(
             sandbox_id,
             SupervisorSessionStateUpdate::Disconnected {
@@ -5958,6 +5968,8 @@ impl ComputeRuntime {
             let Some(current) = existing else {
                 return Ok(());
             };
+            self.validate_compute_driver_binding(&current)
+                .map_err(|error| error.message().to_string())?;
             let current_phase =
                 SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
             if connected
@@ -6121,6 +6133,8 @@ impl ComputeRuntime {
         else {
             return Ok(());
         };
+        self.validate_compute_driver_binding(&existing)
+            .map_err(|error| error.message().to_string())?;
         if provisioning_deadline::timed_out(&existing) {
             return Ok(());
         }
@@ -6218,6 +6232,8 @@ impl ComputeRuntime {
         else {
             return Ok(());
         };
+        self.validate_compute_driver_binding(&sandbox)
+            .map_err(|error| error.message().to_string())?;
         let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
         if matches!(
             phase,
@@ -6283,6 +6299,8 @@ impl ComputeRuntime {
         else {
             return Ok(());
         };
+        self.validate_compute_driver_binding(&sandbox)
+            .map_err(|error| error.message().to_string())?;
         let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
         if phase != SandboxPhase::Completed && !is_failed_main_process_result(&sandbox) {
             return Ok(());
@@ -6366,6 +6384,7 @@ impl ComputeRuntime {
                     sandbox_resource_version(sandbox),
                 )
                 .await?
+                && self.other_driver_owner(sandbox).is_none()
             {
                 self.spawn_driver_sandbox_cleanup(sandbox.object_id(), sandbox.object_name());
             }
@@ -15795,6 +15814,68 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(
+            result.outcome,
+            openshell_core::proto::DeletionOutcome::Completed
+        );
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_no_driver_delete(&driver).await;
+    }
+
+    #[tokio::test]
+    async fn foreign_driver_pending_operation_does_not_block_record_delete() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime_for_driver(driver.clone(), "docker").await;
+        let mut sandbox =
+            sandbox_record_created_by("sb-1", "sandbox-a", SandboxPhase::Starting, "vm");
+        let mut operation =
+            provisioning_deadline::new_preparation_record(openshell_core::time::now_ms(), 60);
+        operation.driver_operation_pending = true;
+        sandbox.status.as_mut().unwrap().provisioning = Some(operation);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime.sandbox_index.update_from_sandbox(&sandbox);
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let error = runtime
+            .delete_sandbox_with_preconditions(
+                "default",
+                "sandbox-a",
+                SandboxDeletePreconditions {
+                    expected_sandbox_id: Some("sb-1".to_string()),
+                    expected_resource_version: Some(sandbox_resource_version(&stored) + 1),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Aborted);
+        assert_eq!(
+            runtime.store.get_message::<Sandbox>("sb-1").await.unwrap(),
+            Some(stored.clone()),
+        );
+
+        let result = runtime
+            .delete_sandbox_with_preconditions(
+                "default",
+                "sandbox-a",
+                SandboxDeletePreconditions {
+                    expected_sandbox_id: Some("sb-1".to_string()),
+                    expected_resource_version: Some(sandbox_resource_version(&stored)),
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(
             result.outcome,
             openshell_core::proto::DeletionOutcome::Completed

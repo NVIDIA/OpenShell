@@ -2880,6 +2880,7 @@ pub(super) async fn handle_forward_tcp(
         MinWorkspaceRole::User,
     )
     .await?;
+    state.compute.validate_compute_driver_binding(&sandbox)?;
 
     // The main process may finish between minting the SSH token and opening
     // its transport. Keep the relay reachable until terminal delivery is
@@ -3420,6 +3421,7 @@ pub(super) async fn handle_create_ssh_session(
     )
     .await?;
     let sandbox_id = sandbox.object_id().to_string();
+    state.compute.validate_compute_driver_binding(&sandbox)?;
 
     if !sandbox_relay_reachable(state, &sandbox) {
         return Err(Status::failed_precondition("sandbox is not ready"));
@@ -10171,6 +10173,86 @@ mod tests {
         assert_ne!(
             first_page.sandboxes[0].object_id(),
             second_page.sandboxes[0].object_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_driver_blocks_ssh_session_and_tcp_forward() {
+        use openshell_core::proto::open_shell_client::OpenShellClient;
+        use openshell_core::proto::open_shell_server::OpenShellServer;
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        let state = test_server_state_with_driver("docker").await;
+        let mut sandbox = test_sandbox("foreign", Vec::new());
+        sandbox.metadata.as_mut().unwrap().annotations.insert(
+            crate::compute::CREATED_BY_DRIVER_ANNOTATION.to_string(),
+            "vm".to_string(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        let stored = state
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let error = handle_create_ssh_session(
+            &state,
+            authed_request(CreateSshSessionRequest {
+                sandbox: "foreign".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("compute driver 'vm'"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let principal = authed_request(())
+            .extensions_mut()
+            .remove::<crate::auth::principal::Principal>()
+            .unwrap();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(OpenShellServer::with_interceptor(
+                    crate::grpc::OpenShellService::new(state.clone()),
+                    move |mut request: Request<()>| {
+                        request.extensions_mut().insert(principal.clone());
+                        Ok(request)
+                    },
+                ))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let mut client = OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        let frame = TcpForwardFrame {
+            payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
+                TcpForwardInit {
+                    sandbox: "foreign".into(),
+                    workspace: "default".into(),
+                    target: Some(loopback_tcp_target()),
+                    ..Default::default()
+                },
+            )),
+        };
+        let error = client
+            .forward_tcp(tokio_stream::iter([frame]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("compute driver 'vm'"));
+        server.abort();
+
+        assert_eq!(
+            state
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap(),
+            Some(stored),
         );
     }
 

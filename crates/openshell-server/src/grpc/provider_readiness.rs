@@ -662,6 +662,7 @@ async fn handle_report_provider_readiness_inner(
         .await
         .map_err(|_| registry_unavailable())?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    state.compute.validate_compute_driver_binding(&sandbox)?;
     if sandbox.phase() != SandboxPhase::Ready as i32 {
         return Err(Status::failed_precondition(
             "sandbox supervisor is not ready",

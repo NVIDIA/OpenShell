@@ -5062,6 +5062,7 @@ pub(super) async fn handle_report_sandbox_configuration(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    state.compute.validate_compute_driver_binding(&sandbox)?;
     let sandbox_name = sandbox.object_name().to_string();
     let workspace = sandbox.object_workspace().to_string();
     crate::compute::provisioning_deadline::refresh_configuration(
@@ -5263,6 +5264,13 @@ pub async fn record_policy_apply_result(
             .collect::<String>()
     });
     let version_i64 = i64::from(version);
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    state.compute.validate_compute_driver_binding(&sandbox)?;
     let updated = state
         .store
         .update_policy_status(

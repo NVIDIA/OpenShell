@@ -159,6 +159,7 @@ async fn handle_report_endpoint_status_inner(
         .await
         .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    state.compute.validate_compute_driver_binding(&sandbox)?;
     let context = active_endpoint_context(state.as_ref(), &sandbox).await?;
     if req.policy_hash != context.policy_hash
         || req.provider_env_revision != context.provider_env_revision
