@@ -34,6 +34,7 @@ use crate::auth::workspace_authz::{
 };
 use crate::compute::MutationScope;
 use crate::pagination::Pagination;
+#[cfg(test)]
 use crate::persistence::ObjectType;
 use crate::persistence::{
     DraftChunkRecord, ObjectId, ObjectListQuery, ObjectName, ObjectWorkspace, PolicyRecord, Store,
@@ -1998,6 +1999,9 @@ async fn current_effective_policy_from_records(
             .await
             .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?
     };
+    // This projection also owns authored-policy proposal/rebase identities.
+    // Trusted runtime prerequisites are composed at launch/config/credential
+    // delivery boundaries, not into editable policy history or review hashes.
     effective_policy_from_captured_inputs(
         catalog,
         records,
@@ -3018,6 +3022,10 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
         policy = Some(effective_policy);
     }
 
+    if let Some(effective_policy) = policy.as_mut() {
+        apply_backend_proxy_baseline(state, effective_policy, policy_source)?;
+    }
+
     let policy_credential_bindings = policy_static_credential_endpoint_bindings(policy.as_ref())?;
     extend_credentialed_scopes_from_policy_bindings(
         &mut provider_policy_context.credentialed_scopes,
@@ -3036,6 +3044,7 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
         if let Err(error) = validate_uninspected_credentialed_endpoints(effective_policy) {
             configuration_error = bounded_configuration_diagnostic(error.message());
         }
+        validate_backend_policy_size(state, effective_policy)?;
         policy_hash = deterministic_policy_hash(effective_policy);
     }
 
@@ -3278,6 +3287,7 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
     .await
 }
 
+#[cfg(test)]
 async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
     store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
@@ -3755,6 +3765,44 @@ pub(super) async fn handle_get_gateway_config(
     }))
 }
 
+fn apply_backend_proxy_baseline(
+    state: &ServerState,
+    effective_policy: &mut ProtoSandboxPolicy,
+    source: PolicySource,
+) -> Result<(), Status> {
+    // Compose trusted workload-namespace prerequisites after provider/global
+    // selection, before compute admission and effective configuration identity.
+    if let Some(baseline) = state.compute.proxy_filesystem_baseline()
+        && baseline.enrich(effective_policy, |_| true)
+    {
+        *effective_policy = validate_and_canonicalize_policy(effective_policy.clone())?;
+        validate_policy_safety(effective_policy)?;
+    }
+    if state.compute.proxy_filesystem_baseline().is_some() && matches!(source, PolicySource::Global)
+    {
+        // Global credential authorities hash the complete effective policy.
+        // Re-stamp after enrichment so create, config and credential delivery agree.
+        openshell_core::policy_identity::stamp_global_token_grant_owners(effective_policy);
+    }
+
+    validate_backend_policy_size(state, effective_policy)?;
+    Ok(())
+}
+
+fn validate_backend_policy_size(
+    state: &ServerState,
+    policy: &ProtoSandboxPolicy,
+) -> Result<(), Status> {
+    if state.compute.proxy_filesystem_baseline().is_some()
+        && policy.encoded_len() > super::MAX_POLICY_SIZE
+    {
+        return Err(Status::failed_precondition(
+            "backend proxy filesystem baseline exceeds the effective policy size limit",
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve the effective create-time policy without exporting credential state.
 /// Provider refresh and secret delivery remain in the supervisor session.
 pub(super) async fn resolve_sandbox_create_runtime_inputs(
@@ -3778,7 +3826,7 @@ pub(super) async fn resolve_sandbox_create_runtime_inputs(
         provider_names,
     )
     .await?;
-    let (effective_policy, _) = current_effective_policy_from_records(
+    let (mut effective_policy, source) = current_effective_policy_from_records(
         state,
         &provider_profile_catalog,
         sandbox,
@@ -3786,6 +3834,7 @@ pub(super) async fn resolve_sandbox_create_runtime_inputs(
         &provider_records,
     )
     .await?;
+    apply_backend_proxy_baseline(state, &mut effective_policy, source)?;
     let policy_credential_bindings =
         policy_static_credential_endpoint_bindings(Some(&effective_policy))?;
     validate_policy_credential_binding_context(
@@ -3869,9 +3918,10 @@ struct ProviderEnvironmentTarget<'a> {
     provider_env_revision: u64,
 }
 
-fn provider_environment_target(
-    inputs: &SandboxConfigInputs,
-) -> Result<ProviderEnvironmentTarget<'_>, Status> {
+fn provider_environment_target<'a>(
+    state: &ServerState,
+    inputs: &'a SandboxConfigInputs,
+) -> Result<ProviderEnvironmentTarget<'a>, Status> {
     let sandbox = &inputs.sandbox;
     let spec = sandbox
         .spec
@@ -3879,13 +3929,14 @@ fn provider_environment_target(
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
     let provider_profile_catalog = &inputs.catalog;
     let provider_records = &inputs.provider_records;
-    let (effective_policy, policy_source) = effective_policy_from_captured_inputs(
+    let (mut effective_policy, policy_source) = effective_policy_from_captured_inputs(
         provider_profile_catalog,
         provider_records,
         decode_policy_from_global_settings(&inputs.global_settings)?,
         inputs.latest_policy.as_ref(),
         sandbox,
     )?;
+    apply_backend_proxy_baseline(state, &mut effective_policy, policy_source)?;
     let policy_credential_bindings =
         policy_static_credential_endpoint_bindings(Some(&effective_policy))?;
     validate_policy_credential_binding_context(
@@ -3924,7 +3975,7 @@ pub async fn build_provider_environment_snapshot_from_inputs(
         policy_source,
         policy_credential_bindings,
         provider_env_revision,
-    } = provider_environment_target(inputs)?;
+    } = provider_environment_target(state, inputs)?;
 
     let provider_names = &spec.providers;
     let provider_profile_catalog = &inputs.catalog;
@@ -4554,6 +4605,26 @@ async fn handle_update_config_inner(
         .map_err(|error| {
             super::persistence_error_to_status(error, "acquire policy mutation lock")
         })?;
+    // Start takes the same mutation lock. Re-read lifecycle and static baseline
+    // after acquiring it so an earlier Stopped observation cannot authorize a
+    // replacement after a new generation has already claimed its grants.
+    let current = state
+        .store
+        .get_message::<Sandbox>(&sandbox_id)
+        .await
+        .map_err(|error| {
+            Status::internal(format!("reload sandbox for policy update failed: {error}"))
+        })?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    if current.object_name() != sandbox.object_name()
+        || current.object_workspace() != sandbox.object_workspace()
+    {
+        return Err(Status::aborted(
+            "sandbox scope changed while waiting for policy update; retry explicitly",
+        ));
+    }
+    let sandbox = current;
+    response_annotations = sandbox_metadata_annotations(&sandbox);
     if has_merge_ops {
         let global_settings = load_global_settings(state.store.as_ref()).await?;
         if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
@@ -4681,9 +4752,12 @@ async fn handle_update_config_inner(
     }
 
     let startup_blocked = crate::policy_store::permits_initial_static_policy_repair(&sandbox);
-    let should_backfill_policy = if startup_blocked && !sandbox_caller {
-        // No child has consumed static restrictions yet. A complete replacement
-        // must be able to repair every field before the first activation.
+    let stopped_replacement = !sandbox_caller
+        && state.compute.supports_launch_policy()
+        && sandbox.phase() == openshell_core::proto::SandboxPhase::Stopped as i32;
+    let should_backfill_policy = if (startup_blocked || stopped_replacement) && !sandbox_caller {
+        // The initial activation is blocked, or the prior generation is stopped.
+        // Admit a complete replacement before a new workload can consume it.
         true
     } else if let Some(baseline_policy) = spec.policy.as_ref() {
         let comparable_baseline = baseline_policy.clone();
@@ -5009,6 +5083,26 @@ fn configuration_failure_diagnostic(error: &Status) -> &'static str {
     }
 }
 
+/// Both admissions name the same instance and configuration generation.
+fn same_generation(
+    current: &openshell_core::proto::SandboxConfigurationAdmission,
+    reported: &openshell_core::proto::SandboxConfigurationAdmission,
+) -> bool {
+    (
+        &current.instance_id,
+        current.policy_version,
+        &current.policy_hash,
+        current.config_revision,
+        current.provider_env_revision,
+    ) == (
+        &reported.instance_id,
+        reported.policy_version,
+        &reported.policy_hash,
+        reported.config_revision,
+        reported.provider_env_revision,
+    )
+}
+
 fn configuration_generation_matches(
     admission: &openshell_core::proto::SandboxConfigurationAdmission,
     config: &GetSandboxConfigResponse,
@@ -5046,6 +5140,15 @@ pub(super) async fn handle_report_sandbox_configuration(
     if reported == ConfigurationAdmissionState::Unspecified {
         return Err(Status::invalid_argument("admission state is required"));
     }
+    let refused_before_start = request.get_ref().refused_before_start;
+    if refused_before_start && reported != ConfigurationAdmissionState::Rejected {
+        return Err(Status::invalid_argument(
+            "refused_before_start requires a rejected admission",
+        ));
+    }
+    let startup_diagnostic = refused_before_start
+        .then(|| openshell_core::backend_startup::backend_startup_diagnostic(&admission.error))
+        .flatten();
     let Some(_mutation_guard) = state
         .compute
         .sandbox_mutation_guard_by_id(&sandbox_id)
@@ -5127,13 +5230,22 @@ pub(super) async fn handle_report_sandbox_configuration(
             Ok(config) if !config.get_ref().configuration_error.is_empty() => config.into_inner().configuration_error,
             _ => "Effective configuration could not be activated; replace the policy or repair attached providers".to_string(),
         };
-        if let Some(current) = current
-            && current.state == i32::from(ConfigurationAdmissionState::Accepted)
-        {
-            // A rejected desired update does not invalidate an accepted runtime.
-            let error = admission.error;
-            admission = current.clone();
-            admission.error = error;
+        if let Some(current) = current {
+            let accepted = current.state == i32::from(ConfigurationAdmissionState::Accepted);
+            let rejected = current.state == i32::from(ConfigurationAdmissionState::Rejected);
+            if refused_before_start
+                && (accepted || rejected)
+                && same_generation(current, &admission)
+            {
+                // A retry of the same failed generation retains its diagnostic.
+                // Only exact known codes are projected; legacy/raw text stays out.
+                admission.error = startup_diagnostic.unwrap_or_else(|| "The isolation backend refused this configuration before the workload started; create the sandbox again with a policy the backend accepts".to_string());
+            } else if accepted {
+                // A rejected desired update does not invalidate an accepted runtime.
+                let error = admission.error;
+                admission = current.clone();
+                admission.error = error;
+            }
         }
     } else {
         admission.error.clear();
@@ -8665,6 +8777,7 @@ mod tests {
                     sandbox_id: sandbox_id.to_string(),
                     admission: Some(admission),
                     expected_instance_id: String::new(),
+                    refused_before_start: false,
                 }),
                 sandbox_id,
             )
@@ -8802,6 +8915,149 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn configuration_admission_records_refusal_of_accepted_generation() {
+        use openshell_core::proto::{
+            ConfigurationAdmissionState as Admission, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission,
+        };
+        let state = test_server_state().await;
+        let sandbox_id = "sb-refused";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "refused",
+                openshell_policy::restrictive_default_policy(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        let report = |admission, refused_before_start| {
+            with_sandbox(
+                Request::new(ReportSandboxConfigurationRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    admission: Some(admission),
+                    expected_instance_id: String::new(),
+                    refused_before_start,
+                }),
+                sandbox_id,
+            )
+        };
+        handle_report_sandbox_configuration(
+            &state,
+            report(
+                SandboxConfigurationAdmission {
+                    instance_id: instance_id.clone(),
+                    state: Admission::Pending.into(),
+                    ..Default::default()
+                },
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        let config = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    name: "refused".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let accepted = SandboxConfigurationAdmission {
+            instance_id,
+            state: Admission::Accepted.into(),
+            policy_version: config.version,
+            policy_hash: config.policy_hash,
+            config_revision: config.config_revision,
+            provider_env_revision: config.provider_env_revision,
+            error: String::new(),
+        };
+        handle_report_sandbox_configuration(&state, report(accepted.clone(), false))
+            .await
+            .unwrap();
+        let readiness = || async {
+            let persisted = state
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let status = persisted.status.unwrap();
+            let ready = status
+                .conditions
+                .into_iter()
+                .find(|condition| condition.r#type == "ConfigurationReady")
+                .unwrap();
+            (status.configuration_admission.unwrap().state, ready)
+        };
+
+        // A runtime that fails to apply the generation it runs, such as a
+        // reconcile of unreachable middleware, keeps the accepted state.
+        let mut refused = accepted;
+        refused.state = Admission::Rejected.into();
+        refused.error = "backend text is not shown".to_string();
+        handle_report_sandbox_configuration(&state, report(refused.clone(), false))
+            .await
+            .unwrap();
+        let (admission_state, ready) = readiness().await;
+        assert_eq!(admission_state, i32::from(Admission::Accepted));
+        assert_eq!(ready.status, "True");
+
+        let mut flagged_acceptance = refused.clone();
+        flagged_acceptance.state = Admission::Accepted.into();
+        assert_eq!(
+            handle_report_sandbox_configuration(&state, report(flagged_acceptance, true))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+        let mut other_generation = refused.clone();
+        other_generation.policy_hash.push('x');
+        assert!(same_generation(&refused, &refused));
+        assert!(!same_generation(&refused, &other_generation));
+
+        refused.error = "openshell.backend.confirm.denied".to_string();
+        handle_report_sandbox_configuration(&state, report(refused.clone(), true))
+            .await
+            .unwrap();
+        let (admission_state, ready) = readiness().await;
+        assert_eq!(admission_state, i32::from(Admission::Rejected));
+        assert_eq!(
+            (ready.status.as_str(), ready.reason.as_str()),
+            ("False", "ConfigurationInvalid")
+        );
+        assert!(
+            ready.message.contains("isolation confirmation"),
+            "{ready:?}"
+        );
+        assert!(!ready.message.contains("backend text"), "{ready:?}");
+        let first_message = ready.message;
+        handle_report_sandbox_configuration(&state, report(refused.clone(), true))
+            .await
+            .unwrap();
+        let (_, repeated) = readiness().await;
+        assert_eq!(repeated.message, first_message);
+
+        refused.error = "openshell.backend.confirm.denied\nBearer secret-value".to_string();
+        handle_report_sandbox_configuration(&state, report(refused, true))
+            .await
+            .unwrap();
+        let (_, unknown) = readiness().await;
+        assert!(!unknown.message.contains("secret-value"));
+        assert!(unknown.message.contains("isolation backend refused"));
+    }
+
     #[test]
     fn configuration_diagnostic_is_bounded_and_removes_control_characters() {
         let diagnostic = bounded_configuration_diagnostic(&format!("rule\n{}", "é".repeat(1000)));
@@ -8843,6 +9099,7 @@ mod tests {
                         state: Admission::Pending.into(),
                         ..Default::default()
                     }),
+                    refused_before_start: false,
                 }),
                 sandbox_id,
             ),
@@ -9044,6 +9301,202 @@ mod tests {
             .expect("driver-independent effective policy");
         assert_eq!(inputs.effective_policy, Some(policy));
         assert!(inputs.launch_authentication.is_none());
+    }
+
+    #[tokio::test]
+    async fn backend_proxy_baseline_is_admitted_before_create_and_config_identity() {
+        use openshell_core::extension_protocol::{
+            COMPUTE_PROXY_FILESYSTEM_BASELINE, ExtensionFamily, extension_metadata,
+        };
+        use openshell_core::proto::compute::v1::{
+            GetCapabilitiesResponse, ProxyFilesystemBaseline,
+        };
+
+        let mut state = test_server_state().await;
+        let baseline = ProxyFilesystemBaseline {
+            read_only: vec!["/platform-runtime-not-on-gateway".into()],
+            read_write: vec!["/platform-device-not-on-gateway".into()],
+        };
+        let driver = Arc::new(
+            crate::test_support::FakeComputeDriver::new().with_capabilities(
+                GetCapabilitiesResponse {
+                    driver_name: "test".into(),
+                    resource_admission_policy:
+                        openshell_core::resource_admission::DriverAdmissionConfig::default()
+                            .acknowledgement(),
+                    proxy_filesystem_baseline: Some(baseline.clone()),
+                    extension: Some(extension_metadata(
+                        ExtensionFamily::Compute,
+                        "openshell/test",
+                        "test",
+                        [COMPUTE_PROXY_FILESYSTEM_BASELINE.to_string()],
+                    )),
+                    ..Default::default()
+                },
+            ),
+        );
+        let compute = crate::compute::ComputeRuntime::from_driver(
+            "test".into(),
+            driver,
+            None,
+            state.store.clone(),
+            crate::sandbox_index::SandboxIndex::new(),
+            crate::sandbox_watch::SandboxWatchBus::new(),
+            crate::tracing_bus::TracingLogBus::new(),
+            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut state).unwrap().compute = compute;
+        let sandbox = test_sandbox(
+            "baseline",
+            "baseline",
+            mcp_policy_with_versions(&[]),
+            Vec::new(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        let policy = sandbox.spec.as_ref().unwrap().policy.as_ref().unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "baseline-v1",
+                "baseline",
+                "default",
+                1,
+                &policy.encode_to_vec(),
+                &deterministic_policy_hash(policy),
+            )
+            .await
+            .unwrap();
+
+        for global in [false, true] {
+            state.store.put_message(&sandbox).await.unwrap();
+            if global {
+                install_test_global_policy(&state).await;
+            }
+            let snapshot = build_sandbox_config_snapshot(&state, &sandbox)
+                .await
+                .unwrap();
+            let provider = build_provider_environment_snapshot(&state, &sandbox, true, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot.provider_env_revision,
+                provider.provider_env_revision
+            );
+            let create = resolve_sandbox_create_runtime_inputs(&state, &sandbox)
+                .await
+                .unwrap();
+            let admitted = create.effective_policy.unwrap();
+            assert_eq!(snapshot.policy.as_ref(), Some(&admitted));
+            assert_eq!(snapshot.policy_hash, deterministic_policy_hash(&admitted));
+            let session_id = if global {
+                "baseline-global"
+            } else {
+                "baseline-local"
+            };
+            let (session_tx, _session_rx) = tokio::sync::mpsc::channel(1);
+            let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+            state.supervisor_sessions.register(
+                "baseline".into(),
+                session_id.into(),
+                session_tx,
+                shutdown_tx,
+            );
+            reset_endpoint_status_for_supervisor_session(&state, "baseline", session_id)
+                .await
+                .unwrap();
+            assert!(
+                state
+                    .supervisor_sessions
+                    .initialize_endpoint_status_authority("baseline", session_id)
+            );
+            for loaded in [false, true] {
+                if loaded {
+                    handle_report_policy_status(
+                        &state,
+                        with_sandbox(
+                            Request::new(ReportPolicyStatusRequest {
+                                sandbox_id: "baseline".into(),
+                                version: 1,
+                                status: PolicyStatus::Loaded as i32,
+                                ..Default::default()
+                            }),
+                            "baseline",
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                }
+                let observations = admitted
+                    .network_policies
+                    .values()
+                    .flat_map(|rule| &rule.endpoints)
+                    .map(|endpoint| openshell_core::proto::EndpointObservation {
+                        endpoint_id: openshell_core::endpoint_status::endpoint_id(endpoint),
+                        result: openshell_core::proto::EndpointResult::NoObservedExchange as i32,
+                        failure: None,
+                    })
+                    .collect();
+                handle_report_endpoint_status(
+                    &state,
+                    with_sandbox(
+                        Request::new(openshell_core::proto::ReportEndpointStatusRequest {
+                            sandbox_id: "baseline".into(),
+                            policy_hash: snapshot.policy_hash.clone(),
+                            provider_env_revision: snapshot.provider_env_revision,
+                            observations,
+                            supervisor_session_id: session_id.into(),
+                            report_sequence: if loaded { 2 } else { 1 },
+                            ..Default::default()
+                        }),
+                        "baseline",
+                    ),
+                )
+                .await
+                .expect(
+                    "runtime endpoint report matches the admitted config before and after load",
+                );
+            }
+            let filesystem = admitted.filesystem.unwrap();
+            assert!(filesystem.read_only.contains(&baseline.read_only[0]));
+            assert!(filesystem.read_write.contains(&baseline.read_write[0]));
+            assert!(
+                !sandbox
+                    .spec
+                    .as_ref()
+                    .unwrap()
+                    .policy
+                    .as_ref()
+                    .unwrap()
+                    .filesystem
+                    .as_ref()
+                    .unwrap()
+                    .read_only
+                    .contains(&baseline.read_only[0])
+            );
+        }
+        let mut oversized = mcp_policy_with_versions(&["2025-11-25"]);
+        oversized.filesystem.as_mut().unwrap().read_only = (0..128)
+            .map(|index| format!("/{index:04}{}", "x".repeat(2035)))
+            .collect();
+        let padding = super::super::MAX_POLICY_SIZE - 16 - oversized.encoded_len();
+        oversized
+            .filesystem
+            .as_mut()
+            .unwrap()
+            .read_only
+            .last_mut()
+            .unwrap()
+            .push_str(&"x".repeat(padding));
+        assert!(oversized.encoded_len() <= super::super::MAX_POLICY_SIZE);
+        assert!(validate_and_canonicalize_policy(oversized.clone()).is_ok());
+        assert_eq!(
+            apply_backend_proxy_baseline(&state, &mut oversized, PolicySource::Sandbox)
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
     }
 
     #[tokio::test]

@@ -221,8 +221,13 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         None,
         None,
         None,
-        Some(direct_listener_identity),
-        None,
+        Some(crate::run::ProxyListenerConfig {
+            bind_addr: config.bind_addr,
+            authorization: None,
+            binary_identity: direct_listener_identity,
+            listener: None,
+            identity_resolver: None,
+        }),
     )
     .await?;
 

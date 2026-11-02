@@ -14,7 +14,7 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
-use openshell_core::proto_struct::struct_to_json_value;
+use openshell_core::proto_struct::struct_to_typed_json_value;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -239,10 +239,12 @@ fn sandbox_config(sandbox: &DriverSandbox) -> Result<MxcSandboxConfig, tonic::St
                 "mxc requires template.driver_config.mxc with a non-empty command array",
             )
         })?;
-    let config: MxcSandboxConfig =
-        serde_json::from_value(struct_to_json_value(config)).map_err(|error| {
-            tonic::Status::invalid_argument(format!("invalid mxc driver_config: {error}"))
-        })?;
+    let json = struct_to_typed_json_value(config).map_err(|error| {
+        tonic::Status::invalid_argument(format!("invalid mxc driver_config: {error}"))
+    })?;
+    let config: MxcSandboxConfig = serde_json::from_value(json).map_err(|error| {
+        tonic::Status::invalid_argument(format!("invalid mxc driver_config: {error}"))
+    })?;
     if config.command.is_empty() || config.command[0].is_empty() {
         return Err(tonic::Status::invalid_argument(
             "mxc driver_config.command must contain a non-empty executable",
@@ -476,16 +478,22 @@ impl MxcComputeBackend {
             resource_capabilities: None,
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
+            proxy_filesystem_baseline: None,
             extension: Some(openshell_core::extension_protocol::extension_metadata(
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/mxc",
                 openshell_core::VERSION,
-                [],
+                [
+                    openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION.to_string(),
+                    openshell_core::extension_protocol::COMPUTE_RESOURCE_CONTRACT.to_string(),
+                ],
             )),
         }
     }
 
     fn validate_sandbox_fields(sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
+        openshell_core::resource_contract::validate_request(sandbox, None, true)
+            .map_err(tonic::Status::failed_precondition)?;
         if let Some(spec) = &sandbox.spec {
             if effective_driver_gpu_count(driver_gpu_requirements(
                 spec.resource_requirements.as_ref(),

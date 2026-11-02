@@ -843,6 +843,10 @@ pub(crate) async fn run_server(
     }
 
     let state = Arc::new(state);
+    state
+        .compute
+        .configure_launch_policy_state(&state)
+        .map_err(Error::config)?;
 
     // Install the recorder before the endpoint-status startup reconciliation so
     // the lock waits and timeouts recorded there are exported. Its listener

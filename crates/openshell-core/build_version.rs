@@ -4,6 +4,26 @@
 type StableVersion = (u32, u32, u32);
 type PrereleaseVersion = (u32, u32, u32, u32);
 
+/// Read metadata only from an explicitly checked-out source tree. An archive
+/// nested in another repository must retain the package-version fallback.
+pub fn git_output(source_root: &std::path::Path, args: &[&str]) -> Option<String> {
+    // A linked worktree has a .git file; a regular checkout has a directory.
+    if !source_root.join(".git").exists() {
+        return None;
+    }
+    let output = std::process::Command::new("git")
+        .current_dir(source_root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|output| output.trim().to_string())
+}
+
 fn parse_stable_tag(tag: &str) -> Option<StableVersion> {
     let tag = tag.strip_prefix('v').unwrap_or(tag);
     let mut parts = tag.split('.');
@@ -57,6 +77,39 @@ pub fn next_dev_version(tag: Option<&str>, distance: u32, sha: &str) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_metadata_stays_with_the_source_checkout() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let parent = temporary.path().join("parent");
+        let initialized = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&parent)
+            .status()?;
+        assert!(initialized.success());
+        let args = ["rev-parse", "--show-toplevel"];
+        assert_eq!(
+            git_output(&parent, &args),
+            Some(parent.canonicalize()?.to_string_lossy().into_owned())
+        );
+        let archive = parent.join("archive");
+        std::fs::create_dir(&archive)?;
+        assert_eq!(git_output(&archive, &args), None);
+
+        let linked = parent.join("linked");
+        let initialized = std::process::Command::new("git")
+            .args(["init", "--quiet", "--separate-git-dir"])
+            .arg(temporary.path().join("metadata"))
+            .arg(&linked)
+            .status()?;
+        assert!(initialized.success());
+        assert!(linked.join(".git").is_file());
+        assert_eq!(
+            git_output(&linked, &args),
+            Some(linked.canonicalize()?.to_string_lossy().into_owned())
+        );
+        Ok(())
+    }
 
     #[test]
     fn exact_stable_release_wins_over_prerelease() {

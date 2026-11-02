@@ -156,12 +156,14 @@ mod tests {
     // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
     // closures and TokenGrantStatus to public reports. Older rows have no grant
     // record; absent report extensions retain compatibility without a rewrite.
+    // Compute ingress adds one shared message and scope enum through status.
+    // Legacy rows decode absent admission; new forward requests are public-only.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "a91e2244a2c1a8e369efe85bd0e4f2769f0f29f6263137280fe38e8a8da3cc6e";
+        "30b4e132cc93813071fd19d2c0caba5b4311caef8d783c3e1cd813454802bc0c";
     const DURABLE_SCHEMA_SHA256: &str =
-        "d4dc7abdb91b919db1f7be0d4652e30cbfda86f3b2ed9b59d5de1f76a2bf691d";
+        "22c86130c18a0932c556cf9774e3576e0159268bba812f4b6ab12be6d3570413";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "ac1ffc4b5b81467de27270a4e33f6db1e31eeb2c52f79750dbaaf19515eadbb2";
+        "bf2c65415c4760a1f44ba781c1117b01019db31395aae04a8ddfb1882a9a2ac6";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -679,9 +681,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (328, 29),
-                (95, 22),
-                (83, 22),
+                (333, 32),
+                (98, 23),
+                (86, 23),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -739,9 +741,15 @@ mod tests {
         assert!(status.configuration_admission.is_none());
         assert_eq!(status.configuration_activated, None);
         assert!(status.provisioning.is_none());
+        assert!(status.ingress_admission.is_none());
         assert!(!crate::policy_store::permits_initial_static_policy_repair(
             &sandbox
         ));
+        let resources = openshell_core::proto::ResourceRequirements::decode(&[10, 0][..]).unwrap();
+        assert!(resources.gpu.is_some());
+        assert!(resources.sampled_budget.is_none());
+        let health = openshell_core::proto::HealthResponse::decode(&[8, 1][..]).unwrap();
+        assert!(!health.supports_sampled_resource_budget);
         assert_eq!(sandbox.encode_to_vec(), bytes);
     }
 

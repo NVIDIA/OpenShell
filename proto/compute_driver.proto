@@ -108,6 +108,17 @@ message GetCapabilitiesResponse {
   // Gateways require an exact policy match before activating the driver.
   // Empty denotes a legacy driver and requires explicit admission opt-out.
   string resource_admission_policy = 13;
+  // Trusted, unconditional workload-namespace prerequisites for proxy mode.
+  // Requires openshell.compute.proxy-filesystem-baseline. Presence, including
+  // an empty message, replaces legacy Linux defaults. The gateway includes
+  // these paths in effective policy before compute admission and signing.
+  ProxyFilesystemBaseline proxy_filesystem_baseline = 14;
+}
+
+message ProxyFilesystemBaseline {
+  // POSIX absolute workload paths, never paths checked on the gateway host.
+  repeated string read_only = 1;
+  repeated string read_write = 2;
 }
 
 message AuthenticateSandboxRequest {
@@ -130,16 +141,23 @@ message ResourceCapabilities {
   CpuResourceCapabilities cpu = 1;
   MemoryResourceCapabilities memory = 2;
   GpuResourceCapabilities gpu = 3;
+  openshell.sandbox.v1.SampledResourceBudgetCapabilities sampled_budget = 4;
 }
 
 message CpuResourceCapabilities {
   // The driver accepts and enforces a portable CPU limit.
   bool limit_supported = 1;
+  // Required for a negotiated resource contract. Absence means unreported.
+  openshell.sandbox.v1.ResourceEnforcement limit_enforcement = 2;
+  openshell.sandbox.v1.ResourceEnforcement request_enforcement = 3;
 }
 
 message MemoryResourceCapabilities {
   // The driver accepts and enforces a portable memory limit.
   bool limit_supported = 1;
+  // Required for a negotiated resource contract. Absence means unreported.
+  openshell.sandbox.v1.ResourceEnforcement limit_enforcement = 2;
+  openshell.sandbox.v1.ResourceEnforcement request_enforcement = 3;
 }
 
 message GpuResourceCapabilities {
@@ -276,6 +294,8 @@ message DriverFenceEvidence {
 message ResourceRequirements {
   // GPU requirements for the sandbox. Presence indicates a GPU request.
   GpuResourceRequirements gpu = 1;
+  // Explicit opt-in to weaker sampled budgets; never inferred from hard limits.
+  openshell.sandbox.v1.SampledResourceBudget sampled_budget = 2;
 }
 
 // Driver GPU resource requirements.
@@ -400,7 +420,12 @@ message ValidateSandboxCreateRequest {
   DriverSandbox sandbox = 1;
 }
 
-message ValidateSandboxCreateResponse {}
+message ValidateSandboxCreateResponse {
+  // Required when openshell.compute.ingress-admission is negotiated. Complete
+  // immutable envelope, including an explicit unsupported result. Create/start
+  // must enforce this envelope from the same retained template/configuration.
+  openshell.sandbox.v1.SandboxIngressAdmission ingress_admission = 1;
+}
 
 message GetSandboxRequest {
   // Stable sandbox ID stored by the gateway.
@@ -462,6 +487,11 @@ message StartSandboxRequest {
   // under a different selection. Operator endpoints may change without
   // changing that identity; the driver still validates the retained resource.
   IsolationBackendRegistration isolation_backend = 6;
+  // Required when openshell.compute.launch-policy is negotiated. The driver
+  // checks document/hash agreement and the request generation before launch.
+  // Same-generation retries must retain the identical input. Legacy drivers
+  // keep their existing supervisor-delivered startup policy behavior.
+  openshell.sandbox.v1.SandboxLaunchPolicy launch_policy = 7;
 }
 
 message StartSandboxResponse {

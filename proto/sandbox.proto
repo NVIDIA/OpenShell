@@ -17,6 +17,31 @@ import "datamodel.proto";
 // - Public sandbox resource types live in `openshell.proto`.
 // - Internal compute-driver sandbox observation types live in `compute_driver.proto`.
 
+// Gateway-owned immutable policy input for one compute launch generation.
+// Live policy reload remains a separate configuration-admission operation.
+message SandboxLaunchPolicy {
+  string generation_id = 1;
+  SandboxPolicy policy = 2;
+  string policy_hash = 3;
+}
+
+// Immutable ingress envelope admitted from the compute driver's resolved inputs.
+// Presence with an unspecified scope is invalid; it never means legacy support.
+message SandboxIngressAdmission {
+  IngressScope scope = 1;
+  // Mutually exclusive with ports. False with an empty list admits no ports.
+  bool all_ports = 2;
+  repeated uint32 ports = 3;
+}
+
+enum IngressScope {
+  INGRESS_SCOPE_UNSPECIFIED = 0;
+  INGRESS_SCOPE_UNSUPPORTED = 1;
+  INGRESS_SCOPE_ISOLATED_LOOPBACK = 2;
+  // The driver has admitted its operator-controlled shared-host opt-in.
+  INGRESS_SCOPE_SHARED_HOST_LOOPBACK = 3;
+}
+
 // Sandbox security policy configuration.
 message SandboxPolicy {
   // Policy version.
@@ -506,4 +531,49 @@ message SupervisorMiddlewareService {
   // no bearer credential; supervisors must not request one. Intended only for
   // trusted-network development deployments.
   bool allow_insecure_transport = 7;
+}
+
+// Explicit budgets observed across a sandbox account. These are not CPU-rate
+// quotas or hard memory limits. Empty budgets are invalid.
+message SampledResourceBudget {
+  google.protobuf.Duration cpu_time = 1;
+  optional uint64 resident_bytes = 2;
+}
+
+// Mechanism and aggregation boundary for a resource request.
+message ResourceEnforcement {
+  ResourceEnforcementKind kind = 1;
+  ResourceEnforcementScope scope = 2;
+}
+
+enum ResourceEnforcementKind {
+  RESOURCE_ENFORCEMENT_KIND_UNSPECIFIED = 0;
+  RESOURCE_ENFORCEMENT_KIND_UNSUPPORTED = 1;
+  RESOURCE_ENFORCEMENT_KIND_KERNEL_LIMIT = 2;
+  // Admission by the platform scheduler, not dedicated physical capacity.
+  RESOURCE_ENFORCEMENT_KIND_SCHEDULER_REQUEST = 3;
+}
+
+enum ResourceEnforcementScope {
+  RESOURCE_ENFORCEMENT_SCOPE_UNSPECIFIED = 0;
+  RESOURCE_ENFORCEMENT_SCOPE_PROCESS = 1;
+  RESOURCE_ENFORCEMENT_SCOPE_CONTAINER = 2;
+  RESOURCE_ENFORCEMENT_SCOPE_SANDBOX_ACCOUNT = 3;
+  RESOURCE_ENFORCEMENT_SCOPE_VIRTUAL_MACHINE = 4;
+}
+
+message SampledResourceBudgetCapabilities {
+  bool cpu_time_supported = 1;
+  bool resident_bytes_supported = 2;
+  ResourceEnforcementScope scope = 3;
+  // Sleep between completed observations; collection adds latency. This is
+  // neither an enforcement deadline nor a bound on overshoot. Short-lived
+  // processes may escape observation.
+  google.protobuf.Duration sampling_interval = 4;
+  bool terminate_on_excess = 5;
+  // Smallest exactly representable CPU-time request.
+  google.protobuf.Duration cpu_time_resolution = 6;
+  // A per-process CPU-time kernel limit also accompanies the sampled budget.
+  // It may use a coarser resolution than the account-wide observation.
+  bool per_process_cpu_limit = 7;
 }

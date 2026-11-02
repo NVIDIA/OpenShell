@@ -36,6 +36,8 @@ use std::time::Duration;
 use tracing::{Instrument as _, debug, info, warn};
 
 use openshell_core::PolicyValidationFailureMode;
+use openshell_core::backend_startup::{BackendStartupStage, backend_startup_diagnostic};
+use openshell_core::filesystem_baseline::FilesystemBaseline;
 
 use openshell_ocsf::{
     ActionId, ActivityId, AppLifecycleBuilder, ConfidenceId, ConfigStateChangeBuilder,
@@ -895,6 +897,7 @@ pub async fn run_sandbox_with_backend(
         Some(image_discovery),
         &RemoteStartupGateway {
             endpoint: openshell_endpoint.clone().unwrap_or_default(),
+            proxy_filesystem_baseline: selected_backend.proxy_filesystem_baseline().cloned(),
         },
     )
     .instrument(tracing::info_span!(parent: &startup, "supervisor.policy.load"))
@@ -994,7 +997,7 @@ pub async fn run_sandbox_with_backend(
     // supervisor-owned handles shared with the backend.
     let admitted_backend_name = selected_backend.backend_name().to_string();
     let ca_file_paths = Arc::new(std::sync::Mutex::new(None));
-    let (bound, proxy_listener) = selected_backend
+    let attached = selected_backend
         .attach(
             backend_setup::BackendServices {
                 ca_file_paths: ca_file_paths.clone(),
@@ -1011,7 +1014,24 @@ pub async fn run_sandbox_with_backend(
             },
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.attach"))
-        .await?;
+        .await;
+    let (bound, proxy_listener) = match attached {
+        Ok(attached) => attached,
+        Err(error) => {
+            if let (Some(sandbox_id), Some(endpoint)) =
+                (sandbox_id.as_deref(), openshell_endpoint.as_deref())
+            {
+                Box::pin(report_backend_startup_failure(
+                    endpoint,
+                    sandbox_id,
+                    &loaded_policy_origin,
+                    &error,
+                ))
+                .await;
+            }
+            return Err(error);
+        }
+    };
     info!(backend = %admitted_backend_name, "Isolation boundary attached");
     let remote_boundary = (bound, admitted_backend_name, ca_file_paths);
 
@@ -1087,11 +1107,33 @@ pub async fn run_sandbox_with_backend(
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
     let (remote_ready, backend_name, ca_file_paths) = {
         let (bound, backend_name, ca_file_paths) = remote_boundary;
-        let ready = bound
-            .confirm()
-            .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.confirm"))
-            .await
-            .map_err(|error| miette::miette!(error.to_string()))?;
+        // Keep the confirmation result and best-effort reporting state out of
+        // the already large supervisor startup future.
+        let ready = Box::pin(async {
+            match bound
+                .confirm()
+                .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.confirm"))
+                .await
+            {
+                Ok(ready) => Ok(ready),
+                Err(error) => {
+                    let error = backend_setup::startup_error(BackendStartupStage::Confirm, error);
+                    if let (Some(sandbox_id), Some(endpoint)) =
+                        (sandbox_id.as_deref(), openshell_endpoint.as_deref())
+                    {
+                        report_backend_startup_failure(
+                            endpoint,
+                            sandbox_id,
+                            &loaded_policy_origin,
+                            &error,
+                        )
+                        .await;
+                    }
+                    Err(error)
+                }
+            }
+        })
+        .await?;
         info!(backend = %backend_name, "Isolation boundary enforcement confirmed");
         (ready, backend_name, ca_file_paths)
     };
@@ -1679,80 +1721,32 @@ fn proxy_baseline_paths() -> (Vec<String>, Vec<String>) {
     )
 }
 
-fn enrich_proto_baseline_paths_with<F>(
-    proto: &mut openshell_core::proto::SandboxPolicy,
-    ro: &[String],
-    rw: &[String],
-    path_exists: F,
-) -> bool
-where
-    F: Fn(&str) -> bool,
-{
-    if ro.is_empty() && rw.is_empty() {
-        return false;
-    }
-
-    let fs = proto
-        .filesystem
-        .get_or_insert_with(|| openshell_core::proto::FilesystemPolicy {
-            include_workdir: true,
-            ..Default::default()
-        });
-
-    let mut modified = false;
-    for path in ro {
-        if !fs.read_only.iter().any(|p| p == path) && !fs.read_write.iter().any(|p| p == path) {
-            if !path_exists(path) {
-                debug!(
-                    path,
-                    "Baseline read-only path does not exist, skipping enrichment"
-                );
-                continue;
-            }
-            fs.read_only.push(path.clone());
-            modified = true;
-        }
-    }
-    for path in rw {
-        if fs.read_write.iter().any(|p| p == path) {
-            continue;
-        }
-        if !path_exists(path) {
-            debug!(
-                path,
-                "Baseline read-write path does not exist, skipping enrichment"
-            );
-            continue;
-        }
-        if fs.read_only.iter().any(|p| p == path) {
-            continue;
-        }
-        fs.read_write.push(path.clone());
-        modified = true;
-    }
-
-    modified
-}
-
 /// Ensure a proto `SandboxPolicy` includes the baseline filesystem paths
 /// required by proxy-mode sandboxes. Paths are only added if
 /// missing; user-specified paths are never removed.
 ///
 /// Returns `true` if the policy was modified (caller may want to sync back).
-fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy) -> bool {
+fn enrich_proto_baseline_paths(
+    proto: &mut openshell_core::proto::SandboxPolicy,
+    baseline: Option<&FilesystemBaseline>,
+) -> bool {
     if proto.network_policies.is_empty() {
         return false;
     }
-    let (ro, rw) = proxy_baseline_paths();
-
-    // Baseline paths are system-injected, not user-specified.  Skip paths
-    // that do not exist in this container image to avoid noisy warnings from
-    // Landlock and, more critically, to prevent a single missing baseline
-    // path from abandoning the entire Landlock ruleset under best-effort
-    // mode (see issue #664).
-    let modified = enrich_proto_baseline_paths_with(proto, &ro, &rw, |path| {
-        std::path::Path::new(path).exists()
-    });
+    let modified = if let Some(baseline) = baseline {
+        // Backend-advertised paths belong to the workload namespace, not this
+        // supervisor's host filesystem. They are unconditional prerequisites.
+        baseline.enrich(proto, |_| true)
+    } else {
+        // Legacy Linux image defaults retain existence filtering: a missing
+        // path must not cause Landlock to abandon the ruleset (issue #664).
+        let (read_only, read_write) = proxy_baseline_paths();
+        FilesystemBaseline {
+            read_only,
+            read_write,
+        }
+        .enrich(proto, |path| std::path::Path::new(path).exists())
+    };
 
     if modified {
         ocsf_emit!(
@@ -1788,17 +1782,22 @@ fn proto_sync_payload_for_enriched_policy(
 /// Ensure a `SandboxPolicy` (Rust type) includes the baseline filesystem
 /// paths required by proxy-mode sandboxes. Used for the
 /// local-file code path where no proto is available.
-fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
+fn enrich_sandbox_baseline_paths(
+    policy: &mut SandboxPolicy,
+    baseline: Option<&FilesystemBaseline>,
+) {
     if !matches!(policy.network.mode, NetworkMode::Proxy) {
         return;
     }
-    let (ro, rw) = proxy_baseline_paths();
+    let (ro, rw) = baseline.map_or_else(proxy_baseline_paths, |baseline| {
+        (baseline.read_only.clone(), baseline.read_write.clone())
+    });
 
     let mut modified = false;
     for path in &ro {
         let p = std::path::PathBuf::from(path);
         if !policy.filesystem.read_only.contains(&p) && !policy.filesystem.read_write.contains(&p) {
-            if !p.exists() {
+            if baseline.is_none() && !p.exists() {
                 debug!(
                     path,
                     "Baseline read-only path does not exist, skipping enrichment"
@@ -1814,7 +1813,7 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
         if policy.filesystem.read_only.contains(&p) || policy.filesystem.read_write.contains(&p) {
             continue;
         }
-        if !p.exists() {
+        if baseline.is_none() && !p.exists() {
             debug!(
                 path,
                 "Baseline read-write path does not exist, skipping enrichment"
@@ -1899,7 +1898,7 @@ mod baseline_tests {
             },
         );
 
-        enrich_proto_baseline_paths(&mut policy);
+        enrich_proto_baseline_paths(&mut policy, None);
 
         let filesystem = policy.filesystem.expect("filesystem policy");
         assert!(filesystem.read_only.contains(&"/proc".to_string()));
@@ -2013,7 +2012,7 @@ mod baseline_tests {
         );
         let original = policy.clone();
 
-        let enriched = enrich_proto_baseline_paths(&mut policy);
+        let enriched = enrich_proto_baseline_paths(&mut policy, None);
 
         assert!(!enriched);
         assert_eq!(policy, original);
@@ -2037,7 +2036,7 @@ mod baseline_tests {
             process: ProcessPolicy::default(),
         };
 
-        enrich_sandbox_baseline_paths(&mut policy);
+        enrich_sandbox_baseline_paths(&mut policy, None);
 
         assert!(
             policy.filesystem.read_only.contains(&PathBuf::from("/tmp")),
@@ -2050,6 +2049,57 @@ mod baseline_tests {
                 .contains(&PathBuf::from("/tmp")),
             "baseline enrichment must not promote explicit read_only /tmp to read_write"
         );
+    }
+
+    #[test]
+    fn selected_backend_baseline_replaces_linux_defaults_in_both_policy_formats() {
+        let baseline = FilesystemBaseline {
+            read_only: vec!["/platform-runtime-not-on-host".into()],
+            read_write: vec!["/explicit-read-only".into()],
+        };
+        for baseline in [baseline, FilesystemBaseline::default()] {
+            baseline.validate().unwrap();
+            let mut proto = openshell_policy::restrictive_default_policy();
+            proto.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+                read_only: vec!["/explicit-read-only".into()],
+                ..Default::default()
+            });
+            proto.network_policies.insert(
+                "proxy".into(),
+                openshell_core::proto::NetworkPolicyRule::default(),
+            );
+            enrich_proto_baseline_paths(&mut proto, Some(&baseline));
+            let filesystem = proto.filesystem.unwrap();
+            let mut expected = vec!["/explicit-read-only".to_string()];
+            expected.extend(baseline.read_only.iter().cloned());
+            assert_eq!(filesystem.read_only, expected);
+            assert!(filesystem.read_write.is_empty());
+
+            let mut local = SandboxPolicy {
+                version: 1,
+                filesystem: FilesystemPolicy {
+                    read_only: vec!["/explicit-read-only".into()],
+                    read_write: vec![],
+                    include_workdir: false,
+                },
+                network: NetworkPolicy {
+                    mode: NetworkMode::Proxy,
+                    proxy: None,
+                },
+                landlock: LandlockPolicy::default(),
+                process: ProcessPolicy::default(),
+            };
+            enrich_sandbox_baseline_paths(&mut local, Some(&baseline));
+            assert_eq!(
+                local.filesystem.read_only,
+                expected.iter().map(PathBuf::from).collect::<Vec<_>>()
+            );
+            assert!(local.filesystem.read_write.is_empty());
+            local.network.mode = NetworkMode::Block;
+            let original = local.filesystem.read_only.clone();
+            enrich_sandbox_baseline_paths(&mut local, Some(&baseline));
+            assert_eq!(local.filesystem.read_only, original);
+        }
     }
 }
 
@@ -2128,6 +2178,9 @@ where
 }
 
 trait StartupGateway: Send + Sync {
+    fn proxy_filesystem_baseline(&self) -> Option<FilesystemBaseline> {
+        None
+    }
     fn snapshot(
         &self,
         sandbox: &str,
@@ -2154,9 +2207,13 @@ trait StartupGateway: Send + Sync {
 
 struct RemoteStartupGateway {
     endpoint: String,
+    proxy_filesystem_baseline: Option<FilesystemBaseline>,
 }
 
 impl StartupGateway for RemoteStartupGateway {
+    fn proxy_filesystem_baseline(&self) -> Option<FilesystemBaseline> {
+        self.proxy_filesystem_baseline.clone()
+    }
     async fn snapshot(
         &self,
         sandbox: &str,
@@ -2318,6 +2375,7 @@ async fn load_policy(
         None,
         &RemoteStartupGateway {
             endpoint: openshell_endpoint.unwrap_or_default(),
+            proxy_filesystem_baseline: None,
         },
     )
     .await
@@ -2349,6 +2407,12 @@ async fn load_policy_with_gateway(
     Option<CapturedProviderEnvironment>,
 )> {
     use openshell_core::proto::ConfigurationAdmissionState;
+    let proxy_baseline = gateway.proxy_filesystem_baseline();
+    if let Some(baseline) = &proxy_baseline {
+        baseline
+            .validate()
+            .map_err(|error| miette::miette!(error))?;
+    }
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
         if sandbox_id.is_some() && openshell_endpoint.is_some() {
@@ -2402,7 +2466,7 @@ async fn load_policy_with_gateway(
             landlock: config.landlock,
             process: config.process,
         };
-        enrich_sandbox_baseline_paths(&mut policy);
+        enrich_sandbox_baseline_paths(&mut policy, proxy_baseline.as_ref());
         // File mode has no operator-registered middleware to connect.
         return Ok((
             policy,
@@ -2452,6 +2516,7 @@ async fn load_policy_with_gateway(
             reconciliation_attempts += 1;
             let mut snapshot =
                 grpc_retry("Startup configuration fetch", || gateway.snapshot(sandbox)).await?;
+            let mut written_at_startup = false;
 
             if snapshot.policy.is_none() && !snapshot.configuration_error.is_empty() {
                 reject_startup_configuration(
@@ -2493,7 +2558,7 @@ async fn load_policy_with_gateway(
                 };
                 // Enrich before syncing so the gateway baseline includes
                 // baseline paths from the start.
-                enrich_proto_baseline_paths(&mut discovered);
+                enrich_proto_baseline_paths(&mut discovered, proxy_baseline.as_ref());
                 strip_proto_provider_policy_entries(&mut discovered);
                 // Sync and re-fetch over a single connection to avoid extra
                 // TLS handshakes.
@@ -2503,7 +2568,10 @@ async fn load_policy_with_gateway(
                 })
                 .await;
                 snapshot = match synced {
-                    Ok(synced) => synced,
+                    Ok(synced) => {
+                        written_at_startup |= synced.version != snapshot.version;
+                        synced
+                    }
                     Err(error) => {
                         // The gateway stored nothing, so report the rejection
                         // against the snapshot this upload was built from and
@@ -2554,7 +2622,7 @@ async fn load_policy_with_gateway(
             // a sandbox-sourced policy is written back. The gateway refuses
             // every sandbox policy write while a global policy is active, so a
             // global policy keeps the added paths in this process only.
-            let enriched = enrich_proto_baseline_paths(&mut proto_policy);
+            let enriched = enrich_proto_baseline_paths(&mut proto_policy, proxy_baseline.as_ref());
             let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched)
                 .filter(|_| snapshot.policy_source == openshell_core::proto::PolicySource::Sandbox);
             if let Some(sync_policy) = sync_policy {
@@ -2563,7 +2631,10 @@ async fn load_policy_with_gateway(
                 })
                 .await;
                 let canonical = match synced {
-                    Ok(canonical) => canonical,
+                    Ok(canonical) => {
+                        written_at_startup |= canonical.version != snapshot.version;
+                        canonical
+                    }
                     Err(error) => {
                         // The stored policy is unchanged, so report the
                         // rejection against the snapshot it was read from and
@@ -2781,6 +2852,7 @@ async fn load_policy_with_gateway(
                 LoadedPolicyOrigin::Gateway {
                     revision: loaded_policy_revision,
                     has_last_valid_policy,
+                    written_at_startup,
                 },
                 agent_proposals_enabled_from_settings(&snapshot.settings),
                 snapshot.extension_authentication_enabled,
@@ -3205,6 +3277,9 @@ enum LoadedPolicyOrigin {
     Gateway {
         revision: Option<LoadedPolicyRevision>,
         has_last_valid_policy: bool,
+        /// This start wrote `revision` to the gateway, so it is the
+        /// supervisor's own revision to fail if the backend refuses it.
+        written_at_startup: bool,
     },
 }
 
@@ -3697,6 +3772,96 @@ fn enqueue_policy_status(sender: &UnboundedSender<PolicyStatusUpdate>, update: P
             "Policy status reporter unavailable during shutdown"
         );
     }
+}
+
+/// Report a classified backend failure before the workload has started.
+fn backend_startup_failure_report(
+    sandbox_id: &str,
+    origin: &LoadedPolicyOrigin,
+    error: &miette::Report,
+) -> Option<openshell_core::proto::ReportSandboxConfigurationRequest> {
+    let LoadedPolicyOrigin::Gateway {
+        revision: Some(revision),
+        ..
+    } = origin
+    else {
+        return None;
+    };
+    let code = error.code()?.to_string();
+    if backend_startup_diagnostic(&code).is_none() && !backend_setup::is_backend_refusal(error) {
+        return None;
+    }
+    Some(openshell_core::proto::ReportSandboxConfigurationRequest {
+        sandbox_id: sandbox_id.to_string(),
+        admission: Some(openshell_core::proto::SandboxConfigurationAdmission {
+            instance_id: revision.admission_instance_id.clone()?,
+            state: openshell_core::proto::ConfigurationAdmissionState::Rejected.into(),
+            policy_version: revision.version,
+            policy_hash: revision.policy_hash.clone(),
+            config_revision: revision.config_revision,
+            provider_env_revision: revision.provider_env_revision,
+            // Carry only a bounded machine code, never backend diagnostics.
+            error: code,
+        }),
+        expected_instance_id: String::new(),
+        refused_before_start: true,
+    })
+}
+
+/// Report a pre-start failure without replacing the original error. The entire
+/// best-effort operation, including any policy-history report, has one deadline.
+async fn report_backend_startup_failure(
+    endpoint: &str,
+    sandbox_id: &str,
+    origin: &LoadedPolicyOrigin,
+    error: &miette::Report,
+) {
+    let Some(request) = backend_startup_failure_report(sandbox_id, origin, error) else {
+        return;
+    };
+    let code = request
+        .admission
+        .as_ref()
+        .map_or("", |admission| admission.error.as_str());
+    let safe_message = backend_startup_diagnostic(code).unwrap_or_else(|| {
+        "The isolation backend refused the admitted configuration before workload execution"
+            .to_string()
+    });
+    let operation = async {
+        if let Err(report_error) =
+            openshell_core::grpc_client::report_sandbox_configuration_request(endpoint, request)
+                .await
+        {
+            warn!(error = %report_error, "Failed to report the isolation backend failure");
+        }
+        if let Some(revision) = refused_startup_revision(origin, error) {
+            let safe_error = miette::miette!(safe_message);
+            report_initial_policy_failure(endpoint, sandbox_id, Some(revision), &safe_error).await;
+        }
+        Ok(())
+    };
+    if let Err(report_error) = grpc_attempt("Backend startup failure reports", operation).await {
+        warn!(error = %report_error, "Backend startup failure reporting did not complete");
+    }
+}
+
+/// The revision this start wrote that the backend refused at Attach, if any.
+///
+/// Only a refusal marks it: `Unavailable` can succeed on the next start, and a
+/// revision the user wrote stays as it was.
+fn refused_startup_revision<'a>(
+    origin: &'a LoadedPolicyOrigin,
+    error: &miette::Report,
+) -> Option<&'a LoadedPolicyRevision> {
+    let LoadedPolicyOrigin::Gateway {
+        revision: Some(revision),
+        written_at_startup: true,
+        ..
+    } = origin
+    else {
+        return None;
+    };
+    backend_setup::is_backend_refusal(error).then_some(revision)
 }
 
 /// Best-effort `FAILED` acknowledgement when initial policy construction or
@@ -4721,7 +4886,7 @@ network_policies:
     async fn startup_rejects_vm_identity_until_matching_policy_is_available() {
         use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
         let mut policy = proto_policy_fixture();
-        enrich_proto_baseline_paths(&mut policy);
+        enrich_proto_baseline_paths(&mut policy, None);
         policy.process = Some(openshell_core::proto::ProcessPolicy {
             run_as_user: "10000".into(),
             run_as_group: "1001".into(),
@@ -4864,7 +5029,7 @@ network_policies:
     async fn startup_pending_gateway_calls_exhaust_their_budgets() {
         for pending_snapshot in [true, false] {
             let mut policy = proto_policy_fixture();
-            enrich_proto_baseline_paths(&mut policy);
+            enrich_proto_baseline_paths(&mut policy, None);
             let (reports, _reported) = tokio::sync::mpsc::unbounded_channel();
             let gateway = TestStartupGateway {
                 desired: Arc::new(std::sync::Mutex::new(settings_poll_result(
@@ -4989,7 +5154,7 @@ network_policies:
     async fn startup_waits_for_repair_and_retries_stale_activation_before_returning() {
         use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
         let mut policy = proto_policy_fixture();
-        enrich_proto_baseline_paths(&mut policy);
+        enrich_proto_baseline_paths(&mut policy, None);
         let mut rejected = settings_poll_result(Some(policy), 1, PolicySource::Sandbox);
         rejected.configuration_admitted = false;
         let (reports, mut reported) = tokio::sync::mpsc::unbounded_channel();
@@ -5436,7 +5601,7 @@ network_policies:
         // paths, so startup writes an enriched copy back. The repaired policy
         // already carries those paths and needs no write-back.
         let mut repaired = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut repaired));
+        assert!(enrich_proto_baseline_paths(&mut repaired, None));
         assert_refused_startup_write_waits_for_repair(
             settings_poll_result(
                 Some(proto_tcp_policy_fixture()),
@@ -5562,7 +5727,7 @@ network_policies:
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_baseline_repair_before_report_refetches() {
         let mut repaired = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut repaired));
+        assert!(enrich_proto_baseline_paths(&mut repaired, None));
         Box::pin(assert_startup_repair_before_rejection_refetches(
             settings_poll_result(
                 Some(proto_tcp_policy_fixture()),
@@ -5706,7 +5871,7 @@ network_policies:
     async fn startup_policy_write_refusal_write_back_outlasts_the_attempt_limit() {
         // The same limit applies to a refused baseline-path write-back.
         let mut repaired = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut repaired));
+        assert!(enrich_proto_baseline_paths(&mut repaired, None));
         assert_refused_startup_write_waits_for_repair(
             settings_poll_result(
                 Some(proto_tcp_policy_fixture()),
@@ -5801,7 +5966,7 @@ network_policies:
         global.global_policy_version = 1;
         let global_generation = report_generation(&global);
         let mut enriched = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut enriched));
+        assert!(enrich_proto_baseline_paths(&mut enriched, None));
         let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
         let gateway = WriteRefusingStartupGateway {
             desired: Arc::new(std::sync::Mutex::new(global)),
@@ -5867,6 +6032,180 @@ network_policies:
             panic!("startup must bind the global policy to its gateway revision");
         };
         assert_eq!(revision.policy_source, PolicySource::Global);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_marks_only_the_revision_it_wrote() {
+        use openshell_core::proto::PolicySource;
+
+        for (needs_baseline_paths, written) in [(true, true), (false, false)] {
+            let mut policy = proto_tcp_policy_fixture();
+            if !needs_baseline_paths {
+                assert!(enrich_proto_baseline_paths(&mut policy, None));
+            }
+            let (calls, _observed) = tokio::sync::mpsc::unbounded_channel();
+            let gateway = WriteRefusingStartupGateway {
+                desired: Arc::new(std::sync::Mutex::new(settings_poll_result(
+                    Some(policy),
+                    1,
+                    PolicySource::Sandbox,
+                ))),
+                refusals: Arc::default(),
+                repair_after_refusal: None,
+                rejection_report_errors: Arc::default(),
+                calls,
+            };
+            let bundle = load_policy_with_gateway(
+                Some("sandbox-id".to_string()),
+                Some("sandbox".to_string()),
+                Some("http://unused.invalid".to_string()),
+                None,
+                None,
+                &openshell_extension_core::ExtensionCredentialStore::new(),
+                LocalPolicyIdentity::Required,
+                None,
+                Some(ImagePolicyDiscovery::Missing),
+                &gateway,
+            )
+            .await
+            .expect("startup must accept the policy");
+            let LoadedPolicyOrigin::Gateway {
+                revision: Some(revision),
+                written_at_startup,
+                ..
+            } = bundle.4
+            else {
+                panic!("startup must bind the policy to its gateway revision");
+            };
+            assert_eq!(written_at_startup, written);
+            assert_eq!(revision.version, if written { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn attach_refusal_reports_the_accepted_generation_as_refused() {
+        use openshell_core::proto::ConfigurationAdmissionState;
+        use openshell_isolation_interface::contract::BackendError;
+
+        let mut revision = LoadedPolicyRevision::from_snapshot(&settings_poll_result(
+            Some(proto_policy_fixture()),
+            3,
+            openshell_core::proto::PolicySource::Sandbox,
+        ));
+        revision.admission_instance_id = Some("instance-1".to_string());
+        let origin = |revision: &LoadedPolicyRevision| LoadedPolicyOrigin::Gateway {
+            revision: Some(revision.clone()),
+            has_last_valid_policy: true,
+            written_at_startup: false,
+        };
+        let refusal = miette::miette!(code = backend_setup::ATTACH_REFUSED, "refused");
+
+        let request = backend_startup_failure_report("sandbox-id", &origin(&revision), &refusal)
+            .expect("a refusal of the accepted generation is reported");
+        assert!(request.refused_before_start);
+        let admission = request.admission.unwrap();
+        assert_eq!(
+            admission.state,
+            i32::from(ConfigurationAdmissionState::Rejected)
+        );
+        assert_eq!(
+            (
+                admission.instance_id.as_str(),
+                admission.policy_version,
+                admission.policy_hash.as_str(),
+                admission.config_revision,
+                admission.provider_env_revision,
+            ),
+            (
+                "instance-1",
+                revision.version,
+                revision.policy_hash.as_str(),
+                revision.config_revision,
+                revision.provider_env_revision,
+            )
+        );
+
+        for (stage, failure) in [
+            (
+                BackendStartupStage::Build,
+                BackendError::Descriptor("secret launch payload".into()),
+            ),
+            (
+                BackendStartupStage::Attach,
+                BackendError::Unavailable("secret endpoint".into()),
+            ),
+            (
+                BackendStartupStage::Confirm,
+                BackendError::Denied("secret policy".into()),
+            ),
+        ] {
+            let error = backend_setup::startup_error(stage, failure);
+            let request = backend_startup_failure_report("sandbox-id", &origin(&revision), &error)
+                .expect("classified startup failures must be reported");
+            let code = request.admission.unwrap().error;
+            assert!(code.starts_with(&format!("openshell.backend.{}.", stage.code())));
+            assert!(!code.contains("secret"));
+            assert!(backend_startup_diagnostic(&code).is_some());
+        }
+
+        let transient = miette::miette!("unavailable");
+        assert!(
+            backend_startup_failure_report("sandbox-id", &origin(&revision), &transient).is_none()
+        );
+        assert!(
+            backend_startup_failure_report(
+                "sandbox-id",
+                &LoadedPolicyOrigin::LocalOverride,
+                &refusal
+            )
+            .is_none()
+        );
+        revision.admission_instance_id = None;
+        assert!(
+            backend_startup_failure_report("sandbox-id", &origin(&revision), &refusal).is_none()
+        );
+    }
+
+    #[test]
+    fn attach_refusal_fails_only_the_revision_this_start_wrote() {
+        use openshell_isolation_interface::contract::BackendError;
+
+        let revision = LoadedPolicyRevision::from_snapshot(&settings_poll_result(
+            Some(proto_policy_fixture()),
+            3,
+            openshell_core::proto::PolicySource::Sandbox,
+        ));
+        let origin = |written_at_startup| LoadedPolicyOrigin::Gateway {
+            revision: Some(revision.clone()),
+            has_last_valid_policy: true,
+            written_at_startup,
+        };
+        let refusal = miette::miette!(code = backend_setup::ATTACH_REFUSED, "refused");
+        let transient = miette::miette!("unavailable");
+
+        assert_eq!(
+            refused_startup_revision(&origin(true), &refusal).map(|revision| revision.version),
+            Some(3)
+        );
+        assert!(refused_startup_revision(&origin(true), &transient).is_none());
+        assert!(refused_startup_revision(&origin(false), &refusal).is_none());
+        assert!(refused_startup_revision(&LoadedPolicyOrigin::LocalOverride, &refusal).is_none());
+        for (failure, refused) in [
+            (BackendError::Denied("policy rejected".into()), true),
+            (BackendError::Attach("attachment refused".into()), true),
+            (
+                BackendError::Unavailable("retry after cleanup".into()),
+                false,
+            ),
+            (BackendError::Confirm("confirmation failed".into()), false),
+            (BackendError::Process("process failed".into()), false),
+        ] {
+            let error = backend_setup::startup_error(BackendStartupStage::Attach, failure);
+            assert_eq!(
+                refused_startup_revision(&origin(true), &error).is_some(),
+                refused
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -6677,6 +7016,7 @@ network_policies:
                 &LoadedPolicyOrigin::Gateway {
                     revision: Some(loaded),
                     has_last_valid_policy: true,
+                    written_at_startup: false,
                 },
                 &canonical,
             ),
@@ -6709,6 +7049,7 @@ network_policies:
         let origin = LoadedPolicyOrigin::Gateway {
             revision: None,
             has_last_valid_policy: true,
+            written_at_startup: false,
         };
 
         assert_eq!(
@@ -6814,6 +7155,7 @@ network_policies:
             &LoadedPolicyOrigin::Gateway {
                 revision: None,
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             true,
             true

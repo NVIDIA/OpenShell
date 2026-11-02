@@ -97,7 +97,13 @@ impl ComputeDriver for ComputeDriverService {
                     .validate_sandbox_create(&sandbox)
                     .await
                     .map_err(Status::from)?;
-                Ok(Response::new(ValidateSandboxCreateResponse {}))
+                Ok(Response::new(ValidateSandboxCreateResponse {
+                    ingress_admission: Some(openshell_core::proto::SandboxIngressAdmission {
+                        scope: openshell_core::proto::IngressScope::IsolatedLoopback as i32,
+                        all_ports: true,
+                        ports: Vec::new(),
+                    }),
+                }))
             })
             .await
     }

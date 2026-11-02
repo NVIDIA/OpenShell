@@ -900,6 +900,10 @@ message HealthResponse {
 
   // Service version.
   string version = 2;
+  // Gateway acknowledgement that sampled budget fields survive public writes
+  // and receive compute admission. This does not promise driver support.
+  // Budget-bearing clients must require true before writes to older gateways.
+  bool supports_sampled_resource_budget = 3;
 }
 
 // Current-user request. The identity comes from the authenticated request.
@@ -994,16 +998,23 @@ message ResourceCapabilities {
   CpuResourceCapabilities cpu = 1;
   MemoryResourceCapabilities memory = 2;
   GpuResourceCapabilities gpu = 3;
+  openshell.sandbox.v1.SampledResourceBudgetCapabilities sampled_budget = 4;
 }
 
 message CpuResourceCapabilities {
   // The driver accepts and enforces a portable CPU limit.
   bool limit_supported = 1;
+  // Required for a negotiated resource contract. Absence means unreported.
+  openshell.sandbox.v1.ResourceEnforcement limit_enforcement = 2;
+  openshell.sandbox.v1.ResourceEnforcement request_enforcement = 3;
 }
 
 message MemoryResourceCapabilities {
   // The driver accepts and enforces a portable memory limit.
   bool limit_supported = 1;
+  // Required for a negotiated resource contract. Absence means unreported.
+  openshell.sandbox.v1.ResourceEnforcement limit_enforcement = 2;
+  openshell.sandbox.v1.ResourceEnforcement request_enforcement = 3;
 }
 
 message GpuResourceCapabilities {
@@ -1079,6 +1090,8 @@ message SandboxSpec {
 message ResourceRequirements {
   // GPU requirements for the sandbox. Presence indicates a GPU request.
   GpuResourceRequirements gpu = 1;
+  // Explicit opt-in to weaker sampled budgets; never inferred from hard limits.
+  openshell.sandbox.v1.SampledResourceBudget sampled_budget = 2;
 }
 
 // Public GPU resource requirements.
@@ -1164,6 +1177,7 @@ message SandboxResources {
   // request. When count is omitted, the request uses the selected driver's
   // default GPU assignment behavior.
   GpuResourceRequirements gpu = 3;
+  openshell.sandbox.v1.SampledResourceBudget sampled_budget = 4;
 }
 
 message SandboxServiceLevel {
@@ -1222,6 +1236,13 @@ message SandboxStatus {
   // failures before a configured endpoint or credential could be selected.
   // Matching grant success or a policy, provider, or supervisor reset clears it.
   TokenGrantFailureObservation last_token_grant_failure = 17;
+  // Gateway-owned launch input, atomically captured with the generation claim.
+  // Retried and recovered launches reuse this input, even if desired policy changes.
+  openshell.sandbox.v1.SandboxLaunchPolicy launch_policy = 18;
+
+  // Gateway-retained immutable compute-driver ingress admission. Absence is
+  // legacy behavior only when the selected driver has not negotiated ingress.
+  openshell.sandbox.v1.SandboxIngressAdmission ingress_admission = 19;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -1303,6 +1324,9 @@ message CreateSandboxRequest {
   // registered after the sandbox has been persisted and route only while the
   // sandbox is ready.
   repeated SandboxServiceExposure service_exposures = 9;
+  // Requested local forward targets, checked before provisioning. This does
+  // not open a listener; clients establish the admitted forwards after create.
+  repeated uint32 forward_ports = 10;
 }
 
 message CreateSandboxTemplateRequest {
@@ -3008,6 +3032,12 @@ message ReportSandboxConfigurationRequest {
   SandboxConfigurationAdmission admission = 2;
   // Pending registration replaces only this previously observed instance.
   string expected_instance_id = 3;
+  // With a Rejected admission for the generation this instance already
+  // reported Accepted: the runtime refused it before the workload started, for
+  // example an isolation backend refusing Attach. The gateway then records the
+  // configuration as rejected instead of keeping the accepted state. Omitted or
+  // false keeps the accepted state; set with any other state is INVALID_ARGUMENT.
+  bool refused_before_start = 4;
 }
 
 message ReportSandboxConfigurationResponse {}

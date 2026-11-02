@@ -1978,6 +1978,16 @@ enum SandboxTemplateCommands {
         #[arg(long)]
         memory: Option<String>,
 
+        /// Sampled cumulative CPU-time budget (for example: 30s). Terminates on
+        /// observed excess; this is not a CPU-rate limit.
+        #[arg(long, value_name = "DURATION")]
+        cpu_time_budget: Option<String>,
+
+        /// Sampled account-wide resident-memory budget in bytes. Terminates on
+        /// observed excess; this is not a hard memory limit.
+        #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
+        resident_memory_budget_bytes: Option<u64>,
+
         /// Request GPU resources for sandboxes created from this template.
         ///
         /// Omit COUNT for the driver's default GPU selection, or pass COUNT
@@ -3737,6 +3747,8 @@ async fn run_async() -> Result<()> {
                                 image,
                                 cpu,
                                 memory,
+                                cpu_time_budget,
+                                resident_memory_budget_bytes,
                                 gpu,
                                 driver_config_json,
                                 ready_within,
@@ -3759,6 +3771,10 @@ async fn run_async() -> Result<()> {
                                     image.as_deref(),
                                     cpu.as_deref(),
                                     memory.as_deref(),
+                                    run::sampled_resource_budget(
+                                        cpu_time_budget.as_deref(),
+                                        resident_memory_budget_bytes,
+                                    )?,
                                     gpu_requirements,
                                     driver_config_json.as_deref(),
                                     ready_within.as_deref(),
@@ -6598,6 +6614,10 @@ mod tests {
             "2",
             "--memory",
             "4Gi",
+            "--cpu-time-budget",
+            "30s",
+            "--resident-memory-budget-bytes",
+            "1073741824",
             "--gpu",
             "1",
             "--driver-config-json",
@@ -6626,6 +6646,8 @@ mod tests {
                         image,
                         cpu,
                         memory,
+                        cpu_time_budget,
+                        resident_memory_budget_bytes,
                         gpu,
                         driver_config_json,
                         ready_within,
@@ -6638,6 +6660,8 @@ mod tests {
                     })),
                 ..
             }) => {
+                assert_eq!(cpu_time_budget.as_deref(), Some("30s"));
+                assert_eq!(resident_memory_budget_bytes, Some(1_073_741_824));
                 assert_eq!(name, "gpu-kata");
                 assert_eq!(image.as_deref(), Some("registry.example.com/agent:latest"));
                 assert_eq!(cpu.as_deref(), Some("2"));

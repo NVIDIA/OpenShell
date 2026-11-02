@@ -114,6 +114,7 @@ pub enum FakeComputeDriverCall {
         sandbox_name: String,
         isolation_backend: Option<openshell_core::proto::compute::v1::IsolationBackendRegistration>,
         launch_authentication: Vec<u8>,
+        launch_policy: Option<openshell_core::proto::SandboxLaunchPolicy>,
     },
     DeleteSandbox {
         sandbox_id: String,
@@ -130,6 +131,7 @@ pub struct FakeComputeDriver {
 #[derive(Debug)]
 struct FakeComputeDriverState {
     capabilities: GetCapabilitiesResponse,
+    ingress_admission: Option<openshell_core::proto::SandboxIngressAdmission>,
     sandboxes: HashMap<String, DriverSandbox>,
     calls: Vec<FakeComputeDriverCall>,
     traceparents: Vec<String>,
@@ -150,9 +152,19 @@ impl FakeComputeDriver {
     }
 
     #[must_use]
+    pub fn with_ingress_admission(
+        self,
+        admission: Option<openshell_core::proto::SandboxIngressAdmission>,
+    ) -> Self {
+        self.with_state(|state| state.ingress_admission = admission);
+        self
+    }
+
+    #[must_use]
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(FakeComputeDriverState {
+                ingress_admission: None,
                 capabilities: GetCapabilitiesResponse {
                     resource_admission_policy:
                         openshell_core::resource_admission::DriverAdmissionConfig::default()
@@ -166,6 +178,7 @@ impl FakeComputeDriver {
                     resource_capabilities: None,
                     rootfs_tar_staging_dir: String::new(),
                     rootfs_tar_max_bytes: 0,
+                    proxy_filesystem_baseline: None,
                     extension: Some(openshell_core::extension_protocol::extension_metadata(
                         openshell_core::extension_protocol::ExtensionFamily::Compute,
                         "openshell/fake-compute-driver",
@@ -218,6 +231,24 @@ impl FakeComputeDriver {
         self
     }
 
+    pub fn set_ingress_capability(&self, supported: bool) {
+        self.with_state(|state| {
+            let capabilities = &mut state
+                .capabilities
+                .extension
+                .as_mut()
+                .unwrap()
+                .supported_capabilities;
+            capabilities.retain(|capability| {
+                capability != openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION
+            });
+            if supported {
+                capabilities
+                    .push(openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION.into());
+            }
+        });
+    }
+
     #[must_use]
     pub fn calls(&self) -> Vec<FakeComputeDriverCall> {
         self.with_state(|state| state.calls.clone())
@@ -230,6 +261,22 @@ impl FakeComputeDriver {
 
     pub fn clear_calls(&self) {
         self.with_state(|state| state.calls.clear());
+    }
+
+    pub fn set_resource_contract(
+        &self,
+        supported: bool,
+        resources: Option<openshell_core::proto::compute::v1::ResourceCapabilities>,
+    ) {
+        self.with_state(|state| {
+            let metadata = state.capabilities.extension.as_mut().unwrap();
+            let capability = openshell_core::extension_protocol::COMPUTE_RESOURCE_CONTRACT;
+            metadata.supported_capabilities.retain(|c| c != capability);
+            if supported {
+                metadata.supported_capabilities.push(capability.into());
+            }
+            state.capabilities.resource_capabilities = resources;
+        });
     }
 
     pub fn set_admission_acknowledgement(&self, acknowledgement: String) {
@@ -342,7 +389,9 @@ impl ComputeDriver for FakeComputeDriver {
                     sandbox: request.sandbox,
                 });
         });
-        Ok(Response::new(ValidateSandboxCreateResponse {}))
+        Ok(Response::new(ValidateSandboxCreateResponse {
+            ingress_admission: self.with_state(|state| state.ingress_admission.clone()),
+        }))
     }
 
     async fn get_sandbox(
@@ -428,6 +477,7 @@ impl ComputeDriver for FakeComputeDriver {
                 sandbox_name: request.name,
                 isolation_backend: request.isolation_backend,
                 launch_authentication: request.launch_authentication,
+                launch_policy: request.launch_policy,
             });
         });
         Ok(Response::new(StartSandboxResponse::default()))

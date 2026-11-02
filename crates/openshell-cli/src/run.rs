@@ -650,7 +650,10 @@ pub async fn sandbox_create(
         None
     };
 
-    let resource_requirements = gpu_requirements.map(|gpu| ResourceRequirements { gpu: Some(gpu) });
+    let resource_requirements = gpu_requirements.map(|gpu| ResourceRequirements {
+        gpu: Some(gpu),
+        ..Default::default()
+    });
 
     let main_terminal = tty_override
         .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
@@ -701,6 +704,11 @@ pub async fn sandbox_create(
         )),
         await_main_process_attachment,
         workload_template: template.unwrap_or_default().to_string(),
+        forward_ports: forward
+            .as_ref()
+            .map(|spec| u32::from(spec.port))
+            .into_iter()
+            .collect(),
         service_exposures: expose
             .map(|target_port| SandboxServiceExposure {
                 service: String::new(),
@@ -2165,11 +2173,22 @@ pub async fn service_forward_tcp(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
+    let target_host = openshell_core::net::normalize_tcp_forward_host(target_host)
+        .map_err(|message| miette::miette!(message))?;
+    if target_port == 0 {
+        return Err(miette::miette!(
+            "tcp target port must be between 1 and 65535"
+        ));
+    }
     let (bind_addr, bind_port) = parse_tcp_forward_spec(local, target_port)?;
     let mut client = grpc_client(server, tls).await?;
 
-    let mut replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+    let (mut replica, scope) =
+        fetch_ready_sandbox_for_forward(&mut client, name, workspace, target_port).await?;
 
+    if scope == openshell_core::proto::IngressScope::SharedHostLoopback {
+        eprintln!("Target is an admitted shared-host loopback service.");
+    }
     let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), bind_port))
         .await
         .into_diagnostic()
@@ -2202,7 +2221,7 @@ pub async fn service_forward_tcp(
             }
 
             _ = health_check.tick() => {
-                replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+                replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace, target_port).await?.0;
             }
 
             accepted = listener.accept() => {
@@ -2213,7 +2232,7 @@ pub async fn service_forward_tcp(
                 let mut client = client.clone();
                 let sandbox_name = sandbox_name.clone();
                 let sandbox_workspace = sandbox_workspace.clone();
-                let target_host = target_host.to_string();
+                let target_host = target_host.clone();
                 let service_id = format!("service-forward:{name}:{target_host}:{target_port}");
                 let fatal_tx = fatal_tx.clone();
                 let legacy_session_tokens = legacy_session_tokens.clone();
@@ -2273,7 +2292,11 @@ async fn fetch_ready_sandbox_for_forward(
     client: &mut crate::tls::GrpcClient,
     name: &str,
     workspace: &str,
-) -> Result<Option<AsciiMetadataValue>> {
+    target_port: u16,
+) -> Result<(
+    Option<AsciiMetadataValue>,
+    openshell_core::proto::IngressScope,
+)> {
     let response = match client
         .get_sandbox(with_owner_hint(GetSandboxRequest {
             name: name.to_string(),
@@ -2306,7 +2329,17 @@ async fn fetch_ready_sandbox_for_forward(
         ));
     }
 
-    Ok(replica)
+    let scope = openshell_core::ingress::admit_port(
+        sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.ingress_admission.as_ref()),
+        u32::from(target_port),
+        false,
+    )
+    .map_err(|error| miette::miette!("{error}"))?;
+
+    Ok((replica, scope))
 }
 
 #[derive(Debug)]
@@ -3379,6 +3412,7 @@ pub async fn sandbox_template_create(
     image: Option<&str>,
     cpu: Option<&str>,
     memory: Option<&str>,
+    sampled_budget: Option<openshell_core::proto::sandbox::v1::SampledResourceBudget>,
     gpu_requirements: Option<GpuResourceRequirements>,
     driver_config_json: Option<&str>,
     ready_within: Option<&str>,
@@ -3391,7 +3425,11 @@ pub async fn sandbox_template_create(
     tls: &TlsOptions,
     suppress_credential_warnings: bool,
 ) -> Result<()> {
-    let resources = if cpu.is_some() || memory.is_some() || gpu_requirements.is_some() {
+    let resources = if cpu.is_some()
+        || memory.is_some()
+        || gpu_requirements.is_some()
+        || sampled_budget.is_some()
+    {
         Some(SandboxResources {
             cpu: cpu
                 .map(validate_cpu_quantity)
@@ -3402,6 +3440,7 @@ pub async fn sandbox_template_create(
                 .transpose()?
                 .unwrap_or_default(),
             gpu: gpu_requirements,
+            sampled_budget,
         })
     } else {
         None
@@ -3412,6 +3451,19 @@ pub async fn sandbox_template_create(
     let desired_service_level = build_template_service_level(ready_within, max_burst)?;
 
     let mut client = grpc_client(server, tls).await?;
+    if sampled_budget.is_some()
+        && !client
+            .health(openshell_core::proto::HealthRequest {})
+            .await
+            .into_diagnostic()?
+            .into_inner()
+            .supports_sampled_resource_budget
+    {
+        return Err(miette!(
+            "gateway does not acknowledge sampled resource budgets; upgrade it before creating this template"
+        ));
+    }
+
     let profile_catalog = fetch_provider_profile_catalog(&mut client, workspace)
         .await
         .unwrap_or_default();
@@ -3460,6 +3512,25 @@ pub async fn sandbox_template_create(
         template.object_name().bold()
     );
     Ok(())
+}
+
+pub fn sampled_resource_budget(
+    cpu_time: Option<&str>,
+    resident_bytes: Option<u64>,
+) -> Result<Option<openshell_core::proto::sandbox::v1::SampledResourceBudget>> {
+    if cpu_time.is_none() && resident_bytes.is_none() {
+        return Ok(None);
+    }
+    let budget = openshell_core::proto::sandbox::v1::SampledResourceBudget {
+        cpu_time: cpu_time
+            .map(parse_duration_to_ms)
+            .transpose()?
+            .map(duration_ms_to_proto),
+        resident_bytes,
+    };
+    openshell_core::resource_contract::validate_sampled_budget(&budget)
+        .map_err(|error| miette!("{error}"))?;
+    Ok(Some(budget))
 }
 
 fn build_template_service_level(
@@ -3690,6 +3761,12 @@ fn sandbox_template_to_json(template: &SandboxWorkloadTemplate) -> serde_json::V
                         .map_or_else(|| serde_json::json!("default"), serde_json::Value::from);
                     resources_json.insert("gpu".to_string(), value);
                 }
+                if let Some(budget) = &resources.sampled_budget {
+                    resources_json.insert("sampled_budget".into(), serde_json::json!({
+                        "cpu_time": budget.cpu_time.map(|d| serde_json::json!({"seconds": d.seconds.to_string(), "nanos": d.nanos})),
+                        "resident_bytes": budget.resident_bytes.map(|n| n.to_string()),
+                    }));
+                }
                 if !resources_json.is_empty() {
                     obj.insert(
                         "resources".to_string(),
@@ -3776,6 +3853,18 @@ fn print_sandbox_template_detail(template: &SandboxWorkloadTemplate) {
             workload.environment.len()
         );
         if let Some(resources) = &workload.resources {
+            if let Some(budget) = &resources.sampled_budget {
+                if let Some(cpu) = budget.cpu_time.as_ref() {
+                    println!(
+                        "  Sampled CPU-time budget: {}.{:09} s",
+                        cpu.seconds, cpu.nanos
+                    );
+                }
+                if let Some(resident) = budget.resident_bytes {
+                    println!("  Sampled resident-memory budget: {resident} bytes");
+                }
+                println!("  Budgets terminate on observed excess; sampling can overshoot.");
+            }
             println!(
                 "  {} {}",
                 "CPU:".dimmed(),
@@ -7026,6 +7115,36 @@ mod tests {
     };
     use openshell_core::proto::TcpForwardFrame;
 
+    #[tokio::test]
+    async fn forward_rejects_invalid_target_before_gateway_or_local_bind() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap().to_string();
+        for (host, port, message) in [
+            ("example.com", 8080, "tcp target host must be loopback"),
+            ("192.0.2.1", 8080, "tcp target host must be loopback"),
+            ("::ffff:127.0.0.1", 8080, "tcp target host must be loopback"),
+            ("", 8080, "tcp target host is required"),
+            (
+                "127.0.0.1",
+                0,
+                "tcp target port must be between 1 and 65535",
+            ),
+        ] {
+            let error = super::service_forward_tcp(
+                "invalid gateway",
+                "sandbox",
+                Some(&local),
+                host,
+                port,
+                &crate::tls::TlsOptions::default(),
+                "default",
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.to_string(), message);
+        }
+    }
+
     #[test]
     fn draft_approval_error_explains_refreshed_evaluation() {
         use super::draft_approval_error;
@@ -8118,6 +8237,7 @@ mod tests {
     fn provisioning_timeout_message_includes_condition_and_gpu_hint() {
         let resource_requirements = ResourceRequirements {
             gpu: Some(GpuResourceRequirements { count: None }),
+            ..Default::default()
         };
         let message = provisioning_timeout_message(
             120,
@@ -8139,7 +8259,10 @@ mod tests {
 
     #[test]
     fn provisioning_timeout_message_omits_gpu_hint_without_gpu_requirements() {
-        let resource_requirements = ResourceRequirements { gpu: None };
+        let resource_requirements = ResourceRequirements {
+            gpu: None,
+            ..Default::default()
+        };
         let message = provisioning_timeout_message(120, Some(&resource_requirements), None);
 
         assert_eq!(message, "sandbox provisioning timed out after 120s");

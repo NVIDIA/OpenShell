@@ -279,12 +279,16 @@ pub struct SandboxSpec {
     /// Request a GPU. Driver-specific device selection is configured via
     /// driver config on the raw proto surface (see [`crate::raw`]).
     pub gpu: bool,
+    /// Explicit sampled account-wide budgets, distinct from hard resource limits.
+    pub sampled_budget: Option<proto::sandbox::v1::SampledResourceBudget>,
     /// Exact canonical command. Empty selects the gateway's scratch login shell.
     pub command: Vec<String>,
     /// Allocate a retained pseudo-terminal for the canonical command.
     pub tty: bool,
     /// Loopback HTTP services to expose when the sandbox is created.
     pub service_exposures: Vec<ServiceExposure>,
+    /// Target ports to admit before provisioning; does not open listeners.
+    pub forward_ports: Vec<u16>,
     /// Restart behavior after the canonical main process exits.
     pub restart_policy: SandboxRestartPolicy,
 }
@@ -336,6 +340,8 @@ pub struct SandboxTemplateCreateSpec {
     pub tty: bool,
     /// Loopback HTTP services to expose when the sandbox is created.
     pub service_exposures: Vec<ServiceExposure>,
+    /// Target ports to admit before provisioning; does not open listeners.
+    pub forward_ports: Vec<u16>,
     /// Create-time sandbox policy. The named workload template supplies runtime
     /// workload fields; policy remains part of the sandbox's governance spec.
     pub policy: Option<proto::SandboxPolicy>,
@@ -377,6 +383,8 @@ pub struct SandboxTemplateListOptions {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct SandboxRef {
+    /// Immutable compute-admitted ingress envelope, absent on legacy gateways.
+    pub ingress_admission: Option<proto::SandboxIngressAdmission>,
     pub id: String,
     pub name: String,
     pub workspace: String,
@@ -432,6 +440,10 @@ impl SandboxRef {
             });
         let meta = sandbox.metadata.unwrap_or_default();
         Self {
+            ingress_admission: sandbox
+                .status
+                .as_ref()
+                .and_then(|status| status.ingress_admission.clone()),
             id: meta.id,
             name: meta.name,
             workspace: meta.workspace,
