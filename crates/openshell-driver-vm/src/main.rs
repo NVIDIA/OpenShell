@@ -306,9 +306,7 @@ fn main() -> Result<()> {
 
 fn run_internal_vm(args: &Args) -> Result<()> {
     ensure_vm_worker_outside_tokio()?;
-    // This launcher can temporarily change cwd while libkrun loads firmware.
-    // Keep it outside Tokio so no runtime worker resolves a path during that
-    // process-wide change. It also forks libkrun before any Tokio threads exist.
+    // libkrun forks its worker before any Tokio threads exist.
     maybe_reexec_internal_vm_with_runtime_env()?;
     let config = build_vm_launch_config(args).map_err(|err| miette::miette!("{err}"))?;
     run_vm(&config).map_err(|err| miette::miette!("{err}"))

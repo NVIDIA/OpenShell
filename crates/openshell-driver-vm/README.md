@@ -339,13 +339,14 @@ so driver choice remains automatic unless the user explicitly overrides it.
 
 For organization-signed macOS packages, `OPENSHELL_VM_RUNTIME_DIR` selects a
 separately signed runtime instead of extracting the embedded libraries. The
-managed VM worker temporarily uses this directory as its working directory
-while libkrun opens `libkrunfw.5.dylib` by name, then restores its original
-working directory. This avoids `DYLD_*` loader variables for the override and
-leaves the embedded runtime path unchanged. The directory must contain
-`libkrun.dylib` and `libkrunfw.5.dylib` from the matching VM runtime build;
-keep it writable only by administrators. See the
-[macOS re-signing recipe](../../docs/how-it-works/sandboxes/runtimes.mdx#re-sign-the-macos-vm-driver).
+driver resolves both dylibs to canonical absolute paths inside that directory
+and passes the firmware path to libkrun before creating a VM context. This
+avoids `DYLD_*` loader variables and process-wide working-directory changes.
+The runtime must be built with the `krun_set_fw_path` entry point added by
+`build-libkrun-macos.sh`; older runtime archives lack it and are rejected.
+The directory must contain `libkrun.dylib` and `libkrunfw.5.dylib` from
+the matching VM runtime build. Keep it writable only by administrators. See
+the [macOS re-signing recipe](../../docs/how-it-works/sandboxes/runtimes.mdx#re-sign-the-macos-vm-driver).
 
 ## TODOs
 
