@@ -11,8 +11,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::l7::request_delivery::{RequestDelivery, RequestDeliveryState};
 use futures::FutureExt as _;
-use openshell_supervisor_middleware::{HttpBodyOutput, HttpPipelineFinish};
+use openshell_supervisor_middleware::{HttpBodyOutput, HttpPipelineFinish, HttpRequestFailureKind};
 
 use super::*;
 
@@ -541,28 +542,38 @@ fn commit_live_head(
 pub enum LiveRequestFailure {
     /// Request middleware rejected or failed the body.
     #[error("{reason}")]
+    #[diagnostic(help("local upstream delivery: {delivery:?}"))]
     Middleware {
+        #[source]
+        kind: Option<HttpRequestFailureKind>,
+        delivery: RequestDeliveryState,
         reason: String,
         denial: Option<openshell_supervisor_middleware::MiddlewareDenial>,
         failure: Option<openshell_supervisor_middleware::MiddlewareFailureDetail>,
     },
     /// The sandbox stopped sending the request body.
     #[error("request body client progress timeout")]
-    ClientTimeout,
+    #[diagnostic(help("local upstream delivery: {delivery:?}"))]
+    ClientTimeout { delivery: RequestDeliveryState },
 }
 
 /// The upstream stopped accepting the request body. It may have answered
 /// before it stopped reading, for example with 413.
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
 #[error("upstream stopped accepting the request body: {detail}")]
+#[diagnostic(help("local upstream delivery: {delivery:?}"))]
 pub struct UpstreamWriteFailed {
+    #[source]
+    kind: HttpRequestFailureKind,
     detail: String,
+    delivery: RequestDeliveryState,
 }
 
 /// Upstream write half that records whether a write failed.
 struct UpstreamWrites<'a, W> {
     inner: &'a mut W,
     failed: &'a AtomicBool,
+    delivery: &'a RequestDelivery,
 }
 
 impl<W> UpstreamWrites<'_, W> {
@@ -584,6 +595,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for UpstreamWrites<'_, W> {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+        if !buf.is_empty() {
+            this.delivery.start();
+        }
         let result = std::pin::Pin::new(&mut *this.inner).poll_write(cx, buf);
         this.record(result)
     }
@@ -761,18 +775,26 @@ where
     U: AsyncWrite + Unpin,
 {
     let failed = AtomicBool::new(false);
+    let delivery = body.delivery.clone();
     let mut upstream = UpstreamWrites {
         inner: upstream,
         failed: &failed,
+        delivery: &delivery,
     };
     let uploaded = upload_live_body(head, body, client, &mut upstream, options, &failed).await;
     match uploaded {
         Err(error) if failed.load(Ordering::Acquire) => {
             Err(miette::Report::new(UpstreamWriteFailed {
+                kind: HttpRequestFailureKind::Io,
                 detail: error.to_string(),
+                delivery: delivery.state(),
             }))
         }
-        uploaded => uploaded,
+        Ok(()) => {
+            delivery.complete();
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -964,15 +986,66 @@ mod tests {
         let (mut upstream, peer) = tokio::io::duplex(16);
         drop(peer);
         let failed = AtomicBool::new(false);
+        let delivery = RequestDelivery::default();
         let mut writes = UpstreamWrites {
             inner: &mut upstream,
             failed: &failed,
+            delivery: &delivery,
         };
         writes
             .write_all(b"body")
             .await
             .expect_err("the upstream closed");
         assert!(failed.load(Ordering::Acquire));
+        assert_eq!(delivery.state(), RequestDeliveryState::Started);
+    }
+
+    #[tokio::test]
+    async fn partial_upstream_write_retains_started_delivery() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        struct PartialWriter(Vec<u8>);
+        impl AsyncWrite for PartialWriter {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                if self.0.is_empty() {
+                    self.0.extend_from_slice(&bytes[..2]);
+                    Poll::Ready(Ok(2))
+                } else {
+                    Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+                }
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let delivery = RequestDelivery::default();
+        let failed = AtomicBool::new(false);
+        let mut upstream = PartialWriter(Vec::new());
+        assert_eq!(delivery.state(), RequestDeliveryState::NotStarted);
+        let mut writes = UpstreamWrites {
+            inner: &mut upstream,
+            failed: &failed,
+            delivery: &delivery,
+        };
+        writes
+            .write_all(b"POST / HTTP/1.1\r\n\r\n")
+            .await
+            .expect_err("partial write");
+        assert_eq!(upstream.0, b"PO");
+        assert!(failed.load(Ordering::Acquire));
+        assert_eq!(delivery.state(), RequestDeliveryState::Started);
     }
 
     #[tokio::test]

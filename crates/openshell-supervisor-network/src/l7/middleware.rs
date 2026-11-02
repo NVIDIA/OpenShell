@@ -15,8 +15,8 @@ use openshell_ocsf::{
 };
 use openshell_supervisor_middleware::{
     ChainHttpHookVersion, HttpBodyInput, HttpBodyOutput, HttpFailureCode, HttpMiddlewareFailure,
-    HttpPipelineFinish, HttpRequestPipeline, HttpRequestPreflightInput, HttpStageDiagnostics,
-    MiddlewareFailureDetail,
+    HttpPipelineFinish, HttpRequestFailureKind, HttpRequestPipeline, HttpRequestPreflightInput,
+    HttpStageDiagnostics, MiddlewareFailureDetail,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1082,6 +1082,7 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
         return Ok(MiddlewareApplyResult::Streamed {
             request,
             body: Box::new(RequestBodyStream {
+                delivery: super::request_delivery::RequestDelivery::default(),
                 reader,
                 session: Some(session),
                 events,
@@ -1133,7 +1134,10 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
                 false,
                 "middleware_failed: request_output_over_capacity",
                 None,
-                HttpStageDiagnostics::default(),
+                HttpStageDiagnostics {
+                    failure_kind: Some(HttpRequestFailureKind::Capacity),
+                    ..Default::default()
+                },
             );
             return Ok(MiddlewareApplyResult::Denied {
                 denial: None,
@@ -1396,7 +1400,10 @@ impl RequestEvents {
                     false,
                     "middleware_cancelled: client_progress_timeout",
                     None,
-                    HttpStageDiagnostics::default(),
+                    HttpStageDiagnostics {
+                        failure_kind: Some(HttpRequestFailureKind::RequestBodyTimeout),
+                        ..Default::default()
+                    },
                 );
                 Ok(MiddlewareApplyResult::RequestTimeout)
             }
@@ -1405,9 +1412,12 @@ impl RequestEvents {
                     false,
                     "middleware_cancelled: request_body_read_failed",
                     None,
-                    HttpStageDiagnostics::default(),
+                    HttpStageDiagnostics {
+                        failure_kind: Some(HttpRequestFailureKind::Io),
+                        ..Default::default()
+                    },
                 );
-                Err(error)
+                Err(error.wrap_err(HttpRequestFailureKind::Io))
             }
         }
     }
@@ -1415,6 +1425,7 @@ impl RequestEvents {
 
 /// A request body that request middleware streams to the upstream.
 pub struct RequestBodyStream {
+    pub(crate) delivery: super::request_delivery::RequestDelivery,
     reader: crate::l7::rest::RequestBodyReader,
     session: Option<HttpRequestPipeline>,
     events: RequestEvents,
@@ -1492,11 +1503,13 @@ impl RequestBodyStream {
                 if failure.end_reason == MiddlewareSessionEndReason::Cancellation
                     && upstream_failed.load(Ordering::Acquire) =>
             {
+                let mut diagnostics = *failure.diagnostics;
+                diagnostics.failure_kind = Some(HttpRequestFailureKind::Io);
                 self.events.emit(
                     false,
                     "middleware_cancelled: upstream_write_failed",
                     None,
-                    *failure.diagnostics,
+                    diagnostics,
                 );
                 return Err(miette!("upstream stopped accepting the request body"));
             }
@@ -1504,11 +1517,15 @@ impl RequestBodyStream {
         };
         let failure = match &error {
             BodyRunError::Middleware(failure) => crate::l7::rest::LiveRequestFailure::Middleware {
+                kind: failure.kind,
+                delivery: self.delivery.state(),
                 reason: failure.reason.clone(),
                 denial: failure.denial.clone(),
                 failure: failure.failure.as_deref().cloned(),
             },
-            BodyRunError::ClientTimeout => crate::l7::rest::LiveRequestFailure::ClientTimeout,
+            BodyRunError::ClientTimeout => crate::l7::rest::LiveRequestFailure::ClientTimeout {
+                delivery: self.delivery.state(),
+            },
             BodyRunError::Client(_) => {
                 return self.events.body_failed(error).map(|_| unreachable!());
             }
@@ -1523,7 +1540,10 @@ impl RequestBodyStream {
             false,
             &format!("middleware_cancelled: {reason}"),
             None,
-            HttpStageDiagnostics::default(),
+            HttpStageDiagnostics {
+                failure_kind: Some(HttpRequestFailureKind::Cancelled),
+                ..Default::default()
+            },
         );
     }
 }
@@ -1539,7 +1559,6 @@ pub(super) fn request_middleware_events(
     denial: Option<&openshell_supervisor_middleware::MiddlewareDenial>,
     diagnostics: &HttpStageDiagnostics,
 ) -> Vec<openshell_ocsf::OcsfEvent> {
-    let applied = diagnostics.applied();
     let req = crate::l7::provider::L7Request {
         action: action.to_string(),
         target: target.to_string(),
@@ -1550,17 +1569,27 @@ pub(super) fn request_middleware_events(
     middleware_events(
         ctx,
         &req,
-        &openshell_supervisor_middleware::ChainOutcome {
-            allowed,
-            reason: reason.to_string(),
-            body: Vec::new(),
-            header_mutations: Vec::new(),
-            findings: diagnostics.findings.clone(),
-            metadata: diagnostics.metadata.clone(),
-            applied,
-            denial: denial.cloned(),
-        },
+        &request_middleware_outcome(allowed, reason, denial, diagnostics),
     )
+}
+
+fn request_middleware_outcome(
+    allowed: bool,
+    reason: &str,
+    denial: Option<&openshell_supervisor_middleware::MiddlewareDenial>,
+    diagnostics: &HttpStageDiagnostics,
+) -> openshell_supervisor_middleware::ChainOutcome {
+    openshell_supervisor_middleware::ChainOutcome {
+        failure_kind: diagnostics.failure_kind,
+        allowed,
+        reason: reason.to_string(),
+        body: Vec::new(),
+        header_mutations: Vec::new(),
+        findings: diagnostics.findings.clone(),
+        metadata: diagnostics.metadata.clone(),
+        applied: diagnostics.applied(),
+        denial: denial.cloned(),
+    }
 }
 
 /// The sandbox stopped sending a request body that DUPLEX request
@@ -1605,7 +1634,10 @@ pub(super) fn mixed_protocol_events(
     target: &str,
     chain: &[openshell_supervisor_middleware::DescribedChainEntry],
 ) -> Vec<openshell_ocsf::OcsfEvent> {
-    let mut diagnostics = HttpStageDiagnostics::default();
+    let mut diagnostics = HttpStageDiagnostics {
+        failure_kind: Some(HttpRequestFailureKind::InvalidResult),
+        ..Default::default()
+    };
     if let Some(entry) = chain.iter().find(|entry| {
         entry.http_hook_version() == Some(openshell_supervisor_middleware::HttpHookVersion::Current)
     }) {
@@ -1614,6 +1646,7 @@ pub(super) fn mixed_protocol_events(
             .push(openshell_supervisor_middleware::HttpStageInvocation {
                 config_name: entry.config_name().to_string(),
                 implementation: entry.implementation().to_string(),
+                failure_kind: Some(HttpRequestFailureKind::InvalidResult),
                 outcome: openshell_supervisor_middleware::HttpStageOutcome::FailClosed,
                 input_bytes: 0,
                 output_bytes: None,
@@ -2918,6 +2951,42 @@ mod tests {
                 safe_middleware_headers(headers).is_err(),
                 "middleware must reject malformed header fields"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod failure_cause_tests {
+    use super::*;
+    #[test]
+    fn request_terminal_cause_survives_successful_stage_records() {
+        for kind in [
+            HttpRequestFailureKind::RequestBodyTimeout,
+            HttpRequestFailureKind::Cancelled,
+        ] {
+            let diagnostics = HttpStageDiagnostics {
+                failure_kind: Some(kind),
+                invocations: vec![openshell_supervisor_middleware::HttpStageInvocation {
+                    failure_kind: None,
+                    config_name: "guard".into(),
+                    implementation: "test/guard".into(),
+                    outcome: openshell_supervisor_middleware::HttpStageOutcome::Duplex,
+                    input_bytes: 0,
+                    output_bytes: None,
+                    transformed: false,
+                    failed: false,
+                    reason_code: None,
+                    failure_reason: None,
+                }],
+                ..Default::default()
+            };
+            let outcome =
+                request_middleware_outcome(false, "unchanged diagnostic", None, &diagnostics);
+            assert_eq!(outcome.failure_kind, Some(kind));
+            assert!(!outcome.allowed);
+            assert!(outcome.denial.is_none());
+            assert!(!outcome.applied[0].failed);
+            assert_eq!(outcome.applied[0].failure_kind, None);
         }
     }
 }
