@@ -357,9 +357,9 @@ reruns without overwriting earlier evidence.
 summarize PRs since the previous stable tag. Prereleases retain a `release-notes`
 artifact, with advisory failures. Stable releases publish the promoted
 prerelease's preview with the prerelease tag replaced by the stable tag. If that
-preview is missing or expired, stable publication generates new notes and
-requires generation to succeed. The promotion summary states whether notes were
-reused or regenerated. Configure the `LLM_INFERENCE_API_KEY` Actions secret and
+preview is missing or expired, the Release workflow's notes job generates new
+notes and requires generation to succeed before publishing. That job's summary
+states whether notes were reused or regenerated. Configure the `LLM_INFERENCE_API_KEY` Actions secret and
 the `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL` Actions variables.
 
 To preview notes without building or publishing:
@@ -421,7 +421,9 @@ same run; the promotion record links to the attempt that produced that evidence.
 Release rebuilds all stable artifacts with the stable version and publishes
 without rerunning qualification. These artifacts have different embedded versions
 from the qualified prerelease. Existing stable tags are never moved; a retry must
-resolve to the same qualified candidate.
+resolve to the same qualified candidate. A retry rebuilds, then publishes only what
+is missing: it keeps published GHCR version tags, Helm charts, GitHub Release assets,
+npm versions, and PyPI versions. Snap uploads are not skipped.
 
 Stable image builds save multi-platform OCI archives as workflow artifacts without
 pushing to GHCR. Publication copies those archives, including their attestations,
@@ -685,12 +687,12 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | File | Role |
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
-| `.github/workflows/release.yml` | Manually promote the latest qualified prerelease for a version and branch, create its stable tag, then rebuild and publish. Support releases preserve shared latest channels. Publishes the prerelease's notes preview, retagged, or generates notes when it is unavailable. The notes-only mode generates a release notes preview artifact. |
+| `.github/workflows/release.yml` | Manually promote the latest qualified prerelease for a version and branch, create its stable tag, then rebuild and publish. Support releases preserve shared latest channels. Publishes the prerelease's notes preview, retagged, or generates notes when it is unavailable. The notes-only mode generates a release notes preview artifact. Published artifacts are never overwritten: a rerun fills in what is missing, and a bad published artifact is fixed by releasing a new patch version. |
 | `.github/workflows/release-auto-tag.yml` | Weekdays at 14:00 Europe/Zurich, tags the next `-pre.N` on `main` when commits landed since the latest one, then dispatches Pre-release. It skips when the train has no `-pre.1` or its version is already stable, so push each train's `-pre.1` tag by hand. |
 | `.github/workflows/release-prerelease.yml` | Pre-release orchestrator, triggered by prerelease tag pushes or dispatched by Release Auto-Tag or manually. A tagless dispatch creates the next candidate on its branch; explicit tags select existing candidates. Builds, then publishes and qualifies in parallel. Qualification failure fails the run and sends the failure notification; published artifacts remain available. |
 | `.github/workflows/release-build.yml` | Shared version computation, binary and image builds, and package builds. Validates that the tag matches the caller's release kind. |
 | `.github/workflows/release-publish.yml` | Shared artifact assembly, OCI image tags and Helm chart publication, and package publication. Stable releases also publish to GitHub Releases, snap, npm, PyPI, and Fern. |
-| `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by prerelease previews, notes-only previews, and stable publication when no preview is reused. |
+| `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by prerelease previews, notes-only previews, and stable releases. Stable releases reuse the promoted prerelease's preview when available. |
 | `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev, Release, and Pre-release without Store credentials or publication. |
 | `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts directly to a Store channel without rebuilding. Release Dev uses `latest/edge`, Pre-release uses `latest/beta`, and Release uses `latest/stable` for the stable rebuild. Uploads queue per channel and architecture, so tagged beta and stable jobs recheck repository tags after earlier publication finishes and before updating their floating channels. Manual dispatch uploads the `snap-linux-*` artifacts from `artifact-run-id`. |

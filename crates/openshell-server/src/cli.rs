@@ -601,6 +601,15 @@ fn prepare_server_config_with_drivers(
         .map_err(|error| miette::miette!("invalid service routing configuration: {error}"))?;
 
     config.enable_sandbox_updates = args.enable_sandbox_updates;
+
+    config.supervisor_app_listener = file
+        .as_ref()
+        .map(|f| f.openshell.supervisor.app_listener.clone())
+        .unwrap_or_default();
+    config
+        .supervisor_app_listener
+        .validate()
+        .map_err(|e| miette::miette!(e))?;
     if let Some(sources) = file
         .as_ref()
         .and_then(|file| file.openshell.gateway.provider_profile_sources.clone())
@@ -851,8 +860,13 @@ async fn run_from_args(
     } else if let Some(otlp) = &otlp_export {
         info!(
             traces_endpoint = otlp.traces_endpoint().map(tracing::field::display),
+            traces_protocol = otlp
+                .traces_endpoint()
+                .map(|_| tracing::field::display(otlp.traces_protocol())),
             ocsf_endpoint = otlp.ocsf_endpoint().map(tracing::field::display),
+            ocsf_protocol = otlp.ocsf_protocol().map(tracing::field::display),
             agent_endpoint = otlp.agent_endpoint().map(tracing::field::display),
+            agent_protocol = otlp.agent_protocol().map(tracing::field::display),
             "OTLP exporting enabled"
         );
     }

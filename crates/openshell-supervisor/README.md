@@ -117,7 +117,7 @@ Console JSON is installed independently of optional file appenders and uses an I
 
 ## OTLP agent trace relay
 
-The `otlp_relay` module forwards the workload's OTLP/HTTP protobuf trace exports to the collector named by `OPENSHELL_OTLP_AGENT_ENDPOINT`. The gateway sets that variable only when `[openshell.gateway.otlp.agent]` is enabled, so trace export alone leaves the relay inactive. Metrics and logs exports to the relay are acknowledged and discarded. The workload exports to the reserved address `192.0.0.8:4318`; the sandbox broker stages that connection to the supervisor, and the network proxy hands the stream to the relay's HTTP/1.1 receiver through the generic reserved-destination hook instead of evaluating policy. The receiver replaces the `openshell.sandbox.id` and `openshell.telemetry.source=agent` resource attributes, pushes the re-encoded batch into a bounded buffer, and a single export task forwards batches over OTLP/gRPC with a lazy connection.
+The `otlp_relay` module forwards the workload's OTLP/HTTP protobuf trace exports to the collector named by `OPENSHELL_OTLP_AGENT_ENDPOINT`, over the transport named by `OPENSHELL_OTLP_AGENT_PROTOCOL` (`grpc` when unset, or `http/protobuf`). The gateway sets those variables only when `[openshell.gateway.otlp.agent]` is enabled, so trace export alone leaves the relay inactive. Metrics and logs exports to the relay are acknowledged and discarded. The workload exports to the reserved address `192.0.0.8:4318`; the sandbox broker stages that connection to the supervisor, and the network proxy hands the stream to the relay's HTTP/1.1 receiver through the generic reserved-destination hook instead of evaluating policy. The receiver replaces the `openshell.sandbox.id` and `openshell.telemetry.source=agent` resource attributes, pushes the re-encoded batch into a bounded buffer, and a single export task forwards the encoded batches to the collector with a lazy connection.
 
 Limits are fixed: 2 MiB per request body, at most 512 `ResourceSpans` entries, 256 KiB of encoded `Resource` fields, and 8192 resource attributes per request (each of these answers 413), a 10 second header-read timeout, 16 concurrent connections, 32 buffered batches, and a 5 second deadline per export attempt. Only the resources are decoded; spans are copied byte for byte, at most two requests at a time. Worst-case memory attributable to the agent is about 67 MiB of buffered batches, plus 32 MiB of bodies awaiting enrichment across the 16 connections, plus about 12 MiB for the two enrichments in progress, plus about 4 MiB for the batch being exported and its encoded copy. A full buffer answers 503 with `Retry-After`. Without an agent endpoint nothing starts and the proxy refuses the relay address. After the agent exits, `run_sandbox_with_backend` flushes buffered batches for up to 5 seconds before it reports the exit to the gateway, then logs a final summary of rejected and failed counts. Flushes skip the wait while the most recent export failed, and batches still pending when the relay is dropped without a flush count as failed. The supervisor tells the sandbox runtime through `AgentSpec::otlp_relay_active` whether the relay runs, and the runtime injects the generic `OTEL_EXPORTER_OTLP_*` defaults only then.
 
@@ -257,3 +257,41 @@ cannot export each instance's records with that instance's collector headers and
 identity. Its console logs and each instance's gateway log push remain, and the
 Kubernetes driver warns at startup when the gateway configures supervisor
 export.
+
+## Application listener
+
+The opt-in application TLS listener serves declared HTTP/1.1 and WebSocket
+services through each sandbox instance's `BoundaryLoopbackConnector`. The host
+binds one listener and dispatches accepted TLS streams by SNI to a bounded queue
+on the owning instance's runtime. That runtime owns request handling, credentials,
+policy state, limits, and OCSF context. Stopping an instance unregisters only its
+routes and closes its streams; it does not stop another instance's ingress.
+
+Gateway configuration snapshots carry the declared-service allowlist. Successful
+poll and push application installs that allowlist; rejected configuration
+suspends it. Polling renews a 30-second freshness lease. In push mode, an accepted
+live supervisor session renews already installed, unexpired routes even when no
+configuration changes. Rejection or a lease lapse cannot revive an old stream.
+With the listener enabled, both polling and push maintenance cap their sleep at
+five seconds, even if the configured polling interval is longer. Failed polls
+do not renew routes. Ending the configuration loop suspends routes.
+
+`OPENSHELL_APP_LISTENER_ENABLED=true` explicitly enables the process listener.
+`OPENSHELL_APP_LISTEN_ADDRESS`, `OPENSHELL_APP_SERVICE_DOMAIN`,
+`OPENSHELL_APP_TLS_CERT`, and `OPENSHELL_APP_TLS_KEY` are then required. Hosted
+instances receive the process router explicitly and never read another
+instance's configuration from process environment. TLS configuration uses
+`openshell-crypto`; certificates are read at process startup. Restart the
+supervisor to reload application certificates.
+
+This path uses application or trusted-edge authentication independently from
+gateway authentication. It validates Host against SNI, preserves public
+Host/Origin and application cookies, strips gateway/edge identity material, and
+retains service-specific bearer passthrough. Hop-by-hop headers are removed from
+requests and responses, preserving successful WebSocket upgrades. An application
+closing its upstream HTTP connection does not close the client connection.
+It has no discovery API or public
+URL selection. Dedicated and shared supervisors expose the app listener on their
+Pod IPs without app Services. Clients must select the member owning their
+sandbox. HA takeover may preserve the workload generation; existing ingress streams
+are not migrated. Runtime ownership fencing must reject stale connectors.

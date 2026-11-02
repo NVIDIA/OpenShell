@@ -201,25 +201,16 @@ pub struct DockerComputeConfig {
     /// Gateway gRPC endpoint the sandbox connects back to.
     pub grpc_endpoint: String,
 
-    /// OTLP/gRPC collector endpoint passed to supervisors. The gateway
-    /// supplies its own export endpoint; driver TOML cannot set it.
-    #[serde(skip)]
-    pub supervisor_otlp_endpoint: Option<String>,
     /// Networking mode for the supervisor only. Workloads always use network=none.
     pub supervisor_network_mode: DockerSupervisorNetworkMode,
 
     /// Override the trusted host address. Bridge mode otherwise resolves Docker's host-gateway.
     pub host_gateway_ip: Option<IpAddr>,
 
-    /// OCSF event export passed to supervisors. The gateway supplies its own
-    /// export; driver TOML cannot set it.
+    /// OTLP exports passed to supervisors. The gateway supplies them from
+    /// `[otlp]`; driver TOML cannot set them.
     #[serde(skip)]
-    pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
-
-    /// OTLP/gRPC collector that supervisors relay workload traces to. The
-    /// gateway supplies it from `[otlp.agent]`; driver TOML cannot set it.
-    #[serde(skip)]
-    pub supervisor_otlp_agent_endpoint: Option<String>,
+    pub supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp,
 
     /// Gateway name passed to supervisors for their telemetry. The gateway
     /// supplies its own name; driver TOML cannot set it.
@@ -324,11 +315,9 @@ impl Default for DockerComputeConfig {
             image_pull_policy: ImagePullPolicy::default(),
             sandbox_label: "default".to_string(),
             grpc_endpoint: String::new(),
-            supervisor_otlp_endpoint: None,
             supervisor_network_mode: DockerSupervisorNetworkMode::Host,
             host_gateway_ip: None,
-            supervisor_ocsf_export: None,
-            supervisor_otlp_agent_endpoint: None,
+            supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp::default(),
             supervisor_gateway_name: None,
             sandbox_runtime_image: None,
             supervisor_bin: None,
@@ -364,13 +353,11 @@ struct DockerDriverRuntimeConfig {
     sandbox_binary: Arc<Vec<u8>>,
     supervisor_image_id: String,
     supervisor_grpc_endpoint: String,
-    supervisor_otlp_endpoint: Option<String>,
     supervisor_network_mode: DockerSupervisorNetworkMode,
     supervisor_endpoint_explicit: bool,
     bridge_default_endpoint: Option<String>,
     host_gateway_ip: Option<IpAddr>,
-    supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
-    supervisor_otlp_agent_endpoint: Option<String>,
+    supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp,
     supervisor_gateway_name: Option<String>,
     ssh_socket_path: String,
     guest_tls: Option<DockerGuestTlsPaths>,
@@ -1027,15 +1014,11 @@ impl DockerComputeDriver {
                 sandbox_binary,
                 supervisor_image_id,
                 supervisor_grpc_endpoint,
-                supervisor_otlp_endpoint: docker_config.supervisor_otlp_endpoint.clone(),
+                supervisor_otlp: docker_config.supervisor_otlp.clone(),
                 supervisor_network_mode: docker_config.supervisor_network_mode,
                 supervisor_endpoint_explicit,
                 bridge_default_endpoint,
                 host_gateway_ip,
-                supervisor_ocsf_export: docker_config.supervisor_ocsf_export.clone(),
-                supervisor_otlp_agent_endpoint: docker_config
-                    .supervisor_otlp_agent_endpoint
-                    .clone(),
                 supervisor_gateway_name: docker_config.supervisor_gateway_name.clone(),
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 guest_tls,
@@ -5970,30 +5953,19 @@ fn docker_child_environment(sandbox: &DriverSandbox) -> HashMap<String, String> 
 /// trace, OCSF events, and relayed workload traces, identifying the gateway
 /// that launched it.
 fn supervisor_otlp_environment(config: &DockerDriverRuntimeConfig) -> Vec<String> {
-    let traces = config.supervisor_otlp_endpoint.iter().flat_map(|endpoint| {
-        std::iter::once((openshell_core::sandbox_env::OTLP_ENDPOINT, endpoint.clone()))
-            .chain(openshell_otel::current_trace_context_environment())
-    });
-    let ocsf = config
-        .supervisor_ocsf_export
+    let exports = config.supervisor_otlp.environment();
+    let trace_context = config
+        .supervisor_otlp
+        .traces
         .iter()
-        .flat_map(openshell_core::sandbox_env::OcsfOtlpExport::environment);
-    let agent = config
-        .supervisor_otlp_agent_endpoint
-        .iter()
-        .map(|endpoint| {
-            (
-                openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT,
-                endpoint.clone(),
-            )
-        });
+        .flat_map(|_| openshell_otel::current_trace_context_environment());
     let gateway_name = config
         .supervisor_gateway_name
         .iter()
         .map(|name| (openshell_core::sandbox_env::GATEWAY_NAME, name.clone()));
-    traces
-        .chain(ocsf)
-        .chain(agent)
+    exports
+        .into_iter()
+        .chain(trace_context)
         .chain(gateway_name)
         .map(|(name, value)| format!("{name}={value}"))
         .collect()

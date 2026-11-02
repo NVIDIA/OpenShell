@@ -20,7 +20,7 @@ OpenShell produces three kinds of observability signals: traces, metrics, and OC
 
 The examples on this page are `gateway.toml` tables. In the Helm chart, set each table under `gatewayConfig`, as described in [Configure Chart Values](/kubernetes/setup#configure-chart-values).
 
-All OTLP export uses OTLP over gRPC. Configure it in `gateway.toml`, and the gateway passes the settings to the sandbox supervisors it starts. Supervisors connect to the collector directly, so the collector must be reachable from sandboxes as well as from the gateway. The gateway ignores the `OTEL_*` variables that would choose which signals are exported or where they go, and honors those that tune export, such as sampling. Refer to [Tuning](/how-it-works/gateways/configuration#tuning) for the full list.
+OTLP export uses gRPC by default, or HTTP/protobuf for collectors that set it. Configure it in `gateway.toml`, and the gateway passes the settings to the sandbox supervisors it starts. Supervisors connect to the collector directly, so the collector must be reachable from sandboxes as well as from the gateway. The gateway ignores the `OTEL_*` variables that would choose which signals are exported or where they go, and honors those that tune export, such as sampling. Refer to [Tuning](/how-it-works/gateways/configuration#tuning) for the full list.
 
 ## Traces
 

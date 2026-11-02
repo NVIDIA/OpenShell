@@ -735,29 +735,18 @@ fn build_env(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.into(),
         openshell_core::telemetry::enabled_env_value().into(),
     );
-    if let Some(endpoint) = &config.supervisor_otlp_endpoint {
-        env.insert(
-            openshell_core::sandbox_env::OTLP_ENDPOINT.into(),
-            endpoint.clone(),
-        );
+    env.extend(
+        config
+            .supervisor_otlp
+            .environment()
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value)),
+    );
+    if config.supervisor_otlp.traces.is_some() {
         env.extend(
             openshell_otel::current_trace_context_environment()
                 .into_iter()
                 .map(|(name, value)| (name.to_string(), value)),
-        );
-    }
-    if let Some(export) = &config.supervisor_ocsf_export {
-        env.extend(
-            export
-                .environment()
-                .into_iter()
-                .map(|(name, value)| (name.to_string(), value)),
-        );
-    }
-    if let Some(endpoint) = &config.supervisor_otlp_agent_endpoint {
-        env.insert(
-            openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT.into(),
-            endpoint.clone(),
         );
     }
     if let Some(name) = &config.supervisor_gateway_name {
@@ -2902,56 +2891,86 @@ mod tests {
 
     #[test]
     fn container_spec_passes_the_gateway_otlp_endpoint_to_the_supervisor() {
+        use openshell_core::sandbox_env::{
+            OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT,
+            OTLP_OCSF_PROTOCOL, OTLP_PROTOCOL, OtlpExport, OtlpProtocol, SupervisorOtlp,
+        };
         let sandbox = test_sandbox("test-id", "legit-name");
         let spec = build_container_spec(&sandbox, &test_config());
-        assert!(
-            spec["env"]
-                .get(openshell_core::sandbox_env::OTLP_ENDPOINT)
-                .is_none()
-        );
+        assert!(spec["env"].get(OTLP_ENDPOINT).is_none());
 
-        let config = PodmanComputeConfig {
-            supervisor_otlp_endpoint: Some("http://127.0.0.1:4317".to_string()),
+        let export = |endpoint: &str, protocol| {
+            Some(OtlpExport {
+                endpoint: endpoint.to_string(),
+                protocol,
+            })
+        };
+        let with_otlp = |supervisor_otlp| PodmanComputeConfig {
+            supervisor_otlp,
             ..test_config()
         };
-        let spec = build_container_spec(&sandbox, &config);
-        assert_eq!(
-            spec["env"][openshell_core::sandbox_env::OTLP_ENDPOINT],
-            "http://127.0.0.1:4317"
-        );
-        assert!(
-            spec["env"]
-                .get(openshell_core::sandbox_env::OTLP_OCSF_ENDPOINT)
-                .is_none()
-        );
 
-        let config = PodmanComputeConfig {
-            supervisor_ocsf_export: Some(openshell_core::sandbox_env::OcsfOtlpExport {
-                endpoint: "http://siem:4317".to_string(),
+        let spec = build_container_spec(
+            &sandbox,
+            &with_otlp(SupervisorOtlp {
+                traces: export("http://127.0.0.1:4317", OtlpProtocol::Grpc),
+                ..SupervisorOtlp::default()
             }),
-            ..test_config()
-        };
-        let spec = build_container_spec(&sandbox, &config);
-        assert_eq!(
-            spec["env"][openshell_core::sandbox_env::OTLP_OCSF_ENDPOINT],
-            "http://siem:4317"
         );
+        assert_eq!(spec["env"][OTLP_ENDPOINT], "http://127.0.0.1:4317");
+        assert!(spec["env"].get(OTLP_PROTOCOL).is_none());
+        assert!(spec["env"].get(OTLP_OCSF_ENDPOINT).is_none());
+
+        let spec = build_container_spec(
+            &sandbox,
+            &with_otlp(SupervisorOtlp {
+                traces: export("http://127.0.0.1:4318", OtlpProtocol::HttpProtobuf),
+                ..SupervisorOtlp::default()
+            }),
+        );
+        assert_eq!(spec["env"][OTLP_PROTOCOL], "http/protobuf");
+
+        let spec = build_container_spec(
+            &sandbox,
+            &with_otlp(SupervisorOtlp {
+                ocsf: export("http://siem:4317", OtlpProtocol::Grpc),
+                ..SupervisorOtlp::default()
+            }),
+        );
+        assert_eq!(spec["env"][OTLP_OCSF_ENDPOINT], "http://siem:4317");
+        assert!(spec["env"].get(OTLP_OCSF_PROTOCOL).is_none());
         assert!(
-            spec["env"]
-                .get(openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT)
-                .is_none(),
+            spec["env"].get(OTLP_AGENT_ENDPOINT).is_none(),
             "the agent trace relay stays off unless the gateway enables it"
         );
 
-        let config = PodmanComputeConfig {
-            supervisor_otlp_agent_endpoint: Some("http://agents:4317".to_string()),
-            ..test_config()
-        };
-        let spec = build_container_spec(&sandbox, &config);
-        assert_eq!(
-            spec["env"][openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT],
-            "http://agents:4317"
+        let spec = build_container_spec(
+            &sandbox,
+            &with_otlp(SupervisorOtlp {
+                ocsf: export("http://siem:4318", OtlpProtocol::HttpProtobuf),
+                ..SupervisorOtlp::default()
+            }),
         );
+        assert_eq!(spec["env"][OTLP_OCSF_PROTOCOL], "http/protobuf");
+
+        let spec = build_container_spec(
+            &sandbox,
+            &with_otlp(SupervisorOtlp {
+                agent: export("http://agents:4317", OtlpProtocol::Grpc),
+                ..SupervisorOtlp::default()
+            }),
+        );
+        assert_eq!(spec["env"][OTLP_AGENT_ENDPOINT], "http://agents:4317");
+        assert!(spec["env"].get(OTLP_AGENT_PROTOCOL).is_none());
+
+        let spec = build_container_spec(
+            &sandbox,
+            &with_otlp(SupervisorOtlp {
+                agent: export("http://agents:4318", OtlpProtocol::HttpProtobuf),
+                ..SupervisorOtlp::default()
+            }),
+        );
+        assert_eq!(spec["env"][OTLP_AGENT_PROTOCOL], "http/protobuf");
 
         let config = PodmanComputeConfig {
             supervisor_gateway_name: Some("prod-west".to_string()),

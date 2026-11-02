@@ -489,7 +489,7 @@ pub enum KubernetesDriverError {
 }
 
 impl KubernetesDriverError {
-    fn from_kube(err: KubeError) -> Self {
+    pub(crate) fn from_kube(err: KubeError) -> Self {
         match err {
             KubeError::Api(api) if api.code == 409 && api.reason == "AlreadyExists" => {
                 Self::AlreadyExists
@@ -1112,22 +1112,9 @@ impl KubernetesComputeDriver {
     /// trace, OCSF events, and relayed workload traces, identifying the
     /// gateway that launched it.
     fn supervisor_otlp_environment(&self) -> Vec<(&'static str, String)> {
-        let mut environment = Vec::new();
-        if let Some(endpoint) = self.config.supervisor_otlp_endpoint.as_deref() {
-            environment.push((
-                openshell_core::sandbox_env::OTLP_ENDPOINT,
-                endpoint.to_string(),
-            ));
+        let mut environment = self.config.supervisor_otlp.environment();
+        if self.config.supervisor_otlp.traces.is_some() {
             environment.extend(openshell_otel::current_trace_context_environment());
-        }
-        if let Some(export) = &self.config.supervisor_ocsf_export {
-            environment.extend(export.environment());
-        }
-        if let Some(endpoint) = &self.config.supervisor_otlp_agent_endpoint {
-            environment.push((
-                openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT,
-                endpoint.clone(),
-            ));
         }
         if let Some(name) = &self.config.supervisor_gateway_name {
             environment.push((openshell_core::sandbox_env::GATEWAY_NAME, name.clone()));
@@ -1286,11 +1273,7 @@ impl KubernetesComputeDriver {
         if let Some(shared) = &shared_supervisor {
             shared.spawn_token_secret_writer(client.clone(), shutdown_rx.clone());
         }
-        if shared_supervisor.is_some()
-            && (config.supervisor_otlp_endpoint.is_some()
-                || config.supervisor_ocsf_export.is_some()
-                || config.supervisor_otlp_agent_endpoint.is_some())
-        {
+        if shared_supervisor.is_some() && !config.supervisor_otlp.is_empty() {
             warn!(
                 "the gateway supervisor topology does not export supervisor OTLP traces or OCSF events or relay workload traces; shared sandbox instances keep console logs and gateway log push"
             );
@@ -3368,44 +3351,47 @@ impl KubernetesComputeDriver {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         pods.create(
             &PostParams::default(),
-            &supervisor_pod(
-                namespace,
-                names,
-                sandbox_id,
-                sandbox_name,
-                &self.config.gateway_id,
-                &self.config.supervisor_image,
-                self.config.supervisor_image_pull_policy,
-                &self.config.service_account_name,
-                agent_uid,
-                agent_gid,
-                &self.generation_image_pull_secret_names(names),
-                &self.config.grpc_endpoint,
-                self.config.supervisor_client_tls(),
-                main_process_spec,
-                log_level,
-                self.config.effective_sa_token_ttl_secs(),
-                self.config.https_proxy.as_deref(),
-                self.config.no_proxy.as_deref(),
-                self.config
-                    .proxy_auth_secret_name
-                    .as_deref()
-                    .zip(self.config.proxy_auth_secret_key.as_deref()),
-                self.config.proxy_auth_allow_insecure == Some(true),
-                self.config.proxy_connect_by_hostname == Some(true),
-                upstream_proxy_ca_bundle_staged,
-                self.config.provider_spiffe_enabled().then_some(
+            &crate::app_listener::configure_supervisor_pod(
+                supervisor_pod(
+                    namespace,
+                    names,
+                    sandbox_id,
+                    sandbox_name,
+                    &self.config.gateway_id,
+                    &self.config.supervisor_image,
+                    self.config.supervisor_image_pull_policy,
+                    &self.config.service_account_name,
+                    agent_uid,
+                    agent_gid,
+                    &self.generation_image_pull_secret_names(names),
+                    &self.config.grpc_endpoint,
+                    self.config.supervisor_client_tls(),
+                    main_process_spec,
+                    log_level,
+                    self.config.effective_sa_token_ttl_secs(),
+                    self.config.https_proxy.as_deref(),
+                    self.config.no_proxy.as_deref(),
                     self.config
-                        .provider_spiffe_workload_api_socket_path
-                        .as_str(),
-                ),
-                network_additional_ca
-                    .as_ref()
-                    .map(|generation| (generation.name.as_str(), generation.digest.as_str())),
-                owner,
-                &self.supervisor_otlp_environment(),
-            )
-            .map_err(KubernetesDriverError::Message)?,
+                        .proxy_auth_secret_name
+                        .as_deref()
+                        .zip(self.config.proxy_auth_secret_key.as_deref()),
+                    self.config.proxy_auth_allow_insecure == Some(true),
+                    self.config.proxy_connect_by_hostname == Some(true),
+                    upstream_proxy_ca_bundle_staged,
+                    self.config.provider_spiffe_enabled().then_some(
+                        self.config
+                            .provider_spiffe_workload_api_socket_path
+                            .as_str(),
+                    ),
+                    network_additional_ca
+                        .as_ref()
+                        .map(|generation| (generation.name.as_str(), generation.digest.as_str())),
+                    owner,
+                    &self.supervisor_otlp_environment(),
+                )
+                .map_err(KubernetesDriverError::Message)?,
+                &self.config.sandbox_runtime.app_listener,
+            ),
         )
         .await
         .map_err(KubernetesDriverError::from_kube)?
@@ -8984,46 +8970,79 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_otlp_environment_carries_only_configured_signals() {
-        use openshell_core::sandbox_env::{OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OcsfOtlpExport};
+        use openshell_core::sandbox_env::{
+            OTLP_AGENT_ENDPOINT, OTLP_AGENT_PROTOCOL, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT,
+            OTLP_OCSF_PROTOCOL, OTLP_PROTOCOL, OtlpExport, OtlpProtocol, SupervisorOtlp,
+        };
 
-        let names = |config: KubernetesComputeConfig| {
-            KubernetesComputeDriver::new_for_test(config)
-                .supervisor_otlp_environment()
+        let export = |endpoint: &str, protocol| {
+            Some(OtlpExport {
+                endpoint: endpoint.into(),
+                protocol,
+            })
+        };
+        let environment = |supervisor_otlp| {
+            KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+                supervisor_otlp,
+                ..Default::default()
+            })
+            .supervisor_otlp_environment()
+        };
+        let names = |supervisor_otlp| {
+            environment(supervisor_otlp)
                 .into_iter()
                 .map(|(name, _)| name)
                 .collect::<Vec<_>>()
         };
-        assert!(names(KubernetesComputeConfig::default()).is_empty());
+        assert!(names(SupervisorOtlp::default()).is_empty());
+        let traces = names(SupervisorOtlp {
+            traces: export("http://traces:4317", OtlpProtocol::Grpc),
+            ..Default::default()
+        });
+        assert_eq!(traces.first(), Some(&OTLP_ENDPOINT));
+        assert!(!traces.contains(&OTLP_PROTOCOL));
         assert_eq!(
-            names(KubernetesComputeConfig {
-                supervisor_otlp_endpoint: Some("http://traces:4317".into()),
+            names(SupervisorOtlp {
+                traces: export("http://traces:4318", OtlpProtocol::HttpProtobuf),
                 ..Default::default()
-            })
-            .first(),
-            Some(&OTLP_ENDPOINT)
+            })[..2],
+            [OTLP_ENDPOINT, OTLP_PROTOCOL]
         );
 
-        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
-            supervisor_ocsf_export: Some(OcsfOtlpExport {
-                endpoint: "http://siem:4317".into(),
+        assert_eq!(
+            environment(SupervisorOtlp {
+                ocsf: export("http://siem:4317", OtlpProtocol::Grpc),
+                ..Default::default()
             }),
-            ..Default::default()
-        });
+            [(OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string()),]
+        );
         assert_eq!(
-            driver.supervisor_otlp_environment(),
-            [(OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string())]
+            environment(SupervisorOtlp {
+                ocsf: export("http://siem:4318", OtlpProtocol::HttpProtobuf),
+                ..Default::default()
+            }),
+            [
+                (OTLP_OCSF_ENDPOINT, "http://siem:4318".to_string()),
+                (OTLP_OCSF_PROTOCOL, "http/protobuf".to_string()),
+            ]
         );
 
-        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
-            supervisor_otlp_agent_endpoint: Some("http://agents:4317".into()),
-            ..Default::default()
-        });
         assert_eq!(
-            driver.supervisor_otlp_environment(),
-            [(
-                openshell_core::sandbox_env::OTLP_AGENT_ENDPOINT,
-                "http://agents:4317".to_string()
-            )]
+            environment(SupervisorOtlp {
+                agent: export("http://agents:4317", OtlpProtocol::Grpc),
+                ..Default::default()
+            }),
+            [(OTLP_AGENT_ENDPOINT, "http://agents:4317".to_string())]
+        );
+        assert_eq!(
+            environment(SupervisorOtlp {
+                agent: export("http://agents:4318", OtlpProtocol::HttpProtobuf),
+                ..Default::default()
+            }),
+            [
+                (OTLP_AGENT_ENDPOINT, "http://agents:4318".to_string()),
+                (OTLP_AGENT_PROTOCOL, "http/protobuf".to_string()),
+            ]
         );
 
         let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {

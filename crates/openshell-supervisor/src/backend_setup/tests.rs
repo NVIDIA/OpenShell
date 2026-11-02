@@ -825,6 +825,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
         .store(true, Ordering::SeqCst);
     let startup = |await_main_process_attachment| {
         let config = crate::SandboxInstanceConfig {
+            app_router: None,
             command: vec!["test-agent".into(), "test-argument".into()],
             workdir: Some("/test-workspace".into()),
             timeout_secs: 15,
@@ -851,6 +852,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             takeover: None,
             supervisor_recovery_timeout_secs: None,
             otlp_agent_endpoint: None,
+            otlp_agent_protocol: openshell_core::sandbox_env::OtlpProtocol::Grpc,
         };
         let bindings = crate::SandboxInstanceBindings::dedicated(
             &config,
@@ -1029,6 +1031,7 @@ async fn suspend_signal_exits_without_terminating_boundary() {
     let setup = TestSetup::new();
     let startup = || {
         let config = crate::SandboxInstanceConfig {
+            app_router: None,
             command: vec!["test-agent".into(), "test-argument".into()],
             workdir: Some("/test-workspace".into()),
             timeout_secs: 15,
@@ -1055,6 +1058,7 @@ async fn suspend_signal_exits_without_terminating_boundary() {
             takeover: None,
             supervisor_recovery_timeout_secs: None,
             otlp_agent_endpoint: None,
+            otlp_agent_protocol: openshell_core::sandbox_env::OtlpProtocol::Grpc,
         };
         let bindings = crate::SandboxInstanceBindings::dedicated(
             &config,
