@@ -162,7 +162,7 @@ pub(super) struct EgressDecision {
     pub(super) endpoint: EndpointDecision,
     /// Resolved binary path.
     pub(super) binary: Option<PathBuf>,
-    /// PID owning the socket.
+    /// PID owning the socket when the owner is unambiguous.
     pub(super) binary_pid: Option<u32>,
     /// Ancestor binary paths from process tree walk.
     pub(super) ancestors: Vec<PathBuf>,

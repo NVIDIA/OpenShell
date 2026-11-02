@@ -58,8 +58,8 @@ pub struct L7EvalContext {
     pub policy_name: String,
     /// Binary path (for cross-layer Rego evaluation).
     pub binary_path: String,
-    /// PID resolved for the admitted connection, when meaningful.
-    pub binary_pid: Option<u32>,
+    /// Exact process identity captured at admission for middleware.
+    pub(crate) middleware_process: Option<openshell_core::proto::Process>,
     /// Ancestor paths.
     pub ancestors: Vec<String>,
     /// Cmdline paths.
@@ -91,11 +91,7 @@ pub struct L7EvalContext {
 
 impl L7EvalContext {
     pub(crate) fn originating_process(&self) -> Option<openshell_core::proto::Process> {
-        (!self.binary_path.is_empty()).then(|| openshell_core::proto::Process {
-            binary: self.binary_path.clone(),
-            pid: self.binary_pid.unwrap_or_default(),
-            ancestors: self.ancestors.clone(),
-        })
+        self.middleware_process.clone()
     }
 
     pub(crate) fn middleware_request_context(
@@ -4074,7 +4070,11 @@ mod tests {
             workspace: "team-a".into(),
             policy_name: "api-policy".into(),
             binary_path: "/usr/bin/curl".into(),
-            binary_pid: Some(42),
+            middleware_process: Some(openshell_core::proto::Process {
+                binary: "/usr/bin/curl".into(),
+                pid: 42,
+                ancestors: vec!["/usr/bin/claude".into()],
+            }),
             ancestors: vec!["/usr/bin/claude".into()],
             cmdline_paths: Vec::new(),
             secret_resolver: None,
@@ -7662,7 +7662,11 @@ network_policies:
             workspace: "workspace-1".into(),
             policy_name: "api".into(),
             binary_path: "/usr/bin/curl".into(),
-            binary_pid: Some(42),
+            middleware_process: Some(openshell_core::proto::Process {
+                binary: "/usr/bin/curl".into(),
+                pid: 42,
+                ancestors: vec!["/usr/bin/claude".into()],
+            }),
             ancestors: vec!["/usr/bin/claude".into()],
             ..Default::default()
         };

@@ -1213,7 +1213,11 @@ mod tests {
             workspace: "wrks-default".into(),
             policy_name: "api-policy".into(),
             binary_path: "/usr/bin/curl".into(),
-            binary_pid: Some(42),
+            middleware_process: Some(openshell_core::proto::Process {
+                binary: "/usr/bin/curl".into(),
+                pid: 42,
+                ancestors: vec!["/usr/bin/claude".into()],
+            }),
             ancestors: vec!["/usr/bin/claude".into()],
             cmdline_paths: Vec::new(),
             secret_resolver: None,
