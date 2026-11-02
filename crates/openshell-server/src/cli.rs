@@ -807,6 +807,15 @@ async fn run_from_args(
     {
         warn!("{field} is deprecated and ignored; OpenShell emits OCSF 1.8.0");
     }
+    if prepared
+        .config_file
+        .as_ref()
+        .is_some_and(|file| file.legacy_podman_ca_bundle_seen)
+    {
+        warn!(
+            "openshell.drivers.podman.additional_ca_bundle is deprecated; use openshell.supervisor.network.additional_ca_bundle"
+        );
+    }
     if let Some(bundle) = prepared.network_trust.as_ref() {
         info!(
             certificate_count = bundle.certificate_count(),
@@ -3328,6 +3337,15 @@ mod tests {
 
     #[test]
     fn prepare_server_config_normalizes_global_network_trust_before_driver_startup() {
+        assert_startup_normalizes_network_trust("openshell.supervisor.network");
+    }
+
+    #[test]
+    fn prepare_server_config_normalizes_legacy_podman_network_trust_before_driver_startup() {
+        assert_startup_normalizes_network_trust("openshell.drivers.podman");
+    }
+
+    fn assert_startup_normalizes_network_trust(table: &str) {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3345,7 +3363,7 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                "[openshell]\nversion = 2\n\n[openshell.supervisor.network]\nadditional_ca_bundle = \"{}\"\n",
+                "[openshell]\nversion = 2\n\n[{table}]\nadditional_ca_bundle = \"{}\"\n",
                 source.display()
             ),
         )
