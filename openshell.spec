@@ -19,8 +19,9 @@ Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 # OpenShell's own code is Apache-2.0. The binaries statically link third-party
 # crates; this is the minimal SPDX expression covering every crate linked into
-# openshell, openshell-gateway and openshell-prover (computed from `cargo tree`
-# license metadata, treating "X OR MIT" as satisfied by MIT or Apache-2.0).
+# openshell, openshell-gateway, openshell-driver-vm, and openshell-prover
+# (computed from `cargo tree` license metadata, treating "X OR MIT" as
+# satisfied by MIT or Apache-2.0).
 # The docs, man page sources, config templates and Python SDK sources carry
 # Apache-2.0 SPDX headers or fall under the repository LICENSE. The unit file is
 # generated from this spec. Re-check when Cargo.lock changes.
@@ -65,6 +66,16 @@ lifecycle management. This package installs Podman-oriented defaults in
 gateway TOML while leaving compute driver selection to gateway auto-detection
 or explicit operator configuration.
 
+# --- Optional VM compute driver sub-package ---
+%package driver-vm
+Summary:        OpenShell MicroVM compute driver
+Requires:       %{name}-gateway = %{version}-%{release}
+Requires:       e2fsprogs >= 1.43
+
+%description driver-vm
+Standalone MicroVM compute driver for the OpenShell gateway. Install this
+package on a KVM host and select compute_driver = "vm" in gateway TOML.
+
 # --- Standalone policy prover sub-package ---
 %package prover
 Summary:        Standalone OpenShell policy boundary prover
@@ -106,6 +117,7 @@ grep -q 'version = "%{openshell_cargo_version}"' Cargo.toml || (echo "ERROR: Car
 %build
 test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell"
 test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell-gateway"
+test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell-driver-vm"
 test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell-prover"
 
 # Generate vendored crate manifest and license metadata.
@@ -128,6 +140,9 @@ install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-prover" %{buildroo
 
 # --- Gateway binary ---
 install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-gateway" %{buildroot}%{_bindir}/%{name}-gateway
+
+# --- VM compute driver ---
+install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-driver-vm" %{buildroot}%{_libexecdir}/%{name}/%{name}-driver-vm
 
 # --- Default gateway TOML config template ---
 # Shipped as a read-only reference in %{_datadir}. The systemd unit seeds a
@@ -244,6 +259,9 @@ touch %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-in
 # Smoke-test the gateway binary
 %{buildroot}%{_bindir}/%{name}-gateway --version
 
+# Smoke-test the VM driver at the path the gateway searches by default.
+%{buildroot}%{_libexecdir}/%{name}/%{name}-driver-vm --version
+
 # Smoke-test the Python SDK version metadata via importlib.metadata.
 # We query the dist-info directly rather than importing the package because
 # the full import pulls in grpcio and other runtime deps not present in the
@@ -313,6 +331,13 @@ grep -q 'gateway.toml.default.v1' %{buildroot}%{_userunitdir}/%{name}-gateway.se
 %{_datadir}/%{name}-gateway/gateway.toml.default
 %{_datadir}/%{name}-gateway/gateway.toml.default.v1
 %{_mandir}/man8/openshell-gateway.8*
+
+%files driver-vm
+%license LICENSE
+%license LICENSE.dependencies
+%license cargo-vendor.txt
+%dir %{_libexecdir}/%{name}
+%{_libexecdir}/%{name}/%{name}-driver-vm
 
 %files -n python3-%{name}
 %license LICENSE
