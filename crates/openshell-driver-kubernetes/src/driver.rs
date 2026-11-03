@@ -6988,19 +6988,13 @@ fn sandbox_from_object_with_bootstrap_state(
 /// start that may replace a settled Stopped phase. Withhold the suspension
 /// until the stop completes, as a start does.
 fn mark_sandbox_runtime_stopping(sandbox: &mut Sandbox) {
-    if let Some(status) = sandbox.status.as_mut() {
-        status.conditions.retain(|condition| {
-            condition.r#type != SANDBOX_SUSPENDED_CONDITION && condition.r#type != "Bootstrapping"
-        });
-    }
+    clear_sandbox_runtime_operation_conditions(sandbox);
     mark_sandbox_runtime_control_unavailable(sandbox);
 }
 
 fn mark_sandbox_runtime_bootstrapping(sandbox: &mut Sandbox) {
+    clear_sandbox_runtime_operation_conditions(sandbox);
     if let Some(status) = sandbox.status.as_mut() {
-        status.conditions.retain(|condition| {
-            condition.r#type != SANDBOX_SUSPENDED_CONDITION && condition.r#type != "Bootstrapping"
-        });
         status.conditions.push(SandboxCondition {
             r#type: "Bootstrapping".to_string(),
             status: "True".to_string(),
@@ -7010,6 +7004,14 @@ fn mark_sandbox_runtime_bootstrapping(sandbox: &mut Sandbox) {
         });
     }
     mark_sandbox_runtime_control_unavailable(sandbox);
+}
+
+fn clear_sandbox_runtime_operation_conditions(sandbox: &mut Sandbox) {
+    if let Some(status) = sandbox.status.as_mut() {
+        status.conditions.retain(|condition| {
+            condition.r#type != SANDBOX_SUSPENDED_CONDITION && condition.r#type != "Bootstrapping"
+        });
+    }
 }
 
 fn mark_sandbox_runtime_control_unavailable(sandbox: &mut Sandbox) {

@@ -14327,29 +14327,64 @@ mod tests {
         assert_eq!(current.phase(), SandboxPhase::Provisioning as i32);
     }
 
-    // A Kubernetes snapshot taken while a stop still holds its bootstrap
-    // annotations can arrive after the stop settled (#5195). It withdraws
-    // readiness without claiming a starting generation.
+    // Gateway side of the Kubernetes stop contract. While a stop holds its
+    // bootstrap annotations, the driver withdraws readiness and reports
+    // neither Bootstrapping nor Suspended. Such a snapshot keeps the stop in
+    // Stopping, never Provisioning or Error, and cannot revive the sandbox
+    // after the stop settles. This passes without the #5195 fix; the driver
+    // test stop_snapshot_does_not_report_a_starting_generation covers the
+    // regression.
     #[tokio::test]
-    async fn late_stop_snapshot_keeps_stopped_sandbox_stopped() {
-        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let sandbox = sandbox_record("sb-stopped", "sandbox-stopped", SandboxPhase::Stopped);
-        runtime.store.put_message(&sandbox).await.unwrap();
-        let mut stopping = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
-        stopping.status = Some(make_driver_status(make_driver_condition(
-            "DependenciesNotReady",
-            "sandbox-runtime enforcement dependencies are not ready",
-        )));
+    async fn kubernetes_stop_snapshots_settle_without_reviving_the_sandbox() {
+        for session_connected in [false, true] {
+            let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+            let sandbox = sandbox_record("sb-stopping", "sandbox-stopping", SandboxPhase::Stopping);
+            runtime.store.put_message(&sandbox).await.unwrap();
+            if session_connected {
+                register_test_supervisor_session(&runtime, sandbox.object_id());
+            }
 
-        runtime.apply_sandbox_update(stopping).await.unwrap();
+            let mut in_flight = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            in_flight.status = Some(make_driver_status(make_driver_condition(
+                "DependenciesNotReady",
+                "sandbox-runtime enforcement dependencies are not ready",
+            )));
+            let mut settled_status = make_driver_status(make_driver_condition(
+                "SandboxSuspended",
+                "Sandbox is suspended",
+            ));
+            settled_status.conditions.push(DriverCondition {
+                r#type: "Suspended".to_string(),
+                status: "True".to_string(),
+                reason: "PodTerminated".to_string(),
+                message: "Pod terminated".to_string(),
+                transition_time: None,
+            });
+            let mut settled = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            settled.status = Some(settled_status);
 
-        let current = runtime
-            .store
-            .get_message::<Sandbox>(sandbox.object_id())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.phase(), SandboxPhase::Stopped as i32);
+            for (step, snapshot, expected) in [
+                ("in-flight stop", &in_flight, SandboxPhase::Stopping),
+                ("completed stop", &settled, SandboxPhase::Stopped),
+                ("late in-flight stop", &in_flight, SandboxPhase::Stopped),
+            ] {
+                runtime
+                    .apply_sandbox_update(snapshot.clone())
+                    .await
+                    .unwrap();
+                let current = runtime
+                    .store
+                    .get_message::<Sandbox>(sandbox.object_id())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    current.phase(),
+                    expected as i32,
+                    "{step} (session_connected={session_connected})"
+                );
+            }
+        }
     }
 
     #[tokio::test]
