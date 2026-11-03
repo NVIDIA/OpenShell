@@ -78,6 +78,7 @@ runs:
       shell: bash
       env:
         CLUSTER_NAME: ${{ inputs.cluster-name }}
+        CALICO_VERSION: v3.30.3
       run: |
         set -euo pipefail
         collect_cni_diagnostics() {
@@ -98,18 +99,14 @@ runs:
           exit "$failure_status"
         }
         trap collect_cni_diagnostics ERR
-        curl -fsSL https://raw.githubusercontent.com/projectcalico/calico/v3.30.3/manifests/calico.yaml \
+        curl -fsSL "https://raw.githubusercontent.com/projectcalico/calico/$CALICO_VERSION/manifests/calico.yaml" \
           -o "$RUNNER_TEMP/calico.yaml"
         sed 's@192.168.0.0/16@10.244.0.0/16@g' "$RUNNER_TEMP/calico.yaml" > "$RUNNER_TEMP/calico-kind.yaml"
         # The kind node's containerd pulls Docker Hub anonymously and is rate
         # limited. The host daemon pulls through the runner's registry mirror.
-        calico_images=$(sed -nE 's/^[[:space:]]*image:[[:space:]]*"?([^"[:space:]]+)"?.*/\1/p' "$RUNNER_TEMP/calico-kind.yaml" | sort -u)
-        if [ -z "$calico_images" ]; then
-          echo "ERROR: no images found in the Calico manifest" >&2
-          exit 1
-        fi
-        for image in $calico_images; do
-          archive="$RUNNER_TEMP/calico-$(basename "${image%%:*}")-linux-amd64.tar"
+        for component in cni node kube-controllers; do
+          image="docker.io/calico/$component:$CALICO_VERSION"
+          archive="$RUNNER_TEMP/calico-$component-linux-amd64.tar"
           docker pull --platform linux/amd64 "$image"
           docker image save --platform linux/amd64 --output "$archive" "$image"
           kind load image-archive "$archive" --name "$CLUSTER_NAME"
