@@ -25,6 +25,19 @@ npm install @nvidia/openshell-sdk
 
 ## Usage
 
+Frozen sandbox creation uses `client.sandbox.createFrozen(spec)` or
+`createFrozenFromTemplate(spec)`, with the existing create spec shape. These
+methods use a distinct optional service and fail on older gateways before
+creating a sandbox. They return the ordinary `SandboxRef`; use
+`getFrozenPolicy(name)` to read the requested mode and optional accepted policy,
+hash and timestamp. An absent policy means the requested freeze is pending.
+After capture, access changes require sandbox recreation.
+
+`client.sandbox.updateGlobalConfig({ policy })` returns the global mutation in
+`update` and workspace-qualified names in `frozenSandboxes` that retain their
+captured policies. Existing configuration result and policy-source types keep
+their original shapes.
+
 ```ts
 import { OpenShellClient } from '@nvidia/openshell-sdk'
 

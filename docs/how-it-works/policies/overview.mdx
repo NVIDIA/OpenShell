@@ -33,9 +33,15 @@ specific time:
 | `network_middlewares` | Additional inspection, transformation, or blocking of traffic that network rules allow. | Sandbox network proxy. | While the sandbox runs. |
 
 Filesystem, Landlock, and process settings are fixed once the sandbox starts.
-Network rules and middleware can change while it runs, as described in [How
+Network rules and middleware can change while it runs, unless the sandbox was
+created with `--frozen`, as described in [How
 Changes Take
 Effect](/how-it-works/policies/manage-policies#how-changes-take-effect).
+
+A [frozen sandbox](/how-it-works/policies/manage-policies#freeze-a-sandbox-policy)
+keeps its first accepted effective policy and provider authorization until it
+is deleted. Later global-policy and provider-profile changes apply to live
+sandboxes; frozen sandboxes retain their captured policy.
 
 Network rules make up most of a typical policy. OpenShell denies every outbound
 connection from a sandbox unless a rule in `network_policies` allows it. Each

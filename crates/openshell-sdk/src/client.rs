@@ -12,12 +12,13 @@ use crate::auth::{BearerSlot, EdgeAuthInterceptor, bearer_metadata};
 use crate::config::{AuthConfig, ClientConfig};
 use crate::error::{Result, SdkError};
 use crate::pagination::{Page, Pager};
-use crate::raw::{AuthedGrpcClient, AuthedSandboxUpdatesClient};
+use crate::raw::{AuthedFrozenSandboxPoliciesClient, AuthedGrpcClient, AuthedSandboxUpdatesClient};
 use crate::refresh::{RefreshedToken, TokenSource};
 use crate::routing::OwnerCache;
 use crate::types::{
-    DeleteOptions, DeletionResult, ExecOptions, ExecResult, Health, ListOptions, ResumeOptions,
-    SandboxPhase, SandboxRef, SandboxSpec, SandboxTemplateCreateSpec, SandboxTemplateListOptions,
+    DeleteOptions, DeletionResult, ExecOptions, ExecResult, FrozenGlobalConfigUpdate,
+    FrozenPolicyState, FrozenSandboxCreateSpec, Health, ListOptions, ResumeOptions, SandboxPhase,
+    SandboxRef, SandboxSpec, SandboxTemplateCreateSpec, SandboxTemplateListOptions,
     SandboxWorkloadTemplate, WorkspaceRef,
 };
 use crate::{WatchEvent, WatchOptions, transport};
@@ -50,6 +51,94 @@ pub struct OpenShellClient {
 }
 
 impl OpenShellClient {
+    /// Authenticated optional frozen-policy service; no proactive OIDC refresh.
+    pub fn raw_frozen_policies(&self) -> AuthedFrozenSandboxPoliciesClient {
+        proto::frozen_sandbox_policies_client::FrozenSandboxPoliciesClient::with_interceptor(
+            self.channel.clone(),
+            self.interceptor.clone(),
+        )
+    }
+
+    /// Optional frozen-policy service after proactive OIDC refresh.
+    pub async fn raw_frozen_policies_fresh(&self) -> Result<AuthedFrozenSandboxPoliciesClient> {
+        self.ensure_fresh().await?;
+        Ok(self.raw_frozen_policies())
+    }
+
+    /// Create a frozen sandbox. Older gateways fail before creating a sandbox.
+    pub async fn create_frozen_sandbox(&self, spec: FrozenSandboxCreateSpec) -> Result<SandboxRef> {
+        self.workspace("default").create_frozen_sandbox(spec).await
+    }
+
+    /// Create a frozen sandbox from a workspace-scoped workload template.
+    pub async fn create_frozen_sandbox_from_template(
+        &self,
+        spec: SandboxTemplateCreateSpec,
+    ) -> Result<SandboxRef> {
+        self.workspace("default")
+            .create_frozen_sandbox_from_template(spec)
+            .await
+    }
+
+    /// Read the requested freeze and accepted policy in the default workspace.
+    pub async fn get_frozen_policy(&self, name: &str) -> Result<FrozenPolicyState> {
+        self.workspace("default").get_frozen_policy(name).await
+    }
+
+    /// Apply a global configuration update and report frozen-policy exceptions.
+    pub async fn update_global_config(
+        &self,
+        request: proto::UpdateConfigRequest,
+    ) -> Result<FrozenGlobalConfigUpdate> {
+        let request = proto::UpdateFrozenGlobalConfigRequest {
+            workspace_scope: request.workspace_scope,
+            sandbox: request.sandbox,
+            policy: request.policy,
+            setting_key: request.setting_key,
+            setting_value: request.setting_value,
+            delete_setting: request.delete_setting,
+            global: true,
+            merge_operations: request.merge_operations,
+            expected_resource_version: request.expected_resource_version,
+            annotations: request.annotations,
+            request_id: request.request_id,
+        };
+        let response = self
+            .frozen_unary(|mut grpc| {
+                let request = request.clone();
+                async move { grpc.update_global_config(request).await }
+            })
+            .await?;
+        Ok(FrozenGlobalConfigUpdate {
+            update: response.update.ok_or_else(|| {
+                SdkError::invalid_config("global update result missing from gateway response")
+            })?,
+            frozen_sandboxes: response.frozen_sandboxes,
+        })
+    }
+
+    async fn frozen_unary<T, F, Fut>(&self, call: F) -> Result<T>
+    where
+        F: Fn(AuthedFrozenSandboxPoliciesClient) -> Fut,
+        Fut: Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+    {
+        self.ensure_fresh().await?;
+        match call(self.raw_frozen_policies()).await {
+            Ok(response) => Ok(response.into_inner()),
+            Err(status) if status.code() == tonic::Code::Unauthenticated => {
+                if self.refresh_on_unauthorized().await? {
+                    call(self.raw_frozen_policies())
+                        .await
+                        .map(tonic::Response::into_inner)
+                        .map_err(map_status)
+                } else {
+                    Err(map_status(status))
+                }
+            }
+            Err(status) => Err(map_status(status)),
+        }
+    }
+
     /// Open a connection to the gateway described by `config`.
     ///
     /// Performs the gRPC channel handshake immediately; subsequent RPCs reuse
@@ -998,6 +1087,71 @@ pub struct WorkspaceScopedClient {
 }
 
 impl WorkspaceScopedClient {
+    /// Create a frozen sandbox in this workspace using a distinct optional RPC.
+    pub async fn create_frozen_sandbox(&self, spec: FrozenSandboxCreateSpec) -> Result<SandboxRef> {
+        let mut request = create_sandbox_request(spec.sandbox);
+        request
+            .spec
+            .as_mut()
+            .expect("create request has a spec")
+            .policy = spec.policy;
+        self.create_frozen(request).await
+    }
+
+    /// Create a frozen sandbox from a workload template in this workspace.
+    pub async fn create_frozen_sandbox_from_template(
+        &self,
+        spec: SandboxTemplateCreateSpec,
+    ) -> Result<SandboxRef> {
+        self.create_frozen(create_sandbox_from_template_request(spec))
+            .await
+    }
+
+    async fn create_frozen(&self, request: proto::CreateSandboxRequest) -> Result<SandboxRef> {
+        let request = proto::CreateFrozenSandboxRequest {
+            workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+            request_id: request.request_id,
+            spec: request.spec,
+            name: request.name,
+            labels: request.labels,
+            annotations: request.annotations,
+            await_main_process_attachment: request.await_main_process_attachment,
+            workload_template: request.workload_template,
+            service_exposures: request.service_exposures,
+        };
+        let response = self
+            .client
+            .frozen_unary(|mut grpc| {
+                let request = request.clone();
+                async move { grpc.create_sandbox(request).await }
+            })
+            .await?;
+        let mut sandbox = sandbox_from_response(response.sandbox)?;
+        if !response.frozen_policy.is_some_and(|state| state.requested) {
+            return Err(SdkError::invalid_config(format!(
+                "gateway did not acknowledge frozen creation for sandbox '{}' (ID '{}', workspace '{}'); remove the sandbox before retrying",
+                sandbox.name, sandbox.id, sandbox.workspace,
+            )));
+        }
+        sandbox.service_urls = response.service_urls;
+        Ok(sandbox)
+    }
+
+    /// Read a pending freeze or the immutable accepted snapshot in this workspace.
+    pub async fn get_frozen_policy(&self, name: &str) -> Result<FrozenPolicyState> {
+        let request = proto::GetFrozenSandboxPolicyRequest {
+            workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+            name: name.to_string(),
+        };
+        self.client
+            .frozen_unary(|mut grpc| {
+                let request = request.clone();
+                async move { grpc.get_policy(request).await }
+            })
+            .await
+            .map(Into::into)
+    }
+
     /// The workspace this client targets.
     pub fn workspace_name(&self) -> &str {
         &self.workspace
