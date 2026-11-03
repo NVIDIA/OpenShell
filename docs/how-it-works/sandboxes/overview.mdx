@@ -737,6 +737,19 @@ Print only the policy YAML for scripting (same effective policy, no metadata):
 openshell sandbox get my-sandbox --policy-only
 ```
 
+### Diagnose Workload Startup Failures
+
+If creation fails, use `openshell sandbox get my-sandbox` to inspect the startup
+diagnostic. An entrypoint launch failure is different from a command that started
+and exited with a nonzero status. Check that the configured executable and
+working directory exist and that the executable has permission to run.
+
+Runtime qualification can also fail before the command starts. If Landlock is
+unavailable, check the kernel and security configuration used by the selected
+runtime; changing the workload's filesystem policy does not add kernel support.
+If OpenShell cannot confirm whether the command started, stop the sandbox and
+wait for cleanup before starting it again.
+
 ### Diagnose Failed Calls to Tool Servers
 
 A sandbox can be `Ready` while an agent's call to an external tool server fails with `fetch failed`. Run `openshell sandbox get my-sandbox` and look under `Tool server connections` for the server's address, `Last result`, and `Reported at`. This is available for configured MCP-over-HTTP endpoints and does not change sandbox readiness.

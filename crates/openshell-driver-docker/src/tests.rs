@@ -4379,6 +4379,29 @@ fn docker_oom_kill_stays_terminal_despite_137() {
 }
 
 #[test]
+fn runtime_qualification_exit_reports_fixed_failure() {
+    for failure in [
+        RuntimeStartupFailure::LandlockUnavailable,
+        RuntimeStartupFailure::LandlockEnforcement,
+        RuntimeStartupFailure::Qualification,
+    ] {
+        let mut sandbox = exited_sandbox_with_ready_reason(CONDITION_EXITED);
+        let state = ContainerState {
+            status: Some(ContainerStateStatusEnum::EXITED),
+            exit_code: Some(i64::from(failure.exit_code())),
+            ..Default::default()
+        };
+        apply_docker_exit_classification(&mut sandbox, &state);
+        assert_eq!(ready_reason(&sandbox), failure.condition_reason());
+        let status = Status::failed_precondition(failure.diagnostic());
+        assert_eq!(
+            supervisor_start_failure_reason(&status, "fallback"),
+            failure.condition_reason()
+        );
+    }
+}
+
+#[test]
 fn supervisor_workspace_validation_exit_is_reported_explicitly() {
     let status = workspace_validation_status();
     assert_eq!(status.message(), WORKSPACE_VALIDATION_FAILED_MESSAGE);
@@ -4398,6 +4421,35 @@ fn supervisor_workspace_validation_exit_is_reported_explicitly() {
         CONDITION_WORKSPACE_VALIDATION_FAILED
     );
     assert_eq!(supervisor_exit_reason(1), "ControlSupervisorExited");
+    assert_eq!(
+        supervisor_exit_reason(i64::from(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED)),
+        LAUNCH_UNCONFIRMED_CONDITION
+    );
+    assert_eq!(
+        supervisor_start_failure_reason(
+            &Status::unavailable(LAUNCH_UNCONFIRMED_DIAGNOSTIC),
+            "fallback"
+        ),
+        LAUNCH_UNCONFIRMED_CONDITION
+    );
+    for wait in [
+        Some(Ok(ContainerWaitResponse {
+            status_code: i64::from(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED),
+            ..Default::default()
+        })),
+        Some(Err(BollardError::DockerContainerWaitError {
+            code: i64::from(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED),
+            error: "PRIVATE STDERR".into(),
+        })),
+    ] {
+        assert_eq!(
+            docker_supervisor_wait_failure(wait),
+            (
+                LAUNCH_UNCONFIRMED_CONDITION,
+                LAUNCH_UNCONFIRMED_DIAGNOSTIC.to_string()
+            )
+        );
+    }
 
     let (reason, message) =
         docker_supervisor_wait_failure(Some(Err(BollardError::DockerContainerWaitError {

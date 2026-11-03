@@ -6,6 +6,7 @@
 #[cfg(target_os = "linux")]
 use std::mem::size_of;
 use std::path::Path;
+use std::process::ExitCode;
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
@@ -156,9 +157,10 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
     let task_memory_copy = true;
     // Check the ABI first: on an older kernel the allow/deny probe would fail
     // with an opaque ruleset error instead of naming the ABI it needs.
-    let landlock_abi =
-        openshell_sandbox::sandbox::linux::require_landlock_abi().wrap_err("Landlock ABI probe")?;
-    probe_landlock_allow_deny().wrap_err("Landlock allow/deny probe")?;
+    let landlock_abi = openshell_sandbox::sandbox::linux::require_landlock_abi()
+        .wrap_err(openshell_core::backend_startup::RuntimeStartupFailure::LandlockUnavailable)?;
+    probe_landlock_allow_deny()
+        .wrap_err(openshell_core::backend_startup::RuntimeStartupFailure::LandlockEnforcement)?;
     let notification = openshell_sandbox::linux::seccomp_notify::probe_notification_api()
         .into_diagnostic()
         .wrap_err("seccomp notification probe")?;
@@ -1770,7 +1772,16 @@ fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
             .with_filter(console_filter),
         )
         .try_init();
-    let (qualification, _) = qualify_runtime()?;
+    let (qualification, _) = qualify_runtime().map_err(|error| {
+        if error
+            .downcast_ref::<openshell_core::backend_startup::RuntimeStartupFailure>()
+            .is_some()
+        {
+            error
+        } else {
+            error.wrap_err(openshell_core::backend_startup::RuntimeStartupFailure::Qualification)
+        }
+    })?;
     openshell_sandbox::run(bootstrap, qualification)
 }
 
@@ -1779,7 +1790,27 @@ fn run_boundary(_bootstrap: &Path, _log_level: &str) -> Result<()> {
     Err(miette::miette!("openshell-sandbox requires Linux"))
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
+    runtime_exit(run())
+}
+
+fn runtime_exit(result: Result<()>) -> Result<ExitCode> {
+    match result {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(error) => {
+            if let Some(failure) =
+                error.downcast_ref::<openshell_core::backend_startup::RuntimeStartupFailure>()
+            {
+                eprintln!("{error:?}");
+                Ok(ExitCode::from(failure.exit_code()))
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let raw_args = std::env::args().collect::<Vec<_>>();
     if raw_args.get(1).map(String::as_str) == Some(COPY_SELF_SUBCOMMAND) {
         let dest = raw_args.get(2).ok_or_else(|| {
@@ -1959,5 +1990,28 @@ mod tests {
 
         let final_path = dest_dir.join("openshell-sandbox");
         assert!(final_path.exists(), "binary should land inside dest dir");
+    }
+}
+
+#[cfg(test)]
+mod startup_exit_tests {
+    use super::*;
+    use openshell_core::backend_startup::RuntimeStartupFailure;
+
+    #[test]
+    fn only_typed_qualification_failures_get_reserved_exit_statuses() {
+        for failure in [
+            RuntimeStartupFailure::LandlockUnavailable,
+            RuntimeStartupFailure::LandlockEnforcement,
+            RuntimeStartupFailure::Qualification,
+        ] {
+            let error = miette::miette!("private probe detail").wrap_err(failure);
+            assert_eq!(
+                runtime_exit(Err(error)).unwrap(),
+                ExitCode::from(failure.exit_code())
+            );
+        }
+        assert!(runtime_exit(Err(miette::miette!("LandlockUnavailable: private output"))).is_err());
+        assert_eq!(runtime_exit(Ok(())).unwrap(), ExitCode::SUCCESS);
     }
 }

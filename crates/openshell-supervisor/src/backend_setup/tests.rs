@@ -118,6 +118,7 @@ struct Observed {
     require_networking: AtomicBool,
     active: AtomicBool,
     attach_error: Mutex<Option<BackendError>>,
+    start_error: Mutex<Option<BackendError>>,
     starts: AtomicUsize,
     releases: AtomicUsize,
     suspendable: AtomicBool,
@@ -378,6 +379,10 @@ impl PreparedBackend for TestLaunch {
                         }
                         observed.record("start");
                         observed.starts.fetch_add(1, Ordering::SeqCst);
+                        let start_error = observed.start_error.lock().unwrap().take();
+                        if let Some(error) = start_error {
+                            return Err(error);
+                        }
                         if observed.defer_restore.load(Ordering::SeqCst) {
                             assert!(observed.events().contains(&"confirm"));
                             observed.restores.fetch_add(1, Ordering::SeqCst);
@@ -979,6 +984,25 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
         .observed
         .deny_confirmation
         .store(false, Ordering::SeqCst);
+    *setup.observed.start_error.lock().unwrap() = Some(BackendError::Process(
+        "spawn entrypoint: Permission denied (secret argument)".into(),
+    ));
+    let error = startup(false)
+        .await
+        .expect_err("entrypoint launch failure must end startup");
+    assert_eq!(
+        error.code().map(|code| code.to_string()).as_deref(),
+        Some("openshell.backend.start-agent.failed")
+    );
+    assert!(error.to_string().contains("secret argument"));
+    assert!(!readiness.exists());
+    assert!(!marker.exists());
+    setup.observed.events.lock().unwrap().truncate(7);
+    setup.observed.starts.store(0, Ordering::SeqCst);
+    tokio::task::yield_now().await;
+    assert!(!setup.observed.active.load(Ordering::SeqCst));
+    assert_eq!(setup.observed.releases.load(Ordering::SeqCst), 2);
+
     let observe_and_shutdown = async {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
@@ -1013,7 +1037,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
         ]
     );
     tokio::task::yield_now().await;
-    assert_eq!(setup.observed.releases.load(Ordering::SeqCst), 2);
+    assert_eq!(setup.observed.releases.load(Ordering::SeqCst), 3);
     assert!(!setup.observed.active.load(Ordering::SeqCst));
     tokio::task::yield_now().await;
     assert!(setup.observed.services.lock().unwrap().upgrade().is_none());

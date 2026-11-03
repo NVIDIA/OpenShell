@@ -850,15 +850,18 @@ fn otlp_span_filter(log_level: &str) -> EnvFilter {
 
 /// Choose the supervisor's exit status for a sandbox run.
 ///
-/// The reserved status tells the compute driver that the sandbox rejected the
-/// image working directory. After the workload exits, the supervisor exits
-/// with the workload's status, so a workload that itself exits with the
+/// Reserved statuses identify a rejected image working directory or a launch
+/// whose outcome could not be confirmed. After the workload exits, the supervisor
+/// exits with the workload's status, so a workload that itself exits with the
 /// reserved status is reported as 1 instead. The gateway receives the
 /// workload's exact status separately.
 fn supervisor_exit(result: Result<i32>) -> Result<i32> {
+    use openshell_core::backend_startup::SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED;
     use openshell_core::driver_utils::SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED;
     match result {
-        Ok(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED) => Ok(1),
+        Ok(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED | SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED) => {
+            Ok(1)
+        }
         Err(error)
             if error
                 .downcast_ref::<openshell_supervisor::WorkspaceValidationFailed>()
@@ -866,6 +869,15 @@ fn supervisor_exit(result: Result<i32>) -> Result<i32> {
         {
             error!(error = ?error, "Image workspace validation failed");
             Ok(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)
+        }
+        Err(error)
+            if error.code().is_some_and(|code| {
+                code.to_string()
+                    .starts_with("openshell.backend.start-agent.")
+            }) =>
+        {
+            error!(error = ?error, "Workload launch did not complete");
+            Ok(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED)
         }
         other => other,
     }
@@ -960,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn only_workspace_validation_failure_exits_with_reserved_status() {
+    fn startup_errors_use_reserved_statuses_without_relabeling_workload_exits() {
         use miette::WrapErr as _;
         use openshell_core::driver_utils::{
             SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED, WORKSPACE_VALIDATION_ERROR_CONTEXT,
@@ -972,18 +984,23 @@ mod tests {
         ))
         .wrap_err(WORKSPACE_VALIDATION_ERROR_CONTEXT)
         .unwrap_err();
-        let error = openshell_supervisor::start_agent_error(format!(
-            "process error: boundary process leaf: start process supervisor leaf: {sandbox_error:?}"
-        ));
+        let error = openshell_supervisor::start_agent_error(
+            openshell_isolation_interface::contract::BackendError::Process(format!(
+                "boundary process leaf: start process supervisor leaf: {sandbox_error:?}"
+            )),
+        );
         assert_eq!(
             supervisor_exit(Err(error)).expect("reserved exit status"),
             SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED
         );
-        assert!(
+        assert_eq!(
             supervisor_exit(Err(openshell_supervisor::start_agent_error(
-                "connect failed".into()
+                openshell_isolation_interface::contract::BackendError::Process(
+                    "connect failed".into()
+                )
             )))
-            .is_err()
+            .unwrap(),
+            openshell_core::backend_startup::SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED
         );
         // Only an agent start failure carries the rejection, even when another
         // error's text contains the same words.
@@ -1000,6 +1017,13 @@ mod tests {
             1
         );
         assert_eq!(supervisor_exit(Ok(0)).unwrap(), 0);
+        assert_eq!(
+            supervisor_exit(Ok(
+                openshell_core::backend_startup::SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED
+            ))
+            .unwrap(),
+            1
+        );
         assert_eq!(supervisor_exit(Ok(143)).unwrap(), 143);
     }
 

@@ -23,6 +23,10 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use openshell_core::backend_startup::{
+    LAUNCH_UNCONFIRMED_CONDITION, LAUNCH_UNCONFIRMED_DIAGNOSTIC, RuntimeStartupFailure,
+    SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED,
+};
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
@@ -5653,7 +5657,7 @@ async fn wait_for_docker_supervisor_ready(
         .await
     {
         Ok(()) => Ok(()),
-        Err(status) => Err(recorded_workspace_validation_failure(failures, sandbox_id)
+        Err(status) => Err(recorded_supervisor_start_failure(failures, sandbox_id)
             .await
             .unwrap_or(status)),
     }
@@ -5675,7 +5679,14 @@ async fn poll_docker_supervisor_ready(
             .map_err(|error| {
                 Status::internal(format!("inspect Docker sandbox container: {error}"))
             })?;
-        if sandbox.state.unwrap_or_default().running == Some(false) {
+        let workload_state = sandbox.state.unwrap_or_default();
+        if workload_state.running == Some(false) {
+            if let Some(failure) = workload_state
+                .exit_code
+                .and_then(RuntimeStartupFailure::from_exit_code)
+            {
+                return Err(Status::failed_precondition(failure.diagnostic()));
+            }
             return Err(Status::unavailable(
                 "Docker sandbox exited before supervisor became ready",
             ));
@@ -5697,6 +5708,11 @@ async fn poll_docker_supervisor_ready(
                 warn!(sandbox_id, supervisor_id, supervisor_logs = %log_tail, "Docker sandbox rejected the image working directory");
                 return Err(workspace_validation_status());
             }
+            _ if state.running == Some(false)
+                && state.exit_code == Some(i64::from(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED)) =>
+            {
+                return Err(Status::unavailable(LAUNCH_UNCONFIRMED_DIAGNOSTIC));
+            }
             _ if state.running == Some(false) => {
                 let log_tail = docker_container_log_tail(docker, supervisor_id).await;
                 warn!(sandbox_id, supervisor_id, supervisor_logs = %log_tail, "Docker supervisor exited before becoming ready");
@@ -5716,6 +5732,20 @@ fn docker_supervisor_wait_failure(
     result: Option<Result<ContainerWaitResponse, BollardError>>,
 ) -> (&'static str, String) {
     match result {
+        Some(Ok(status)) if status.status_code == i64::from(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED) => {
+            (
+                LAUNCH_UNCONFIRMED_CONDITION,
+                LAUNCH_UNCONFIRMED_DIAGNOSTIC.to_string(),
+            )
+        }
+        Some(Err(BollardError::DockerContainerWaitError { code, .. }))
+            if code == i64::from(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED) =>
+        {
+            (
+                LAUNCH_UNCONFIRMED_CONDITION,
+                LAUNCH_UNCONFIRMED_DIAGNOSTIC.to_string(),
+            )
+        }
         Some(Ok(status)) => (
             supervisor_exit_reason(status.status_code),
             format!(
@@ -5738,15 +5768,20 @@ fn docker_supervisor_wait_failure(
     }
 }
 
-async fn recorded_workspace_validation_failure(
+async fn recorded_supervisor_start_failure(
     failures: &Arc<Mutex<HashMap<String, DockerRuntimeFailure>>>,
     sandbox_id: &str,
 ) -> Option<Status> {
     let failures = failures.lock().await;
     failures
         .get(sandbox_id)
-        .filter(|failure| failure.reason == CONDITION_WORKSPACE_VALIDATION_FAILED)
-        .map(|_| workspace_validation_status())
+        .and_then(|failure| match failure.reason {
+            CONDITION_WORKSPACE_VALIDATION_FAILED => Some(workspace_validation_status()),
+            LAUNCH_UNCONFIRMED_CONDITION => {
+                Some(Status::unavailable(LAUNCH_UNCONFIRMED_DIAGNOSTIC))
+            }
+            _ => None,
+        })
 }
 
 /// Startup failure for a supervisor that exited because the sandbox rejected
@@ -5763,8 +5798,22 @@ fn supervisor_start_failure_reason(status: &Status, default: &'static str) -> &'
         && status.message() == WORKSPACE_VALIDATION_FAILED_MESSAGE
     {
         CONDITION_WORKSPACE_VALIDATION_FAILED
+    } else if status.code() == tonic::Code::Unavailable
+        && status.message() == LAUNCH_UNCONFIRMED_DIAGNOSTIC
+    {
+        LAUNCH_UNCONFIRMED_CONDITION
     } else {
-        default
+        [
+            RuntimeStartupFailure::LandlockUnavailable,
+            RuntimeStartupFailure::LandlockEnforcement,
+            RuntimeStartupFailure::Qualification,
+        ]
+        .into_iter()
+        .find(|failure| {
+            status.code() == tonic::Code::FailedPrecondition
+                && status.message() == failure.diagnostic()
+        })
+        .map_or(default, RuntimeStartupFailure::condition_reason)
     }
 }
 
@@ -5772,6 +5821,8 @@ fn supervisor_start_failure_reason(status: &Status, default: &'static str) -> &'
 fn supervisor_exit_reason(status_code: i64) -> &'static str {
     if status_code == i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED) {
         CONDITION_WORKSPACE_VALIDATION_FAILED
+    } else if status_code == i64::from(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED) {
+        LAUNCH_UNCONFIRMED_CONDITION
     } else {
         "ControlSupervisorExited"
     }
@@ -6576,7 +6627,7 @@ fn apply_docker_exit_classification(sandbox: &mut DriverSandbox, state: &Contain
     if state.oom_killed == Some(true) {
         return;
     }
-    let Some(code) = state.exit_code.filter(|&code| matches!(code, 137 | 143)) else {
+    let Some(code) = state.exit_code else {
         return;
     };
     let Some(condition) = sandbox
@@ -6589,8 +6640,13 @@ fn apply_docker_exit_classification(sandbox: &mut DriverSandbox, state: &Contain
     if condition.reason != CONDITION_EXITED {
         return;
     }
-    condition.reason = CONDITION_RUNTIME_RESTART.to_string();
-    condition.message = format!("Container terminated by signal (exit code {code})");
+    if let Some(failure) = RuntimeStartupFailure::from_exit_code(code) {
+        condition.reason = failure.condition_reason().to_string();
+        condition.message = failure.diagnostic().to_string();
+    } else if matches!(code, 137 | 143) {
+        condition.reason = CONDITION_RUNTIME_RESTART.to_string();
+        condition.message = format!("Container terminated by signal (exit code {code})");
+    }
 }
 
 fn container_ready_condition(
