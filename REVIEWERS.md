@@ -13,6 +13,7 @@ CI/CD workflows, release pipelines, build targets, packaging, and artifact publi
 | Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
 | Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
 | Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
+| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
 
 ### area:drivers
 
@@ -24,6 +25,7 @@ Infrastructure orchestration, including compute scheduling, secret management, r
 | Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
 | Mrunal Patel | [@mrunalp](https://github.com/mrunalp) | Red Hat |
 | Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
+| Russell Bryant | [@russellb](https://github.com/russellb) | Red Hat |
 
 ### area:runtime
 
@@ -46,6 +48,7 @@ Authentication, multitenancy, gateway interceptors, FIPS compliance, and other e
 | --- | --- | --- |
 | Seth Jennings | [@sjenning](https://github.com/sjenning) | Red Hat |
 | Derek Carr | [@derekwaynecarr](https://github.com/derekwaynecarr) | Red Hat |
+| Akram Ben Aissi | [@akram](https://github.com/akram) | Red Hat |
 
 ### area:platform
 
@@ -81,12 +84,13 @@ Cross-cutting system design, component boundaries, data and control flow, archit
 
 ### topic:authnz
 
-Authentication, authorization, credential protection, policy integrity/signed policiesIncludes identity verification, login and session handling, OIDC integration, bearer-token validation, access permissions, and authorization across tenant and workspace boundaries.
+Authentication, authorization, credential protection, policy integrity/signed policies. Includes identity verification, login and session handling, OIDC integration, bearer-token validation, access permissions, and authorization across tenant and workspace boundaries.
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
 | Seth Jennings | [@sjenning](https://github.com/sjenning) | Red Hat |
 | Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
+| Gordon Sim | [@grs](https://github.com/grs) | Red Hat |
 
 ### topic:compliance
 
@@ -150,6 +154,10 @@ Kubernetes operator development, custom resource definitions (CRDs), deployment 
 | Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
 | Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
 | Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
+| Krzysztof Malczuk | [@2000krysztof](https://github.com/2000krysztof) | Red Hat |
+| Mark Campbell | [@Bobbins228](https://github.com/Bobbins228) | Red Hat |
+| Jorge Garcia Oncins | [@jgarciao](https://github.com/jgarciao) | Red Hat |
+| Ignas Baranauskas | [@Ygnas](https://github.com/Ygnas) | Red Hat |
 
 ### topic:mcp
 
@@ -170,6 +178,7 @@ General network transport, connectivity, and proxy behavior not covered by the m
 | Adrien Langou | [@alangou](https://github.com/alangou) | NVIDIA |
 | Shiju | [@shiju-nv](https://github.com/shiju-nv) | NVIDIA |
 | Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
+| Russell Bryant | [@russellb](https://github.com/russellb) | Red Hat |
 
 ### topic:observability
 
@@ -182,6 +191,7 @@ Logging, metrics, tracing, telemetry, dashboards, event correlation, and the col
 | Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
 | Artem Lytvyn | [@letv1nnn](https://github.com/letv1nnn) | Independent |
 | Roland Huss | [@rhuss](https://github.com/rhuss) | Red Hat |
+| Gaizka Menendez | [@gmenher](https://github.com/gmenher) | Red Hat |
 
 ### topic:operability
 
@@ -235,6 +245,7 @@ Software Development Kit (SDK) creation, maintenance, language bindings, and dis
 | Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
 | Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
 | Max Dubrinsky | [@maxdubrinsky](https://github.com/maxdubrinsky) | Gretel |
+| Krzysztof Malczuk | [@2000krysztof](https://github.com/2000krysztof) | Red Hat |
 
 ### topic:security
 
@@ -246,6 +257,9 @@ Vulnerability management, static/dynamic analysis, FSR (Functional Security Requ
 | John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
 | Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
 | Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
+| Krzysztof Malczuk | [@2000krysztof](https://github.com/2000krysztof) | Red Hat |
+| Christian Zaccaria | [@ChristianZaccaria](https://github.com/ChristianZaccaria) | Red Hat |
+| Russell Bryant | [@russellb](https://github.com/russellb) | Red Hat |
 
 ### topic:testing
 
@@ -256,3 +270,15 @@ Unit, integration, regression, conformance, and end-to-end testing, including te
 | Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
 | Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
 | Evan Lezar | [@elezar](https://github.com/elezar) | NVIDIA |
+| Mark Campbell | [@Bobbins228](https://github.com/Bobbins228) | Red Hat |
+| Jorge Garcia Oncins | [@jgarciao](https://github.com/jgarciao) | Red Hat |
+| Gaizka Menendez | [@gmenher](https://github.com/gmenher) | Red Hat |
+
+### topic:ux
+
+CLI command interface and flags, help text, error messages and exit codes, human readable outputs, TUI, and first run path to working sandbox.
+
+| Name | GitHub ID | Company/Organization |
+| --- | --- | --- |
+| Roland Huss | [@rhuss](https://github.com/rhuss) | Red Hat |
+| Artem Lytvyn | [@letv1nnn](https://github.com/letv1nnn) | Independent |
