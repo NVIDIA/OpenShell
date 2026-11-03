@@ -34,7 +34,8 @@
 //! ```
 //!
 //! The fixture owns no Keycloak state, so it has nothing to clean up. Tests
-//! that create resources in Keycloak or `OpenShell` must remove them.
+//! that create resources in Keycloak or `OpenShell` must remove them, for
+//! example with [`Context::on_cleanup`].
 
 use std::fmt;
 use std::ops::{Deref, DerefMut};

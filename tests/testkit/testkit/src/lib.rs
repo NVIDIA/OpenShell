@@ -22,6 +22,7 @@
 //! Tests find the gateway the same way the `openshell` CLI does (see
 //! [`gateway`]).
 
+mod cleanup;
 mod cli;
 mod context;
 mod error;
@@ -29,6 +30,7 @@ pub mod gateway;
 mod poll;
 mod run;
 
+pub use cleanup::CLEANUP_TIMEOUT;
 pub use cli::{BIN_ENV, CLI_TIMEOUT, Cli, CliOutput};
 pub use context::{
     Context, DELETE_TIMEOUT, EXEC_TIMEOUT, ExecOutput, READY_TIMEOUT, STOP_TIMEOUT, Sandbox,

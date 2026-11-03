@@ -3,8 +3,6 @@
 
 //! Per-test context: the SDK client, the run ID, and the resources to clean up.
 
-use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use openshell_sdk::raw::{AuthedGrpcClient, proto};
@@ -14,6 +12,7 @@ use openshell_sdk::{
 };
 use rand::Rng;
 
+use crate::cleanup::{CLEANUP_TIMEOUT, Cleanup};
 use crate::cli::{Cli, CliOutput};
 use crate::error::{Error, Result, ResultExt};
 use crate::poll::{Poll, poll_until};
@@ -24,11 +23,7 @@ pub const DELETE_TIMEOUT: Duration = Duration::from_mins(2);
 pub const EXEC_TIMEOUT: Duration = Duration::from_mins(2);
 /// Stopping includes stopping compute, which can take a while on some drivers.
 pub const STOP_TIMEOUT: Duration = Duration::from_mins(5);
-const CLEANUP_TIMEOUT: Duration = Duration::from_mins(2);
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Names of sandboxes created by a test and not yet confirmed deleted.
-type Registry = Arc<Mutex<BTreeSet<String>>>;
 
 /// What a test uses to act on the system under test.
 pub struct Context {
@@ -36,7 +31,7 @@ pub struct Context {
     grpc: Grpc,
     cli: Cli,
     run_id: String,
-    sandboxes: Registry,
+    cleanup: Cleanup,
 }
 
 impl Context {
@@ -49,7 +44,7 @@ impl Context {
             },
             cli,
             run_id: generate_run_id(),
-            sandboxes: Registry::default(),
+            cleanup: Cleanup::default(),
         }
     }
 
@@ -83,6 +78,12 @@ impl Context {
         self.cli.run_with_env(None, env, args).await
     }
 
+    /// The CLI that [`Context::cli`] runs, for code that can't borrow the
+    /// context, such as a cleanup hook.
+    pub fn cli_handle(&self) -> Cli {
+        self.cli.clone()
+    }
+
     /// The ID unique to this test run, used in resource names.
     pub fn run_id(&self) -> &str {
         &self.run_id
@@ -104,7 +105,7 @@ impl Context {
             client: self.client.clone(),
             grpc: self.grpc.clone(),
             policy: None,
-            sandboxes: Arc::clone(&self.sandboxes),
+            cleanup: self.cleanup.clone(),
             spec: SandboxSpec {
                 name: Some(self.name(suffix)),
                 ..SandboxSpec::default()
@@ -115,8 +116,44 @@ impl Context {
     /// Track a sandbox the test is about to create through the CLI, so cleanup
     /// deletes it even if the test fails after the gateway accepted the create.
     /// Call this before the CLI command; use [`Context::adopt`] afterwards.
+    ///
+    /// Cleanup deletes the sandbox and waits until it is gone, at the point
+    /// in the cleanup order where it was first tracked. Tracking a sandbox
+    /// again, for example by adopting it, doesn't move it.
     pub fn track(&self, name: &str) {
-        lock(&self.sandboxes).insert(name.to_string());
+        track_sandbox(&self.cleanup, &self.client, name);
+    }
+
+    /// Run `hook` after the test body, whether the body passes, fails, or
+    /// panics. Use it to remove what testkit doesn't track, such as
+    /// providers, profiles, or images. `name` says what the hook does, for
+    /// reporting a failure.
+    ///
+    /// Hooks run one at a time, last registered first, after the body and
+    /// before the test reports. Sandboxes from [`Context::sandbox`] and
+    /// [`Context::track`] are cleaned up the same way, so a hook registered
+    /// before a sandbox is created runs after the sandbox is deleted. Each
+    /// hook has [`CLEANUP_TIMEOUT`]. A hook that fails, panics, or times out
+    /// is reported and the remaining hooks still run; it fails a test whose
+    /// body passed.
+    ///
+    /// ```ignore
+    /// let cli = cx.cli_handle();
+    /// let provider = cx.name("provider");
+    /// cx.cli(["provider", "create", "--name", &provider /* ... */])
+    ///     .await?
+    ///     .success()?;
+    /// cx.on_cleanup(format!("delete provider {provider}"), async move || {
+    ///     cli.run(["provider", "delete", &provider]).await?.success()?;
+    ///     Ok(())
+    /// });
+    /// ```
+    pub fn on_cleanup<F, Fut>(&self, name: impl Into<String>, hook: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result> + Send + 'static,
+    {
+        self.cleanup.push(name, hook);
     }
 
     /// A handle to a sandbox created outside the builder, e.g. by the CLI.
@@ -131,7 +168,7 @@ impl Context {
         Ok(Sandbox {
             client: self.client.clone(),
             grpc: self.grpc.clone(),
-            sandboxes: Arc::clone(&self.sandboxes),
+            cleanup: self.cleanup.clone(),
             name: name.to_string(),
             id: found.id,
         })
@@ -181,45 +218,33 @@ impl Context {
         Ok(())
     }
 
-    /// Delete every sandbox the test created and has not deleted. Returns the
-    /// cleanup failures; they are reported separately from the test result.
-    ///
-    /// Sandboxes are deleted concurrently, each with the full
-    /// [`CLEANUP_TIMEOUT`], so a slow delete cannot use up the time for the
-    /// others and cleanup takes about one timeout however many there are.
+    /// Run the cleanup hooks, including deleting the sandboxes the test
+    /// created and has not deleted. Returns the cleanup failures; they are
+    /// reported separately from the test result.
     pub(crate) async fn cleanup(&self) -> Vec<String> {
-        let names: Vec<String> = lock(&self.sandboxes).iter().cloned().collect();
-        // The timeout wraps the whole delete, not just the wait for it, so a
-        // gateway that never answers the delete cannot hang cleanup.
-        let results = futures::future::join_all(names.iter().map(|name| async move {
-            let delete = async {
-                self.client
-                    .delete_sandbox(
-                        name,
-                        DeleteOptions {
-                            allow_missing: true,
-                        },
-                    )
-                    .await?;
-                self.client.wait_deleted(name, CLEANUP_TIMEOUT, None).await
-            };
-            match tokio::time::timeout(CLEANUP_TIMEOUT, delete).await {
-                Ok(result) => result.map_err(|error| error.to_string()),
-                Err(_) => Err(format!("timed out after {}s", CLEANUP_TIMEOUT.as_secs())),
-            }
-        }))
-        .await;
-        let mut failures = Vec::new();
-        for (name, result) in names.iter().zip(results) {
-            match result {
-                Ok(()) => {
-                    lock(&self.sandboxes).remove(name);
-                }
-                Err(error) => failures.push(format!("delete sandbox {name}: {error}")),
-            }
-        }
-        failures
+        self.cleanup.run(CLEANUP_TIMEOUT).await
     }
+}
+
+/// Register the cleanup hook that deletes sandbox `name`, unless it is
+/// already tracked.
+fn track_sandbox(cleanup: &Cleanup, client: &WorkspaceScopedClient, name: &str) {
+    let client = client.clone();
+    let owned = name.to_string();
+    // The timeout wraps the whole hook, not just the wait, so a gateway that
+    // never answers the delete cannot hang cleanup.
+    cleanup.push_keyed(name, format!("delete sandbox {name}"), async move || {
+        client
+            .delete_sandbox(
+                &owned,
+                DeleteOptions {
+                    allow_missing: true,
+                },
+            )
+            .await?;
+        client.wait_deleted(&owned, CLEANUP_TIMEOUT, None).await?;
+        Ok(())
+    });
 }
 
 /// The generated gRPC client, for public API the SDK does not wrap yet.
@@ -244,7 +269,7 @@ pub struct SandboxBuilder {
     client: WorkspaceScopedClient,
     grpc: Grpc,
     policy: Option<proto::SandboxPolicy>,
-    sandboxes: Registry,
+    cleanup: Cleanup,
     spec: SandboxSpec,
 }
 
@@ -285,7 +310,7 @@ impl SandboxBuilder {
     /// cleaned up.
     pub async fn create(self) -> Result<Sandbox> {
         let name = self.spec.name.clone().unwrap_or_default();
-        lock(&self.sandboxes).insert(name.clone());
+        track_sandbox(&self.cleanup, &self.client, &name);
         let id = match self.policy {
             None => {
                 self.client
@@ -334,7 +359,7 @@ impl SandboxBuilder {
         Ok(Sandbox {
             client: self.client,
             grpc: self.grpc,
-            sandboxes: self.sandboxes,
+            cleanup: self.cleanup,
             name,
             id,
         })
@@ -353,7 +378,7 @@ const fn restart_policy(policy: SandboxRestartPolicy) -> proto::SandboxRestartPo
 pub struct Sandbox {
     client: WorkspaceScopedClient,
     grpc: Grpc,
-    sandboxes: Registry,
+    cleanup: Cleanup,
     name: String,
     id: String,
 }
@@ -542,13 +567,24 @@ impl Sandbox {
             .wait_deleted(&self.name, DELETE_TIMEOUT, Some(&self.id))
             .await
             .context(format!("wait for sandbox {} to be deleted", self.name))?;
-        lock(&self.sandboxes).remove(&self.name);
+        self.cleanup.remove(&self.name);
         Ok(())
     }
 }
 
-fn lock(registry: &Registry) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
-    registry.lock().unwrap_or_else(PoisonError::into_inner)
+#[cfg(test)]
+impl Context {
+    /// A context for a gateway that isn't running, so gateway calls fail.
+    pub(crate) fn unconnected() -> Self {
+        const ENDPOINT: &str = "http://127.0.0.1:1";
+        let channel = tonic::transport::Channel::from_static(ENDPOINT).connect_lazy();
+        let interceptor =
+            openshell_sdk::EdgeAuthInterceptor::new(None, None).expect("no-op interceptor");
+        let client = OpenShellClient::from_parts(channel, interceptor);
+        let gateway =
+            crate::gateway::Gateway::from_endpoint(ENDPOINT.to_string(), "default".to_string());
+        Self::new(&client, "default", Cli::from_env(&gateway))
+    }
 }
 
 /// Short, lowercase, and DNS-label safe, so names work on every driver.
