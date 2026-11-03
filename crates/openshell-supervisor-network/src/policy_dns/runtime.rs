@@ -101,14 +101,16 @@ impl PolicyDnsRuntime {
         config: PolicyDnsRuntimeConfig,
         mut engine_ready: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self> {
-        let upstream = trusted_resolver_from_resolv_conf()?;
+        let resolver = SocketTrustedResolver::from_resolv_conf("/etc/resolv.conf")
+            .map_err(|error| miette::miette!(error))
+            .wrap_err("failed to configure trusted supervisor resolver")?;
         let store = Arc::new(ResolvedEndpointStore::new(
             StoreConfig::new(config.pools, MAX_MAPPINGS)
                 .map_err(|error| miette::miette!(error.to_string()))?,
         ));
         let service = Arc::new(PolicyDnsService::new(
             policy,
-            SocketTrustedResolver::new(upstream),
+            resolver,
             store.clone(),
             trusted_host_gateway,
         ));
@@ -191,14 +193,16 @@ impl PolicyDnsRuntime {
         config: PolicyDnsRuntimeConfig,
         engine_ready: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self> {
-        let upstream = trusted_resolver_from_resolv_conf()?;
+        let resolver = SocketTrustedResolver::from_resolv_conf("/etc/resolv.conf")
+            .map_err(|error| miette::miette!(error))
+            .wrap_err("failed to configure trusted supervisor resolver")?;
         let store = Arc::new(ResolvedEndpointStore::new(
             StoreConfig::new(config.pools, MAX_MAPPINGS)
                 .map_err(|error| miette::miette!(error.to_string()))?,
         ));
         let service = Arc::new(PolicyDnsService::new(
             policy,
-            SocketTrustedResolver::new(upstream),
+            resolver,
             store.clone(),
             trusted_host_gateway,
         ));
@@ -305,28 +309,6 @@ impl Drop for PolicyDnsRuntime {
             task.abort();
         }
     }
-}
-
-fn trusted_resolver_from_resolv_conf() -> Result<SocketAddr> {
-    let contents = std::fs::read_to_string("/etc/resolv.conf")
-        .into_diagnostic()
-        .wrap_err("failed to read trusted supervisor resolver configuration")?;
-    for line in contents.lines() {
-        let line = line.split('#').next().unwrap_or_default();
-        let mut fields = line.split_whitespace();
-        if fields.next() != Some("nameserver") {
-            continue;
-        }
-        let Some(value) = fields.next() else {
-            continue;
-        };
-        if let Ok(ip) = value.parse::<IpAddr>() {
-            return Ok(SocketAddr::new(ip, 53));
-        }
-    }
-    Err(miette::miette!(
-        "no literal nameserver is configured in supervisor /etc/resolv.conf"
-    ))
 }
 
 #[cfg(test)]
