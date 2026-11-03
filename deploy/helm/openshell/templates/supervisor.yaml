@@ -12,12 +12,12 @@
 {{- $endpoint := get $kubernetes "grpc_endpoint" }}
 {{- $endpointUrl := urlParse $endpoint }}
 {{- $gatewayTls := and (not .Values.server.disableTls) .Values.server.tls.clientTlsSecretName }}
-# One supervisor process hosting a sandbox instance per sandbox generation.
-# The process dials the gateway over TLS with the supervisor token the gateway
-# mints for it and receives its assignments from it; nothing but sandbox
-# runtimes and kubelet probes connect to it. The Pod holds no Kubernetes
-# identity of its own: each instance acts only with the credentials the
-# gateway issued for its generation.
+# One supervisor process per replica hosts a sandbox instance for each sandbox
+# generation placed on it. The process dials the gateway over TLS with the
+# supervisor token the gateway mints for it and receives its assignments from
+# it; nothing but sandbox runtimes and kubelet probes connect to it. The Pod
+# holds no Kubernetes identity of its own: each instance acts only with the
+# credentials the gateway issued for its generation.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,10 +27,21 @@ metadata:
     {{- include "openshell.labels" . | nindent 4 }}
     app.kubernetes.io/component: supervisor
 spec:
-  # Instances live in this process; a second replica could not serve them.
-  replicas: 1
+  # The replicas form a high-availability pool. Each instance lives in the
+  # process hosting it; the pool rolls one member at a time, starting a new
+  # member before an old one leaves, and the gateway hands a failed or leaving
+  # member's instances to the remaining members. One replica has no failover
+  # but scales like any other count: only the replica count depends on the
+  # pool's size, so scaling changes nothing else here or in the gateway
+  # configuration.
+  {{- if ne (include "openshell.supervisorAutoscalingEnabled" .) "true" }}
+  replicas: {{ include "openshell.supervisorReplicas" . }}
+  {{- end }}
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       {{- include "openshell.supervisorSelectorLabels" . | nindent 6 }}
@@ -41,7 +52,9 @@ spec:
     spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
-      terminationGracePeriodSeconds: 30
+      # A stopping member announces that it is leaving, and the gateway moves
+      # its instances to the remaining members before it exits.
+      terminationGracePeriodSeconds: 60
       {{- with ($imagePullSecrets | uniq) }}
       imagePullSecrets:
         {{- range . }}
@@ -50,6 +63,10 @@ spec:
       {{- end }}
       {{- with .Values.supervisor.podSecurityContext }}
       securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.supervisor.affinity }}
+      affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
@@ -81,6 +98,17 @@ spec:
             - name: OPENSHELL_GATEWAY_TLS_SERVER_NAME
               value: {{ get $endpointUrl "hostname" | quote }}
             {{- end }}
+            # Pool membership: the Pod name is this member's stable ID, and
+            # other members redirect the runtimes of its instances to its Pod
+            # IP.
+            - name: OPENSHELL_SUPERVISOR_POOL_MEMBER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           ports:
             - name: runtime
               containerPort: {{ get $shared "runtime_port" }}
@@ -137,72 +165,4 @@ spec:
               - key: ca.crt
                 path: ca.crt
         {{- end }}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ $name }}
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "openshell.labels" . | nindent 4 }}
-    app.kubernetes.io/component: supervisor
-spec:
-  selector:
-    {{- include "openshell.supervisorSelectorLabels" . | nindent 4 }}
-  ports:
-    - name: runtime
-      port: {{ get $shared "runtime_port" }}
-      targetPort: runtime
-      protocol: TCP
-{{- if .Values.networkPolicy.enabled }}
----
-# Only sandbox workloads in this gateway's sandbox namespaces reach the routed
-# runtime listener. Each sandbox's own egress allowance limits its workload to
-# that port, and the routing preface plus the generation's pinned TLS identity
-# decide which instance it reaches. The supervisor dials the gateway itself,
-# so no ingress from the gateway is needed.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: {{ $name }}
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "openshell.labels" . | nindent 4 }}
-    app.kubernetes.io/component: supervisor
-spec:
-  podSelector:
-    matchLabels:
-      {{- include "openshell.supervisorSelectorLabels" . | nindent 6 }}
-  policyTypes:
-    - Ingress
-    - Egress
-  ingress:
-    - from:
-        - namespaceSelector:
-            {{- include "openshell.supervisorSandboxNamespaces" (dict "kubernetes" $kubernetes) | nindent 12 }}
-          podSelector:
-            matchLabels:
-              openshell.ai/boundary-role: workload
-      ports:
-        - protocol: TCP
-          port: {{ get $shared "runtime_port" }}
-  # Instances carry policy-approved sandbox egress, as dedicated supervisors
-  # do, and the host reaches the gateway.
-  egress:
-    - {}
-{{- end }}
----
-# Delivery of the gateway-minted supervisor token. The chart creates the
-# Secret empty; the gateway replaces its `token` on every renewal, and the
-# supervisor re-reads the mounted file on each connection attempt. Helm
-# upgrades leave the live token in place.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ $name }}-token
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "openshell.labels" . | nindent 4 }}
-    app.kubernetes.io/component: supervisor
-type: Opaque
 {{- end }}

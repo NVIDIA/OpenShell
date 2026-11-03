@@ -1349,6 +1349,21 @@ describe('waits', () => {
     await expect(sandbox.waitReady('sb', 30)).rejects.toMatchObject({ code: 'connect' });
   });
 
+  it('waitReady rejects suspended sandboxes without waiting for timeout', async () => {
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: {
+          metadata: { id: 'sb-id', name: 'sb' },
+          status: { phase: SandboxPhase.SUSPENDED },
+        },
+      }),
+    });
+    await expect(sandbox.waitReady('sb', 30)).rejects.toMatchObject({
+      code: 'connect',
+      message: expect.stringContaining('suspended'),
+    });
+  });
+
   it('waitReady rejects rather than hanging when get() never resolves', async () => {
     const sandbox = client({
       // Only settles when the per-poll deadline signal aborts the call.

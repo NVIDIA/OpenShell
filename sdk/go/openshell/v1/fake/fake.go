@@ -25,6 +25,7 @@ type Client struct {
 
 	sandboxes      v1.SandboxInterface
 	templateCreate v1.SandboxTemplateCreateInterface
+	suspendResume  v1.SandboxSuspendResumeInterface
 	templates      v1.SandboxTemplateInterface
 	providers      v1.ProviderInterface
 	services       v1.ServiceInterface
@@ -84,6 +85,7 @@ func NewClient(opts ...ClientOption) *Client {
 	sandboxes := newFakeSandboxClient(fc.sandboxStore, fc.templateStore, fc.sandboxBroadcaster, fc.isClosed)
 	fc.sandboxes = sandboxes
 	fc.templateCreate = sandboxes
+	fc.suspendResume = sandboxes
 	fc.templates = newFakeSandboxTemplateClient(fc.templateStore, fc.isClosed)
 	fc.providers = newFakeProviderClient(fc.providerStore, fc.isClosed)
 	fc.services = newFakeServiceClient(fc.isClosed)
@@ -119,6 +121,11 @@ func (fc *Client) SandboxTemplates() v1.SandboxTemplateInterface { return fc.tem
 // without changing the legacy Sandboxes() interface.
 func (fc *Client) CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *types.SandboxSpec, opts ...types.CreateOption) (*types.Sandbox, error) {
 	return fc.templateCreate.CreateFromTemplate(ctx, workspace, name, templateName, spec, opts...)
+}
+
+// SandboxSuspendResume returns the sandbox suspend and resume sub-client.
+func (fc *Client) SandboxSuspendResume() v1.SandboxSuspendResumeInterface {
+	return fc.suspendResume
 }
 
 // Providers returns the provider sub-client.

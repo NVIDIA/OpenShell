@@ -27,7 +27,15 @@ RUN_WITH_GATEWAY_COMMAND="__openshell_run_kubernetes_e2e"
 source "${ROOT}/e2e/support/conformance.sh"
 
 # Unset or empty selects Rust defaults; e2e-conformance-only skips Rust tests.
+# Reusable-workflow inputs are exported as an explicitly empty environment
+# variable when the caller uses their default. Treat that the same as unset so
+# the focused additional-CA row retains the upstream Kubernetes feature set.
 E2E_FEATURES="${OPENSHELL_E2E_KUBERNETES_FEATURES:-e2e,e2e-host-gateway,e2e-kubernetes}"
+
+if [ "${OPENSHELL_E2E_KUBE_TEST:-}" = "additional_ca" ]; then
+  export OPENSHELL_E2E_ADDITIONAL_CA=1
+  E2E_FEATURES="${E2E_FEATURES},e2e-additional-ca"
+fi
 
 # Fixed output path of the `e2e-kubernetes` nextest profile (`.config/nextest.toml`).
 JUNIT_XML="${ROOT}/results/e2e-kubernetes.xml"
@@ -90,10 +98,20 @@ run_suite() {
 }
 
 run_e2e() {
+  if [ "${OPENSHELL_E2E_KUBE_TEST:-}" = "kubernetes_image_update" ]; then
+    cargo test --locked --manifest-path "${ROOT}/tests/suites/features/Cargo.toml" \
+      -p openshell-test-feature-kubernetes-updates -- --nocapture
+    return
+  fi
   run_conformance
   if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
     echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
     return 0
+  fi
+
+  if [ -z "${OPENSHELL_E2E_KUBE_TEST:-}" ]; then
+    cargo test --locked --manifest-path "${ROOT}/tests/suites/features/Cargo.toml" \
+      -p openshell-test-feature-kubernetes-updates -- --nocapture
   fi
 
   # Pin `--target-dir` so the profile `junit.path` resolves regardless of `CARGO_TARGET_DIR`.

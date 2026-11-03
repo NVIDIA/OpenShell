@@ -3,13 +3,14 @@
 See [Cryptography and FIPS](CRYPTO.md) for the architecture,
 contributor rules, and production OpenSSL/FIPS follow-up requirements.
 
-`openshell-crypto` owns first-party crypto backend selection. AWS-LC is the only
-production implementation. This change preserves TLS algorithms, Ed25519 gateway
+`openshell-crypto` owns first-party crypto backend selection. AWS-LC remains the
+application default; an optional system-OpenSSL backend supports explicit context
+selection by embedders. The facade preserves TLS algorithms, Ed25519 gateway
 JWTs, P-256 certificate keys, native trust roots, and credential envelope formats.
-The interface is intended to support a system-OpenSSL backend for regulated
-deployments, related to [#900](https://github.com/NVIDIA/OpenShell/issues/900).
-This stage implements AWS-LC only. An OpenSSL proof of concept will validate the
-provider integration separately; this is not a FIPS build or compliance claim.
+The OpenSSL implementation builds on the standalone proof of concept following
+[the generic backend refactor](https://github.com/NVIDIA/OpenShell/pull/3351).
+Application-wide OpenSSL selection and downstream FIPS qualification remain
+separate work; enabling this backend is not a FIPS build or compliance claim.
 
 ## Boundaries
 
@@ -60,11 +61,118 @@ A second backend must adapt these integrations and the application startup path.
 Disabling this crate's feature alone does not remove dependency-owned crypto
 from the entire product graph.
 
-The later OpenSSL build must use system shared libraries without vendoring,
-respect system provider configuration, and verify the resulting linked artifacts.
-Linking and module qualification are build/deployment concerns, separate from the
-Rust key and primitive contracts. The proof of concept will test those concerns
-and the Rustls provider integration before a production OpenSSL backend is added.
+### Selecting system OpenSSL
+
+An embedder enables `openssl` and disables crate defaults:
+
+```toml
+openshell-crypto = { path = "crates/openshell-crypto", default-features = false, features = ["openssl"] }
+```
+
+Install the context before facade use or JWT initialization:
+
+```rust,ignore
+use openshell_crypto::{CryptoContext, OpenSsl, install_default_context};
+
+install_default_context(CryptoContext::new(Box::new(OpenSsl)))?;
+```
+
+The feature makes `OpenSsl` available without selecting it automatically. When
+both backends are enabled, `CryptoContext::default()` still chooses AWS-LC. With
+AWS-LC disabled, use before installation fails closed. Inspect Cargo's resolved
+graph for other dependencies that re-enable AWS-LC. This feature adds no gateway
+flag, image, or supported OpenSSL-only whole-application build.
+
+Use OpenSSL 3 development libraries, a C compiler, and pkg-config. The Nix shell
+supplies these; Homebrew OpenSSL works on macOS. Set `OPENSSL_NO_VENDOR=1` and
+`OPENSSL_STATIC=0` for shared-library builds, then inspect `otool -L` (macOS) or
+`ldd` (Linux). No vendoring feature is enabled. Runtime libraries, provider
+packages and configuration must be supplied and verified by the deployment.
+
+The backend uses OpenSSL's default library context and configuration without
+loading modules or overriding property queries. Configure the process before
+startup; do not unload providers or change policy during operations. Keys retain
+OpenSSL resources for their lifetime. Capabilities describe implemented operations,
+not runtime algorithm availability. `provider_version` stays unknown because the
+library version does not identify the module that performed an operation.
+
+Certificate keys support P-256, P-384, Ed25519 and RSA, with PEM/PKCS#8 import and
+PKCS#8 export. Encrypted PEM keys, including those with an empty passphrase, are
+rejected without prompting for a password. RSA generation uses 2048 bits. P-521 certificate keys are rejected:
+rcgen 0.14 exposes that descriptor only with AWS-LC enabled. Existing P-521 users
+must retain AWS-LC until this limitation is resolved. This backend uses exportable
+software keys and does not add HSM or PKCS#11 loading.
+
+TLS uses `rustls-openssl` 0.4.1 with TLS 1.2/1.3, without its `fips`, vendored or
+prefer-post-quantum features. The jsonwebtoken 10 adapter includes compatibility
+guards for malformed HMAC signatures, EC key consistency and algorithm/curve
+binding, RSA public-component bounds, JOSE RSA-PSS salt lengths and fixed-width
+EC JWK coordinates. Certificate key import also checks EC key consistency and
+requires RSA keys in the 2048–8192-bit range, matching AWS-LC.
+RSA certificate imports and JWT signing also validate private-key consistency,
+including the private exponent, primes, and CRT parameters, before using the key.
+RSA signing/verification, EC signing, and EC JWK extraction reuse the validated
+OpenSSL key instead of parsing it again through the upstream adapter. Claim
+validation stays in jsonwebtoken. AEAD setup errors remain distinct from authentication errors;
+tentative plaintext is cleared on failure and returned only after authentication.
+
+At AEAD finalization, all OpenSSL errors map to `CryptoError::Authentication`.
+The [EVP AEAD interface](https://docs.openssl.org/3.0/man3/EVP_EncryptInit/#aead-interface)
+reports unsuccessful authentication through the finalization result; it does not
+provide a portable error-stack discriminator between a bad tag and a late provider
+failure across providers. A provider failure at this stage therefore shares that
+classification. Setup and update failures remain `CryptoError::Operation`.
+No failure releases tentative plaintext or triggers a backend fallback.
+
+The optional `tls-tonic`, `tls-kube`, and `tls-sqlx` features can each compile with
+`--no-default-features --features openssl,<feature>`; CI checks those combinations
+individually. These features expose integration dependencies, not OpenSSL transport
+adapters for them. Compilation does not establish that dependency-owned clients
+use OpenSSL at runtime or make an OpenSSL-only whole-application build supported.
+
+Linux CI checks that the OpenSSL-only TLS test executable dynamically resolves
+both `libssl` and `libcrypto`. The Nix devshell supplies those libraries; this is
+a linkage regression check, not validation against a distro's OpenSSL packages,
+provider configuration, or FIPS operating mode. Distro qualification remains
+downstream work.
+The test explicitly creates a native OpenSSL TLS context to retain `libssl` for
+this assertion; the backend itself uses Rustls for TLS protocol handling.
+
+Both protocol adapters are external community-maintained dependencies:
+[`rustls-openssl`](https://github.com/tofay/rustls-openssl) and
+[`jsonwebtoken-openssl`](https://github.com/arckoor/jsonwebtoken-providers).
+As of 2026-10-23, upstream rustls-openssl has released 0.4.2, while the JWT adapter's
+repository remains unarchived with recent activity. This is not a support or
+security-maintenance commitment from OpenShell or those projects. The exact
+`rustls-openssl =0.4.1` pin preserves the reviewed provider behavior until a
+deliberate upgrade is validated. `jsonwebtoken-openssl =1.0.0` matches our
+jsonwebtoken 10 provider API; version 2 targets jsonwebtoken 11. Dependency
+updates must rerun interoperability, rejection, provider-failure, and linkage
+checks. Distro packagers need both Rust adapter crates as well as system OpenSSL;
+packaging Rust sources does not permit vendoring the native OpenSSL library.
+
+Protocol limitations remain: Rustls hash/HKDF callbacks and JWT JWK thumbprint
+hashing cannot return backend errors; adapter helpers can panic on provider
+failure. The TLS adapter also uses direct OpenSSL SHA operations and low-level
+EC key generation that do not establish provider-module ownership. First-party
+TLS setup uses `tls::try_client_builder()` / `tls::try_server_builder()` and their
+`_with_protocol_versions` variants. These return configuration errors when the
+selected provider has no usable ciphers or compatible key-exchange groups, without
+switching providers or relaxing the requested protocol versions. The older
+infallible builders remain for API compatibility and panic on configuration errors;
+runtime consumers should use the fallible variants. This backend does not
+promise panic-free protocol operation or a provider-qualified TLS path. These
+limitations require disposition during downstream integration and qualification.
+
+The pinned `rustls-openssl` 0.4.1 verifier prints OpenSSL error stacks directly to
+stderr through `std::dbg!`, including in release builds, when verification returns
+an OpenSSL error. Peer-controlled malformed signatures can trigger this path;
+the output bypasses application logging controls and can create repeated
+diagnostic noise. Verification still fails. Upstream
+[0.4.2 removes this output](https://github.com/tofay/rustls-openssl/blob/0.4.2/src/verify.rs#L347).
+Upgrade and validate the dependency before deploying this TLS path; that release
+also changes provider routing and FIPS reporting, so the upgrade requires more
+than removing the diagnostic call.
 
 ## Lifecycle and posture
 
@@ -110,17 +218,20 @@ rotation constraints still apply. Authentication failures expose no plaintext or
 distinction between wrong keys, AAD, nonce, ciphertext, or tags.
 
 Coverage excludes dependency-owned SSH/russh primitives, AWS SigV4 signing,
-SPIFFE RustCrypto verification, and non-Rust client runtimes. AWS SDK HTTPS also
+SPIFFE JWT verification, and non-Rust client runtimes. SPIFFE uses its AWS-LC
+backend directly, outside the facade. AWS SDK HTTPS also
 retains its dependency-owned selection. Non-security content hashes and ordinary
 scheduling randomness are not migrated. No SSH or PQC capability is asserted by
-the primitive capability report. OpenSSL, strict policy, module version discovery,
-and deployment qualification belong in follow-up work.
+the primitive capability report. Application-wide OpenSSL integration, strict
+policy, module version discovery, and deployment qualification remain follow-ups.
 
-Operator certificate fingerprints, runtime refresh replay hashes and derived token
+Migrated paths for operator certificate fingerprints, runtime refresh replay hashes and derived token
 IDs, bearer-cache fingerprints, Sandbox Protocol request digests and request-ID
 entropy, Kubernetes/VM runtime
 fence entropy, VM socket-directory entropy, and rootfs staging-token entropy use
-the selected backend.
+the selected backend. The [dependency exception inventory](CRYPTO.md#existing-direct-first-party-exceptions)
+records remaining direct implementations, including other bearer-cache and
+session-identity paths.
 These operations retain SHA-256, UUID v4 encoding where applicable, and existing
 hex encodings. Backend failures propagate; callers must not substitute another
 implementation or continue with a placeholder identity.
@@ -140,11 +251,14 @@ not a whole-application crypto coverage claim:
 | Provider-refresh advisory-lock keys | Deterministic database lock selection for coordinating refreshes, not authentication or encryption. These remain outside the selected-backend contract. |
 | Endpoint IDs and pagination fingerprints | Deterministic identification/request matching, not authentication. These remain outside the selected-backend contract. |
 | Debug token fingerprints | Diagnostic display only; direct hashing remains outside the contract even though the input is a credential. |
+| Destination-trust generation labels (`openshell-server` network trust, Podman operator staging, Kubernetes ConfigMap naming, VM staged-snapshot checks) | Deterministic identity derivation for naming and generation equality, not encryption or proof of authorization. Trust decisions use the gateway's normalization, immutable staging, exact-byte validation, and TLS verification rather than these digests. These retain `sha2` directly. |
 | Schema compatibility tests, content-cache identities, retry jitter, test fixtures | Non-authentication uses remain unchanged. |
 
-Cargo feature selection does not prevent a crate from adding another crypto
-dependency. Review first-party security-sensitive operations against this scope;
-no source-scanning boundary lint is installed.
+The [cargo-deny dependency guardrail](CRYPTO.md#dependency-guardrail) rejects
+unapproved direct dependencies on the catalogued crypto implementations. It
+preserves explicitly classified exceptions, including security-sensitive uses
+awaiting migration. Review operations inside those crates against that scope;
+the dependency check does not inspect source-level usage.
 
 Durable proxy CA loading uses backend key import and `pki::issuer_from_der`.
 The helper uses `x509-parser` without verification features to read the subject,
@@ -178,6 +292,32 @@ Ring. Inspect that boundary with
 `cargo tree -p openshell-crypto --no-default-features --edges normal,build,dev`.
 Branch Checks runs this test separately from workspace tests and rejects Ring or
 AWS-LC in the dependency tree, including build and test dependencies.
+It also runs OpenSSL-only and dual-backend tests and Clippy, and rejects Ring,
+AWS-LC and vendored OpenSSL from the OpenSSL-only crate graph. Run locally with
+system OpenSSL available:
+
+```shell
+OPENSSL_NO_VENDOR=1 OPENSSL_STATIC=0 cargo test --locked -p openshell-crypto --no-default-features --features openssl
+OPENSSL_NO_VENDOR=1 OPENSSL_STATIC=0 cargo test --locked -p openshell-crypto --features openssl
+OPENSSL_NO_VENDOR=1 OPENSSL_STATIC=0 cargo clippy --locked -p openshell-crypto --no-default-features --features openssl --all-targets -- -D warnings
+OPENSSL_NO_VENDOR=1 OPENSSL_STATIC=0 cargo clippy --locked -p openshell-crypto --features openssl --all-targets -- -D warnings
+cargo tree --locked -p openshell-crypto --no-default-features --features openssl --edges normal,build,dev
+```
+
+For Nix, run these commands from `nix develop .#crypto`, entered outside the
+default development shell. CI uses this native toolchain for both OpenSSL-only
+and dual-backend checks. The default shell's release toolchains supply an
+unprefixed system AWS-LC whose `libcrypto`/`libssl` names and symbols collide with
+OpenSSL. The crypto shell selects Nix OpenSSL explicitly and lets Cargo build
+symbol-prefixed AWS-LC for the dual-backend tests.
+
+Tests cover known answers, tampering, chunked AEAD, PKI/CA import, JWT algorithms
+and claims, TLS 1.2/1.3 mutual authentication and rejected peers, and AWS-LC/OpenSSL
+interoperability. A subprocess uses an unsatisfiable property query to test
+unavailable algorithms without modifying its parent process. Its ignored child
+test is invoked by the parent automatically. These are backend contract tests,
+not target RHEL qualification or product E2E tests.
+
 Existing bootstrap, credential-store, gateway TLS/OIDC, and proxy tests exercise the
 migrated consumers. The cargo-deny Ring restrictions and their explicit wrapper
 exceptions remain in force.

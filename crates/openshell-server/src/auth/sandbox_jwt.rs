@@ -24,10 +24,10 @@ pub use openshell_extension_core::{
     EXTENSION_JWT_TYP, ExtensionAudience, ExtensionCallerKind, ExtensionJwtClaims,
     MAX_EXTENSION_TOKEN_TTL,
 };
+use rustls::pki_types::pem::{PemObject, SectionKind};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use std::{
-    io::Cursor,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -295,6 +295,17 @@ impl SandboxSessionJwtAuthority {
         self.issuer.mint_supervisor_token(ttl)
     }
 
+    /// Mint the takeover grant of one supervisor term of a shared pool
+    /// instance. The caller has already advanced the sandbox's persisted
+    /// credential epoch to the grant's.
+    pub fn mint_supervisor_takeover(
+        &self,
+        takeover: &openshell_core::jwt::SupervisorTakeover,
+        ttl: Duration,
+    ) -> Result<MintedSessionToken, SessionJwtError> {
+        self.issuer.mint_supervisor_takeover(takeover, ttl)
+    }
+
     /// Verify a presented supervisor token.
     pub fn verify_supervisor_token(
         &self,
@@ -366,6 +377,7 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
                 sandbox_id: authenticated.sandbox_id.to_string(),
                 source: SandboxIdentitySource::BootstrapJwt {
                     issuer: "launch-session".to_string(),
+                    auth_epoch: Some(authenticated.auth_epoch),
                 },
                 trust_domain: Some("openshell".to_string()),
             },
@@ -522,9 +534,11 @@ impl ExtensionJwtIssuer {
 
 impl GatewayJwks {
     fn from_public_key_pem(public_key_pem: &[u8], kid: String) -> Result<Self, String> {
-        let item = rustls_pemfile::read_one(&mut Cursor::new(public_key_pem))
+        let item = <(SectionKind, Vec<u8>)>::pem_slice_iter(public_key_pem)
+            .next()
+            .transpose()
             .map_err(|e| format!("failed to parse Ed25519 public key PEM for JWKS: {e}"))?;
-        let Some(rustls_pemfile::Item::SubjectPublicKeyInfo(der)) = item else {
+        let Some((SectionKind::PublicKey, der)) = item else {
             return Err("Ed25519 public key PEM does not contain a PUBLIC KEY block".into());
         };
         let (remainder, spki) = SubjectPublicKeyInfo::from_der(der.as_ref())

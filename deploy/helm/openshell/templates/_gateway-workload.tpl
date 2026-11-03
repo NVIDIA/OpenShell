@@ -17,12 +17,14 @@ Gateway pod template shared by the StatefulSet and Deployment workload shapes.
 {{- $legacyCredentialDrivers := .Values.server.credentialDrivers | default dict -}}
 {{- $legacyVaultResources := get $legacyCredentialDrivers "vault" | default dict -}}
 {{- $vaultCaConfigMapName := get $vaultResources "caConfigMapName" | default (get $legacyVaultResources "caConfigMapName") -}}
+{{- $supervisorNetwork := .Values.supervisor.network | default dict -}}
 metadata:
   annotations:
     # Roll the gateway workload when the rendered gateway TOML changes - the
     # gateway only reads /etc/openshell/gateway.toml at startup, so without
     # this annotation a `helm upgrade` that only mutates the ConfigMap would
-    # leave pods running with stale config.
+    # leave pods running with stale config. The operator-owned additional-CA
+    # ConfigMap is not checksummed; restart the gateway after changing its data.
     checksum/gateway-config: {{ include (print $.Template.BasePath "/gateway-config.yaml") . | sha256sum }}
     {{- with .Values.podAnnotations }}
     {{- toYaml . | nindent 4 }}
@@ -134,6 +136,11 @@ spec:
         - name: SSL_CERT_FILE
           value: /etc/openshell-tls/oidc-ca/ca.crt
         {{- end }}
+        # The gateway stages normalized, content-addressed supervisor trust
+        # artifacts under its XDG state directory. Keep that state on a
+        # dedicated writable volume for both StatefulSet and Deployment modes.
+        - name: XDG_STATE_HOME
+          value: /var/lib/openshell-state
         - name: OPENSHELL_TELEMETRY_ENABLED
           value: {{ .Values.server.telemetryEnabled | quote }}
         {{- if $spiffeSocketPath }}
@@ -161,6 +168,12 @@ spec:
         - name: gateway-peer-token
           mountPath: /var/run/secrets/openshell-peer
           readOnly: true
+        {{- if get $supervisorNetwork "additionalCaConfigMapName" }}
+        - name: additional-ca-source
+          mountPath: /etc/openshell-tls/additional-ca-source/ca.crt
+          subPath: ca.crt
+          readOnly: true
+        {{- end }}
         {{- if not .Values.server.disableTls }}
         - name: tls-cert
           mountPath: /etc/openshell-tls/server
@@ -202,6 +215,8 @@ spec:
         {{- with .Values.server.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+        - name: gateway-state
+          mountPath: /var/lib/openshell-state
       ports:
         - name: grpc
           containerPort: {{ .Values.service.port }}
@@ -255,6 +270,14 @@ spec:
               path: token
               audience: openshell-gateway-peer
               expirationSeconds: 3600
+    {{- if get $supervisorNetwork "additionalCaConfigMapName" }}
+    - name: additional-ca-source
+      configMap:
+        name: {{ get $supervisorNetwork "additionalCaConfigMapName" | quote }}
+        items:
+          - key: ca.crt
+            path: ca.crt
+    {{- end }}
     {{- if not .Values.server.disableTls }}
     - name: tls-cert
       secret:
@@ -310,6 +333,8 @@ spec:
     {{- with .Values.server.extraVolumes }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
+    - name: gateway-state
+      emptyDir: {}
   {{- with .Values.nodeSelector }}
   nodeSelector:
     {{- toYaml . | nindent 4 }}

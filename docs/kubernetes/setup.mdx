@@ -317,6 +317,7 @@ The most commonly changed values are:
 | `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
 | `server.auth.allowUnauthenticatedUsers` | Accept user-facing calls without OIDC or mTLS credentials. Use only for trusted local development or a fully trusted access proxy. |
 | `server.enableLoopbackServiceHttp` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
+| `server.serviceHostnameFormat` | Set to `hashed` to make exposed-service hostnames opaque per-gateway hash labels when multiple gateways share one service base domain behind a single ingress; the hash discriminator is the gateway installation name (`server.name`, defaulting to the release name), which must be unique among those gateways. Empty keeps the readable composite hostnames. Refer to [Ingress](/kubernetes/ingress#multiple-gateways-behind-one-ingress). |
 | `pkiInitJob.serverDnsNames` / `certManager.serverDnsNames` | Additional gateway server DNS SANs. Wildcard SANs also enable sandbox service URLs under that domain. |
 | `supervisor.sandboxRuntime.boundaryPort` | Non-privileged TLS port used between paired supervisor and sandbox Pods. |
 | `upstreamProxy` | Operator-owned corporate HTTP forward proxy for policy-approved TLS egress. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |
@@ -408,13 +409,19 @@ managed mode, the configured image-pull Secrets. The gateway stages their
 contents into each sandbox runtime generation's Secrets in the workspace
 namespace.
 
-The namespaced Role covers sandbox lifecycle and identity:
+The namespaced Role covers sandbox lifecycle, supervisor resources, and identity.
+Both the gateway chart and separate workspace chart grant these permissions.
+Stopped-sandbox updates use direct Pod `get` requests to check known workload and
+supervisor Pod names for remaining Pods.
 
 | API Group | Resource | Verbs |
 |---|---|---|
 | `agents.x-k8s.io` | `sandboxes`, `sandboxes/status` | create, delete, get, list, patch, update, watch |
 | `""` | `events` | get, list, watch |
-| `""` | `pods` | get |
+| `""` | `pods` | create, delete, get, list, patch, watch |
+| `""` | `services` | create, get |
+| `""` | `secrets` | create, delete |
+| `networking.k8s.io` | `networkpolicies` | create, get |
 
 The ClusterRole grants node inspection and token validation:
 

@@ -193,6 +193,7 @@ impl SandboxInstanceRegistration {
             sandbox_id: self.sandbox_id.clone(),
             generation: self.auth.runtime_generation.to_string(),
             launch_material,
+            takeover: None,
         })
     }
 
@@ -240,6 +241,7 @@ mod tests {
             sandbox_id: "sandbox".to_string(),
             generation: "gen".to_string(),
             launch_material: b"{}".to_vec(),
+            takeover: None,
         };
         let error = SandboxInstanceRegistration::from_assignment(&mismatched).unwrap_err();
         assert!(error.to_string().contains("not a valid registration"));

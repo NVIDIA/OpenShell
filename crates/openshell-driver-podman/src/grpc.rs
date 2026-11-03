@@ -9,9 +9,9 @@ use openshell_core::proto::compute::v1::{
     DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
     EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
     GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
-    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_server::ComputeDriver,
+    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, SuspendSandboxRequest,
+    SuspendSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -47,6 +47,9 @@ impl ComputeDriverService {
         }
     }
 }
+
+#[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for ComputeDriverService {}
 
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
@@ -155,6 +158,15 @@ impl ComputeDriver for ComputeDriverService {
             .await
     }
 
+    async fn suspend_sandbox(
+        &self,
+        _request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SuspendSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "the Podman compute driver does not support sandbox suspend",
+        ))
+    }
+
     async fn stop_sandbox(
         &self,
         request: Request<StopSandboxRequest>,
@@ -178,23 +190,26 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<StartSandboxResponse>, Status> {
-        self.rpc_tracer
-            .trace(openshell_otel::rpc::START_SANDBOX, async {
-                let request = request.into_inner();
-                if request.sandbox_id.is_empty() {
-                    return Err(Status::invalid_argument("sandbox_id is required"));
-                }
-                self.driver
-                    .start_sandbox(
-                        &request.sandbox_id,
-                        &request.generation_id,
-                        &request.launch_authentication,
-                    )
-                    .await
-                    .map_err(Status::from)?;
-                Ok(Response::new(StartSandboxResponse::default()))
-            })
-            .await
+        Box::pin(
+            self.rpc_tracer
+                .trace(openshell_otel::rpc::START_SANDBOX, async {
+                    let request = request.into_inner();
+                    if request.sandbox_id.is_empty() {
+                        return Err(Status::invalid_argument("sandbox_id is required"));
+                    }
+                    self.driver
+                        .start_sandbox(
+                            &request.sandbox_id,
+                            &request.generation_id,
+                            &request.launch_authentication,
+                            request.sandbox.as_ref(),
+                        )
+                        .await
+                        .map_err(Status::from)?;
+                    Ok(Response::new(StartSandboxResponse::default()))
+                }),
+        )
+        .await
     }
 
     async fn delete_sandbox(

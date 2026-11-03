@@ -34,3 +34,5 @@ Every PR from this issue-backed workflow must have its own existing issue and us
 Do not apply acceptance or roadmap decisions on behalf of a maintainer. Do not introduce `agent:*` workflow labels.
 
 For first-party security-sensitive crypto, use `openshell-crypto` and extend its facade/backend contracts when needed. Follow the [crypto architecture](../../../crates/openshell-crypto/CRYPTO.md) for compatibility, failure handling, and explicit coverage exceptions.
+
+When changing crypto dependencies, run `mise run rust:deny:policy`, including its dependency-boundary regression fixtures. Review any `deny.toml` wrapper change against the documented exception scope; an existing allowance does not authorize new security-sensitive operations outside the facade.

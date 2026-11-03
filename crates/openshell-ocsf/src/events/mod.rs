@@ -214,6 +214,7 @@ mod tests {
             .activity(ActivityId::Open)
             .action(ActionId::Allowed)
             .severity(SeverityId::Informational)
+            .dst_endpoint(Endpoint::from_domain("sandbox.local", 22))
             .build();
 
         let json = serde_json::to_value(&event).unwrap();
@@ -229,6 +230,7 @@ mod tests {
             .activity(ActivityId::Open)
             .severity(SeverityId::Informational)
             .process(Process::new("test", 1))
+            .actor_process(Process::new("openshell-sandbox", 1))
             .build();
 
         let json = serde_json::to_value(&event).unwrap();

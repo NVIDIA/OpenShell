@@ -506,4 +506,32 @@ message SupervisorMiddlewareService {
   // no bearer credential; supervisors must not request one. Intended only for
   // trusted-network development deployments.
   bool allow_insecure_transport = 7;
+  // How the gateway and supervisor authorize the bindings returned by Describe.
+  // Absence preserves dynamic discovery. A supervisor predating this field
+  // cannot enforce a binding policy; upgrade supervisors before requiring one.
+  SupervisorMiddlewareBindingPolicy binding_policy = 8;
+  // Operation/phase pairs required by an allowlist or exact policy. Every
+  // listed binding must be advertised, and only listed bindings may run.
+  repeated SupervisorMiddlewareBinding bindings = 9;
+}
+
+// Operator authority over the bindings in a supervisor middleware manifest.
+enum SupervisorMiddlewareBindingPolicy {
+  // Older gateways omit this field, which selects dynamic discovery.
+  SUPERVISOR_MIDDLEWARE_BINDING_POLICY_UNSPECIFIED = 0;
+  // Accept all supported bindings in the manifest.
+  SUPERVISOR_MIDDLEWARE_BINDING_POLICY_DYNAMIC = 1;
+  // Require and enable the listed bindings; ignore other supported bindings.
+  SUPERVISOR_MIDDLEWARE_BINDING_POLICY_ALLOWLIST = 2;
+  // Require the listed bindings and reject additional bindings.
+  SUPERVISOR_MIDDLEWARE_BINDING_POLICY_EXACT = 3;
+}
+
+// An operation/phase pair that the platform can authorize. These identify
+// platform capabilities, not service-owned binding names.
+enum SupervisorMiddlewareBinding {
+  SUPERVISOR_MIDDLEWARE_BINDING_UNSPECIFIED = 0;
+  SUPERVISOR_MIDDLEWARE_BINDING_HTTP_REQUEST_PRE_CREDENTIALS = 1;
+  SUPERVISOR_MIDDLEWARE_BINDING_HTTP_RESPONSE_PRE_RETURN = 2;
+  SUPERVISOR_MIDDLEWARE_BINDING_WEBSOCKET_MESSAGE_PRE_CREDENTIALS = 3;
 }

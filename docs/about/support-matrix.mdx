@@ -55,8 +55,15 @@ OpenShell publishes multi-architecture gateway images for `linux/amd64` and `lin
 | Linux (Debian/Ubuntu)            | aarch64 (arm64)       | Supported |
 | macOS (Docker Desktop)           | Apple Silicon (arm64) | Supported |
 | Windows (WSL 2 + Docker Desktop) | x86_64                | Experimental  |
+| [Native Windows (MXC)](#windows) | x86_64 and ARM64 | `windows` branch |
 
 On Linux, the `openshell` CLI is a static musl binary and does not require glibc at runtime.
+
+### Windows
+
+Native Windows uses MXC and is separate from WSL 2. Use the
+[Windows guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md)
+for builds from `windows`, host requirements, and enforcement limitations.
 
 ## Standalone Gateway Binary
 

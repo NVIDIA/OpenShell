@@ -18,7 +18,7 @@ jobs:
         with:
           stale-issue-label: state:stale
 
-          days-before-issue-stale: 14
+          days-before-issue-stale: 28
           days-before-issue-close: 14
           days-before-pr-stale: -1
           days-before-pr-close: -1
@@ -26,11 +26,11 @@ jobs:
           operations-per-run: 300
           sort-by: updated
 
-          exempt-issue-labels: lifecycle:frozen,state:frozen
+          exempt-issue-labels: lifecycle:frozen,state:frozen,roadmap
           close-issue-reason: not_planned
 
           stale-issue-message: >
-            This issue has had no activity for 14 days and is now marked stale.
+            This issue has had no activity for 28 days and is now marked stale.
             It may be closed in 14 days if there is no further activity.
             Comment or remove the state:stale label to keep it open.
           close-issue-message: >
