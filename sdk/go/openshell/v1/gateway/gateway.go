@@ -169,7 +169,7 @@ func resolveAuthProvider(cfg *Config) (types.AuthProvider, error) {
 		return &lazyEdgeAuth{loader: &edgeTokenLoader{dir: cfg.Dir}}, nil
 
 	case AuthModeOIDC:
-		src := newDiskTokenSource(cfg.Dir)
+		src := newDiskTokenSource(cfg.Dir, cfg.Name)
 		return v1.RefreshableToken(src)
 
 	case AuthModeMTLS:
