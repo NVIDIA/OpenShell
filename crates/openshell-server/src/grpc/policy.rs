@@ -4892,19 +4892,20 @@ async fn handle_update_config_inner(
         validate_no_reserved_provider_policy_keys(&new_policy)?;
     }
 
-    new_policy = validate_and_canonicalize_policy(new_policy)?;
-    if selected_initial_backfill
-        && spec
+    if selected_initial_backfill {
+        new_policy = validate_and_canonicalize_policy(new_policy)?;
+        if spec
             .policy
             .as_ref()
             .is_some_and(|baseline| baseline != &new_policy)
-    {
-        return Err(super::persistence_error_to_status(
-            crate::persistence::PersistenceError::Conflict {
-                current_resource_version: Some(current_version),
-            },
-            "backfill initial sandbox policy",
-        ));
+        {
+            return Err(super::persistence_error_to_status(
+                crate::persistence::PersistenceError::Conflict {
+                    current_resource_version: Some(current_version),
+                },
+                "backfill initial sandbox policy",
+            ));
+        }
     }
 
     let startup_blocked = crate::policy_store::permits_initial_static_policy_repair(&sandbox);
@@ -4924,6 +4925,9 @@ async fn handle_update_config_inner(
         true
     };
 
+    if !selected_initial_backfill {
+        new_policy = validate_and_canonicalize_policy(new_policy)?;
+    }
     let backfill_policy = should_backfill_policy.then(|| new_policy.clone());
     validate_policy_safety(&new_policy)?;
     crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy).await?;
