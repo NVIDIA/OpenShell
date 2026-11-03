@@ -56,6 +56,7 @@ fn worker_overlay_case(interrupt_retry: bool) {
             b"sandbox-owner-v2:1000:1000\n",
         )
         .unwrap();
+        fs::write(sandbox.join("overlay-unpublished"), b"unpublished\n").unwrap();
     }
     let source = cache.join("test-image/rootfs.ext4");
     fs::create_dir_all(source.parent().unwrap()).unwrap();
@@ -185,6 +186,8 @@ fn worker_overlay_case(interrupt_retry: bool) {
         serde_json::json!({"Ok": {"Overlay": {"uid": 1000, "gid": 1000}}})
     );
     assert_eq!(fs::read(sandbox.join("overlay.ext4")).unwrap(), expected);
+    assert!(sandbox.join("overlay-published").exists());
+    assert!(!sandbox.join("overlay-unpublished").exists());
     assert_eq!(
         fs::read(&template).unwrap(),
         expected,

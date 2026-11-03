@@ -372,10 +372,54 @@ pub fn set_rootfs_image_file_mode(
 
 /// Repair a preserved overlay before the driver mutates it offline. A full
 /// overlay needs space for guest init even when the workload has stopped.
+#[cfg(test)]
 pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
-    let initial_space = ext4_image_space(image_path).ok();
-    let full_overlay = initial_space
-        .is_some_and(|space| space.available_bytes < OVERLAY_RECOVERY_MIN_AVAILABLE_BYTES);
+    recover_rootfs_image_with_cleanup(image_path, &[])
+}
+
+/// Recover on a private copy, then atomically replace the saved image only
+/// after checking space and removing obsolete guest authentication material.
+pub fn recover_rootfs_image_with_cleanup(
+    image_path: &Path,
+    guest_paths_to_remove: &[String],
+) -> Result<(), String> {
+    let initial_space = ext4_image_space(image_path)?;
+    let checked_free_blocks = fsck_free_blocks_without_replay(image_path, &initial_space)?;
+    let full_overlay = checked_free_blocks
+        .saturating_sub(initial_space.reserved_blocks)
+        .saturating_mul(initial_space.block_size)
+        < OVERLAY_RECOVERY_MIN_AVAILABLE_BYTES;
+    let parent = image_path
+        .parent()
+        .ok_or_else(|| format!("overlay {} has no parent directory", image_path.display()))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".overlay-recovery-")
+        .tempdir_in(parent)
+        .map_err(|error| format!("stage overlay recovery: {error}"))?;
+    let staged_image = staging.path().join("overlay.ext4");
+    clone_or_copy_sparse_file(image_path, &staged_image).map_err(|error| {
+        if full_overlay {
+            format!("OverlayDiskFull: cannot copy saved overlay for recovery: {error}")
+        } else {
+            error
+        }
+    })?;
+    recover_rootfs_image_in_place(&staged_image, full_overlay, checked_free_blocks)?;
+    for guest_path in guest_paths_to_remove {
+        remove_rootfs_image_file(&staged_image, guest_path)?;
+    }
+    File::open(&staged_image)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("sync recovered overlay: {error}"))?;
+    fs::rename(&staged_image, image_path)
+        .map_err(|error| format!("publish recovered overlay: {error}"))
+}
+
+fn recover_rootfs_image_in_place(
+    image_path: &Path,
+    full_overlay: bool,
+    checked_free_blocks: u64,
+) -> Result<(), String> {
     let mut command = e2fs_command("e2fsck")?;
     let path = PathBuf::from(command.get_program());
     let output = command
@@ -402,50 +446,27 @@ pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        // Preen refuses some orphaned inodes left by a failed full-disk boot.
-        // Permit only orphan reconnection on a full overlay; any other repair
-        // that preen cannot do safely still requires review.
-        if !full_overlay
-            || !matches!(output.status.code(), Some(4..=7))
-            || !String::from_utf8_lossy(&output.stdout).contains("Unattached inode")
-        {
-            return Err(if full_overlay {
-                format!(
-                    "OverlayDiskFull: filesystem repair needs review; [openshell.drivers.vm] overlay_disk_mib sizes new overlays: {error}"
-                )
-            } else {
-                error
-            });
-        }
-        let mut config = tempfile::NamedTempFile::new()
-            .map_err(|error| format!("create e2fsck recovery config: {error}"))?;
-        config
-            .write_all(b"[problems]\n0x040002 = {\n    preen_ok = true\n}\n")
-            .and_then(|()| config.flush())
-            .map_err(|error| format!("write e2fsck recovery config: {error}"))?;
-        let repair = Command::new(&path)
-            .env("LC_ALL", "C")
-            .env("E2FSCK_CONFIG", config.path())
-            .arg("-p")
-            .arg("-f")
-            .arg(image_path)
-            .output()
-            .map_err(|error| {
-                format!(
-                    "OverlayDiskFull: [openshell.drivers.vm] overlay_disk_mib sizes new overlays; run {}: {error}",
-                    path.display()
-                )
-            })?;
-        if !matches!(repair.status.code(), Some(0..=3)) {
-            return Err(format!(
-                "OverlayDiskFull: filesystem repair needs review; [openshell.drivers.vm] overlay_disk_mib sizes new overlays. {error}\nretry stdout: {}\nretry stderr: {}",
-                String::from_utf8_lossy(&repair.stdout),
-                String::from_utf8_lossy(&repair.stderr)
-            ));
-        }
+        // Reconnecting an orphan into lost+found can make its former guest
+        // path disappear. Keep the original image for manual recovery.
+        let now_full = full_overlay
+            || ext4_image_space(image_path)
+                .is_ok_and(|space| space.available_bytes < OVERLAY_RECOVERY_MIN_AVAILABLE_BYTES);
+        return Err(if now_full {
+            format!(
+                "OverlayDiskFull: filesystem repair needs review; [openshell.drivers.vm] overlay_disk_mib sizes new overlays: {error}"
+            )
+        } else {
+            error
+        });
     }
 
     let mut space = ext4_image_space(image_path)?;
+    if space.free_blocks > checked_free_blocks {
+        return Err(format!(
+            "OverlayDiskFull: journal replay or filesystem repair would release saved overlay blocks ({} to {} free); refusing to start",
+            checked_free_blocks, space.free_blocks
+        ));
+    }
     while space.available_bytes < OVERLAY_RECOVERY_MIN_AVAILABLE_BYTES {
         space = grow_full_overlay(image_path, space).map_err(|error| {
             format!(
@@ -461,6 +482,74 @@ struct Ext4ImageSpace {
     available_bytes: u64,
     filesystem_bytes: u64,
     recovery_shortfall: u64,
+    block_size: u64,
+    free_blocks: u64,
+    reserved_blocks: u64,
+    needs_recovery: bool,
+}
+
+/// A dirty image without a recorded guest flush cannot be safely replayed.
+pub fn rootfs_image_needs_recovery(image_path: &Path) -> Result<bool, String> {
+    ext4_image_space(image_path).map(|space| space.needs_recovery)
+}
+
+fn fsck_free_blocks_without_replay(
+    image_path: &Path,
+    initial_space: &Ext4ImageSpace,
+) -> Result<u64, String> {
+    let mut command = e2fs_command("e2fsck")?;
+    let path = PathBuf::from(command.get_program());
+    let output = command
+        .env("LC_ALL", "C")
+        .arg("-n")
+        .arg("-f")
+        .arg(image_path)
+        .output()
+        .map_err(|error| format!("OverlayDiskFull: run {}: {error}", path.display()))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (used, total) = stdout
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let (_, counts) = line.rsplit_once(", ")?;
+            let counts = counts.strip_suffix(" blocks")?;
+            let (used, total) = counts.split_once('/')?;
+            Some((used.parse::<u64>().ok()?, total.parse::<u64>().ok()?))
+        })
+        .ok_or_else(|| {
+            format!(
+                "OverlayDiskFull: cannot verify saved overlay block usage before journal replay with {} on {}\nstdout: {}\nstderr: {}",
+                path.display(),
+                image_path.display(),
+                stdout,
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })?;
+    let counted_free = stdout
+        .lines()
+        .filter_map(|line| {
+            line.split_once("Free blocks count wrong (")?
+                .1
+                .split_once("counted=")?
+                .1
+                .split_once(')')?
+                .0
+                .parse::<u64>()
+                .ok()
+        })
+        .next_back();
+    let free = counted_free.unwrap_or_else(|| total.saturating_sub(used));
+    if used > total
+        || free > total
+        || total.saturating_mul(initial_space.block_size) != initial_space.filesystem_bytes
+        || output.status.code().is_none_or(|code| code & 8 != 0)
+    {
+        return Err(format!(
+            "OverlayDiskFull: cannot verify saved overlay block usage before journal replay: {}",
+            image_path.display()
+        ));
+    }
+    Ok(free)
 }
 
 fn ext4_image_space(image_path: &Path) -> Result<Ext4ImageSpace, String> {
@@ -539,6 +628,10 @@ fn ext4_image_space(image_path: &Path) -> Result<Ext4ImageSpace, String> {
         available_bytes,
         filesystem_bytes,
         recovery_shortfall,
+        block_size,
+        free_blocks: free,
+        reserved_blocks: reserved,
+        needs_recovery: u32_at(0x60) & 0x4 != 0,
     })
 }
 
@@ -1886,7 +1979,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_rootfs_image_repairs_unattached_inode_on_full_overlay() {
+    fn recover_rootfs_image_refuses_unattached_inode_without_changing_original() {
         if ["e2fsck", "debugfs", "resize2fs"]
             .iter()
             .any(|tool| e2fs_command(tool).is_err())
@@ -1929,7 +2022,11 @@ mod tests {
             "{preen:?}"
         );
 
-        recover_rootfs_image(&image).expect("repair full overlay with orphaned inode");
+        let before = fs::read(&image).expect("read saved overlay");
+        let error =
+            recover_rootfs_image(&image).expect_err("an orphaned path needs manual recovery");
+        assert!(error.contains("OverlayDiskFull"), "{error}");
+        assert_eq!(fs::read(&image).expect("read refused overlay"), before);
 
         let work = e2fs_command("debugfs")
             .expect("debugfs")
@@ -1973,15 +2070,80 @@ mod tests {
         .expect("create nearly full ext4 image");
 
         let tool = directory.path().join("e2fsck");
+        let real_e2fsck = e2fs_command("e2fsck").expect("real e2fsck");
         fs::write(
             &tool,
-            "#!/bin/sh\nif [ \"$1\" = \"-y\" ]; then\n  printf repaired > \"$OPENSHELL_ROOTFS_TOOL_TEST_ROOT/broad-repair\"\n  exit 0\nfi\nif [ -n \"$E2FSCK_CONFIG\" ]; then\n  echo 'Unrelated corruption'\n  exit 4\nfi\necho 'Unattached inode 15'\nexit 4\n",
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"-n\" ]; then\n  exec '{}' \"$@\"\nfi\nif [ \"$1\" = \"-y\" ]; then\n  printf repaired > \"$OPENSHELL_ROOTFS_TOOL_TEST_ROOT/broad-repair\"\n  exit 0\nfi\necho 'Unattached inode 15'\nexit 4\n",
+                real_e2fsck.get_program().to_string_lossy()
+            ),
         )
         .expect("write repair fixture");
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o755))
             .expect("make repair fixture executable");
         run_tool_fixture_test(
             "rootfs::tests::overlay_recovery_refuses_unrelated_repairs_after_unattached_inode",
+            directory.path(),
+        );
+    }
+
+    #[test]
+    fn recovery_refuses_replay_that_discards_full_overlay_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if let Some(directory) = std::env::var_os("OPENSHELL_ROOTFS_TOOL_TEST_ROOT") {
+            let directory = PathBuf::from(directory);
+            let image = directory.join("overlay.ext4");
+            let before = fs::read(&image).expect("read saved overlay");
+            let error = recover_rootfs_image(&image)
+                .expect_err("restart must refuse a replay that loses saved files");
+            assert!(error.contains("OverlayDiskFull"), "{error}");
+            assert!(error.contains("release saved overlay blocks"), "{error}");
+            assert_eq!(fs::read(&image).expect("read refused overlay"), before);
+            return;
+        }
+        if ["mke2fs", "e2fsck", "debugfs"]
+            .iter()
+            .any(|tool| e2fs_command(tool).is_err())
+        {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("replay fixture");
+        let source = directory.path().join("source");
+        let empty = directory.path().join("empty");
+        fs::create_dir_all(source.join("upper")).expect("create upperdir");
+        fs::create_dir_all(source.join("work")).expect("create workdir");
+        fs::create_dir_all(empty.join("upper")).expect("create empty upperdir");
+        fs::create_dir_all(empty.join("work")).expect("create empty workdir");
+        fs::write(source.join("upper/recover.txt"), b"saved marker\n").expect("write marker");
+        fs::write(source.join("upper/fill"), vec![b'A'; 44 * 1024 * 1024]).expect("fill overlay");
+        create_ext4_image_from_dir_with_size(
+            &source,
+            &directory.path().join("overlay.ext4"),
+            64 * 1024 * 1024,
+        )
+        .expect("create full overlay");
+        create_ext4_image_from_dir_with_size(
+            &empty,
+            &directory.path().join("empty.ext4"),
+            64 * 1024 * 1024,
+        )
+        .expect("create empty overlay");
+        let real_e2fsck = e2fs_command("e2fsck").expect("real e2fsck");
+        let tool = directory.path().join("e2fsck");
+        fs::write(
+            &tool,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"-n\" ]; then\n  exec '{}' \"$@\"\nfi\n/bin/cp \"$OPENSHELL_ROOTFS_TOOL_TEST_ROOT/empty.ext4\" \"$3\"\n",
+                real_e2fsck.get_program().to_string_lossy()
+            ),
+        )
+        .expect("write replay fixture");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755))
+            .expect("make replay fixture executable");
+        run_tool_fixture_test(
+            "rootfs::tests::recovery_refuses_replay_that_discards_full_overlay_files",
             directory.path(),
         );
     }
@@ -2154,6 +2316,15 @@ mod tests {
             return;
         }
         let directory = tempfile::tempdir().expect("tool installation");
+        let source = directory.path().join("source");
+        fs::create_dir_all(source.join("upper")).expect("create upperdir");
+        fs::create_dir_all(source.join("work")).expect("create workdir");
+        create_ext4_image_from_dir_with_size(
+            &source,
+            &directory.path().join("overlay.ext4"),
+            64 * 1024 * 1024,
+        )
+        .expect("create fixture overlay");
         run_tool_fixture_test(
             "rootfs::tests::recovery_preserves_selected_path_and_execution_errors",
             directory.path(),

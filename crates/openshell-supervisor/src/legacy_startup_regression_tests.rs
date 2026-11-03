@@ -301,6 +301,7 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         auth_bundle,
         admitted_isolation_backend: Some("test-held".into()),
         main_exit_marker: None,
+        termination_ack_marker: None,
         trace_context: None,
         provider_workload_api_socket: None,
         proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),

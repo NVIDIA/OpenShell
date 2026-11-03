@@ -247,20 +247,25 @@ the overlay while cached image disks remain unchanged. The overlay disk must be
 large enough to hold the compressed payload, unpacked rootfs, and sandbox writes
 during the first prepare.
 
-On restart, the driver checks a preserved overlay with `e2fsck` before writing
-new launch files. If fewer than 32 MiB are available to the sandbox after the
-check, it grows the sparse disk and ext4 filesystem by at least 64 MiB,
-then checks the usable space again before booting. Recovery can grow further in
-the same start if ext4 reserved blocks or metadata still leave too little room.
-If preen stops on an unattached inode in a nearly full overlay, the driver
-retries preen with orphan reconnection enabled. Other repairs that require
-interaction still stop startup.
-The driver retains the overlay image and publishes an `OverlayDiskFull`
-warning when it grows the disk. Later full-disk restarts can grow it again.
-`overlay_disk_mib` sets the initial size of new overlays; it is not a hard
-cap on recovery growth, and changing it does not resize existing overlays. Recovery requires `resize2fs` on the gateway host. If repair or
-growth fails, the start error names `OverlayDiskFull` and the config key, and
-the existing overlay is retained for another attempt.
+On restart, the driver checks a preserved overlay with read-only `e2fsck`,
+then replays the journal and checks the filesystem on a private copy before
+writing new launch files. If fewer than 32 MiB are available after the check,
+it grows the sparse disk and ext4 filesystem by at least 64 MiB and rechecks
+usable space before booting. Recovery can grow further in the same start.
+The driver refuses a full overlay if journal replay or repair would release
+saved blocks, or if preen requests orphan reconnection or another interactive
+repair. The original image remains untouched in these cases. Guest credential
+cleanup runs on the recovered copy after journal replay. VM shutdown flushes
+the guest filesystem and records a durable acknowledgement. A restart refuses
+an unacknowledged flush, and older overlays with an unreplayed journal are
+refused if no acknowledgement exists.
+The driver publishes an `OverlayDiskFull` warning when it grows the disk. Later
+full-disk restarts can grow it again. `overlay_disk_mib` sets the initial size
+of new overlays; it is not a hard cap on recovery growth, and changing it does
+not resize existing overlays. Recovery requires `resize2fs` on the gateway
+host. A missing previously published overlay is never replaced with an empty
+one. A failed recovery reports `OverlayDiskFull` and retains the original
+image for inspection.
 
 The driver also writes the accepted `DriverSandbox` launch request to
 `<state-dir>/sandboxes/<id>/sandbox.pb`. If the gateway restarts, it starts a

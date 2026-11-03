@@ -253,7 +253,7 @@ openshell sandbox download full /sandbox/work ./work
 openshell sandbox exec full -- rm -f /sandbox/fill
 ```
 
-If repair or growth fails, start reports `OverlayDiskFull` and retains the overlay for another attempt. Recovery needs `resize2fs` and free space on the gateway host. A later full-disk restart can grow the disk again. `overlay_disk_mib` sets the initial size of new sandboxes, not a limit on recovery growth; changing it does not resize an existing overlay.
+If recovery would discard saved blocks, needs interactive filesystem repair, or cannot grow the disk, start reports `OverlayDiskFull` and retains the original overlay for inspection. The driver also refuses to replace a missing saved overlay with an empty one, or to replay an unacknowledged dirty journal. Recovery needs `resize2fs` and free space on the gateway host. A later full-disk restart can grow the disk again. `overlay_disk_mib` sets the initial size of new sandboxes, not a limit on recovery growth; changing it does not resize an existing overlay.
 
 ### MicroVM Mounts
 
