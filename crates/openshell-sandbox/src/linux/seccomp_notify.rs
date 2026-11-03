@@ -3,10 +3,13 @@
 
 //! Minimal, typed wrappers for Linux seccomp user notification.
 //!
-//! The wrappers validate notification IDs around every operation and keep raw
-//! UAPI structures private. Production policy and queueing belong to the
-//! sandbox crate; this module owns only the kernel ABI and active conformance
-//! probe.
+//! The wrappers keep raw UAPI structures private. Response operations resolve
+//! the notification ID atomically in the kernel and fail with `ENOENT` when
+//! the target was interrupted or terminated, so they need no userspace
+//! `SECCOMP_IOCTL_NOTIF_ID_VALID` pre-check; callers validate an ID explicitly
+//! only where an effect must be authorized before it is applied. Production
+//! policy and queueing belong to the sandbox crate; this module owns only the
+//! kernel ABI and active conformance probe.
 
 #![allow(unsafe_code)]
 
@@ -172,9 +175,12 @@ impl NotificationProbeReport {
 ///
 /// The listener is installed without `WAIT_KILLABLE_RECV`, so mediation is the
 /// same on every kernel. A signal can interrupt a notified syscall, which the
-/// kernel then restarts or fails with `EINTR`; broker handlers check the
-/// notification is still live before acting and answer a repeated operation
-/// as the kernel would.
+/// kernel then restarts or fails with `EINTR`. Sending a response needs no
+/// prior ID check: the kernel looks up the ID under its notification lock and
+/// reports `ENOENT` when the target was interrupted or terminated. No live
+/// path answers the same notification twice, and a second response would only
+/// report `EINPROGRESS` instead of `ENOENT`, which callers treat as the same
+/// `io::Error`.
 pub struct NotificationListener {
     fd: OwnedFd,
 }
@@ -215,7 +221,6 @@ impl NotificationListener {
 
     /// Return a successful scalar result to the notifying syscall.
     pub fn respond_value(&self, id: u64, value: i64) -> io::Result<()> {
-        self.validate_id(id)?;
         let mut response = RawResponse {
             id,
             val: value,
@@ -238,7 +243,6 @@ impl NotificationListener {
                 "seccomp response errno must be positive",
             ));
         }
-        self.validate_id(id)?;
         let mut response = RawResponse {
             id,
             val: 0,
@@ -255,10 +259,12 @@ impl NotificationListener {
 
     /// Continue a verified local-kernel operation in the notifying task.
     ///
+    /// The kernel resolves the notification ID under its notification lock and
+    /// fails with `ENOENT` once the target was interrupted or terminated, so
+    /// it never continues a syscall whose notification is no longer live.
     /// Callers must not use this for an external INET operation or where a
     /// mutable workload pointer is part of the authorization decision.
     pub fn respond_continue(&self, id: u64) -> io::Result<()> {
-        self.validate_id(id)?;
         let mut response = RawResponse {
             id,
             val: 0,
@@ -281,7 +287,6 @@ impl NotificationListener {
         source: RawFd,
         close_on_exec: bool,
     ) -> io::Result<RawFd> {
-        self.validate_id(notification_id)?;
         let srcfd = u32::try_from(source)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source FD is negative"))?;
         let mut addfd = RawAddFd {
@@ -415,6 +420,9 @@ fn probe_scalar_round_trip() -> io::Result<()> {
     if i64::from(notification.syscall) != libc::SYS_getppid {
         return Err(io::Error::other("unexpected scalar probe syscall"));
     }
+    // Exercise ID validation explicitly: the response wrappers no longer do,
+    // and `SeccompEvidence.id_validation` still reports this probe.
+    listener.validate_id(notification.id)?;
     listener.respond_value(notification.id, PROBE_VALUE)?;
     let observed = launcher
         .join()
@@ -1124,5 +1132,68 @@ mod tests {
             .respond_errno(1, 0)
             .expect_err("zero errno must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn response_wrappers_report_kernel_enoent_for_a_dead_notification() {
+        // The wrappers issue no SECCOMP_IOCTL_NOTIF_ID_VALID pre-check, so a
+        // response to a notification whose target is gone has to surface the
+        // kernel's own ENOENT from NOTIF_SEND or ADDFD-SEND. A notification
+        // that was answered and whose target then returned is no longer live,
+        // which gives every wrapper a dead ID without racing a signal.
+        const PROBE_VALUE: libc::c_long = 0x0bad_c0de;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let launcher = thread::spawn(move || -> io::Result<libc::c_long> {
+            let listener = install_listener(&[libc::SYS_getppid])?;
+            sender
+                .send(listener)
+                .map_err(|_| io::Error::other("notification broker disappeared"))?;
+            // SAFETY: getppid has no pointer arguments. The installed filter
+            // blocks here until the broker answers the notification.
+            Ok(unsafe { libc::syscall(libc::SYS_getppid) })
+        });
+
+        let Ok(listener) = receiver.recv() else {
+            panic!("{}", launcher_failure(launcher, "dead notification"));
+        };
+        let notification =
+            receive_probe_notification(&listener).expect("receive probe notification");
+        assert_eq!(i64::from(notification.syscall), libc::SYS_getppid);
+        listener
+            .respond_value(notification.id, PROBE_VALUE)
+            .expect("answer the live notification");
+        let observed = launcher
+            .join()
+            .expect("notification launcher exits")
+            .expect("notification response is delivered");
+        assert_eq!(observed, PROBE_VALUE, "response value was not delivered");
+
+        // The target returned from the notified syscall, so the kernel dropped
+        // the notification. Every wrapper must now refuse the stale ID.
+        let source = rustix::event::eventfd(1, rustix::event::EventfdFlags::CLOEXEC)
+            .expect("create ADDFD source");
+        let dead_id = notification.id;
+        let outcomes = [
+            ("respond_value", listener.respond_value(dead_id, 0)),
+            (
+                "respond_errno",
+                listener.respond_errno(dead_id, libc::EPERM),
+            ),
+            ("respond_continue", listener.respond_continue(dead_id)),
+            (
+                "add_fd_and_send",
+                listener
+                    .add_fd_and_send(dead_id, source.as_raw_fd(), true)
+                    .map(|_| ()),
+            ),
+        ];
+        for (wrapper, outcome) in outcomes {
+            let error = outcome.expect_err("a dead notification accepted a response");
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ENOENT),
+                "{wrapper} did not surface the kernel ENOENT for a dead notification"
+            );
+        }
     }
 }
