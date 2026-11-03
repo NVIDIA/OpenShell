@@ -691,7 +691,7 @@ struct RemoteComputeDriver {
     client: RemoteComputeDriverClient,
     app_endpoints_client: openshell_core::proto::compute::v1::compute_driver_app_endpoints_client::ComputeDriverAppEndpointsClient<tonic::service::interceptor::InterceptedService<Channel, TraceContextInterceptor>>,
     configuration_updates_client: openshell_core::proto::compute::v1::compute_driver_configuration_updates_client::ComputeDriverConfigurationUpdatesClient<tonic::service::interceptor::InterceptedService<Channel, TraceContextInterceptor>>,
-    admission_acknowledgement: Arc<StdMutex<Option<String>>>,
+    admission_handshake: Arc<StdMutex<Option<(String, bool)>>>,
 }
 
 type RemoteComputeDriverClient = ComputeDriverClient<
@@ -704,7 +704,7 @@ impl RemoteComputeDriver {
             client: ComputeDriverClient::with_interceptor(channel.clone(), TraceContextInterceptor),
             app_endpoints_client: openshell_core::proto::compute::v1::compute_driver_app_endpoints_client::ComputeDriverAppEndpointsClient::with_interceptor(channel.clone(), TraceContextInterceptor),
             configuration_updates_client: openshell_core::proto::compute::v1::compute_driver_configuration_updates_client::ComputeDriverConfigurationUpdatesClient::with_interceptor(channel, TraceContextInterceptor),
-            admission_acknowledgement: Arc::new(StdMutex::new(None)),
+            admission_handshake: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -713,8 +713,8 @@ impl RemoteComputeDriver {
     }
 
     async fn verify_admission_policy(&self, external_isolation: bool) -> Result<(), Status> {
-        let expected = self
-            .admission_acknowledgement
+        let (expected, require_ingress) = self
+            .admission_handshake
             .lock()
             .map_err(|_| Status::internal("admission handshake lock poisoned"))?
             .clone()
@@ -733,6 +733,17 @@ impl RemoteComputeDriver {
         {
             return Err(Status::failed_precondition(
                 "remote compute driver no longer supports isolation backend registration; restart the gateway after upgrading the driver",
+            ));
+        }
+        if require_ingress
+            && !current.extension.as_ref().is_some_and(|metadata| {
+                metadata.supported_capabilities.iter().any(|capability| {
+                    capability == openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION
+                })
+            })
+        {
+            return Err(Status::failed_precondition(
+                "remote compute driver no longer supports negotiated ingress admission; restart the gateway after upgrading the driver",
             ));
         }
         if current.resource_admission_policy != expected {
@@ -772,10 +783,13 @@ impl ComputeDriver for RemoteComputeDriver {
     {
         let mut client = self.client();
         let response = client.get_capabilities(request).await?;
-        self.admission_acknowledgement
+        self.admission_handshake
             .lock()
             .map_err(|_| Status::internal("admission handshake lock poisoned"))?
-            .get_or_insert_with(|| response.get_ref().resource_admission_policy.clone());
+            .get_or_insert_with(|| (
+                response.get_ref().resource_admission_policy.clone(),
+                response.get_ref().extension.as_ref().is_some_and(|metadata| metadata.supported_capabilities.iter().any(|capability| capability == openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION)),
+            ));
         Ok(response)
     }
 
@@ -1487,6 +1501,41 @@ impl ComputeRuntime {
         }
     }
 
+    pub(crate) fn supports_ingress_admission(&self) -> bool {
+        self.driver_info
+            .negotiated_extension
+            .supported_capabilities
+            .iter()
+            .any(|capability| {
+                capability == openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION
+            })
+    }
+
+    pub(crate) fn admit_ingress_port(&self, sandbox: &Sandbox, port: u32) -> Result<(), Status> {
+        openshell_core::ingress::admit_port(
+            sandbox
+                .status
+                .as_ref()
+                .and_then(|status| status.ingress_admission.as_ref()),
+            port,
+            self.supports_ingress_admission(),
+        )
+        .map(|_| ())
+        .map_err(Status::failed_precondition)
+    }
+
+    pub(crate) fn project_ingress_admission(&self, sandbox: &mut Sandbox) {
+        if self.supports_ingress_admission() {
+            // A retained legacy resource under a modern driver has no evidence.
+            // Publish explicit unavailable evidence so clients never infer legacy.
+            sandbox
+                .status
+                .get_or_insert_with(Default::default)
+                .ingress_admission
+                .get_or_insert_with(Default::default);
+        }
+    }
+
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
         self.validate_sandbox_create_with_runtime_inputs(
             sandbox,
@@ -1494,6 +1543,7 @@ impl ComputeRuntime {
             false,
         )
         .await
+        .map(|_| ())
     }
 
     pub(crate) async fn validate_sandbox_create_with_runtime_inputs(
@@ -1501,7 +1551,7 @@ impl ComputeRuntime {
         sandbox: &Sandbox,
         runtime_inputs: &SandboxCreateRuntimeInputs,
         await_main_process_attachment: bool,
-    ) -> Result<(), Status> {
+    ) -> Result<Option<openshell_core::proto::SandboxIngressAdmission>, Status> {
         self.validate_caller_driver_config(
             sandbox
                 .spec
@@ -1523,7 +1573,8 @@ impl ComputeRuntime {
             let staged = self.rootfs_tar_staging.peek(&token)?;
             set_rootfs_tar_path(&mut driver_sandbox, &staged);
         }
-        self.driver
+        let response = self
+            .driver
             .call(
                 openshell_otel::rpc::VALIDATE_SANDBOX_CREATE,
                 Some(sandbox.object_id()),
@@ -1535,8 +1586,17 @@ impl ComputeRuntime {
                         .await
                 },
             )
-            .await
-            .map(|_| ())
+            .await?
+            .into_inner();
+        if self.supports_ingress_admission() {
+            let admission = response.ingress_admission.ok_or_else(|| {
+                Status::failed_precondition("compute driver omitted negotiated ingress admission")
+            })?;
+            openshell_core::ingress::validate(&admission).map_err(Status::failed_precondition)?;
+            Ok(Some(admission))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn create_sandbox(
@@ -1683,6 +1743,26 @@ impl ComputeRuntime {
             ISOLATION_BACKEND_ANNOTATION.into(),
             self.isolation_backend_name().into(),
         );
+
+        if self.supports_ingress_admission()
+            && sandbox
+                .status
+                .as_ref()
+                .and_then(|status| status.ingress_admission.as_ref())
+                .is_none()
+        {
+            let admission = self
+                .validate_sandbox_create_with_runtime_inputs(
+                    &sandbox,
+                    &runtime_inputs,
+                    await_main_process_attachment,
+                )
+                .await?;
+            sandbox
+                .status
+                .get_or_insert_with(Default::default)
+                .ingress_admission = admission;
+        }
 
         // Strip the staging token from the public sandbox before anything
         // persists it: the object store copy is readable by every member of the
@@ -7666,6 +7746,7 @@ fn public_status_from_driver(
         next_restart_time: None,
         main_process_started_time: None,
         last_token_grant_failure: None,
+        ingress_admission: None,
     }
 }
 
@@ -7822,6 +7903,9 @@ fn apply_driver_snapshot(
             .configuration_admission
             .clone_from(&current_status.configuration_admission);
         status.configuration_activated = current_status.configuration_activated;
+        status
+            .ingress_admission
+            .clone_from(&current_status.ingress_admission);
         status.provisioning.clone_from(&current_status.provisioning);
     }
     if old_phase != phase {
@@ -8563,7 +8647,7 @@ impl ComputeDriver for NoopTestDriver {
         Status,
     > {
         Ok(tonic::Response::new(
-            openshell_core::proto::compute::v1::ValidateSandboxCreateResponse {},
+            openshell_core::proto::compute::v1::ValidateSandboxCreateResponse::default(),
         ))
     }
 
@@ -9229,7 +9313,9 @@ mod tests {
                 .lock()
                 .expect("validated sandbox observation lock poisoned")
                 .push(request.into_inner().sandbox.expect("validation sandbox"));
-            Ok(tonic::Response::new(ValidateSandboxCreateResponse {}))
+            Ok(tonic::Response::new(
+                ValidateSandboxCreateResponse::default(),
+            ))
         }
 
         async fn get_sandbox(
@@ -9771,7 +9857,9 @@ mod tests {
             &self,
             _request: Request<ValidateSandboxCreateRequest>,
         ) -> Result<tonic::Response<ValidateSandboxCreateResponse>, Status> {
-            Ok(tonic::Response::new(ValidateSandboxCreateResponse {}))
+            Ok(tonic::Response::new(
+                ValidateSandboxCreateResponse::default(),
+            ))
         }
 
         async fn get_sandbox(
@@ -16515,59 +16603,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_sandbox_update_without_status_preserves_existing_status() {
-        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
-        sandbox.status = Some(SandboxStatus {
-            conditions: vec![SandboxCondition {
-                r#type: "Ready".to_string(),
-                status: "True".to_string(),
-                reason: "DependenciesReady".to_string(),
-                message: "Pod is Ready".to_string(),
-                transition_time: None,
-            }],
-            current_policy_version: 7,
-            ..Default::default()
-        });
-        sandbox.set_phase(SandboxPhase::Ready as i32);
-        runtime.store.put_message(&sandbox).await.unwrap();
+    async fn apply_sandbox_update_preserves_gateway_owned_status() {
+        for observed_status in [
+            None,
+            Some(make_driver_status(DriverCondition {
+                status: "True".into(),
+                ..make_driver_condition("DependenciesReady", "Pod is Ready")
+            })),
+        ] {
+            let mut runtime = test_runtime(Arc::new(TestDriver::default())).await;
+            runtime.driver_info.driver_reports_runtime_readiness = true;
+            let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+            sandbox.status = Some(SandboxStatus {
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: "DependenciesReady".to_string(),
+                    message: "Pod is Ready".to_string(),
+                    transition_time: None,
+                }],
+                current_policy_version: 7,
+                ..Default::default()
+            });
+            sandbox.set_phase(SandboxPhase::Ready as i32);
+            let ingress = openshell_core::proto::SandboxIngressAdmission {
+                scope: openshell_core::proto::IngressScope::SharedHostLoopback as i32,
+                all_ports: false,
+                ports: vec![8080],
+            };
+            sandbox.status.as_mut().unwrap().ingress_admission = Some(ingress.clone());
+            runtime.store.put_message(&sandbox).await.unwrap();
 
-        runtime
-            .apply_sandbox_update(DriverSandbox {
-                id: "sb-1".to_string(),
-                name: "sandbox-a".to_string(),
-                namespace: "default".to_string(),
-                spec: None,
-                status: None,
-                workspace: "default".to_string(),
-            })
-            .await
-            .unwrap();
+            runtime
+                .apply_sandbox_update(DriverSandbox {
+                    id: "sb-1".to_string(),
+                    name: "sandbox-a".to_string(),
+                    namespace: "default".to_string(),
+                    spec: None,
+                    status: observed_status,
+                    workspace: "default".to_string(),
+                })
+                .await
+                .unwrap();
 
-        let stored = runtime
-            .store
-            .get_message::<Sandbox>("sb-1")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            SandboxPhase::try_from(stored.phase()).unwrap(),
-            SandboxPhase::Ready
-        );
-        assert_eq!(stored.current_policy_version(), 7);
-        let ready = stored
-            .status
-            .as_ref()
-            .and_then(|status| {
-                status
-                    .conditions
-                    .iter()
-                    .find(|condition| condition.r#type == "Ready")
-            })
-            .unwrap();
-        assert_eq!(ready.status, "True");
-        assert_eq!(ready.reason, "DependenciesReady");
-        assert_eq!(ready.message, "Pod is Ready");
+            let stored = runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                SandboxPhase::try_from(stored.phase()).unwrap(),
+                SandboxPhase::Ready
+            );
+            assert_eq!(stored.current_policy_version(), 7);
+            assert_eq!(
+                stored.status.as_ref().unwrap().ingress_admission.as_ref(),
+                Some(&ingress)
+            );
+            let ready = stored
+                .status
+                .as_ref()
+                .and_then(|status| {
+                    status
+                        .conditions
+                        .iter()
+                        .find(|condition| condition.r#type == "Ready")
+                })
+                .unwrap();
+            assert_eq!(ready.status, "True");
+            assert_eq!(ready.reason, "DependenciesReady");
+            assert_eq!(ready.message, "Pod is Ready");
+        }
     }
 
     #[tokio::test]
@@ -18977,57 +19084,65 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
     #[cfg(unix)]
     async fn remote_compute_driver_rejects_policy_changes_before_forwarding() {
         use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("admission.sock");
-        let driver = FakeComputeDriver::new();
-        let _server = driver.serve_uds(&socket_path).unwrap();
-        let endpoint = connect_remote_compute_driver("external-test", &socket_path)
-            .await
-            .unwrap();
-        let remote = RemoteComputeDriver::new(endpoint.channel);
-        remote
-            .get_capabilities(Request::new(GetCapabilitiesRequest {
-                gateway: Some(gateway_metadata(ExtensionFamily::Compute)),
-            }))
-            .await
-            .unwrap();
-        driver.set_admission_acknowledgement(String::new());
-        driver.clear_calls();
-        let sandbox = DriverSandbox::default();
-        let status = remote
-            .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
-                sandbox: Some(sandbox.clone()),
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(status.code(), Code::FailedPrecondition);
-        assert!(
+        for remove_ingress in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket_path = dir.path().join("admission.sock");
+            let driver = FakeComputeDriver::new();
+            driver.set_ingress_capability(true);
+            let _server = driver.serve_uds(&socket_path).unwrap();
+            let endpoint = connect_remote_compute_driver("external-test", &socket_path)
+                .await
+                .unwrap();
+            let remote = RemoteComputeDriver::new(endpoint.channel);
             remote
-                .create_sandbox(Request::new(CreateSandboxRequest {
-                    sandbox: Some(sandbox)
+                .get_capabilities(Request::new(GetCapabilitiesRequest {
+                    gateway: Some(gateway_metadata(ExtensionFamily::Compute)),
                 }))
                 .await
-                .is_err()
-        );
-        assert!(
-            remote
-                .start_sandbox(Request::new(StartSandboxRequest::default()))
+                .unwrap();
+            if remove_ingress {
+                driver.set_ingress_capability(false);
+            } else {
+                driver.set_admission_acknowledgement(String::new());
+            }
+            driver.clear_calls();
+            let sandbox = DriverSandbox::default();
+            let status = remote
+                .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
+                    sandbox: Some(sandbox.clone()),
+                }))
                 .await
-                .is_err()
-        );
-        let status = openshell_core::compute::ComputeDriver::update_sandbox_configuration(
-            &remote,
-            Request::new(
-                openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest::default(),
-            ),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(status.code(), Code::FailedPrecondition);
-        assert_eq!(
-            driver.calls(),
-            vec![FakeComputeDriverCall::GetCapabilities; 4]
-        );
+                .unwrap_err();
+            assert_eq!(status.code(), Code::FailedPrecondition);
+            assert!(
+                remote
+                    .create_sandbox(Request::new(CreateSandboxRequest {
+                        sandbox: Some(sandbox)
+                    }))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                remote
+                    .start_sandbox(Request::new(StartSandboxRequest::default()))
+                    .await
+                    .is_err()
+            );
+            let status = openshell_core::compute::ComputeDriver::update_sandbox_configuration(
+                &remote,
+                Request::new(
+                    openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest::default(
+                    ),
+                ),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(status.code(), Code::FailedPrecondition);
+            assert_eq!(
+                driver.calls(),
+                vec![FakeComputeDriverCall::GetCapabilities; 4]
+            );
+        }
     }
 
     #[tokio::test]

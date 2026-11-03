@@ -115,6 +115,7 @@ type SandboxWorkloadTemplateProvenance struct {
 
 // SandboxStatus holds the observed state of a sandbox.
 type SandboxStatus struct {
+	IngressAdmission     *SandboxIngressAdmission
 	AgentPod             string
 	AgentFd              string
 	SandboxFd            string
@@ -275,4 +276,23 @@ type AttachProviderResult struct {
 type DetachProviderResult struct {
 	Sandbox  *Sandbox
 	Detached bool
+}
+
+// IngressScope describes the network namespace of admitted service targets.
+type IngressScope string
+
+// IngressScope values identify the admitted loopback namespace.
+const (
+	IngressUnknown            IngressScope = "unknown"
+	IngressUnsupported        IngressScope = "unsupported"
+	IngressIsolatedLoopback   IngressScope = "isolated_loopback"
+	IngressSharedHostLoopback IngressScope = "shared_host_loopback"
+)
+
+// SandboxIngressAdmission is the immutable compute-admitted forwarding envelope.
+// Nil indicates legacy absence; Unknown never grants a target port.
+type SandboxIngressAdmission struct {
+	Scope    IngressScope
+	AllPorts bool
+	Ports    []uint32
 }

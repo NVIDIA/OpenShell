@@ -1495,6 +1495,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             await_main_process_attachment: false,
             workload_template: String::new(),
             service_exposures: Vec::new(),
+            forward_ports: ports.iter().map(|spec| u32::from(spec.port)).collect(),
         };
 
         let sandbox_name =
@@ -1523,7 +1524,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
         // If ports or command are set, wait for Ready before finishing.
         if need_ready {
             let mut attempts = 0;
-            let _sandbox_id = loop {
+            let ready_sandbox = loop {
                 attempts += 1;
                 if attempts > 150 {
                     let _ = tx.send(Event::CreateResult(Err(
@@ -1544,7 +1545,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                     && let Some(sandbox) = resp.into_inner().sandbox
                 {
                     if sandbox.phase() == SandboxPhase::Ready as i32 {
-                        break sandbox.object_id().to_string();
+                        break sandbox;
                     }
                     if sandbox.phase() == SandboxPhase::Error as i32 {
                         let _ = tx.send(Event::CreateResult(Err(
@@ -1554,6 +1555,25 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                     }
                 }
             };
+
+            // Inspect admission before creating any SSH sessions or listeners.
+            for spec in &ports {
+                if let Err(error) = openshell_core::ingress::admit_port(
+                    ready_sandbox
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.ingress_admission.as_ref()),
+                    u32::from(spec.port),
+                    false,
+                ) {
+                    let _ = tx.send(Event::ForwardWarnings(vec![format!(
+                        "port {}: {error}",
+                        spec.port
+                    )]));
+                    let _ = tx.send(Event::CreateResult(Ok((sandbox_name, workspace))));
+                    return;
+                }
+            }
 
             // Start port forwards if requested.
             if !ports.is_empty() {

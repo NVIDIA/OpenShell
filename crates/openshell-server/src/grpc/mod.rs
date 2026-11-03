@@ -255,7 +255,11 @@ impl openshell_core::proto::sandbox_updates_server::SandboxUpdates for OpenShell
         &self,
         request: Request<openshell_core::proto::UpdateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 }
 
@@ -336,7 +340,11 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn begin_rootfs_tar_staging(
@@ -408,14 +416,22 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<AttachSandboxProviderRequest>,
     ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn detach_sandbox_provider(
         &self,
         request: Request<DetachSandboxProviderRequest>,
     ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn get_sandbox_provider_status(
@@ -443,14 +459,22 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn start_sandbox(
         &self,
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn suspend_sandbox(

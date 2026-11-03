@@ -79,7 +79,7 @@ use crate::persistence::current_time_ms;
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
 const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
 const MAX_TEMPLATES_PER_WORKSPACE: u32 = 1000;
-const MAX_CREATE_SERVICE_EXPOSURES: usize = 32;
+const MAX_CREATE_INGRESS_PORTS: usize = 32;
 const SANDBOX_CAS_RETRY_LIMIT: usize = 16;
 
 #[cfg(test)]
@@ -363,7 +363,7 @@ pub(super) async fn handle_update_sandbox(
     )
     .await?;
     Ok(Response::new(SandboxResponse {
-        sandbox: Some(sandbox),
+        sandbox: Some(project_public_sandbox(state, sandbox)),
         service_urls: HashMap::new(),
     }))
 }
@@ -776,7 +776,7 @@ async fn handle_create_sandbox_inner(
     state
         .compute
         .validate_launch_signer_configured(state.sandbox_session_jwt_authority.is_some())?;
-    state
+    let ingress_admission = state
         .compute
         .validate_sandbox_create_with_runtime_inputs(
             &sandbox,
@@ -788,6 +788,19 @@ async fn handle_create_sandbox_inner(
             warn!(error = %status, "Rejecting sandbox create request");
             status
         })?;
+
+    sandbox
+        .status
+        .get_or_insert_with(Default::default)
+        .ingress_admission = ingress_admission;
+    for port in request.forward_ports.iter().copied().chain(
+        request
+            .service_exposures
+            .iter()
+            .map(|exposure| exposure.target_port),
+    ) {
+        state.compute.admit_ingress_port(&sandbox, port)?;
+    }
 
     let runtime_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
         .map_err(|error| Status::internal(error.to_string()))?;
@@ -875,9 +888,16 @@ async fn handle_create_sandbox_inner(
         "CreateSandbox request completed successfully"
     );
     Ok(Response::new(SandboxResponse {
-        sandbox: Some(sandbox),
+        sandbox: Some(project_public_sandbox(state, sandbox)),
         service_urls,
     }))
+}
+
+/// Project gateway-owned evidence on every outward sandbox value without
+/// rewriting retained legacy records or accepting driver-supplied evidence.
+fn project_public_sandbox(state: &ServerState, mut sandbox: Sandbox) -> Sandbox {
+    state.compute.project_ingress_admission(&mut sandbox);
+    sandbox
 }
 
 fn validate_create_sandbox_request_pre_io(
@@ -888,9 +908,23 @@ fn validate_create_sandbox_request_pre_io(
     crate::grpc::validation::validate_labels(&request.labels)?;
     crate::grpc::validation::validate_caller_annotations(&request.annotations, "annotations")?;
 
-    if request.service_exposures.len() > MAX_CREATE_SERVICE_EXPOSURES {
+    if request.forward_ports.len() > MAX_CREATE_INGRESS_PORTS {
         return Err(Status::invalid_argument(format!(
-            "service_exposures must contain at most {MAX_CREATE_SERVICE_EXPOSURES} entries"
+            "forward_ports must contain at most {MAX_CREATE_INGRESS_PORTS} entries"
+        )));
+    }
+    if request
+        .forward_ports
+        .iter()
+        .any(|port| !(1..=65535).contains(port))
+    {
+        return Err(Status::invalid_argument(
+            "forward_ports must be between 1 and 65535",
+        ));
+    }
+    if request.service_exposures.len() > MAX_CREATE_INGRESS_PORTS {
+        return Err(Status::invalid_argument(format!(
+            "service_exposures must contain at most {MAX_CREATE_INGRESS_PORTS} entries"
         )));
     }
     let mut service_names = HashSet::with_capacity(request.service_exposures.len());
@@ -1053,7 +1087,7 @@ pub(super) async fn handle_get_sandbox(
         None
     };
     let mut response = Response::new(SandboxResponse {
-        sandbox: Some(sandbox),
+        sandbox: Some(project_public_sandbox(state, sandbox)),
         service_urls: HashMap::new(),
     });
     if let Some(value) = owner.and_then(|owner| owner.parse().ok()) {
@@ -1109,11 +1143,14 @@ pub(super) async fn handle_list_sandboxes(
             label_selector: selector,
         },
     };
-    let page = state
+    let mut page = state
         .store
         .list_message_page::<Sandbox>(query, after.as_ref(), pagination.page_size())
         .await
         .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+    for sandbox in &mut page.messages {
+        state.compute.project_ingress_admission(sandbox);
+    }
     let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
     Ok(Response::new(ListSandboxesResponse {
         sandboxes: page.messages,
@@ -1641,7 +1678,7 @@ pub(super) async fn handle_attach_sandbox_provider(
     );
 
     Ok(Response::new(AttachSandboxProviderResponse {
-        sandbox: Some(sandbox),
+        sandbox: Some(project_public_sandbox(state, sandbox)),
         attached,
         receipt: Some(receipt),
     }))
@@ -1769,7 +1806,7 @@ pub(super) async fn handle_detach_sandbox_provider(
     );
 
     Ok(Response::new(DetachSandboxProviderResponse {
-        sandbox: Some(sandbox),
+        sandbox: Some(project_public_sandbox(state, sandbox)),
         detached,
         receipt: Some(receipt),
     }))
@@ -1879,7 +1916,7 @@ async fn handle_stop_sandbox_inner(
     let sandbox = state.compute.stop_sandbox(workspace, name).await?;
     info!(sandbox_name = %name, "StopSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
-        sandbox: Some(sandbox),
+        sandbox: Some(project_public_sandbox(state, sandbox)),
         service_urls: HashMap::new(),
     }))
 }
@@ -1934,7 +1971,7 @@ async fn handle_start_sandbox_inner(
         .project_endpoint_status(&mut sandbox, remote_authority);
     info!(sandbox_name = %name, "StartSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
-        sandbox: Some(sandbox),
+        sandbox: Some(project_public_sandbox(state, sandbox)),
         service_urls: HashMap::new(),
     }))
 }
@@ -1975,7 +2012,7 @@ async fn handle_suspend_sandbox_inner(
     let sandbox = state.compute.suspend_sandbox(workspace, name).await?;
     info!(sandbox_name = %name, "SuspendSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
-        sandbox: Some(sandbox),
+        sandbox: Some(project_public_sandbox(state, sandbox)),
         service_urls: HashMap::new(),
     }))
 }
@@ -2031,7 +2068,7 @@ async fn handle_resume_sandbox_inner(
         .project_endpoint_status(&mut sandbox, remote_authority);
     info!(sandbox_name = %name, "ResumeSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
-        sandbox: Some(sandbox),
+        sandbox: Some(project_public_sandbox(state, sandbox)),
         service_urls: HashMap::new(),
     }))
 }
@@ -2229,7 +2266,7 @@ pub(super) async fn handle_watch_sandbox(
                         .send(Ok(SandboxStreamEvent {
                             payload: Some(
                                 openshell_core::proto::sandbox_stream_event::Payload::Sandbox(
-                                    sandbox.clone(),
+                                    project_public_sandbox(&state, sandbox.clone()),
                                 ),
                             ),
                             // Status snapshots are re-read, not resumed by cursor.
@@ -2509,7 +2546,7 @@ pub(super) async fn handle_watch_sandbox(
                                 match state.store.get_message::<Sandbox>(&sandbox_id).await {
                                     Ok(Some(sandbox)) => {
                                         state.sandbox_index.update_from_sandbox(&sandbox);
-                                        if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone())), cursor: String::new() })).await.is_err() {
+                                        if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(project_public_sandbox(&state, sandbox.clone()))), cursor: String::new() })).await.is_err() {
                                             return;
                                         }
                                         if stop_on_terminal {
@@ -2878,6 +2915,10 @@ pub(super) async fn handle_forward_tcp(
         MinWorkspaceRole::User,
     )
     .await?;
+
+    if let relay_open::Target::Tcp(target) = &target {
+        state.compute.admit_ingress_port(&sandbox, target.port)?;
+    }
 
     // The main process may finish between minting the SSH token and opening
     // its transport. Keep the relay reachable until terminal delivery is
@@ -4342,6 +4383,377 @@ mod tests {
     use openshell_core::proto::{
         GpuResourceRequirements, SandboxServiceExposure, ServiceAuthorizationMode, ServiceEndpoint,
     };
+
+    #[tokio::test]
+    async fn ingress_admission_rejects_unadmitted_create_ports_before_provisioning() {
+        use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
+        use openshell_core::extension_protocol::{
+            COMPUTE_INGRESS_ADMISSION, ExtensionFamily, extension_metadata,
+        };
+        use openshell_core::proto::compute::v1::GetCapabilitiesResponse;
+        use openshell_core::proto::{IngressScope, SandboxIngressAdmission};
+
+        use futures::StreamExt as _;
+        use openshell_core::proto::open_shell_server::OpenShell as _;
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("private-key");
+        std::fs::write(&key, b"test-only stable fingerprint material").unwrap();
+        let exact = SandboxIngressAdmission {
+            scope: IngressScope::SharedHostLoopback as i32,
+            ports: vec![8080],
+            all_ports: false,
+        };
+        for (modern, admission, port, accepted) in [
+            (false, None, 8081, true),
+            (true, None, 8080, false),
+            (true, Some(SandboxIngressAdmission::default()), 8080, false),
+            (
+                true,
+                Some(SandboxIngressAdmission {
+                    scope: IngressScope::Unsupported as i32,
+                    ..Default::default()
+                }),
+                8080,
+                false,
+            ),
+            (true, Some(exact.clone()), 8081, false),
+            (true, Some(exact.clone()), 8080, true),
+            (true, Some(exact.clone()), 0, false),
+            (
+                true,
+                Some(SandboxIngressAdmission {
+                    ports: vec![8080, 8080],
+                    ..exact.clone()
+                }),
+                8080,
+                false,
+            ),
+            (
+                true,
+                Some(SandboxIngressAdmission {
+                    all_ports: true,
+                    ..exact.clone()
+                }),
+                8080,
+                false,
+            ),
+            (
+                true,
+                Some(SandboxIngressAdmission {
+                    scope: IngressScope::IsolatedLoopback as i32,
+                    all_ports: true,
+                    ports: vec![],
+                }),
+                8081,
+                true,
+            ),
+        ] {
+            for forward in [false, true] {
+                let mut state = test_server_state().await;
+                Arc::get_mut(&mut state).unwrap().config.gateway_jwt =
+                    Some(openshell_core::config::GatewayJwtConfig {
+                        signing_key_path: key.clone(),
+                        public_key_path: directory.path().join("public"),
+                        kid_path: directory.path().join("kid"),
+                        gateway_id: "test".into(),
+                        ttl_secs: None,
+                    });
+                let driver = Arc::new(
+                    FakeComputeDriver::new()
+                        .with_ingress_admission(admission.clone())
+                        .with_capabilities(GetCapabilitiesResponse {
+                            driver_name: "test".into(),
+                            default_image: "test/image".into(),
+                            resource_admission_policy:
+                                openshell_core::resource_admission::DriverAdmissionConfig::default()
+                                    .acknowledgement(),
+                            extension: Some(extension_metadata(
+                                ExtensionFamily::Compute,
+                                "openshell/test",
+                                "test",
+                                if modern {
+                                    vec![COMPUTE_INGRESS_ADMISSION.to_string()]
+                                } else {
+                                    vec![]
+                                },
+                            )),
+                            ..Default::default()
+                        }),
+                );
+                let compute = crate::compute::ComputeRuntime::from_driver(
+                    "test".into(),
+                    driver.clone(),
+                    None,
+                    state.store.clone(),
+                    crate::sandbox_index::SandboxIndex::new(),
+                    crate::sandbox_watch::SandboxWatchBus::new(),
+                    crate::tracing_bus::TracingLogBus::new(),
+                    Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+                )
+                .await
+                .unwrap();
+                Arc::get_mut(&mut state).unwrap().compute = compute;
+                let result = handle_create_sandbox(
+                    &state,
+                    authed_request(CreateSandboxRequest {
+                        name: "ingress".into(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                        spec: Some(SandboxSpec {
+                            policy: Some(openshell_policy::restrictive_default_policy()),
+                            ..Default::default()
+                        }),
+                        forward_ports: if forward { vec![port] } else { vec![] },
+                        service_exposures: if forward {
+                            vec![]
+                        } else {
+                            vec![SandboxServiceExposure {
+                                target_port: port,
+                                ..Default::default()
+                            }]
+                        },
+                        ..Default::default()
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "modern={modern}, admission={admission:?}, port={port}"
+                );
+                let provisioned = driver
+                    .calls()
+                    .iter()
+                    .any(|call| matches!(call, FakeComputeDriverCall::CreateSandbox { .. }));
+                assert_eq!(provisioned, accepted);
+                let stored = state
+                    .store
+                    .get_message_by_name::<Sandbox>("default", "ingress")
+                    .await
+                    .unwrap();
+                assert_eq!(stored.is_some(), accepted);
+                if accepted && modern {
+                    let sandbox = stored.unwrap();
+                    assert_eq!(
+                        sandbox.status.as_ref().unwrap().ingress_admission,
+                        admission
+                    );
+                    if !admission.as_ref().unwrap().all_ports {
+                        assert!(
+                            super::super::service::expose_service_endpoint(
+                                &state,
+                                "default",
+                                &sandbox,
+                                "unadmitted",
+                                8081,
+                                ServiceAuthorizationMode::Strip
+                            )
+                            .await
+                            .is_err()
+                        );
+                        assert!(
+                            state
+                                .store
+                                .get_message_by_name::<ServiceEndpoint>(
+                                    "default",
+                                    "ingress--unadmitted"
+                                )
+                                .await
+                                .unwrap()
+                                .is_none()
+                        );
+                        // A resource created before ingress negotiation has no
+                        // retained evidence. Every current read must expose its
+                        // unavailability without rewriting that legacy record.
+                        let mut legacy = sandbox.clone();
+                        let metadata = legacy.metadata.as_mut().unwrap();
+                        metadata.id = "legacy-ingress".into();
+                        metadata.name = "legacy-ingress".into();
+                        metadata.resource_version = 0;
+                        legacy.set_phase(SandboxPhase::Ready as i32);
+                        legacy.status.as_mut().unwrap().ingress_admission = None;
+                        state.store.put_message(&legacy).await.unwrap();
+                        let get = handle_get_sandbox(
+                            &state,
+                            authed_request(GetSandboxRequest {
+                                name: "legacy-ingress".into(),
+                                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                    "default",
+                                )),
+                            }),
+                        )
+                        .await
+                        .unwrap()
+                        .into_inner()
+                        .sandbox
+                        .unwrap();
+                        assert!(
+                            openshell_core::ingress::admit_port(
+                                get.status.as_ref().unwrap().ingress_admission.as_ref(),
+                                8080,
+                                false
+                            )
+                            .is_err()
+                        );
+                        let service = crate::grpc::OpenShellService::new(state.clone());
+                        let start = StartSandboxRequest {
+                            name: "legacy-ingress".into(),
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                            request_id: uuid::Uuid::new_v4().to_string(),
+                        };
+                        for replay in [false, true] {
+                            let started = service
+                                .start_sandbox(authed_request(start.clone()))
+                                .await
+                                .unwrap();
+                            assert_eq!(
+                                started.metadata().contains_key("openshell-replayed"),
+                                replay
+                            );
+                            let descriptor = started
+                                .into_inner()
+                                .sandbox
+                                .unwrap()
+                                .status
+                                .unwrap()
+                                .ingress_admission;
+                            assert!(descriptor.is_some());
+                            assert!(
+                                openshell_core::ingress::admit_port(
+                                    descriptor.as_ref(),
+                                    8080,
+                                    false
+                                )
+                                .is_err()
+                            );
+                        }
+                        let mut stream = handle_watch_sandbox(
+                            &state,
+                            authed_request(WatchSandboxRequest {
+                                sandbox: "legacy-ingress".into(),
+                                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                    "default",
+                                )),
+                                follow_status: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await
+                        .unwrap()
+                        .into_inner();
+                        for updated in [false, true] {
+                            if updated {
+                                state.sandbox_watch_bus.notify("legacy-ingress");
+                            }
+                            let event = tokio::time::timeout(
+                                std::time::Duration::from_secs(1),
+                                stream.next(),
+                            )
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .unwrap();
+                            let Some(
+                                openshell_core::proto::sandbox_stream_event::Payload::Sandbox(
+                                    snapshot,
+                                ),
+                            ) = event.payload
+                            else {
+                                panic!("expected status snapshot")
+                            };
+                            assert!(snapshot.status.unwrap().ingress_admission.is_some());
+                        }
+                        assert!(
+                            state
+                                .store
+                                .get_message::<Sandbox>("legacy-ingress")
+                                .await
+                                .unwrap()
+                                .unwrap()
+                                .status
+                                .unwrap()
+                                .ingress_admission
+                                .is_none()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ingress_admission_guards_live_tcp_targets_without_blocking_ssh_transport() {
+        use openshell_core::proto::open_shell_client::OpenShellClient;
+        use openshell_core::proto::open_shell_server::OpenShellServer;
+        use openshell_core::proto::{IngressScope, SandboxIngressAdmission, tcp_forward_frame};
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        let state = test_server_state().await;
+        let mut sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "ingress-live".into(),
+                name: "ingress-live".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Stopped as i32);
+        sandbox.status.as_mut().unwrap().ingress_admission = Some(SandboxIngressAdmission {
+            scope: IngressScope::SharedHostLoopback as i32,
+            all_ports: false,
+            ports: vec![8080],
+        });
+        state.store.put_message(&sandbox).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(OpenShellServer::with_interceptor(
+                    crate::OpenShellService::new(state),
+                    crate::test_support::authenticate_as_dev_user,
+                ))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let mut client = OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        for (target, diagnostic) in [
+            (
+                tcp_forward_init::Target::Tcp(TcpRelayTarget {
+                    host: "127.0.0.1".into(),
+                    port: 8081,
+                }),
+                "target port was not admitted",
+            ),
+            (
+                tcp_forward_init::Target::Tcp(TcpRelayTarget {
+                    host: "127.0.0.1".into(),
+                    port: 8080,
+                }),
+                "sandbox is not ready",
+            ),
+            (
+                tcp_forward_init::Target::Ssh(SshRelayTarget::default()),
+                "sandbox is not ready",
+            ),
+        ] {
+            let error = client
+                .forward_tcp(tokio_stream::iter([TcpForwardFrame {
+                    payload: Some(tcp_forward_frame::Payload::Init(TcpForwardInit {
+                        sandbox: "ingress-live".into(),
+                        workspace: "default".into(),
+                        target: Some(target),
+                        ..Default::default()
+                    })),
+                }]))
+                .await
+                .unwrap_err();
+            assert!(error.message().contains(diagnostic), "{error}");
+        }
+        server.abort();
+    }
 
     #[tokio::test]
     async fn missing_launch_signer_precedes_driver_validation_and_preserves_staged_archive() {
@@ -7151,6 +7563,7 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
@@ -7226,6 +7639,7 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
@@ -7264,6 +7678,7 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
@@ -7346,6 +7761,7 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
@@ -7726,6 +8142,7 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
@@ -7789,6 +8206,7 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
@@ -8114,6 +8532,7 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
@@ -8185,6 +8604,7 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
@@ -8236,6 +8656,7 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
@@ -8280,6 +8701,7 @@ mod tests {
                     await_main_process_attachment: false,
                     workload_template: String::new(),
                     service_exposures: Vec::new(),
+                    forward_ports: Vec::new(),
                 }),
             )
             .await
@@ -8940,6 +9362,7 @@ mod tests {
                 workload_template: "gpu-kata".to_string(),
                 await_main_process_attachment: false,
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
@@ -9029,6 +9452,7 @@ mod tests {
                 workload_template: "default-image".to_string(),
                 await_main_process_attachment: false,
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
@@ -9083,6 +9507,7 @@ mod tests {
                 workload_template: "default-gpu".to_string(),
                 await_main_process_attachment: false,
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
@@ -9124,6 +9549,7 @@ mod tests {
                 workload_template: "corrupt-template".to_string(),
                 await_main_process_attachment: false,
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
@@ -9166,6 +9592,7 @@ mod tests {
                 workload_template: "gpu-kata".to_string(),
                 await_main_process_attachment: false,
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
@@ -9193,6 +9620,7 @@ mod tests {
                 workload_template: "Invalid_Template_Name".to_string(),
                 await_main_process_attachment: false,
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
@@ -9223,6 +9651,7 @@ mod tests {
                 workload_template: "missing-template".to_string(),
                 await_main_process_attachment: false,
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
@@ -9253,6 +9682,7 @@ mod tests {
                 workload_template: String::new(),
                 await_main_process_attachment: false,
                 service_exposures: Vec::new(),
+                forward_ports: Vec::new(),
             }),
         )
         .await
