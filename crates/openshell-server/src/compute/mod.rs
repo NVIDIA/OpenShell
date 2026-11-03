@@ -5581,7 +5581,9 @@ impl ComputeRuntime {
         let ready_container_exit = existing_phase == SandboxPhase::Ready
             && (driver_snapshot_confirms_stopped(&incoming)
                 || driver_snapshot_reports_runtime_restart(&incoming));
-        if existing_phase != SandboxPhase::Starting && !ready_container_exit {
+        let stopped_bootstrap =
+            existing_phase == SandboxPhase::Stopped && driver_snapshot_confirms_starting(&incoming);
+        if existing_phase != SandboxPhase::Starting && !ready_container_exit && !stopped_bootstrap {
             return self.apply_sandbox_update_locked(incoming, existing).await;
         }
 
@@ -5591,6 +5593,8 @@ impl ComputeRuntime {
         // stop the new generation before the replacement supervisor connects.
         // The replacement may already be Ready when the old exit arrives, so
         // terminal container snapshots need the same check after readiness.
+        // A bootstrap event queued before Stop reached Stopped must also be
+        // revalidated so it cannot undo the completed stop.
         // Release this sandbox's local mutation lock, wait for that lifecycle
         // operation, and then reread both the driver and store before applying
         // an authoritative observation. Taking the per-sandbox gate only for
@@ -5620,7 +5624,10 @@ impl ComputeRuntime {
         match observed {
             Ok(Some(live)) if live.id == incoming.id && live.status.is_some() => incoming = live,
             Ok(Some(_) | None) | Err(_)
-                if matches!(current_phase, SandboxPhase::Starting | SandboxPhase::Ready) =>
+                if matches!(
+                    current_phase,
+                    SandboxPhase::Starting | SandboxPhase::Ready | SandboxPhase::Stopped
+                ) =>
             {
                 warn!(
                     sandbox_id = %incoming.id,
@@ -14298,8 +14305,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_bootstrap_snapshot_waits_for_stop_and_revalidates() {
+        let sandbox = sandbox_record("sb-stop-race", "sandbox-stop-race", SandboxPhase::Ready);
+        let mut stopped = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        stopped.status = Some(make_driver_status(make_driver_condition(
+            "ContainerExited",
+            "container stopped by request",
+        )));
+        let mut bootstrapping = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        let mut status = make_driver_status(make_driver_condition(
+            "DependenciesNotReady",
+            "old bootstrap snapshot queued before stop",
+        ));
+        status.conditions.push(DriverCondition {
+            r#type: "Bootstrapping".to_string(),
+            status: "True".to_string(),
+            reason: "GenerationStarting".to_string(),
+            ..Default::default()
+        });
+        bootstrapping.status = Some(status);
+
+        for (observation, outcome) in [
+            (
+                "stopped",
+                ControlledGetOutcome::Sandbox(Box::new(stopped.clone())),
+            ),
+            ("missing", ControlledGetOutcome::Missing),
+            (
+                "unavailable",
+                ControlledGetOutcome::Error("driver unavailable"),
+            ),
+            (
+                "wrong sandbox",
+                ControlledGetOutcome::Sandbox(Box::new(DriverSandbox {
+                    id: "other-sandbox".to_string(),
+                    ..stopped.clone()
+                })),
+            ),
+            (
+                "missing status",
+                ControlledGetOutcome::Sandbox(Box::new(DriverSandbox {
+                    status: None,
+                    ..stopped.clone()
+                })),
+            ),
+        ] {
+            let driver = ControlledDriver::new();
+            driver.block_stop();
+            driver.set_get_outcome(outcome);
+            let runtime = test_runtime(driver.clone()).await;
+            runtime.store.put_message(&sandbox).await.unwrap();
+
+            let stop_runtime = runtime.clone();
+            let sandbox_name = sandbox.object_name().to_string();
+            let stop =
+                tokio::spawn(
+                    async move { stop_runtime.stop_sandbox("default", &sandbox_name).await },
+                );
+            tokio::time::timeout(Duration::from_secs(1), driver.stop_started.notified())
+                .await
+                .expect("stop did not reach the driver");
+            runtime.apply_sandbox_update(stopped.clone()).await.unwrap();
+
+            let gate = runtime.lifecycle_gates.gate_for(sandbox.object_id());
+            let update_runtime = runtime.clone();
+            let stale_bootstrap = bootstrapping.clone();
+            let update =
+                tokio::spawn(
+                    async move { update_runtime.apply_sandbox_update(stale_bootstrap).await },
+                );
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while Arc::strong_count(&gate) < 3 {
+                    assert!(
+                        !update.is_finished(),
+                        "{observation}: queued bootstrap must wait for the active stop"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("bootstrap update did not wait on the lifecycle gate");
+
+            driver.release_stop();
+            stop.await.unwrap().unwrap();
+            update.await.unwrap().unwrap();
+            let current = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                current.phase(),
+                SandboxPhase::Stopped as i32,
+                "{observation}: stale bootstrap must not revive the stopped sandbox"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn active_bootstrap_snapshot_recovers_stale_stopped_view() {
-        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
         let sandbox = sandbox_record("sb-restart", "sandbox-restart", SandboxPhase::Stopped);
         runtime.store.put_message(&sandbox).await.unwrap();
         let mut bootstrapping = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
@@ -14316,6 +14423,9 @@ mod tests {
         });
         bootstrapping.status = Some(status);
 
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+            bootstrapping.clone(),
+        )));
         runtime.apply_sandbox_update(bootstrapping).await.unwrap();
 
         let current = runtime
