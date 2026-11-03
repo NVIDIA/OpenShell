@@ -62,6 +62,10 @@ pub fn mediate_process_signal(
             if info.si_code >= 0 || info.si_code == libc::SI_TKILL {
                 return Err(io::Error::from_raw_os_error(libc::EPERM));
             }
+            // Native `rt_sigqueueinfo` overwrites `si_signo` with the syscall
+            // signal argument; `pidfd_send_signal` rejects a mismatch with
+            // EINVAL.
+            info.si_signo = signal;
             &raw const info
         }
         _ => return Err(io::Error::from_raw_os_error(libc::ENOSYS)),
@@ -188,6 +192,104 @@ fn thread_group_id(tid: u32) -> io::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicI32;
+
+    /// Value carried in `sigval.sival_ptr` to prove the queued payload survives.
+    const QUEUED_VALUE: usize = 0x5150;
+
+    /// Write end of the report pipe used by the forked child's handler.
+    static REPORT_PIPE: AtomicI32 = AtomicI32::new(-1);
+
+    /// Overlay for the `siginfo_t` `_sifields._rt` fields used by `SI_QUEUE`.
+    ///
+    /// The `value` field sits at the offset the libc `si_value` accessor reads.
+    #[repr(C)]
+    struct QueuedSiginfo {
+        signo: libc::c_int,
+        errno: libc::c_int,
+        code: libc::c_int,
+        pid: libc::pid_t,
+        uid: libc::uid_t,
+        value: libc::sigval,
+    }
+
+    extern "C" fn report_queued_signal(
+        _signal: libc::c_int,
+        info: *mut libc::siginfo_t,
+        _context: *mut libc::c_void,
+    ) {
+        // SAFETY: an SA_SIGINFO handler receives a live kernel siginfo.
+        let (signo, value) = unsafe { ((*info).si_signo, (*info).si_value().sival_ptr.addr()) };
+        let record = [signo, i32::try_from(value).unwrap_or(-1)];
+        // SAFETY: the report descriptor is an inherited pipe write end and
+        // write is async-signal-safe.
+        unsafe {
+            libc::write(
+                REPORT_PIPE.load(Ordering::Relaxed),
+                record.as_ptr().cast(),
+                size_of_val(&record),
+            );
+        }
+    }
+
+    /// Build a queued-signal `siginfo` whose `si_signo` deliberately differs
+    /// from the signal passed to `rt_sigqueueinfo`.
+    fn queued_siginfo() -> libc::siginfo_t {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `siginfo_t` starts with the three `c_int` fields then the
+        // `_sifields._rt` fields; the overlay is `repr(C)` and stays in bounds.
+        unsafe {
+            (&raw mut info)
+                .cast::<QueuedSiginfo>()
+                .write(QueuedSiginfo {
+                    signo: libc::SIGUSR2,
+                    errno: 0,
+                    code: libc::SI_QUEUE,
+                    pid: 0,
+                    uid: 0,
+                    value: libc::sigval {
+                        sival_ptr: std::ptr::without_provenance_mut(QUEUED_VALUE),
+                    },
+                });
+        }
+        info
+    }
+
+    /// Wait in a forked child for one queued `SIGUSR1`.
+    ///
+    /// The handler reports the observed `si_signo` and `si_value` through the
+    /// inherited pipe. Only async-signal-safe libc calls run here and no Rust
+    /// cleanup follows `fork`.
+    fn queued_signal_child(read_fd: libc::c_int, write_fd: libc::c_int) -> ! {
+        // SAFETY: the child owns its inherited descriptors and reports through
+        // the write end only.
+        unsafe {
+            libc::close(read_fd);
+            REPORT_PIPE.store(write_fd, Ordering::Relaxed);
+            let mut blocked: libc::sigset_t = std::mem::zeroed();
+            let mut empty: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&raw mut blocked);
+            libc::sigemptyset(&raw mut empty);
+            libc::sigaddset(&raw mut blocked, libc::SIGUSR1);
+            libc::sigprocmask(libc::SIG_BLOCK, &raw const blocked, std::ptr::null_mut());
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = report_queued_signal as *const () as libc::sighandler_t;
+            action.sa_flags = libc::SA_SIGINFO;
+            libc::sigemptyset(&raw mut action.sa_mask);
+            if libc::sigaction(libc::SIGUSR1, &raw const action, std::ptr::null_mut()) != 0 {
+                libc::_exit(1);
+            }
+            // Bound the wait so a missing delivery fails instead of hanging.
+            libc::alarm(10);
+            let ready = 1_u8;
+            if libc::write(write_fd, (&raw const ready).cast(), 1) != 1 {
+                libc::_exit(2);
+            }
+            // Unblocks SIGUSR1 atomically with the wait.
+            libc::sigsuspend(&raw const empty);
+            libc::_exit(0);
+        }
+    }
 
     #[test]
     fn filtered_worker_cannot_signal_the_sandbox_through_a_tid() {
@@ -217,6 +319,121 @@ mod tests {
             .respond_errno(notification.id, libc::EPERM)
             .unwrap();
         assert_eq!(worker.join().unwrap(), (-1, Some(libc::EPERM)));
+    }
+
+    /// A queued signal must reach the target with the requested `si_signo`.
+    ///
+    /// Native `rt_sigqueueinfo` overwrites `si_signo` with the syscall signal
+    /// argument, and `pidfd_send_signal` rejects a mismatched `si_signo` with
+    /// EINVAL, so mediation must mirror that overwrite.
+    #[test]
+    fn queued_signal_preserves_signo_and_value() {
+        let mut descriptors = [0_i32; 2];
+        // SAFETY: pipe fills both entries of the live array with new FDs.
+        assert_eq!(
+            unsafe { libc::pipe(descriptors.as_mut_ptr()) },
+            0,
+            "pipe failed"
+        );
+        let [read_fd, write_fd] = descriptors;
+
+        // SAFETY: the child body runs only async-signal-safe libc calls before
+        // `_exit`, so the multi-threaded test process is safe to fork.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            queued_signal_child(read_fd, write_fd);
+        }
+        // SAFETY: the parent only reads the report pipe.
+        assert_eq!(unsafe { libc::close(write_fd) }, 0, "close failed");
+
+        let mut ready = [0_u8; 1];
+        // SAFETY: read fills the live readiness buffer from the inherited pipe.
+        let ready_bytes = unsafe { libc::read(read_fd, ready.as_mut_ptr().cast(), 1) };
+        assert_eq!(ready_bytes, 1, "child did not install its signal handler");
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let target = u32::try_from(child).expect("child PID fits u32");
+        let worker = std::thread::spawn(move || {
+            let listener = crate::linux::seccomp_notify::install_workload_listener().unwrap();
+            sender.send(listener).unwrap();
+            let info = queued_siginfo();
+            // SAFETY: `info` outlives the kernel's copy; the worker blocks in
+            // the notified syscall until the broker responds.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_rt_sigqueueinfo,
+                    libc::c_long::from(target),
+                    libc::c_long::from(libc::SIGUSR1),
+                    &raw const info,
+                )
+            };
+            let error = if result < 0 {
+                io::Error::last_os_error().raw_os_error()
+            } else {
+                None
+            };
+            (result, error)
+        });
+
+        let listener = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let notification = listener.receive().unwrap();
+        assert_eq!(i64::from(notification.syscall), libc::SYS_rt_sigqueueinfo);
+        let mediation = mediate_process_signal(
+            &listener,
+            notification,
+            std::process::id(),
+            &AtomicBool::new(false),
+        );
+        if let Err(error) = &mediation {
+            listener
+                .respond_errno(notification.id, error.raw_os_error().unwrap_or(libc::EPERM))
+                .unwrap();
+            // SAFETY: the child is this test's direct descendant and would
+            // otherwise wait out its alarm.
+            unsafe { libc::kill(child, libc::SIGKILL) };
+        }
+        let worker_result = worker.join().unwrap();
+
+        let mut status = 0;
+        // SAFETY: the child is a live direct descendant of this process.
+        assert_eq!(
+            unsafe { libc::waitpid(child, &raw mut status, 0) },
+            child,
+            "waitpid failed"
+        );
+        let mut observed = [0_i32; 2];
+        // SAFETY: read fills the live record buffer; the parent closed the
+        // write end, so a child that never reported leaves the pipe at EOF.
+        let reported = unsafe {
+            libc::read(
+                read_fd,
+                observed.as_mut_ptr().cast(),
+                size_of_val(&observed),
+            )
+        };
+        // SAFETY: this process still owns the read end.
+        assert_eq!(unsafe { libc::close(read_fd) }, 0, "close failed");
+
+        assert!(
+            mediation.is_ok(),
+            "queued signal mediation failed: {:?}",
+            mediation.as_ref().err()
+        );
+        assert_eq!(worker_result, (0, None));
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "child did not exit cleanly: {status}"
+        );
+        assert_eq!(
+            reported,
+            isize::try_from(size_of_val(&observed)).unwrap(),
+            "child did not report the delivered siginfo"
+        );
+        assert_eq!(observed[0], libc::SIGUSR1);
+        assert_eq!(observed[1], i32::try_from(QUEUED_VALUE).unwrap());
     }
 
     #[test]
