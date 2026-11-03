@@ -440,7 +440,7 @@ fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
     )
 }
 
-const METRICS_TLS_HANDSHAKE_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+const METRICS_TLS_HANDSHAKE_WARNING_INTERVAL: Duration = Duration::from_mins(1);
 
 #[derive(Default)]
 struct MetricsTlsHandshakeLogState {
@@ -2486,8 +2486,9 @@ mod tests {
         proto::{HealthRequest, open_shell_client::OpenShellClient},
     };
     use rcgen::{CertificateParams, KeyUsagePurpose};
-    use std::fs::{self, File};
-    use std::io::{BufReader, Error, ErrorKind};
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use std::fs;
+    use std::io::{Error, ErrorKind};
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
     use std::sync::{
@@ -2520,22 +2521,21 @@ mod tests {
 
     fn test_tls_connector(ca_path: &Path, client_auth: Option<(&Path, &Path)>) -> TlsConnector {
         let mut roots = rustls::RootCertStore::empty();
-        let file = File::open(ca_path).expect("failed to open test CA certificate");
-        for certificate in rustls_pemfile::certs(&mut BufReader::new(file)) {
+        let certificates =
+            CertificateDer::pem_file_iter(ca_path).expect("failed to open test CA certificate");
+        for certificate in certificates {
             roots
                 .add(certificate.expect("failed to parse test CA certificate"))
                 .expect("failed to add test CA certificate");
         }
 
         let config = if let Some((cert_path, key_path)) = client_auth {
-            let cert_file = File::open(cert_path).expect("failed to open test client certificate");
-            let cert_chain = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+            let cert_chain = CertificateDer::pem_file_iter(cert_path)
+                .expect("failed to open test client certificate")
                 .collect::<Result<Vec<_>, _>>()
                 .expect("failed to parse test client certificate");
-            let key_file = File::open(key_path).expect("failed to open test client key");
-            let private_key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-                .expect("failed to parse test client key")
-                .expect("test client key is missing");
+            let private_key =
+                PrivateKeyDer::from_pem_file(key_path).expect("failed to parse test client key");
 
             Arc::new(
                 rustls::ClientConfig::builder()
@@ -3118,7 +3118,7 @@ mod tests {
                 .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
         );
         let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
-        let limiter = MetricsTlsHandshakeLogLimiter::new(Duration::from_secs(60));
+        let limiter = MetricsTlsHandshakeLogLimiter::new(Duration::from_mins(1));
 
         log_metrics_tls_handshake_rejection(
             &limiter,
@@ -3146,14 +3146,14 @@ mod tests {
 
     #[test]
     fn metrics_tls_handshake_warnings_are_rate_limited() {
-        let limiter = MetricsTlsHandshakeLogLimiter::new(Duration::from_secs(60));
+        let limiter = MetricsTlsHandshakeLogLimiter::new(Duration::from_mins(1));
         let start = Instant::now();
 
         assert_eq!(limiter.record(start), Some(0));
         assert_eq!(limiter.record(start + Duration::from_secs(1)), None);
         assert_eq!(limiter.record(start + Duration::from_secs(2)), None);
         assert_eq!(
-            limiter.record(start + Duration::from_secs(60)),
+            limiter.record(start + Duration::from_mins(1)),
             Some(2),
             "the next warning reports the rejected handshakes suppressed during the interval"
         );
@@ -3172,7 +3172,7 @@ mod tests {
                 .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
         );
         let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
-        let limiters = MetricsTlsHandshakeLogLimiters::new(Duration::from_secs(60));
+        let limiters = MetricsTlsHandshakeLogLimiters::new(Duration::from_mins(1));
         let client = "192.0.2.10:443".parse().expect("valid test client address");
 
         // A rejected handshake warns once and suppresses further rejections

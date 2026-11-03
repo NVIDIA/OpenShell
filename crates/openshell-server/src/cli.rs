@@ -1645,7 +1645,6 @@ mod tests {
     use clap::Parser;
     use openshell_core::config::ServiceHostnameFormat;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -3269,9 +3268,12 @@ require_client_auth = true
                     .expect("valid metrics TLS configuration")
                     .expect("metrics TLS is configured");
 
-                assert_eq!(tls.cert_path, PathBuf::from("/metrics/tls.crt"));
-                assert_eq!(tls.key_path, PathBuf::from("/metrics/tls.key"));
-                assert_eq!(tls.client_ca_path, Some(PathBuf::from("/metrics/ca.crt")));
+                assert_eq!(tls.cert_path, std::path::PathBuf::from("/metrics/tls.crt"));
+                assert_eq!(tls.key_path, std::path::PathBuf::from("/metrics/tls.key"));
+                assert_eq!(
+                    tls.client_ca_path,
+                    Some(std::path::PathBuf::from("/metrics/ca.crt"))
+                );
                 assert!(tls.require_client_auth);
             });
     }
@@ -3371,6 +3373,21 @@ require_client_auth = true
                         .contains("metrics TLS requires --metrics-tls-cert"),
                     "error: {error}"
                 );
+
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-require-client-auth",
+                ]);
+                let error = resolve_metrics_tls(&args)
+                    .expect_err("client authentication alone must enable metrics TLS validation");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("metrics TLS requires --metrics-tls-cert"),
+                    "error: {error}"
+                );
             });
     }
 
@@ -3401,12 +3418,11 @@ require_client_auth = true
                 ]);
                 let registry = test_registry("podman", true);
 
-                let error =
-                    match super::prepare_server_config_with_drivers(&mut args, &matches, &registry)
-                    {
-                        Err(error) => error,
-                        Ok(_) => panic!("metrics TLS without a listener must be rejected"),
-                    };
+                let Err(error) =
+                    super::prepare_server_config_with_drivers(&mut args, &matches, &registry)
+                else {
+                    panic!("metrics TLS without a listener must be rejected");
+                };
                 assert!(
                     error
                         .to_string()
@@ -3517,7 +3533,7 @@ require_client_auth = true
 
                 assert_eq!(
                     super::resolve_config_path(&args).unwrap(),
-                    Some(PathBuf::from("/tmp/missing.toml"))
+                    Some(std::path::PathBuf::from("/tmp/missing.toml"))
                 );
             });
     }
