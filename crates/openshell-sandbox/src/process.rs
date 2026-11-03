@@ -615,9 +615,17 @@ impl ProcessHandle {
         #[cfg(target_os = "linux")]
         let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
             .map_err(|error| miette::miette!("prepare child self-protection filter: {error}"))?;
+        // Landlock best-effort degradation is reported to this thread over a
+        // CLOEXEC pipe instead of being logged from the forked child.
+        let landlock_report = sandbox::linux::LandlockReportPipe::new()
+            .map_err(|error| miette::miette!("create Landlock report pipe: {error}"))?;
+        let landlock_report_fd = landlock_report.child_fd();
         #[cfg(target_os = "linux")]
-        let child_install =
-            sandbox::linux::ChildSandboxInstall::new(prepared_sandbox, child_hardening);
+        let child_install = sandbox::linux::ChildSandboxInstall::new(
+            prepared_sandbox,
+            child_hardening,
+            landlock_report_fd,
+        );
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
@@ -657,14 +665,18 @@ impl ProcessHandle {
             }
         }
 
+        // The registry lock is held across spawn and the Landlock report
+        // drain so a child exiting during the drain is registered before
+        // the orphan reaper can consider it.
+        #[cfg(target_os = "linux")]
+        let mut child_registry = managed_children::lock();
         // Name the program in the error: a bare "No such file or directory"
         // here is otherwise indistinguishable from a missing working directory
         // or interpreter, and is a common failure on images that lack the
         // requested shell/binary (e.g. bash on Alpine).
         #[cfg(target_os = "linux")]
-        let mut child_registry = managed_children::lock();
-        #[cfg(target_os = "linux")]
-        let mut child = spawn_command_with_workload_launcher(launcher, cmd)
+        let mut child = landlock_report
+            .spawn_and_drain(|| spawn_command_with_workload_launcher(launcher, cmd))
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to spawn sandbox entrypoint process '{program}'"))?;
         #[cfg(not(target_os = "linux"))]
@@ -1750,6 +1762,81 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn harden_child_process_marks_process_nondumpable() {
         assert_eq!(probe_hardened_child(dumpable_flag_probe), 0);
+    }
+
+    /// `ProcessHandle::spawn` must drain the Landlock report pipe after
+    /// `spawn` returns but before mapping the spawn error, so a failed spawn
+    /// still returns promptly instead of stalling on a never-EOF pipe (the
+    /// drain blocks forever if the parent's write end is never dropped).
+    /// Forcing a real `restrict_self` degradation through this
+    /// public spawn API is not possible — the blocking seccomp filter used
+    /// in the landlock tests can only be installed in a forked child — so
+    /// this pins the closest observable contract: the failed spawn returns
+    /// its entrypoint error rather than hanging. The spawn runs on a
+    /// dedicated thread waited with a channel timeout, so a stalled drain
+    /// fails the test cleanly instead of deadlocking a runtime shutdown.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_spawn_drains_the_landlock_report_pipe_before_returning() {
+        if sandbox::linux::require_landlock_abi().is_err() {
+            return;
+        }
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start test workload launcher");
+        std::thread::spawn(move || {
+            while let Ok(notification) = listener.receive() {
+                let syscall = i64::from(notification.syscall);
+                if syscall == libc::SYS_openat || syscall == libc::SYS_openat2 {
+                    let _ = listener.respond_continue(notification.id);
+                } else {
+                    #[cfg(target_arch = "x86_64")]
+                    if syscall == libc::SYS_open {
+                        let _ = listener.respond_continue(notification.id);
+                        continue;
+                    }
+                    let _ = listener.respond_errno(notification.id, libc::EPERM);
+                }
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let mut policy = policy_with_process(ProcessPolicy::default());
+        policy.filesystem.read_only = vec![root.path().to_path_buf()];
+        policy.landlock = LandlockPolicy {
+            compatibility: openshell_core::policy::LandlockCompatibility::BestEffort,
+        };
+        let provider_env = HashMap::new();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build spawn runtime");
+            let _entered = runtime.enter();
+            let _ = result_tx.send(ProcessHandle::spawn(
+                &launcher,
+                "/definitely/missing/openshell-entrypoint",
+                &[],
+                &ResolvedWorkspace::default(),
+                false,
+                &policy,
+                None,
+                child_env::TlsEnvironmentMode::Override,
+                &provider_env,
+                false,
+            ));
+        });
+        let result = result_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("spawn must return instead of stalling on the Landlock report pipe");
+        let Err(error) = result else {
+            panic!("the missing entrypoint must fail the spawn");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("failed to spawn sandbox entrypoint"),
+            "the error must come from the entrypoint spawn, not an earlier step: {error}"
+        );
     }
 
     #[test]
