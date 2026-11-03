@@ -185,9 +185,10 @@ def test_frozen_budget_write_requires_health_acknowledgement(ack, error):
             assert service.create_request is None
         else:
             client.create_frozen(workspace="default", spec=spec, forward_ports=[8080])
+            request = service.create_request
+            assert request is not None
             assert (
-                service.create_request.spec.resource_requirements.sampled_budget.resident_bytes
-                == 1024
+                request.spec.resource_requirements.sampled_budget.resident_bytes == 1024
             )
-            assert list(service.create_request.forward_ports) == [8080]
+            assert list(request.forward_ports) == [8080]
         assert legacy.create_calls == 0
