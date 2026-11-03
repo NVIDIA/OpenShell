@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -24,6 +24,8 @@ pub(crate) const DEFAULT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const MAX_DNS_MESSAGE_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_RETAINED_ADDRESSES: usize = 16;
 pub(crate) const MAX_CNAME_HOPS: usize = 8;
+/// How long a fallback stays first before the primary is retried.
+const PREFERENCE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum AddressFamily {
@@ -96,7 +98,7 @@ pub(crate) trait TrustedResolver: Send + Sync {
 pub(crate) struct SocketTrustedResolver {
     servers: Mutex<Vec<SocketAddr>>,
     conf_path: Option<PathBuf>,
-    preferred: Mutex<Option<SocketAddr>>,
+    preferred: Mutex<Option<(SocketAddr, Instant)>>,
     exchange_timeout: Duration,
 }
 
@@ -138,11 +140,19 @@ impl SocketTrustedResolver {
         })
     }
 
-    /// Current servers, preferred (last answering) first. An unreadable or
-    /// empty configuration keeps the last good list.
+    /// Servers in configured order, with a recent fallback first until it
+    /// expires or the config changes. A bad read keeps the last good list.
     fn current_servers(&self) -> Vec<SocketAddr> {
+        self.servers_at(Instant::now())
+    }
+
+    fn servers_at(&self, now: Instant) -> Vec<SocketAddr> {
         let mut servers = self
             .servers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut preferred = self
+            .preferred
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(path) = &self.conf_path
@@ -152,15 +162,14 @@ impl SocketTrustedResolver {
             if !fresh.is_empty() && fresh != *servers {
                 tracing::info!(servers = ?fresh, "policy DNS upstream servers changed");
                 *servers = fresh;
+                *preferred = None;
             }
         }
+        if preferred.is_some_and(|(_, since)| now.duration_since(since) >= PREFERENCE_TTL) {
+            *preferred = None;
+        }
         let mut list = servers.clone();
-        drop(servers);
-        let preferred = *self
-            .preferred
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(index) = preferred.and_then(|p| list.iter().position(|s| *s == p)) {
+        if let Some(index) = preferred.and_then(|(p, _)| list.iter().position(|s| *s == p)) {
             list[..=index].rotate_right(1);
         }
         list
@@ -178,10 +187,14 @@ impl SocketTrustedResolver {
         for server in self.current_servers() {
             match self.exchange_with(server, &wire, id, &query).await {
                 Ok(response) => {
-                    *self
+                    let mut preferred = self
                         .preferred
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(server);
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // Keep the old timestamp so it can expire.
+                    if preferred.is_none_or(|(p, _)| p != server) {
+                        *preferred = Some((server, Instant::now()));
+                    }
                     return Ok(response);
                 }
                 Err(error @ (ResolveError::Timeout | ResolveError::Io(_))) => failure = error,
@@ -653,6 +666,40 @@ mod tests {
     }
 
     #[test]
+    fn preference_is_dropped_when_resolv_conf_changes() {
+        let (a, b): (SocketAddr, SocketAddr) = (
+            "192.0.2.10:53".parse().unwrap(),
+            "192.0.2.20:53".parse().unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 192.0.2.10\nnameserver 192.0.2.20\n").unwrap();
+        let resolver = SocketTrustedResolver::from_resolv_conf(&path).unwrap();
+        *resolver.preferred.lock().unwrap() = Some((b, Instant::now()));
+        assert_eq!(resolver.current_servers(), [b, a]);
+
+        std::fs::write(&path, "nameserver 192.0.2.20\nnameserver 192.0.2.10\n").unwrap();
+        *resolver.preferred.lock().unwrap() = Some((a, Instant::now()));
+        assert_eq!(resolver.current_servers(), [b, a]);
+        assert_eq!(*resolver.preferred.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn preference_expires_so_the_configured_primary_is_retried() {
+        let (a, b): (SocketAddr, SocketAddr) = (
+            "192.0.2.10:53".parse().unwrap(),
+            "192.0.2.20:53".parse().unwrap(),
+        );
+        let resolver = SocketTrustedResolver::with_timeout(a, DEFAULT_EXCHANGE_TIMEOUT);
+        resolver.servers.lock().unwrap().push(b);
+        let since = Instant::now();
+        *resolver.preferred.lock().unwrap() = Some((b, since));
+
+        assert_eq!(resolver.servers_at(since + Duration::from_secs(1)), [b, a]);
+        assert_eq!(resolver.servers_at(since + PREFERENCE_TTL), [a, b]);
+    }
+
+    #[test]
     fn resolv_conf_without_nameserver_is_rejected_at_start() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("resolv.conf");
@@ -688,9 +735,13 @@ mod tests {
         );
         resolver.servers.lock().unwrap().push(live_addr);
         let name = NormalizedName::parse("db.example").unwrap();
+        let mut promoted = None;
         for _ in 0..2 {
             let answer = resolver.resolve(&name, AddressFamily::Ipv4).await.unwrap();
             assert_eq!(answer.addresses, ["8.8.8.8".parse::<IpAddr>().unwrap()]);
+            // Later successes must not refresh the expiry.
+            let preferred = *resolver.preferred.lock().unwrap();
+            assert_eq!(*promoted.get_or_insert(preferred), preferred);
         }
         assert_eq!(resolver.current_servers()[0], live_addr);
         task.await.unwrap();
