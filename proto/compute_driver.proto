@@ -146,6 +146,17 @@ message GetCapabilitiesResponse {
   // Gateways require an exact policy match before activating the driver.
   // Empty denotes a legacy driver and requires explicit admission opt-out.
   string resource_admission_policy = 13;
+  // Trusted, unconditional workload-namespace prerequisites for proxy mode.
+  // Requires openshell.compute.proxy-filesystem-baseline. Presence, including
+  // an empty message, replaces legacy Linux defaults. The gateway includes
+  // these paths in effective policy before compute admission and signing.
+  ProxyFilesystemBaseline proxy_filesystem_baseline = 14;
+}
+
+message ProxyFilesystemBaseline {
+  // POSIX absolute workload paths, never paths checked on the gateway host.
+  repeated string read_only = 1;
+  repeated string read_write = 2;
 }
 
 message AuthenticateSandboxRequest {
