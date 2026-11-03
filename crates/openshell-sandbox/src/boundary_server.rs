@@ -4884,6 +4884,8 @@ mod linux {
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "sockaddr_vm exceeds socklen_t")
                 })?;
+            // SAFETY: socket() creates a fresh descriptor and takes only
+            // scalar arguments; the result is checked below before any use.
             let raw_fd = unsafe {
                 libc::socket(
                     libc::AF_VSOCK,
@@ -4894,6 +4896,8 @@ mod linux {
             if raw_fd < 0 {
                 return Err(io::Error::last_os_error());
             }
+            // SAFETY: raw_fd was checked non-negative above and is uniquely
+            // owned; this is its single wrap into an OwnedFd.
             let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
             let address = libc::sockaddr_vm {
                 svm_family: family,
@@ -4902,6 +4906,8 @@ mod linux {
                 svm_cid: libc::VMADDR_CID_ANY,
                 svm_zero: [0; 4],
             };
+            // SAFETY: bind operates on the live OwnedFd with a fully
+            // initialized sockaddr_vm of the declared length.
             let result = unsafe {
                 libc::bind(
                     fd.as_raw_fd(),
@@ -4912,6 +4918,7 @@ mod linux {
             if result < 0 {
                 return Err(io::Error::last_os_error());
             }
+            // SAFETY: listen operates on the live, bound OwnedFd.
             if unsafe { libc::listen(fd.as_raw_fd(), 16) } < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -4935,6 +4942,9 @@ mod linux {
                     listener,
                     server_config,
                 } => {
+                    // SAFETY: accept4 takes the live listener descriptor with
+                    // SOCK_CLOEXEC and a valid null address buffer; the
+                    // returned descriptor is checked below before any use.
                     let raw_fd = unsafe {
                         libc::accept4(
                             listener.as_raw_fd(),
@@ -4946,8 +4956,11 @@ mod linux {
                     if raw_fd < 0 {
                         Err(io::Error::last_os_error())
                     } else {
+                        // SAFETY: raw_fd was checked non-negative above and
+                        // is uniquely owned; this is its single wrap.
+                        let stream = unsafe { File::from_raw_fd(raw_fd) };
                         Ok(ControlStream::PendingTls {
-                            stream: PlainControlStream::Vsock(unsafe { File::from_raw_fd(raw_fd) }),
+                            stream: PlainControlStream::Vsock(stream),
                             server_config: server_config.clone(),
                         })
                     }
@@ -5142,8 +5155,26 @@ mod linux {
         ) -> io::Result<openshell_isolation_interface::contract::BoundaryDuplexStream> {
             match self {
                 Self::Vsock(file) => {
-                    let stream =
-                        unsafe { std::os::unix::net::UnixStream::from_raw_fd(file.into_raw_fd()) };
+                    let raw_fd = file.into_raw_fd();
+                    // SAFETY: `into_raw_fd` handed over a valid, open,
+                    // solely-owned descriptor exactly once, so this is its
+                    // single re-wrap. The descriptor is an AF_VSOCK stream
+                    // reinterpreted as a Unix stream; the stream only ever
+                    // sees family-agnostic operations (fcntl, read/write,
+                    // epoll registration via `from_std`, and shutdown), which
+                    // behave the same on AF_VSOCK streams. `peer_addr`,
+                    // `local_addr`, and `peer_cred` must never be called on
+                    // it: they would fail at runtime on a vsock descriptor.
+                    // The surface is fenced by this private enum and by the
+                    // `Box<dyn DuplexStream>` erasure in `into_tokio`. The
+                    // dial side performs the same reinterpretation in the
+                    // `RuntimeInitiatedVsock` arm of `dial_supervisor`, but
+                    // files its vsock descriptors under the `Unix` variant
+                    // (not `Vsock`) and uses only `take_error()` (a
+                    // SOL_SOCKET getsockopt) and `writable()`, both
+                    // family-agnostic; the allowed-ops list above covers
+                    // this accept-side stream only.
+                    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(raw_fd) };
                     stream.set_nonblocking(true)?;
                     Ok(Box::new(tokio::net::UnixStream::from_std(stream)?))
                 }
