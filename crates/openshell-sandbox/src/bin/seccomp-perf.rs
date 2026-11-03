@@ -4,20 +4,17 @@
 //! Microbenchmark entry point for the production seccomp network broker.
 
 #[cfg(target_os = "linux")]
-use std::net::SocketAddr;
-
-#[cfg(target_os = "linux")]
 use clap::builder::{PossibleValue, PossibleValuesParser};
 #[cfg(target_os = "linux")]
 use clap::{Parser, Subcommand, ValueEnum as _};
 #[cfg(target_os = "linux")]
-use openshell_sandbox::perf::{BenchmarkOptions, Layer, Protocol};
+use openshell_sandbox::perf::{BenchmarkOptions, Layer, Protocol, Target};
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Parser)]
 #[command(
-    about = "Measure native and seccomp-filtered socket performance",
-    long_about = "Measure native and seccomp-filtered TCP socket performance."
+    about = "Measure native and seccomp-filtered socket and file-open performance",
+    long_about = "Measure native and seccomp-filtered TCP socket and file-open performance."
 )]
 struct Cli {
     /// Benchmark layer: native, filtered, or all.
@@ -56,8 +53,9 @@ enum Command {
     Worker {
         #[arg(long)]
         protocol: Protocol,
+        /// Worker target: a socket address, or a file path for file-open.
         #[arg(long)]
-        target: SocketAddr,
+        target: String,
         #[arg(long)]
         iterations: u64,
         #[arg(long)]
@@ -83,7 +81,7 @@ fn main() -> anyhow::Result<()> {
     {
         let report = openshell_sandbox::perf::run_worker(
             protocol,
-            target,
+            Target::parse(protocol, &target)?,
             iterations,
             warmup,
             concurrency,

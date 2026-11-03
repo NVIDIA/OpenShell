@@ -3,8 +3,11 @@
 
 //! Opt-in microbenchmarks for the production seccomp network listener.
 
+use std::fmt;
+use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -36,22 +39,75 @@ impl Layer {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Protocol {
     TcpConnect,
     TcpStream,
+    FileOpen,
 }
 
 impl Protocol {
     pub fn selection(value: &str) -> anyhow::Result<Vec<Self>> {
         match value {
-            "all" => Ok(vec![Self::TcpConnect, Self::TcpStream]),
+            "all" => Ok(vec![Self::TcpConnect, Self::TcpStream, Self::FileOpen]),
             _ => Ok(vec![
                 Self::from_str(value, true).map_err(|error| anyhow::anyhow!("{error}"))?,
             ]),
         }
     }
+}
+
+/// Where a benchmark worker directs its measured operation: a socket address
+/// for the socket protocols, or a file path for file-open.
+#[derive(Clone, Debug)]
+pub enum Target {
+    Tcp(SocketAddr),
+    File(PathBuf),
+}
+
+impl Target {
+    /// Parse the worker `--target` value for `protocol`.
+    pub fn parse(protocol: Protocol, value: &str) -> anyhow::Result<Self> {
+        match protocol {
+            Protocol::FileOpen => Ok(Self::File(PathBuf::from(value))),
+            Protocol::TcpConnect | Protocol::TcpStream => {
+                Ok(Self::Tcp(value.parse().with_context(|| {
+                    format!("parse socket address {value}")
+                })?))
+            }
+        }
+    }
+
+    fn tcp(&self) -> io::Result<SocketAddr> {
+        match self {
+            Self::Tcp(address) => Ok(*address),
+            Self::File(_) => Err(target_mismatch()),
+        }
+    }
+
+    fn file(&self) -> io::Result<&Path> {
+        match self {
+            Self::File(path) => Ok(path),
+            Self::Tcp(_) => Err(target_mismatch()),
+        }
+    }
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tcp(address) => write!(formatter, "{address}"),
+            Self::File(path) => write!(formatter, "{}", path.display()),
+        }
+    }
+}
+
+fn target_mismatch() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "benchmark target does not match the protocol",
+    )
 }
 
 #[derive(Debug)]
@@ -144,7 +200,10 @@ pub fn run(options: BenchmarkOptions) -> anyhow::Result<Vec<BenchmarkReport>> {
 }
 
 struct Fixture {
-    target: SocketAddr,
+    target: Target,
+    /// Keeps the file-open fixture alive until its worker finishes; the
+    /// socket fixtures own a listener thread instead.
+    _file: Option<tempfile::NamedTempFile>,
 }
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -155,8 +214,20 @@ impl Fixture {
         match protocol {
             Protocol::TcpConnect => start_tcp_fixture(false),
             Protocol::TcpStream => start_tcp_fixture(true),
+            Protocol::FileOpen => start_file_fixture(),
         }
     }
+}
+
+fn start_file_fixture() -> io::Result<Fixture> {
+    // The measured operation opens and closes an ordinary file, so the
+    // filtered layer exercises the broker's open mediation (the provider
+    // prefix probe and continue); the fixture only needs to exist.
+    let file = tempfile::NamedTempFile::new()?;
+    Ok(Fixture {
+        target: Target::File(file.path().to_path_buf()),
+        _file: Some(file),
+    })
 }
 
 fn start_tcp_fixture(echo: bool) -> io::Result<Fixture> {
@@ -186,13 +257,16 @@ fn start_tcp_fixture(echo: bool) -> io::Result<Fixture> {
                 }
             }
         })?;
-    Ok(Fixture { target })
+    Ok(Fixture {
+        target: Target::Tcp(target),
+        _file: None,
+    })
 }
 
 #[allow(clippy::cast_precision_loss)]
 pub fn run_worker(
     protocol: Protocol,
-    target: SocketAddr,
+    target: Target,
     iterations: u64,
     warmup: u64,
     concurrency: usize,
@@ -205,6 +279,7 @@ pub fn run_worker(
     let mut readiness = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
         let sender = sender.clone();
+        let target = target.clone();
         let (start_tx, start_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         starters.push(start_tx);
@@ -285,7 +360,8 @@ pub fn run_worker(
 
 /// Report application bytes transferred by the measured operation. A TCP
 /// stream operation writes one payload and reads its echo, so both directions
-/// count. A connect-only operation transfers no application payload.
+/// count. A connect-only or file-open operation transfers no application
+/// payload.
 #[allow(clippy::cast_precision_loss)]
 fn throughput_mbit_per_second(
     protocol: Protocol,
@@ -294,7 +370,7 @@ fn throughput_mbit_per_second(
     seconds: f64,
 ) -> f64 {
     let bytes_per_operation = match protocol {
-        Protocol::TcpConnect => 0,
+        Protocol::TcpConnect | Protocol::FileOpen => 0,
         Protocol::TcpStream => payload_bytes.saturating_mul(2),
     };
     operations as f64 * bytes_per_operation as f64 * 8.0 / seconds / 1_000_000.0
@@ -305,14 +381,15 @@ impl Protocol {
         match self {
             Self::TcpConnect => "implemented local TCP socket/connect interception",
             Self::TcpStream => "implemented established TCP fast path",
+            Self::FileOpen => "implemented ordinary file open mediation",
         }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct WorkerOptions {
     protocol: Protocol,
-    target: SocketAddr,
+    target: Target,
     iterations: u64,
     warmup: u64,
     payload_bytes: usize,
@@ -335,7 +412,7 @@ fn worker_loop(
     let prepared = (|| -> anyhow::Result<_> {
         let payload = vec![0x5a; payload_bytes];
         let mut tcp = if matches!(protocol, Protocol::TcpStream) {
-            Some(connect(target)?)
+            Some(connect(&target)?)
         } else {
             None
         };
@@ -344,7 +421,7 @@ fn worker_loop(
             if Instant::now() >= preparation_deadline {
                 bail!("benchmark warmup exceeded preparation deadline");
             }
-            one_operation(protocol, target, &payload, &mut response, tcp.as_mut())?;
+            one_operation(protocol, &target, &payload, &mut response, tcp.as_mut())?;
         }
         Ok((payload, response, tcp))
     })();
@@ -365,7 +442,7 @@ fn worker_loop(
     let mut samples = Vec::with_capacity(usize::try_from(iterations).unwrap_or(0));
     for _ in 0..iterations {
         let started = Instant::now();
-        one_operation(protocol, target, &payload, &mut response, tcp.as_mut())?;
+        one_operation(protocol, &target, &payload, &mut response, tcp.as_mut())?;
         samples.push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
     }
     Ok(samples)
@@ -373,7 +450,7 @@ fn worker_loop(
 
 fn one_operation(
     protocol: Protocol,
-    target: SocketAddr,
+    target: &Target,
     payload: &[u8],
     response: &mut [u8],
     tcp: Option<&mut TcpStream>,
@@ -387,12 +464,19 @@ fn one_operation(
             stream.write_all(payload)?;
             stream.read_exact(response)?;
         }
+        Protocol::FileOpen => {
+            // Open and close an ordinary file. Under the filter this measures
+            // the broker's open mediation: the provider prefix probe and the
+            // continue response, with no supervisor decision involved.
+            drop(File::open(target.file()?)?);
+        }
     }
     Ok(())
 }
 
-fn connect(target: SocketAddr) -> io::Result<TcpStream> {
-    let stream = TcpStream::connect_timeout(&target, OPERATION_TIMEOUT)?;
+fn connect(target: &Target) -> io::Result<TcpStream> {
+    let address = target.tcp()?;
+    let stream = TcpStream::connect_timeout(&address, OPERATION_TIMEOUT)?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(OPERATION_TIMEOUT))?;
     stream.set_write_timeout(Some(OPERATION_TIMEOUT))?;
@@ -434,11 +518,51 @@ mod tests {
     }
 
     #[test]
+    fn file_open_never_reports_payload_throughput() {
+        let small_payload = throughput_mbit_per_second(Protocol::FileOpen, 1_000, 64, 1.0);
+        let large_payload = throughput_mbit_per_second(Protocol::FileOpen, 1_000, 65_507, 1.0);
+        assert!(small_payload.abs() < f64::EPSILON);
+        assert!(large_payload.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn targets_parse_per_protocol() {
+        let target = Target::parse(Protocol::FileOpen, "/tmp/seccomp-perf-fixture")
+            .expect("parse file-open target");
+        assert!(
+            matches!(target, Target::File(ref path) if path == Path::new("/tmp/seccomp-perf-fixture"))
+        );
+
+        let target =
+            Target::parse(Protocol::TcpConnect, "127.0.0.1:8080").expect("parse tcp target");
+        assert!(matches!(target, Target::Tcp(address) if address.port() == 8080));
+
+        assert!(Target::parse(Protocol::TcpStream, "not a socket address").is_err());
+    }
+
+    #[test]
+    fn file_open_worker_measures_operations() {
+        let file = tempfile::NamedTempFile::new().expect("create fixture file");
+        let report = run_worker(
+            Protocol::FileOpen,
+            Target::File(file.path().to_path_buf()),
+            4,
+            1,
+            2,
+            8,
+        )
+        .expect("run file-open worker");
+        assert_eq!(report.protocol, Protocol::FileOpen);
+        assert_eq!(report.iterations, 8);
+        assert_eq!(report.concurrency, 2);
+    }
+
+    #[test]
     fn preparation_failure_does_not_wait_for_other_workers() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let address = listener.local_addr().expect("test listener address");
         drop(listener);
 
-        assert!(run_worker(Protocol::TcpStream, address, 1, 1, 2, 8).is_err());
+        assert!(run_worker(Protocol::TcpStream, Target::Tcp(address), 1, 1, 2, 8).is_err());
     }
 }
