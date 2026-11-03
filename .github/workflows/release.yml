@@ -153,20 +153,104 @@ jobs:
       release-tag: ${{ needs.promote.outputs.tag }}
       source-sha: ${{ needs.build.outputs.source_sha }}
       semver: ${{ needs.build.outputs.semver }}
-      python-version: ${{ needs.build.outputs.python_version }}
       npm-version: ${{ needs.build.outputs.npm_version }}
       is-prerelease: false
       make-latest: ${{ needs.promote.outputs.make-latest == 'true' }}
     secrets:
       BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
       SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+
+  publish-pypi:
+    name: Publish Python Wheel to PyPI
+    needs: [promote, build, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/openshell/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # Publish the wheel attached to the GitHub Release rather than this run's
+      # build artifact, so a later run can finish publishing the same bytes.
+      - name: Download and verify the released wheel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.promote.outputs.tag }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+          PYTHON_VERSION: ${{ needs.build.outputs.python_version }}
+        run: |
+          set -euo pipefail
+          tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_TAG}" --jq .sha)
+          if [[ "${tag_sha}" != "${SOURCE_SHA}" ]]; then
+            echo "${RELEASE_TAG} points to ${tag_sha}, not ${SOURCE_SHA}" >&2
+            exit 1
+          fi
+          gh release download "${RELEASE_TAG}" -R "${GITHUB_REPOSITORY}" \
+            --pattern '*.whl' --pattern openshell-checksums-sha256.txt --dir release
+          shopt -s nullglob
+          wheels=(release/*.whl)
+          if [[ "${#wheels[@]}" -ne 1 ]]; then
+            echo "Expected exactly one Python wheel on ${RELEASE_TAG}, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+          wheel=$(basename "${wheels[0]}")
+          if [[ "${wheel}" != openshell-"${PYTHON_VERSION}"-*.whl ]]; then
+            echo "${wheel} is not an openshell ${PYTHON_VERSION} wheel" >&2
+            exit 1
+          fi
+          checksum=$(awk -v wheel="${wheel}" '$2 == wheel { print $1 "  " $2 }' release/openshell-checksums-sha256.txt)
+          if [[ -z "${checksum}" ]]; then
+            echo "${wheel} is missing from the release checksums" >&2
+            exit 1
+          fi
+          (cd release && sha256sum -c - <<<"${checksum}")
+          mkdir dist
+          mv "release/${wheel}" dist/
+
+      - name: Publish wheel to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          skip-existing: true
+
+  publish-fern-docs:
+    name: Sync and Publish Fern Docs
+    needs: [build, publish, publish-pypi]
+    permissions:
+      contents: write
+    uses: ./.github/workflows/sync-docs.yml
+    with:
+      operation: sync
+      channel: stable
+      source_ref: ${{ needs.build.outputs.source_sha }}
+      release_version: ${{ needs.build.outputs.semver }}
+      version_slug: v${{ needs.build.outputs.semver }}
+      display_name: Latest (v${{ needs.build.outputs.semver }})
+      publish: true
+    secrets:
       FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
-      GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
-      GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
+
+  check-publication:
+    name: Check Stable Publication
+    needs: [promote, build, release-notes, publish, publish-pypi, publish-fern-docs]
+    if: ${{ always() && !inputs.notes-only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Require every stable publisher to succeed
+        shell: bash
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          jq -e 'all(.[]; .result == "success")' <<<"${NEEDS}"
 
   notify-release-failure:
     name: Notify Release Failure
-    needs: [promote, build, release-notes, publish]
+    needs: [promote, build, release-notes, publish, publish-pypi, publish-fern-docs, check-publication]
     if: failure()
     runs-on: ubuntu-latest
     timeout-minutes: 2
