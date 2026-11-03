@@ -27,6 +27,10 @@ on:
         description: Release version without the v prefix
         required: true
         type: string
+      python-version:
+        description: Python package version
+        required: true
+        type: string
       npm-version:
         description: TypeScript package version
         required: true
@@ -518,6 +522,19 @@ jobs:
             buf push proto --label "${RELEASE_TAG}" \
             --source-control-url "${SOURCE_CONTROL_URL}"
 
+  publish-pypi:
+    name: Publish Python Wheel
+    needs: release
+    if: ${{ !inputs.is-prerelease }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/wheel-publish.yml
+    with:
+      release-tag: ${{ inputs.release-tag }}
+      source-sha: ${{ inputs.source-sha }}
+      python-version: ${{ inputs.python-version }}
+
   publish-snap:
     name: Publish Snap
     needs: release
@@ -583,6 +600,7 @@ jobs:
       - tag-ghcr-release
       - release-helm
       - release
+      - publish-pypi
       - publish-snap
       - publish-prerelease-snap
       - publish-sdk-typescript
@@ -602,7 +620,7 @@ jobs:
           if [[ "${IS_PRERELEASE}" == "true" ]]; then
             expected+=(publish-prerelease-snap)
           else
-            expected+=(publish-sdk-typescript tag-sdk-go)
+            expected+=(publish-pypi publish-sdk-typescript tag-sdk-go)
             if [[ "${MAKE_LATEST}" == "true" ]]; then
               expected+=(publish-snap)
             fi

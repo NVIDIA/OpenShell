@@ -52,7 +52,6 @@ def test_release_workflows_sync_and_publish_docs_once() -> None:
     assert tag_job["needs"] == [
         "build",
         "publish",
-        "publish-pypi",
     ]
     assert tag_job["uses"] == "./.github/workflows/sync-docs.yml"
     assert tag_job["with"]["channel"] == "stable"

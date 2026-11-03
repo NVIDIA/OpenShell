@@ -86,8 +86,15 @@ Watch the stable release run and report its result.
 
 ## PyPI publishing
 
-Stable releases publish the built Python wheel directly to PyPI from the `publish-pypi` job in `release.yml`, after the other release publishers succeed. The job downloads the wheel from the stable GitHub Release, not the run's build artifact, and checks the stable tag's source commit and the wheel's release checksum. It uses Trusted Publishing with the `pypi` GitHub environment. Configure the `openshell` PyPI project's GitHub publisher with owner `NVIDIA`, repository `OpenShell`, workflow `release.yml`, and environment `pypi`. No PyPI API token or GitLab trigger credentials are required.
+Stable releases publish the Python wheel to PyPI from `wheel-publish.yml`, which the `publish-pypi` job in `release-publish.yml` calls after the GitHub Release is created. The workflow downloads the wheel from the stable GitHub Release, not a run's build artifact, and checks the stable tag's source commit and the wheel's release checksum. It uses Trusted Publishing with the `pypi` GitHub environment. PyPI matches the workflow file that contains the publishing job, so configure the `openshell` PyPI project's GitHub publisher with owner `NVIDIA`, repository `OpenShell`, workflow `wheel-publish.yml`, and environment `pypi`. No PyPI API token or GitLab trigger credentials are required.
 
-The environment must allow the branch used to dispatch Release. For a support release, explicitly allow its support branch before dispatching. Required reviewers, if configured, must approve the PyPI job. Stable docs publish after PyPI succeeds. An existing wheel on PyPI is skipped when retrying Release; PyPI does not allow replacing a published wheel. Because the job publishes the release asset, a new Release run for the same tag can finish a failed PyPI upload.
+The environment must allow the branch used to dispatch Release or `wheel-publish.yml`. For a support release, explicitly allow its support branch before dispatching. Required reviewers, if configured, must approve the PyPI job. An existing wheel on PyPI is skipped; PyPI does not allow replacing a published wheel.
+
+If a stable release did not reach PyPI, publish the wheel without rerunning Release:
+
+```shell
+gh workflow run wheel-publish.yml -R NVIDIA/OpenShell --ref main \
+  -f release-tag=vX.Y.Z -f source-sha=<tag commit> -f python-version=X.Y.Z
+```
 
 Development and prerelease wheels remain GitHub Release assets and do not publish to PyPI.
