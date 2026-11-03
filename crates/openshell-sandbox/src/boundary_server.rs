@@ -9495,6 +9495,171 @@ mod linux {
             drop(in_progress);
         }
 
+        /// Many idle piped execs must leave the control plane responsive:
+        /// the blocking pool they share with the gRPC exchange, exec
+        /// spawn/reap, and `AcceptNetwork` must not fill with threads parked
+        /// on idle exec pipes.
+        ///
+        /// The pool is capped at 16 rather than 4 for a reason worth keeping
+        /// in sync with the implementation: before the readiness-based exec
+        /// streams, every idle piped exec parked three blocking threads
+        /// (reaper waitid, stdout read, stderr read through
+        /// `tokio::fs::File`), so 12 execs demanded 36 threads and the pool
+        /// saturated around the sixth exec. After it, only the per-exec
+        /// reaper still parks one thread: 12 reapers plus the fresh exec's
+        /// spawn transient is 13 of 16, leaving three spare threads for
+        /// control traffic. A cap of 4 could not host 12 idle execs even
+        /// after the fix, so the test would fail on both sides.
+        ///
+        /// Every step runs on its own thread with a channel deadline
+        /// because `start_exec` blocks on the process runtime and
+        /// `serve_request` blocks on its socket pair; an in-thread timeout
+        /// can preempt neither. A stalled step fails its receive instead of
+        /// hanging the suite.
+        #[test]
+        fn many_idle_execs_leave_the_control_plane_responsive() {
+            const CHILD_MARKER: &str = "OPENSHELL_TEST_BOUNDARY_IDLE_EXEC_CHILD";
+            const SANDBOX: &str = "sandbox-idle-exec";
+            const GENERATION: &str = "generation-idle-exec";
+            if std::env::var_os(CHILD_MARKER).is_none() {
+                run_isolated(
+                    "boundary_server::linux::tests::many_idle_execs_leave_the_control_plane_responsive",
+                    CHILD_MARKER,
+                    Duration::from_mins(1),
+                );
+                return;
+            }
+
+            let gateway = TestGateway::new();
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .max_blocking_threads(16)
+                .enable_all()
+                .build()
+                .expect("bounded blocking-pool process runtime");
+            let _entered = process_runtime.enter();
+            let boundary = takeover_test_runtime(&gateway, SANDBOX, GENERATION, &process_runtime);
+            let owner = boundary
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request((), &gateway.token(SANDBOX, GENERATION, 1)).metadata(),
+                )
+                .expect("owner principal");
+            assert!(matches!(
+                boundary.attach(takeover_test_policy(), false),
+                Response::Attached { .. }
+            ));
+            boundary
+                .commit_attach(&owner, test_supervisor_instance_id(), None, None)
+                .expect("attach owner");
+            assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
+            boundary.commit_confirm(&owner).expect("confirm owner");
+            let Response::Started { process_id, .. } = boundary.start_agent(
+                SANDBOX.to_string(),
+                AgentSpecWire {
+                    program: "/bin/sleep".to_string(),
+                    args: vec!["60".to_string()],
+                    workdir: None,
+                    timeout_secs: 120,
+                    interactive: false,
+                    otlp_relay_active: false,
+                },
+                None,
+                None,
+                0,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ) else {
+                panic!("owner could not start the workload");
+            };
+
+            let start_exec_on_thread = |spec: ExecSpecWire| {
+                let boundary = boundary.clone();
+                let (done, result) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let request = RequestEnvelope::new(Request::Exec { spec: spec.clone() })
+                        .expect("build exec request");
+                    let _ = done.send(
+                        boundary
+                            .start_exec(
+                                &request.request_id,
+                                &request.payload_digest,
+                                request.exec_admission_deadline_unix_ms,
+                                spec,
+                            )
+                            .map(|started| started.process_id)
+                            .map_err(|error| format!("{error:?}")),
+                    );
+                });
+                result.recv_timeout(Duration::from_secs(10))
+            };
+            let idle_spec = || ExecSpecWire {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "sleep 30".to_string()],
+                shell: None,
+                runtime_helper: None,
+                env: Vec::new(),
+                workdir: None,
+                pty: false,
+            };
+            let mut exec_ids = Vec::new();
+            for index in 0..12 {
+                let exec_id = start_exec_on_thread(idle_spec())
+                    .unwrap_or_else(|_| panic!("idle exec {index} did not start within 10s"))
+                    .expect("idle exec starts");
+                exec_ids.push(exec_id);
+            }
+
+            exec_ids.push(
+                start_exec_on_thread(ExecSpecWire {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), "exit 0".to_string()],
+                    shell: None,
+                    runtime_helper: None,
+                    env: Vec::new(),
+                    workdir: None,
+                    pty: false,
+                })
+                .expect("fresh exec did not start within 10s")
+                .expect("fresh exec starts while idle execs occupy the pool"),
+            );
+
+            let control_boundary = boundary.clone();
+            let (control_done, control_result) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = control_done.send(serve_request(
+                    &control_boundary,
+                    &owner,
+                    Request::DiscoverPolicy,
+                ));
+            });
+            assert!(matches!(
+                control_result
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("control request is served within 10s"),
+                Response::ImagePolicy { .. }
+            ));
+
+            // Cleanup: end every exec and the workload inside the isolated
+            // limit so no `sleep 30` child outlives the test binary.
+            for exec_id in &exec_ids {
+                let _ = boundary.signal(exec_id, SignalWire::Kill);
+            }
+            for exec_id in &exec_ids {
+                assert!(
+                    matches!(boundary.wait(exec_id), Response::Exited { .. }),
+                    "exec {exec_id} must be reaped"
+                );
+            }
+            assert_eq!(boundary.terminate(&process_id), Response::Terminated);
+            let workload = boundary.running_process(&process_id).expect("workload");
+            let terminated_by = std::time::Instant::now() + Duration::from_secs(10);
+            while !workload.has_exited() && std::time::Instant::now() < terminated_by {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(workload.has_exited(), "workload did not exit");
+        }
+
         /// A replacement whose connection is lost while it is promoted is the
         /// owner in force when its loss is handled: the workload ends frozen
         /// under a fresh recovery deadline, which then terminates it, whether
