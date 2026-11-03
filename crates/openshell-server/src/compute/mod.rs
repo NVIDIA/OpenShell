@@ -513,6 +513,8 @@ pub struct ComputeDriverInfoSnapshot {
     pub driver_reports_runtime_readiness: bool,
     /// Static portable resource request forms from the startup capability snapshot.
     pub resource_capabilities: Option<DriverResourceCapabilities>,
+    /// Driver-reported workload facts; absence is deliberately not inferred.
+    pub workload_compatibility: Option<openshell_core::proto::compute::v1::WorkloadCompatibility>,
     /// Directory where rootfs tar files must be staged.
     pub rootfs_tar_staging_dir: String,
     /// Maximum rootfs tar file size in bytes.
@@ -1002,6 +1004,11 @@ impl ComputeRuntime {
             capabilities.extension.clone(),
         )
         .map_err(|error| ComputeError::Message(error.to_string()))?;
+        openshell_core::extension_protocol::validate_workload_compatibility(
+            &driver_name,
+            capabilities.workload_compatibility.as_ref(),
+        )
+        .map_err(|error| ComputeError::Message(error.to_string()))?;
         info!(
             configured_driver = %driver_name,
             advertised_driver = %capabilities.driver_name,
@@ -1016,6 +1023,7 @@ impl ComputeRuntime {
             supports_sandbox_authentication: capabilities.supports_sandbox_authentication,
             driver_reports_runtime_readiness: capabilities.driver_reports_runtime_readiness,
             resource_capabilities: capabilities.resource_capabilities,
+            workload_compatibility: capabilities.workload_compatibility,
             rootfs_tar_staging_dir: capabilities.rootfs_tar_staging_dir,
             rootfs_tar_max_bytes: capabilities.rootfs_tar_max_bytes,
         };
@@ -8416,6 +8424,7 @@ impl ComputeDriver for NoopTestDriver {
                 supports_sandbox_authentication: self.sandbox_authentication.is_some(),
                 driver_reports_runtime_readiness: false,
                 resource_capabilities: None,
+                workload_compatibility: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -8611,6 +8620,7 @@ pub fn new_test_runtime_with_driver(
             supports_sandbox_authentication,
             driver_reports_runtime_readiness: false,
             resource_capabilities: None,
+            workload_compatibility: None,
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
         },
@@ -9049,6 +9059,7 @@ mod tests {
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
                 resource_capabilities: None,
+                workload_compatibility: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
                 extension: (!self.omit_protocol_metadata).then(|| {
@@ -9515,6 +9526,7 @@ mod tests {
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
                 resource_capabilities: None,
+                workload_compatibility: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -9815,6 +9827,7 @@ mod tests {
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
                 resource_capabilities: None,
+                workload_compatibility: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
             },

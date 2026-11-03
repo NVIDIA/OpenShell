@@ -1568,6 +1568,13 @@ impl VmDriver {
                     count_selection_supported: self.config.gpu_enabled,
                 }),
             }),
+            workload_compatibility: Some(
+                openshell_core::proto::compute::v1::WorkloadCompatibility {
+                    operating_system: "linux".to_string(),
+                    architecture: linux_oci_arch().to_string(),
+                    execution_restrictions: Vec::new(),
+                },
+            ),
             rootfs_tar_staging_dir: self
                 .config
                 .rootfs_tar_staging_dir()
@@ -14127,6 +14134,10 @@ while :; do sleep 0.05; done"#,
     #[test]
     fn capabilities_report_static_resource_support() {
         let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        let workload = driver.capabilities().workload_compatibility.unwrap();
+        assert_eq!(workload.operating_system, "linux");
+        assert_eq!(workload.architecture, linux_oci_arch());
+        assert!(workload.execution_restrictions.is_empty());
         let resources = driver.capabilities().resource_capabilities.unwrap();
         assert!(!resources.cpu.unwrap().limit_supported);
         assert!(!resources.memory.unwrap().limit_supported);

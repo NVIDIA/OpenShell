@@ -57,6 +57,17 @@ type ComputeDriverInfo struct {
 	Name          string
 	DriverName    string
 	DriverVersion string
+	// WorkloadCompatibility is nil when the configured driver does not report it.
+	WorkloadCompatibility *WorkloadCompatibility
+}
+
+// WorkloadCompatibility describes the workload, separately from the gateway host.
+// Empty platform fields and an empty restriction list remain unreported; this
+// metadata neither establishes installation health nor admits a command.
+type WorkloadCompatibility struct {
+	OperatingSystem       string
+	Architecture          string
+	ExecutionRestrictions []string
 }
 
 // CurrentUser holds the authenticated caller's identity.
