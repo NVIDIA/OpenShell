@@ -89,6 +89,13 @@ pub fn find_endpoint_ambiguities(policy: &SandboxPolicy) -> Vec<EndpointAmbiguit
             {
                 continue;
             }
+            // PROTOTYPE: named vs hostless endpoints authorize different
+            // destination classes (named requests vs raw-IP connections);
+            // they never compete for the same request's config. Mirror of
+            // plain_l4_endpoint_does_not_compete_with_l7_endpoint_metadata.
+            if left.endpoint.host.is_empty() != right.endpoint.host.is_empty() {
+                continue;
+            }
 
             let mut conflicts = connection_conflicts(left.endpoint, right.endpoint);
             if endpoint_contributes_request_pipeline_metadata(left.endpoint)
@@ -1052,6 +1059,58 @@ mod tests {
         assert_eq!(
             find_endpoint_ambiguities(&policy_with(left, right)).len(),
             1
+        );
+    }
+
+    fn hostless_cidr(protocol: &str) -> NetworkEndpoint {
+        NetworkEndpoint {
+            host: String::new(),
+            port: 443,
+            allowed_ips: vec!["10.10.0.0/24".to_string()],
+            protocol: protocol.to_string(),
+            enforcement: NetworkEnforcementMode::Enforce as i32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn named_and_hostless_endpoints_are_different_destination_classes() {
+        // A hostless allowed_ips endpoint authorizes raw-IP connections in
+        // its range; a named endpoint authorizes requests to its hostname.
+        // They never compete for the same request's config, so the pair
+        // mirrors plain_l4_endpoint_does_not_compete_with_l7_endpoint_metadata.
+        assert!(find_endpoint_ambiguities(&policy_with(
+            hostless_cidr("rest"),
+            endpoint("example.com", 443)
+        ))
+        .is_empty());
+    }
+
+    #[test]
+    fn named_endpoint_metadata_conflicts_do_not_spill_into_hostless_pairs() {
+        let mut tls_skip = hostless_cidr("rest");
+        tls_skip.tls = NetworkTlsMode::Skip as i32;
+        let mut named_tcp = endpoint("example.com", 443);
+        named_tcp.protocol = "tcp".to_string();
+        named_tcp.tls = NetworkTlsMode::Skip as i32;
+
+        assert!(find_endpoint_ambiguities(&policy_with(tls_skip, named_tcp)).is_empty());
+    }
+
+    #[test]
+    fn hostless_endpoints_still_compete_on_raw_ip_connections() {
+        // Two hostless endpoints authorize the SAME raw-IP connection class,
+        // so differing allowed_ips remain ambiguous.
+        let mut other_range = hostless_cidr("rest");
+        other_range.allowed_ips = vec!["192.168.0.0/16".to_string()];
+
+        let ambiguities = find_endpoint_ambiguities(&policy_with(hostless_cidr("rest"), other_range));
+        assert_eq!(ambiguities.len(), 1);
+        assert!(
+            ambiguities[0]
+                .conflicts
+                .iter()
+                .any(|field| field.contains("allowed_ips"))
         );
     }
 
