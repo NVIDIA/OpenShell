@@ -48,11 +48,27 @@ pub struct ManagedChild {
 
 /// Exclusive access to the managed-child registry.
 ///
-/// A process spawner holds this guard from immediately before `spawn` or
-/// `fork` until the returned PID is registered. The orphan reaper holds the
-/// same guard while deciding whether to reap an exited child. This closes the
-/// otherwise unavoidable window in which a fast-exiting managed child exists
-/// but its PID has not yet been published.
+/// Two invariants let the orphan reaper tell supervised children from
+/// incidental zombies without racing a spawn:
+///
+/// 1. Every spawner holds this guard from immediately before `spawn` or `fork`
+///    until the returned PID is registered. A fast-exiting managed child
+///    therefore always has a published PID by the time a reaper scan sees it.
+/// 2. In the boundary process, nothing reaps an unregistered direct child
+///    except the orphan reaper; `spawn` and its normal waiters are the only
+///    consumers of a registered child's status. The one exception,
+///    `task_memory::probe_child_access`, forks inside the separate
+///    single-threaded probe binary, which never starts the reaper.
+///
+/// The reaper does not hold this guard across the `/proc` sweep or the
+/// candidate snapshot. It collects the candidate PIDs under the guard, releases
+/// it, and then reacquires it for each candidate to recheck the registry and
+/// run the `WNOHANG` `waitpid` while still holding it. That guard spans the
+/// recheck and the reap attempt, so a spawner can neither register the
+/// candidate in between nor fork a newer process onto the number while the old
+/// one is still unreaped: the kernel keeps a PID allocated until its child is
+/// reaped. Spawns therefore serialize against one candidate's non-blocking reap
+/// attempt, never against the whole scan.
 pub struct RegistryGuard(MutexGuard<'static, HashMap<i32, u64>>);
 
 impl RegistryGuard {
@@ -76,8 +92,8 @@ impl RegistryGuard {
     }
 }
 
-/// Lock the registry for an atomic spawn-and-register or inspect-and-reap
-/// operation.
+/// Lock the registry for an atomic spawn-and-register, or to inspect the
+/// supervised-child set.
 pub fn lock() -> RegistryGuard {
     RegistryGuard(
         MANAGED_CHILDREN
@@ -205,21 +221,52 @@ fn wait_for_reaper_event(fd: libc::c_int) -> io::Result<()> {
 }
 
 fn reap_unmanaged_children_once() -> io::Result<usize> {
+    reap_unmanaged_children_once_with(|_| {}, |_| {})
+}
+
+/// One reaper scan. `before_recheck` is the test seam: it runs for every
+/// snapshot candidate after the registry snapshot is released and before the
+/// per-candidate recheck, which is where a late registration must be observed.
+/// `before_waitpid` runs for every unmanaged candidate after the recheck and
+/// before the reap attempt, inside the registry guard.
+fn reap_unmanaged_children_once_with(
+    mut before_recheck: impl FnMut(i32),
+    mut before_waitpid: impl FnMut(i32),
+) -> io::Result<usize> {
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 
     #[cfg(test)]
     REAPER_SCAN_COUNT.fetch_add(1, Ordering::Relaxed);
     let children = direct_child_pids()?;
-    let registry = lock();
+    // Snapshot the candidates under the registry lock, then drop it: spawns
+    // and explicit waiters must not stall behind the /proc sweep. The reap
+    // attempt below takes the lock again per candidate.
+    let candidates: Vec<i32> = {
+        let registry = lock();
+        children
+            .into_iter()
+            .filter(|pid| !registry.contains(*pid))
+            .collect()
+    };
     let mut reaped = 0;
-    for pid in children {
+    for pid in candidates {
+        before_recheck(pid);
+        // Hold the registry guard across the recheck *and* the waitpid: a
+        // spawner that registers this child after the snapshot owns its exit
+        // status, so reaping it here would steal that status from its explicit
+        // waiter. `WNOHANG` never blocks, so serializing spawns against one
+        // candidate's reap attempt is brief.
+        let registry = lock();
         if registry.contains(pid) {
             continue;
         }
+        before_waitpid(pid);
         match waitpid(nix::unistd::Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive)
             | Err(nix::errno::Errno::ECHILD | nix::errno::Errno::ESRCH) => {}
             Ok(_) => reaped += 1,
+            // Abort the pass on an unexpected error, as before: the caller
+            // retries the whole scan on the next SIGCHLD or poll timeout.
             Err(error) => return Err(io::Error::other(error)),
         }
     }
@@ -251,6 +298,7 @@ mod tests {
     use super::*;
     use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
     use nix::unistd::Pid;
+    use std::cell::Cell;
     use std::process::Command;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -362,8 +410,11 @@ mod tests {
             }
         }
 
+        // Mirror the reaper's lock scope: hold the registry guard across the
+        // per-candidate recheck and the reap attempt.
         let registry = lock();
-        let reaped = if registry.contains(pid.as_raw()) {
+        let managed = registry.contains(pid.as_raw());
+        let reaped = if managed {
             None
         } else {
             Some(waitpid(pid, Some(WaitPidFlag::WNOHANG)))
@@ -380,6 +431,133 @@ mod tests {
             wait.is_ok(),
             "the explicit child waiter must retain the exit status"
         );
+    }
+
+    #[test]
+    fn registration_after_snapshot_is_left_to_its_explicit_waiter() {
+        // Run in an isolated process: the scan reaps every unmanaged direct
+        // child, and other tests in this binary spawn children of their own.
+        const HELPER_ENV: &str = "OPENSHELL_REAPER_SEAM_TEST_HELPER";
+        if std::env::var_os(HELPER_ENV).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "managed_children::tests::registration_after_snapshot_is_left_to_its_explicit_waiter",
+                    "--nocapture",
+                ])
+                .env(HELPER_ENV, "1")
+                .output()
+                .expect("start isolated reaper seam test process");
+            assert!(
+                output.status.success(),
+                "reaper seam test failed: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 11"])
+            .spawn()
+            .expect("spawn fast child");
+        let pid = i32::try_from(child.id()).expect("child PID");
+        // Let the child become a zombie: a reaper that failed to skip it would
+        // consume the status this test's explicit waiter needs.
+        wait_until(|| {
+            !matches!(
+                waitid(
+                    Id::Pid(Pid::from_raw(pid)),
+                    WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT
+                ),
+                Ok(WaitStatus::StillAlive)
+            )
+        });
+
+        // Simulate a spawner registering the child after the candidate
+        // snapshot but before the per-candidate recheck.
+        let registered = Cell::new(None);
+        let reaped = reap_unmanaged_children_once_with(
+            |candidate| {
+                if candidate == pid {
+                    registered.set(lock().register(u32::try_from(pid).unwrap()));
+                }
+            },
+            |_| {},
+        )
+        .expect("reaper scan");
+
+        assert_eq!(
+            reaped, 0,
+            "the reaper must skip a child registered in the recheck window"
+        );
+        assert!(
+            matches!(child.wait(), Ok(status) if status.code() == Some(11)),
+            "the explicit child waiter must retain the exit status"
+        );
+        if let Some(managed_child) = registered.take() {
+            unregister(managed_child);
+        }
+    }
+
+    #[test]
+    fn reaper_holds_the_registry_guard_from_recheck_through_waitpid() {
+        // Run in an isolated process: the scan reaps every unmanaged direct
+        // child, and other tests in this binary spawn children of their own.
+        const HELPER_ENV: &str = "OPENSHELL_REAPER_GUARD_TEST_HELPER";
+        if std::env::var_os(HELPER_ENV).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "managed_children::tests::reaper_holds_the_registry_guard_from_recheck_through_waitpid",
+                    "--nocapture",
+                ])
+                .env(HELPER_ENV, "1")
+                .output()
+                .expect("start isolated reaper guard test process");
+            assert!(
+                output.status.success(),
+                "reaper guard test failed: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 11"])
+            .spawn()
+            .expect("spawn fast child");
+        let pid = i32::try_from(child.id()).expect("child PID");
+        wait_until(|| {
+            !matches!(
+                waitid(
+                    Id::Pid(Pid::from_raw(pid)),
+                    WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT
+                ),
+                Ok(WaitStatus::StillAlive)
+            )
+        });
+
+        // A spawner that registers between the recheck and the reap attempt
+        // must be impossible: otherwise the reaper steals the exit status of a
+        // newly managed fast-exiting child. Holding the registry guard across
+        // both closes the window, so the registry is locked when the seam runs.
+        let guard_held = Cell::new(false);
+        let reaped = reap_unmanaged_children_once_with(
+            |_| {},
+            |candidate| {
+                if candidate == pid {
+                    guard_held.set(MANAGED_CHILDREN.try_lock().is_err());
+                }
+            },
+        )
+        .expect("reaper scan");
+
+        assert!(
+            guard_held.get(),
+            "the registry guard must span the recheck and the waitpid"
+        );
+        assert_eq!(reaped, 1, "the reaper must still reap unmanaged children");
+        let _ = child.wait();
     }
 
     #[test]
