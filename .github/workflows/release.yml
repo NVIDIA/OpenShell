@@ -158,6 +158,7 @@ jobs:
       is-prerelease: false
       make-latest: ${{ needs.promote.outputs.make-latest == 'true' }}
     secrets:
+      BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
       SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
       FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
       GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
