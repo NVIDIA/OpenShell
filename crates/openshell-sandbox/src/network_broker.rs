@@ -71,7 +71,41 @@ fn acquire_pending_dns_slot(active: &Arc<AtomicUsize>) -> io::Result<PendingDnsS
         .map_err(|_| io::Error::from_raw_os_error(libc::EAGAIN))
 }
 
+/// Acquire one of the bounded external-connect slots.
+///
+/// Three bounds govern an external connect, in the order they apply. The
+/// resolution quota (see `acquire_resolution_slot`) bounds concurrent
+/// `openshell-network-open` workers, acquired by the broker thread before
+/// the spawn. The resolve lock bounds cold identity hashing to one at a
+/// time. These open slots bound opens queued awaiting supervisor
+/// decisions: external connects acquire the slot inside their worker only
+/// after the identity resolve, so a held slot is a queued open and
+/// slot-hold time is bounded by the decision timeout. Local connects
+/// acquire it before spawning their worker instead, because nothing slow
+/// runs between their acquire and the worker's bounded native connect.
+/// The orderings are deliberate; unifying them would add spawn churn to
+/// local connects without tightening either bound.
 fn acquire_pending_open_slot(active: &Arc<AtomicUsize>) -> io::Result<PendingOpenSlot> {
+    active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < OPEN_QUEUE_CAPACITY).then_some(current + 1)
+        })
+        .map(|_| PendingOpenSlot(Arc::clone(active)))
+        .map_err(|_| io::Error::from_raw_os_error(libc::EAGAIN))
+}
+
+/// Acquire one of the bounded resolve-phase open-worker permits.
+///
+/// The broker thread acquires this before spawning an
+/// `openshell-network-open` worker, and the worker holds it for its whole
+/// lifetime (a refused spawn drops it inline). The open slot is acquired
+/// only after the resolve, so during a burst of cold connects
+/// `active_opens` stays near zero and the slot pre-check never fires;
+/// without this quota, the spawned worker count would be bounded only by
+/// the workload's concurrent connect syscalls. Capping concurrent workers
+/// at `OPEN_QUEUE_CAPACITY` restores the bound the broker thread had
+/// before the resolve moved into the worker.
+fn acquire_resolution_slot(active: &Arc<AtomicUsize>) -> io::Result<PendingOpenSlot> {
     active
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             (current < OPEN_QUEUE_CAPACITY).then_some(current + 1)
@@ -83,8 +117,16 @@ fn acquire_pending_open_slot(active: &Arc<AtomicUsize>) -> io::Result<PendingOpe
 /// One external TCP open blocked in `connect(2)` until the supervisor decides.
 pub struct PendingTcpOpen {
     pub(crate) destination: SocketAddr,
+    /// Connect-time identity of the connecting thread: procfs ancestry plus a
+    /// cold SHA-256 of every executable, resolved by the network-open worker
+    /// before this open is queued. A resolution failure is a supervisor
+    /// decision input (`binary_pins.admit` passes it through), never an errno.
     pub(crate) identity: Result<BinaryIdentity, ResolveError>,
     pub(crate) socket: NetworkSocketMetadata,
+    /// Broker dispatch entry to queue put: worker-spawn scheduling plus the
+    /// identity resolve, including any cold hash. A cross-crate telemetry
+    /// contract (`sandbox_notification_to_queue`); its distribution includes
+    /// the spawn since the resolve moved off the broker thread.
     pub(crate) notification_to_queue: Duration,
     pub(crate) queued_at: Instant,
     decision: std::sync::mpsc::SyncSender<TcpOpenDecision>,
@@ -208,6 +250,13 @@ struct NotificationQueues {
     workload_frozen: Arc<AtomicBool>,
     protected_control_port: Option<u16>,
     identity_resolver: ProcfsIdentityResolver,
+    /// Serializes identity resolution across the `openshell-network-open`
+    /// workers; see the worker's pre-queue phase for why.
+    resolve_lock: Arc<Mutex<()>>,
+    /// Bounds concurrent `openshell-network-open` workers; acquired by the
+    /// broker thread before the spawn and held for the worker's whole
+    /// lifetime. See `acquire_resolution_slot`.
+    resolving_opens: Arc<AtomicUsize>,
     pending: mpsc::Sender<PendingTcpOpen>,
     dns_relay: DnsRelay,
     active_opens: Arc<AtomicUsize>,
@@ -308,6 +357,8 @@ impl NetworkBroker {
         let (pending_tx, pending_rx) = mpsc::channel(OPEN_QUEUE_CAPACITY);
         let (pending_dns_tx, pending_dns_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
         let active_opens = Arc::new(AtomicUsize::new(0));
+        let resolving_opens = Arc::new(AtomicUsize::new(0));
+        let resolve_lock = Arc::new(Mutex::new(()));
         let dns_relay = start_dns_relay(dns_address, pending_dns_tx)?;
         let dns_address = dns_relay.address;
         let descriptor_soft_limit = descriptor_soft_limit()?;
@@ -319,6 +370,8 @@ impl NetworkBroker {
             workload_frozen: workload_frozen.clone(),
             protected_control_port,
             identity_resolver,
+            resolve_lock,
+            resolving_opens,
             pending: pending_tx,
             dns_relay,
             active_opens,
@@ -898,7 +951,9 @@ fn connect_socket(
         pending,
         dns_relay,
         active_opens,
+        resolving_opens,
         identity_resolver,
+        resolve_lock,
         decision_timeout,
         protected_control_port,
         ..
@@ -1039,34 +1094,88 @@ fn connect_socket(
         return Err(io::Error::from_raw_os_error(libc::EACCES));
     }
 
-    let identity = identity_resolver.resolve(notification.tid);
+    // Fail fast without a spawn under sustained slot saturation; the worker
+    // re-checks authoritatively, so a slot taken in between is answered by
+    // the worker rather than lost.
+    if active_opens.load(Ordering::Acquire) >= OPEN_QUEUE_CAPACITY {
+        return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+    }
+    // Bound the resolve-phase workers before the spawn. The open slot is
+    // acquired only after the resolve, so during a burst of cold connects
+    // active_opens stays near zero and the check above never fires; without
+    // this quota, the worker count would be bounded only by the workload's
+    // concurrent connect syscalls. Acquired here and held for the worker's
+    // whole lifetime, it restores the concurrency bound the broker thread
+    // had when it ran the resolve inline.
+    let resolution = acquire_resolution_slot(&resolving_opens)?;
     let (decision_tx, decision_rx) = std::sync::mpsc::sync_channel(1);
     let (relay_tx, relay_rx) = oneshot::channel();
-    let slot = acquire_pending_open_slot(&active_opens)?;
-    pending
-        .try_send(PendingTcpOpen {
-            destination,
-            identity,
-            socket: NetworkSocketMetadata {
-                socket_cookie: socket_identity.cookie,
-                nonblocking,
-                process_generation: u64::from(notification.tid),
-            },
-            notification_to_queue: notification_started.elapsed(),
-            queued_at: Instant::now(),
-            decision: decision_tx,
-            relay: relay_rx,
-        })
-        .map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => io::Error::from_raw_os_error(libc::EAGAIN),
-            mpsc::error::TrySendError::Closed(_) => {
-                io::Error::new(io::ErrorKind::BrokenPipe, "network-open queue closed")
-            }
-        })?;
     let worker_listener = Arc::clone(&listener);
     std::thread::Builder::new()
         .name("openshell-network-open".to_string())
         .spawn(move || {
+            // The resolution quota is held for the worker's whole lifetime:
+            // a refused spawn drops it inline on the broker thread, and a
+            // panic or exit here releases it with the closure.
+            let _resolution = resolution;
+            // Pre-queue phase, panic-contained and answered by the worker:
+            // no worker may exit without answering its notification, or the
+            // blocked syscall hangs forever. The containment stops at a
+            // successful queue put; a panic after it must not answer EIO
+            // while a queued open still expects a supervisor decision.
+            let Some(slot) = respond_contained(&worker_listener, &notification, || {
+                // Serialize identity resolution across the open workers.
+                // Before the resolve moved here, the broker thread ran it
+                // serially, so a burst of connects from one uncached binary
+                // paid one cold hash followed by digest-cache hits; without
+                // this lock, up to OPEN_QUEUE_CAPACITY resolve-phase workers
+                // would hash the same binary concurrently, spending worse
+                // aggregate CPU and wall-clock under burst. The lock preserves
+                // that aggregate work while keeping the broker thread free;
+                // opens still never queue behind identity work, because a
+                // worker waiting on the lock has already left the broker
+                // thread. Per-key single-flight in openshell-binary-identity
+                // remains a follow-up.
+                let identity = {
+                    let _serialized_resolve = lock(&resolve_lock);
+                    identity_resolver.resolve(notification.tid)
+                };
+                // Acquire the open slot only after the resolve. The resolve
+                // lock bounds cold hashing to one at a time, so a slot taken
+                // first would be held while its worker waits on the
+                // serialized cold hashes of every distinct binary queued
+                // ahead of it: an unbounded slot-hold time that turns
+                // resolve time into EAGAIN saturation for further connects.
+                // Acquiring after the resolve keeps a held slot a queued
+                // open awaiting a supervisor decision, bounded by the
+                // decision timeout, as before the resolve moved here.
+                let slot = acquire_pending_open_slot(&active_opens)?;
+                pending
+                    .try_send(PendingTcpOpen {
+                        destination,
+                        identity,
+                        socket: NetworkSocketMetadata {
+                            socket_cookie: socket_identity.cookie,
+                            nonblocking,
+                            process_generation: u64::from(notification.tid),
+                        },
+                        notification_to_queue: notification_started.elapsed(),
+                        queued_at: Instant::now(),
+                        decision: decision_tx,
+                        relay: relay_rx,
+                    })
+                    .map_err(|error| match error {
+                        mpsc::error::TrySendError::Full(_) => {
+                            io::Error::from_raw_os_error(libc::EAGAIN)
+                        }
+                        mpsc::error::TrySendError::Closed(_) => {
+                            io::Error::new(io::ErrorKind::BrokenPipe, "network-open queue closed")
+                        }
+                    })?;
+                Ok(slot)
+            }) else {
+                return;
+            };
             // The worker owns its quota: an unresponsive supervisor must not
             // retain a blocked syscall or worker slot indefinitely.
             let _slot = slot;
@@ -1818,6 +1927,48 @@ fn error_to_errno(error: &io::Error) -> i32 {
     error.raw_os_error().unwrap_or(libc::EACCES).max(1)
 }
 
+/// Run a worker's answerable phase and answer its notification, containing a
+/// panic.
+///
+/// Invariant: no worker may exit without answering its notification. A worker
+/// that exits silently leaves the workload's blocked syscall hanging forever,
+/// so the phase runs under `catch_unwind`: an `Err` is answered with its
+/// errno and a panic with `EIO`, mirroring the broker loop's containment.
+/// Returns the phase's value only when it succeeded; the caller must stop
+/// and return after `None`.
+fn respond_contained<T>(
+    listener: &NotificationListener,
+    notification: &Notification,
+    phase: impl FnOnce() -> io::Result<T>,
+) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(phase)) {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                tid = notification.tid,
+                syscall = notification.syscall,
+                %error,
+                "sandbox network worker denied (tid={}, syscall={}): {error}",
+                notification.tid,
+                notification.syscall
+            );
+            let _ = listener.respond_errno(notification.id, error_to_errno(&error));
+            None
+        }
+        Err(_) => {
+            tracing::error!(
+                tid = notification.tid,
+                syscall = notification.syscall,
+                "sandbox network worker panicked (tid={}, syscall={})",
+                notification.tid,
+                notification.syscall
+            );
+            let _ = listener.respond_errno(notification.id, libc::EIO);
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1846,6 +1997,13 @@ mod tests {
         // Check disappearance and refusal before bind can trigger collection.
         let _replacement = TcpListener::bind(address).expect("reuse listener port");
     }
+
+    /// Serializes the slot-saturation tests: each one pins close to
+    /// `OPEN_QUEUE_CAPACITY` workload threads for its whole body, and stacking
+    /// them inflates the machine load behind neighboring tests' sub-second
+    /// timing pins (the queue-full EAGAIN test measures against a 250 ms
+    /// decision timeout).
+    static SATURATION_TESTS: Mutex<()> = Mutex::new(());
 
     #[test]
     fn listening_socket_lives_only_as_long_as_workload_aliases() {
@@ -2564,6 +2722,50 @@ mod tests {
     }
 
     #[test]
+    fn worker_pre_queue_panic_is_contained_and_answered_with_eio() {
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        // Any live notified syscall stands in for the worker's blocked
+        // connect(2): the containment must answer whatever notification the
+        // panicking phase was holding. A file open reaches a notification
+        // without any broker-side socket machinery.
+        let client = std::thread::spawn(move || {
+            launcher
+                .execute(|| std::fs::File::open("/dev/null"))
+                .expect("launcher result")
+        });
+        let notification = loop {
+            let notification = listener.receive().expect("receive mediated open");
+            let syscall = i64::from(notification.syscall);
+            if syscall == libc::SYS_openat {
+                break notification;
+            }
+            #[cfg(target_arch = "x86_64")]
+            if syscall == libc::SYS_open {
+                break notification;
+            }
+            listener
+                .respond_continue(notification.id)
+                .expect("continue unrelated mediated syscall");
+        };
+        // The panic arm of the worker containment: a panic anywhere in the
+        // pre-queue phase (slot acquire, identity resolve, queue put) must
+        // answer the blocked syscall with EIO instead of hanging it forever.
+        let contained = respond_contained(&listener, &notification, || -> io::Result<()> {
+            panic!("forced pre-queue phase panic")
+        });
+        assert!(
+            contained.is_none(),
+            "a panicked phase must not yield a value"
+        );
+        let error = client
+            .join()
+            .expect("join open client")
+            .expect_err("panicked phase must fail the mediated syscall");
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
     fn dns_worker_slots_are_bounded_and_reusable() {
         let active = Arc::new(AtomicUsize::new(DNS_WORKER_CAPACITY - 1));
         let last = acquire_pending_dns_slot(&active).expect("last available slot");
@@ -2971,6 +3173,963 @@ mod tests {
             "mediated socket creation waited {blocking_wait:?} behind a slow connect"
         );
         assert_eq!(nonblocking_result, Some(libc::EINPROGRESS));
+    }
+
+    /// Trailing zero padding added to a copy of this test binary so its cold
+    /// SHA-256 is long enough to measure (and, unfixed, to stall the broker)
+    /// on any profile, independent of how big the build itself is. Trailing
+    /// zeros keep the copy an ELF executable with deterministic bytes.
+    const COLD_CONNECT_PADDING_BYTES: usize = 128 * 1024 * 1024;
+
+    /// Time one standalone SHA-256 of `path`, mirroring the resolver's own
+    /// 8 KiB-buffered read loop, so test bounds derive from the hash itself
+    /// instead of a wall-clock constant.
+    fn sha256_duration(path: &std::path::Path) -> Duration {
+        let started = Instant::now();
+        let mut executable = std::fs::File::open(path).expect("open hashing fixture");
+        let mut digest = openshell_crypto::sha256_digest().expect("start SHA-256");
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let length = executable.read(&mut buffer).expect("read hashing fixture");
+            if length == 0 {
+                break;
+            }
+            digest
+                .update(&buffer[..length])
+                .expect("hash fixture bytes");
+        }
+        let _ = digest.finish().expect("finish SHA-256");
+        started.elapsed()
+    }
+
+    #[test]
+    fn cold_external_connect_does_not_stall_mediated_opens() {
+        use std::io::BufRead as _;
+        // The regression: the broker thread itself ran the connect-time
+        // identity resolution (procfs walks plus a cold SHA-256 of every
+        // executable in the chain), so every mediated open queued behind it.
+        const CHILD: &str = "OPENSHELL_COLD_CONNECT_STALL_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // Runs under the inherited workload filter: signal readiness,
+            // then make the cold external connect the test measures against.
+            io::stdout()
+                .write_all(b"ready\n")
+                .expect("signal readiness");
+            io::stdout().flush().expect("flush readiness");
+            let error = TcpStream::connect("203.0.113.7:443")
+                .expect_err("cold external connect must be mediated");
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            return;
+        }
+
+        // A padded copy of this binary is the connecting executable: a fresh
+        // inode (a deterministic digest-cache miss for the fresh test broker)
+        // whose cold hash is long enough to measure.
+        let fixture = tempfile::tempdir().expect("create fixture directory");
+        let cold_binary = fixture.path().join("cold-connect-binary");
+        std::fs::copy(std::env::current_exe().unwrap(), &cold_binary).expect("copy test binary");
+        {
+            let padded = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&cold_binary)
+                .expect("reopen fixture for padding");
+            let current_len = padded.metadata().expect("stat fixture").len();
+            // Extend with a sparse hole instead of writing zeros: the temp
+            // directory is tmpfs on many hosts, and the hashed tail only needs
+            // to read back as deterministic zero bytes, which a hole does
+            // without committing pages.
+            padded
+                .set_len(
+                    current_len
+                        + u64::try_from(COLD_CONNECT_PADDING_BYTES).expect("padding size fits"),
+                )
+                .expect("extend fixture with a zero hole");
+        }
+        let probe = fixture.path().join("open-probe");
+        std::fs::write(&probe, b"probe").expect("create open probe");
+        // The faster, cache-hot run is the conservative baseline: it keeps
+        // the bound tight and the telemetry assertion below hard to trip.
+        let hash_duration = sha256_duration(&cold_binary).min(sha256_duration(&cold_binary));
+        assert!(
+            hash_duration > Duration::from_millis(20),
+            "cold-connect fixture hashes too fast to measure: {hash_duration:?}"
+        );
+
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        // The decision timeout must tolerate a parallel-suite scheduler
+        // descheduling this thread between the worker's queue put and the
+        // accept+deny below; a too-short timeout answers ETIMEDOUT and
+        // surfaces as a confusing double failure far from the cause. The
+        // resolver is bounded by this test process so the cold hash of the
+        // child's padded binary actually runs instead of failing on an
+        // unreadable host ancestor.
+        let broker = NetworkBroker::start_with_identity_root(
+            listener,
+            Duration::from_secs(30),
+            std::process::id(),
+        )
+        .unwrap();
+        let (completed_opens, mut child, child_stdout) = launcher
+            .execute(move || {
+                // The child inherits the filter from this launcher thread and
+                // execs the padded copy, so the broker cold-hashes it.
+                let mut child = std::process::Command::new(&cold_binary)
+                    .args([
+                        "--exact",
+                        "network_broker::tests::cold_external_connect_does_not_stall_mediated_opens",
+                        "--nocapture",
+                        "--quiet",
+                    ])
+                    .env(CHILD, "1")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("spawn cold-connect child");
+                let mut stdout =
+                    io::BufReader::new(child.stdout.take().expect("pipe child stdout"));
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    stdout.read_line(&mut line).expect("read child readiness");
+                    assert!(!line.is_empty(), "child exited before signaling readiness");
+                    if line.trim() == "ready" {
+                        break;
+                    }
+                }
+                // Let the connect notification reach the broker and start its
+                // identity work before measuring.
+                std::thread::sleep(Duration::from_millis(10));
+                // Count opens completed while the cold resolve is still in
+                // flight, rather than timing them: machine load inflates any
+                // duration, but only the broker thread's serialization can
+                // keep every open unanswered for the whole resolve. An open
+                // that returns after the deadline says nothing about when
+                // the broker answered it, so it must not count: under the
+                // serialization bug the first open blocks through the whole
+                // resolve and returns late, still inside this loop.
+                let started = Instant::now();
+                let mut completed = 0_u32;
+                while started.elapsed() < hash_duration {
+                    drop(std::fs::File::open(&probe).expect("open probe file"));
+                    if started.elapsed() < hash_duration {
+                        completed += 1;
+                    } else {
+                        break;
+                    }
+                }
+                (completed, child, stdout)
+            })
+            .expect("launcher result");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let pending = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(30), broker.accept())
+                .await
+                .expect("cold connect queued")
+                .expect("pending TCP open")
+        });
+        // The resolve (now also the worker-spawn scheduling) must stay inside
+        // the telemetry window; a fresh timer in the worker would shrink it to
+        // microseconds. The standalone hash and the worker's resolve run under
+        // different machine load, so the pin tolerates timing variance rather
+        // than demanding the full standalone duration.
+        assert!(
+            pending.notification_to_queue >= hash_duration / 4,
+            "notification_to_queue {:?} dropped the identity resolve (fixture hash {hash_duration:?})",
+            pending.notification_to_queue
+        );
+        pending
+            .decide(TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied))
+            .expect("deny cold connect");
+        // The regression discriminator: the resolve hashes at least the padded
+        // fixture, so it is still in flight throughout the measurement window.
+        // Serialized on the broker thread (the bug), no open completes inside
+        // the window and the count stays zero; off the broker thread, opens
+        // complete throughout.
+        assert!(
+            completed_opens > 0,
+            "no mediated open completed while the cold identity resolve was in flight \
+             (fixture hash {hash_duration:?}): opens are serialized behind connect-time \
+             identity work"
+        );
+        assert!(child.wait().expect("wait cold-connect child").success());
+        // Keep the read end open until the child has exited so its harness
+        // summary never hits a broken pipe.
+        drop(child_stdout);
+    }
+
+    #[test]
+    fn concurrent_cold_connects_from_one_uncached_binary_all_queue_and_answer() {
+        // The resolve lock serializes connect-time identity resolution across
+        // the open workers, and the slot is acquired only after the resolve,
+        // so workers waiting on the lock hold no slot. The resolution quota
+        // acquired before the spawn bounds the burst's workers well above
+        // its size. A burst of cold connects from one uncached binary must
+        // therefore all queue and be answered: no deadlock on the lock, no
+        // EAGAIN from quota or slot pressure, and no syscall left hanging.
+        // The once-only hashing itself is structural (the lock plus the
+        // resolver's digest cache) and is not directly asserted.
+        const BURST: usize = 8;
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        // The resolver is bounded by this test process so the cold hash of
+        // the connecting binary actually runs instead of failing on an
+        // unreadable host ancestor. Unlike the saturation tests, the digest
+        // cache is deliberately left cold: every connect below is a cold
+        // connect from the same uncached binary.
+        // Like the single-cold-connect test above, the decision timeout must
+        // tolerate a parallel-suite scheduler descheduling this thread
+        // between a worker's queue put and the accept+deny below; a
+        // too-short timeout answers ETIMEDOUT and surfaces as a confusing
+        // double failure far from the cause.
+        let broker = NetworkBroker::start_with_identity_root(
+            listener,
+            Duration::from_secs(30),
+            std::process::id(),
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let clients = launcher
+            .execute(move || {
+                (0..BURST)
+                    .map(|_| std::thread::spawn(|| TcpStream::connect("203.0.113.7:443")))
+                    .collect::<Vec<_>>()
+            })
+            .expect("launcher result");
+
+        // Every burst connect must queue and be answered by a decision. The
+        // accept timeout is generous because the first worker cold-hashes the
+        // connecting binary while the rest wait on the resolve lock.
+        for _ in 0..BURST {
+            let pending = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(30), broker.accept())
+                    .await
+                    .expect("cold burst connect queued")
+                    .expect("pending TCP open")
+            });
+            pending
+                .decide(TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied))
+                .expect("deny cold burst connect");
+        }
+        for client in clients {
+            let error = client
+                .join()
+                .expect("join cold burst connect")
+                .expect_err("cold burst connect must be denied");
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        }
+    }
+
+    /// Padding for the resolution-quota fixture. Larger than the stall
+    /// fixture above so the cold resolve stays in flight comfortably longer
+    /// than dispatching the burst's notifications takes: the discriminator at
+    /// the bottom needs the broker to exhaust the resolution quota while the
+    /// cold hash is still running, and a parallel test suite can slow
+    /// notification dispatch far past a smaller hash. The sparse hole reads
+    /// back as zeros without committing pages, so the size costs CPU only.
+    const RESOLUTION_QUOTA_PADDING_BYTES: usize = 1024 * 1024 * 1024;
+
+    /// Watches the quota fixture for opens so the test can prove the cold
+    /// connect was dispatched before the burst fires: the connect worker's
+    /// identity resolve opens the connecting process's executable, so an
+    /// `IN_OPEN` event on the fixture means the cold hash is underway. The
+    /// child's `exec` also opens the fixture, so queued events are drained
+    /// before the child is released.
+    struct FixtureOpenWatch {
+        fd: OwnedFd,
+    }
+
+    impl FixtureOpenWatch {
+        fn new(path: &std::path::Path) -> Self {
+            use std::os::unix::ffi::OsStrExt as _;
+
+            // SAFETY: inotify_init1 is a plain syscall wrapper with no
+            // preconditions beyond the flags passed here.
+            let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+            assert!(
+                fd >= 0,
+                "inotify_init1 failed: {}",
+                io::Error::last_os_error()
+            );
+            // SAFETY: inotify_add_watch is a plain syscall wrapper; the path
+            // names a live fixture file that outlives the watch.
+            let added = unsafe {
+                libc::inotify_add_watch(
+                    fd,
+                    std::ffi::CString::new(path.as_os_str().as_bytes())
+                        .expect("fixture path holds no NUL")
+                        .as_ptr(),
+                    libc::IN_OPEN,
+                )
+            };
+            assert!(
+                added >= 0,
+                "inotify_add_watch failed: {}",
+                io::Error::last_os_error()
+            );
+            // SAFETY: the descriptor is valid, open, and not yet owned.
+            Self {
+                fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            }
+        }
+
+        /// Discard already-queued events (the child's `exec` open) so a
+        /// later [`Self::wait_for_open`] only observes opens after this
+        /// point.
+        fn drain(&self) {
+            let mut buffer = [0_u8; 1024];
+            loop {
+                // SAFETY: read on a valid nonblocking descriptor, with a
+                // buffer whose length matches the count.
+                let length = unsafe {
+                    libc::read(
+                        self.fd.as_raw_fd(),
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                    )
+                };
+                if length > 0 {
+                    continue;
+                }
+                if length == 0 {
+                    return;
+                }
+                let error = io::Error::last_os_error();
+                match error.raw_os_error() {
+                    // A signal arrived mid-read; retry the drain.
+                    Some(libc::EINTR) => {}
+                    Some(libc::EAGAIN) => return,
+                    _ => panic!("drain fixture watch: {error}"),
+                }
+            }
+        }
+
+        /// Wait until the fixture is opened again: the cold connect's
+        /// identity resolve has started and holds the resolve lock.
+        fn wait_for_open(&self, timeout: Duration) {
+            let deadline = Instant::now() + timeout;
+            let mut buffer = [0_u8; 1024];
+            loop {
+                // SAFETY: read on a valid nonblocking descriptor, with a
+                // buffer whose length matches the count.
+                let length = unsafe {
+                    libc::read(
+                        self.fd.as_raw_fd(),
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                    )
+                };
+                if length > 0 {
+                    return;
+                }
+                if length < 0 {
+                    let error = io::Error::last_os_error();
+                    match error.raw_os_error() {
+                        Some(libc::EINTR) => continue,
+                        Some(libc::EAGAIN) => {}
+                        _ => panic!("read fixture watch: {error}"),
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the cold connect's identity resolve did not open the \
+                     fixture within {timeout:?}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[test]
+    fn cold_resolve_burst_is_bounded_by_the_resolution_quota() {
+        use std::io::BufRead as _;
+        // The regression: with the open slot acquired only after the resolve,
+        // nothing bounded the resolve-phase open workers. During a burst of
+        // cold connects, active_opens stays near zero (every worker waits on
+        // the resolve lock behind the cold hash), so the fail-fast pre-check
+        // never fired and every concurrent connect syscall spawned another
+        // worker. The resolution quota, acquired by the broker thread before
+        // the spawn, must cap the workers so the burst's overflow connects
+        // are answered EAGAIN while the cold resolve is still in flight.
+        const CHILD: &str = "OPENSHELL_RESOLUTION_QUOTA_CHILD";
+        // More concurrent connects than the quota and slot bounds: the cold
+        // child's worker holds one permit for its whole lifetime, so exactly
+        // OPEN_QUEUE_CAPACITY - 1 burst connects may spawn workers and the
+        // rest must be answered EAGAIN inline by the broker thread.
+        const BURST: usize = OPEN_QUEUE_CAPACITY + 8;
+        const EXPECTED_EAGAIN: usize = BURST + 1 - OPEN_QUEUE_CAPACITY;
+        let _saturation = lock(&SATURATION_TESTS);
+        if std::env::var_os(CHILD).is_some() {
+            // Runs under the inherited workload filter: signal readiness,
+            // then wait for the parent's go before making the cold external
+            // connect whose resolve holds the lock and one quota permit
+            // while the burst fires.
+            io::stdout()
+                .write_all(b"ready\n")
+                .expect("signal readiness");
+            io::stdout().flush().expect("flush readiness");
+            // Hold the connect until the parent has proven it was dispatched
+            // and its resolve started: a burst fired before this connect
+            // reaches the broker could take the resolution permits ahead of
+            // it and answer it EAGAIN instead of queueing it.
+            let mut line = String::new();
+            io::stdin().read_line(&mut line).expect("read go signal");
+            assert_eq!(line.trim(), "go", "unexpected go signal");
+            let error = TcpStream::connect("203.0.113.7:443")
+                .expect_err("cold external connect must be mediated");
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            return;
+        }
+
+        // A padded copy of this binary is the cold-connecting executable: a
+        // fresh inode (a digest-cache miss for the fresh test broker) whose
+        // cold hash keeps the resolve lock busy well past the burst below.
+        let fixture = tempfile::tempdir().expect("create fixture directory");
+        let cold_binary = fixture.path().join("resolution-quota-binary");
+        std::fs::copy(std::env::current_exe().unwrap(), &cold_binary).expect("copy test binary");
+        {
+            let padded = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&cold_binary)
+                .expect("reopen fixture for padding");
+            let current_len = padded.metadata().expect("stat fixture").len();
+            // A sparse hole reads back as deterministic zero bytes without
+            // committing pages, like the stall fixture above.
+            padded
+                .set_len(
+                    current_len
+                        + u64::try_from(RESOLUTION_QUOTA_PADDING_BYTES).expect("padding size fits"),
+                )
+                .expect("extend fixture with a zero hole");
+        }
+        let hash_duration = sha256_duration(&cold_binary).min(sha256_duration(&cold_binary));
+        assert!(
+            hash_duration > Duration::from_millis(100),
+            "resolution-quota fixture hashes too fast to measure: {hash_duration:?}"
+        );
+
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        // Like the cold-connect tests above: the decision timeout tolerates
+        // a parallel-suite scheduler descheduling this thread between a
+        // worker's queue put and the accept+deny below, and the resolver is
+        // bounded by this test process so the cold hash actually runs.
+        let broker = NetworkBroker::start_with_identity_root(
+            listener,
+            Duration::from_secs(30),
+            std::process::id(),
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        // Warm the digest cache for the burst threads' binary (this test
+        // binary) so only the child's padded fixture is a cold resolve, and
+        // the warm-up worker releases its resolution permit before the burst
+        // relies on the quota.
+        warm_up_open_resolver(&launcher, &broker, &runtime);
+
+        // The resolver reports the executable as /proc/<pid>/exe resolves
+        // it, so compare against the canonicalized fixture path to find the
+        // cold child's queued open.
+        let cold_exe_path = std::fs::canonicalize(&cold_binary).expect("canonicalize fixture");
+        // Watch the fixture before the child execs it: every parent-side read
+        // of the fixture (copy, padding, measurement hashes) is done, so the
+        // only opens left are the child's exec and the cold connect worker's
+        // identity resolve.
+        let fixture_watch = FixtureOpenWatch::new(&cold_binary);
+        let (mut child, child_stdout) = launcher
+            .execute(move || {
+                let mut child = std::process::Command::new(&cold_binary)
+                    .args([
+                        "--exact",
+                        "network_broker::tests::cold_resolve_burst_is_bounded_by_the_resolution_quota",
+                        "--nocapture",
+                        "--quiet",
+                    ])
+                    .env(CHILD, "1")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("spawn cold-connect child");
+                let mut stdout =
+                    io::BufReader::new(child.stdout.take().expect("pipe child stdout"));
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    stdout.read_line(&mut line).expect("read child readiness");
+                    assert!(!line.is_empty(), "child exited before signaling readiness");
+                    if line.trim() == "ready" {
+                        break;
+                    }
+                }
+                (child, stdout)
+            })
+            .expect("launcher result");
+        // Discard the child's exec open of the fixture, then release the
+        // child and wait for its cold connect's identity resolve to open the
+        // fixture. That event proves the broker dispatched the cold connect
+        // and its worker holds the resolve lock and one resolution permit,
+        // so the burst below fires against a resolve that is provably in
+        // flight. A fixed sleep here could fire the burst before the child's
+        // connect was even dispatched.
+        fixture_watch.drain();
+        child
+            .stdin
+            .take()
+            .expect("pipe cold-connect child stdin")
+            .write_all(b"go\n")
+            .expect("release cold-connect child");
+        fixture_watch.wait_for_open(Duration::from_secs(30));
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let burst_started = Instant::now();
+        let clients: Vec<_> = launcher
+            .execute(move || {
+                (0..BURST)
+                    .map(|_| {
+                        let result_tx = result_tx.clone();
+                        std::thread::spawn(move || {
+                            // Timestamp the answer in the connecting thread,
+                            // the moment connect(2) returns, so the ordering
+                            // below measures the broker's answers rather than
+                            // any collector-thread scheduling delay.
+                            let result = TcpStream::connect("203.0.113.7:443");
+                            let _ = result_tx.send((result, Instant::now()));
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .expect("launcher result");
+        // Count the inline EAGAIN answers as they land so the test can gate
+        // on them; the arrival timestamps were taken by the connecting
+        // threads themselves.
+        let eagain_answered = Arc::new(AtomicUsize::new(0));
+        let eagain_counter = Arc::clone(&eagain_answered);
+        let (done_tx, mut done_rx) = oneshot::channel();
+        let collector = std::thread::spawn(move || {
+            let mut arrivals = Vec::new();
+            while let Ok((result, answered_at)) = result_rx.recv() {
+                let errno = result.err().and_then(|error| error.raw_os_error());
+                if errno == Some(libc::EAGAIN) {
+                    eagain_counter.fetch_add(1, Ordering::Release);
+                }
+                arrivals.push((errno, answered_at));
+            }
+            // Every sender dropped: all burst connects have been answered.
+            let _ = done_tx.send(arrivals);
+        });
+
+        // Gate on the burst's inline EAGAIN answers before deciding any
+        // open. No decision has been issued yet, so no worker has exited and
+        // no resolution permit has been recycled: the broker answers the
+        // burst's overflow inline while it still has notifications to
+        // dispatch, and the child's open plus the permitted burst opens are
+        // all still queued. The burst has exactly BURST + 1 notifications and
+        // the quota admits OPEN_QUEUE_CAPACITY of them, so waiting for all
+        // EXPECTED_EAGAIN rejections proves the broker dispatched every
+        // notification. Only then can queued opens be denied without the
+        // released permit spawning an extra worker whose open nobody accepts
+        // and whose syscall the decision timeout answers ETIMEDOUT.
+        let gate_started = Instant::now();
+        while eagain_answered.load(Ordering::Acquire) < EXPECTED_EAGAIN {
+            assert!(
+                gate_started.elapsed() < Duration::from_secs(30),
+                "the burst was not answered {EXPECTED_EAGAIN} inline EAGAINs within 30s"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Dispatch is complete, so deciding opens can no longer recycle a
+        // permit into a new worker. Deny each burst open as it is accepted,
+        // and hold the cold child's open undecided until every burst connect
+        // has been answered.
+        let mut cold_open = None;
+        let mut cold_queued_at = None;
+        let arrivals = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    tokio::select! {
+                        open = broker.accept() => {
+                            let pending = open.expect("pending TCP open");
+                            let is_cold = pending
+                                .identity
+                                .as_ref()
+                                .is_ok_and(|identity| identity.executable.path == cold_exe_path);
+                            if is_cold {
+                                cold_queued_at = Some(pending.queued_at);
+                                cold_open = Some(pending);
+                            } else {
+                                pending
+                                    .decide(TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied))
+                                    .expect("deny quota burst open");
+                            }
+                        }
+                        Ok(arrivals) = &mut done_rx => break arrivals,
+                    }
+                }
+            })
+            .await
+            .expect("answer every burst connect within the decision timeout")
+        });
+        // With every burst connect answered, the held cold open can no longer
+        // recycle a resolution permit either; decide it.
+        cold_open
+            .expect("cold child open queued")
+            .decide(TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied))
+            .expect("deny cold connect");
+        let cold_queued_at = cold_queued_at.expect("cold child open queued");
+        collector.join().expect("join burst collector");
+
+        for client in clients {
+            client.join().expect("join burst connect");
+        }
+        assert!(
+            child.wait().expect("wait cold-connect child").success(),
+            "cold-connect child failed"
+        );
+        // Keep the read end open until the child has exited so its harness
+        // summary never hits a broken pipe.
+        drop(child_stdout);
+
+        let mut eagain = 0;
+        let mut denied = 0;
+        let mut first_eagain: Option<Instant> = None;
+        for (errno, arrived) in arrivals {
+            match errno {
+                Some(libc::EAGAIN) => {
+                    // Arrivals are ordered by each sender's channel put, not
+                    // by answer time (a thread can be preempted between
+                    // timestamping and sending), so track the earliest
+                    // EAGAIN timestamp rather than the first received.
+                    first_eagain =
+                        Some(first_eagain.map_or(arrived, |earliest| earliest.min(arrived)));
+                    eagain += 1;
+                }
+                Some(libc::EACCES) => denied += 1,
+                other => panic!("unexpected burst connect result: {other:?}"),
+            }
+        }
+        assert_eq!(
+            eagain, EXPECTED_EAGAIN,
+            "burst beyond the resolution quota must be answered EAGAIN"
+        );
+        assert_eq!(denied, BURST - EXPECTED_EAGAIN);
+        // The discriminator: the quota's EAGAIN answers arrive while the cold
+        // resolve is still in flight, before the cold open can queue. No
+        // open can queue before the cold hash finishes (the resolve lock
+        // serializes every worker behind it), and without the quota no
+        // EAGAIN can precede the cold open's queueing either: EAGAIN requires
+        // all OPEN_QUEUE_CAPACITY slots held, and the cold open is among the
+        // first to queue behind the hash. An EAGAIN observed before
+        // cold_queued_at can only come from the broker thread's inline quota
+        // rejection.
+        let first_eagain = first_eagain.expect("burst EAGAIN answers must arrive");
+        assert!(
+            first_eagain < cold_queued_at,
+            "first EAGAIN arrived {:?} after the burst started, after the cold open \
+             queued {:?} after the burst started (fixture hash {hash_duration:?}): the \
+             burst was not bounded by the resolution quota during the cold resolve",
+            first_eagain.saturating_duration_since(burst_started),
+            cold_queued_at.saturating_duration_since(burst_started),
+        );
+    }
+
+    /// Warm the resolver's digest cache once so a later saturation storm does
+    /// not repeat the cold hash per connecting thread: one mediated connect
+    /// through the launcher, denied here, then a brief settle to let the
+    /// warm-up worker release its open slot and resolution permit before the
+    /// storm relies on the bounds.
+    fn warm_up_open_resolver(
+        launcher: &crate::linux::workload_launcher::WorkloadLauncher,
+        broker: &NetworkBroker,
+        runtime: &tokio::runtime::Runtime,
+    ) {
+        let warm_launcher = launcher.clone();
+        let warm = std::thread::spawn(move || {
+            warm_launcher
+                .execute(|| TcpStream::connect("203.0.113.7:443"))
+                .expect("launcher result")
+        });
+        let warm_pending = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(30), broker.accept())
+                .await
+                .expect("warm-up connect queued")
+                .expect("pending TCP open")
+        });
+        warm_pending
+            .decide(TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied))
+            .expect("deny warm-up connect");
+        let error = warm
+            .join()
+            .expect("join warm-up")
+            .expect_err("warm-up denied");
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn external_connect_is_answered_eagain_while_the_open_queue_stays_full() {
+        let _saturation = lock(&SATURATION_TESTS);
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        // The decision timeout bounds how long saturation holds: queued
+        // connects are answered at the timeout, so the test cannot stall.
+        let decision_timeout = Duration::from_millis(250);
+        let broker = NetworkBroker::start_with_decision_timeout(
+            listener,
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            decision_timeout,
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        // Warm the resolver's digest cache once so the saturation storm below
+        // does not repeat the cold hash per connecting thread.
+        warm_up_open_resolver(&launcher, &broker, &runtime);
+
+        // More undrained connects than the queue and slot bound: every slot
+        // is held until the decision timeout, and the queue keeps the
+        // timed-out opens after their workers exit.
+        let saturated = OPEN_QUEUE_CAPACITY + 8;
+        launcher
+            .execute(move || {
+                let clients: Vec<_> = (0..saturated)
+                    .map(|_| std::thread::spawn(|| TcpStream::connect("203.0.113.7:443")))
+                    .collect();
+                for client in clients {
+                    let _ = client.join().expect("join saturated connect");
+                }
+            })
+            .expect("launcher result");
+
+        // The queue is still full; the probe's worker must answer EAGAIN
+        // itself rather than leave the syscall hanging. A short settle lets
+        // the last timed-out workers release their slots first.
+        std::thread::sleep(Duration::from_millis(100));
+        let probe = std::thread::spawn(move || {
+            launcher
+                .execute(|| TcpStream::connect("203.0.113.7:443"))
+                .expect("launcher result")
+        });
+        let started = Instant::now();
+        let error = probe
+            .join()
+            .expect("join probe")
+            .expect_err("queue-full connect must be rejected");
+        assert_eq!(error.raw_os_error(), Some(libc::EAGAIN));
+        // The errno already proves the answer came from queue pressure rather
+        // than the decision timeout (which answers ETIMEDOUT); the bound only
+        // guards against a hang, so it tolerates parallel-suite scheduling
+        // delays instead of pinning the decision timeout.
+        assert!(
+            started.elapsed() < decision_timeout * 4,
+            "queue-full EAGAIN took {:?}, far longer than the decision timeout",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn external_connect_is_answered_eagain_while_every_open_slot_stays_held() {
+        let _saturation = lock(&SATURATION_TESTS);
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        // Unlike the queue-full test, the decision timeout is far longer than
+        // the whole probe: every held open keeps its slot until the test
+        // releases the decisions, so the saturation below is the slot bound
+        // alone and cannot drain before the probe runs.
+        let decision_timeout = Duration::from_secs(10);
+        let broker = NetworkBroker::start_with_decision_timeout(
+            listener,
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            decision_timeout,
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        // Warm the resolver's digest cache once so the saturation storm below
+        // does not repeat the cold hash per connecting thread. The settle
+        // inside lets the warm-up worker release its slot before the storm
+        // relies on acquiring every remaining one.
+        warm_up_open_resolver(&launcher, &broker, &runtime);
+
+        // Hold every slot with the queue drained: each accepted but undecided
+        // open keeps its worker (and its slot) waiting on the decision
+        // channel, and the accepts empty the queue, so the probe below faces
+        // the slot bound alone rather than a full queue.
+        let saturated = OPEN_QUEUE_CAPACITY;
+        let clients: Vec<_> = launcher
+            .execute(move || {
+                (0..saturated)
+                    .map(|_| std::thread::spawn(|| TcpStream::connect("203.0.113.7:443")))
+                    .collect::<Vec<_>>()
+            })
+            .expect("launcher result");
+        let mut held = Vec::with_capacity(saturated);
+        for _ in 0..saturated {
+            let pending = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(30), broker.accept())
+                    .await
+                    .expect("slot-holding connect queued")
+                    .expect("pending TCP open")
+            });
+            held.push(pending);
+        }
+
+        // With every slot held and the queue empty, the broker thread's
+        // fail-fast saturation check must reject the probe inline, without a
+        // worker, a queued open, or a hanging syscall.
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        launcher
+            .execute(move || {
+                std::thread::spawn(move || {
+                    let _ = probe_tx.send(TcpStream::connect("203.0.113.7:443"));
+                });
+            })
+            .expect("launcher result");
+        let started = Instant::now();
+        let error = probe_rx
+            .recv_timeout(decision_timeout)
+            .expect("slot-saturated probe must be answered, not hang")
+            .expect_err("slot-saturated connect must be rejected");
+        assert_eq!(error.raw_os_error(), Some(libc::EAGAIN));
+        assert!(
+            started.elapsed() < decision_timeout,
+            "slot-saturated EAGAIN took {:?}, longer than the decision timeout",
+            started.elapsed()
+        );
+        // The rejected probe never reached the supervisor: no open was queued
+        // behind the held ones.
+        let queued = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(250), broker.accept()).await
+        });
+        assert!(queued.is_err(), "rejected probe must not queue an open");
+
+        // Release the held decisions so the storm threads can exit.
+        drop(held);
+        for client in clients {
+            let _ = client.join().expect("join slot-holding connect");
+        }
+    }
+
+    #[test]
+    fn concurrent_connects_at_the_open_slot_boundary_answer_eagain_without_hanging() {
+        const RACERS: usize = 8;
+        let _saturation = lock(&SATURATION_TESTS);
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let decision_timeout = Duration::from_secs(10);
+        let broker = NetworkBroker::start_with_decision_timeout(
+            listener,
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            decision_timeout,
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        // Warm the resolver's digest cache once so the boundary storm below
+        // does not repeat the cold hash per connecting thread.
+        warm_up_open_resolver(&launcher, &broker, &runtime);
+
+        // Leave exactly one slot free: as above, the accepted but undecided
+        // opens hold every other slot and the accepts drain the queue.
+        let boundary = OPEN_QUEUE_CAPACITY - 1;
+        let clients: Vec<_> = launcher
+            .execute(move || {
+                (0..boundary)
+                    .map(|_| std::thread::spawn(|| TcpStream::connect("203.0.113.7:443")))
+                    .collect::<Vec<_>>()
+            })
+            .expect("launcher result");
+        let mut held = Vec::with_capacity(boundary);
+        for _ in 0..boundary {
+            let pending = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(30), broker.accept())
+                    .await
+                    .expect("slot-holding connect queued")
+                    .expect("pending TCP open")
+            });
+            held.push(pending);
+        }
+
+        // Race concurrent connects for the last slot. Exactly one can acquire
+        // it and reach the supervisor; every other racer must be answered
+        // EAGAIN inline by the broker thread, never left hanging. During the
+        // race all OPEN_QUEUE_CAPACITY resolution permits are held: `boundary`
+        // by the undecided opens' workers plus one by the winner's, so a
+        // losing racer can never spawn a worker and never reaches the
+        // worker's authoritative slot re-check. The broker thread answers it
+        // instead, at the fail-fast pre-check or the resolution-quota
+        // rejection. Which branch answers each loser depends on scheduling,
+        // so the test pins the outcome: one mediated open, EAGAIN for the
+        // rest.
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        launcher
+            .execute(move || {
+                for _ in 0..RACERS {
+                    let result_tx = result_tx.clone();
+                    std::thread::spawn(move || {
+                        let _ = result_tx.send(TcpStream::connect("203.0.113.7:443"));
+                    });
+                }
+            })
+            .expect("launcher result");
+        // Collect the losers first: each answers itself, and the queued
+        // winner keeps holding the last slot until every racer has been
+        // dispatched, so denying it cannot let a late racer queue behind it.
+        for racer in 1..RACERS {
+            let error = result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|_| panic!("boundary racer {racer} must be answered, not hang"))
+                .expect_err("boundary racer must be rejected");
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::EAGAIN),
+                "only the queued racer may be denied; the rest must be EAGAIN"
+            );
+        }
+        let winner = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(30), broker.accept())
+                .await
+                .expect("exactly one boundary racer must queue")
+                .expect("pending TCP open")
+        });
+        winner
+            .decide(TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied))
+            .expect("deny boundary connect");
+        let error = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("queued boundary racer must be answered, not hang")
+            .expect_err("queued boundary racer must be denied");
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+
+        // Release the held decisions so the storm threads can exit.
+        drop(held);
+        for client in clients {
+            let _ = client.join().expect("join slot-holding connect");
+        }
     }
 
     #[test]
