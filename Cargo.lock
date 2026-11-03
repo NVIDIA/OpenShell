@@ -4863,9 +4863,11 @@ dependencies = [
  "futures",
  "http 1.4.0",
  "http-body-util",
+ "hyper-rustls",
  "hyper-util",
  "metrics",
  "metrics-util",
+ "openshell-crypto",
  "openshell-ocsf",
  "openshell-otel-test-support",
  "opentelemetry",
@@ -4874,7 +4876,10 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",
+ "rustls",
+ "rustls-native-certs",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tonic",
@@ -4882,6 +4887,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -4898,8 +4904,10 @@ dependencies = [
  "opentelemetry-proto",
  "prost",
  "rcgen",
+ "rustls",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tonic",
  "tracing",
@@ -5182,6 +5190,7 @@ dependencies = [
 name = "openshell-supervisor"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "bytes",
  "clap",
  "futures",

@@ -18,6 +18,7 @@ compile_error!(
 );
 
 mod activity_aggregator;
+pub mod app_listener;
 pub mod backend_setup;
 mod config_runtime;
 mod denial_aggregator;
@@ -27,6 +28,9 @@ mod otlp_relay;
 mod provider_readiness;
 pub mod sandbox_instance_host;
 pub mod shared_host;
+#[cfg(test)]
+#[path = "../../../tests/support/environment.rs"]
+mod test_environment;
 
 use config_runtime::{agent_proposals_enabled_from_settings, run_policy_poll_loop};
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -886,6 +890,7 @@ pub fn trace_context_from_environment() -> Option<RegistrationTraceContext> {
 /// from its [`SandboxInstanceBindings`], so one process can host several
 /// instances.
 pub struct SandboxInstanceConfig {
+    pub app_router: Option<app_listener::Router>,
     pub command: Vec<String>,
     pub workdir: Option<String>,
     pub timeout_secs: u64,
@@ -1053,6 +1058,7 @@ pub async fn run_sandbox_instance(
     controls: SandboxInstanceControls,
 ) -> Result<i32> {
     let SandboxInstanceConfig {
+        app_router,
         command,
         workdir,
         timeout_secs,
@@ -1298,8 +1304,13 @@ pub async fn run_sandbox_instance(
     // handler is installed when the first staged connection arrives, and
     // before attach so the agent spec can tell the boundary whether to point
     // workload SDKs at it.
-    let (mut otlp_relay, otlp_reserved_destination) =
-        otlp_relay::activate(otlp_agent_endpoint, otlp_agent_protocol, sandbox_id.clone());
+    let (mut otlp_relay, otlp_reserved_destination) = otlp_relay::activate(
+        otlp_agent_endpoint,
+        otlp_agent_protocol,
+        auth_bundle.agent_otlp().headers.cloned(),
+        auth_bundle.agent_otlp().tls.cloned(),
+        sandbox_id.clone(),
+    );
 
     // Construct the selected client only after shared policy and credential
     // setup has completed. Keep live credentials and later CA publication in
@@ -1581,6 +1592,26 @@ pub async fn run_sandbox_instance(
         });
     }
 
+    let app_instance =
+        match app_router {
+            Some(router) => {
+                if !loaded_policy_origin.allows_gateway_policy_reload() {
+                    return Err(miette::miette!(
+                        "app ingress requires gateway-managed configuration"
+                    ));
+                }
+                Some(
+                    router.instance(sandbox.as_deref().ok_or_else(|| {
+                        miette::miette!("app ingress requires sandbox identity")
+                    })?)?,
+                )
+            }
+            None => None,
+        };
+    let app_routes = app_instance
+        .as_ref()
+        .map(|instance| instance.routes.clone());
+
     // Spawn background policy poll task (gRPC mode only).
     if let (Some(id), Some(sandbox), Some(gateway), Some(engine)) = (
         sandbox_id.as_deref(),
@@ -1606,6 +1637,7 @@ pub async fn run_sandbox_instance(
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
         let poll_ctx = PolicyPollLoopContext {
+            app_routes: app_routes.clone(),
             gateway: poll_gateway,
             sandbox_id: poll_id,
             sandbox: poll_sandbox,
@@ -1691,6 +1723,8 @@ pub async fn run_sandbox_instance(
         } else {
             info!(backend = %backend_name, "Isolation boundary agent started");
         }
+        let _app_listener =
+            app_instance.map(|instance| instance.start(running.loopback_connector()));
         let agent = running.agent();
         let boundary_access = openshell_supervisor_process::delegated::start_boundary_access(
             sandbox_id.as_deref(),
@@ -4196,6 +4230,7 @@ async fn report_initial_policy_failure(
 /// When the entrypoint PID is available, policy reloads include symlink
 /// resolution for binary paths via the container filesystem.
 struct PolicyPollLoopContext {
+    app_routes: Option<app_listener::Routes>,
     gateway: openshell_core::grpc_client::GatewayEndpoint,
     sandbox_id: String,
     /// Canonical sandbox reference used by name-scoped configuration APIs.
@@ -4619,9 +4654,16 @@ mod tests {
                 .expect("token"),
             sandbox_expires_at: 0,
             ssh_host_private_key: None,
+            traces_otlp_headers: None,
             ocsf_otlp_headers: None,
+            agent_otlp_headers: None,
+            otlp_tls: Vec::new(),
+            traces_otlp_tls: None,
+            ocsf_otlp_tls: None,
+            agent_otlp_tls: None,
         };
         let config = SandboxInstanceConfig {
+            app_router: None,
             command: vec!["true".to_string()],
             workdir: None,
             timeout_secs: 0,
@@ -5095,6 +5137,7 @@ network_policies:
         source: openshell_core::proto::PolicySource,
     ) -> openshell_core::grpc_client::SettingsPollResult {
         openshell_core::grpc_client::SettingsPollResult {
+            service_routes: Vec::new(),
             policy,
             version,
             policy_hash: format!("hash-v{version}"),
@@ -7173,6 +7216,7 @@ network_policies:
         let canonical =
             settings_poll_result(Some(newer), 1, openshell_core::proto::PolicySource::Sandbox);
         let canonical = openshell_core::grpc_client::SettingsPollResult {
+            service_routes: Vec::new(),
             policy_hash: "hash-provider-change".to_string(),
             config_revision: loaded.config_revision + 1,
             ..canonical
@@ -7227,6 +7271,7 @@ network_policies:
     #[test]
     fn unchanged_sandbox_policy_revision_candidate_is_strictly_scoped() {
         let sandbox_result = openshell_core::grpc_client::SettingsPollResult {
+            service_routes: Vec::new(),
             policy_hash: "same-policy".to_string(),
             ..settings_poll_result(
                 Some(proto_policy_fixture()),
@@ -7267,6 +7312,7 @@ network_policies:
         );
 
         let global_result = openshell_core::grpc_client::SettingsPollResult {
+            service_routes: Vec::new(),
             policy_hash: "same-policy".to_string(),
             ..settings_poll_result(
                 Some(proto_policy_fixture()),

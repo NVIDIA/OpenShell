@@ -15,26 +15,26 @@ use metrics::{
 use metrics_util::registry::{Registry, Storage};
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Meter;
-use opentelemetry_otlp::{MetricExporter, WithExportConfig, WithHttpConfig};
+use opentelemetry_otlp::MetricExporter;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 
-use crate::{OtlpHttpClient, OtlpTarget, Protocol, SetupError};
+use crate::{OtlpTarget, Protocol, SetupError};
 
 impl OtlpTarget {
     /// Build a meter provider that exports metrics to this target on the
     /// SDK's periodic interval (`OTEL_METRIC_EXPORT_INTERVAL`).
     pub fn meter_provider(&self) -> Result<SdkMeterProvider, SetupError> {
+        self.check_tls()?;
         let exporter = match self.protocol {
             Protocol::Grpc => self
                 .configure(MetricExporter::builder().with_tonic())
                 .build()?,
-            Protocol::HttpProtobuf => MetricExporter::builder()
-                .with_http()
-                .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
-                .with_endpoint(self.http_signal_url("v1/metrics")?)
-                .with_http_client(OtlpHttpClient::new(crate::transport::export_timeout(
+            Protocol::HttpProtobuf => self
+                .configure_http(
+                    MetricExporter::builder().with_http(),
+                    "v1/metrics",
                     "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
-                ))?)
+                )?
                 .build()?,
         };
         Ok(SdkMeterProvider::builder()
@@ -410,23 +410,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn target_builds_an_http_meter_provider_but_not_over_tls() {
-        let target = |endpoint| {
-            OtlpTarget::new(&OtlpExportConfig {
-                endpoint,
-                service_name: ServiceName::Fixed("openshell-gateway"),
-                service_version: None,
-                resource_attributes: Vec::new(),
-            })
-            .unwrap()
-            .with_protocol(Protocol::HttpProtobuf)
-        };
-        target("http://127.0.0.1:4318")
-            .meter_provider()
-            .expect("meter provider");
-        assert!(matches!(
-            target("https://collector.example:4318").meter_provider(),
-            Err(SetupError::HttpsUnsupported)
-        ));
+    async fn target_builds_a_meter_provider_for_either_protocol_and_scheme() {
+        for protocol in [Protocol::Grpc, Protocol::HttpProtobuf] {
+            for endpoint in ["http://127.0.0.1:4318", "https://collector.example:4318"] {
+                OtlpTarget::new(&OtlpExportConfig {
+                    endpoint,
+                    service_name: ServiceName::Fixed("openshell-gateway"),
+                    service_version: None,
+                    resource_attributes: Vec::new(),
+                })
+                .unwrap()
+                .with_protocol(protocol)
+                .meter_provider()
+                .unwrap_or_else(|error| panic!("{protocol:?} {endpoint}: {error}"));
+            }
+        }
     }
 }

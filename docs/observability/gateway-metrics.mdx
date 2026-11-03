@@ -154,6 +154,8 @@ metrics  = true
 `metrics = true` sends metrics to the `endpoint`. To send them to another
 collector, use a `[openshell.gateway.otlp.metrics]` table with `enabled = true`
 and its own `endpoint`, and `protocol = "http/protobuf"` to use OTLP/HTTP.
+The table also takes `headers`, `headers_file`, and the TLS file keys described in
+[OTLP Export](/how-it-works/gateways/configuration#otlp-export).
 Counters, gauges, and histograms keep their names and labels, and histograms use the latency buckets in seconds. The gateway pushes
 every 60 seconds. For the interval and other export tuning, refer to
 [Tuning](/how-it-works/gateways/configuration#tuning).

@@ -10698,6 +10698,20 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_state_dirs_stay_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = unique_temp_dir();
+        let dir = base.join("sandboxes").join("sandbox-123");
+        create_private_dir_all(&dir).await.unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[tokio::test]
     async fn sandbox_request_metadata_round_trips_for_start() {
         let base = unique_temp_dir();
@@ -11242,7 +11256,13 @@ mod tests {
                 sandbox_token: SecretJwt::parse(format!("sandbox-{label}")).expect("sandbox token"),
                 sandbox_expires_at: 1,
                 ssh_host_private_key: None,
+                traces_otlp_headers: None,
                 ocsf_otlp_headers: None,
+                agent_otlp_headers: None,
+                otlp_tls: Vec::new(),
+                traces_otlp_tls: None,
+                ocsf_otlp_tls: None,
+                agent_otlp_tls: None,
             },
             gateway_id: "gateway-a".to_string(),
             verification_keys: vec![SessionVerificationKey {

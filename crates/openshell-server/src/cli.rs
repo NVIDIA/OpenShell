@@ -401,20 +401,11 @@ fn prepare_server_config_with_drivers(
     // when that file exists. Missing default config is not an error: runtime
     // defaults and OPENSHELL_* env vars are enough for package-managed starts.
     let config_path = resolve_config_path(args)?;
-    let file: Option<ConfigFile> = if let Some(path) = config_path {
+    let mut file: Option<ConfigFile> = if let Some(path) = config_path {
         Some(config_file::load(&path).map_err(|e| miette::miette!("{e}"))?)
     } else {
         None
     };
-    // Normalize sources now, but defer artifact staging until the selected
-    // driver has been proven able to propagate the bundle. This keeps a
-    // rejected startup/preflight from leaving gateway state behind.
-    let normalized_network_trust = file
-        .as_ref()
-        .map(|file| crate::network_trust::normalize_from_config(&file.openshell.supervisor.network))
-        .transpose()
-        .map_err(|error| miette::miette!("{error}"))?
-        .flatten();
     if let Some(file) = file.as_ref() {
         merge_file_into_args(args, &file.openshell.gateway, matches);
     }
@@ -423,6 +414,18 @@ fn prepare_server_config_with_drivers(
     let compute_driver = compute_drivers
         .select(args.compute_driver.as_deref())
         .map_err(|error| miette::miette!("{error}"))?;
+    if let Some(file) = file.as_mut() {
+        config_file::normalize_legacy_podman_ca_bundle(file, compute_driver.name())
+            .map_err(|error| miette::miette!("{error}"))?;
+    }
+    // Interpret legacy driver settings only after effective selection. Defer
+    // artifact staging until the driver has proven it can propagate the bundle.
+    let normalized_network_trust = file
+        .as_ref()
+        .map(|file| crate::network_trust::normalize_from_config(&file.openshell.supervisor.network))
+        .transpose()
+        .map_err(|error| miette::miette!("{error}"))?
+        .flatten();
     let local_tls = apply_runtime_defaults(args)?;
     let guest_tls = GuestTlsPaths::resolve(
         file.as_ref().map(|file| &file.openshell.gateway),
@@ -601,6 +604,15 @@ fn prepare_server_config_with_drivers(
         .map_err(|error| miette::miette!("invalid service routing configuration: {error}"))?;
 
     config.enable_sandbox_updates = args.enable_sandbox_updates;
+
+    config.supervisor_app_listener = file
+        .as_ref()
+        .map(|f| f.openshell.supervisor.app_listener.clone())
+        .unwrap_or_default();
+    config
+        .supervisor_app_listener
+        .validate()
+        .map_err(|e| miette::miette!(e))?;
     if let Some(sources) = file
         .as_ref()
         .and_then(|file| file.openshell.gateway.provider_profile_sources.clone())
@@ -807,6 +819,15 @@ async fn run_from_args(
     {
         warn!("{field} is deprecated and ignored; OpenShell emits OCSF 1.8.0");
     }
+    if prepared
+        .config_file
+        .as_ref()
+        .is_some_and(|file| file.legacy_podman_ca_bundle_seen)
+    {
+        warn!(
+            "openshell.drivers.podman.additional_ca_bundle is deprecated; use openshell.supervisor.network.additional_ca_bundle"
+        );
+    }
     if let Some(bundle) = prepared.network_trust.as_ref() {
         info!(
             certificate_count = bundle.certificate_count(),
@@ -995,7 +1016,7 @@ fn run_effective_config_preflight(
     } else {
         resolve_config_path(&run)?
     };
-    let file = path
+    let mut file = path
         .as_ref()
         .map(|path| config_file::preflight(path).map_err(|error| miette::miette!("{error}")))
         .transpose()?;
@@ -1017,6 +1038,12 @@ fn run_effective_config_preflight(
             .map(|driver| compute_drivers.select(Some(driver)))
             .transpose()
             .map_err(|error| miette::miette!("{error}"))?;
+        if let Some(selection) = selection.as_ref()
+            && let Some(file) = file.as_mut()
+        {
+            config_file::normalize_legacy_podman_ca_bundle(file, selection.name())
+                .map_err(|error| miette::miette!("{error}"))?;
+        }
         let empty_file = ConfigFile::default();
         let semantic_file = file.as_ref().unwrap_or(&empty_file);
         validate_preflight_semantics(&run, matches, semantic_file)?;
@@ -1080,14 +1107,28 @@ fn run_effective_config_preflight(
                 if !semantic_file.openshell.drivers.contains_key(driver_name) {
                     continue;
                 }
-                validate_preflight_isolation_backend(semantic_file, driver_name)?;
+                // Detection-free preflight checks each candidate independently;
+                // a Podman alias must never change another candidate's trust.
+                let mut candidate_file = semantic_file.clone();
+                config_file::normalize_legacy_podman_ca_bundle(&mut candidate_file, driver_name)
+                    .map_err(|error| miette::miette!("{error}"))?;
+                let candidate_trust_configured = crate::network_trust::normalize_from_config(
+                    &candidate_file.openshell.supervisor.network,
+                )?
+                .is_some();
+                let candidate_startup = crate::compute::driver_config::DriverStartupContext {
+                    file: Some(&candidate_file),
+                    network_trust_configured: candidate_trust_configured,
+                    ..driver_startup
+                };
+                validate_preflight_isolation_backend(&candidate_file, driver_name)?;
                 crate::validate_compute_driver_config(
                     compute_drivers,
                     driver_name,
                     run.name.trim(),
                     SocketAddr::new(run.bind_address, run.port),
                     &run.log_level,
-                    driver_startup,
+                    candidate_startup,
                     true,
                 )?;
             }
@@ -3345,6 +3386,17 @@ mod tests {
 
     #[test]
     fn prepare_server_config_normalizes_global_network_trust_before_driver_startup() {
+        assert_startup_normalizes_network_trust("openshell.supervisor.network", "cli");
+    }
+
+    #[test]
+    fn prepare_server_config_normalizes_legacy_podman_network_trust_before_driver_startup() {
+        for selector in ["cli", "env", "file", "auto"] {
+            assert_startup_normalizes_network_trust("openshell.drivers.podman", selector);
+        }
+    }
+
+    fn assert_startup_normalizes_network_trust(table: &str, selector: &str) {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3353,41 +3405,162 @@ mod tests {
         let config_dir = tempfile::tempdir().unwrap();
         let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path().to_str().unwrap());
         let _config = EnvVarGuard::set("XDG_CONFIG_HOME", config_dir.path().to_str().unwrap());
+        let _legacy = EnvVarGuard::remove("OPENSHELL_DRIVERS");
+        let _driver = if selector == "env" {
+            EnvVarGuard::set("OPENSHELL_COMPUTE_DRIVER", "podman")
+        } else {
+            EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER")
+        };
 
         let certificate = rcgen::generate_simple_self_signed(vec!["destination.example".into()])
             .expect("test certificate");
         let source = source_dir.path().join("destination-ca.pem");
         std::fs::write(&source, certificate.cert.pem()).unwrap();
         let config_path = config_dir.path().join("gateway.toml");
+        let driver_table = if selector == "file" {
+            "[openshell.gateway]\ncompute_driver = 'podman'\n"
+        } else {
+            ""
+        };
         std::fs::write(
             &config_path,
             format!(
-                "[openshell]\nversion = 2\n\n[openshell.supervisor.network]\nadditional_ca_bundle = \"{}\"\n",
+                "[openshell]\nversion = 2\n{driver_table}\n[{table}]\nadditional_ca_bundle = \"{}\"\n",
                 source.display()
             ),
         )
         .unwrap();
 
-        let (mut args, matches) = parse_with_args(&[
+        let mut argv = vec![
             "openshell-gateway",
             "--config",
             config_path.to_str().unwrap(),
             "--db-url",
             "sqlite::memory:",
             "--disable-tls",
-            "--compute-driver",
-            "local",
-        ]);
-        let prepared = super::prepare_server_config_with_drivers(
-            &mut args,
-            &matches,
-            &detected_local_registry(),
-        )
-        .expect("global network trust should normalize during startup preparation");
+        ];
+        if selector == "cli" {
+            argv.extend(["--compute-driver", "podman"]);
+        }
+        let (mut run, matches) = parse_with_args(&argv);
+        let mut registry = crate::ComputeDriverRegistry::new();
+        registry
+            .install(
+                crate::ComputeDriverRegistration::new(
+                    "podman",
+                    100,
+                    Some(detect_registered_local),
+                    TestFactory,
+                )
+                .unwrap()
+                .with_local_singleplayer(),
+            )
+            .unwrap();
+        let (preflight_args, preflight_matches) = parse_with_args(&argv);
+        super::run_effective_config_preflight(None, preflight_args, &preflight_matches, &registry)
+            .expect("selected or candidate Podman preflight accepts the legacy alias");
+        assert!(!state.path().join("network-supervisor").exists());
+        let prepared = super::prepare_server_config_with_drivers(&mut run, &matches, &registry)
+            .expect("global network trust should normalize during startup preparation");
         let bundle = prepared.network_trust.expect("normalized trust bundle");
         assert_eq!(bundle.certificate_count(), 1);
         assert!(bundle.artifact_path().is_file());
         assert_eq!(std::fs::read(bundle.artifact_path()).unwrap(), bundle.pem());
+    }
+
+    #[test]
+    fn inactive_podman_ca_bundle_is_inert_in_startup_and_preflight() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", state.to_str().unwrap());
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", root.path().to_str().unwrap());
+        let _legacy = EnvVarGuard::remove("OPENSHELL_DRIVERS");
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["destination.example".into()]).unwrap();
+        let ca = root.path().join("global-ca.pem");
+        std::fs::write(&ca, certificate.cert.pem()).unwrap();
+        let valid_legacy = format!("'{}'", ca.display());
+        let config_path = root.path().join("gateway.toml");
+        let mut registry = crate::ComputeDriverRegistry::new();
+        registry
+            .install(
+                crate::ComputeDriverRegistration::new(
+                    "docker",
+                    100,
+                    Some(detect_registered_local),
+                    TestFactory,
+                )
+                .unwrap()
+                .with_local_singleplayer(),
+            )
+            .unwrap();
+
+        for selector in ["cli", "env", "auto"] {
+            let _driver = if selector == "env" {
+                EnvVarGuard::set("OPENSHELL_COMPUTE_DRIVER", "docker")
+            } else {
+                EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER")
+            };
+            for global in [false, true] {
+                for legacy in [
+                    "'/nonexistent/inactive-ca.pem'",
+                    "''",
+                    "42",
+                    "['/old.pem']",
+                    &valid_legacy,
+                ] {
+                    let configured_driver = if selector == "auto" {
+                        ""
+                    } else {
+                        "compute_driver = 'podman'"
+                    };
+                    let global_table = if global {
+                        format!(
+                            "[openshell.supervisor.network]\nadditional_ca_bundle = '{}'\n",
+                            ca.display()
+                        )
+                    } else {
+                        String::new()
+                    };
+                    std::fs::write(&config_path, format!(
+                        "[openshell]\nversion = 2\n[openshell.gateway]\n{configured_driver}\n{global_table}[openshell.drivers.docker]\n[openshell.drivers.podman]\nadditional_ca_bundle = {legacy}\n"
+                    )).unwrap();
+                    let mut argv = vec![
+                        "openshell-gateway",
+                        "--config",
+                        config_path.to_str().unwrap(),
+                        "--db-url",
+                        "sqlite::memory:",
+                        "--disable-tls",
+                    ];
+                    if selector == "cli" {
+                        argv.extend(["--compute-driver", "docker"]);
+                    }
+                    let (run, matches) = parse_with_args(&argv);
+                    super::run_effective_config_preflight(None, run, &matches, &registry)
+                        .expect("inactive Podman settings must not affect preflight");
+                    let (mut run, matches) = parse_with_args(&argv);
+                    let prepared =
+                        super::prepare_server_config_with_drivers(&mut run, &matches, &registry)
+                            .expect("inactive Podman settings must not affect startup");
+                    assert_eq!(prepared.compute_driver.name(), "docker");
+                    assert_eq!(prepared.network_trust.is_some(), global);
+                    if let Some(bundle) = prepared.network_trust {
+                        assert_eq!(bundle.certificate_count(), 1);
+                    }
+                    let file = prepared.config_file.unwrap();
+                    assert!(!file.legacy_podman_ca_bundle_seen);
+                    assert!(
+                        file.openshell.drivers["podman"]
+                            .get("additional_ca_bundle")
+                            .is_some()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
