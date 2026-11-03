@@ -3229,10 +3229,11 @@ message SupervisorHello {
   uint64 connection_epoch = 3;
   // The supervisor can report credential, policy, and launch-environment installation.
   bool supports_provider_readiness = 4;
-  // Set when this connection is the result of following a SessionRedirect. The
-  // receiving gateway serves a redirected hello locally instead of redirecting
-  // again, so a disagreement about membership cannot bounce the supervisor
-  // between replicas. A gateway that is shutting down may still redirect it.
+  // Set when this connection follows a SessionRedirect, or dials the replica
+  // serving the sandbox's shared supervisor. The receiving gateway serves a
+  // redirected hello locally instead of redirecting again, so a disagreement
+  // about membership cannot bounce the supervisor between replicas. A gateway
+  // that is shutting down may still redirect it.
   bool redirected = 5;
   // The supervisor understands SessionRedirect. Gateways never redirect a
   // supervisor that does not set this.

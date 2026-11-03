@@ -594,7 +594,8 @@ impl ReconnectBackoff {
 }
 
 /// The peer endpoint of the replica serving the shared host, once it is one
-/// other than `avoid`, waiting up to [`GATEWAY_HOME_WAIT`].
+/// other than `avoid`, waiting up to [`GATEWAY_HOME_WAIT`] while no replica
+/// serves the host. `None` at once when the serving replica has no endpoint.
 async fn wait_for_home(
     home: &mut watch::Receiver<Option<String>>,
     avoid: Option<&str>,
@@ -607,6 +608,7 @@ async fn wait_for_home(
     .ok()?
     .ok()
     .and_then(|home| (*home).clone())
+    .filter(|home| !home.is_empty())
 }
 
 /// The peer endpoint of the shared host, once it is one other than `current`,
@@ -618,7 +620,9 @@ async fn home_moved(home: Option<&mut watch::Receiver<Option<String>>>, current:
     };
     loop {
         let endpoint = home.borrow_and_update().clone();
-        if let Some(endpoint) = endpoint.filter(|endpoint| endpoint != current) {
+        if let Some(endpoint) =
+            endpoint.filter(|endpoint| !endpoint.is_empty() && endpoint != current)
+        {
             return endpoint;
         }
         if home.changed().await.is_err() {
@@ -1738,6 +1742,21 @@ mod ocsf_event_tests {
         tokio::task::yield_now().await;
         tx.send_replace(Some("https://gw-b:8443".to_string()));
         assert_eq!(moved.await.unwrap().as_deref(), Some("https://gw-b:8443"));
+    }
+
+    #[tokio::test]
+    async fn a_host_gateway_without_a_peer_endpoint_is_not_waited_for() {
+        let (_tx, mut home) = watch::channel(Some(String::new()));
+        let started = tokio::time::Instant::now();
+        assert_eq!(wait_for_home(&mut home, None).await, None);
+        assert!(started.elapsed() < GATEWAY_HOME_WAIT);
+
+        let moved = tokio::time::timeout(
+            Duration::from_millis(50),
+            home_moved(Some(&mut home), "https://gw-a:8443"),
+        )
+        .await;
+        assert!(moved.is_err(), "an endpointless gateway is not a move");
     }
 
     #[tokio::test]

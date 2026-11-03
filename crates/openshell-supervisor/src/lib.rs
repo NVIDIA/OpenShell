@@ -897,7 +897,8 @@ pub struct SandboxInstanceConfig {
     pub container_image: String,
     pub openshell_endpoint: Option<String>,
     /// Peer endpoint of the gateway replica serving the shared host, which
-    /// the session dials instead of `openshell_endpoint` when set.
+    /// the session dials instead of `openshell_endpoint` when set and
+    /// nonempty.
     pub gateway_home: Option<tokio::sync::watch::Receiver<Option<String>>>,
     pub policy_rules: Option<String>,
     pub policy_data: Option<String>,

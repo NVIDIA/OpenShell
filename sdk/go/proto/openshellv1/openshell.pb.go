@@ -14345,10 +14345,11 @@ type SupervisorHello struct {
 	ConnectionEpoch uint64 `protobuf:"varint,3,opt,name=connection_epoch,json=connectionEpoch,proto3" json:"connection_epoch,omitempty"`
 	// The supervisor can report credential, policy, and launch-environment installation.
 	SupportsProviderReadiness bool `protobuf:"varint,4,opt,name=supports_provider_readiness,json=supportsProviderReadiness,proto3" json:"supports_provider_readiness,omitempty"`
-	// Set when this connection is the result of following a SessionRedirect. The
-	// receiving gateway serves a redirected hello locally instead of redirecting
-	// again, so a disagreement about membership cannot bounce the supervisor
-	// between replicas. A gateway that is shutting down may still redirect it.
+	// Set when this connection follows a SessionRedirect, or dials the replica
+	// serving the sandbox's shared supervisor. The receiving gateway serves a
+	// redirected hello locally instead of redirecting again, so a disagreement
+	// about membership cannot bounce the supervisor between replicas. A gateway
+	// that is shutting down may still redirect it.
 	Redirected bool `protobuf:"varint,5,opt,name=redirected,proto3" json:"redirected,omitempty"`
 	// The supervisor understands SessionRedirect. Gateways never redirect a
 	// supervisor that does not set this.

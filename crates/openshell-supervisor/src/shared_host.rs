@@ -210,7 +210,8 @@ pub struct SharedHost {
     /// A gateway currently accepts this host's stream.
     gateway_connected: watch::Sender<bool>,
     /// Peer endpoint of the gateway replica accepting this host's stream;
-    /// hosted instances dial their sessions there.
+    /// hosted instances dial their sessions there. Empty when that replica
+    /// has none, and `None` while no replica accepts the stream.
     gateway_home: watch::Sender<Option<String>>,
     /// Recovery deadline (seconds) the latest snapshot offers the runtimes
     /// of instances this host starts or takes over; `None` keeps the runtime
@@ -1368,7 +1369,8 @@ async fn run_stream(
         accepted,
         redial: accepted
             .then(|| host.gateway_home.borrow().clone())
-            .flatten(),
+            .flatten()
+            .filter(|endpoint| !endpoint.is_empty()),
     };
     // One deadline covers saying hello, connecting, attaching, and being
     // accepted, so a slow stage leaves less time for the next; the reconnect
@@ -1444,9 +1446,7 @@ async fn run_stream(
                     Some(host_gateway_message::Payload::Accepted(accepted_message)) => {
                         accepted = true;
                         host.gateway_connected.send_replace(true);
-                        host.gateway_home.send_replace(
-                            Some(accepted_message.peer_endpoint.clone()).filter(|endpoint| !endpoint.is_empty()),
-                        );
+                        host.gateway_home.send_replace(Some(accepted_message.peer_endpoint.clone()));
                         tracing::info!(session = %accepted_message.session_id, "gateway accepted the supervisor host");
                         // A pool gateway detects failed members by silence,
                         // so it asks for more frequent heartbeats.
