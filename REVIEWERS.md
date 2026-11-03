@@ -10,9 +10,9 @@ CI/CD workflows, release pipelines, build targets, packaging, and artifact publi
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
+| Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
 | Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
 | Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
-| Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
 | Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
 
 ### area:drivers
@@ -21,10 +21,10 @@ Infrastructure orchestration, including compute scheduling, secret management, r
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
-| Evan Lezar | [@elezar](https://github.com/elezar) | NVIDIA |
-| Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
-| Mrunal Patel | [@mrunalp](https://github.com/mrunalp) | Red Hat |
 | Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
+| Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
+| Evan Lezar | [@elezar](https://github.com/elezar) | NVIDIA |
+| Mrunal Patel | [@mrunalp](https://github.com/mrunalp) | Red Hat |
 | Russell Bryant | [@russellb](https://github.com/russellb) | Red Hat |
 
 ### area:runtime
@@ -36,9 +36,9 @@ Provider discovery and configuration, profiles, sandbox attachments, provider-co
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
 | Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
-| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
-| Shiju | [@shiju-nv](https://github.com/shiju-nv) | NVIDIA |
 | Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
+| Shiju | [@shiju-nv](https://github.com/shiju-nv) | NVIDIA |
+| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
 
 ### area:enterprise
 
@@ -46,9 +46,9 @@ Authentication, multitenancy, gateway interceptors, FIPS compliance, and other e
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
-| Seth Jennings | [@sjenning](https://github.com/sjenning) | Red Hat |
-| Derek Carr | [@derekwaynecarr](https://github.com/derekwaynecarr) | Red Hat |
 | Akram Ben Aissi | [@akram](https://github.com/akram) | Red Hat |
+| Derek Carr | [@derekwaynecarr](https://github.com/derekwaynecarr) | Red Hat |
+| Seth Jennings | [@sjenning](https://github.com/sjenning) | Red Hat |
 
 ### area:platform
 
@@ -56,9 +56,9 @@ SDKs, CLIs, API machinery, gateway infrastructure, persistence (eg postgres, sql
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
+| Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
 | Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
 | Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
-| Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
 
 ## Topics
 
@@ -88,9 +88,9 @@ Authentication, authorization, credential protection, policy integrity/signed po
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
-| Seth Jennings | [@sjenning](https://github.com/sjenning) | Red Hat |
-| Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
 | Gordon Sim | [@grs](https://github.com/grs) | Red Hat |
+| Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
+| Seth Jennings | [@sjenning](https://github.com/sjenning) | Red Hat |
 
 ### topic:compliance
 
@@ -98,8 +98,8 @@ FIPS, regulatory alignment, auditability, and standardization requirements.
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
-| John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
 | Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
+| John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
 
 ### topic:documentation
 
@@ -107,8 +107,8 @@ Architecture documentation, README maintenance, project website updates, and aut
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
-| Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
 | Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
+| Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
 | Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
 
 ### topic:dx
@@ -118,8 +118,8 @@ Ensure OpenShell is easy to contribute to for humans and agents.
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
 | Evan Lezar | [@elezar](https://github.com/elezar) | NVIDIA |
-| John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
 | Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
+| John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
 | Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
 | Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
 
@@ -129,10 +129,10 @@ Extension APIs and integration points, including consistency, general-purpose de
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
-| Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
-| Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
-| Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
 | Artem Lytvyn | [@letv1nnn](https://github.com/letv1nnn) | Independent |
+| Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
+| Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
+| Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
 
 ### topic:gpu
 
@@ -140,8 +140,8 @@ GPU scheduling, Kubernetes Dynamic Resource Allocation (DRA), Container Device I
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
-| Evan Lezar | [@elezar](https://github.com/elezar) | NVIDIA |
 | Adrien Langou | [@alangou](https://github.com/alangou) | NVIDIA |
+| Evan Lezar | [@elezar](https://github.com/elezar) | NVIDIA |
 
 ### topic:kubernetes
 
@@ -149,15 +149,15 @@ Kubernetes operator development, custom resource definitions (CRDs), deployment 
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
-| Mrunal Patel | [@mrunalp](https://github.com/mrunalp) | Red Hat |
-| Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
 | Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
+| Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
+| Ignas Baranauskas | [@Ygnas](https://github.com/Ygnas) | Red Hat |
+| Jorge Garcia Oncins | [@jgarciao](https://github.com/jgarciao) | Red Hat |
 | Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
-| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
 | Krzysztof Malczuk | [@2000krysztof](https://github.com/2000krysztof) | Red Hat |
 | Mark Campbell | [@Bobbins228](https://github.com/Bobbins228) | Red Hat |
-| Jorge Garcia Oncins | [@jgarciao](https://github.com/jgarciao) | Red Hat |
-| Ignas Baranauskas | [@Ygnas](https://github.com/Ygnas) | Red Hat |
+| Mrunal Patel | [@mrunalp](https://github.com/mrunalp) | Red Hat |
+| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
 
 ### topic:mcp
 
@@ -174,11 +174,11 @@ General network transport, connectivity, and proxy behavior not covered by the m
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
-| John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
 | Adrien Langou | [@alangou](https://github.com/alangou) | NVIDIA |
-| Shiju | [@shiju-nv](https://github.com/shiju-nv) | NVIDIA |
 | Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
+| John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
 | Russell Bryant | [@russellb](https://github.com/russellb) | Red Hat |
+| Shiju | [@shiju-nv](https://github.com/shiju-nv) | NVIDIA |
 
 ### topic:observability
 
@@ -186,12 +186,12 @@ Logging, metrics, tracing, telemetry, dashboards, event correlation, and the col
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
+| Artem Lytvyn | [@letv1nnn](https://github.com/letv1nnn) | Independent |
+| Gaizka Menendez | [@gmenher](https://github.com/gmenher) | Red Hat |
 | Kris Hicks | [@krishicks](https://github.com/krishicks) | NVIDIA |
 | Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
-| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
-| Artem Lytvyn | [@letv1nnn](https://github.com/letv1nnn) | Independent |
 | Roland Huss | [@rhuss](https://github.com/rhuss) | Red Hat |
-| Gaizka Menendez | [@gmenher](https://github.com/gmenher) | Red Hat |
+| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
 
 ### topic:operability
 
@@ -199,9 +199,9 @@ Deployment and configuration of OpenShell installations, upgrades, backup and re
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
+| Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
 | Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
 | Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
-| Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
 
 ### topic:performance
 
@@ -209,10 +209,10 @@ Startup time, latency, throughput, resource overhead, scalability, and benchmark
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
-| Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
 | Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
 | Drew Newberry | [@drew](https://github.com/drew) | NVIDIA |
 | Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
+| Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
 
 ### topic:policy
 
@@ -221,9 +221,9 @@ Policy authoring, validation, proving, distribution, enforcement, and policy erg
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
 | Adrien Langou | [@alangou](https://github.com/alangou) | NVIDIA |
+| John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
 | Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
 | Shiju | [@shiju-nv](https://github.com/shiju-nv) | NVIDIA |
-| John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
 
 ### topic:reliability
 
@@ -231,10 +231,10 @@ High availability, failure recovery, retries, graceful degradation, fault tolera
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
-| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
-| Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
-| Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
 | Divesh Chowdary | [@FrostGod](https://github.com/FrostGod) | NVIDIA |
+| Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
+| Piotr Mlocek | [@pimlock](https://github.com/pimlock) | NVIDIA |
+| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
 
 ### topic:sdk
 
@@ -242,10 +242,10 @@ Software Development Kit (SDK) creation, maintenance, language bindings, and dis
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
-| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
-| Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
-| Max Dubrinsky | [@maxdubrinsky](https://github.com/maxdubrinsky) | Gretel |
 | Krzysztof Malczuk | [@2000krysztof](https://github.com/2000krysztof) | Red Hat |
+| Max Dubrinsky | [@maxdubrinsky](https://github.com/maxdubrinsky) | Gretel |
+| Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
+| Taylor Mutch | [@TaylorMutch](https://github.com/TaylorMutch) | NVIDIA |
 
 ### topic:security
 
@@ -254,12 +254,12 @@ Vulnerability management, static/dynamic analysis, FSR (Functional Security Requ
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
 | Adrien Langou | [@alangou](https://github.com/alangou) | NVIDIA |
-| John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
-| Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
-| Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
-| Krzysztof Malczuk | [@2000krysztof](https://github.com/2000krysztof) | Red Hat |
 | Christian Zaccaria | [@ChristianZaccaria](https://github.com/ChristianZaccaria) | Red Hat |
+| Jim Meyer | [@purp](https://github.com/purp) | NVIDIA |
+| John T. Myers | [@johntmyers](https://github.com/johntmyers) | NVIDIA |
+| Krzysztof Malczuk | [@2000krysztof](https://github.com/2000krysztof) | Red Hat |
 | Russell Bryant | [@russellb](https://github.com/russellb) | Red Hat |
+| Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
 
 ### topic:testing
 
@@ -267,12 +267,12 @@ Unit, integration, regression, conformance, and end-to-end testing, including te
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
+| Evan Lezar | [@elezar](https://github.com/elezar) | NVIDIA |
+| Gaizka Menendez | [@gmenher](https://github.com/gmenher) | Red Hat |
+| Jorge Garcia Oncins | [@jgarciao](https://github.com/jgarciao) | Red Hat |
+| Mark Campbell | [@Bobbins228](https://github.com/Bobbins228) | Red Hat |
 | Matthew Grossman | [@matthewgrossman](https://github.com/matthewgrossman) | NVIDIA |
 | Simon Scatton | [@SDAChess](https://github.com/SDAChess) | NVIDIA |
-| Evan Lezar | [@elezar](https://github.com/elezar) | NVIDIA |
-| Mark Campbell | [@Bobbins228](https://github.com/Bobbins228) | Red Hat |
-| Jorge Garcia Oncins | [@jgarciao](https://github.com/jgarciao) | Red Hat |
-| Gaizka Menendez | [@gmenher](https://github.com/gmenher) | Red Hat |
 
 ### topic:ux
 
@@ -280,5 +280,5 @@ CLI command interface and flags, help text, error messages and exit codes, human
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |
-| Roland Huss | [@rhuss](https://github.com/rhuss) | Red Hat |
 | Artem Lytvyn | [@letv1nnn](https://github.com/letv1nnn) | Independent |
+| Roland Huss | [@rhuss](https://github.com/rhuss) | Red Hat |
