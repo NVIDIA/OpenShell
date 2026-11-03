@@ -1096,11 +1096,15 @@ endpoint_matches_request(ep, network) if {
 	ep.ports[_] == network.port
 }
 
-# Hostless endpoint with allowed_ips: match on port only.
+# Hostless endpoint with allowed_ips: raw-IP destinations on port only.
+# Same destination-class separation as the admission matcher: DNS-mediated
+# names are governed by named endpoints, so a hostless CIDR endpoint never
+# constrains a hostname's pinned resolutions.
 endpoint_matches_request(ep, network) if {
 	object.get(ep, "host", "") == ""
 	count(object.get(ep, "allowed_ips", [])) > 0
 	ep.ports[_] == network.port
+	raw_ip_destination(network.host)
 }
 
 endpoint_matches_l7_request(ep, network, request) if {
