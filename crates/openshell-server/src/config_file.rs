@@ -50,6 +50,9 @@ pub const SCHEMA_VERSION: u32 = 2;
 pub struct ConfigFile {
     #[serde(default)]
     pub openshell: OpenShellRoot,
+    /// Retained until tracing is installed so startup can report migration guidance.
+    #[serde(skip)]
+    pub(crate) legacy_podman_ca_bundle_seen: bool,
 }
 
 /// `[openshell]` table.
@@ -1570,6 +1573,52 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
     Ok(file)
 }
 
+/// Preserve the v0.1.5 Podman TOML key while routing it through the shared
+/// startup validation and staging path. Remove it before driver decoding:
+/// Podman's standalone JSON configuration deliberately rejects this field.
+pub(crate) fn normalize_legacy_podman_ca_bundle(
+    file: &mut ConfigFile,
+    selected_driver: &str,
+) -> Result<(), ConfigFileError> {
+    const LEGACY_FIELD: &str = "openshell.drivers.podman.additional_ca_bundle";
+    if selected_driver != "podman" {
+        return Ok(());
+    }
+    let Some(value) = file
+        .openshell
+        .drivers
+        .get_mut("podman")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|table| table.remove("additional_ca_bundle"))
+    else {
+        return Ok(());
+    };
+    let path = value.as_str().ok_or(ConfigFileError::InvalidValue {
+        field: LEGACY_FIELD,
+        message: "must be a string path",
+    })?;
+    if path.trim().is_empty() {
+        return Err(ConfigFileError::InvalidValue {
+            field: LEGACY_FIELD,
+            message: "path must not be empty",
+        });
+    }
+    let path = PathBuf::from(path);
+    let canonical = &mut file.openshell.supervisor.network.additional_ca_bundle;
+    match canonical {
+        Some(current) if *current != path => {
+            return Err(ConfigFileError::InvalidValue {
+                field: LEGACY_FIELD,
+                message: "conflicts with openshell.supervisor.network.additional_ca_bundle; use only the supervisor network setting",
+            });
+        }
+        Some(_) => {}
+        None => *canonical = Some(path),
+    }
+    file.legacy_podman_ca_bundle_seen = true;
+    Ok(())
+}
+
 fn detected_version(contents: &str) -> String {
     let Ok(value) = contents.parse::<toml::Value>() else {
         return "unavailable".to_string();
@@ -1840,6 +1889,7 @@ compute_driver = 42
                 },
                 ..Default::default()
             },
+            ..Default::default()
         };
 
         let serialized = toml::to_string(&file).expect("config serializes");
@@ -2807,6 +2857,74 @@ additional_ca_bundle = "/etc/openshell/ca-bundle.crt"
             file.openshell.supervisor.network.additional_ca_bundle,
             Some(PathBuf::from("/etc/openshell/ca-bundle.crt"))
         );
+    }
+
+    #[test]
+    fn legacy_podman_ca_bundle_normalizes_and_preserves_driver_settings() {
+        for supervisor in [
+            "",
+            "[openshell.supervisor.network]\nadditional_ca_bundle = '/etc/ca.pem'\n",
+        ] {
+            let tmp = write_tmp(&format!(
+                "{supervisor}[openshell.drivers.podman]\nadditional_ca_bundle = '/etc/ca.pem'\nsocket_path = '/run/podman.sock'\n"
+            ));
+            let mut file = load(tmp.path()).expect("legacy alias loads without interpretation");
+            normalize_legacy_podman_ca_bundle(&mut file, "podman").unwrap();
+            assert!(file.legacy_podman_ca_bundle_seen);
+            assert_eq!(
+                file.openshell.supervisor.network.additional_ca_bundle,
+                Some(PathBuf::from("/etc/ca.pem"))
+            );
+            let table = driver_table(
+                "podman",
+                &file.openshell.gateway,
+                file.openshell.drivers.get("podman"),
+            );
+            assert!(table.get("additional_ca_bundle").is_none());
+            assert_eq!(table["socket_path"].as_str(), Some("/run/podman.sock"));
+        }
+    }
+
+    #[test]
+    fn legacy_podman_ca_bundle_rejects_conflicting_supervisor_setting() {
+        let tmp = write_tmp(
+            r#"
+[openshell.drivers.podman]
+additional_ca_bundle = "/etc/old-ca.pem"
+[openshell.supervisor.network]
+additional_ca_bundle = "/etc/new-ca.pem"
+"#,
+        );
+        let mut file = load(tmp.path()).unwrap();
+        let error = normalize_legacy_podman_ca_bundle(&mut file, "podman")
+            .expect_err("different trust paths must not be ignored");
+        assert!(
+            error
+                .to_string()
+                .contains("openshell.drivers.podman.additional_ca_bundle")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with openshell.supervisor.network.additional_ca_bundle")
+        );
+    }
+
+    #[test]
+    fn legacy_podman_ca_bundle_rejects_invalid_values() {
+        for value in ["42", "true", "['/etc/ca.pem']", "''", "'  '"] {
+            let tmp = write_tmp(&format!(
+                "[openshell.drivers.podman]\nadditional_ca_bundle = {value}\n"
+            ));
+            let mut file = load(tmp.path()).unwrap();
+            let error = normalize_legacy_podman_ca_bundle(&mut file, "podman")
+                .expect_err("invalid selected alias must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("openshell.drivers.podman.additional_ca_bundle")
+            );
+        }
     }
 
     #[test]
