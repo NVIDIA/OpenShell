@@ -82,7 +82,10 @@ func TestHealth_GetGatewayInfo_DeepCopy(t *testing.T) {
 		Status:  types.ServiceStatusHealthy,
 		Version: "1.0.0",
 		ComputeDrivers: []types.ComputeDriverInfo{
-			{Name: "k8s"},
+			{Name: "k8s", WorkloadCompatibility: &types.WorkloadCompatibility{
+				OperatingSystem:       "linux",
+				ExecutionRestrictions: []string{"fixed restriction"},
+			}},
 		},
 		Extensions: []types.ExtensionInfo{{
 			ConfiguredName:        "k8s",
@@ -92,11 +95,15 @@ func TestHealth_GetGatewayInfo_DeepCopy(t *testing.T) {
 
 	info1, _ := fc.Health().GetGatewayInfo(context.Background())
 	info1.ComputeDrivers[0].Name = "mutated"
+	info1.ComputeDrivers[0].WorkloadCompatibility.OperatingSystem = "mutated"
+	info1.ComputeDrivers[0].WorkloadCompatibility.ExecutionRestrictions[0] = "mutated"
 	info1.Extensions[0].ConfiguredName = "mutated"
 	info1.Extensions[0].SupportedCapabilities[0] = "mutated"
 
 	info2, _ := fc.Health().GetGatewayInfo(context.Background())
 	assert.Equal(t, "k8s", info2.ComputeDrivers[0].Name)
+	assert.Equal(t, "linux", info2.ComputeDrivers[0].WorkloadCompatibility.OperatingSystem)
+	assert.Equal(t, "fixed restriction", info2.ComputeDrivers[0].WorkloadCompatibility.ExecutionRestrictions[0])
 	assert.Equal(t, "k8s", info2.Extensions[0].ConfiguredName)
 	assert.Equal(t, "openshell.compute.contract", info2.Extensions[0].SupportedCapabilities[0])
 }

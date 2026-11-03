@@ -35,8 +35,12 @@ pub struct AtomicPolicyRevisionWrite {
     pub expected_resource_version: u64,
     pub annotations: HashMap<String, String>,
     /// Populate the create-time baseline, or replace it while startup admission
-    /// is blocked and no workload has consumed the static restrictions.
+    /// is blocked or the sandbox is stopped before a new launch generation.
     pub backfill_policy: Option<ProtoSandboxPolicy>,
+    /// Authorize replacement of an existing baseline while first-start admission
+    /// is blocked or the prior generation is stopped. Only management callers
+    /// may authorize replacement; sandbox-origin sync must conflict instead.
+    pub replace_startup_baseline: bool,
 }
 
 pub fn policy_record_for_atomic_write(
@@ -96,7 +100,8 @@ pub fn project_policy_revision_onto_sandbox(
     sandbox.set_resource_version(current_resource_version);
 
     let mut changed = false;
-    let startup_blocked = permits_initial_static_policy_repair(&sandbox);
+    let startup_blocked = permits_initial_static_policy_repair(&sandbox)
+        || sandbox.phase() == openshell_core::proto::SandboxPhase::Stopped as i32;
     if let Some(backfill_policy) = write.backfill_policy.as_ref() {
         let spec = sandbox
             .spec
@@ -108,7 +113,7 @@ pub fn project_policy_revision_onto_sandbox(
                 changed = true;
             }
             Some(current) if current == backfill_policy => {}
-            Some(_) if startup_blocked => {
+            Some(_) if startup_blocked && write.replace_startup_baseline => {
                 spec.policy = Some(backfill_policy.clone());
                 changed = true;
             }
@@ -729,7 +734,7 @@ mod tests {
             .unwrap()
             .read_write
             .push("/new-static-path".to_string());
-        let write = AtomicPolicyRevisionWrite {
+        let mut write = AtomicPolicyRevisionWrite {
             id: "revision".to_string(),
             sandbox_id: "sandbox".to_string(),
             workspace: "default".to_string(),
@@ -740,6 +745,7 @@ mod tests {
             expected_resource_version: 0,
             annotations: HashMap::new(),
             backfill_policy: Some(replacement.clone()),
+            replace_startup_baseline: true,
         };
         for activated in [None, Some(false), Some(true)] {
             for state in [Admission::Pending, Admission::Rejected, Admission::Accepted] {
@@ -772,5 +778,27 @@ mod tests {
                 }
             }
         }
+        // A sandbox backfill chosen from an empty baseline cannot replace a
+        // management repair that commits before its atomic projection.
+        write.replace_startup_baseline = false;
+        let blocked = Sandbox {
+            spec: Some(SandboxSpec {
+                policy: Some(baseline),
+                ..Default::default()
+            }),
+            status: Some(SandboxStatus {
+                configuration_activated: Some(false),
+                configuration_admission: Some(SandboxConfigurationAdmission {
+                    state: Admission::Pending.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            project_policy_revision_onto_sandbox(&write, &blocked.encode_to_vec(), 1),
+            Err(PersistenceError::Conflict { .. })
+        ));
     }
 }

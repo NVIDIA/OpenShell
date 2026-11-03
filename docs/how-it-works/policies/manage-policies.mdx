@@ -37,6 +37,43 @@ openshell sandbox create --name my-sandbox
 Without either, the sandbox uses a policy from its image or the restrictive
 [default policy](/how-it-works/policies/default-policy).
 
+## Freeze a Sandbox Policy
+
+Use `--frozen` to keep a sandbox's first accepted effective policy for its lifetime.
+All gateways sharing its store must support frozen policies before you create
+a frozen sandbox. Do not downgrade those gateways while frozen sandboxes exist.
+
+```shell
+openshell sandbox create --name review-bot \
+  --policy ./approved-policy.yaml --provider github --frozen --detach
+openshell sandbox get review-bot
+openshell policy get review-bot --full
+```
+
+The snapshot includes any global override and attached provider profiles and
+authorization. Later global-policy or profile changes leave it unchanged, even
+across restarts. Sandbox and image policies receive required proxy filesystem
+paths before the snapshot is captured. A global policy must already include
+those paths; otherwise initialization is rejected until you repair it.
+An upgraded runtime that requires additional paths refuses to start a captured
+policy. Review the required paths and recreate the sandbox instead of extending
+its existing access.
+
+After the configuration is accepted, policy edits, proposal approvals, and
+provider attach or detach fail. Recreate the sandbox to change its policy or
+providers. You cannot enable or disable freezing on an existing sandbox.
+
+Credentials and tokens still rotate. Changing a provider's identity,
+configuration, or refresh authorization withholds that provider's credentials
+without changing the frozen policy.
+
+`sandbox get` shows a pending freeze before initialization and the frozen hash
+and timestamp afterward. `policy get --full` returns the saved effective policy.
+
+Verify approved policy and profile artifacts in a trusted deployment step.
+Freezing preserves the accepted policy; it does not verify approval or
+provide a pre-launch approval gate.
+
 ## Ship a Policy in an Image
 
 To include a policy in a sandbox image, add it at `/etc/openshell/policy.yaml`:
@@ -191,8 +228,8 @@ running sandbox. The startup sections do not:
 | Network rules | The sandbox loads the new rules. Connections opened under the previous rules close. | Apply the change, then retry the request. |
 | Middleware in `network_middlewares` | You can add, remove, or reconfigure built-in middleware and external services already registered with the gateway. | Apply the change with `openshell policy set`. |
 | External middleware registration | Policy changes cannot register a service or change its gateway connection settings. | Update the gateway configuration and restart the gateway. |
-| Added filesystem paths | The saved policy can change, but the running workload keeps its existing filesystem permissions. | Recreate the sandbox. |
-| Removed filesystem paths, or changed `include_workdir`, Landlock, or process settings | OpenShell rejects the change after the workload starts. | Recreate the sandbox. |
+| Added filesystem paths | The running sandbox rejects the revision because its filesystem permissions are fixed at startup. | Follow [Change Filesystem and Process Settings](#change-filesystem-and-process-settings). |
+| Removed filesystem paths, or changed `include_workdir`, Landlock, or process settings | OpenShell rejects the change while the workload is running. | Follow [Change Filesystem and Process Settings](#change-filesystem-and-process-settings). |
 
 When new network rules take effect, OpenShell closes connections that were
 opened under the previous rules, including HTTP keep-alive connections, tunnels,
@@ -222,16 +259,41 @@ repair a rejected change.
 
 ## Change Filesystem and Process Settings
 
-Filesystem, Landlock, and process settings take effect only when a sandbox
-starts, so changing them requires a new sandbox. Save the base policy as
-described in [Replace the Complete Policy](#replace-the-complete-policy), and
-edit these settings in the file.
+Filesystem, Landlock, and process settings take effect when a workload starts.
+Save the base policy as described in
+[Replace the Complete Policy](#replace-the-complete-policy), and edit these
+settings in the file.
 
 When the policy allows network access, OpenShell adds the system paths that
 sandbox processes need, so list only the paths your workload requires. [Baseline
 Filesystem
 Paths](/how-it-works/policies/default-policy#baseline-filesystem-paths) lists
 those paths.
+
+### Update a Stopped Sandbox
+
+For a sandbox created without `--frozen`, a compute driver that supports
+[generation-bound launch policy](/extensibility/isolation-backends#the-protocols)
+lets you change these settings between runs. Stop the sandbox and check its
+state:
+
+```shell
+openshell sandbox stop my-sandbox
+openshell sandbox get my-sandbox
+```
+
+When the sandbox is stopped, replace the complete policy and start it again:
+
+```shell
+openshell policy set my-sandbox --policy ./policy.yaml
+openshell sandbox start my-sandbox
+```
+
+### Recreate a Sandbox
+
+For a frozen sandbox or a driver without this support, recreate the sandbox
+with the edited policy. A frozen sandbox rejects policy changes even while
+stopped.
 
 <Warning>
 Deleting a sandbox stops its processes and removes its state. Copy out anything

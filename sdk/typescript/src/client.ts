@@ -19,6 +19,8 @@ import { type CallOptions, type Client, Code, createClient, type Transport } fro
 import { errorCode, fromConnect, SdkError } from './errors.js';
 import type { Provider, WorkspaceSelectorSchema } from './gen/datamodel_pb.js';
 import type {
+  FrozenSandboxPolicyState,
+  FrozenSandboxResponse,
   Sandbox,
   SandboxLogLine,
   SandboxStreamEvent,
@@ -28,6 +30,7 @@ import type {
 } from './gen/openshell_pb.js';
 import {
   type ExecSandboxInputSchema,
+  FrozenSandboxPolicies,
   OpenShell,
   ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
   SandboxPhase,
@@ -38,11 +41,28 @@ import {
   type TcpForwardFrameSchema,
 } from './gen/openshell_pb.js';
 import type { EffectiveSetting, GetSandboxConfigResponse, SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
-import { PolicySource, type SandboxPolicySchema, SettingScope, type SettingValueSchema } from './gen/sandbox_pb.js';
+import {
+  IngressScope,
+  PolicySource,
+  type SampledResourceBudgetSchema,
+  type SandboxPolicySchema,
+  SettingScope,
+  type SettingValueSchema,
+} from './gen/sandbox_pb.js';
 import { ProviderClient } from './providers.js';
 import { heldUntilReady, OWNER_REPLICA_HEADER, OWNER_REQUEST_HEADER, routedStream } from './routing.js';
 import { validateSshResponse } from './ssh-validate.js';
 import { buildTransport, type ConnectOptions } from './transport.js';
+
+// Match the gateway's loopback-only forward target contract without DNS.
+function normalizeForwardHost(value: string): string {
+  const host = value.trim();
+  if (!host) throw new SdkError('invalid_config', 'tcp target host is required');
+  if (host.toLowerCase() === 'localhost') return '127.0.0.1';
+  if (net.isIPv4(host) && host.startsWith('127.')) return host;
+  if (net.isIPv6(host) && !host.includes('%') && new URL(`http://[${host}]`).hostname === '[::1]') return '::1';
+  throw new SdkError('invalid_config', 'tcp target host must be loopback');
+}
 
 function durationFromSeconds(seconds: number) {
   if (!Number.isFinite(seconds) || seconds < 0) {
@@ -80,9 +100,21 @@ export type {
   SandboxWorkloadTemplate,
   SandboxWorkloadTemplateSpec,
 } from './gen/openshell_pb.js';
-export type { SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
+export type { SampledResourceBudget, SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
 export type { ConnectOptions };
 export { errorCode };
+
+// Health acknowledges that the gateway preserves sampled fields on writes.
+// It is available to workspace users; driver admission still decides support.
+async function requireSampledBudgetSupport(grpc: Client<typeof OpenShell>): Promise<void> {
+  const health = await grpc.health({});
+  if (!health.supportsSampledResourceBudget) {
+    throw new SdkError(
+      'invalid_config',
+      'gateway does not acknowledge sampled resource budgets; upgrade it before creating this workload',
+    );
+  }
+}
 
 // ---- Curated public types --------------------------------------------------
 
@@ -164,12 +196,16 @@ export interface SandboxSpec {
   environment?: Record<string, string>;
   providers?: string[];
   gpu?: boolean;
+  /** Explicit sampled budgets, distinct from hard CPU and memory quotas. */
+  sampledBudget?: MessageInitShape<typeof SampledResourceBudgetSchema>;
   /** Exact canonical command. Empty selects the gateway scratch shell. */
   command?: string[];
   /** Allocate a retained pseudo-terminal for the canonical command. */
   tty?: boolean;
   /** Loopback HTTP services to expose when the sandbox is created. */
   serviceExposures?: ServiceExposure[];
+  /** Target ports to admit before provisioning; does not open listeners. */
+  forwardPorts?: number[];
   /** Restart behavior after the canonical main process exits. */
   restartPolicy?: SandboxRestartPolicyName;
   /**
@@ -191,7 +227,7 @@ export interface SandboxSpec {
 export interface ServiceExposure {
   /** Service name. Empty or omitted selects the unnamed endpoint. */
   service?: string;
-  /** Loopback TCP port inside the sandbox. */
+  /** TCP port in the compute-admitted loopback namespace. */
   targetPort: number;
   /** Handling for an incoming application Authorization header. */
   authorizationMode?: ServiceAuthorizationMode;
@@ -225,6 +261,8 @@ export interface SandboxFromTemplateSpec {
   tty?: boolean;
   /** Loopback HTTP services to expose when the sandbox is created. */
   serviceExposures?: ServiceExposure[];
+  /** Target ports to admit before provisioning; does not open listeners. */
+  forwardPorts?: number[];
   /**
    * Create-time sandbox policy (the safety boundary). The named workload
    * template supplies runtime workload fields.
@@ -232,7 +270,14 @@ export interface SandboxFromTemplateSpec {
   policy?: MessageInitShape<typeof SandboxPolicySchema>;
 }
 
+export interface SandboxIngressAdmission {
+  scope: 'unknown' | 'unsupported' | 'isolated_loopback' | 'shared_host_loopback';
+  allPorts: boolean;
+  ports: number[];
+}
+
 export interface SandboxRef {
+  ingressAdmission?: SandboxIngressAdmission;
   id: string;
   name: string;
   workspace: string;
@@ -470,9 +515,9 @@ export interface WaitDeletedOptions extends WaitOptions {
 }
 
 export interface ForwardOptions extends SandboxWorkspaceOptions {
-  /** Loopback TCP port inside the sandbox to dial. */
+  /** TCP port in the compute-admitted loopback namespace to dial. */
   targetPort: number;
-  /** Target host inside the sandbox (loopback only). Default 127.0.0.1. */
+  /** Target host in the admitted loopback namespace. Default 127.0.0.1. */
   targetHost?: string;
   /** Local port to bind. Default 0 (ephemeral). */
   localPort?: number;
@@ -565,6 +610,36 @@ export interface UpdateConfigResult {
   deleted: boolean;
 }
 
+/** Immutable accepted policy, exposed without changing ordinary sandbox references. */
+export interface FrozenSandboxPolicy {
+  policy?: SandboxPolicy;
+  version: number;
+  policyHash: string;
+  frozenAtMs?: number;
+  policySource: PolicySourceName;
+  globalPolicyVersion: number;
+}
+
+/** A requested freeze is pending until policy is present. */
+export interface FrozenPolicyState {
+  requested: boolean;
+  policy?: FrozenSandboxPolicy;
+}
+
+export interface FrozenGlobalConfigUpdateSpec {
+  policy?: MessageInitShape<typeof SandboxPolicySchema>;
+  settingKey?: string;
+  settingValue?: MessageInitShape<typeof SettingValueSchema>;
+  deleteSetting?: boolean;
+  requestId?: string;
+}
+
+/** Result of the optional global update operation, including frozen exceptions. */
+export interface FrozenGlobalConfigUpdate {
+  update: UpdateConfigResult;
+  frozenSandboxes: string[];
+}
+
 // ---- enum → lowercase string -----------------------------------------------
 
 // Exported for the enum-name drift test only; not re-exported from index.ts, so
@@ -630,7 +705,22 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
   if (!meta?.id || !meta.name) {
     throw new SdkError('invalid_config', 'sandbox metadata.id and metadata.name are required in gateway responses');
   }
+  const ingress = sandbox.status?.ingressAdmission;
   return {
+    ingressAdmission: ingress
+      ? {
+          scope:
+            ingress.scope === IngressScope.ISOLATED_LOOPBACK
+              ? 'isolated_loopback'
+              : ingress.scope === IngressScope.SHARED_HOST_LOOPBACK
+                ? 'shared_host_loopback'
+                : ingress.scope === IngressScope.UNSUPPORTED
+                  ? 'unsupported'
+                  : 'unknown',
+          allPorts: ingress.allPorts,
+          ports: [...ingress.ports],
+        }
+      : undefined,
     id: meta.id,
     name: meta.name,
     workspace: meta.workspace,
@@ -700,6 +790,91 @@ function updateConfigResult(resp: UpdateConfigResponse): UpdateConfigResult {
     policyHash: resp.policyHash,
     settingsRevision: resp.settingsRevision.toString(),
     deleted: resp.deleted,
+  };
+}
+
+function frozenPolicyState(state: FrozenSandboxPolicyState): FrozenPolicyState {
+  const policy = state.policy;
+  return {
+    requested: state.requested,
+    policy: policy
+      ? {
+          policy: policy.policy,
+          version: policy.version,
+          policyHash: policy.policyHash,
+          frozenAtMs: timestampEpochMs(policy.frozenTime),
+          policySource: POLICY_SOURCE_NAMES[policy.policySource] ?? 'unspecified',
+          globalPolicyVersion: policy.globalPolicyVersion,
+        }
+      : undefined,
+  };
+}
+
+function frozenSandboxFromResponse(response: FrozenSandboxResponse): SandboxRef {
+  const sandbox = sandboxRef(response.sandbox, response.serviceUrls);
+  if (!response.frozenPolicy?.requested) {
+    throw new SdkError(
+      'invalid_config',
+      `gateway did not acknowledge frozen creation for sandbox '${sandbox.name}' (ID '${sandbox.id}', workspace '${sandbox.workspace}'); remove the sandbox before retrying`,
+    );
+  }
+  return sandbox;
+}
+
+function createSandboxRequest(
+  spec: SandboxSpec,
+): Omit<MessageInitShape<typeof OpenShell.method.createSandbox.input>, '$typeName'> {
+  const specInit: MessageInitShape<typeof SandboxSpecSchema> = {
+    environment: spec.environment ?? {},
+    providers: spec.providers ?? [],
+    template: spec.image ? { image: spec.image } : undefined,
+    resourceRequirements:
+      spec.gpu || spec.sampledBudget !== undefined
+        ? { gpu: spec.gpu ? {} : undefined, sampledBudget: spec.sampledBudget }
+        : undefined,
+    policy: spec.policy,
+    command: spec.command ?? [],
+    tty: spec.tty ?? false,
+    restartPolicy: restartPolicyValue(spec.restartPolicy),
+  };
+  if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
+  return {
+    workspaceScope: workspaceScope(spec),
+    name: spec.name ?? '',
+    labels: spec.labels ?? {},
+    spec: specInit,
+    forwardPorts: [...(spec.forwardPorts ?? [])],
+    serviceExposures:
+      spec.serviceExposures?.map((exposure) => ({
+        service: exposure.service ?? '',
+        targetPort: exposure.targetPort,
+        authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
+      })) ?? [],
+  };
+}
+
+function createSandboxTemplateRequest(
+  spec: SandboxFromTemplateSpec,
+): Omit<MessageInitShape<typeof OpenShell.method.createSandbox.input>, '$typeName'> {
+  if (spec.workloadTemplate.trim() === '') throw new SdkError('invalid_config', 'workloadTemplate is required');
+  return {
+    workspaceScope: workspaceScope(spec),
+    name: spec.name ?? '',
+    labels: spec.labels ?? {},
+    spec: {
+      providers: spec.providers ?? [],
+      command: spec.command ?? [],
+      tty: spec.tty ?? false,
+      policy: spec.policy,
+    },
+    workloadTemplate: spec.workloadTemplate,
+    forwardPorts: [...(spec.forwardPorts ?? [])],
+    serviceExposures:
+      spec.serviceExposures?.map((exposure) => ({
+        service: exposure.service ?? '',
+        targetPort: exposure.targetPort,
+        authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
+      })) ?? [],
   };
 }
 
@@ -1118,6 +1293,9 @@ export class SandboxTemplateClient {
     options?: SandboxTemplateWorkspaceOptions | null,
   ): Promise<SandboxWorkloadTemplate> {
     try {
+      if (template.spec?.workload?.resources?.sampledBudget !== undefined) {
+        await requireSampledBudgetSupport(this.grpc);
+      }
       const resp = await this.grpc.createSandboxTemplate({
         workspaceScope: workspaceScope(options),
         template,
@@ -1184,6 +1362,7 @@ export class SandboxTemplateClient {
 // transport (one connection) across all of its scoped clients.
 export class SandboxClient {
   private readonly grpc: Client<typeof OpenShell>;
+  private readonly frozenGrpc: Client<typeof FrozenSandboxPolicies>;
 
   /**
    * Advanced escape hatch: a generated client for every gateway RPC, including
@@ -1201,6 +1380,46 @@ export class SandboxClient {
     this.transport = transport;
     this.grpc = grpc;
     this.raw = this.grpc;
+    this.frozenGrpc = createClient(FrozenSandboxPolicies, transport);
+  }
+
+  /** Create through the optional frozen-policy service; never fall back to ordinary creation. */
+  async createFrozen(spec: SandboxSpec): Promise<SandboxRef> {
+    try {
+      const request = createSandboxRequest(spec);
+      if (request.spec?.resourceRequirements?.sampledBudget !== undefined) await requireSampledBudgetSupport(this.grpc);
+      return frozenSandboxFromResponse(await this.frozenGrpc.createSandbox(request));
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
+  }
+
+  async createFrozenFromTemplate(spec: SandboxFromTemplateSpec): Promise<SandboxRef> {
+    try {
+      return frozenSandboxFromResponse(await this.frozenGrpc.createSandbox(createSandboxTemplateRequest(spec)));
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
+  }
+
+  async getFrozenPolicy(name: string, options?: SandboxCallOptions | null): Promise<FrozenPolicyState> {
+    try {
+      return frozenPolicyState(
+        await this.frozenGrpc.getPolicy(namedTarget(name, options), requestCallOptions(options)),
+      );
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
+  }
+
+  async updateGlobalConfig(update: FrozenGlobalConfigUpdateSpec): Promise<FrozenGlobalConfigUpdate> {
+    try {
+      const response = await this.frozenGrpc.updateGlobalConfig({ ...update, global: true });
+      if (!response.update) throw new SdkError('invalid_config', 'global update result missing from gateway response');
+      return { update: updateConfigResult(response.update), frozenSandboxes: [...response.frozenSandboxes] };
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
   }
 
   /**
@@ -1213,62 +1432,20 @@ export class SandboxClient {
 
   async create(spec: SandboxSpec): Promise<SandboxRef> {
     try {
-      // Curated fields build the base spec; rawSpec then shallow-overrides at
-      // the top spec level (Object.assign, so any field it sets wins). The
-      // runtime assign avoids the generated $typeName upgrading the literal and
-      // rejecting the curated `template: { image }` init shorthand.
-      const specInit: MessageInitShape<typeof SandboxSpecSchema> = {
-        environment: spec.environment ?? {},
-        providers: spec.providers ?? [],
-        template: spec.image ? { image: spec.image } : undefined,
-        resourceRequirements: spec.gpu ? { gpu: {} } : undefined,
-        policy: spec.policy,
-        command: spec.command ?? [],
-        tty: spec.tty ?? false,
-        restartPolicy: restartPolicyValue(spec.restartPolicy),
-      };
-      if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
-
-      const resp = await this.grpc.createSandbox({
-        workspaceScope: workspaceScope(spec),
-        name: spec.name ?? '',
-        labels: spec.labels ?? {},
-        spec: specInit,
-        serviceExposures:
-          spec.serviceExposures?.map((exposure) => ({
-            service: exposure.service ?? '',
-            targetPort: exposure.targetPort,
-            authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
-          })) ?? [],
-      });
-      return sandboxRef(resp.sandbox, resp.serviceUrls);
+      const request = createSandboxRequest(spec);
+      if (request.spec?.resourceRequirements?.sampledBudget !== undefined) await requireSampledBudgetSupport(this.grpc);
+      const response = await this.grpc.createSandbox(request);
+      return sandboxRef(response.sandbox, response.serviceUrls);
     } catch (e) {
-      throw fromConnect(e);
+      throw e instanceof SdkError ? e : fromConnect(e);
     }
   }
 
   async createFromTemplate(spec: SandboxFromTemplateSpec): Promise<SandboxRef> {
-    if (spec.workloadTemplate.trim() === '') throw new SdkError('invalid_config', 'workloadTemplate is required');
+    const request = createSandboxTemplateRequest(spec);
     try {
-      const resp = await this.grpc.createSandbox({
-        workspaceScope: workspaceScope(spec),
-        name: spec.name ?? '',
-        labels: spec.labels ?? {},
-        spec: {
-          providers: spec.providers ?? [],
-          command: spec.command ?? [],
-          tty: spec.tty ?? false,
-          policy: spec.policy,
-        },
-        workloadTemplate: spec.workloadTemplate,
-        serviceExposures:
-          spec.serviceExposures?.map((exposure) => ({
-            service: exposure.service ?? '',
-            targetPort: exposure.targetPort,
-            authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
-          })) ?? [],
-      });
-      return sandboxRef(resp.sandbox, resp.serviceUrls);
+      const response = await this.grpc.createSandbox(request);
+      return sandboxRef(response.sandbox, response.serviceUrls);
     } catch (e) {
       throw fromConnect(e);
     }
@@ -1736,8 +1913,11 @@ export class SandboxClient {
   // the `init` (TCP target + token), relay bytes both ways in ~64 KiB chunks,
   // and revoke the token on close. Process-lifetime only.
   async forward(name: string, opts: ForwardOptions): Promise<ForwardHandle> {
-    const targetHost = opts.targetHost ?? '127.0.0.1';
+    const targetHost = normalizeForwardHost(opts.targetHost ?? '127.0.0.1');
     const targetPort = opts.targetPort;
+    if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
+      throw new SdkError('invalid_config', 'tcp target port must be between 1 and 65535');
+    }
     const localHost = opts.localHost ?? '127.0.0.1';
     const localPort = opts.localPort ?? 0;
 
@@ -1751,6 +1931,17 @@ export class SandboxClient {
       const ref = found.ref;
       if (ref.phase !== 'ready') {
         throw new SdkError('connect', `sandbox '${name}' is not ready (phase: ${ref.phase})`);
+      }
+      const ingress = ref.ingressAdmission;
+      if (
+        ingress &&
+        ((ingress.scope !== 'isolated_loopback' && ingress.scope !== 'shared_host_loopback') ||
+          (ingress.allPorts && ingress.ports.length > 0) ||
+          ingress.ports.some((port) => !Number.isInteger(port) || port < 1 || port > 65535) ||
+          new Set(ingress.ports).size !== ingress.ports.length ||
+          (!ingress.allPorts && !ingress.ports.includes(targetPort)))
+      ) {
+        throw new SdkError('invalid_config', 'target port was not admitted by the compute driver');
       }
       sandboxId = ref.id;
       owner = found.owner;

@@ -4,6 +4,7 @@
 package types
 
 import (
+	"slices"
 	"time"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
@@ -14,6 +15,7 @@ type createConfig struct {
 	labels           map[string]string
 	annotations      map[string]string
 	serviceExposures []ServiceExposure
+	forwardPorts     []uint32
 }
 
 // CreateOption configures a Create call.
@@ -105,3 +107,12 @@ type ExecOptions struct {
 	// for automation and managed checks that need predictable startup behavior.
 	NoLoginShell bool
 }
+
+// WithForwardPorts requests admission before sandbox creation. It does not open listeners.
+func WithForwardPorts(ports ...uint32) CreateOption {
+	snapshot := slices.Clone(ports)
+	return func(c *createConfig) { c.forwardPorts = slices.Clone(snapshot) }
+}
+
+// ForwardPorts returns the requested target ports.
+func (c *createConfig) ForwardPorts() []uint32 { return slices.Clone(c.forwardPorts) }

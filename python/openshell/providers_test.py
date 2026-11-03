@@ -212,6 +212,7 @@ def test_shared_client_preserves_mtls_and_does_not_attach_bearer(monkeypatch, tm
         return SimpleNamespace()
 
     monkeypatch.setattr(openshell_pb2_grpc, "OpenShellStub", stub)
+    monkeypatch.setattr(openshell_pb2_grpc, "FrozenSandboxPoliciesStub", stub)
 
     def reject_bearer(*_args):
         pytest.fail("operator connection must not attach a bearer interceptor")
@@ -222,7 +223,7 @@ def test_shared_client_preserves_mtls_and_does_not_attach_bearer(monkeypatch, tm
         tls=TlsConfig(ca_path=ca, cert_path=cert, key_path=key),
     ) as connection:
         assert isinstance(connection.providers(), ProviderClient)
-        assert stub_channels == [channel, channel]
+        assert stub_channels == [channel, channel, channel]
         assert seen == {
             "root_certificates": b"ca",
             "private_key": b"operator-key",

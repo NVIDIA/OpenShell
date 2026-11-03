@@ -8,8 +8,10 @@ import (
 
 	v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
+	sb "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 func TestGatewayInfoFromProto(t *testing.T) {
@@ -22,6 +24,17 @@ func TestGatewayInfoFromProto(t *testing.T) {
 				Capabilities: &pb.ComputeDriverCapabilities{
 					DriverName:    "kubernetes",
 					DriverVersion: "2.1.0",
+					ResourceCapabilities: &pb.ResourceCapabilities{
+						Cpu:    &pb.CpuResourceCapabilities{LimitSupported: true, LimitEnforcement: &sb.ResourceEnforcement{Kind: 2, Scope: 2}},
+						Memory: &pb.MemoryResourceCapabilities{LimitSupported: true, RequestEnforcement: &sb.ResourceEnforcement{Kind: 3, Scope: 2}},
+						Gpu:    &pb.GpuResourceCapabilities{CountSelectionSupported: true},
+						SampledBudget: &sb.SampledResourceBudgetCapabilities{CpuTimeSupported: true, ResidentBytesSupported: true, Scope: 3,
+							SamplingInterval: &durationpb.Duration{Nanos: 100000000}, TerminateOnExcess: true,
+							CpuTimeResolution: &durationpb.Duration{Nanos: 1000000}, PerProcessCpuLimit: true},
+					},
+					WorkloadCompatibility: &pb.WorkloadCompatibility{
+						OperatingSystem: "linux",
+					},
 				},
 			},
 			{
@@ -56,10 +69,30 @@ func TestGatewayInfoFromProto(t *testing.T) {
 	assert.Equal(t, "2.1.0", info.ComputeDrivers[0].DriverVersion)
 	assert.Equal(t, "docker", info.ComputeDrivers[1].Name)
 	assert.Equal(t, "docker-engine", info.ComputeDrivers[1].DriverName)
+	require.NotNil(t, info.ComputeDrivers[0].WorkloadCompatibility)
+	assert.Equal(t, "linux", info.ComputeDrivers[0].WorkloadCompatibility.OperatingSystem)
+	assert.Empty(t, info.ComputeDrivers[0].WorkloadCompatibility.Architecture)
+	assert.Nil(t, info.ComputeDrivers[1].WorkloadCompatibility)
 	require.Len(t, info.Extensions, 1)
 	assert.Equal(t, v1.ExtensionKindComputeDriver, info.Extensions[0].Kind)
 	assert.Equal(t, "openshell/kubernetes", info.Extensions[0].ImplementationName)
 	assert.Equal(t, uint32(1), info.Extensions[0].ProtocolMajor)
+	resources := info.ComputeDrivers[0].Resources
+	require.NotNil(t, resources)
+	assert.Equal(t, "KernelLimit", resources.CPU.LimitEnforcement.Kind)
+	assert.Equal(t, "Container", resources.CPU.LimitEnforcement.Scope)
+	assert.Equal(t, "SchedulerRequest", resources.Memory.RequestEnforcement.Kind)
+	assert.True(t, resources.GPU.CountSelectionSupported)
+	assert.Equal(t, int32(100000000), resources.SampledBudget.SamplingInterval.Nanos)
+	assert.Equal(t, int32(1000000), resources.SampledBudget.CPUTimeResolution.Nanos)
+	assert.True(t, resources.SampledBudget.TerminateOnExcess)
+	assert.True(t, resources.SampledBudget.PerProcessCPULimit)
+	proto.ComputeDrivers[0].Capabilities.ResourceCapabilities.SampledBudget.SamplingInterval.Nanos = 1
+	assert.Equal(t, int32(100000000), resources.SampledBudget.SamplingInterval.Nanos)
+	unknown := resourceEnforcement(&sb.ResourceEnforcement{Kind: 99, Scope: 99})
+	assert.Equal(t, "Unknown", unknown.Kind)
+	assert.Equal(t, "Unknown", unknown.Scope)
+
 }
 
 func TestGatewayInfoFromProto_NoDrivers(t *testing.T) {
@@ -85,7 +118,14 @@ func TestGatewayInfoFromProto_DeepCopy(t *testing.T) {
 		Status:         pb.ServiceStatus_SERVICE_STATUS_HEALTHY,
 		GatewayVersion: "1.0.0",
 		ComputeDrivers: []*pb.ComputeDriverInfo{
-			{Name: "k8s", Capabilities: &pb.ComputeDriverCapabilities{DriverName: "kubernetes"}},
+			{Name: "native", Capabilities: &pb.ComputeDriverCapabilities{
+				DriverName: "native",
+				WorkloadCompatibility: &pb.WorkloadCompatibility{
+					OperatingSystem:       "macos",
+					Architecture:          "arm64",
+					ExecutionRestrictions: []string{"Setuid executables cannot run in this runtime."},
+				},
+			}},
 		},
 		Extensions: []*pb.NegotiatedExtensionInfo{{
 			ConfiguredName:        "k8s",
@@ -95,10 +135,15 @@ func TestGatewayInfoFromProto_DeepCopy(t *testing.T) {
 
 	info := GatewayInfoFromProto(proto)
 	proto.ComputeDrivers[0].Name = "mutated"
+	proto.ComputeDrivers[0].Capabilities.WorkloadCompatibility.OperatingSystem = "mutated"
+	proto.ComputeDrivers[0].Capabilities.WorkloadCompatibility.ExecutionRestrictions[0] = "mutated"
 	proto.Extensions[0].ConfiguredName = "mutated"
 	proto.Extensions[0].SupportedCapabilities[0] = "mutated"
 
-	assert.Equal(t, "k8s", info.ComputeDrivers[0].Name)
+	assert.Equal(t, "native", info.ComputeDrivers[0].Name)
+	assert.Equal(t, "macos", info.ComputeDrivers[0].WorkloadCompatibility.OperatingSystem)
+	assert.Equal(t, "arm64", info.ComputeDrivers[0].WorkloadCompatibility.Architecture)
+	assert.Equal(t, "Setuid executables cannot run in this runtime.", info.ComputeDrivers[0].WorkloadCompatibility.ExecutionRestrictions[0])
 	assert.Equal(t, "k8s", info.Extensions[0].ConfiguredName)
 	assert.Equal(t, "openshell.compute.contract", info.Extensions[0].SupportedCapabilities[0])
 }

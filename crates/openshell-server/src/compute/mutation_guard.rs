@@ -478,6 +478,12 @@ impl ComputeRuntime {
     pub(crate) fn set_mutation_lock_timeout_for_tests(&self, timeout: Duration) {
         self.mutation_locks.set_timeout_for_tests(timeout);
     }
+
+    #[cfg(test)]
+    pub(crate) fn sandbox_mutation_lock_references_for_tests(&self, sandbox_id: &str) -> usize {
+        self.mutation_locks
+            .key_references(MutationLockKey::Sandbox(sandbox_id).advisory_key())
+    }
 }
 
 #[cfg(test)]

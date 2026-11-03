@@ -29,6 +29,12 @@ func (s *sandboxTemplateClient) Create(ctx context.Context, workspace string, te
 	if err != nil {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
 	}
+	if protoTemplate.GetSpec().GetWorkload().GetResources().GetSampledBudget() != nil {
+		if err := requireSampledBudgetSupport(ctx, s.client); err != nil {
+			return nil, err
+		}
+	}
+
 	resp, err := s.client.CreateSandboxTemplate(ctx, &pb.CreateSandboxTemplateRequest{
 		Template:       protoTemplate,
 		WorkspaceScope: namedWorkspaceScope(workspace),

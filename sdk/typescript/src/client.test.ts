@@ -702,6 +702,7 @@ describe('create', () => {
   it('sends create-time service exposures', async () => {
     let created: {
       serviceExposures?: Array<{ service?: string; targetPort?: number; authorizationMode?: number }>;
+      forwardPorts?: number[];
     } = {};
     const sandbox = client({
       createSandbox: (req) => {
@@ -718,6 +719,7 @@ describe('create', () => {
 
     const result = await sandbox.create({
       image: 'img',
+      forwardPorts: [8080],
       serviceExposures: [
         { targetPort: 4500 },
         {
@@ -728,6 +730,7 @@ describe('create', () => {
       ],
     });
 
+    expect(created.forwardPorts).toEqual([8080]);
     expect(
       created.serviceExposures?.map(({ service, targetPort, authorizationMode }) => ({
         service,
@@ -761,22 +764,39 @@ describe('create', () => {
   });
 
   it('sends canonical main process fields', async () => {
-    let created: { spec?: { command?: string[]; tty?: boolean } } = {};
+    let created: {
+      spec?: {
+        command?: string[];
+        tty?: boolean;
+        resourceRequirements?: {
+          sampledBudget?: { residentBytes?: bigint; cpuTime?: { seconds?: bigint; nanos?: number } };
+        };
+      };
+    } = {};
+    let supportsSampledResourceBudget = false;
     const sandbox = client({
+      health: () => ({ supportsSampledResourceBudget }),
       createSandbox: (req) => {
         created = req;
         return readySandbox('sb', 'sb-id');
       },
     });
 
-    await sandbox.create({
+    const spec = {
       image: 'img',
       command: ['/opt/worker', '--serve'],
       tty: true,
-    });
+      sampledBudget: { cpuTime: { seconds: 2n, nanos: 0 }, residentBytes: 4096n },
+    };
+    await expect(sandbox.create(spec)).rejects.toMatchObject({ code: 'invalid_config' });
+    expect(created).toEqual({});
+    supportsSampledResourceBudget = true;
+    await sandbox.create(spec);
 
     expect(created.spec?.command).toEqual(['/opt/worker', '--serve']);
     expect(created.spec?.tty).toBe(true);
+    expect(created.spec?.resourceRequirements?.sampledBudget?.residentBytes).toBe(4096n);
+    expect(created.spec?.resourceRequirements?.sampledBudget?.cpuTime?.seconds).toBe(2n);
   });
 
   it('sends the restart policy', async () => {
@@ -1162,6 +1182,37 @@ describe('create', () => {
       name: 'gpu-kata',
       resourceVersion: '42',
     });
+  });
+});
+
+describe('sampled budget compatibility', () => {
+  it('blocks template and raw-spec writes until the gateway acknowledges the fields', async () => {
+    let supported = false;
+    let writes = 0;
+    const transport = createRouterTransport((router) => {
+      router.service(OpenShell, {
+        health: () => ({ supportsSampledResourceBudget: supported }),
+        createSandboxTemplate: (req) => {
+          writes++;
+          return { template: req.template };
+        },
+        createSandbox: () => {
+          writes++;
+          return readySandbox('budget', 'sb-id');
+        },
+      });
+    });
+    const templates = new SandboxTemplateClient(transport);
+    const sandbox = new SandboxClient(transport);
+    const template = { spec: { workload: { resources: { sampledBudget: { residentBytes: 4096n } } } } };
+    const spec = { rawSpec: { resourceRequirements: { sampledBudget: { residentBytes: 4096n } } } };
+    await expect(templates.create(template)).rejects.toMatchObject({ code: 'invalid_config' });
+    await expect(sandbox.create(spec)).rejects.toMatchObject({ code: 'invalid_config' });
+    expect(writes).toBe(0);
+    supported = true;
+    await templates.create(template);
+    await sandbox.create(spec);
+    expect(writes).toBe(2);
   });
 });
 
@@ -2167,6 +2218,50 @@ describe('ssh sessions', () => {
 });
 
 describe('forward', () => {
+  it('rejects an unadmitted target before creating a local forward handle', async () => {
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: {
+          metadata: { id: 'sb-id', name: 'sb', workspace: 'default' },
+          status: { phase: SandboxPhase.READY, ingressAdmission: { scope: 3, allPorts: false, ports: [8080] } },
+        },
+      }),
+    });
+    await expect(sandbox.forward('sb', { targetPort: 9090 })).rejects.toMatchObject({ code: 'invalid_config' });
+  });
+
+  it('rejects invalid targets before gateway access or binding a local port', async () => {
+    let reads = 0;
+    const sandbox = client({
+      getSandbox: () => {
+        reads++;
+        return readySandbox('sb', 'id');
+      },
+    });
+    for (const targetHost of ['example.com', '192.0.2.1', '::ffff:127.0.0.1', '::1%lo0', '[::1]', '']) {
+      await expect(sandbox.forward('sb', { targetHost, targetPort: 9000 })).rejects.toMatchObject({
+        code: 'invalid_config',
+        message: expect.stringContaining('tcp target host'),
+      });
+    }
+    for (const targetPort of [0, -1, 65536, 1.5, Number.NaN]) {
+      await expect(sandbox.forward('sb', { targetPort })).rejects.toMatchObject({
+        code: 'invalid_config',
+        message: '[invalid_config] tcp target port must be between 1 and 65535',
+      });
+    }
+    expect(reads).toBe(0);
+    for (const [targetHost, normalized] of [
+      [' LOCALHOST ', '127.0.0.1'],
+      ['127.2.3.4', '127.2.3.4'],
+      ['0:0:0:0:0:0:0:1', '::1'],
+    ]) {
+      const handle = await sandbox.forward('sb', { targetHost, targetPort: 9000 });
+      expect(handle.targetHost).toBe(normalized);
+      await handle.close();
+    }
+  });
+
   it('binds a local port and relays bytes both ways, minting + revoking a token', async () => {
     let sshReq: ScopedRequest = {};
     let revokedToken: string | undefined;

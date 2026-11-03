@@ -1,0 +1,15 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+syntax = "proto3";
+
+// Gateway-private freeze state. Existing public sandbox rows and frozen
+// openshell.storage.v1 declarations remain unchanged.
+package openshell.storage.frozen.v1;
+import "openshell.proto";
+
+// Existence chooses frozen mode at creation; an absent policy is pending.
+// The snapshot is captured once in the same transaction as first acceptance.
+message StoredFrozenSandboxPolicy {
+  string sandbox_id = 1;
+  openshell.v1.FrozenSandboxPolicy policy = 2;
+}

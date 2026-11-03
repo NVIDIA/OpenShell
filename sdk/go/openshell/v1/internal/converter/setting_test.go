@@ -533,17 +533,19 @@ func TestConfigUpdateToProto_NilPolicy(t *testing.T) {
 
 func TestConfigUpdateResultFromProto(t *testing.T) {
 	resp := &pb.UpdateConfigResponse{
-		Version:          10,
-		PolicyHash:       "sha256:updated",
-		SettingsRevision: 55,
-		Deleted:          true,
-		Annotations:      map[string]string{"sandbox_id": "sb-123"},
+		CreatedPolicyRevision: true,
+		Version:               10,
+		PolicyHash:            "sha256:updated",
+		SettingsRevision:      55,
+		Deleted:               true,
+		Annotations:           map[string]string{"sandbox_id": "sb-123"},
 	}
 
 	result := ConfigUpdateResultFromProto(resp)
 
 	require.NotNil(t, result)
 	assert.Equal(t, uint32(10), result.Version)
+	assert.True(t, result.CreatedPolicyRevision)
 	assert.Equal(t, "sha256:updated", result.PolicyHash)
 	assert.Equal(t, uint64(55), result.SettingsRevision)
 	assert.True(t, result.Deleted)
@@ -560,6 +562,7 @@ func TestConfigUpdateResultFromProto_DefaultValues(t *testing.T) {
 
 	require.NotNil(t, result)
 	assert.Zero(t, result.Version)
+	assert.False(t, result.CreatedPolicyRevision)
 	assert.Empty(t, result.PolicyHash)
 	assert.Zero(t, result.SettingsRevision)
 	assert.False(t, result.Deleted)

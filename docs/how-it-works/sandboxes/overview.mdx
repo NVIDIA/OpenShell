@@ -737,6 +737,19 @@ Print only the policy YAML for scripting (same effective policy, no metadata):
 openshell sandbox get my-sandbox --policy-only
 ```
 
+### Diagnose Workload Startup Failures
+
+If creation fails, use `openshell sandbox get my-sandbox` to inspect the startup
+diagnostic. An entrypoint launch failure is different from a command that started
+and exited with a nonzero status. Check that the configured executable and
+working directory exist and that the executable has permission to run.
+
+Runtime qualification can also fail before the command starts. If Landlock is
+unavailable, check the kernel and security configuration used by the selected
+runtime; changing the workload's filesystem policy does not add kernel support.
+If OpenShell cannot confirm whether the command started, stop the sandbox and
+wait for cleanup before starting it again.
+
 ### Diagnose Failed Calls to Tool Servers
 
 A sandbox can be `Ready` while an agent's call to an external tool server fails with `fetch failed`. Run `openshell sandbox get my-sandbox` and look under `Tool server connections` for the server's address, `Last result`, and `Reported at`. This is available for configured MCP-over-HTTP endpoints and does not change sandbox readiness.
@@ -826,6 +839,15 @@ Press `c` in the Sandboxes panel to create a sandbox. In the optional Command fi
 
 ## Port Forwarding
 
+Compute drivers can restrict forwarding to an admitted set of ports. Declare
+forward ports when creating the sandbox; unadmitted targets are rejected before
+provisioning or opening a local listener. `openshell sandbox get <name> -o json`
+shows `ingress_admission` with its scope, port list and `all_ports` flag. A
+`shared_host_loopback` scope refers to an operator-approved host service, rather
+than a service isolated inside the sandbox. If an upgraded driver reports
+unknown or missing admission for an existing sandbox, recreate it with the
+required ports. A legacy driver leaves admission absent.
+
 Forward a local port to a running sandbox to access services inside it, such as a web server or database:
 
 ```shell
@@ -875,6 +897,18 @@ openshell sandbox create --from registry.example.com/your-org/claude-agent:lates
 ```
 
 </Tip>
+
+### Forward a TCP service through the gateway
+
+Use the gateway's TCP relay to forward a loopback service:
+
+```shell
+openshell forward service my-sandbox --target-host 127.0.0.1 --target-port 8080 --local 0
+```
+
+The target host must be a loopback IP address or `localhost`, and the target
+port must be between 1 and 65535. The CLI and TypeScript SDK reject invalid
+targets before opening a local listener. The gateway also validates each target.
 
 ## SSH Config
 
@@ -1168,6 +1202,8 @@ to inspect the diagnostic, then [repair the policy or provider configuration](/h
 Management operations remain available while startup is blocked. After repair,
 the supervisor completes startup without recreating the sandbox. Starting a
 stopped sandbox repeats configuration admission before launching its workload.
+
+When an image policy conflicts with an initial filesystem or process policy repair, OpenShell keeps the repaired settings and reloads configuration. Some concurrent startup updates can still overwrite newer network rules. Wait until startup completes before making further edits, and inspect the effective policy if startup reports repeated conflicts.
 
 Image preparation and initial supervisor startup have an absolute deadline of 1800 seconds by default, independently of the CLI wait timeout. Operators can set `image_preparation_timeout_seconds` in `[openshell.gateway]` to any value from 1 through 86400. Each new create or explicit start stores its deadline. Progress events, configuration edits, and gateway or driver restarts cannot extend it. Changing the gateway setting affects new attempts only.
 

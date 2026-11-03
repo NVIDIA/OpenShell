@@ -43,6 +43,8 @@ use std::time::Duration;
 use tracing::{Instrument as _, debug, info, warn};
 
 use openshell_core::PolicyValidationFailureMode;
+use openshell_core::backend_startup::{BackendStartupStage, backend_startup_diagnostic};
+use openshell_core::filesystem_baseline::FilesystemBaseline;
 use openshell_supervisor_control::RegistrationTraceContext;
 
 use openshell_ocsf::{
@@ -87,11 +89,14 @@ pub struct WorkspaceValidationFailed(String);
 /// The sandbox reports errors across the boundary as text, so a workspace
 /// rejection is recognized here, once, and carried as
 /// [`WorkspaceValidationFailed`] from then on.
-pub fn start_agent_error(message: String) -> miette::Report {
+pub fn start_agent_error(
+    error: openshell_isolation_interface::contract::BackendError,
+) -> miette::Report {
+    let message = error.to_string();
     if message.contains(openshell_core::driver_utils::WORKSPACE_VALIDATION_ERROR_CONTEXT) {
         miette::Report::new(WorkspaceValidationFailed(message))
     } else {
-        miette::miette!(message)
+        backend_setup::startup_error(BackendStartupStage::StartAgent, error)
     }
 }
 
@@ -303,6 +308,7 @@ fn prepare_control_readiness_path(path: &std::path::Path) -> Result<()> {
             "supervisor readiness socket path must be absolute"
         ));
     }
+    openshell_core::unix_socket_path::check(path).into_diagnostic()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .into_diagnostic()
@@ -1206,6 +1212,7 @@ pub async fn run_sandbox_instance(
         Some(image_discovery),
         &RemoteStartupGateway {
             gateway: gateway.clone(),
+            proxy_filesystem_baseline: selected_backend.proxy_filesystem_baseline().cloned(),
         },
     )
     .instrument(tracing::info_span!(parent: &startup, "supervisor.policy.load"))
@@ -1317,7 +1324,7 @@ pub async fn run_sandbox_instance(
     // supervisor-owned handles shared with the backend.
     let admitted_backend_name = selected_backend.backend_name().to_string();
     let ca_file_paths = Arc::new(std::sync::Mutex::new(None));
-    let (bound, proxy_listener) = selected_backend
+    let attached = selected_backend
         .attach(
             backend_setup::BackendServices {
                 ca_file_paths: ca_file_paths.clone(),
@@ -1337,7 +1344,22 @@ pub async fn run_sandbox_instance(
             },
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.attach"))
-        .await?;
+        .await;
+    let (bound, proxy_listener) = match attached {
+        Ok(attached) => attached,
+        Err(error) => {
+            if let (Some(sandbox_id), Some(gateway)) = (sandbox_id.as_deref(), gateway.as_ref()) {
+                Box::pin(report_backend_startup_failure(
+                    gateway,
+                    sandbox_id,
+                    &loaded_policy_origin,
+                    &error,
+                ))
+                .await;
+            }
+            return Err(error);
+        }
+    };
     info!(backend = %admitted_backend_name, "Isolation boundary attached");
     let remote_boundary = (bound, admitted_backend_name, ca_file_paths);
 
@@ -1415,11 +1437,27 @@ pub async fn run_sandbox_instance(
     let adopts_running_agent = remote_boundary.0.adopts_running_agent();
     let (bound, backend_name, ca_file_paths) = remote_boundary;
     let confirm = Box::pin(async {
-        let ready = bound
+        let ready = match bound
             .confirm()
             .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.confirm"))
             .await
-            .map_err(|error| miette::miette!(error.to_string()))?;
+        {
+            Ok(ready) => ready,
+            Err(error) => {
+                let error = backend_setup::startup_error(BackendStartupStage::Confirm, error);
+                if let (Some(sandbox_id), Some(gateway)) = (sandbox_id.as_deref(), gateway.as_ref())
+                {
+                    report_backend_startup_failure(
+                        gateway,
+                        sandbox_id,
+                        &loaded_policy_origin,
+                        &error,
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        };
         info!(backend = %backend_name, "Isolation boundary enforcement confirmed");
         Ok::<_, miette::Report>(ready)
     });
@@ -1642,7 +1680,7 @@ pub async fn run_sandbox_instance(
             sandbox_id: poll_id,
             sandbox: poll_sandbox,
             opa_engine: poll_engine,
-            loaded_policy_origin,
+            loaded_policy_origin: loaded_policy_origin.clone(),
             vm_identity: vm_policy_identity,
             entrypoint_pid: poll_pid,
             interval_secs: poll_interval_secs,
@@ -1698,12 +1736,28 @@ pub async fn run_sandbox_instance(
 
     let (confirmed, backend_name) = remote_ready;
     let exit_code = {
-        let running = confirmed
-            .into_boundary()
-            .start_agent()
-            .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.start_agent"))
-            .await
-            .map_err(|error| start_agent_error(error.to_string()))?;
+        let started =
+            Box::pin(confirmed.into_boundary().start_agent().instrument(
+                tracing::info_span!(parent: &startup, "supervisor.boundary.start_agent"),
+            ))
+            .await;
+        let running = match started {
+            Ok(running) => running,
+            Err(error) => {
+                let error = start_agent_error(error);
+                if let (Some(sandbox_id), Some(gateway)) = (sandbox_id.as_deref(), gateway.as_ref())
+                {
+                    Box::pin(report_backend_startup_failure(
+                        gateway,
+                        sandbox_id,
+                        &loaded_policy_origin,
+                        &error,
+                    ))
+                    .await;
+                }
+                return Err(error);
+            }
+        };
         // Opening can only prepare a restore. Report success after StartAgent
         // has completed restoration, so a late failure is never logged as resumed.
         if let Some(outcome) = running.launch_outcome()
@@ -2153,80 +2207,32 @@ fn proxy_baseline_paths() -> (Vec<String>, Vec<String>) {
     )
 }
 
-fn enrich_proto_baseline_paths_with<F>(
-    proto: &mut openshell_core::proto::SandboxPolicy,
-    ro: &[String],
-    rw: &[String],
-    path_exists: F,
-) -> bool
-where
-    F: Fn(&str) -> bool,
-{
-    if ro.is_empty() && rw.is_empty() {
-        return false;
-    }
-
-    let fs = proto
-        .filesystem
-        .get_or_insert_with(|| openshell_core::proto::FilesystemPolicy {
-            include_workdir: true,
-            ..Default::default()
-        });
-
-    let mut modified = false;
-    for path in ro {
-        if !fs.read_only.iter().any(|p| p == path) && !fs.read_write.iter().any(|p| p == path) {
-            if !path_exists(path) {
-                debug!(
-                    path,
-                    "Baseline read-only path does not exist, skipping enrichment"
-                );
-                continue;
-            }
-            fs.read_only.push(path.clone());
-            modified = true;
-        }
-    }
-    for path in rw {
-        if fs.read_write.iter().any(|p| p == path) {
-            continue;
-        }
-        if !path_exists(path) {
-            debug!(
-                path,
-                "Baseline read-write path does not exist, skipping enrichment"
-            );
-            continue;
-        }
-        if fs.read_only.iter().any(|p| p == path) {
-            continue;
-        }
-        fs.read_write.push(path.clone());
-        modified = true;
-    }
-
-    modified
-}
-
 /// Ensure a proto `SandboxPolicy` includes the baseline filesystem paths
 /// required by proxy-mode sandboxes. Paths are only added if
 /// missing; user-specified paths are never removed.
 ///
 /// Returns `true` if the policy was modified (caller may want to sync back).
-fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy) -> bool {
+fn enrich_proto_baseline_paths(
+    proto: &mut openshell_core::proto::SandboxPolicy,
+    baseline: Option<&FilesystemBaseline>,
+) -> bool {
     if proto.network_policies.is_empty() {
         return false;
     }
-    let (ro, rw) = proxy_baseline_paths();
-
-    // Baseline paths are system-injected, not user-specified.  Skip paths
-    // that do not exist in this container image to avoid noisy warnings from
-    // Landlock and, more critically, to prevent a single missing baseline
-    // path from abandoning the entire Landlock ruleset under best-effort
-    // mode (see issue #664).
-    let modified = enrich_proto_baseline_paths_with(proto, &ro, &rw, |path| {
-        std::path::Path::new(path).exists()
-    });
+    let modified = if let Some(baseline) = baseline {
+        // Backend-advertised paths belong to the workload namespace, not this
+        // supervisor's host filesystem. They are unconditional prerequisites.
+        baseline.enrich(proto, |_| true)
+    } else {
+        // Legacy Linux image defaults retain existence filtering: a missing
+        // path must not cause Landlock to abandon the ruleset (issue #664).
+        let (read_only, read_write) = proxy_baseline_paths();
+        FilesystemBaseline {
+            read_only,
+            read_write,
+        }
+        .enrich(proto, |path| std::path::Path::new(path).exists())
+    };
 
     if modified {
         ocsf_emit!(
@@ -2240,6 +2246,47 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
     }
 
     modified
+}
+
+fn prepare_startup_baseline_paths(
+    policy: &mut openshell_core::proto::SandboxPolicy,
+    snapshot: &openshell_core::grpc_client::FrozenSettingsPollResult,
+    baseline: Option<&FilesystemBaseline>,
+) -> Result<bool> {
+    let immutable = snapshot.frozen
+        || (snapshot.frozen_requested
+            && snapshot.policy_source == openshell_core::proto::PolicySource::Global);
+    if !immutable {
+        return Ok(enrich_proto_baseline_paths(policy, baseline));
+    }
+    if policy.network_policies.is_empty() {
+        return Ok(false);
+    }
+    let mut candidate = policy.clone();
+    if !enrich_proto_baseline_paths(&mut candidate, baseline) {
+        return Ok(false);
+    }
+    let present = policy.filesystem.as_ref();
+    let mut missing = candidate
+        .filesystem
+        .iter()
+        .flat_map(|fs| fs.read_only.iter().chain(&fs.read_write))
+        .filter(|path| {
+            !present.is_some_and(|fs| fs.read_only.contains(path) || fs.read_write.contains(path))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    missing.sort();
+    missing.dedup();
+    let recovery = if snapshot.frozen {
+        "the captured policy is incompatible with this runtime; delete and recreate the sandbox with an approved policy containing these paths"
+    } else {
+        "the global policy must include these paths before frozen initialization can be accepted; repair the global policy and retry"
+    };
+    Err(miette::miette!(
+        "frozen policy is missing required proxy filesystem paths: {}; {recovery}",
+        missing.join(", ")
+    ))
 }
 
 fn strip_proto_provider_policy_entries(proto: &mut openshell_core::proto::SandboxPolicy) -> bool {
@@ -2262,17 +2309,22 @@ fn proto_sync_payload_for_enriched_policy(
 /// Ensure a `SandboxPolicy` (Rust type) includes the baseline filesystem
 /// paths required by proxy-mode sandboxes. Used for the
 /// local-file code path where no proto is available.
-fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
+fn enrich_sandbox_baseline_paths(
+    policy: &mut SandboxPolicy,
+    baseline: Option<&FilesystemBaseline>,
+) {
     if !matches!(policy.network.mode, NetworkMode::Proxy) {
         return;
     }
-    let (ro, rw) = proxy_baseline_paths();
+    let (ro, rw) = baseline.map_or_else(proxy_baseline_paths, |baseline| {
+        (baseline.read_only.clone(), baseline.read_write.clone())
+    });
 
     let mut modified = false;
     for path in &ro {
         let p = std::path::PathBuf::from(path);
         if !policy.filesystem.read_only.contains(&p) && !policy.filesystem.read_write.contains(&p) {
-            if !p.exists() {
+            if baseline.is_none() && !p.exists() {
                 debug!(
                     path,
                     "Baseline read-only path does not exist, skipping enrichment"
@@ -2288,7 +2340,7 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
         if policy.filesystem.read_only.contains(&p) || policy.filesystem.read_write.contains(&p) {
             continue;
         }
-        if !p.exists() {
+        if baseline.is_none() && !p.exists() {
             debug!(
                 path,
                 "Baseline read-write path does not exist, skipping enrichment"
@@ -2373,7 +2425,7 @@ mod baseline_tests {
             },
         );
 
-        enrich_proto_baseline_paths(&mut policy);
+        enrich_proto_baseline_paths(&mut policy, None);
 
         let filesystem = policy.filesystem.expect("filesystem policy");
         assert!(filesystem.read_only.contains(&"/proc".to_string()));
@@ -2487,7 +2539,7 @@ mod baseline_tests {
         );
         let original = policy.clone();
 
-        let enriched = enrich_proto_baseline_paths(&mut policy);
+        let enriched = enrich_proto_baseline_paths(&mut policy, None);
 
         assert!(!enriched);
         assert_eq!(policy, original);
@@ -2511,7 +2563,7 @@ mod baseline_tests {
             process: ProcessPolicy::default(),
         };
 
-        enrich_sandbox_baseline_paths(&mut policy);
+        enrich_sandbox_baseline_paths(&mut policy, None);
 
         assert!(
             policy.filesystem.read_only.contains(&PathBuf::from("/tmp")),
@@ -2524,6 +2576,57 @@ mod baseline_tests {
                 .contains(&PathBuf::from("/tmp")),
             "baseline enrichment must not promote explicit read_only /tmp to read_write"
         );
+    }
+
+    #[test]
+    fn selected_backend_baseline_replaces_linux_defaults_in_both_policy_formats() {
+        let baseline = FilesystemBaseline {
+            read_only: vec!["/platform-runtime-not-on-host".into()],
+            read_write: vec!["/explicit-read-only".into()],
+        };
+        for baseline in [baseline, FilesystemBaseline::default()] {
+            baseline.validate().unwrap();
+            let mut proto = openshell_policy::restrictive_default_policy();
+            proto.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+                read_only: vec!["/explicit-read-only".into()],
+                ..Default::default()
+            });
+            proto.network_policies.insert(
+                "proxy".into(),
+                openshell_core::proto::NetworkPolicyRule::default(),
+            );
+            enrich_proto_baseline_paths(&mut proto, Some(&baseline));
+            let filesystem = proto.filesystem.unwrap();
+            let mut expected = vec!["/explicit-read-only".to_string()];
+            expected.extend(baseline.read_only.iter().cloned());
+            assert_eq!(filesystem.read_only, expected);
+            assert!(filesystem.read_write.is_empty());
+
+            let mut local = SandboxPolicy {
+                version: 1,
+                filesystem: FilesystemPolicy {
+                    read_only: vec!["/explicit-read-only".into()],
+                    read_write: vec![],
+                    include_workdir: false,
+                },
+                network: NetworkPolicy {
+                    mode: NetworkMode::Proxy,
+                    proxy: None,
+                },
+                landlock: LandlockPolicy::default(),
+                process: ProcessPolicy::default(),
+            };
+            enrich_sandbox_baseline_paths(&mut local, Some(&baseline));
+            assert_eq!(
+                local.filesystem.read_only,
+                expected.iter().map(PathBuf::from).collect::<Vec<_>>()
+            );
+            assert!(local.filesystem.read_write.is_empty());
+            local.network.mode = NetworkMode::Block;
+            let original = local.filesystem.read_only.clone();
+            enrich_sandbox_baseline_paths(&mut local, Some(&baseline));
+            assert_eq!(local.filesystem.read_only, original);
+        }
     }
 }
 
@@ -2601,11 +2704,44 @@ where
     ))
 }
 
+/// Retry transport failures while preserving the snapshot used by the request.
+/// `None` means the gateway returned `ABORTED`: the caller must back off and
+/// fetch fresh configuration instead of resending this snapshot's request.
+async fn grpc_retry_snapshot<T, F, Fut>(op_name: &str, f: F) -> Result<Option<T>>
+where
+    T: Send,
+    F: Fn() -> Fut + Send + Sync,
+    Fut: Future<Output = Result<T>> + Send,
+{
+    grpc_retry(op_name, || async {
+        match f().await {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => {
+                let mut source: Option<&dyn std::error::Error> = Some(error.as_ref());
+                while let Some(cause) = source {
+                    if let Some(status) = cause.downcast_ref::<tonic::Status>() {
+                        if status.code() == tonic::Code::Aborted {
+                            return Ok(None);
+                        }
+                        break;
+                    }
+                    source = cause.source();
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
+}
+
 trait StartupGateway: Send + Sync {
+    fn proxy_filesystem_baseline(&self) -> Option<FilesystemBaseline> {
+        None
+    }
     fn snapshot(
         &self,
         sandbox: &str,
-    ) -> impl Future<Output = Result<openshell_core::grpc_client::SettingsPollResult>> + Send;
+    ) -> impl Future<Output = Result<openshell_core::grpc_client::FrozenSettingsPollResult>> + Send;
     fn provider(
         &self,
         id: &str,
@@ -2615,7 +2751,13 @@ trait StartupGateway: Send + Sync {
         sandbox: &str,
         policy: &openshell_core::proto::SandboxPolicy,
         workspace: &str,
-    ) -> impl Future<Output = Result<openshell_core::grpc_client::SettingsPollResult>> + Send;
+    ) -> impl Future<
+        Output = Result<
+            openshell_core::grpc_client::PolicySyncResult<
+                openshell_core::grpc_client::FrozenSettingsPollResult,
+            >,
+        >,
+    > + Send;
     fn report(
         &self,
         id: &str,
@@ -2628,6 +2770,7 @@ trait StartupGateway: Send + Sync {
 
 struct RemoteStartupGateway {
     gateway: Option<openshell_core::grpc_client::GatewayEndpoint>,
+    proxy_filesystem_baseline: Option<FilesystemBaseline>,
 }
 
 impl RemoteStartupGateway {
@@ -2639,11 +2782,14 @@ impl RemoteStartupGateway {
 }
 
 impl StartupGateway for RemoteStartupGateway {
+    fn proxy_filesystem_baseline(&self) -> Option<FilesystemBaseline> {
+        self.proxy_filesystem_baseline.clone()
+    }
     async fn snapshot(
         &self,
         sandbox: &str,
-    ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
-        openshell_core::grpc_client::fetch_settings_snapshot(self.gateway()?, sandbox).await
+    ) -> Result<openshell_core::grpc_client::FrozenSettingsPollResult> {
+        openshell_core::grpc_client::fetch_frozen_settings_snapshot(self.gateway()?, sandbox).await
     }
     async fn provider(
         &self,
@@ -2656,8 +2802,12 @@ impl StartupGateway for RemoteStartupGateway {
         sandbox: &str,
         policy: &openshell_core::proto::SandboxPolicy,
         workspace: &str,
-    ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
-        openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
+    ) -> Result<
+        openshell_core::grpc_client::PolicySyncResult<
+            openshell_core::grpc_client::FrozenSettingsPollResult,
+        >,
+    > {
+        openshell_core::grpc_client::sync_policy_and_fetch_frozen_snapshot(
             self.gateway()?,
             sandbox,
             policy,
@@ -2800,6 +2950,7 @@ async fn load_policy(
         None,
         &RemoteStartupGateway {
             gateway: openshell_gateway,
+            proxy_filesystem_baseline: None,
         },
     )
     .await
@@ -2831,6 +2982,12 @@ async fn load_policy_with_gateway(
     Option<CapturedProviderEnvironment>,
 )> {
     use openshell_core::proto::ConfigurationAdmissionState;
+    let proxy_baseline = gateway.proxy_filesystem_baseline();
+    if let Some(baseline) = &proxy_baseline {
+        baseline
+            .validate()
+            .map_err(|error| miette::miette!(error))?;
+    }
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
         if sandbox_id.is_some() && openshell_gateway.is_some() {
@@ -2884,7 +3041,7 @@ async fn load_policy_with_gateway(
             landlock: config.landlock,
             process: config.process,
         };
-        enrich_sandbox_baseline_paths(&mut policy);
+        enrich_sandbox_baseline_paths(&mut policy, proxy_baseline.as_ref());
         // File mode has no operator-registered middleware to connect.
         return Ok((
             policy,
@@ -2923,6 +3080,7 @@ async fn load_policy_with_gateway(
         .await?;
         let discovery = image_discovery.unwrap_or_else(discover_image_policy);
         let mut reconciliation_attempts = 0u32;
+        let mut startup_created_policy_version = None;
         let mut rejection_log = StartupRejectionLog::default();
         loop {
             if reconciliation_attempts == 5 {
@@ -2974,17 +3132,29 @@ async fn load_policy_with_gateway(
                 };
                 // Enrich before syncing so the gateway baseline includes
                 // baseline paths from the start.
-                enrich_proto_baseline_paths(&mut discovered);
+                enrich_proto_baseline_paths(&mut discovered, proxy_baseline.as_ref());
                 strip_proto_provider_policy_entries(&mut discovered);
                 // Sync and re-fetch over a single connection to avoid extra
                 // TLS handshakes.
                 let ws = snapshot.workspace.clone();
-                let synced = grpc_retry("Image policy synchronization", || {
+                let synced = grpc_retry_snapshot("Image policy synchronization", || {
                     gateway.sync(sandbox, &discovered, &ws)
                 })
                 .await;
                 snapshot = match synced {
-                    Ok(synced) => synced,
+                    Ok(Some(synced)) => {
+                        if let Some(version) = synced.created_policy_version {
+                            startup_created_policy_version = Some(version);
+                        }
+                        synced.snapshot
+                    }
+                    Ok(None) => {
+                        tokio::time::sleep(Duration::from_secs(
+                            1u64 << reconciliation_attempts.min(2),
+                        ))
+                        .await;
+                        continue;
+                    }
                     Err(error) => {
                         // The gateway stored nothing, so report the rejection
                         // against the snapshot this upload was built from and
@@ -3035,16 +3205,54 @@ async fn load_policy_with_gateway(
             // a sandbox-sourced policy is written back. The gateway refuses
             // every sandbox policy write while a global policy is active, so a
             // global policy keeps the added paths in this process only.
-            let enriched = enrich_proto_baseline_paths(&mut proto_policy);
+            let enriched = match prepare_startup_baseline_paths(
+                &mut proto_policy,
+                &snapshot,
+                proxy_baseline.as_ref(),
+            ) {
+                Ok(enriched) => enriched,
+                Err(error) => {
+                    reject_startup_configuration(
+                        gateway,
+                        &mut rejection_log,
+                        id,
+                        &instance_id,
+                        &snapshot,
+                        &error.to_string(),
+                        None,
+                    )
+                    .await?;
+                    if snapshot.frozen {
+                        return Err(error);
+                    }
+                    reconciliation_attempts = 0;
+                    continue;
+                }
+            };
             let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched)
-                .filter(|_| snapshot.policy_source == openshell_core::proto::PolicySource::Sandbox);
+                .filter(|_| {
+                    !snapshot.frozen
+                        && snapshot.policy_source == openshell_core::proto::PolicySource::Sandbox
+                });
             if let Some(sync_policy) = sync_policy {
-                let synced = grpc_retry("Enriched policy synchronization", || {
+                let synced = grpc_retry_snapshot("Enriched policy synchronization", || {
                     gateway.sync(sandbox, &sync_policy, &snapshot.workspace)
                 })
                 .await;
                 let canonical = match synced {
-                    Ok(canonical) => canonical,
+                    Ok(Some(canonical)) => {
+                        if let Some(version) = canonical.created_policy_version {
+                            startup_created_policy_version = Some(version);
+                        }
+                        canonical.snapshot
+                    }
+                    Ok(None) => {
+                        tokio::time::sleep(Duration::from_secs(
+                            1u64 << reconciliation_attempts.min(2),
+                        ))
+                        .await;
+                        continue;
+                    }
                     Err(error) => {
                         // The stored policy is unchanged, so report the
                         // rejection against the snapshot it was read from and
@@ -3262,6 +3470,9 @@ async fn load_policy_with_gateway(
                 LoadedPolicyOrigin::Gateway {
                     revision: loaded_policy_revision,
                     has_last_valid_policy,
+                    written_at_startup: snapshot.policy_source
+                        == openshell_core::proto::PolicySource::Sandbox
+                        && startup_created_policy_version == Some(snapshot.version),
                 },
                 agent_proposals_enabled_from_settings(&snapshot.settings),
                 snapshot.extension_authentication_enabled,
@@ -3686,6 +3897,9 @@ enum LoadedPolicyOrigin {
     Gateway {
         revision: Option<LoadedPolicyRevision>,
         has_last_valid_policy: bool,
+        /// This start wrote `revision` to the gateway, so it is the
+        /// supervisor's own revision to fail if the backend refuses it.
+        written_at_startup: bool,
     },
 }
 
@@ -4178,6 +4392,100 @@ fn enqueue_policy_status(sender: &UnboundedSender<PolicyStatusUpdate>, update: P
             "Policy status reporter unavailable during shutdown"
         );
     }
+}
+
+/// Build an authenticated generation-bound startup failure report.
+fn backend_startup_failure_report(
+    sandbox_id: &str,
+    origin: &LoadedPolicyOrigin,
+    error: &miette::Report,
+) -> Option<openshell_core::proto::ReportSandboxConfigurationRequest> {
+    let LoadedPolicyOrigin::Gateway {
+        revision: Some(revision),
+        ..
+    } = origin
+    else {
+        return None;
+    };
+    let mut code = error.code()?.to_string();
+    // Starting is a mutation: a lost reply can follow successful execution.
+    // This path cannot prove that workload execution did not begin.
+    let refused_before_start = !code.starts_with("openshell.backend.start-agent.");
+    if !refused_before_start {
+        code = "openshell.backend.start-agent.unconfirmed".to_string();
+    }
+    backend_startup_diagnostic(&code)?;
+    Some(openshell_core::proto::ReportSandboxConfigurationRequest {
+        sandbox_id: sandbox_id.to_string(),
+        admission: Some(openshell_core::proto::SandboxConfigurationAdmission {
+            instance_id: revision.admission_instance_id.clone()?,
+            state: openshell_core::proto::ConfigurationAdmissionState::Rejected.into(),
+            policy_version: revision.version,
+            policy_hash: revision.policy_hash.clone(),
+            config_revision: revision.config_revision,
+            provider_env_revision: revision.provider_env_revision,
+            // Carry only a bounded machine code, never backend diagnostics.
+            error: code,
+        }),
+        expected_instance_id: String::new(),
+        refused_before_start,
+    })
+}
+
+/// Report a startup failure without replacing the original error. The entire
+/// best-effort operation, including any policy-history report, has one deadline.
+async fn report_backend_startup_failure(
+    gateway: &openshell_core::grpc_client::GatewayEndpoint,
+    sandbox_id: &str,
+    origin: &LoadedPolicyOrigin,
+    error: &miette::Report,
+) {
+    let Some(request) = backend_startup_failure_report(sandbox_id, origin, error) else {
+        return;
+    };
+    let code = request
+        .admission
+        .as_ref()
+        .map_or("", |admission| admission.error.as_str());
+    let safe_message = backend_startup_diagnostic(code).unwrap_or_else(|| {
+        "The isolation backend refused the admitted configuration before workload execution"
+            .to_string()
+    });
+    let operation = async {
+        if let Err(report_error) =
+            openshell_core::grpc_client::report_sandbox_configuration_request(gateway, request)
+                .await
+        {
+            warn!(error = %report_error, "Failed to report the isolation backend failure");
+        }
+        if let Some(revision) = refused_startup_revision(origin, error) {
+            let safe_error = miette::miette!(safe_message);
+            report_initial_policy_failure(gateway, sandbox_id, Some(revision), &safe_error).await;
+        }
+        Ok(())
+    };
+    if let Err(report_error) = grpc_attempt("Backend startup failure reports", operation).await {
+        warn!(error = %report_error, "Backend startup failure reporting did not complete");
+    }
+}
+
+/// The revision this start wrote that the backend refused at Attach, if any.
+///
+/// Only a refusal marks it: `Unavailable` can succeed on the next start, and a
+/// revision the user wrote stays as it was.
+fn refused_startup_revision<'a>(
+    origin: &'a LoadedPolicyOrigin,
+    error: &miette::Report,
+) -> Option<&'a LoadedPolicyRevision> {
+    let LoadedPolicyOrigin::Gateway {
+        revision: Some(revision),
+        written_at_startup: true,
+        ..
+    } = origin
+    else {
+        return None;
+    };
+    backend_setup::is_backend_refusal(error).then_some(revision)
 }
 
 /// Best-effort `FAILED` acknowledgement when initial policy construction or
@@ -5173,7 +5481,7 @@ network_policies:
         async fn snapshot(
             &self,
             _id: &str,
-        ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
+        ) -> Result<openshell_core::grpc_client::FrozenSettingsPollResult> {
             if self.pending_snapshot {
                 return std::future::pending().await;
             }
@@ -5182,7 +5490,7 @@ network_policies:
                     tonic::Status::new(code, "snapshot unavailable"),
                 ));
             }
-            Ok(self.desired.lock().unwrap().clone())
+            Ok(self.desired.lock().unwrap().clone().into())
         }
         async fn provider(
             &self,
@@ -5197,8 +5505,17 @@ network_policies:
             _sandbox: &str,
             _policy: &openshell_core::proto::SandboxPolicy,
             _workspace: &str,
-        ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
-            self.snapshot("").await
+        ) -> Result<
+            openshell_core::grpc_client::PolicySyncResult<
+                openshell_core::grpc_client::FrozenSettingsPollResult,
+            >,
+        > {
+            self.snapshot("")
+                .await
+                .map(|snapshot| openshell_core::grpc_client::PolicySyncResult {
+                    snapshot,
+                    created_policy_version: None,
+                })
         }
         async fn report(
             &self,
@@ -5262,7 +5579,7 @@ network_policies:
     async fn startup_rejects_vm_identity_until_matching_policy_is_available() {
         use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
         let mut policy = proto_policy_fixture();
-        enrich_proto_baseline_paths(&mut policy);
+        enrich_proto_baseline_paths(&mut policy, None);
         policy.process = Some(openshell_core::proto::ProcessPolicy {
             run_as_user: "10000".into(),
             run_as_group: "1001".into(),
@@ -5405,7 +5722,7 @@ network_policies:
     async fn startup_pending_gateway_calls_exhaust_their_budgets() {
         for pending_snapshot in [true, false] {
             let mut policy = proto_policy_fixture();
-            enrich_proto_baseline_paths(&mut policy);
+            enrich_proto_baseline_paths(&mut policy, None);
             let (reports, _reported) = tokio::sync::mpsc::unbounded_channel();
             let gateway = TestStartupGateway {
                 desired: Arc::new(std::sync::Mutex::new(settings_poll_result(
@@ -5530,7 +5847,7 @@ network_policies:
     async fn startup_waits_for_repair_and_retries_stale_activation_before_returning() {
         use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
         let mut policy = proto_policy_fixture();
-        enrich_proto_baseline_paths(&mut policy);
+        enrich_proto_baseline_paths(&mut policy, None);
         let mut rejected = settings_poll_result(Some(policy), 1, PolicySource::Sandbox);
         rejected.configuration_admitted = false;
         let (reports, mut reported) = tokio::sync::mpsc::unbounded_channel();
@@ -5705,6 +6022,8 @@ network_policies:
     /// script rejection-report errors to exercise retries and fatal failures.
     #[derive(Clone)]
     struct WriteRefusingStartupGateway {
+        frozen: bool,
+        frozen_requested: bool,
         desired: Arc<std::sync::Mutex<openshell_core::grpc_client::SettingsPollResult>>,
         refusals: Arc<std::sync::Mutex<std::collections::VecDeque<SyncRefusal>>>,
         repair_after_refusal: Option<openshell_core::grpc_client::SettingsPollResult>,
@@ -5716,9 +6035,13 @@ network_policies:
         async fn snapshot(
             &self,
             _sandbox: &str,
-        ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
+        ) -> Result<openshell_core::grpc_client::FrozenSettingsPollResult> {
             self.calls.send(StartupCall::Snapshot).unwrap();
-            Ok(self.desired.lock().unwrap().clone())
+            Ok(openshell_core::grpc_client::FrozenSettingsPollResult {
+                snapshot: self.desired.lock().unwrap().clone(),
+                frozen: self.frozen,
+                frozen_requested: self.frozen_requested || self.frozen,
+            })
         }
         async fn provider(
             &self,
@@ -5733,7 +6056,11 @@ network_policies:
             _sandbox: &str,
             policy: &openshell_core::proto::SandboxPolicy,
             _workspace: &str,
-        ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
+        ) -> Result<
+            openshell_core::grpc_client::PolicySyncResult<
+                openshell_core::grpc_client::FrozenSettingsPollResult,
+            >,
+        > {
             self.calls.send(StartupCall::Sync).unwrap();
             let mut desired = self.desired.lock().unwrap();
             // The gateway checks for a global policy before it validates the
@@ -5764,7 +6091,14 @@ network_policies:
                 version,
                 openshell_core::proto::PolicySource::Sandbox,
             );
-            Ok(desired.clone())
+            Ok(openshell_core::grpc_client::PolicySyncResult {
+                snapshot: openshell_core::grpc_client::FrozenSettingsPollResult {
+                    snapshot: desired.clone(),
+                    frozen: self.frozen,
+                    frozen_requested: self.frozen_requested || self.frozen,
+                },
+                created_policy_version: Some(version),
+            })
         }
         async fn report(
             &self,
@@ -5868,6 +6202,8 @@ network_policies:
             .collect();
         let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
         let gateway = WriteRefusingStartupGateway {
+            frozen: false,
+            frozen_requested: false,
             desired: Arc::new(std::sync::Mutex::new(initial)),
             refusals: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
                 refusals,
@@ -5979,7 +6315,7 @@ network_policies:
         // paths, so startup writes an enriched copy back. The repaired policy
         // already carries those paths and needs no write-back.
         let mut repaired = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut repaired));
+        assert!(enrich_proto_baseline_paths(&mut repaired, None));
         assert_refused_startup_write_waits_for_repair(
             settings_poll_result(
                 Some(proto_tcp_policy_fixture()),
@@ -6018,6 +6354,8 @@ network_policies:
         let diagnostic = format!("Gateway rejected the {write}: {}", refusal.message);
         let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
         let gateway = WriteRefusingStartupGateway {
+            frozen: false,
+            frozen_requested: false,
             desired: Arc::new(std::sync::Mutex::new(initial)),
             refusals: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
                 refusal,
@@ -6087,6 +6425,182 @@ network_policies:
         assert_eq!(bundle.2, Some(repaired));
     }
 
+    async fn assert_startup_write_aborted_refetches(image_upload: bool) {
+        use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
+        // Inject ABORTED while the fixture changes the desired policy. This
+        // checks the supervisor's response to a reported conflict; it does not
+        // show that the gateway rejects an unfenced stale policy write.
+        let operator_policy = proto_policy_fixture();
+        let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = WriteRefusingStartupGateway {
+            frozen: false,
+            frozen_requested: false,
+            desired: Arc::new(std::sync::Mutex::new(if image_upload {
+                unset_policy_snapshot()
+            } else {
+                settings_poll_result(Some(proto_tcp_policy_fixture()), 1, PolicySource::Sandbox)
+            })),
+            refusals: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+                SyncRefusal::new(
+                    tonic::Code::Aborted,
+                    "persist policy revision failed due to concurrent modification",
+                ),
+            ]))),
+            repair_after_refusal: Some(settings_poll_result(
+                Some(operator_policy.clone()),
+                2,
+                PolicySource::Sandbox,
+            )),
+            rejection_report_errors: Arc::default(),
+            calls,
+        };
+        let started = tokio::time::Instant::now();
+        let policy = load_startup_test_policy(&gateway)
+            .await
+            .expect("startup accepts the operator's policy");
+        let mut trace = Vec::new();
+        while let Ok(call) = observed.try_recv() {
+            trace.push(call);
+        }
+        let refused = trace
+            .iter()
+            .position(|call| *call == StartupCall::Sync)
+            .expect("startup attempts the policy write");
+        assert_eq!(
+            trace.get(refused + 1),
+            Some(&StartupCall::Snapshot),
+            "after ABORTED, startup must fetch a fresh snapshot instead of resending the stale payload; calls: {trace:?}"
+        );
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|call| **call == StartupCall::Sync)
+                .count(),
+            1,
+            "startup must not resend the payload built from the stale read; calls: {trace:?}"
+        );
+        assert!(
+            !trace.iter().any(|call| matches!(
+                call,
+                StartupCall::Report(report)
+                    if report.state == ConfigurationAdmissionState::Rejected
+            )),
+            "a stale write is not a configuration error; calls: {trace:?}"
+        );
+        assert_eq!(
+            policy, operator_policy,
+            "startup must install the operator's policy, not the stale write-back"
+        );
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert_eq!(gateway.desired.lock().unwrap().version, 2);
+        let accepted = trace.last().expect("startup reports acceptance");
+        assert!(matches!(accepted, StartupCall::Report(report)
+            if report.state == ConfigurationAdmissionState::Accepted
+                && report.generation == Some((2, "hash-v2".to_string(), 200, 0))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_conflict_writes_refetch_instead_of_resending() {
+        for image_upload in [true, false] {
+            Box::pin(assert_startup_write_aborted_refetches(image_upload)).await;
+        }
+    }
+
+    /// Load through the production startup loop, retaining a timeout so a
+    /// mistaken conflict retry cannot leave a test waiting for repair forever.
+    async fn load_startup_test_policy(
+        gateway: &impl StartupGateway,
+    ) -> Result<openshell_core::proto::SandboxPolicy> {
+        let bundle = timeout(
+            Duration::from_mins(1),
+            load_policy_with_gateway(
+                Some("sandbox-id".to_string()),
+                Some("sandbox".to_string()),
+                Some(test_gateway()),
+                None,
+                None,
+                &openshell_extension_core::ExtensionCredentialStore::new(),
+                LocalPolicyIdentity::Required,
+                None,
+                Some(ImagePolicyDiscovery::Policy(Box::new(
+                    proto_tcp_policy_fixture(),
+                ))),
+                gateway,
+            ),
+        )
+        .await
+        .expect("startup must finish within its retry budget")?;
+        Ok(bundle
+            .2
+            .expect("gateway startup returns its accepted policy"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_conflict_write_transport_errors_are_retried() {
+        use openshell_core::proto::PolicySource;
+        for image_upload in [true, false] {
+            let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
+            let gateway = WriteRefusingStartupGateway {
+                frozen: false,
+                frozen_requested: false,
+                desired: Arc::new(std::sync::Mutex::new(if image_upload {
+                    unset_policy_snapshot()
+                } else {
+                    settings_poll_result(Some(proto_tcp_policy_fixture()), 1, PolicySource::Sandbox)
+                })),
+                refusals: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+                    SyncRefusal::new(tonic::Code::Unavailable, "transport failed"),
+                ]))),
+                repair_after_refusal: None,
+                rejection_report_errors: Arc::default(),
+                calls,
+            };
+            load_startup_test_policy(&gateway)
+                .await
+                .expect("startup retries a transport failure");
+            let syncs = std::iter::from_fn(|| observed.try_recv().ok())
+                .filter(|call| *call == StartupCall::Sync)
+                .count();
+            assert_eq!(syncs, 2, "the same write is retried once");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_conflict_writes_keep_reconciliation_budget() {
+        use openshell_core::proto::PolicySource;
+        for image_upload in [true, false] {
+            let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
+            let gateway = WriteRefusingStartupGateway {
+                frozen: false,
+                frozen_requested: false,
+                desired: Arc::new(std::sync::Mutex::new(if image_upload {
+                    unset_policy_snapshot()
+                } else {
+                    settings_poll_result(Some(proto_tcp_policy_fixture()), 1, PolicySource::Sandbox)
+                })),
+                refusals: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+                    vec![SyncRefusal::new(tonic::Code::Aborted, "configuration keeps changing"); 5],
+                ))),
+                repair_after_refusal: None,
+                rejection_report_errors: Arc::default(),
+                calls,
+            };
+            let error = load_startup_test_policy(&gateway)
+                .await
+                .expect_err("conflicts must have a bounded retry budget");
+            assert!(
+                error
+                    .to_string()
+                    .contains("did not stabilize after 5 attempts"),
+                "{error}"
+            );
+            let syncs = std::iter::from_fn(|| observed.try_recv().ok())
+                .filter(|call| *call == StartupCall::Sync)
+                .count();
+            assert_eq!(syncs, 5, "each conflict spends one attempt, no resends");
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_image_repair_before_report_refetches() {
         Box::pin(assert_startup_repair_before_rejection_refetches(
@@ -6107,7 +6621,7 @@ network_policies:
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_baseline_repair_before_report_refetches() {
         let mut repaired = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut repaired));
+        assert!(enrich_proto_baseline_paths(&mut repaired, None));
         Box::pin(assert_startup_repair_before_rejection_refetches(
             settings_poll_result(
                 Some(proto_tcp_policy_fixture()),
@@ -6130,6 +6644,8 @@ network_policies:
         let snapshot = unset_policy_snapshot();
         let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
         let gateway = WriteRefusingStartupGateway {
+            frozen: false,
+            frozen_requested: false,
             desired: Arc::new(std::sync::Mutex::new(snapshot.clone())),
             refusals: Arc::default(),
             repair_after_refusal: None,
@@ -6253,7 +6769,7 @@ network_policies:
     async fn startup_policy_write_refusal_write_back_outlasts_the_attempt_limit() {
         // The same limit applies to a refused baseline-path write-back.
         let mut repaired = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut repaired));
+        assert!(enrich_proto_baseline_paths(&mut repaired, None));
         assert_refused_startup_write_waits_for_repair(
             settings_poll_result(
                 Some(proto_tcp_policy_fixture()),
@@ -6340,19 +6856,36 @@ network_policies:
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_global_policy_skips_baseline_write_back() {
+        for (source, frozen) in [
+            (openshell_core::proto::PolicySource::Global, false),
+            (openshell_core::proto::PolicySource::Sandbox, true),
+        ] {
+            assert_fixed_policy_skips_baseline_write_back(source, frozen).await;
+        }
+    }
+
+    async fn assert_fixed_policy_skips_baseline_write_back(
+        source: openshell_core::proto::PolicySource,
+        frozen: bool,
+    ) {
         use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
         // The gateway serves a global policy that has network rules but lacks
         // the proxy baseline paths. It refuses every sandbox policy write while
         // that policy is active, so startup must add the paths locally and
         // install the policy without writing it back.
-        let mut global =
-            settings_poll_result(Some(proto_tcp_policy_fixture()), 1, PolicySource::Global);
-        global.global_policy_version = 1;
+        let mut initial = proto_tcp_policy_fixture();
+        if frozen {
+            enrich_proto_baseline_paths(&mut initial, None);
+        }
+        let mut global = settings_poll_result(Some(initial), 1, source);
+        global.global_policy_version = u32::from(source == PolicySource::Global);
         let global_generation = report_generation(&global);
         let mut enriched = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut enriched));
+        assert!(enrich_proto_baseline_paths(&mut enriched, None));
         let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
         let gateway = WriteRefusingStartupGateway {
+            frozen,
+            frozen_requested: frozen,
             desired: Arc::new(std::sync::Mutex::new(global)),
             refusals: Arc::default(),
             repair_after_refusal: None,
@@ -6375,10 +6908,10 @@ network_policies:
             ),
         )
         .await
-        .expect("startup must not wait for repair under a global policy")
+        .expect("startup must not wait for repair under a fixed policy")
         .unwrap_or_else(|error| {
             panic!(
-                "startup exited under a global policy: {}",
+                "startup exited under a fixed policy: {}",
                 startup_error_chain(&error)
             )
         });
@@ -6401,21 +6934,430 @@ network_policies:
                 StartupCall::Snapshot,
                 report(ConfigurationAdmissionState::Accepted),
             ],
-            "startup must not write a global policy back as a sandbox policy"
+            "startup must not write a fixed policy back as a sandbox policy"
         );
         assert_eq!(
             bundle.2,
             Some(enriched),
-            "startup installs the global policy with the baseline paths added"
+            "startup installs the fixed policy with the baseline paths added"
         );
         let LoadedPolicyOrigin::Gateway {
             revision: Some(revision),
             ..
         } = bundle.4
         else {
-            panic!("startup must bind the global policy to its gateway revision");
+            panic!("startup must bind the fixed policy to its gateway revision");
         };
-        assert_eq!(revision.policy_source, PolicySource::Global);
+        assert_eq!(revision.policy_source, source);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn frozen_startup_rejects_implicit_baseline_expansion() {
+        use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
+        for captured in [false, true] {
+            let source = if captured {
+                PolicySource::Sandbox
+            } else {
+                PolicySource::Global
+            };
+            let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
+            let gateway = WriteRefusingStartupGateway {
+                frozen: captured,
+                frozen_requested: true,
+                desired: Arc::new(std::sync::Mutex::new(settings_poll_result(
+                    Some(proto_tcp_policy_fixture()),
+                    1,
+                    source,
+                ))),
+                refusals: Arc::default(),
+                repair_after_refusal: None,
+                rejection_report_errors: Arc::default(),
+                calls,
+            };
+            let extension_credentials = openshell_extension_core::ExtensionCredentialStore::new();
+            let mut startup = Box::pin(load_policy_with_gateway(
+                Some("sandbox-id".into()),
+                Some("sandbox".into()),
+                Some(test_gateway()),
+                None,
+                None,
+                &extension_credentials,
+                LocalPolicyIdentity::Required,
+                None,
+                Some(ImagePolicyDiscovery::Missing),
+                &gateway,
+            ));
+            let mut trace = Vec::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    call = observed.recv() => {
+                        let call = call.expect("startup records its rejection");
+                        let rejected = matches!(&call, StartupCall::Report(report) if report.state == ConfigurationAdmissionState::Rejected);
+                        trace.push(call);
+                        if rejected { break; }
+                    }
+                    result = &mut startup => panic!(
+                        "startup completed before rejecting a frozen expansion: {}",
+                        result.err().map_or_else(|| "accepted".to_string(), |error| error.to_string())
+                    ),
+                }
+            }
+            assert!(!trace.iter().any(|call| matches!(
+                call,
+                StartupCall::Sync
+                    | StartupCall::Report(StartupReport {
+                        state: ConfigurationAdmissionState::Accepted,
+                        ..
+                    })
+            )));
+            if captured {
+                let error = startup
+                    .await
+                    .err()
+                    .expect("an incompatible captured policy cannot be repaired in place");
+                assert!(error.to_string().contains("delete and recreate"));
+            } else {
+                let mut repaired = proto_tcp_policy_fixture();
+                enrich_proto_baseline_paths(&mut repaired, None);
+                *gateway.desired.lock().unwrap() =
+                    settings_poll_result(Some(repaired.clone()), 2, source);
+                let result = startup
+                    .await
+                    .expect("a baseline-complete global repair is accepted");
+                assert_eq!(result.2, Some(repaired));
+            }
+        }
+    }
+
+    struct ConcurrentSyncStartupGateway {
+        inner: WriteRefusingStartupGateway,
+        after_sync: openshell_core::grpc_client::SettingsPollResult,
+        created_version: Option<u32>,
+        reject_first_acceptance: AtomicBool,
+    }
+
+    impl StartupGateway for ConcurrentSyncStartupGateway {
+        async fn snapshot(
+            &self,
+            sandbox: &str,
+        ) -> Result<openshell_core::grpc_client::FrozenSettingsPollResult> {
+            self.inner.snapshot(sandbox).await
+        }
+
+        async fn provider(
+            &self,
+            id: &str,
+        ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
+            self.inner.provider(id).await
+        }
+
+        async fn sync(
+            &self,
+            _sandbox: &str,
+            _policy: &openshell_core::proto::SandboxPolicy,
+            _workspace: &str,
+        ) -> Result<
+            openshell_core::grpc_client::PolicySyncResult<
+                openshell_core::grpc_client::FrozenSettingsPollResult,
+            >,
+        > {
+            self.inner.calls.send(StartupCall::Sync).unwrap();
+            *self.inner.desired.lock().unwrap() = self.after_sync.clone();
+            Ok(openshell_core::grpc_client::PolicySyncResult {
+                snapshot: self.after_sync.clone().into(),
+                created_policy_version: self.created_version,
+            })
+        }
+
+        async fn report(
+            &self,
+            id: &str,
+            instance_id: &str,
+            snapshot: Option<&openshell_core::grpc_client::SettingsPollResult>,
+            state: openshell_core::proto::ConfigurationAdmissionState,
+            error: &str,
+        ) -> Result<()> {
+            if state == openshell_core::proto::ConfigurationAdmissionState::Accepted
+                && self.reject_first_acceptance.swap(false, Ordering::SeqCst)
+            {
+                return Err(openshell_core::grpc_client::grpc_status_error(
+                    tonic::Status::aborted("retry the same accepted configuration"),
+                ));
+            }
+            self.inner
+                .report(id, instance_id, snapshot, state, error)
+                .await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_write_ownership_requires_a_matching_created_sandbox_revision() {
+        use openshell_core::proto::PolicySource;
+
+        for (created_version, accepted_version, source, owned) in [
+            (Some(2), 2, PolicySource::Sandbox, true),
+            (Some(2), 3, PolicySource::Sandbox, false),
+            (None, 2, PolicySource::Sandbox, false),
+            (Some(2), 2, PolicySource::Global, false),
+        ] {
+            let initial = proto_tcp_policy_fixture();
+            let mut enriched = initial.clone();
+            assert!(enrich_proto_baseline_paths(&mut enriched, None));
+            let mut after_sync = settings_poll_result(Some(enriched), accepted_version, source);
+            if source == PolicySource::Global {
+                after_sync.global_policy_version = 7;
+            }
+            let (calls, _observed) = tokio::sync::mpsc::unbounded_channel();
+            let gateway = ConcurrentSyncStartupGateway {
+                inner: WriteRefusingStartupGateway {
+                    frozen: false,
+                    frozen_requested: false,
+                    desired: Arc::new(std::sync::Mutex::new(settings_poll_result(
+                        Some(initial),
+                        1,
+                        PolicySource::Sandbox,
+                    ))),
+                    refusals: Arc::default(),
+                    repair_after_refusal: None,
+                    rejection_report_errors: Arc::default(),
+                    calls,
+                },
+                after_sync,
+                created_version,
+                reject_first_acceptance: AtomicBool::new(true),
+            };
+            let bundle = load_policy_with_gateway(
+                Some("sandbox-id".into()),
+                Some("sandbox".into()),
+                Some(test_gateway()),
+                None,
+                None,
+                &openshell_extension_core::ExtensionCredentialStore::new(),
+                LocalPolicyIdentity::Required,
+                None,
+                Some(ImagePolicyDiscovery::Missing),
+                &gateway,
+            )
+            .await
+            .expect("startup must retry and accept the canonical snapshot");
+            let denial = backend_setup::startup_error(
+                BackendStartupStage::Attach,
+                openshell_isolation_interface::contract::BackendError::Denied(
+                    "policy denied".into(),
+                ),
+            );
+            assert_eq!(
+                refused_startup_revision(&bundle.4, &denial).is_some(),
+                owned,
+                "ownership must survive a same-version retry but never pass to a later or deduplicated user revision"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_marks_only_the_revision_it_wrote() {
+        use openshell_core::proto::PolicySource;
+
+        for (needs_baseline_paths, written) in [(true, true), (false, false)] {
+            let mut policy = proto_tcp_policy_fixture();
+            if !needs_baseline_paths {
+                assert!(enrich_proto_baseline_paths(&mut policy, None));
+            }
+            let (calls, _observed) = tokio::sync::mpsc::unbounded_channel();
+            let gateway = WriteRefusingStartupGateway {
+                frozen: false,
+                frozen_requested: false,
+                desired: Arc::new(std::sync::Mutex::new(settings_poll_result(
+                    Some(policy),
+                    1,
+                    PolicySource::Sandbox,
+                ))),
+                refusals: Arc::default(),
+                repair_after_refusal: None,
+                rejection_report_errors: Arc::default(),
+                calls,
+            };
+            let bundle = load_policy_with_gateway(
+                Some("sandbox-id".to_string()),
+                Some("sandbox".to_string()),
+                Some(test_gateway()),
+                None,
+                None,
+                &openshell_extension_core::ExtensionCredentialStore::new(),
+                LocalPolicyIdentity::Required,
+                None,
+                Some(ImagePolicyDiscovery::Missing),
+                &gateway,
+            )
+            .await
+            .expect("startup must accept the policy");
+            let LoadedPolicyOrigin::Gateway {
+                revision: Some(revision),
+                written_at_startup,
+                ..
+            } = bundle.4
+            else {
+                panic!("startup must bind the policy to its gateway revision");
+            };
+            assert_eq!(written_at_startup, written);
+            assert_eq!(revision.version, if written { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn attach_refusal_reports_the_accepted_generation_as_refused() {
+        use openshell_core::proto::ConfigurationAdmissionState;
+        use openshell_isolation_interface::contract::BackendError;
+
+        let mut revision = LoadedPolicyRevision::from_snapshot(&settings_poll_result(
+            Some(proto_policy_fixture()),
+            3,
+            openshell_core::proto::PolicySource::Sandbox,
+        ));
+        revision.admission_instance_id = Some("instance-1".to_string());
+        let origin = |revision: &LoadedPolicyRevision| LoadedPolicyOrigin::Gateway {
+            revision: Some(revision.clone()),
+            has_last_valid_policy: true,
+            written_at_startup: false,
+        };
+        let refusal = backend_setup::startup_error(
+            BackendStartupStage::Attach,
+            BackendError::Denied("refused".into()),
+        );
+
+        let request = backend_startup_failure_report("sandbox-id", &origin(&revision), &refusal)
+            .expect("a refusal of the accepted generation is reported");
+        assert!(request.refused_before_start);
+        let admission = request.admission.unwrap();
+        assert_eq!(
+            admission.state,
+            i32::from(ConfigurationAdmissionState::Rejected)
+        );
+        assert_eq!(
+            (
+                admission.instance_id.as_str(),
+                admission.policy_version,
+                admission.policy_hash.as_str(),
+                admission.config_revision,
+                admission.provider_env_revision,
+            ),
+            (
+                "instance-1",
+                revision.version,
+                revision.policy_hash.as_str(),
+                revision.config_revision,
+                revision.provider_env_revision,
+            )
+        );
+
+        for (stage, failure) in [
+            (
+                BackendStartupStage::Build,
+                BackendError::Descriptor("secret launch payload".into()),
+            ),
+            (
+                BackendStartupStage::Attach,
+                BackendError::Unavailable("secret endpoint".into()),
+            ),
+            (
+                BackendStartupStage::Confirm,
+                BackendError::Denied("secret policy".into()),
+            ),
+        ] {
+            let error = backend_setup::startup_error(stage, failure);
+            let request = backend_startup_failure_report("sandbox-id", &origin(&revision), &error)
+                .expect("classified startup failures must be reported");
+            let code = request.admission.unwrap().error;
+            assert!(code.starts_with(&format!("openshell.backend.{}.", stage.code())));
+            assert!(!code.contains("secret"));
+            assert!(backend_startup_diagnostic(&code).is_some());
+        }
+
+        let transient = miette::miette!("unavailable");
+        for failure in [
+            BackendError::Process("launch outcome is unknown".into()),
+            BackendError::Unavailable("reply was lost".into()),
+            BackendError::Denied("already-running inputs differ".into()),
+            BackendError::Terminated("runtime connection was lost".into()),
+        ] {
+            let error = start_agent_error(failure);
+            let request = backend_startup_failure_report("sandbox-id", &origin(&revision), &error)
+                .expect("an uncertain launch has a bounded infrastructure report");
+            assert!(!request.refused_before_start);
+            assert_eq!(
+                request.admission.unwrap().error,
+                "openshell.backend.start-agent.unconfirmed"
+            );
+        }
+        assert!(
+            backend_startup_failure_report("sandbox-id", &origin(&revision), &transient).is_none()
+        );
+        assert!(
+            backend_startup_failure_report(
+                "sandbox-id",
+                &LoadedPolicyOrigin::LocalOverride,
+                &refusal
+            )
+            .is_none()
+        );
+        revision.admission_instance_id = None;
+        assert!(
+            backend_startup_failure_report("sandbox-id", &origin(&revision), &refusal).is_none()
+        );
+    }
+
+    #[test]
+    fn attach_refusal_fails_only_the_revision_this_start_wrote() {
+        use openshell_isolation_interface::contract::BackendError;
+
+        let revision = LoadedPolicyRevision::from_snapshot(&settings_poll_result(
+            Some(proto_policy_fixture()),
+            3,
+            openshell_core::proto::PolicySource::Sandbox,
+        ));
+        let origin = |written_at_startup| LoadedPolicyOrigin::Gateway {
+            revision: Some(revision.clone()),
+            has_last_valid_policy: true,
+            written_at_startup,
+        };
+        let refusal = backend_setup::startup_error(
+            BackendStartupStage::Attach,
+            BackendError::Denied("refused".into()),
+        );
+        let transient = miette::miette!("unavailable");
+
+        assert_eq!(
+            refused_startup_revision(&origin(true), &refusal).map(|revision| revision.version),
+            Some(3)
+        );
+        assert!(refused_startup_revision(&origin(true), &transient).is_none());
+        assert!(refused_startup_revision(&origin(false), &refusal).is_none());
+        assert!(refused_startup_revision(&LoadedPolicyOrigin::LocalOverride, &refusal).is_none());
+        for stage in [
+            BackendStartupStage::Build,
+            BackendStartupStage::Attach,
+            BackendStartupStage::Confirm,
+            BackendStartupStage::StartAgent,
+        ] {
+            for failure in [
+                BackendError::Denied("policy rejected".into()),
+                BackendError::Attach("mediation transport failed".into()),
+                BackendError::Unavailable("retry after cleanup".into()),
+                BackendError::Confirm("confirmation failed".into()),
+                BackendError::Process("process failed".into()),
+            ] {
+                let refused = stage == BackendStartupStage::Attach
+                    && matches!(failure, BackendError::Denied(_));
+                let error = backend_setup::startup_error(stage, failure);
+                assert_eq!(
+                    refused_startup_revision(&origin(true), &error).is_some(),
+                    refused
+                );
+                assert_eq!(backend_setup::is_backend_refusal(&error), refused);
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -6446,6 +7388,8 @@ network_policies:
             ] {
                 let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
                 let gateway = WriteRefusingStartupGateway {
+                    frozen: false,
+                    frozen_requested: false,
                     desired: Arc::new(std::sync::Mutex::new(initial.clone())),
                     refusals: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
                         SyncRefusal::new(code, "sandbox caller cannot write this policy"),
@@ -7227,6 +8171,7 @@ network_policies:
                 &LoadedPolicyOrigin::Gateway {
                     revision: Some(loaded),
                     has_last_valid_policy: true,
+                    written_at_startup: false,
                 },
                 &canonical,
             ),
@@ -7259,6 +8204,7 @@ network_policies:
         let origin = LoadedPolicyOrigin::Gateway {
             revision: None,
             has_last_valid_policy: true,
+            written_at_startup: false,
         };
 
         assert_eq!(
@@ -7366,6 +8312,7 @@ network_policies:
             &LoadedPolicyOrigin::Gateway {
                 revision: None,
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             true,
             true
@@ -7592,3 +8539,43 @@ network_policies:
 
 #[cfg(test)]
 mod legacy_startup_regression_tests;
+
+#[cfg(test)]
+mod combined_frozen_baseline_tests {
+    use super::*;
+    #[test]
+    fn frozen_backend_baseline_is_checked_without_mutating_the_snapshot() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "proxy".into(),
+            openshell_core::proto::NetworkPolicyRule::default(),
+        );
+        let original = policy.clone();
+        let snapshot = openshell_core::grpc_client::FrozenSettingsPollResult {
+            snapshot: tests::settings_poll_result(
+                Some(policy.clone()),
+                1,
+                openshell_core::proto::PolicySource::Sandbox,
+            ),
+            frozen: true,
+            frozen_requested: true,
+        };
+        let baseline = FilesystemBaseline {
+            read_only: vec!["/backend-required".into()],
+            read_write: vec![],
+        };
+        let error =
+            prepare_startup_baseline_paths(&mut policy, &snapshot, Some(&baseline)).unwrap_err();
+        assert!(error.to_string().contains("/backend-required"));
+        assert_eq!(policy, original);
+        policy
+            .filesystem
+            .as_mut()
+            .unwrap()
+            .read_only
+            .push("/backend-required".into());
+        let admitted = policy.clone();
+        assert!(!prepare_startup_baseline_paths(&mut policy, &snapshot, Some(&baseline)).unwrap());
+        assert_eq!(policy, admitted);
+    }
+}

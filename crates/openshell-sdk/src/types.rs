@@ -291,14 +291,75 @@ pub struct SandboxSpec {
     /// Request a GPU. Driver-specific device selection is configured via
     /// driver config on the raw proto surface (see [`crate::raw`]).
     pub gpu: bool,
+    /// Explicit sampled account-wide budgets, distinct from hard resource limits.
+    pub sampled_budget: Option<proto::sandbox::v1::SampledResourceBudget>,
     /// Exact canonical command. Empty selects the gateway's scratch login shell.
     pub command: Vec<String>,
     /// Allocate a retained pseudo-terminal for the canonical command.
     pub tty: bool,
     /// Loopback HTTP services to expose when the sandbox is created.
     pub service_exposures: Vec<ServiceExposure>,
+    /// Target ports to admit before provisioning; does not open listeners.
+    pub forward_ports: Vec<u16>,
     /// Restart behavior after the canonical main process exits.
     pub restart_policy: SandboxRestartPolicy,
+}
+
+/// Create a sandbox whose first accepted effective policy is retained for its lifetime.
+#[derive(Clone, Debug, Default)]
+pub struct FrozenSandboxCreateSpec {
+    pub sandbox: SandboxSpec,
+    /// Omit to discover the initial policy from the image.
+    pub policy: Option<proto::SandboxPolicy>,
+}
+
+/// Freeze request and accepted snapshot, queried independently of sandbox status.
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub struct FrozenPolicyState {
+    pub requested: bool,
+    /// Absent until initialization successfully accepts a configuration.
+    pub policy: Option<FrozenSandboxPolicy>,
+}
+
+/// Immutable accepted policy and its provenance. Provider authorization remains raw-only.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct FrozenSandboxPolicy {
+    pub policy: Option<proto::SandboxPolicy>,
+    pub version: u32,
+    pub policy_hash: String,
+    pub frozen_at_ms: Option<i64>,
+    pub policy_source: proto::PolicySource,
+    pub global_policy_version: u32,
+}
+
+impl From<proto::FrozenSandboxPolicyState> for FrozenPolicyState {
+    fn from(value: proto::FrozenSandboxPolicyState) -> Self {
+        Self {
+            requested: value.requested,
+            policy: value.policy.map(|policy| FrozenSandboxPolicy {
+                policy: policy.policy,
+                version: policy.version,
+                policy_hash: policy.policy_hash,
+                frozen_at_ms: policy
+                    .frozen_time
+                    .as_ref()
+                    .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok()),
+                policy_source: proto::PolicySource::try_from(policy.policy_source)
+                    .unwrap_or_default(),
+                global_policy_version: policy.global_policy_version,
+            }),
+        }
+    }
+}
+
+/// Global mutation result including sandboxes retaining their frozen policy.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct FrozenGlobalConfigUpdate {
+    pub update: proto::UpdateConfigResponse,
+    pub frozen_sandboxes: Vec<String>,
 }
 
 /// A loopback HTTP service to expose during sandbox creation.
@@ -348,6 +409,8 @@ pub struct SandboxTemplateCreateSpec {
     pub tty: bool,
     /// Loopback HTTP services to expose when the sandbox is created.
     pub service_exposures: Vec<ServiceExposure>,
+    /// Target ports to admit before provisioning; does not open listeners.
+    pub forward_ports: Vec<u16>,
     /// Create-time sandbox policy. The named workload template supplies runtime
     /// workload fields; policy remains part of the sandbox's governance spec.
     pub policy: Option<proto::SandboxPolicy>,
@@ -389,6 +452,8 @@ pub struct SandboxTemplateListOptions {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct SandboxRef {
+    /// Immutable compute-admitted ingress envelope, absent on legacy gateways.
+    pub ingress_admission: Option<proto::SandboxIngressAdmission>,
     pub id: String,
     pub name: String,
     pub workspace: String,
@@ -444,6 +509,10 @@ impl SandboxRef {
             });
         let meta = sandbox.metadata.unwrap_or_default();
         Self {
+            ingress_admission: sandbox
+                .status
+                .as_ref()
+                .and_then(|status| status.ingress_admission.clone()),
             id: meta.id,
             name: meta.name,
             workspace: meta.workspace,

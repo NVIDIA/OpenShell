@@ -11,11 +11,14 @@ use std::sync::{Arc, Mutex};
 
 use miette::Result;
 use openshell_core::SandboxSessionId;
+use openshell_core::backend_startup::BackendStartupStage;
+use openshell_core::filesystem_baseline::FilesystemBaseline;
 use openshell_core::jwt::{SessionBearerTokenSlot, SupervisorAuthBundle};
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::{
-    BackendDescriptor, BackendError, ResolvedWorkloadIdentity, SandboxContext, SandboxPolicy,
+    BackendDescriptor, BackendError, BackendErrorKind, ResolvedWorkloadIdentity, SandboxContext,
+    SandboxPolicy,
 };
 use openshell_sandbox_backend::BoundBoundary;
 
@@ -58,6 +61,13 @@ pub trait BackendSetup: Sync {
     /// Name chosen by trusted composition and checked against admission before decoding.
     fn backend_name(&self) -> &str;
 
+    /// Trusted proxy prerequisites. `None` retains legacy Linux image defaults;
+    /// an explicit empty baseline suppresses them. Match the compute driver's
+    /// advertised baseline so policy admission precedes immutable signing.
+    fn proxy_filesystem_baseline(&self) -> Option<FilesystemBaseline> {
+        None
+    }
+
     /// Decode native launch data without starting workload code. The returned
     /// identity must describe the same resource retained by the prepared backend.
     fn decode(
@@ -85,12 +95,61 @@ pub trait PreparedBackend: Send + Sync {
     ) -> std::result::Result<BuiltBackend, BackendError>;
 }
 
+/// Keep the original typed error for refusal classification while exposing
+/// only an allowlisted stage/kind code to the configuration report.
+#[derive(Debug)]
+struct StartupError {
+    stage: BackendStartupStage,
+    error: BackendError,
+}
+
+impl std::fmt::Display for StartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for StartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl miette::Diagnostic for StartupError {
+    fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        let kind = match self.error.kind() {
+            BackendErrorKind::Invalid => "invalid",
+            BackendErrorKind::Denied => "denied",
+            BackendErrorKind::Unavailable => "unavailable",
+            BackendErrorKind::Unsupported => "unsupported",
+            BackendErrorKind::Failed => "failed",
+            BackendErrorKind::Terminated => "terminated",
+        };
+        Some(Box::new(format!(
+            "openshell.backend.{}.{kind}",
+            self.stage.code()
+        )))
+    }
+}
+
+pub(crate) fn startup_error(stage: BackendStartupStage, error: BackendError) -> miette::Report {
+    miette::Report::new(StartupError { stage, error })
+}
+
+pub(crate) fn is_backend_refusal(error: &miette::Report) -> bool {
+    error.downcast_ref::<StartupError>().is_some_and(|failure| {
+        failure.stage == BackendStartupStage::Attach
+            && matches!(failure.error, BackendError::Denied(_))
+    })
+}
+
 /// Created only after name and launch identity checks. Consuming attachment
 /// prevents reusing one prepared startup to build or attach a second client.
 pub struct SelectedBackend {
     descriptor: BackendDescriptor,
     identity: LaunchIdentity,
     prepared: Box<dyn PreparedBackend>,
+    proxy_filesystem_baseline: Option<FilesystemBaseline>,
 }
 
 impl SelectedBackend {
@@ -121,7 +180,7 @@ impl SelectedBackend {
 
         let (identity, prepared) = setup
             .decode(&descriptor.payload)
-            .map_err(|error| miette::miette!(error.to_string()))?;
+            .map_err(|error| startup_error(BackendStartupStage::Build, error))?;
         if sandbox_id.is_none_or(|id| id.is_empty() || identity.sandbox_id != id) {
             return Err(miette::miette!(
                 "runtime descriptor does not match admitted sandbox"
@@ -137,16 +196,28 @@ impl SelectedBackend {
                 "supervisor authentication bundle does not match runtime generation"
             ));
         }
+        let proxy_filesystem_baseline = setup.proxy_filesystem_baseline();
+        if let Some(baseline) = &proxy_filesystem_baseline {
+            baseline
+                .validate()
+                .map_err(|error| miette::miette!(error))?;
+        }
         Ok(Self {
             descriptor,
             identity,
             prepared,
+            proxy_filesystem_baseline,
         })
     }
 
     /// Return the backend name already matched to the admitted selection.
     pub fn backend_name(&self) -> &str {
         &self.descriptor.backend_name
+    }
+
+    /// Baseline captured only after admitted name and launch identity checks.
+    pub fn proxy_filesystem_baseline(&self) -> Option<&FilesystemBaseline> {
+        self.proxy_filesystem_baseline.as_ref()
     }
 
     /// Carry the selected backend's VM identity constraint into policy handling.
@@ -180,11 +251,14 @@ impl SelectedBackend {
         let built = self
             .prepared
             .build(services)
-            .map_err(|error| miette::miette!(error.to_string()))?;
+            .map_err(|error| startup_error(BackendStartupStage::Build, error))?;
         self.descriptor.payload = built.payload;
         if built.backend.backend_name() != self.descriptor.backend_name {
-            return Err(miette::miette!(
-                "RPC client backend does not match admitted backend"
+            return Err(startup_error(
+                BackendStartupStage::Build,
+                BackendError::Descriptor(
+                    "RPC client backend does not match admitted backend".into(),
+                ),
             ));
         }
         let backend = built.backend;
@@ -200,7 +274,7 @@ impl SelectedBackend {
                 },
             )
             .await
-            .map_err(|error| miette::miette!(error.to_string()))?;
+            .map_err(|error| startup_error(BackendStartupStage::Attach, error))?;
         Ok((bound, built.proxy_listener))
     }
 }

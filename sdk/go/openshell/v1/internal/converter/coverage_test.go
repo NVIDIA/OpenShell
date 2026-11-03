@@ -89,9 +89,10 @@ func TestConverterCoversAllProtoFields_SandboxWorkloadConfig(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxResources(t *testing.T) {
 	handled := fieldSet{
-		"cpu":    true,
-		"memory": true,
-		"gpu":    true,
+		"cpu":            true,
+		"memory":         true,
+		"gpu":            true,
+		"sampled_budget": true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxResources{}).ProtoReflect().Descriptor(), handled, nil)
@@ -126,6 +127,7 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 		"current_policy_version":    true,
 		"exit_code":                 true,
 		"configuration_admission":   true,
+		"ingress_admission":         true,
 		"restart_count":             true,
 		"next_restart_time":         true,
 		"main_process_started_time": true,
@@ -137,7 +139,7 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 	// lifecycle bookkeeping remains available through the raw protobuf API.
 	// Image updates are raw-only; their pending reconciliation intent and
 	// monotonic image revision bookkeeping are not part of the curated status model.
-	skipped := fieldSet{"main_process_instance_id": true, "configuration_activated": true, "provisioning": true, "image_update": true, "image_revision": true}
+	skipped := fieldSet{"main_process_instance_id": true, "configuration_activated": true, "provisioning": true, "image_update": true, "image_revision": true, "launch_policy": true}
 
 	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, skipped)
 }
@@ -460,5 +462,34 @@ func assertAllFieldsCovered(
 				name, desc.FullName(),
 			)
 		}
+	}
+}
+
+func TestConverterCoversAllProtoFields_UpdateConfigResponse(t *testing.T) {
+	handled := fieldSet{"version": true, "policy_hash": true, "settings_revision": true, "deleted": true, "annotations": true, "created_policy_revision": true}
+	assertAllFieldsCovered(t, (&pb.UpdateConfigResponse{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_SandboxIngressAdmission(t *testing.T) {
+	assertAllFieldsCovered(t, (&sandboxpb.SandboxIngressAdmission{}).ProtoReflect().Descriptor(), fieldSet{"scope": true, "all_ports": true, "ports": true}, nil)
+}
+
+// Resource descriptors are public operator data; no fields are intentionally skipped.
+func TestConverterCoversResourceContracts(t *testing.T) {
+	for _, entry := range []struct {
+		message protoreflect.MessageDescriptor
+		fields  fieldSet
+	}{
+		{(&pb.ComputeDriverCapabilities{}).ProtoReflect().Descriptor(), fieldSet{"driver_name": true, "driver_version": true, "resource_capabilities": true, "workload_compatibility": true}},
+		{(&pb.WorkloadCompatibility{}).ProtoReflect().Descriptor(), fieldSet{"operating_system": true, "architecture": true, "execution_restrictions": true}},
+		{(&pb.ResourceCapabilities{}).ProtoReflect().Descriptor(), fieldSet{"cpu": true, "memory": true, "gpu": true, "sampled_budget": true}},
+		{(&pb.CpuResourceCapabilities{}).ProtoReflect().Descriptor(), fieldSet{"limit_supported": true, "limit_enforcement": true, "request_enforcement": true}},
+		{(&pb.MemoryResourceCapabilities{}).ProtoReflect().Descriptor(), fieldSet{"limit_supported": true, "limit_enforcement": true, "request_enforcement": true}},
+		{(&sandboxpb.ResourceEnforcement{}).ProtoReflect().Descriptor(), fieldSet{"kind": true, "scope": true}},
+		{(&sandboxpb.SampledResourceBudgetCapabilities{}).ProtoReflect().Descriptor(), fieldSet{"cpu_time_supported": true, "resident_bytes_supported": true, "scope": true, "sampling_interval": true, "terminate_on_excess": true, "cpu_time_resolution": true, "per_process_cpu_limit": true}},
+		{(&sandboxpb.SampledResourceBudget{}).ProtoReflect().Descriptor(), fieldSet{"cpu_time": true, "resident_bytes": true}},
+		{(&pb.ResourceRequirements{}).ProtoReflect().Descriptor(), fieldSet{"gpu": true, "sampled_budget": true}},
+	} {
+		assertAllFieldsCovered(t, entry.message, entry.fields, nil)
 	}
 }

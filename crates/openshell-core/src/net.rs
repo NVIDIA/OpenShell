@@ -19,6 +19,31 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::net::TcpStream;
 
+/// Normalize a TCP forward destination without DNS resolution.
+///
+/// Forward targets must be sandbox loopback addresses. `localhost` uses IPv4
+/// loopback consistently across clients and the gateway.
+///
+/// # Errors
+/// Returns an error for an empty host or a non-loopback destination.
+pub fn normalize_tcp_forward_host(host: &str) -> Result<String, &'static str> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err("tcp target host is required");
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok("127.0.0.1".to_string());
+    }
+    let ip: IpAddr = host
+        .parse()
+        .map_err(|_| "tcp target host must be loopback")?;
+    if ip.is_loopback() {
+        Ok(ip.to_string())
+    } else {
+        Err("tcp target host must be loopback")
+    }
+}
+
 /// Check if a hostname is a known cloud metadata hostname that resolves to an
 /// always-blocked metadata service.
 ///

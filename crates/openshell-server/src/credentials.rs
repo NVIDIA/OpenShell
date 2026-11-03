@@ -1059,6 +1059,11 @@ fn parse_driver_table(
                 "[openshell.credential_drivers.{driver_name}] socket_path must be absolute"
             )));
         }
+        openshell_core::unix_socket_path::check(socket_path).map_err(|err| {
+            Error::config(format!(
+                "[openshell.credential_drivers.{driver_name}] socket_path: {err}"
+            ))
+        })?;
         if let Some(command) = command.as_ref()
             && !command.is_absolute()
         {
@@ -2570,6 +2575,25 @@ socket_path = "vault.sock"
             .unwrap_err();
 
         assert!(err.to_string().contains("socket_path must be absolute"));
+    }
+
+    #[tokio::test]
+    async fn runtime_rejects_overlong_uds_socket_path() {
+        let config = Config::new(None).with_credential_drivers(["vault"]);
+        let file = config_file(&format!(
+            r#"
+[openshell.credential_drivers.vault]
+transport = "uds"
+socket_path = "/{}/vault.sock"
+"#,
+            "a".repeat(openshell_core::unix_socket_path::MAX_LEN)
+        ));
+
+        let err = CredentialRuntime::from_config_file(&config, Some(&file))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("-byte limit"), "{err}");
     }
 
     #[tokio::test]

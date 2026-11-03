@@ -279,7 +279,8 @@ fn params_with_tool(
     params
 }
 
-fn allow_def_to_proto(_protocol: &str, allow: L7AllowDef) -> L7Allow {
+/// Convert an authored L7 allow rule to protobuf, carrying MCP `tool` as `params.name`.
+pub fn allow_def_to_proto(allow: L7AllowDef) -> L7Allow {
     let params = flatten_param_matchers(params_with_tool(allow.params, allow.tool));
     L7Allow {
         method: allow.method,
@@ -300,7 +301,8 @@ fn allow_def_to_proto(_protocol: &str, allow: L7AllowDef) -> L7Allow {
     }
 }
 
-fn deny_def_to_proto(_protocol: &str, deny: L7DenyRuleDef) -> L7DenyRule {
+/// Convert an authored L7 deny rule to protobuf, carrying MCP `tool` as `params.name`.
+pub fn deny_def_to_proto(deny: L7DenyRuleDef) -> L7DenyRule {
     let params = flatten_param_matchers(params_with_tool(deny.params, deny.tool));
     L7DenyRule {
         method: deny.method,
@@ -534,14 +536,11 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             rules: allow_rules
                                 .into_iter()
                                 .map(|r| L7Rule {
-                                    allow: Some(allow_def_to_proto(&protocol, r.allow)),
+                                    allow: Some(allow_def_to_proto(r.allow)),
                                 })
                                 .collect(),
                             allowed_ips: e.allowed_ips,
-                            deny_rules: deny_rules
-                                .into_iter()
-                                .map(|deny| deny_def_to_proto(&protocol, deny))
-                                .collect(),
+                            deny_rules: deny_rules.into_iter().map(deny_def_to_proto).collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
                             websocket_credential_rewrite: e.websocket_credential_rewrite,
                             request_body_credential_rewrite: e.request_body_credential_rewrite,
@@ -3290,6 +3289,83 @@ network_policies:
             .collect::<Vec<_>>()
             .join("; ");
         assert!(errors.contains("invalid host pattern"), "{errors}");
+    }
+
+    #[test]
+    fn validate_rejects_ports_in_middleware_selector_patterns() {
+        for (include, exclude, reason) in [
+            ("api.example.com:443", None, "cannot include one"),
+            ("*.example.com:443", None, "cannot include one"),
+            ("api.example.com:*", None, "cannot include one"),
+            (
+                "api.example.com",
+                Some("api.example.com:22"),
+                "cannot include one",
+            ),
+            ("10.0.0.1:443", None, "cannot include one"),
+            ("10.0.0.1:*", None, "cannot include one"),
+            ("*:443", None, "cannot include one"),
+            ("[2001:db8::1]:443", None, "without brackets"),
+            ("[2001:db8::1]", None, "without brackets"),
+            ("2001:db8::1::2", None, "complete IPv6 address"),
+            ("cafe:*", None, "complete IPv6 address"),
+            ("beef:443", None, "complete IPv6 address"),
+            ("2001:4860:*", None, "complete IPv6 address"),
+            ("fe80::*", None, "complete IPv6 address"),
+        ] {
+            let mut policy = restrictive_default_policy();
+            let mut middleware = middleware_config("openshell/regex");
+            let selector = middleware.endpoints.as_mut().unwrap();
+            selector.include = vec![include.into()];
+            selector.exclude = exclude.into_iter().map(Into::into).collect();
+            add_middleware(&mut policy, "redactor", middleware);
+
+            let errors = validate_sandbox_policy(&policy)
+                .expect_err("a selector pattern with a port")
+                .into_iter()
+                .map(|violation| violation.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            let pattern = exclude.unwrap_or(include);
+            assert!(
+                errors.contains(&format!("pattern '{pattern}' is invalid"))
+                    && errors.contains(reason),
+                "{errors}"
+            );
+        }
+
+        // The supervisor's local-file policy path runs the same check.
+        let data = serde_json::json!({
+            "network_middlewares": {
+                "redactor": {
+                    "middleware": "openshell/regex",
+                    "endpoints": {"include": ["api.example.com:443"]}
+                }
+            }
+        });
+        let violations = validate_network_middleware_json(&data).expect("parse middleware policy");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::InvalidMiddlewareConfig { name, reason }
+                if name == "redactor" && reason.contains("cannot include one")
+        )));
+    }
+
+    #[test]
+    fn validate_accepts_ipv6_middleware_selector_addresses() {
+        for pattern in ["2001:db8::1", "2001:DB8::1", "::1", "::ffff:10.0.0.1"] {
+            let mut policy = restrictive_default_policy();
+            let mut middleware = middleware_config("openshell/regex");
+            middleware.endpoints.as_mut().unwrap().include = vec![pattern.into()];
+            add_middleware(&mut policy, "redactor", middleware);
+            if let Err(violations) = validate_sandbox_policy(&policy) {
+                panic!("IPv6 selector '{pattern}' was rejected: {violations:?}");
+            }
+        }
+
+        // The proxy matches IPv6 hosts without brackets.
+        assert!(middleware_host_matches("2001:DB8::1", "2001:db8::1").unwrap());
+        assert!(!middleware_host_matches("2001:db8::1", "2001:db8::2").unwrap());
     }
 
     #[test]

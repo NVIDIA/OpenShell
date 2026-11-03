@@ -104,6 +104,13 @@ openshell sandbox create --from registry.example.com/your-org/claude-agent:lates
 openshell sandbox create --from registry.example.com/your-org/codex-agent:latest --provider codex -- codex
 ```
 
+For fixed access, add `--frozen` at creation. The first accepted effective policy
+and provider authorization remain fixed until deletion; new policy requires
+recreation. Check `sandbox get` for pending or initialized freeze state and
+`policy get <name> --full` for the captured policy. Credential/token rotation
+continues within that authorization. Do not try to repair an initialized frozen
+sandbox with policy updates, proposal approvals or provider attach/detach.
+
 The agent will be prompted interactively if credentials are missing.
 
 ### Step 4: Exit and clean up
@@ -353,6 +360,17 @@ are temporarily exempt from labels; the public `--gpu` flag needs no driver
 config opt-in. Consult the published gateway configuration reference before
 changing admission settings; do not recommend disabling admission to bypass a
 denial. Put driver config on a template only when it should be reused.
+
+For a compute driver that advertises sampled account budgets, use
+`sandbox template create` with `--cpu-time-budget 30s` and
+`--resident-memory-budget-bytes 1073741824`, then create from that template.
+These explicit budgets terminate on observed excess; collection and sampling
+can overshoot. They are distinct from `--cpu` core-rate limits and `--memory`
+hard limits. Inspect `gateway info` for driver guarantees; ordinary workspace
+users do not need its administrator permission to use budgets. Budget-bearing
+writes check the public gateway protocol acknowledgement and fail on older
+gateways rather than discarding the fields. Unsupported drivers reject the
+request before provisioning.
 
 ### Manage sandbox workload templates
 
@@ -613,7 +631,7 @@ and [API errors](https://docs.nvidia.com/openshell/latest/sdk/api-errors).
 
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
-**Key concept**: Policies have static fields (immutable after activation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
+**Key concept**: Policies have static fields (immutable within a running generation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
 
 If startup reports `ConfigurationInvalid`, inspect `openshell sandbox get` and
 repair the complete policy or provider set through the gateway. The workload
@@ -700,7 +718,7 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - Binary matching patterns
 - Ordered `network_middlewares`, host selection, HTTP request/response and WebSocket bindings, and `fail_open` or `fail_closed` behavior
 
-`network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
+`network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. If `filesystem_policy`, `landlock`, or `process` need changes on a live sandbox, stop it before replacing the policy when the compute driver supports generation-bound launch policy; otherwise recreate it. Frozen sandboxes retain their first accepted policy and reject changes even while stopped. Starting claims a new admitted policy input, while retries retain that input. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
 Middleware can inspect HTTP requests, HTTP responses, or client WebSocket text
 messages when the implementation advertises the matching binding. The built-in
@@ -822,6 +840,12 @@ The service is now reachable at `localhost:8080`.
 CLI forwards ignore SSH multiplexing and automatic backgrounding settings in the
 user's SSH config. Only background forwards are tracked by `forward list` and
 managed by `forward stop`; foreground forwards end when the command exits.
+
+Forwarding and service exposure respect the compute driver's admitted target
+ports. Modern drivers reject unsupported or unadmitted ports before create
+provisioning or a local listener starts. Shared-host loopback scope means the
+target shares the compute host's network namespace; choose a different local
+port when the target already occupies that host port.
 
 Manage or iterate on the sandbox:
 

@@ -77,6 +77,7 @@ fn driver_config(args: &Args) -> toml::Table {
 }
 
 fn prepare_socket(socket_path: &Path) -> Result<()> {
+    openshell_core::unix_socket_path::check(socket_path).into_diagnostic()?;
     let parent = socket_path.parent().ok_or_else(|| {
         miette!(
             "credential driver socket path '{}' has no parent directory",

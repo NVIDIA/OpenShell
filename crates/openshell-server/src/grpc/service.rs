@@ -93,6 +93,7 @@ pub(super) async fn expose_service_endpoint(
     target_port: u32,
     authorization_mode: ServiceAuthorizationMode,
 ) -> Result<Response<ServiceEndpointResponse>, Status> {
+    state.compute.admit_ingress_port(sandbox, target_port)?;
     let sandbox_name = sandbox.object_name();
     // Count and persist under the same fleet-wide sandbox guard, including
     // create-time exposure, so concurrent gateways cannot overfill the allowlist.

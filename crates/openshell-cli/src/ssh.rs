@@ -111,6 +111,7 @@ struct SshSessionConfig {
     gateway_url: String,
     token: String,
     main_terminal: bool,
+    ingress_admission: Option<openshell_core::proto::SandboxIngressAdmission>,
     replica: Option<AsciiMetadataValue>,
 }
 
@@ -203,6 +204,10 @@ async fn ssh_session_config(
     );
 
     Ok(SshSessionConfig {
+        ingress_admission: sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.ingress_admission.clone()),
         proxy_command,
         sandbox_id: session.sandbox_id.clone(),
         sandbox_name: name.to_string(),
@@ -742,9 +747,18 @@ pub async fn sandbox_forward(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
-    openshell_core::forward::check_port_available(spec)?;
-
     let session = ssh_session_config(server, name, tls, workspace, None).await?;
+    let scope = openshell_core::ingress::admit_port(
+        session.ingress_admission.as_ref(),
+        u32::from(spec.port),
+        false,
+    )
+    .map_err(|error| miette::miette!("{error}"))?;
+    if scope == openshell_core::proto::IngressScope::SharedHostLoopback {
+        eprintln!("Target is an admitted shared-host loopback service.");
+    }
+
+    openshell_core::forward::check_port_available(spec)?;
 
     let mut command = TokioCommand::from(ssh_forward_command(
         &session.proxy_command,
@@ -2548,6 +2562,7 @@ mod tests {
                     async move {
                         if setup {
                             let session = SshSessionConfig {
+                                ingress_admission: None,
                                 proxy_command: String::new(),
                                 sandbox_id: String::new(),
                                 sandbox_name: String::new(),

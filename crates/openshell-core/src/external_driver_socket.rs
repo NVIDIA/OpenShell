@@ -14,6 +14,7 @@ use tokio_stream::Stream;
 
 /// Prepare and bind a private Unix socket owned by the current effective UID.
 pub fn bind_private(path: &Path) -> Result<UnixListener, String> {
+    crate::unix_socket_path::check(path).map_err(|err| err.to_string())?;
     let parent = path
         .parent()
         .ok_or_else(|| format!("driver socket path '{}' has no parent", path.display()))?;
@@ -171,6 +172,20 @@ mod tests {
             .expect_err("symlinked socket parent must be rejected");
 
         assert!(err.contains("must be a directory, not a symlink"));
+    }
+
+    #[test]
+    fn bind_private_rejects_overlong_path_before_creating_parent() {
+        let temp_dir = tempfile::tempdir().expect("create temporary directory");
+        let parent = temp_dir
+            .path()
+            .join("a".repeat(crate::unix_socket_path::MAX_LEN));
+
+        let err = bind_private(&parent.join("compute.sock"))
+            .expect_err("overlong socket path must be rejected");
+
+        assert!(err.contains("-byte limit"), "{err}");
+        assert!(!parent.exists());
     }
 
     #[test]

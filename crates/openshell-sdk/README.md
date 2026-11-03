@@ -28,6 +28,25 @@ Code constructing complete raw Rust message literals must add
 Exhaustive destructuring patterns must include `service_routes` or end with `..`.
 The curated SDK API is unchanged.
 
+## Frozen sandbox policies
+
+`create_frozen_sandbox(FrozenSandboxCreateSpec { sandbox, policy })` creates a
+sandbox through the optional frozen-policy service. The template equivalent is
+`create_frozen_sandbox_from_template(SandboxTemplateCreateSpec)`. Both are also
+available on a workspace-scoped client. Existing create specs and sandbox
+references retain their ordinary shape.
+
+Use `get_frozen_policy(name)` to distinguish a requested, pending freeze from
+the captured policy, hash and timestamp. Once initialization accepts the first
+configuration, subsequent reads return that snapshot. Changing its access
+requires recreating the sandbox. `update_global_config(UpdateConfigRequest)`
+returns the mutation result and names of sandboxes retaining a frozen policy.
+
+Older gateways return `Unimplemented` before creation; the SDK never retries
+through ordinary creation. `raw_frozen_policies` and
+`raw_frozen_policies_fresh` share the client's transport and live bearer slot,
+with the same refresh distinction as the main raw client.
+
 ## Auth and refresh
 
 The curated surface drives OIDC refresh automatically: proactively before a
@@ -212,3 +231,31 @@ These helpers use the raw client's authentication slot. They do not perform OIDC
 - Async-only. Tonic is async-native; callers needing a blocking call can wrap
   with their own runtime.
 - The curated surface will grow as more RPCs graduate from `raw`.
+
+## Next minor API migration
+
+These source-breaking API changes target the next minor release and must not be backported into the `0.1.x` patch series. Upgrade gateway writers and supervisors together before using the new contracts. Older protobuf writers can discard new metadata even when they decode the existing wire fields successfully.
+
+### Startup refusal reporting
+
+Raw `ReportSandboxConfigurationRequest` adds `refused_before_start`, and `UpdateConfigResponse` adds `created_policy_revision`. Complete generated Rust literals must initialize both fields to `false` or use `..Default::default()`. Complete raw TypeScript messages need the corresponding boolean defaults; generated message builders supply them.
+
+Legacy wire payloads decode both flags as false. A false or unacknowledged creation receipt does not establish startup ownership. An older writer can discard this metadata.
+
+### Launch policy
+
+Raw `SandboxStatus` adds optional `launch_policy`, exposing the retained generation, policy document and digest under existing policy-read authorization. Provider credential values and environment data are not included. Complete generated Rust status literals must add `launch_policy: None` or use `..Default::default()`.
+
+Legacy wire payloads retain their field identities and decode the new field as absent. A negotiated launch without retained input fails closed. Stop and explicitly start the sandbox to claim a new generation; retries and recovery do not replace an already claimed generation's input. Frozen sandboxes keep their original accepted policy.
+
+### Ingress admission
+
+Raw `SandboxStatus` adds optional `ingress_admission`, and raw `CreateSandboxRequest` adds `forward_ports`. Compute-driver `ValidateSandboxCreateResponse` also adds optional `ingress_admission`. Complete generated Rust literals must initialize optional descriptors to `None` and ports to an empty vector, or use `..Default::default()`.
+
+Legacy wire payloads retain their field identities and decode the new fields as absent or empty. With a driver that negotiates ingress admission, the gateway rejects forwarding without that record until the sandbox is recreated with admitted ports. Legacy drivers that do not negotiate admission can still omit it.
+
+### Resource budgets
+
+Raw `HealthResponse`, public and compute resource requirements, resource capabilities and workload-template resource messages gain acknowledgement, enforcement and sampled-budget fields. Complete generated Rust literals must initialize the new fields or use `..Default::default()`. Complete TypeScript Health responses need `supportsSampledResourceBudget: false` or a generated message builder.
+
+Legacy wire fields retain their identities and new optional fields remain absent on old payloads. Before sending a budget-bearing write, check the Health acknowledgement for field preservation. The selected driver's admission separately checks enforcement.

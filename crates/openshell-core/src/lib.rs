@@ -12,6 +12,7 @@
 pub mod activity;
 pub mod app_listener;
 pub mod auth;
+pub mod backend_startup;
 pub mod compute;
 pub mod config;
 pub mod container_paths;
@@ -29,14 +30,17 @@ pub mod error;
 pub mod extension_protocol;
 #[cfg(unix)]
 pub mod external_driver_socket;
+pub mod filesystem_baseline;
 pub mod forward;
 pub mod google_cloud;
 pub mod gpu;
 pub mod grpc_client;
 pub mod host_pattern;
 pub mod image;
+pub mod ingress;
 pub mod isolation_registration;
 pub mod jwt;
+pub mod launch_policy;
 pub mod local_api_socket;
 pub mod mcp;
 pub mod metadata;
@@ -56,6 +60,7 @@ pub mod proto_struct;
 pub mod provider_credentials;
 pub mod replica_routing;
 pub mod resource_admission;
+pub mod resource_contract;
 pub mod rpc_error;
 pub mod sandbox_env;
 pub mod sandbox_generation;
@@ -70,6 +75,7 @@ pub mod time;
 pub mod token_grant_failure;
 pub mod transport_errors;
 pub mod upload;
+pub use openshell_extension_core::unix_socket_path;
 
 pub use config::{
     AppArmorProfile, Config, ExtensionBindingPolicy, GatewayAuthConfig,

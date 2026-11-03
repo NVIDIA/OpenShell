@@ -54,9 +54,21 @@ type ExtensionInfo struct {
 
 // ComputeDriverInfo describes a compute backend available on the gateway.
 type ComputeDriverInfo struct {
+	Resources     *ResourceCapabilities
 	Name          string
 	DriverName    string
 	DriverVersion string
+	// WorkloadCompatibility is nil when the configured driver does not report it.
+	WorkloadCompatibility *WorkloadCompatibility
+}
+
+// WorkloadCompatibility describes the workload, separately from the gateway host.
+// Empty platform fields and an empty restriction list remain unreported; this
+// metadata neither establishes installation health nor admits a command.
+type WorkloadCompatibility struct {
+	OperatingSystem       string
+	Architecture          string
+	ExecutionRestrictions []string
 }
 
 // CurrentUser holds the authenticated caller's identity.
@@ -66,4 +78,43 @@ type CurrentUser struct {
 	Roles            []string
 	Scopes           []string
 	IdentityProvider string
+}
+
+// ResourceCapabilities reports the configured compute driver's guarantees.
+type ResourceCapabilities struct {
+	CPU           *ResourceDomainCapabilities
+	Memory        *ResourceDomainCapabilities
+	GPU           *GPUResourceCapabilities
+	SampledBudget *SampledBudgetCapabilities
+}
+
+// ResourceDomainCapabilities describes resource limit and request enforcement.
+type ResourceDomainCapabilities struct {
+	LimitSupported     bool
+	LimitEnforcement   *ResourceEnforcement
+	RequestEnforcement *ResourceEnforcement
+}
+
+// ResourceEnforcement identifies the mechanism and scope of a resource guarantee.
+type ResourceEnforcement struct {
+	// Unknown enum values are preserved as "Unknown", never inferred as support.
+	Kind  string
+	Scope string
+}
+
+// GPUResourceCapabilities describes supported GPU selection methods.
+type GPUResourceCapabilities struct {
+	DefaultSelectionSupported bool
+	CountSelectionSupported   bool
+}
+
+// SampledBudgetCapabilities describes supported sampled workload budgets.
+type SampledBudgetCapabilities struct {
+	CPUTimeSupported       bool
+	ResidentBytesSupported bool
+	Scope                  string
+	SamplingInterval       *ResourceDuration
+	TerminateOnExcess      bool
+	CPUTimeResolution      *ResourceDuration
+	PerProcessCPULimit     bool
 }

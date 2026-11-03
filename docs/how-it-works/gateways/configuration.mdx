@@ -724,7 +724,7 @@ gateway under the worktree-specific k3d cluster name; select it with
 tasks export spans and OCSF log records to the forwarded receiver
 automatically.
 
-In-process compute drivers read their backend-specific settings from `[openshell.drivers.<name>]`. An external driver's gateway table supplies only its `socket_path`; configure the external driver process itself through that binary's flags or environment variables. A driver that advertises `supports_sandbox_authentication` may authenticate an opaque bootstrap credential through the compute-driver protocol. It must return the same non-empty runtime identity from sandbox creation and credential authentication. Start requests include the previously recorded opaque identity so the driver can preserve the stable resource while rotating generation-specific compute. For `IssueSandboxToken`, the gateway verifies the sandbox exists and the driver/runtime identity matches the durable provisioning record before returning a generation-bound session JWT. The in-process Kubernetes driver reads `service_account_name`, `workspace_mode`, and namespace discovery from `[openshell.drivers.kubernetes]`; an external Kubernetes driver receives the equivalent values through its own CLI or environment contract.
+In-process compute drivers read their backend-specific settings from `[openshell.drivers.<name>]`. An external driver's gateway table supplies only its `socket_path`. The gateway rejects a Unix socket path longer than 107 bytes on Linux or 103 bytes on macOS. Configure the external driver process itself through that binary's flags or environment variables. A driver that advertises `supports_sandbox_authentication` may authenticate an opaque bootstrap credential through the compute-driver protocol. It must return the same non-empty runtime identity from sandbox creation and credential authentication. Start requests include the previously recorded opaque identity so the driver can preserve the stable resource while rotating generation-specific compute. For `IssueSandboxToken`, the gateway verifies the sandbox exists and the driver/runtime identity matches the durable provisioning record before returning a generation-bound session JWT. The in-process Kubernetes driver reads `service_account_name`, `workspace_mode`, and namespace discovery from `[openshell.drivers.kubernetes]`; an external Kubernetes driver receives the equivalent values through its own CLI or environment contract.
 
 ### OCSF Log Export
 
@@ -843,7 +843,7 @@ max_payload_bytes = 262144
 timeout = "500ms"
 ```
 
-Each service advertises operation and phase pairs through `Describe`. A sandbox policy attaches the service by its registration `name`; the gateway operator controls which bindings that attachment can use. Registration names must be unique and cannot start with the reserved `openshell/` namespace. The name in the service manifest is for diagnostics only.
+Each service advertises operation and phase pairs through `Describe`. A sandbox policy attaches the service by its registration `name`; the gateway operator controls which bindings that attachment can use. Registration names must be unique and cannot start with the reserved `openshell/` namespace. The name in the service manifest is for diagnostics only. A service that requires the `openshell.supervisor-middleware.http-hooks` capability receives its HTTP bindings through the [HTTP hooks](/extensibility/supervisor-middleware/operations#http).
 
 | `binding_policy` | What the gateway and supervisor require |
 | --- | --- |
@@ -866,7 +866,7 @@ The gateway connects to every registered service and validates `Describe` before
 
 Startup also requires compatible [extension protocol metadata](/extensibility/overview#protocol-negotiation). Upgrade legacy gateways and operator-run services together during a coordinated outage; neither mixed legacy/current pairing is supported. A service rejects a gateway that omits peer metadata, and a gateway rejects a service that omits metadata, uses another protocol major, or requires unsupported gateway capabilities. Protected `GetGatewayInfo` and `openshell gateway info` report the resulting non-secret snapshot.
 
-`max_payload_bytes` is the shared operator limit for inspectable logical payloads across the bindings authorized for this service. It caps HTTP request and response units, replacement bodies, and complete WebSocket text messages and replacements. Whole-response inspection uses it as the stage's total body limit. Streaming response inspection applies it to each unit. The value must be greater than zero, no larger than each binding's advertised `max_payload_bytes` capability, and no larger than the 4 MiB platform maximum. OpenShell rejects oversized values instead of silently clamping them. Binary WebSocket messages are not exposed to V1 middleware, so this field does not limit binary pass-through. Middleware gRPC servers should allow messages of at least 4 MiB plus 293 KiB so a maximum-size payload and its protobuf envelope fit on the transport.
+`max_payload_bytes` is the shared operator limit for inspectable logical payloads across the bindings authorized for this service. It caps HTTP request and response units, replacement bodies, and complete WebSocket text messages and replacements. Whole-response inspection uses it as the stage's total body limit. Streaming response inspection applies it to each unit. The value must be greater than zero, unless every authorized binding of the service is an HTTP hook binding that advertises a zero limit, and no larger than each binding's advertised `max_payload_bytes` capability, and no larger than the 4 MiB platform maximum. OpenShell rejects oversized values instead of silently clamping them. Binary WebSocket messages are not exposed to V1 middleware, so this field does not limit binary pass-through. Middleware gRPC servers should allow messages of at least 4 MiB plus 293 KiB so a maximum-size payload and its protobuf envelope fit on the transport.
 
 `timeout` is the operator-configured service-wide RPC timeout. It accepts the same compact duration syntax as gateway interceptors: an integer followed by `ms` or `s`, such as `500ms` or `2s`. Values must be between `10ms` and `30s`, inclusive. Omit the field to use the 500 ms platform default. A binding may advertise a shorter `timeout` in the `Describe` manifest, but it cannot extend the operator-configured deadline; OpenShell uses the smaller value. OpenShell validates both levels before accepting the service. The operator-configured service timeout applies to `Describe` and `ValidateConfig`. The effective binding timeout applies to HTTP request evaluation, HTTP response preflight and unit exchanges, WebSocket preflight, and each WebSocket message. Accepted streaming protocols have no connection-wide RPC deadline.
 
@@ -928,7 +928,7 @@ The gateway validates snapshot structure and provider-profile semantics. It trea
 
 Set `credential_drivers` only when the gateway should store provider secrets in an external credential backend. Provider secrets include injectable credentials and gateway-only refresh material such as OAuth refresh tokens, client secrets, and service-account private keys. OpenShell supports at most one enabled credential driver at a time. When `credential_drivers` is omitted, the gateway uses its default encrypted database credential storage. `credential_drivers = []` is invalid in the TOML file; omit the field for the default encrypted store, or select a backend such as `kubernetes-secrets` or `vault`.
 
-Credential driver tables are backend-owned and live under `[openshell.credential_drivers.<name>]`. Built-in drivers default to in-tree transport, so they do not need a `transport` field. Use `transport = "uds"` with an absolute `socket_path` only for a remote gRPC driver over a Unix domain socket.
+Credential driver tables are backend-owned and live under `[openshell.credential_drivers.<name>]`. Built-in drivers default to in-tree transport, so they do not need a `transport` field. Use `transport = "uds"` with an absolute `socket_path` only for a remote gRPC driver over a Unix domain socket. The gateway rejects a `socket_path` longer than 107 bytes on Linux or 103 bytes on macOS.
 
 ```toml
 [openshell.gateway.credential_storage]
@@ -1648,6 +1648,8 @@ kid_path         = "/etc/openshell/jwt/kid"
 gateway_id       = "openshell"
 
 [openshell.drivers.vm]
+# Persistent VM state stays here. The gateway keeps the driver control socket
+# in a private temporary directory under /tmp, independent of state_dir.
 state_dir        = "/var/lib/openshell/vm"
 # Where the gateway looks for the openshell-driver-vm subprocess binary.
 driver_dir       = "/usr/local/libexec/openshell"

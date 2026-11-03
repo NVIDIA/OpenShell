@@ -504,6 +504,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     // ===================================================================
     // SANDBOX COMMANDS
@@ -1536,6 +1537,10 @@ enum SandboxCommands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: Option<String>,
 
+        /// Freeze the effective policy after initialization for this sandbox's lifetime.
+        #[arg(long)]
+        frozen: bool,
+
         /// Forward a local port to the sandbox before the initial command or shell starts.
         /// Accepts [`bind_address`:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
         #[arg(long, conflicts_with = "no_keep")]
@@ -1996,6 +2001,16 @@ enum SandboxTemplateCommands {
         /// Memory limit for sandboxes created from this template (for example: 512Mi, 4Gi, 8G).
         #[arg(long)]
         memory: Option<String>,
+
+        /// Sampled cumulative CPU-time budget (for example: 30s). Terminates on
+        /// observed excess; this is not a CPU-rate limit.
+        #[arg(long, value_name = "DURATION")]
+        cpu_time_budget: Option<String>,
+
+        /// Sampled account-wide resident-memory budget in bytes. Terminates on
+        /// observed excess; this is not a hard memory limit.
+        #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
+        resident_memory_budget_bytes: Option<u64>,
 
         /// Request GPU resources for sandboxes created from this template.
         ///
@@ -3395,6 +3410,7 @@ async fn run_async() -> Result<()> {
                     driver_config_json,
                     providers,
                     policy,
+                    frozen,
                     forward,
                     expose,
                     expose_authorization_mode,
@@ -3467,41 +3483,53 @@ async fn run_async() -> Result<()> {
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
-                    let exit_code = Box::pin(run::sandbox_create(
-                        endpoint,
-                        &ctx.name,
-                        run::SandboxCreateConfig {
-                            name: name.as_deref(),
-                            template: template.as_deref(),
-                            from: from.as_deref(),
-                            uploads: &upload_specs,
-                            keep,
-                            gpu_requirements,
-                            cpu: cpu.as_deref(),
-                            memory: memory.as_deref(),
-                            driver_config_json: driver_config_json.as_deref(),
-                            editor,
-                            providers: &providers,
-                            policy: policy.as_deref(),
-                            forward,
-                            expose,
-                            expose_authorization_mode: expose_authorization_mode.into(),
-                            command: &command,
-                            tty_override,
-                            auto_providers_override,
-                            labels: labels_map,
-                            annotations: annotations_map,
-                            environment: env_map,
-                            approval_mode: &approval_mode,
-                            output: output.as_str(),
-                            detach,
-                            suppress_credential_warnings: no_credential_warnings,
-                            restart_policy: &restart_policy,
-                        },
-                        &cli.workspace,
-                        &tls,
-                    ))
-                    .await?;
+                    let config = run::SandboxCreateConfig {
+                        name: name.as_deref(),
+                        template: template.as_deref(),
+                        from: from.as_deref(),
+                        uploads: &upload_specs,
+                        keep,
+                        gpu_requirements,
+                        cpu: cpu.as_deref(),
+                        memory: memory.as_deref(),
+                        driver_config_json: driver_config_json.as_deref(),
+                        editor,
+                        providers: &providers,
+                        policy: policy.as_deref(),
+                        forward,
+                        expose,
+                        expose_authorization_mode: expose_authorization_mode.into(),
+                        command: &command,
+                        tty_override,
+                        auto_providers_override,
+                        labels: labels_map,
+                        annotations: annotations_map,
+                        environment: env_map,
+                        approval_mode: &approval_mode,
+                        output: output.as_str(),
+                        detach,
+                        suppress_credential_warnings: no_credential_warnings,
+                        restart_policy: &restart_policy,
+                    };
+                    let exit_code = if frozen {
+                        Box::pin(run::sandbox_create_frozen(
+                            endpoint,
+                            &ctx.name,
+                            config,
+                            &cli.workspace,
+                            &tls,
+                        ))
+                        .await?
+                    } else {
+                        Box::pin(run::sandbox_create(
+                            endpoint,
+                            &ctx.name,
+                            config,
+                            &cli.workspace,
+                            &tls,
+                        ))
+                        .await?
+                    };
                     if exit_code != 0 {
                         std::process::exit(exit_code);
                     }
@@ -3764,6 +3792,8 @@ async fn run_async() -> Result<()> {
                                 image,
                                 cpu,
                                 memory,
+                                cpu_time_budget,
+                                resident_memory_budget_bytes,
                                 gpu,
                                 driver_config_json,
                                 ready_within,
@@ -3786,6 +3816,10 @@ async fn run_async() -> Result<()> {
                                     image.as_deref(),
                                     cpu.as_deref(),
                                     memory.as_deref(),
+                                    run::sampled_resource_budget(
+                                        cpu_time_budget.as_deref(),
+                                        resident_memory_budget_bytes,
+                                    )?,
                                     gpu_requirements,
                                     driver_config_json.as_deref(),
                                     ready_within.as_deref(),
@@ -6325,6 +6359,38 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_create_frozen_supports_inline_and_named_templates() {
+        for args in [
+            vec!["openshell", "sandbox", "create", "--frozen"],
+            vec![
+                "openshell",
+                "sandbox",
+                "create",
+                "--template",
+                "agent",
+                "--frozen",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Sandbox {
+                    command: Some(SandboxCommands::Create { frozen: true, .. }),
+                    ..
+                })
+            ));
+        }
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { frozen: false, .. }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn sandbox_create_restart_policy_defaults_to_never() {
         let cli = Cli::try_parse_from(["openshell", "sandbox", "create"]).unwrap();
         match cli.command {
@@ -6657,6 +6723,10 @@ mod tests {
             "2",
             "--memory",
             "4Gi",
+            "--cpu-time-budget",
+            "30s",
+            "--resident-memory-budget-bytes",
+            "1073741824",
             "--gpu",
             "1",
             "--driver-config-json",
@@ -6685,6 +6755,8 @@ mod tests {
                         image,
                         cpu,
                         memory,
+                        cpu_time_budget,
+                        resident_memory_budget_bytes,
                         gpu,
                         driver_config_json,
                         ready_within,
@@ -6697,6 +6769,8 @@ mod tests {
                     })),
                 ..
             }) => {
+                assert_eq!(cpu_time_budget.as_deref(), Some("30s"));
+                assert_eq!(resident_memory_budget_bytes, Some(1_073_741_824));
                 assert_eq!(name, "gpu-kata");
                 assert_eq!(image.as_deref(), Some("registry.example.com/agent:latest"));
                 assert_eq!(cpu.as_deref(), Some("2"));

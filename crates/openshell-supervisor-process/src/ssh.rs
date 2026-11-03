@@ -123,6 +123,9 @@ fn ssh_server_init(
     // shared socket retains group access. Linux abstract sockets avoid a
     // workload-replaceable filesystem inode.
     let abstract_socket = crate::unix_socket::is_abstract(listen_path);
+    if !abstract_socket {
+        openshell_core::unix_socket_path::check(listen_path).into_diagnostic()?;
+    }
     if !abstract_socket && let Some(parent) = listen_path.parent() {
         std::fs::create_dir_all(parent).into_diagnostic()?;
         #[cfg(unix)]

@@ -117,6 +117,8 @@ struct Observed {
     deny_confirmation: AtomicBool,
     require_networking: AtomicBool,
     active: AtomicBool,
+    attach_error: Mutex<Option<BackendError>>,
+    start_error: Mutex<Option<BackendError>>,
     starts: AtomicUsize,
     releases: AtomicUsize,
     suspendable: AtomicBool,
@@ -308,6 +310,10 @@ impl PreparedBackend for TestLaunch {
                 Ok(match request {
                     Request::Attach { .. } => {
                         observed.record("attach");
+                        let attach_error = observed.attach_error.lock().unwrap().take();
+                        if let Some(error) = attach_error {
+                            return Err(error);
+                        }
                         if observed.active.swap(true, Ordering::SeqCst) {
                             return Err(BackendError::Denied("already attached".into()));
                         }
@@ -373,6 +379,10 @@ impl PreparedBackend for TestLaunch {
                         }
                         observed.record("start");
                         observed.starts.fetch_add(1, Ordering::SeqCst);
+                        let start_error = observed.start_error.lock().unwrap().take();
+                        if let Some(error) = start_error {
+                            return Err(error);
+                        }
                         if observed.defer_restore.load(Ordering::SeqCst) {
                             assert!(observed.events().contains(&"confirm"));
                             observed.restores.fetch_add(1, Ordering::SeqCst);
@@ -581,6 +591,42 @@ async fn attachment_receives_live_supervisor_services() {
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
     assert!(setup.observed.services.lock().unwrap().upgrade().is_none());
+}
+
+#[tokio::test]
+async fn attach_refusal_is_marked_as_a_refusal() {
+    let setup = TestSetup::new();
+    setup.observed.active.store(true, Ordering::SeqCst);
+    let error = setup
+        .select()
+        .attach(setup.services(), policy(), agent())
+        .await
+        .err()
+        .expect("an already attached boundary refuses attachment");
+    assert_eq!(
+        error.code().map(|code| code.to_string()).as_deref(),
+        Some("openshell.backend.attach.denied")
+    );
+    assert!(error.to_string().contains("already attached"));
+}
+
+#[tokio::test]
+async fn attach_transport_failures_are_not_policy_refusals() {
+    for failure in [
+        BackendError::Attach("mediation transport failed".into()),
+        BackendError::Unavailable("backend unavailable".into()),
+    ] {
+        let setup = TestSetup::new();
+        *setup.observed.attach_error.lock().unwrap() = Some(failure);
+        let error = setup
+            .select()
+            .attach(setup.services(), policy(), agent())
+            .await
+            .err()
+            .expect("backend transport failure must fail startup");
+        assert!(!is_backend_refusal(&error));
+        assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test]
@@ -907,7 +953,13 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
         .observed
         .deny_confirmation
         .store(true, Ordering::SeqCst);
-    assert!(startup(false).await.is_err());
+    let error = startup(false)
+        .await
+        .expect_err("confirmation must refuse startup");
+    assert_eq!(
+        error.code().map(|code| code.to_string()).as_deref(),
+        Some("openshell.backend.confirm.unsupported")
+    );
     assert_eq!(
         setup.observed.events(),
         [
@@ -932,6 +984,25 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
         .observed
         .deny_confirmation
         .store(false, Ordering::SeqCst);
+    *setup.observed.start_error.lock().unwrap() = Some(BackendError::Process(
+        "spawn entrypoint: Permission denied (secret argument)".into(),
+    ));
+    let error = startup(false)
+        .await
+        .expect_err("entrypoint launch failure must end startup");
+    assert_eq!(
+        error.code().map(|code| code.to_string()).as_deref(),
+        Some("openshell.backend.start-agent.failed")
+    );
+    assert!(error.to_string().contains("secret argument"));
+    assert!(!readiness.exists());
+    assert!(!marker.exists());
+    setup.observed.events.lock().unwrap().truncate(7);
+    setup.observed.starts.store(0, Ordering::SeqCst);
+    tokio::task::yield_now().await;
+    assert!(!setup.observed.active.load(Ordering::SeqCst));
+    assert_eq!(setup.observed.releases.load(Ordering::SeqCst), 2);
+
     let observe_and_shutdown = async {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
@@ -966,7 +1037,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
         ]
     );
     tokio::task::yield_now().await;
-    assert_eq!(setup.observed.releases.load(Ordering::SeqCst), 2);
+    assert_eq!(setup.observed.releases.load(Ordering::SeqCst), 3);
     assert!(!setup.observed.active.load(Ordering::SeqCst));
     tokio::task::yield_now().await;
     assert!(setup.observed.services.lock().unwrap().upgrade().is_none());

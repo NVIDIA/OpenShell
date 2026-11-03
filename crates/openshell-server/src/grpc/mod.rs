@@ -4,6 +4,7 @@
 //! gRPC service implementation.
 
 mod auth_rpc;
+mod frozen_policy;
 pub mod mutation_replay;
 pub mod policy;
 pub mod provider;
@@ -248,7 +249,11 @@ impl openshell_core::proto::sandbox_updates_server::SandboxUpdates for OpenShell
         &self,
         request: Request<openshell_core::proto::UpdateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 }
 
@@ -261,6 +266,7 @@ impl OpenShell for OpenShellService {
         Ok(Response::new(HealthResponse {
             status: ServiceStatus::Healthy.into(),
             version: openshell_core::VERSION.to_string(),
+            supports_sampled_resource_budget: true,
         }))
     }
 
@@ -311,6 +317,13 @@ impl OpenShell for OpenShellService {
                         .resource_capabilities
                         .as_ref()
                         .map(|resources| public_resource_capabilities(*resources)),
+                    workload_compatibility: driver.workload_compatibility.as_ref().map(
+                        |workload| openshell_core::proto::WorkloadCompatibility {
+                            operating_system: workload.operating_system.clone(),
+                            architecture: workload.architecture.clone(),
+                            execution_restrictions: workload.execution_restrictions.clone(),
+                        },
+                    ),
                 }),
             })
             .collect();
@@ -329,7 +342,11 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn begin_rootfs_tar_staging(
@@ -401,14 +418,22 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<AttachSandboxProviderRequest>,
     ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn detach_sandbox_provider(
         &self,
         request: Request<DetachSandboxProviderRequest>,
     ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn get_sandbox_provider_status(
@@ -436,14 +461,22 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn start_sandbox(
         &self,
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if let Some(sandbox) = response.get_mut().sandbox.as_mut() {
+            self.state.compute.project_ingress_admission(sandbox);
+        }
+        Ok(response)
     }
 
     async fn suspend_sandbox(
@@ -970,14 +1003,19 @@ fn public_resource_capabilities(
     resources: openshell_core::proto::compute::v1::ResourceCapabilities,
 ) -> ResourceCapabilities {
     ResourceCapabilities {
+        sampled_budget: resources.sampled_budget,
         cpu: resources.cpu.as_ref().map(|cpu| CpuResourceCapabilities {
             limit_supported: cpu.limit_supported,
+            limit_enforcement: cpu.limit_enforcement,
+            request_enforcement: cpu.request_enforcement,
         }),
         memory: resources
             .memory
             .as_ref()
             .map(|memory| MemoryResourceCapabilities {
                 limit_supported: memory.limit_supported,
+                limit_enforcement: memory.limit_enforcement,
+                request_enforcement: memory.request_enforcement,
             }),
         gpu: resources.gpu.as_ref().map(|gpu| GpuResourceCapabilities {
             default_selection_supported: gpu.default_selection_supported,
@@ -1310,24 +1348,115 @@ mod tests {
         ResourceCapabilities as DriverResourceCapabilities,
     };
 
+    #[tokio::test]
+    async fn gateway_info_preserves_driver_workload_compatibility_and_legacy_absence() {
+        use crate::test_support::FakeComputeDriver;
+        use openshell_core::proto::compute::v1::GetCapabilitiesRequest;
+        use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriver;
+
+        for (workload, valid) in [
+            (None, true),
+            (
+                Some(openshell_core::proto::compute::v1::WorkloadCompatibility {
+                    operating_system: "macos".into(),
+                    architecture: "arm64".into(),
+                    execution_restrictions: vec![
+                        "Setuid executables cannot run in this runtime.".into(),
+                    ],
+                }),
+                true,
+            ),
+            (
+                Some(openshell_core::proto::compute::v1::WorkloadCompatibility {
+                    execution_restrictions: vec!["bad\nPRIVATE DIAGNOSTIC".into()],
+                    ..Default::default()
+                }),
+                false,
+            ),
+        ] {
+            let mut state = test_support::test_server_state().await;
+            let driver = FakeComputeDriver::new();
+            let mut capabilities = driver
+                .get_capabilities(Request::new(GetCapabilitiesRequest::default()))
+                .await
+                .unwrap()
+                .into_inner();
+            capabilities.workload_compatibility = workload.clone();
+            let driver = Arc::new(driver.with_capabilities(capabilities));
+            let compute = crate::compute::ComputeRuntime::from_driver(
+                "external-native".into(),
+                driver,
+                None,
+                state.store.clone(),
+                crate::sandbox_index::SandboxIndex::new(),
+                crate::sandbox_watch::SandboxWatchBus::new(),
+                crate::tracing_bus::TracingLogBus::new(),
+                Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+            )
+            .await;
+            if !valid {
+                let error = compute.expect_err("invalid metadata must fail startup");
+                assert!(error.to_string().contains("workload_compatibility"));
+                assert!(!error.to_string().contains("PRIVATE DIAGNOSTIC"));
+                continue;
+            }
+            let compute = compute.unwrap();
+            Arc::get_mut(&mut state).unwrap().compute = compute;
+            let response = OpenShellService::new(state)
+                .get_gateway_info(Request::new(GetGatewayInfoRequest {}))
+                .await
+                .unwrap()
+                .into_inner();
+            let reported = response.compute_drivers[0]
+                .capabilities
+                .as_ref()
+                .unwrap()
+                .workload_compatibility
+                .as_ref();
+            assert_eq!(reported.is_some(), workload.is_some());
+            if let Some(reported) = reported {
+                assert_eq!(reported.operating_system, "macos");
+                assert_eq!(reported.architecture, "arm64");
+                assert_eq!(
+                    reported.execution_restrictions,
+                    workload.unwrap().execution_restrictions
+                );
+            }
+        }
+    }
+
     #[test]
     fn public_resource_capabilities_preserves_reported_fields() {
         let driver_capabilities = DriverResourceCapabilities {
             cpu: Some(DriverCpuResourceCapabilities {
                 limit_supported: true,
+                limit_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                    kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::KernelLimit
+                        as i32,
+                    scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container
+                        as i32,
+                }),
+                ..Default::default()
             }),
             memory: Some(DriverMemoryResourceCapabilities {
                 limit_supported: false,
+                ..Default::default()
             }),
             gpu: Some(DriverGpuResourceCapabilities {
                 default_selection_supported: true,
                 count_selection_supported: true,
             }),
+            sampled_budget: None,
         };
 
         let capabilities = public_resource_capabilities(driver_capabilities);
 
-        assert!(capabilities.cpu.expect("CPU capabilities").limit_supported);
+        let cpu = capabilities.cpu.expect("CPU capabilities");
+        assert!(cpu.limit_supported);
+        assert_eq!(
+            cpu.limit_enforcement.unwrap().scope,
+            openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container as i32
+        );
         assert!(
             !capabilities
                 .memory

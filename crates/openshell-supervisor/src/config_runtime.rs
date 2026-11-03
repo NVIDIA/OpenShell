@@ -26,12 +26,12 @@ use tracing::{debug, info, warn};
 use crate::provider_readiness::EnvironmentIdentity;
 use crate::{
     CapturedProviderEnvironment, FailedRuntimeRevision, GatewayRuntimeFailureDisposition,
-    InitialPollDisposition, LoadedPolicyOrigin, MiddlewareAuthentication,
-    MiddlewareRegistryReconciliation, MiddlewareRegistryStatus, MiddlewareReloadContext,
-    PolicyGatewayClient, PolicyPollLoopContext, PolicyStatusUpdate, RejectedPolicyGeneration,
-    apply_gateway_runtime_reload_failure, apply_policy_validation_failure,
-    emit_policy_validation_failure, endpoint_status, enqueue_policy_status,
-    gateway_policy_runtime_needs_reconciliation, initial_poll_disposition,
+    GatewayRuntimeReloadError, InitialPollDisposition, LoadedPolicyOrigin,
+    MiddlewareAuthentication, MiddlewareRegistryReconciliation, MiddlewareRegistryStatus,
+    MiddlewareReloadContext, PolicyGatewayClient, PolicyPollLoopContext, PolicyStatusUpdate,
+    RejectedPolicyGeneration, apply_gateway_runtime_reload_failure,
+    apply_policy_validation_failure, emit_policy_validation_failure, endpoint_status,
+    enqueue_policy_status, gateway_policy_runtime_needs_reconciliation, initial_poll_disposition,
     middleware_registry_needs_rebuild, next_poll_delay, ocsf_ctx,
     provider_environment_is_installable, reconcile_middleware_registry,
     reload_gateway_configuration_runtime, retain_extension_credentials, run_policy_status_reporter,
@@ -207,6 +207,34 @@ impl ConfigRuntime {
             has_last_valid_policy: ctx.loaded_policy_origin.has_last_valid_policy(),
             stream: StreamConfigurationState::default(),
         }
+    }
+
+    fn validate_live_filesystem_policy(
+        &self,
+        candidate: Option<&openshell_core::proto::SandboxPolicy>,
+    ) -> Result<()> {
+        let (Some(applied), Some(candidate)) = (&self.endpoint_policy, candidate) else {
+            return Ok(());
+        };
+        let same_paths = |left: &[String], right: &[String]| {
+            left.iter().collect::<std::collections::HashSet<_>>() == right.iter().collect()
+        };
+        let unchanged = match (&applied.filesystem, &candidate.filesystem) {
+            (Some(applied), Some(candidate)) => {
+                applied.include_workdir == candidate.include_workdir
+                    && same_paths(&applied.read_only, &candidate.read_only)
+                    && same_paths(&applied.read_write, &candidate.read_write)
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
+            // Reloading the network engine cannot change installed filesystem permissions.
+            miette::bail!(
+                "filesystem policy cannot be changed on a running sandbox; recreate the sandbox to apply filesystem changes"
+            );
+        }
+        Ok(())
     }
 
     /// Bring the runtime to one sandbox configuration snapshot.
@@ -430,28 +458,34 @@ impl ConfigRuntime {
         let mut runtime_error = String::new();
         if policy_runtime_changed {
             let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
-            let runtime_result = reload_gateway_configuration_runtime(
-                &ctx.opa_engine,
-                result.policy.as_ref(),
-                pid,
-                MiddlewareReloadContext {
-                    desired_services: &result.supervisor_middleware_services,
-                    authentication: &MiddlewareAuthentication {
-                        credentials: middleware_credentials.clone(),
-                        enabled: result.extension_authentication_enabled,
-                    },
-                    registry_changed: middleware_registry_changed,
-                    connector: &ctx.middleware_connector,
-                },
-                ctx.vm_identity,
-                || {
-                    if let Some(prepared) = prepared_provider.as_ref() {
-                        ctx.provider_credentials
-                            .install_prepared(&prepared.credentials);
-                    }
-                },
-            )
-            .await;
+            let runtime_result = match self.validate_live_filesystem_policy(result.policy.as_ref())
+            {
+                Ok(()) => {
+                    reload_gateway_configuration_runtime(
+                        &ctx.opa_engine,
+                        result.policy.as_ref(),
+                        pid,
+                        MiddlewareReloadContext {
+                            desired_services: &result.supervisor_middleware_services,
+                            authentication: &MiddlewareAuthentication {
+                                credentials: middleware_credentials.clone(),
+                                enabled: result.extension_authentication_enabled,
+                            },
+                            registry_changed: middleware_registry_changed,
+                            connector: &ctx.middleware_connector,
+                        },
+                        ctx.vm_identity,
+                        || {
+                            if let Some(prepared) = prepared_provider.as_ref() {
+                                ctx.provider_credentials
+                                    .install_prepared(&prepared.credentials);
+                            }
+                        },
+                    )
+                    .await
+                }
+                Err(error) => Err(GatewayRuntimeReloadError::PolicyValidation(error)),
+            };
 
             match runtime_result {
                 Ok(generation) => {
@@ -2196,6 +2230,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&settings)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             connector,
         );
@@ -2317,6 +2352,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&settings)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -2364,6 +2400,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -2464,6 +2501,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&settings)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -2522,6 +2560,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -2584,6 +2623,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -2676,6 +2716,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -2845,6 +2886,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_revision),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -2916,6 +2958,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_revision),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             middleware_connector,
         );
@@ -2993,6 +3036,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_revision),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             connector,
         );
@@ -3060,6 +3104,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_revision),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             connector,
         );
@@ -3137,6 +3182,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_v1.clone()),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             Some(1),
         )
@@ -3153,6 +3199,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(empty_loaded),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             Some(1),
         )
@@ -3164,6 +3211,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_v1.clone()),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             Some(1),
         )
@@ -3176,6 +3224,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_v2),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             Some(2),
         )
@@ -3202,6 +3251,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_revision),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3323,6 +3373,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3372,6 +3423,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_filesystem_changes_reject_streamed_policy_without_advancing_active_revision() {
+        use openshell_core::proto::{ConfigurationAdmissionState, FilesystemPolicy, PolicySource};
+
+        for source in [PolicySource::Sandbox, PolicySource::Global] {
+            for change in ["read_only", "read_write", "from_none"] {
+                let mut policy = proto_policy_fixture();
+                if change == "from_none" {
+                    policy.filesystem = None;
+                } else {
+                    // Startup may already have added the proxy's filesystem prerequisites.
+                    policy
+                        .filesystem
+                        .as_mut()
+                        .unwrap()
+                        .read_only
+                        .push("/proxy-baseline".into());
+                }
+                let initial = settings_poll_result(Some(policy.clone()), 1, source);
+                let engine = Arc::new(OpaEngine::from_proto(&policy).unwrap());
+                let mut ctx = policy_poll_test_context(
+                    engine.clone(),
+                    LoadedPolicyOrigin::Gateway {
+                        revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                        has_last_valid_policy: true,
+                        written_at_startup: false,
+                    },
+                    default_middleware_connector(),
+                );
+                ctx.endpoint_policy = Some(policy.clone());
+                let (client, _polls, _reports) = scripted_policy_gateway();
+                let mut runtime = started_runtime(&ctx, &initial);
+                let original_generation = engine.current_generation();
+                let original_revision = runtime.applied_revision.clone();
+                let filesystem = policy
+                    .filesystem
+                    .get_or_insert_with(FilesystemPolicy::default);
+                if change == "read_write" {
+                    filesystem.read_write.push("/extra-readwrite".into());
+                } else {
+                    filesystem.read_only.push("/extra-readonly".into());
+                }
+                let mut candidate = settings_poll_result(Some(policy), 2, source);
+                let fail_closed = source == PolicySource::Global && change == "read_only";
+                candidate.policy_validation_failure_mode = if fail_closed {
+                    PolicyValidationFailureMode::FailClosed
+                } else {
+                    PolicyValidationFailureMode::RetainLastValid
+                };
+                let result = apply_with_provider(&mut runtime, &ctx, &client, &candidate).await;
+
+                assert_eq!(
+                    result.outcome,
+                    if fail_closed {
+                        ConfigApplyOutcome::FailedClosed
+                    } else {
+                        ConfigApplyOutcome::FailedRetainedLastKnownGood
+                    },
+                    "{source:?}: {change}"
+                );
+                assert_eq!(
+                    result.admission.state,
+                    i32::from(ConfigurationAdmissionState::Rejected)
+                );
+                assert!(
+                    result
+                        .failure
+                        .as_ref()
+                        .unwrap()
+                        .message
+                        .contains("filesystem")
+                );
+                if source == PolicySource::Sandbox {
+                    let status = result.policy_load.unwrap();
+                    assert_eq!(status.version, 2);
+                    assert!(!status.loaded);
+                    assert!(status.error.contains("filesystem"));
+                }
+                assert_eq!(runtime.applied_revision, original_revision);
+                assert_eq!(runtime.policy_version, 1);
+                assert_eq!(runtime.policy_hash, initial.policy_hash);
+                assert_eq!(runtime.endpoint_policy, initial.policy);
+                assert_eq!(engine.fail_closed_reason().is_some(), fail_closed);
+                assert_eq!(
+                    engine.current_generation(),
+                    original_generation + u64::from(fail_closed)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn live_filesystem_change_poll_reports_failure_then_accepts_network_only_repair() {
+        use openshell_core::proto::PolicySource;
+
+        let policy = proto_policy_fixture();
+        let initial = settings_poll_result(Some(policy.clone()), 1, PolicySource::Sandbox);
+        let mut rejected = policy.clone();
+        rejected
+            .filesystem
+            .as_mut()
+            .unwrap()
+            .read_only
+            .push("/extra-readonly".into());
+        let mut rejected = settings_poll_result(Some(rejected), 2, PolicySource::Sandbox);
+        rejected.policy_validation_failure_mode = PolicyValidationFailureMode::RetainLastValid;
+        let mut repaired = policy.clone();
+        repaired.network_policies = proto_tcp_policy_fixture().network_policies;
+        repaired.filesystem.as_mut().unwrap().read_only.reverse();
+        let repaired = settings_poll_result(Some(repaired), 3, PolicySource::Sandbox);
+        let engine = Arc::new(OpaEngine::from_proto(&policy).unwrap());
+        let mut ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+                written_at_startup: false,
+            },
+            default_middleware_connector(),
+        );
+        ctx.endpoint_policy = Some(policy);
+        let (client, polls, mut reports) = scripted_policy_gateway();
+        polls.send(initial).unwrap();
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        expect_policy_report(&mut reports, 1).await;
+        polls.send(rejected).unwrap();
+        let (version, loaded, error) = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(version, 2);
+        assert!(!loaded);
+        assert!(error.contains("filesystem"));
+        assert_eq!(engine.current_generation(), 0);
+        polls.send(repaired).unwrap();
+        expect_policy_report(&mut reports, 3).await;
+        assert_eq!(engine.current_generation(), 1);
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn rejected_stream_snapshot_preserves_admitted_settings() {
         use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
 
@@ -3406,6 +3597,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3480,6 +3672,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3609,6 +3802,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3713,6 +3907,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3752,6 +3947,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3807,6 +4003,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -3859,6 +4056,7 @@ mod tests {
                         revision: has_last_valid
                             .then(|| LoadedPolicyRevision::from_snapshot(&initial)),
                         has_last_valid_policy: has_last_valid,
+                        written_at_startup: false,
                     },
                     default_middleware_connector(),
                 );
@@ -3983,6 +4181,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: None,
                 has_last_valid_policy: false,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -4028,6 +4227,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -4067,6 +4267,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );
@@ -4160,6 +4361,7 @@ mod tests {
             LoadedPolicyOrigin::Gateway {
                 revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             default_middleware_connector(),
         );

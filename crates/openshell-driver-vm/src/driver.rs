@@ -45,6 +45,9 @@ use oci_client::manifest::{
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
 use openshell_core::UpstreamProxyConfig;
+use openshell_core::backend_startup::{
+    LAUNCH_UNCONFIRMED_CONDITION, LAUNCH_UNCONFIRMED_DIAGNOSTIC, SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED,
+};
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::driver_mounts;
 use openshell_core::gpu::{
@@ -70,7 +73,7 @@ use openshell_core::proto::compute::v1::{
     WorkloadIdentityRequest, compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
-    deserialize_optional_non_empty_string_list, struct_to_json_value,
+    deserialize_optional_non_empty_string_list, struct_to_typed_json_value,
 };
 use openshell_core::{
     NetworkSupervisorTrustBundle, network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES,
@@ -192,8 +195,9 @@ impl VmSandboxDriverConfig {
             return Ok(Self::default());
         };
 
-        serde_json::from_value(struct_to_json_value(config))
-            .map_err(|err| format!("invalid vm driver_config: {err}"))
+        let json = struct_to_typed_json_value(config)
+            .map_err(|err| format!("invalid vm driver_config: {err}"))?;
+        serde_json::from_value(json).map_err(|err| format!("invalid vm driver_config: {err}"))
     }
 }
 
@@ -1457,7 +1461,9 @@ impl VmDriver {
             .env(openshell_core::sandbox_env::SANDBOX, &sandbox.name)
             .env(
                 openshell_core::sandbox_env::SSH_SOCKET_PATH,
-                sandbox_socket_dir(&self.socket_root, &sandbox.id).join("ssh.sock"),
+                sandbox_socket_dir(&self.socket_root, &sandbox.id)
+                    .map_err(|err| Status::internal(format!("sandbox socket dir: {err}")))?
+                    .join("ssh.sock"),
             )
             .env(
                 openshell_core::sandbox_env::PROXY_TLS_DIR,
@@ -1534,16 +1540,37 @@ impl VmDriver {
     }
 
     #[must_use]
+    fn resource_capabilities(gpu_supported: bool) -> ResourceCapabilities {
+        ResourceCapabilities {
+            cpu: Some(CpuResourceCapabilities {
+                limit_supported: false,
+                ..Default::default()
+            }),
+            memory: Some(MemoryResourceCapabilities {
+                limit_supported: false,
+                ..Default::default()
+            }),
+            gpu: Some(GpuResourceCapabilities {
+                default_selection_supported: gpu_supported,
+                count_selection_supported: gpu_supported,
+            }),
+            sampled_budget: None,
+        }
+    }
+
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
         let mut extension = openshell_core::extension_protocol::extension_metadata(
             openshell_core::extension_protocol::ExtensionFamily::Compute,
             "openshell/vm",
             openshell_core::VERSION,
-            [],
+            [openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION.to_string()],
         );
         extension
             .required_capabilities
             .push(openshell_core::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION.to_string());
+        extension
+            .supported_capabilities
+            .push(openshell_core::extension_protocol::COMPUTE_RESOURCE_CONTRACT.to_string());
         GetCapabilitiesResponse {
             resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
                 allow_driver_config: self.config.allow_driver_config,
@@ -1556,24 +1583,21 @@ impl VmDriver {
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: false,
-            resource_capabilities: Some(ResourceCapabilities {
-                cpu: Some(CpuResourceCapabilities {
-                    limit_supported: false,
-                }),
-                memory: Some(MemoryResourceCapabilities {
-                    limit_supported: false,
-                }),
-                gpu: Some(GpuResourceCapabilities {
-                    default_selection_supported: self.config.gpu_enabled,
-                    count_selection_supported: self.config.gpu_enabled,
-                }),
-            }),
+            resource_capabilities: Some(Self::resource_capabilities(self.config.gpu_enabled)),
+            workload_compatibility: Some(
+                openshell_core::proto::compute::v1::WorkloadCompatibility {
+                    operating_system: "linux".to_string(),
+                    architecture: linux_oci_arch().to_string(),
+                    execution_restrictions: Vec::new(),
+                },
+            ),
             rootfs_tar_staging_dir: self
                 .config
                 .rootfs_tar_staging_dir()
                 .to_string_lossy()
                 .into_owned(),
             rootfs_tar_max_bytes: self.config.rootfs_tar_max_bytes(),
+            proxy_filesystem_baseline: None,
             extension: Some(extension),
         }
     }
@@ -2054,10 +2078,10 @@ impl VmDriver {
         }
 
         let console_output = state_dir.join("rootfs-console.log");
-        create_sandbox_socket_dir(&self.socket_root_fd, &self.socket_root, &sandbox.id)
-            .map_err(|err| Status::internal(format!("create socket dir failed: {err}")))?;
         let control_socket =
-            sandbox_socket_dir(&self.socket_root, &sandbox.id).join(VM_CONTROL_SOCKET);
+            create_sandbox_socket_dir(&self.socket_root_fd, &self.socket_root, &sandbox.id)
+                .map_err(|err| Status::internal(format!("create socket dir failed: {err}")))?
+                .join(VM_CONTROL_SOCKET);
         let session_id = launch_authentication.supervisor.session_id;
         let channel_tls = generate_sandbox_tls_material(session_id)
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -5077,11 +5101,23 @@ impl VmDriver {
                         let _ = terminate_vm_process(&mut process.child).await;
                     }
                 }
-                let mut message = status.code().map_or_else(
-                    || format!("{component} process exited"),
-                    |code| format!("{component} process exited with status {code}"),
-                );
+                let launch_unconfirmed = component == "host supervisor"
+                    && status.code() == Some(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED);
+                let reason = if launch_unconfirmed {
+                    LAUNCH_UNCONFIRMED_CONDITION
+                } else {
+                    "ProcessExited"
+                };
+                let mut message = if launch_unconfirmed {
+                    LAUNCH_UNCONFIRMED_DIAGNOSTIC.to_string()
+                } else {
+                    status.code().map_or_else(
+                        || format!("{component} process exited"),
+                        |code| format!("{component} process exited with status {code}"),
+                    )
+                };
                 if component == "host supervisor"
+                    && !launch_unconfirmed
                     && let Some(state_dir) = state_dir.as_deref()
                     && let Some(stderr) = read_vm_console_tail(
                         &state_dir.join("supervisor.err.log"),
@@ -5092,18 +5128,14 @@ impl VmDriver {
                         .expect("writing to String cannot fail");
                 }
                 if let Some(snapshot) = self
-                    .set_snapshot_condition(
-                        &sandbox_id,
-                        error_condition("ProcessExited", &message),
-                        false,
-                    )
+                    .set_snapshot_condition(&sandbox_id, error_condition(reason, &message), false)
                     .await
                 {
                     self.publish_snapshot(snapshot);
                 }
                 self.publish_platform_event(
                     sandbox_id.clone(),
-                    platform_event("vm", "Warning", "ProcessExited", message),
+                    platform_event("vm", "Warning", reason, message),
                 );
                 let (has_gpu, cleanup_ctx) = {
                     let registry = self.registry.lock().await;
@@ -5334,7 +5366,13 @@ impl ComputeDriver for VmDriver {
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.validate_sandbox(&sandbox)?;
-        Ok(Response::new(ValidateSandboxCreateResponse {}))
+        Ok(Response::new(ValidateSandboxCreateResponse {
+            ingress_admission: Some(openshell_core::proto::SandboxIngressAdmission {
+                scope: openshell_core::proto::IngressScope::IsolatedLoopback as i32,
+                all_ports: true,
+                ports: Vec::new(),
+            }),
+        }))
     }
 
     async fn create_sandbox(
@@ -5541,6 +5579,8 @@ fn decode_launch_authentication(
 
 #[allow(clippy::result_large_err)]
 fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Status> {
+    openshell_core::resource_contract::validate_request(sandbox, None, true)
+        .map_err(Status::failed_precondition)?;
     validate_sandbox_id(&sandbox.id)?;
 
     let spec = sandbox
@@ -6783,11 +6823,20 @@ async fn restrict_owner_only_dir(_path: &Path) -> Result<(), std::io::Error> {
 }
 
 const SOCKET_ROOT_ALLOC_RETRIES: usize = 16;
-/// macOS `sun_path` is 104 bytes including the NUL terminator.
-const MAX_SUN_PATH_LEN: usize = 103;
 
-fn sandbox_socket_dir(socket_root: &Path, sandbox_id: &str) -> PathBuf {
-    socket_root.join(sandbox_id)
+/// Name of a sandbox's socket directory under the socket root. Sandbox IDs can
+/// be 128 bytes, so a fixed-length digest keeps socket paths short.
+fn sandbox_socket_leaf(sandbox_id: &str) -> Result<String, std::io::Error> {
+    let digest = openshell_crypto::sha256(sandbox_id.as_bytes()).map_err(std::io::Error::other)?;
+    let mut leaf = String::with_capacity(32);
+    for byte in &digest[..16] {
+        write!(&mut leaf, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(leaf)
+}
+
+fn sandbox_socket_dir(socket_root: &Path, sandbox_id: &str) -> Result<PathBuf, std::io::Error> {
+    Ok(socket_root.join(sandbox_socket_leaf(sandbox_id)?))
 }
 
 fn allocate_socket_root() -> Result<(PathBuf, OwnedFd), std::io::Error> {
@@ -6836,34 +6885,34 @@ fn create_sandbox_socket_dir(
     socket_root: &Path,
     sandbox_id: &str,
 ) -> Result<PathBuf, std::io::Error> {
-    let longest = socket_root.join(sandbox_id).join(VM_CONTROL_SOCKET);
-    if longest.as_os_str().len() > MAX_SUN_PATH_LEN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "socket path {} exceeds sun_path limit ({MAX_SUN_PATH_LEN} bytes)",
-                longest.display()
-            ),
-        ));
-    }
-    match rustix::fs::mkdirat(root_fd, sandbox_id, rustix::fs::Mode::from_raw_mode(0o700)) {
+    let leaf = sandbox_socket_leaf(sandbox_id)?;
+    let dir = socket_root.join(&leaf);
+    openshell_core::unix_socket_path::check(&dir.join(VM_CONTROL_SOCKET))?;
+    match rustix::fs::mkdirat(
+        root_fd,
+        leaf.as_str(),
+        rustix::fs::Mode::from_raw_mode(0o700),
+    ) {
         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
         Err(e) => return Err(e.into()),
     }
-    Ok(socket_root.join(sandbox_id))
+    Ok(dir)
 }
 
 fn remove_sandbox_socket_dir(root_fd: &OwnedFd, sandbox_id: &str) {
+    let Ok(leaf) = sandbox_socket_leaf(sandbox_id) else {
+        return;
+    };
     if let Ok(leaf_fd) = rustix::fs::openat(
         root_fd,
-        sandbox_id,
+        leaf.as_str(),
         rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW,
         rustix::fs::Mode::empty(),
     ) {
         let _ = rustix::fs::unlinkat(&leaf_fd, VM_CONTROL_SOCKET, rustix::fs::AtFlags::empty());
         let _ = rustix::fs::unlinkat(&leaf_fd, "ssh.sock", rustix::fs::AtFlags::empty());
     }
-    let _ = rustix::fs::unlinkat(root_fd, sandbox_id, rustix::fs::AtFlags::REMOVEDIR);
+    let _ = rustix::fs::unlinkat(root_fd, leaf.as_str(), rustix::fs::AtFlags::REMOVEDIR);
 }
 
 #[allow(clippy::result_large_err)]
@@ -8327,7 +8376,8 @@ mod tests {
     use tonic::Code;
 
     fn test_socket_root() -> (PathBuf, Arc<OwnedFd>) {
-        let dir = std::env::temp_dir().join(format!(
+        // Production socket roots live under /tmp; macOS TMPDIR is too long.
+        let dir = Path::new("/tmp").join(format!(
             "os-test-{:016x}",
             u64::from_ne_bytes(openshell_crypto::random_bytes::<8>().expect("test entropy"))
         ));
@@ -9337,9 +9387,10 @@ mod tests {
                 .spawn()
                 .unwrap()
         };
-        for (component, child) in [
-            ("VM", spawn_exited_child()),
-            ("host supervisor", running_child()),
+        for (component, child, launch_unconfirmed) in [
+            ("VM", spawn_exited_child(), false),
+            ("host supervisor", running_child(), false),
+            ("host supervisor", running_child(), true),
         ] {
             let temp = tempfile::tempdir().unwrap();
             std::fs::write(temp.path().join("rootfs-console.log"), "agent output\n").unwrap();
@@ -9348,7 +9399,29 @@ mod tests {
             let mut events = driver.events.subscribe();
             insert_test_record(&driver, "sb-exit", temp.path().to_path_buf(), child).await;
 
+            if launch_unconfirmed {
+                let process = driver.registry.lock().await["sb-exit"]
+                    .process
+                    .as_ref()
+                    .unwrap()
+                    .clone();
+                let mut process = process.lock().await;
+                process.supervisor.wait().await.unwrap();
+                process.supervisor = Command::new("sh")
+                    .arg("-c")
+                    .arg("exit 84")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+            }
             driver.monitor_sandbox("sb-exit".to_string()).await;
+            let expected_reason = if launch_unconfirmed {
+                LAUNCH_UNCONFIRMED_CONDITION
+            } else {
+                "ProcessExited"
+            };
 
             let condition = driver.registry.lock().await["sb-exit"]
                 .snapshot
@@ -9358,7 +9431,7 @@ mod tests {
                     status
                         .conditions
                         .iter()
-                        .find(|condition| condition.reason == "ProcessExited")
+                        .find(|condition| condition.reason == expected_reason)
                         .cloned()
                 })
                 .expect("ProcessExited condition");
@@ -9366,17 +9439,22 @@ mod tests {
             while let Ok(event) = events.try_recv() {
                 if let Some(watch_sandboxes_event::Payload::PlatformEvent(platform)) = event.payload
                     && let Some(event) = platform.event
-                    && event.reason == "ProcessExited"
+                    && event.reason == expected_reason
                 {
                     event_message = Some(event.message);
                 }
             }
-            let event_message = event_message.expect("ProcessExited platform event");
+            let event_message = event_message.expect("process failure platform event");
             for message in [&condition.message, &event_message] {
-                assert!(message.starts_with(&format!("{component} process exited")));
+                if launch_unconfirmed {
+                    assert_eq!(message.as_str(), LAUNCH_UNCONFIRMED_DIAGNOSTIC);
+                    assert!(!message.contains("supervisor error"));
+                } else {
+                    assert!(message.starts_with(&format!("{component} process exited")));
+                }
                 assert!(!message.contains("agent output"), "{component}: {message}");
             }
-            if component == "host supervisor" {
+            if !launch_unconfirmed && component == "host supervisor" {
                 assert!(condition.message.contains("supervisor error"));
             }
         }
@@ -9575,6 +9653,7 @@ mod tests {
     fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
         ResourceRequirements {
             gpu: Some(GpuResourceRequirements { count }),
+            ..Default::default()
         }
     }
 
@@ -9946,7 +10025,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_vm_sandbox_accepts_template_resources_as_noop() {
+    fn validate_vm_sandbox_rejects_unenforced_template_resources() {
         use openshell_core::proto::compute::v1::DriverResourceRequirements;
 
         let sandbox = Sandbox {
@@ -9964,8 +10043,10 @@ mod tests {
             }),
             ..Default::default()
         };
-        validate_vm_sandbox(&sandbox, false)
-            .expect("template.resources should be accepted and ignored");
+        assert_eq!(
+            validate_vm_sandbox(&sandbox, false).unwrap_err().code(),
+            Code::FailedPrecondition
+        );
     }
 
     #[test]
@@ -10558,20 +10639,26 @@ mod tests {
     }
 
     #[test]
-    fn create_sandbox_socket_dir_rejects_over_long_ids() {
+    fn create_sandbox_socket_dir_accepts_longest_sandbox_id() {
         let (root, fd) = test_socket_root();
-        let err = create_sandbox_socket_dir(&fd, &root, &"x".repeat(128)).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(!root.join("x".repeat(128)).exists());
+        let sandbox_id = "x".repeat(128);
+        let dir = create_sandbox_socket_dir(&fd, &root, &sandbox_id).unwrap();
+        assert!(dir.is_dir());
+        assert_eq!(dir, sandbox_socket_dir(&root, &sandbox_id).unwrap());
+        std::os::unix::net::UnixListener::bind(dir.join(VM_CONTROL_SOCKET)).unwrap();
+        remove_sandbox_socket_dir(&fd, &sandbox_id);
+        assert!(!dir.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn sandbox_socket_dir_fits_macos_sun_path() {
-        let sandbox_id = "3eb2ad45-bead-4c2e-bd10-1a4a7f3a2721";
+        let sandbox_id = "x".repeat(128);
         let worst_root = "/tmp/os-4294967295-00000000000000000000000000000000";
-        let control = sandbox_socket_dir(Path::new(worst_root), sandbox_id).join(VM_CONTROL_SOCKET);
-        let ssh = sandbox_socket_dir(Path::new(worst_root), sandbox_id).join("ssh.sock");
+        let dir = sandbox_socket_dir(Path::new(worst_root), &sandbox_id).unwrap();
+        let control = dir.join(VM_CONTROL_SOCKET);
+        let ssh = dir.join("ssh.sock");
+        assert_ne!(dir, sandbox_socket_dir(Path::new(worst_root), "y").unwrap());
         assert!(
             control.as_os_str().len() < 104,
             "control socket path exceeds macOS sun_path: {}",
@@ -14127,6 +14214,10 @@ while :; do sleep 0.05; done"#,
     #[test]
     fn capabilities_report_static_resource_support() {
         let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        let workload = driver.capabilities().workload_compatibility.unwrap();
+        assert_eq!(workload.operating_system, "linux");
+        assert_eq!(workload.architecture, linux_oci_arch());
+        assert!(workload.execution_restrictions.is_empty());
         let resources = driver.capabilities().resource_capabilities.unwrap();
         assert!(!resources.cpu.unwrap().limit_supported);
         assert!(!resources.memory.unwrap().limit_supported);

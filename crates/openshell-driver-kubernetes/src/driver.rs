@@ -50,6 +50,10 @@ use kube::runtime::wait::await_condition;
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
 use openshell_core::NetworkSupervisorTrustBundle;
+use openshell_core::backend_startup::{
+    LAUNCH_UNCONFIRMED_CONDITION, LAUNCH_UNCONFIRMED_DIAGNOSTIC, RuntimeStartupFailure,
+    SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED,
+};
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_GATEWAY_ID, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID,
@@ -69,7 +73,7 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
     WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
-use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
+use openshell_core::proto_struct::{struct_to_typed_json_value, value_to_json};
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use openshell_sandbox_backend::boundary_protocol::{
     GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
@@ -711,7 +715,8 @@ impl KubernetesSandboxDriverConfig {
             return Ok(Self::default());
         };
 
-        let json = serde_json::Value::Object(struct_to_json_object(config));
+        let json = struct_to_typed_json_value(config)
+            .map_err(|err| format!("invalid kubernetes driver_config: {err}"))?;
         let config: Self = serde_json::from_value(json)
             .map_err(|err| format!("invalid kubernetes driver_config: {err}"))?;
         config
@@ -1296,6 +1301,38 @@ impl KubernetesComputeDriver {
         Ok(driver)
     }
 
+    fn resource_capabilities() -> ResourceCapabilities {
+        ResourceCapabilities {
+                cpu: Some(CpuResourceCapabilities {
+                    limit_supported: true,
+                    request_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                        kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::SchedulerRequest as i32,
+                        scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container as i32,
+                    }),
+                    limit_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                        kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::KernelLimit as i32,
+                        scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container as i32,
+                    }),
+}),
+                memory: Some(MemoryResourceCapabilities {
+                    limit_supported: true,
+                    request_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                        kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::SchedulerRequest as i32,
+                        scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container as i32,
+                    }),
+                    limit_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                        kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::KernelLimit as i32,
+                        scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container as i32,
+                    }),
+}),
+                gpu: Some(GpuResourceCapabilities {
+                    default_selection_supported: true,
+                    count_selection_supported: true,
+                }),
+            sampled_budget: None,
+}
+    }
+
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
         Ok(GetCapabilitiesResponse {
             resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
@@ -1309,20 +1346,17 @@ impl KubernetesComputeDriver {
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication: true,
             driver_reports_runtime_readiness: false,
-            resource_capabilities: Some(ResourceCapabilities {
-                cpu: Some(CpuResourceCapabilities {
-                    limit_supported: true,
-                }),
-                memory: Some(MemoryResourceCapabilities {
-                    limit_supported: true,
-                }),
-                gpu: Some(GpuResourceCapabilities {
-                    default_selection_supported: true,
-                    count_selection_supported: true,
-                }),
-            }),
+            resource_capabilities: Some(Self::resource_capabilities()),
+            workload_compatibility: Some(
+                openshell_core::proto::compute::v1::WorkloadCompatibility {
+                    operating_system: "linux".to_string(),
+                    architecture: String::new(),
+                    execution_restrictions: Vec::new(),
+                },
+            ),
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
+            proxy_filesystem_baseline: None,
             extension: Some(openshell_core::extension_protocol::extension_metadata(
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/kubernetes",
@@ -1330,6 +1364,8 @@ impl KubernetesComputeDriver {
                 [
                     openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION
                         .to_string(),
+                    openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION.to_string(),
+                    openshell_core::extension_protocol::COMPUTE_RESOURCE_CONTRACT.to_string(),
                 ],
             )),
         })
@@ -2105,6 +2141,12 @@ impl KubernetesComputeDriver {
             self.config.allow_driver_config,
             sandbox,
         )?;
+        openshell_core::resource_contract::validate_request(
+            sandbox,
+            Some(&Self::resource_capabilities()),
+            true,
+        )
+        .map_err(tonic::Status::failed_precondition)?;
         self.config
             .resource_admission
             .validate()
@@ -2359,6 +2401,12 @@ impl KubernetesComputeDriver {
         )
     )]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<String, KubernetesDriverError> {
+        openshell_core::resource_contract::validate_request(
+            sandbox,
+            Some(&Self::resource_capabilities()),
+            true,
+        )
+        .map_err(|error| admission_error(tonic::Status::failed_precondition(error)))?;
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let _guard = self
             .lifecycle_gates
@@ -4988,6 +5036,7 @@ impl KubernetesComputeDriver {
                     &object,
                 )
                 .await
+                .0
                 {
                     SandboxRuntimeControlAvailability::Available
                     | SandboxRuntimeControlAvailability::Degraded => {}
@@ -5015,6 +5064,7 @@ impl KubernetesComputeDriver {
                     &object,
                 )
                 .await
+                .0
                 {
                     SandboxRuntimeControlAvailability::Available
                     | SandboxRuntimeControlAvailability::Degraded => {}
@@ -6840,36 +6890,94 @@ fn sandbox_runtime_readiness_state(
     }
 }
 
+fn runtime_startup_failure_from_pod(pod: &Pod) -> Option<(&'static str, &'static str)> {
+    let container = pod
+        .spec
+        .as_ref()?
+        .containers
+        .iter()
+        .find(|container| container.name == "agent")?;
+    let command = container.command.as_ref()?;
+    if command.first()? != &format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox")
+        || command.get(1).map(String::as_str) != Some("--bootstrap")
+    {
+        return None;
+    }
+    let terminated = pod
+        .status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .iter()
+        .find(|container| container.name == "agent")?
+        .state
+        .as_ref()?
+        .terminated
+        .as_ref()?;
+    if terminated.signal.is_some_and(|signal| signal != 0)
+        || terminated.reason.as_deref() == Some("OOMKilled")
+    {
+        return None;
+    }
+    let failure = RuntimeStartupFailure::from_exit_code(i64::from(terminated.exit_code))?;
+    Some((failure.condition_reason(), failure.diagnostic()))
+}
+
+fn supervisor_startup_failure_from_pod(pod: &Pod) -> Option<(&'static str, &'static str)> {
+    let terminated = pod
+        .status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .iter()
+        .find(|container| container.name == "supervisor")?
+        .state
+        .as_ref()?
+        .terminated
+        .as_ref()?;
+    if terminated.signal.is_some_and(|signal| signal != 0)
+        || terminated.reason.as_deref() == Some("OOMKilled")
+    {
+        return None;
+    }
+    (terminated.exit_code == SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED)
+        .then_some((LAUNCH_UNCONFIRMED_CONDITION, LAUNCH_UNCONFIRMED_DIAGNOSTIC))
+}
+
 async fn sandbox_runtime_workload_generation_matches(
     client: &Client,
     namespace: &str,
     pod_name: &str,
     sandbox: &DynamicObject,
-) -> SandboxRuntimeControlAvailability {
+) -> (
+    SandboxRuntimeControlAvailability,
+    Option<(&'static str, &'static str)>,
+) {
     let Some(expected_uid) = sandbox
         .metadata
         .annotations
         .as_ref()
         .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID))
     else {
-        return SandboxRuntimeControlAvailability::Unavailable;
+        return (SandboxRuntimeControlAvailability::Unavailable, None);
     };
     let pods = Api::<Pod>::namespaced(client.clone(), namespace);
     match tokio::time::timeout(KUBE_API_TIMEOUT, pods.get_opt(pod_name)).await {
-        Ok(Ok(Some(pod))) if pod.metadata.uid.as_deref() == Some(expected_uid.as_str()) => {
-            SandboxRuntimeControlAvailability::Available
-        }
-        Ok(Ok(_)) => SandboxRuntimeControlAvailability::Unavailable,
+        Ok(Ok(Some(pod))) if pod.metadata.uid.as_deref() == Some(expected_uid.as_str()) => (
+            SandboxRuntimeControlAvailability::Available,
+            runtime_startup_failure_from_pod(&pod),
+        ),
+        Ok(Ok(_)) => (SandboxRuntimeControlAvailability::Unavailable, None),
         Ok(Err(error)) => {
             warn!(pod = pod_name, %error, "could not verify sandbox-runtime workload generation");
-            SandboxRuntimeControlAvailability::Unknown
+            (SandboxRuntimeControlAvailability::Unknown, None)
         }
         Err(_) => {
             warn!(
                 pod = pod_name,
                 "timed out checking sandbox-runtime workload generation"
             );
-            SandboxRuntimeControlAvailability::Unknown
+            (SandboxRuntimeControlAvailability::Unknown, None)
         }
     }
 }
@@ -6879,14 +6987,17 @@ async fn sandbox_runtime_supervisor_generation_matches(
     namespace: &str,
     sandbox_id: &str,
     sandbox: &DynamicObject,
-) -> SandboxRuntimeControlAvailability {
+) -> (
+    SandboxRuntimeControlAvailability,
+    Option<(&'static str, &'static str)>,
+) {
     match supervisor_placement(sandbox) {
         Ok(SupervisorPlacement::Dedicated) => {}
         // The sandbox instance's sandbox is checked with its availability.
         Ok(SupervisorPlacement::Shared { .. }) => {
-            return SandboxRuntimeControlAvailability::Available;
+            return (SandboxRuntimeControlAvailability::Available, None);
         }
-        Err(_) => return SandboxRuntimeControlAvailability::Unavailable,
+        Err(_) => return (SandboxRuntimeControlAvailability::Unavailable, None),
     }
     let Some(expected_uid) = sandbox
         .metadata
@@ -6894,25 +7005,26 @@ async fn sandbox_runtime_supervisor_generation_matches(
         .as_ref()
         .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID))
     else {
-        return SandboxRuntimeControlAvailability::Unavailable;
+        return (SandboxRuntimeControlAvailability::Unavailable, None);
     };
     let names = SandboxRuntimeNames::new(sandbox_id);
     let pods = Api::<Pod>::namespaced(client.clone(), namespace);
     match tokio::time::timeout(KUBE_API_TIMEOUT, pods.get_opt(&names.supervisor_pod)).await {
-        Ok(Ok(Some(pod))) if pod.metadata.uid.as_deref() == Some(expected_uid.as_str()) => {
-            SandboxRuntimeControlAvailability::Available
-        }
-        Ok(Ok(_)) => SandboxRuntimeControlAvailability::Unavailable,
+        Ok(Ok(Some(pod))) if pod.metadata.uid.as_deref() == Some(expected_uid.as_str()) => (
+            SandboxRuntimeControlAvailability::Available,
+            supervisor_startup_failure_from_pod(&pod),
+        ),
+        Ok(Ok(_)) => (SandboxRuntimeControlAvailability::Unavailable, None),
         Ok(Err(error)) => {
             warn!(pod = names.supervisor_pod, %error, "could not verify sandbox-runtime supervisor generation");
-            SandboxRuntimeControlAvailability::Unknown
+            (SandboxRuntimeControlAvailability::Unknown, None)
         }
         Err(_) => {
             warn!(
                 pod = names.supervisor_pod,
                 "timed out checking sandbox-runtime supervisor generation"
             );
-            SandboxRuntimeControlAvailability::Unknown
+            (SandboxRuntimeControlAvailability::Unknown, None)
         }
     }
 }
@@ -6923,17 +7035,13 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
     namespace: &str,
     obj: DynamicObject,
 ) -> Result<(String, Sandbox), String> {
-    let bootstrapping = sandbox_runtime_bootstrap_in_progress(&obj);
     let sandbox_id = sandbox_id_from_object(&obj).unwrap_or_default();
     let object_namespace = obj
         .metadata
         .namespace
         .clone()
         .unwrap_or_else(|| namespace.to_string());
-    let (name, mut sandbox) = sandbox_from_object(namespace, obj.clone())?;
-    if bootstrapping {
-        mark_sandbox_runtime_bootstrapping(&mut sandbox);
-    }
+    let (name, mut sandbox) = sandbox_from_object_with_bootstrap_state(namespace, &obj)?;
     if !sandbox_id.is_empty() {
         let dependencies = Box::pin(generation_control_availability(
             client,
@@ -6954,8 +7062,11 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
             &sandbox_id,
             &obj,
         ));
-        let (dependencies, workload_generation, supervisor_generation) =
-            tokio::join!(dependencies, workload_generation, supervisor_generation);
+        let (
+            dependencies,
+            (workload_generation, workload_failure),
+            (supervisor_generation, supervisor_failure),
+        ) = tokio::join!(dependencies, workload_generation, supervisor_generation);
         // A transient API read failure is not evidence that the running
         // boundary disappeared. Preserve the CR's published readiness for
         // Unknown and let periodic reconciliation retry.
@@ -6968,8 +7079,51 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
         {
             mark_sandbox_runtime_control_unavailable(&mut sandbox);
         }
+        if sandbox_runtime_should_run(&obj)
+            && let Some((reason, message)) = workload_failure.or(supervisor_failure)
+        {
+            let status = sandbox.status.get_or_insert_with(Default::default);
+            status.conditions.retain(|condition| {
+                condition.r#type != "Ready" && condition.r#type != SANDBOX_SUSPENDED_CONDITION
+            });
+            status.conditions.push(SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: reason.to_string(),
+                message: message.to_string(),
+                transition_time: None,
+            });
+        }
     }
     Ok((name, sandbox))
+}
+
+fn sandbox_from_object_with_bootstrap_state(
+    namespace: &str,
+    obj: &DynamicObject,
+) -> Result<(String, Sandbox), String> {
+    let (name, mut sandbox) = sandbox_from_object(namespace, obj.clone())?;
+    if sandbox_runtime_bootstrap_in_progress(obj) {
+        if sandbox_runtime_bootstrap_operation(obj) == Some("stop") {
+            mark_sandbox_runtime_stopping(&mut sandbox);
+        } else {
+            mark_sandbox_runtime_bootstrapping(&mut sandbox);
+        }
+    }
+    Ok((name, sandbox))
+}
+
+/// A stop holds the bootstrap annotations until its completion patch, but it
+/// is not a start: the gateway reads `Bootstrapping=True` as an accepted
+/// start that may replace a settled Stopped phase. Withhold the suspension
+/// until the stop completes, as a start does.
+fn mark_sandbox_runtime_stopping(sandbox: &mut Sandbox) {
+    if let Some(status) = sandbox.status.as_mut() {
+        status.conditions.retain(|condition| {
+            condition.r#type != SANDBOX_SUSPENDED_CONDITION && condition.r#type != "Bootstrapping"
+        });
+    }
+    mark_sandbox_runtime_control_unavailable(sandbox);
 }
 
 fn mark_sandbox_runtime_bootstrapping(sandbox: &mut Sandbox) {
@@ -11625,6 +11779,7 @@ mod tests {
             spec: Some(SandboxSpec {
                 resource_requirements: Some(ResourceRequirements {
                     gpu: Some(GpuResourceRequirements { count: Some(0) }),
+                    ..Default::default()
                 }),
                 ..SandboxSpec::default()
             }),
@@ -12891,6 +13046,11 @@ mod tests {
                         "key": "nvidia.com/gpu",
                         "operator": "Exists",
                         "effect": "NoSchedule"
+                    }, {
+                        "key": "maintenance.example.com/pool",
+                        "operator": "Exists",
+                        "effect": "NoExecute",
+                        "tolerationSeconds": 512
                     }]
                 },
                 "containers": {
@@ -12933,6 +13093,10 @@ mod tests {
             pod_template["spec"]["tolerations"][0]["key"],
             serde_json::json!("nvidia.com/gpu")
         );
+        let toleration: k8s_openapi::api::core::v1::Toleration =
+            serde_json::from_value(pod_template["spec"]["tolerations"][1].clone())
+                .expect("transport preserves the integer expected by the Kubernetes API");
+        assert_eq!(toleration.toleration_seconds, Some(512));
         assert_eq!(
             pod_template["spec"]["containers"][0]["resources"]["requests"]["vendor.example/gpu-memory"],
             serde_json::json!("8Gi")
@@ -14449,6 +14613,142 @@ mod tests {
                 && condition.status == "True"
                 && condition.reason == "SandboxRuntimeGenerationStarting"
         }));
+    }
+
+    fn sandbox_cr_mid_operation(operation: Option<&str>) -> DynamicObject {
+        let mut annotations = BTreeMap::from([
+            (
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING.to_string(),
+                "true".to_string(),
+            ),
+            (
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE.to_string(),
+                SandboxRuntimeBootstrapPhase::Suspending
+                    .as_str()
+                    .to_string(),
+            ),
+        ]);
+        if let Some(operation) = operation {
+            annotations.insert(
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION.to_string(),
+                operation.to_string(),
+            );
+        }
+        DynamicObject {
+            types: None,
+            metadata: ObjectMeta {
+                name: Some("alpha--work".to_string()),
+                namespace: Some("default".to_string()),
+                annotations: Some(annotations),
+                labels: Some(BTreeMap::from([
+                    (LABEL_SANDBOX_ID.to_string(), "uuid-123".to_string()),
+                    (LABEL_SANDBOX_NAME.to_string(), "work".to_string()),
+                    (LABEL_SANDBOX_WORKSPACE.to_string(), "alpha".to_string()),
+                    (
+                        LABEL_MANAGED_BY.to_string(),
+                        LABEL_MANAGED_BY_VALUE.to_string(),
+                    ),
+                ])),
+                ..Default::default()
+            },
+            data: serde_json::json!({
+                "status": {
+                    "conditions": [
+                        {"type": "Ready", "status": "False", "reason": "SandboxSuspended"},
+                        {"type": "Suspended", "status": "True", "reason": "PodTerminated"},
+                    ]
+                }
+            }),
+        }
+    }
+
+    fn has_condition(sandbox: &Sandbox, r#type: &str, status: &str) -> bool {
+        sandbox.status.as_ref().is_some_and(|sandbox_status| {
+            sandbox_status
+                .conditions
+                .iter()
+                .any(|condition| condition.r#type == r#type && condition.status == status)
+        })
+    }
+
+    // The gateway treats Bootstrapping=True as an accepted start and lets it
+    // replace a settled Stopped phase. A snapshot taken while a stop still
+    // holds its bootstrap annotations can arrive after that stop settled
+    // (#5195), so it must not claim a starting generation.
+    #[test]
+    fn stop_snapshot_does_not_report_a_starting_generation() {
+        let (_, sandbox) = sandbox_from_object_with_bootstrap_state(
+            "default",
+            &sandbox_cr_mid_operation(Some("stop")),
+        )
+        .unwrap();
+
+        assert!(!has_condition(&sandbox, "Bootstrapping", "True"));
+        // Suspension is still published only once the stop completes.
+        assert!(!has_condition(
+            &sandbox,
+            SANDBOX_SUSPENDED_CONDITION,
+            "True"
+        ));
+        assert!(!has_condition(&sandbox, "Ready", "True"));
+    }
+
+    #[test]
+    fn start_snapshots_report_a_starting_generation() {
+        for operation in [Some("create"), Some("restart"), None] {
+            let (_, sandbox) = sandbox_from_object_with_bootstrap_state(
+                "default",
+                &sandbox_cr_mid_operation(operation),
+            )
+            .unwrap();
+
+            assert!(
+                has_condition(&sandbox, "Bootstrapping", "True"),
+                "{operation:?}"
+            );
+            assert!(
+                !has_condition(&sandbox, SANDBOX_SUSPENDED_CONDITION, "True"),
+                "{operation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_pod_exit_reports_fixed_startup_failure() {
+        let mut pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "runtime"},
+            "spec": {"containers": [{"name": "agent", "command": [format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"), "--bootstrap", BOUNDARY_CONFIG_PATH]}]},
+            "status": {"containerStatuses": [{"name": "agent", "image": "test", "imageID": "test", "ready": false, "restartCount": 0, "state": {"terminated": {"exitCode": 81}}}]}
+        })).unwrap();
+        assert_eq!(
+            runtime_startup_failure_from_pod(&pod),
+            Some((
+                RuntimeStartupFailure::LandlockUnavailable.condition_reason(),
+                RuntimeStartupFailure::LandlockUnavailable.diagnostic()
+            ))
+        );
+        pod.spec.as_mut().unwrap().containers[0].command = Some(vec!["untrusted-command".into()]);
+        assert_eq!(runtime_startup_failure_from_pod(&pod), None);
+        let state = &mut pod
+            .status
+            .as_mut()
+            .unwrap()
+            .container_statuses
+            .as_mut()
+            .unwrap()[0];
+        state.name = "supervisor".into();
+        state
+            .state
+            .as_mut()
+            .unwrap()
+            .terminated
+            .as_mut()
+            .unwrap()
+            .exit_code = SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED;
+        assert_eq!(
+            supervisor_startup_failure_from_pod(&pod),
+            Some((LAUNCH_UNCONFIRMED_CONDITION, LAUNCH_UNCONFIRMED_DIAGNOSTIC))
+        );
     }
 
     #[test]

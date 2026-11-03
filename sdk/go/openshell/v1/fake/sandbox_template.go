@@ -38,6 +38,7 @@ func copySandboxWorkloadTemplateSpec(spec types.SandboxWorkloadTemplateSpec) typ
 		workload.Environment = copyStringMap(spec.Workload.Environment)
 		if spec.Workload.Resources != nil {
 			resources := *spec.Workload.Resources
+			resources.SampledBudget = copySampledBudget(resources.SampledBudget)
 			if spec.Workload.Resources.GPU != nil {
 				gpu := *spec.Workload.Resources.GPU
 				if spec.Workload.Resources.GPU.Count != nil {

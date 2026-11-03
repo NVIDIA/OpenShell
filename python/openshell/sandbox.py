@@ -28,6 +28,7 @@ from ._proto import (
     datamodel_pb2,
     openshell_pb2,
     openshell_pb2_grpc,
+    sandbox_pb2,
 )
 from .errors import _error_mapping_channel, from_grpc_error
 from .mutations import DeletionOutcome, DeletionResult
@@ -145,6 +146,16 @@ def _retry_unrouted(error: grpc.RpcError) -> bool:
         or "no healthy upstream" in details
         or "connection failure" in details
     )
+
+
+def _require_sampled_budget_support(stub: Any, timeout: float) -> None:
+    # This protocol acknowledgement is public; driver guarantees are checked
+    # by the gateway. Never write fields an older gateway would discard.
+    response = stub.Health(openshell_pb2.HealthRequest(), timeout=timeout)
+    if not response.supports_sampled_resource_budget:
+        raise SandboxError(
+            "gateway does not acknowledge sampled resource budgets; upgrade it before creating this workload"
+        )
 
 
 def _workspace_scope(workspace: str) -> datamodel_pb2.WorkspaceSelector:
@@ -516,6 +527,43 @@ class SandboxConditionRef:
 
 
 @dataclass(frozen=True)
+class FrozenSandboxPolicyRef:
+    """Immutable snapshot identity and a copied effective policy."""
+
+    policy: sandbox_pb2.SandboxPolicy | None
+    version: int
+    policy_hash: str
+    frozen_at_ms: int | None
+    policy_source: int
+    global_policy_version: int
+
+
+@dataclass(frozen=True)
+class FrozenPolicyState:
+    """A requested freeze is pending until its policy is present."""
+
+    requested: bool
+    policy: FrozenSandboxPolicyRef | None = None
+
+
+@dataclass(frozen=True)
+class FrozenGlobalConfigUpdate:
+    """Global mutation result with names retaining a captured policy."""
+
+    update: openshell_pb2.UpdateConfigResponse
+    frozen_sandboxes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SandboxIngressAdmissionRef:
+    """Compute-admitted loopback namespace and immutable target ports."""
+
+    scope: int
+    all_ports: bool
+    ports: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class SandboxStatusRef:
     phase: int
     current_policy_version: int
@@ -524,6 +572,7 @@ class SandboxStatusRef:
     next_restart_at_ms: int | None = None
     main_process_started_at_ms: int | None = None
     conditions: tuple[SandboxConditionRef, ...] = ()
+    ingress_admission: SandboxIngressAdmissionRef | None = None
 
 
 class ServiceAuthorizationMode(IntEnum):
@@ -785,6 +834,9 @@ class SandboxClient:
             _error_mapping_channel(self._channel)
         )
         self._owners = _OwnerCache()
+        self._frozen_stub = openshell_pb2_grpc.FrozenSandboxPoliciesStub(
+            _error_mapping_channel(self._channel)
+        )
 
     @classmethod
     def from_active_cluster(
@@ -923,8 +975,11 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
+        forward_ports: Sequence[int] | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
+        if request_spec.resource_requirements.HasField("sampled_budget"):
+            _require_sampled_budget_support(self._stub, self._timeout)
         response = self._stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
                 workspace_scope=_workspace_scope(workspace),
@@ -932,6 +987,7 @@ class SandboxClient:
                 name=name or "",
                 labels=dict(labels) if labels else {},
                 service_exposures=_service_exposure_messages(service_exposures),
+                forward_ports=list(forward_ports or ()),
             ),
             timeout=self._timeout,
         )
@@ -949,6 +1005,7 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
+        forward_ports: Sequence[int] | None = None,
     ) -> SandboxRef:
         if not workload_template.strip():
             raise SandboxError("workload_template is required")
@@ -961,6 +1018,7 @@ class SandboxClient:
                 labels=dict(labels) if labels else {},
                 workload_template=workload_template,
                 service_exposures=_service_exposure_messages(service_exposures),
+                forward_ports=list(forward_ports or ()),
             ),
             timeout=self._timeout,
         )
@@ -977,6 +1035,7 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
+        forward_ports: Sequence[int] | None = None,
     ) -> SandboxSession:
         return SandboxSession(
             self,
@@ -986,8 +1045,135 @@ class SandboxClient:
                 name=name,
                 labels=labels,
                 service_exposures=service_exposures,
+                forward_ports=forward_ports,
             ),
         )
+
+    def create_frozen(
+        self,
+        *,
+        workspace: str,
+        spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+        service_exposures: Sequence[ServiceExposure] | None = None,
+        forward_ports: Sequence[int] | None = None,
+    ) -> SandboxRef:
+        """Create through the optional frozen-policy service without a legacy fallback."""
+        return self._create_frozen(
+            workspace=workspace,
+            spec=spec if spec is not None else _default_spec(),
+            name=name,
+            labels=labels,
+            service_exposures=service_exposures,
+            forward_ports=forward_ports,
+        )
+
+    def create_frozen_from_template(
+        self,
+        *,
+        workspace: str,
+        workload_template: str,
+        spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+        service_exposures: Sequence[ServiceExposure] | None = None,
+        forward_ports: Sequence[int] | None = None,
+    ) -> SandboxRef:
+        """Create a frozen sandbox using a workspace-scoped workload template."""
+        if not workload_template.strip():
+            raise SandboxError("workload_template is required")
+        return self._create_frozen(
+            workspace=workspace,
+            workload_template=workload_template,
+            spec=spec if spec is not None else openshell_pb2.SandboxSpec(),
+            name=name,
+            labels=labels,
+            service_exposures=service_exposures,
+            forward_ports=forward_ports,
+        )
+
+    def _create_frozen(
+        self,
+        *,
+        workspace: str,
+        spec: openshell_pb2.SandboxSpec,
+        name: str | None,
+        labels: Mapping[str, str] | None,
+        service_exposures: Sequence[ServiceExposure] | None,
+        forward_ports: Sequence[int] | None,
+        workload_template: str = "",
+    ) -> SandboxRef:
+        if spec.resource_requirements.HasField("sampled_budget"):
+            _require_sampled_budget_support(self._stub, self._timeout)
+        response = self._frozen_stub.CreateSandbox(
+            openshell_pb2.CreateFrozenSandboxRequest(
+                workspace_scope=_workspace_scope(workspace),
+                spec=spec,
+                name=name or "",
+                labels=dict(labels) if labels else {},
+                workload_template=workload_template,
+                service_exposures=_service_exposure_messages(service_exposures),
+                forward_ports=list(forward_ports or ()),
+            ),
+            timeout=self._timeout,
+        )
+        sandbox = _sandbox_ref(response.sandbox, response.service_urls)
+        if not sandbox.id:
+            raise SandboxError("CreateSandbox returned empty sandbox id")
+        if (
+            not response.HasField("frozen_policy")
+            or not response.frozen_policy.requested
+        ):
+            raise SandboxError(
+                "gateway did not acknowledge frozen creation for sandbox "
+                f"'{sandbox.name}' (ID '{sandbox.id}', workspace '{workspace}'); "
+                "remove the sandbox before retrying"
+            )
+        return sandbox
+
+    def get_frozen_policy(self, name: str, *, workspace: str) -> FrozenPolicyState:
+        """Read a pending freeze or the first accepted policy snapshot."""
+        response = self._frozen_stub.GetPolicy(
+            openshell_pb2.GetFrozenSandboxPolicyRequest(
+                workspace_scope=_workspace_scope(workspace), name=name
+            ),
+            timeout=self._timeout,
+        )
+        policy = None
+        if response.HasField("policy"):
+            snapshot = response.policy
+            body = None
+            if snapshot.HasField("policy"):
+                body = sandbox_pb2.SandboxPolicy()
+                body.CopyFrom(snapshot.policy)
+            policy = FrozenSandboxPolicyRef(
+                policy=body,
+                version=snapshot.version,
+                policy_hash=snapshot.policy_hash,
+                frozen_at_ms=snapshot.frozen_time.ToMilliseconds()
+                if snapshot.HasField("frozen_time")
+                else None,
+                policy_source=snapshot.policy_source,
+                global_policy_version=snapshot.global_policy_version,
+            )
+        return FrozenPolicyState(requested=response.requested, policy=policy)
+
+    def update_global_config(
+        self, request: openshell_pb2.UpdateFrozenGlobalConfigRequest
+    ) -> FrozenGlobalConfigUpdate:
+        """Update global configuration and report frozen-policy exceptions."""
+        global_request = openshell_pb2.UpdateFrozenGlobalConfigRequest()
+        global_request.CopyFrom(request)
+        setattr(global_request, "global", True)
+        response = self._frozen_stub.UpdateGlobalConfig(
+            global_request, timeout=self._timeout
+        )
+        if not response.HasField("update"):
+            raise SandboxError("global update result missing from gateway response")
+        update = openshell_pb2.UpdateConfigResponse()
+        update.CopyFrom(response.update)
+        return FrozenGlobalConfigUpdate(update, tuple(response.frozen_sandboxes))
 
     def create_session_from_template(
         self,
@@ -998,6 +1184,7 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
+        forward_ports: Sequence[int] | None = None,
     ) -> SandboxSession:
         return SandboxSession(
             self,
@@ -1008,6 +1195,7 @@ class SandboxClient:
                 name=name,
                 labels=labels,
                 service_exposures=service_exposures,
+                forward_ports=forward_ports,
             ),
         )
 
@@ -1497,6 +1685,7 @@ class SandboxTemplateClient:
         memory: str | None = None,
         gpu_count: int | None = None,
         gpu: bool = False,
+        sampled_budget: sandbox_pb2.SampledResourceBudget | None = None,
         driver_config: Mapping[str, Any] | None = None,
     ) -> openshell_pb2.SandboxWorkloadTemplate:
         if template is None:
@@ -1512,10 +1701,14 @@ class SandboxTemplateClient:
                 memory=memory,
                 gpu_count=gpu_count,
                 gpu=gpu,
+                sampled_budget=sampled_budget,
                 driver_config=driver_config,
             )
         elif (
-            any(value is not None for value in (name, image, cpu, memory, gpu_count))
+            any(
+                value is not None
+                for value in (name, image, cpu, memory, gpu_count, sampled_budget)
+            )
             or any(
                 bool(value)
                 for value in (labels, annotations, environment, driver_config)
@@ -1525,6 +1718,9 @@ class SandboxTemplateClient:
             raise SandboxError(
                 "template cannot be combined with template builder fields"
             )
+
+        if template.spec.workload.resources.HasField("sampled_budget"):
+            _require_sampled_budget_support(self._stub, self._timeout)
 
         response = self._stub.CreateSandboxTemplate(
             openshell_pb2.CreateSandboxTemplateRequest(
@@ -2012,6 +2208,13 @@ def _sandbox_ref(
             if status is not None and status.HasField("main_process_started_time")
             else None,
             conditions=_sandbox_conditions(status),
+            ingress_admission=SandboxIngressAdmissionRef(
+                scope=status.ingress_admission.scope,
+                all_ports=status.ingress_admission.all_ports,
+                ports=tuple(status.ingress_admission.ports),
+            )
+            if status is not None and status.HasField("ingress_admission")
+            else None,
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},
         created_from_workload_template=provenance,
@@ -2040,6 +2243,7 @@ def _sandbox_workload_template(
     memory: str | None = None,
     gpu_count: int | None = None,
     gpu: bool = False,
+    sampled_budget: sandbox_pb2.SampledResourceBudget | None = None,
     driver_config: Mapping[str, Any] | None = None,
 ) -> openshell_pb2.SandboxWorkloadTemplate:
     if gpu_count is not None and gpu_count <= 0:
@@ -2059,6 +2263,8 @@ def _sandbox_workload_template(
         template.spec.workload.image = image
     if environment:
         template.spec.workload.environment.update(dict(environment))
+    if sampled_budget is not None:
+        template.spec.workload.resources.sampled_budget.CopyFrom(sampled_budget)
     if cpu is not None:
         template.spec.workload.resources.cpu = cpu
     if memory is not None:

@@ -23,6 +23,10 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use openshell_core::backend_startup::{
+    LAUNCH_UNCONFIRMED_CONDITION, LAUNCH_UNCONFIRMED_DIAGNOSTIC, RuntimeStartupFailure,
+    SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED,
+};
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
@@ -55,7 +59,7 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
-    deserialize_optional_non_empty_string_list, struct_to_json_value,
+    deserialize_optional_non_empty_string_list, struct_to_typed_json_value,
 };
 use openshell_core::{
     AppArmorProfile, Error, ImagePullPolicy, NetworkSupervisorTrustBundle, Result as CoreResult,
@@ -783,8 +787,9 @@ impl DockerSandboxDriverConfig {
             return Ok(Self::default());
         };
 
-        serde_json::from_value(struct_to_json_value(config))
-            .map_err(|err| format!("invalid docker driver_config: {err}"))
+        let json = struct_to_typed_json_value(config)
+            .map_err(|err| format!("invalid docker driver_config: {err}"))?;
+        serde_json::from_value(json).map_err(|err| format!("invalid docker driver_config: {err}"))
     }
 }
 
@@ -1063,6 +1068,36 @@ impl DockerComputeDriver {
         Ok(driver)
     }
 
+    fn resource_capabilities(gpu_supported: bool) -> ResourceCapabilities {
+        ResourceCapabilities {
+            cpu: Some(CpuResourceCapabilities {
+                limit_supported: true,
+                limit_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                    kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::KernelLimit
+                        as i32,
+                    scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container
+                        as i32,
+                }),
+                ..Default::default()
+            }),
+            memory: Some(MemoryResourceCapabilities {
+                limit_supported: true,
+                limit_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                    kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::KernelLimit
+                        as i32,
+                    scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container
+                        as i32,
+                }),
+                ..Default::default()
+            }),
+            gpu: Some(GpuResourceCapabilities {
+                default_selection_supported: gpu_supported,
+                count_selection_supported: gpu_supported,
+            }),
+            sampled_budget: None,
+        }
+    }
+
     fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
             resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
@@ -1076,25 +1111,25 @@ impl DockerComputeDriver {
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: false,
-            resource_capabilities: Some(ResourceCapabilities {
-                cpu: Some(CpuResourceCapabilities {
-                    limit_supported: true,
-                }),
-                memory: Some(MemoryResourceCapabilities {
-                    limit_supported: true,
-                }),
-                gpu: Some(GpuResourceCapabilities {
-                    default_selection_supported: self.config.gpu.cdi_supported,
-                    count_selection_supported: self.config.gpu.cdi_supported,
-                }),
-            }),
+            resource_capabilities: Some(Self::resource_capabilities(self.config.gpu.cdi_supported)),
+            workload_compatibility: Some(
+                openshell_core::proto::compute::v1::WorkloadCompatibility {
+                    operating_system: "linux".to_string(),
+                    architecture: String::new(),
+                    execution_restrictions: Vec::new(),
+                },
+            ),
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
+            proxy_filesystem_baseline: None,
             extension: Some(openshell_core::extension_protocol::extension_metadata(
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/docker",
                 openshell_core::VERSION,
-                [],
+                [
+                    openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION.to_string(),
+                    openshell_core::extension_protocol::COMPUTE_RESOURCE_CONTRACT.to_string(),
+                ],
             )),
         }
     }
@@ -1116,6 +1151,12 @@ impl DockerComputeDriver {
             config.allow_driver_config,
             sandbox,
         )?;
+        openshell_core::resource_contract::validate_request(
+            sandbox,
+            Some(&Self::resource_capabilities(config.gpu.cdi_supported)),
+            true,
+        )
+        .map_err(Status::failed_precondition)?;
         let spec = sandbox
             .spec
             .as_ref()
@@ -3354,7 +3395,13 @@ impl ComputeDriver for DockerComputeDriver {
                 CdiGpuDefaultSelector::peek_device_ids,
             )
             .await?;
-        Ok(Response::new(ValidateSandboxCreateResponse {}))
+        Ok(Response::new(ValidateSandboxCreateResponse {
+            ingress_admission: Some(openshell_core::proto::SandboxIngressAdmission {
+                scope: openshell_core::proto::IngressScope::IsolatedLoopback as i32,
+                all_ports: true,
+                ports: Vec::new(),
+            }),
+        }))
     }
 
     async fn get_sandbox(
@@ -5653,7 +5700,7 @@ async fn wait_for_docker_supervisor_ready(
         .await
     {
         Ok(()) => Ok(()),
-        Err(status) => Err(recorded_workspace_validation_failure(failures, sandbox_id)
+        Err(status) => Err(recorded_supervisor_start_failure(failures, sandbox_id)
             .await
             .unwrap_or(status)),
     }
@@ -5675,7 +5722,14 @@ async fn poll_docker_supervisor_ready(
             .map_err(|error| {
                 Status::internal(format!("inspect Docker sandbox container: {error}"))
             })?;
-        if sandbox.state.unwrap_or_default().running == Some(false) {
+        let workload_state = sandbox.state.unwrap_or_default();
+        if workload_state.running == Some(false) {
+            if let Some(failure) = workload_state
+                .exit_code
+                .and_then(RuntimeStartupFailure::from_exit_code)
+            {
+                return Err(Status::failed_precondition(failure.diagnostic()));
+            }
             return Err(Status::unavailable(
                 "Docker sandbox exited before supervisor became ready",
             ));
@@ -5697,6 +5751,11 @@ async fn poll_docker_supervisor_ready(
                 warn!(sandbox_id, supervisor_id, supervisor_logs = %log_tail, "Docker sandbox rejected the image working directory");
                 return Err(workspace_validation_status());
             }
+            _ if state.running == Some(false)
+                && state.exit_code == Some(i64::from(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED)) =>
+            {
+                return Err(Status::unavailable(LAUNCH_UNCONFIRMED_DIAGNOSTIC));
+            }
             _ if state.running == Some(false) => {
                 let log_tail = docker_container_log_tail(docker, supervisor_id).await;
                 warn!(sandbox_id, supervisor_id, supervisor_logs = %log_tail, "Docker supervisor exited before becoming ready");
@@ -5716,6 +5775,20 @@ fn docker_supervisor_wait_failure(
     result: Option<Result<ContainerWaitResponse, BollardError>>,
 ) -> (&'static str, String) {
     match result {
+        Some(Ok(status)) if status.status_code == i64::from(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED) => {
+            (
+                LAUNCH_UNCONFIRMED_CONDITION,
+                LAUNCH_UNCONFIRMED_DIAGNOSTIC.to_string(),
+            )
+        }
+        Some(Err(BollardError::DockerContainerWaitError { code, .. }))
+            if code == i64::from(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED) =>
+        {
+            (
+                LAUNCH_UNCONFIRMED_CONDITION,
+                LAUNCH_UNCONFIRMED_DIAGNOSTIC.to_string(),
+            )
+        }
         Some(Ok(status)) => (
             supervisor_exit_reason(status.status_code),
             format!(
@@ -5738,15 +5811,20 @@ fn docker_supervisor_wait_failure(
     }
 }
 
-async fn recorded_workspace_validation_failure(
+async fn recorded_supervisor_start_failure(
     failures: &Arc<Mutex<HashMap<String, DockerRuntimeFailure>>>,
     sandbox_id: &str,
 ) -> Option<Status> {
     let failures = failures.lock().await;
     failures
         .get(sandbox_id)
-        .filter(|failure| failure.reason == CONDITION_WORKSPACE_VALIDATION_FAILED)
-        .map(|_| workspace_validation_status())
+        .and_then(|failure| match failure.reason {
+            CONDITION_WORKSPACE_VALIDATION_FAILED => Some(workspace_validation_status()),
+            LAUNCH_UNCONFIRMED_CONDITION => {
+                Some(Status::unavailable(LAUNCH_UNCONFIRMED_DIAGNOSTIC))
+            }
+            _ => None,
+        })
 }
 
 /// Startup failure for a supervisor that exited because the sandbox rejected
@@ -5763,8 +5841,22 @@ fn supervisor_start_failure_reason(status: &Status, default: &'static str) -> &'
         && status.message() == WORKSPACE_VALIDATION_FAILED_MESSAGE
     {
         CONDITION_WORKSPACE_VALIDATION_FAILED
+    } else if status.code() == tonic::Code::Unavailable
+        && status.message() == LAUNCH_UNCONFIRMED_DIAGNOSTIC
+    {
+        LAUNCH_UNCONFIRMED_CONDITION
     } else {
-        default
+        [
+            RuntimeStartupFailure::LandlockUnavailable,
+            RuntimeStartupFailure::LandlockEnforcement,
+            RuntimeStartupFailure::Qualification,
+        ]
+        .into_iter()
+        .find(|failure| {
+            status.code() == tonic::Code::FailedPrecondition
+                && status.message() == failure.diagnostic()
+        })
+        .map_or(default, RuntimeStartupFailure::condition_reason)
     }
 }
 
@@ -5772,6 +5864,8 @@ fn supervisor_start_failure_reason(status: &Status, default: &'static str) -> &'
 fn supervisor_exit_reason(status_code: i64) -> &'static str {
     if status_code == i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED) {
         CONDITION_WORKSPACE_VALIDATION_FAILED
+    } else if status_code == i64::from(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED) {
+        LAUNCH_UNCONFIRMED_CONDITION
     } else {
         "ControlSupervisorExited"
     }
@@ -6438,7 +6532,6 @@ fn docker_pids_limit(value: Option<std::num::NonZeroI64>) -> Result<Option<i64>,
     Ok(value.map(std::num::NonZeroI64::get))
 }
 
-#[allow(clippy::cast_possible_truncation)]
 fn parse_cpu_limit(value: &str) -> Result<Option<i64>, Status> {
     let value = value.trim();
     if value.is_empty() {
@@ -6455,7 +6548,9 @@ fn parse_cpu_limit(value: &str) -> Result<Option<i64>, Status> {
                 "docker cpu_limit must be greater than zero",
             ));
         }
-        return Ok(Some(millicores.saturating_mul(1_000_000)));
+        return millicores.checked_mul(1_000_000).map(Some).ok_or_else(|| {
+            Status::failed_precondition("docker CPU limit exceeds the supported range")
+        });
     }
 
     let cores = value.parse::<f64>().map_err(|_| {
@@ -6469,10 +6564,9 @@ fn parse_cpu_limit(value: &str) -> Result<Option<i64>, Status> {
         ));
     }
 
-    Ok(Some((cores * 1_000_000_000.0).round() as i64))
+    checked_docker_limit(cores * 1_000_000_000.0, "CPU").map(Some)
 }
 
-#[allow(clippy::cast_possible_truncation)]
 fn parse_memory_limit(value: &str) -> Result<Option<i64>, Status> {
     let value = value.trim();
     if value.is_empty() {
@@ -6515,7 +6609,20 @@ fn parse_memory_limit(value: &str) -> Result<Option<i64>, Status> {
         }
     };
 
-    Ok(Some((amount * multiplier).round() as i64))
+    checked_docker_limit(amount * multiplier, "memory").map(Some)
+}
+
+// Docker uses zero as an unlimited control. Positive authored quantities must
+// remain positive after conversion and fit the signed wire field exactly.
+#[allow(clippy::cast_possible_truncation)]
+fn checked_docker_limit(value: f64, resource: &str) -> Result<i64, Status> {
+    let value = value.floor();
+    if !value.is_finite() || value < 1.0 || value >= 2_f64.powi(63) {
+        return Err(Status::failed_precondition(format!(
+            "docker {resource} limit is outside the supported positive range"
+        )));
+    }
+    Ok(value as i64)
 }
 
 fn sandbox_from_container_summary(summary: &ContainerSummary) -> Option<DriverSandbox> {
@@ -6576,7 +6683,7 @@ fn apply_docker_exit_classification(sandbox: &mut DriverSandbox, state: &Contain
     if state.oom_killed == Some(true) {
         return;
     }
-    let Some(code) = state.exit_code.filter(|&code| matches!(code, 137 | 143)) else {
+    let Some(code) = state.exit_code else {
         return;
     };
     let Some(condition) = sandbox
@@ -6589,8 +6696,13 @@ fn apply_docker_exit_classification(sandbox: &mut DriverSandbox, state: &Contain
     if condition.reason != CONDITION_EXITED {
         return;
     }
-    condition.reason = CONDITION_RUNTIME_RESTART.to_string();
-    condition.message = format!("Container terminated by signal (exit code {code})");
+    if let Some(failure) = RuntimeStartupFailure::from_exit_code(code) {
+        condition.reason = failure.condition_reason().to_string();
+        condition.message = failure.diagnostic().to_string();
+    } else if matches!(code, 137 | 143) {
+        condition.reason = CONDITION_RUNTIME_RESTART.to_string();
+        condition.message = format!("Container terminated by signal (exit code {code})");
+    }
 }
 
 fn container_ready_condition(
