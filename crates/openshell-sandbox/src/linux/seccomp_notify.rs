@@ -24,6 +24,7 @@ const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_ulong = 1 << 3;
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 
 const BPF_LD_W_ABS: u16 = 0x20;
 const BPF_JMP_JEQ_K: u16 = 0x15;
@@ -310,6 +311,13 @@ impl NotificationListener {
 /// Only the named syscalls notify. Unexpected architectures are killed, x32
 /// syscalls are killed on x86-64, and all other native syscalls are allowed.
 pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
+    install_filter(syscalls, &[])
+}
+
+fn install_filter(
+    syscalls: &[i64],
+    denied_socket_options: &[(i32, i32)],
+) -> io::Result<NotificationListener> {
     if syscalls.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -319,18 +327,32 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
     verify_notification_sizes()?;
     set_no_new_privileges()?;
 
-    install_notification_filter(syscalls)
+    install_notification_filter(syscalls, denied_socket_options)
 }
 
 /// Install the capability-free workload networking listener on the calling
 /// launcher thread.
 ///
 /// The filter mediates every syscall that can create, select, or materially
-/// reconfigure an INET endpoint. Connected `send()`/null-destination
-/// `sendto()` retains the audited cBPF fast path. `accept`/`accept4` run
-/// natively: the broker binds every INET socket to loopback before injecting
-/// it, and accepted sockets inherit their listener's binding.
-pub fn install_workload_listener() -> io::Result<NotificationListener> {
+/// reconfigure an INET endpoint. `denied_socket_options` pairs are answered
+/// with `EPERM` in the kernel rather than notified, so a confined option never
+/// costs a broker round trip. Connected `send()`/null-destination `sendto()`
+/// retains the audited cBPF fast path. `accept`/`accept4` run natively: the
+/// broker binds every INET socket to loopback before injecting it, and
+/// accepted sockets inherit their listener's binding.
+///
+/// The table must not be empty: with no pairs the filter neither denies nor
+/// notifies `setsockopt`, which would silently drop the interface-selection
+/// confinement. Callers that want no option policy use [`install_listener`].
+pub fn install_workload_listener(
+    denied_socket_options: &[(i32, i32)],
+) -> io::Result<NotificationListener> {
+    if denied_socket_options.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "at least one denied socket option is required",
+        ));
+    }
     #[allow(unused_mut)] // SYS_open is unavailable on some architectures.
     let mut syscalls = vec![
         libc::SYS_socket,
@@ -340,7 +362,6 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
         libc::SYS_sendto,
         libc::SYS_sendmsg,
         libc::SYS_sendmmsg,
-        libc::SYS_setsockopt,
         libc::SYS_kill,
         libc::SYS_tkill,
         libc::SYS_tgkill,
@@ -351,7 +372,7 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
     ];
     #[cfg(target_arch = "x86_64")]
     syscalls.push(libc::SYS_open);
-    install_listener(&syscalls)
+    install_filter(&syscalls, denied_socket_options)
 }
 
 /// Run a no-capability conformance probe.
@@ -633,8 +654,11 @@ fn receive_probe_notification(listener: &NotificationListener) -> io::Result<Not
     listener.receive()
 }
 
-fn install_notification_filter(syscalls: &[i64]) -> io::Result<NotificationListener> {
-    let mut program = build_filter(syscalls)?;
+fn install_notification_filter(
+    syscalls: &[i64],
+    denied_socket_options: &[(i32, i32)],
+) -> io::Result<NotificationListener> {
+    let mut program = build_filter(syscalls, denied_socket_options)?;
     let length = u16::try_from(program.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "seccomp filter is too large"))?;
     let mut fprog = libc::sock_fprog {
@@ -662,7 +686,10 @@ fn install_notification_filter(syscalls: &[i64]) -> io::Result<NotificationListe
     Ok(NotificationListener { fd })
 }
 
-fn build_filter(syscalls: &[i64]) -> io::Result<Vec<libc::sock_filter>> {
+fn build_filter(
+    syscalls: &[i64],
+    denied_socket_options: &[(i32, i32)],
+) -> io::Result<Vec<libc::sock_filter>> {
     let mut program = vec![
         stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
         jump(BPF_JMP_JEQ_K, native_audit_arch(), 1, 0),
@@ -675,6 +702,10 @@ fn build_filter(syscalls: &[i64]) -> io::Result<Vec<libc::sock_filter>> {
         jump(BPF_JMP_JSET_K, X32_SYSCALL_BIT, 0, 1),
         stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
     ]);
+
+    if !denied_socket_options.is_empty() {
+        append_setsockopt_filter(&mut program, denied_socket_options)?;
+    }
 
     let mut syscalls = syscalls.to_vec();
     syscalls.sort_unstable();
@@ -723,6 +754,64 @@ fn append_sendto_filter(program: &mut Vec<libc::sock_filter>) -> io::Result<()> 
         stmt(BPF_ALU_AND_K, !CONNECTED_SEND_FLAGS),
         jump(BPF_JMP_JEQ_K, 0, 1, 0),
         stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF),
+        stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
+    ]);
+    Ok(())
+}
+
+/// Refuse the `setsockopt(2)` level/option pairs denied by policy, in the
+/// kernel, without a broker round trip.
+///
+/// The kernel truncates `level` and `optname` to `int`, so the arms compare
+/// only the low 32-bit word of each argument: a junk-extended encoding of a
+/// denied pair would otherwise reach the kernel and apply the denied option.
+/// Arguments whose high word is nonzero, once no denied pair matched, return
+/// `EINVAL` as the broker did; everything else falls through to the kernel.
+fn append_setsockopt_filter(
+    program: &mut Vec<libc::sock_filter>,
+    denied_socket_options: &[(i32, i32)],
+) -> io::Result<()> {
+    // Five instructions per pair, six for the two high-word guards, and one
+    // trailing allow.
+    let skipped = denied_socket_options
+        .len()
+        .checked_mul(5)
+        .and_then(|length| length.checked_add(7))
+        .and_then(|length| u8::try_from(length).ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "setsockopt filter is too large",
+            )
+        })?;
+    let syscall = u32::try_from(libc::SYS_setsockopt)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative setsockopt syscall"))?;
+    program.push(jump(BPF_JMP_JEQ_K, syscall, 0, skipped));
+
+    let denied = SECCOMP_RET_ERRNO | libc::EPERM.unsigned_abs();
+    for (level, option) in denied_socket_options {
+        program.extend([
+            stmt(BPF_LD_W_ABS, argument_word_offset(1, 0)),
+            jump(BPF_JMP_JEQ_K, u32::from_ne_bytes(level.to_ne_bytes()), 0, 3),
+            stmt(BPF_LD_W_ABS, argument_word_offset(2, 0)),
+            jump(
+                BPF_JMP_JEQ_K,
+                u32::from_ne_bytes(option.to_ne_bytes()),
+                0,
+                1,
+            ),
+            stmt(BPF_RET_K, denied),
+        ]);
+    }
+
+    let invalid = SECCOMP_RET_ERRNO | libc::EINVAL.unsigned_abs();
+    program.extend([
+        stmt(BPF_LD_W_ABS, argument_word_offset(1, 1)),
+        jump(BPF_JMP_JEQ_K, 0, 1, 0),
+        stmt(BPF_RET_K, invalid),
+        stmt(BPF_LD_W_ABS, argument_word_offset(2, 1)),
+        jump(BPF_JMP_JEQ_K, 0, 1, 0),
+        stmt(BPF_RET_K, invalid),
         stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
     ]);
     Ok(())
@@ -945,7 +1034,6 @@ mod tests {
     /// notification size query keeps working, so `install_listener` fails the
     /// way a restrictive host does.
     fn install_set_mode_filter_eperm_filter() -> io::Result<()> {
-        const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
         let seccomp_number = u32::try_from(libc::SYS_seccomp)
             .map_err(|_| io::Error::other("syscall number does not fit u32"))?;
         let mut instructions = [
@@ -981,7 +1069,6 @@ mod tests {
     }
 
     fn install_process_vm_enosys_filter() -> io::Result<()> {
-        const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
         let syscall_number = |number: libc::c_long| {
             u32::try_from(number).map_err(|_| io::Error::other("syscall number does not fit u32"))
         };

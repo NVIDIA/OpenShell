@@ -267,8 +267,9 @@ mod linux {
         }
         crate::managed_children::start_orphan_reaper()
             .map_err(|error| format!("start sandbox orphan reaper: {error}"))?;
-        let (launcher, listener) = crate::linux::workload_launcher::start()
-            .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start(&crate::network_broker::DENIED_SOCKET_OPTIONS)
+                .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
         let protected_control_port = match &config.listener {
             BoundaryListenerConfig::TlsTcp { address, .. } => Some(address.port()),
             // Validation requires every supervisor address to share one port.
@@ -6438,8 +6439,10 @@ mod linux {
             NetworkBroker,
             crate::linux::workload_launcher::WorkloadLauncher,
         ) {
-            let (launcher, listener) =
-                crate::linux::workload_launcher::start().expect("start test listener");
+            let (launcher, listener) = crate::linux::workload_launcher::start(
+                &crate::network_broker::DENIED_SOCKET_OPTIONS,
+            )
+            .expect("start test listener");
             (
                 NetworkBroker::start_for_test(listener).expect("start test network broker"),
                 launcher,
@@ -7666,8 +7669,10 @@ mod linux {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn grpc_server_dispatches_authenticated_logical_streams() {
-            let (workload_launcher, listener) =
-                crate::linux::workload_launcher::start().expect("start multiplexed test listener");
+            let (workload_launcher, listener) = crate::linux::workload_launcher::start(
+                &crate::network_broker::DENIED_SOCKET_OPTIONS,
+            )
+            .expect("start multiplexed test listener");
             let network_broker =
                 NetworkBroker::start_for_test(listener).expect("start multiplexed test broker");
             let (verification_key, token) = test_auth_material("sandbox-multiplexed");
