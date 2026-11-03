@@ -101,6 +101,19 @@ runs:
         curl -fsSL https://raw.githubusercontent.com/projectcalico/calico/v3.30.3/manifests/calico.yaml \
           -o "$RUNNER_TEMP/calico.yaml"
         sed 's@192.168.0.0/16@10.244.0.0/16@g' "$RUNNER_TEMP/calico.yaml" > "$RUNNER_TEMP/calico-kind.yaml"
+        # The kind node's containerd pulls Docker Hub anonymously and is rate
+        # limited. The host daemon pulls through the runner's registry mirror.
+        calico_images=$(sed -nE 's/^[[:space:]]*image:[[:space:]]*"?([^"[:space:]]+)"?.*/\1/p' "$RUNNER_TEMP/calico-kind.yaml" | sort -u)
+        if [ -z "$calico_images" ]; then
+          echo "ERROR: no images found in the Calico manifest" >&2
+          exit 1
+        fi
+        for image in $calico_images; do
+          archive="$RUNNER_TEMP/calico-$(basename "${image%%:*}")-linux-amd64.tar"
+          docker pull --platform linux/amd64 "$image"
+          docker image save --platform linux/amd64 --output "$archive" "$image"
+          kind load image-archive "$archive" --name "$CLUSTER_NAME"
+        done
         kubectl --context "kind-$CLUSTER_NAME" apply -f "$RUNNER_TEMP/calico-kind.yaml"
         kubectl --context "kind-$CLUSTER_NAME" -n kube-system rollout status daemonset/calico-node --timeout=300s
         kubectl --context "kind-$CLUSTER_NAME" -n kube-system rollout status deployment/calico-kube-controllers --timeout=300s
