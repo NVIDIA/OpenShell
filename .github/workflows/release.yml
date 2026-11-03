@@ -171,13 +171,9 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - name: Download built wheel
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: python-wheel
-          path: dist/
-
-      - name: Verify wheel against the stable release
+      # Publish the wheel attached to the GitHub Release rather than this run's
+      # build artifact, so a later run can finish publishing the same bytes.
+      - name: Download and verify the released wheel
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -191,10 +187,12 @@ jobs:
             echo "${RELEASE_TAG} points to ${tag_sha}, not ${SOURCE_SHA}" >&2
             exit 1
           fi
+          gh release download "${RELEASE_TAG}" -R "${GITHUB_REPOSITORY}" \
+            --pattern '*.whl' --pattern openshell-checksums-sha256.txt --dir release
           shopt -s nullglob
-          wheels=(dist/*.whl)
+          wheels=(release/*.whl)
           if [[ "${#wheels[@]}" -ne 1 ]]; then
-            echo "Expected exactly one Python wheel, found ${#wheels[@]}" >&2
+            echo "Expected exactly one Python wheel on ${RELEASE_TAG}, found ${#wheels[@]}" >&2
             exit 1
           fi
           wheel=$(basename "${wheels[0]}")
@@ -202,15 +200,14 @@ jobs:
             echo "${wheel} is not an openshell ${PYTHON_VERSION} wheel" >&2
             exit 1
           fi
-          gh release download "${RELEASE_TAG}" -R "${GITHUB_REPOSITORY}" \
-            --pattern openshell-checksums-sha256.txt --dir checksums
-          checksum=$(awk -v wheel="${wheel}" '$2 == wheel { print $1 "  " $2 }' checksums/openshell-checksums-sha256.txt)
+          checksum=$(awk -v wheel="${wheel}" '$2 == wheel { print $1 "  " $2 }' release/openshell-checksums-sha256.txt)
           if [[ -z "${checksum}" ]]; then
             echo "${wheel} is missing from the release checksums" >&2
             exit 1
           fi
-          cd dist
-          sha256sum -c - <<<"${checksum}"
+          (cd release && sha256sum -c - <<<"${checksum}")
+          mkdir dist
+          mv "release/${wheel}" dist/
 
       - name: Publish wheel to PyPI
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
