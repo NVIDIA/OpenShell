@@ -6923,17 +6923,13 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
     namespace: &str,
     obj: DynamicObject,
 ) -> Result<(String, Sandbox), String> {
-    let bootstrapping = sandbox_runtime_bootstrap_in_progress(&obj);
     let sandbox_id = sandbox_id_from_object(&obj).unwrap_or_default();
     let object_namespace = obj
         .metadata
         .namespace
         .clone()
         .unwrap_or_else(|| namespace.to_string());
-    let (name, mut sandbox) = sandbox_from_object(namespace, obj.clone())?;
-    if bootstrapping {
-        mark_sandbox_runtime_bootstrapping(&mut sandbox);
-    }
+    let (name, mut sandbox) = sandbox_from_object_with_bootstrap_state(namespace, &obj)?;
     if !sandbox_id.is_empty() {
         let dependencies = Box::pin(generation_control_availability(
             client,
@@ -6970,6 +6966,34 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
         }
     }
     Ok((name, sandbox))
+}
+
+fn sandbox_from_object_with_bootstrap_state(
+    namespace: &str,
+    obj: &DynamicObject,
+) -> Result<(String, Sandbox), String> {
+    let (name, mut sandbox) = sandbox_from_object(namespace, obj.clone())?;
+    if sandbox_runtime_bootstrap_in_progress(obj) {
+        if sandbox_runtime_bootstrap_operation(obj) == Some("stop") {
+            mark_sandbox_runtime_stopping(&mut sandbox);
+        } else {
+            mark_sandbox_runtime_bootstrapping(&mut sandbox);
+        }
+    }
+    Ok((name, sandbox))
+}
+
+/// A stop holds the bootstrap annotations until its completion patch, but it
+/// is not a start: the gateway reads `Bootstrapping=True` as an accepted
+/// start that may replace a settled Stopped phase. Withhold the suspension
+/// until the stop completes, as a start does.
+fn mark_sandbox_runtime_stopping(sandbox: &mut Sandbox) {
+    if let Some(status) = sandbox.status.as_mut() {
+        status.conditions.retain(|condition| {
+            condition.r#type != SANDBOX_SUSPENDED_CONDITION && condition.r#type != "Bootstrapping"
+        });
+    }
+    mark_sandbox_runtime_control_unavailable(sandbox);
 }
 
 fn mark_sandbox_runtime_bootstrapping(sandbox: &mut Sandbox) {
@@ -14449,6 +14473,104 @@ mod tests {
                 && condition.status == "True"
                 && condition.reason == "SandboxRuntimeGenerationStarting"
         }));
+    }
+
+    fn sandbox_cr_mid_operation(operation: Option<&str>) -> DynamicObject {
+        let mut annotations = BTreeMap::from([
+            (
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING.to_string(),
+                "true".to_string(),
+            ),
+            (
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE.to_string(),
+                SandboxRuntimeBootstrapPhase::Suspending
+                    .as_str()
+                    .to_string(),
+            ),
+        ]);
+        if let Some(operation) = operation {
+            annotations.insert(
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION.to_string(),
+                operation.to_string(),
+            );
+        }
+        DynamicObject {
+            types: None,
+            metadata: ObjectMeta {
+                name: Some("alpha--work".to_string()),
+                namespace: Some("default".to_string()),
+                annotations: Some(annotations),
+                labels: Some(BTreeMap::from([
+                    (LABEL_SANDBOX_ID.to_string(), "uuid-123".to_string()),
+                    (LABEL_SANDBOX_NAME.to_string(), "work".to_string()),
+                    (LABEL_SANDBOX_WORKSPACE.to_string(), "alpha".to_string()),
+                    (
+                        LABEL_MANAGED_BY.to_string(),
+                        LABEL_MANAGED_BY_VALUE.to_string(),
+                    ),
+                ])),
+                ..Default::default()
+            },
+            data: serde_json::json!({
+                "status": {
+                    "conditions": [
+                        {"type": "Ready", "status": "False", "reason": "SandboxSuspended"},
+                        {"type": "Suspended", "status": "True", "reason": "PodTerminated"},
+                    ]
+                }
+            }),
+        }
+    }
+
+    fn has_condition(sandbox: &Sandbox, r#type: &str, status: &str) -> bool {
+        sandbox.status.as_ref().is_some_and(|sandbox_status| {
+            sandbox_status
+                .conditions
+                .iter()
+                .any(|condition| condition.r#type == r#type && condition.status == status)
+        })
+    }
+
+    // The gateway treats Bootstrapping=True as an accepted start and lets it
+    // replace a settled Stopped phase. A snapshot taken while a stop still
+    // holds its bootstrap annotations can arrive after that stop settled
+    // (#5195), so it must not claim a starting generation.
+    #[test]
+    fn stop_snapshot_does_not_report_a_starting_generation() {
+        let (_, sandbox) = sandbox_from_object_with_bootstrap_state(
+            "default",
+            &sandbox_cr_mid_operation(Some("stop")),
+        )
+        .unwrap();
+
+        assert!(!has_condition(&sandbox, "Bootstrapping", "True"));
+        // Suspension is still published only once the stop completes.
+        assert!(!has_condition(
+            &sandbox,
+            SANDBOX_SUSPENDED_CONDITION,
+            "True"
+        ));
+        assert!(!has_condition(&sandbox, "Ready", "True"));
+    }
+
+    #[test]
+    fn start_snapshots_report_a_starting_generation() {
+        for operation in [Some("create"), Some("restart"), None] {
+            let (_, sandbox) = sandbox_from_object_with_bootstrap_state(
+                "default",
+                &sandbox_cr_mid_operation(operation),
+            )
+            .unwrap();
+
+            assert!(
+                has_condition(&sandbox, "Bootstrapping", "True"),
+                "{operation:?}"
+            );
+            assert!(
+                !has_condition(&sandbox, SANDBOX_SUSPENDED_CONDITION, "True"),
+                "{operation:?}"
+            );
+        }
     }
 
     #[test]

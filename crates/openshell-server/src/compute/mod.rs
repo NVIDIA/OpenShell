@@ -14327,6 +14327,31 @@ mod tests {
         assert_eq!(current.phase(), SandboxPhase::Provisioning as i32);
     }
 
+    // A Kubernetes snapshot taken while a stop still holds its bootstrap
+    // annotations can arrive after the stop settled (#5195). It withdraws
+    // readiness without claiming a starting generation.
+    #[tokio::test]
+    async fn late_stop_snapshot_keeps_stopped_sandbox_stopped() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-stopped", "sandbox-stopped", SandboxPhase::Stopped);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let mut stopping = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        stopping.status = Some(make_driver_status(make_driver_condition(
+            "DependenciesNotReady",
+            "sandbox-runtime enforcement dependencies are not ready",
+        )));
+
+        runtime.apply_sandbox_update(stopping).await.unwrap();
+
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.phase(), SandboxPhase::Stopped as i32);
+    }
+
     #[tokio::test]
     async fn suspended_bootstrap_snapshot_does_not_revive_stopped_sandbox() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
