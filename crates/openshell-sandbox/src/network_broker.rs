@@ -15,6 +15,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::accept_errors::{
+    RESOURCE_ERROR_BACKOFF, ResourceBackoffLogger, is_peer_reset, is_pending_network_error,
+    is_transient_resource_error,
+};
 use crate::linux::seccomp_notify::{Notification, NotificationListener};
 use crate::linux::socket_registry::{
     InetFamily, InetKind, SocketIdentity, SocketMetadata, SocketRegistry, SocketState,
@@ -416,6 +420,107 @@ impl NetworkBroker {
     }
 }
 
+/// What the DNS TCP relay accept loop does with an accept error.
+#[derive(Debug, PartialEq, Eq)]
+enum DnsTcpAcceptErrorAction {
+    /// Retry immediately: the call was interrupted, or the peer reset before
+    /// the accepted connection could be served.
+    Skip,
+    /// Retry after a short backoff: transient resource exhaustion.
+    Backoff,
+    /// Unrecoverable: stop serving TCP DNS.
+    Stop,
+}
+
+fn dns_tcp_accept_error_action(error: &io::Error) -> DnsTcpAcceptErrorAction {
+    if error.kind() == io::ErrorKind::Interrupted
+        || is_peer_reset(error)
+        || is_pending_network_error(error)
+    {
+        DnsTcpAcceptErrorAction::Skip
+    } else if is_transient_resource_error(error) {
+        DnsTcpAcceptErrorAction::Backoff
+    } else {
+        DnsTcpAcceptErrorAction::Stop
+    }
+}
+
+/// Serve accepted DNS TCP streams until an unrecoverable accept error.
+///
+/// A transient resource error, or a peer that resets before its accept
+/// completes, must not stop the relay: TCP DNS keeps serving for the rest of
+/// the sandbox's life.
+fn dns_tcp_accept_loop(
+    mut accept: impl FnMut() -> io::Result<(TcpStream, SocketAddr)>,
+    tcp_admissions: Arc<Mutex<HashMap<SocketAddr, SocketIdentity>>>,
+    active_workers: Arc<AtomicUsize>,
+    pending: mpsc::Sender<PendingDnsQuery>,
+) {
+    // Warn once per exhaustion episode plus a bounded re-warn cadence, not on
+    // every backoff retry.
+    let mut resource_backoff_log = ResourceBackoffLogger::new();
+    loop {
+        let (stream, peer) = match accept() {
+            Ok(accepted) => {
+                resource_backoff_log.reset();
+                accepted
+            }
+            Err(error) => match dns_tcp_accept_error_action(&error) {
+                DnsTcpAcceptErrorAction::Skip => {
+                    tracing::debug!(%error, "skipping DNS TCP accept of a reset peer");
+                    continue;
+                }
+                DnsTcpAcceptErrorAction::Backoff => {
+                    if resource_backoff_log.should_log(&error) {
+                        tracing::warn!(
+                            %error,
+                            "DNS TCP accept hit a transient resource limit; retrying"
+                        );
+                    }
+                    std::thread::sleep(RESOURCE_ERROR_BACKOFF);
+                    continue;
+                }
+                DnsTcpAcceptErrorAction::Stop => {
+                    tracing::warn!(%error, "stopping the DNS TCP relay accept loop");
+                    // Dual-emit: the relay stopping is a security finding
+                    // (an unavailable control), not just an operational one.
+                    openshell_ocsf::ocsf_emit!(
+                        openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                            .activity(openshell_ocsf::ActivityId::Open)
+                            .severity(openshell_ocsf::SeverityId::High)
+                            .confidence(openshell_ocsf::ConfidenceId::High)
+                            .is_alert(true)
+                            .finding_info(openshell_ocsf::FindingInfo::new(
+                                "sandbox-dns-tcp-relay-stopped",
+                                "Sandbox DNS TCP Relay Stopped",
+                            ))
+                            .message("DNS TCP relay stopped serving; TCP DNS mediation unavailable")
+                            .build()
+                    );
+                    return;
+                }
+            },
+        };
+        // One admission authorizes exactly one accepted TCP stream;
+        // no peer mapping needs to outlive this accept.
+        if lock(&tcp_admissions).remove(&peer).is_none() {
+            tracing::warn!(%peer, "dropping DNS stream from unregistered socket");
+            continue;
+        }
+        let Ok(worker_slot) = acquire_pending_dns_slot(&active_workers) else {
+            tracing::warn!(%peer, "dropping DNS stream because the worker quota is full");
+            continue;
+        };
+        let tcp_pending = pending.clone();
+        let _ = std::thread::Builder::new()
+            .name("openshell-dns-tcp-query".to_string())
+            .spawn(move || {
+                let _worker_slot = worker_slot;
+                serve_dns_tcp(stream, tcp_pending);
+            });
+    }
+}
+
 fn start_dns_relay(
     address: SocketAddr,
     pending: mpsc::Sender<PendingDnsQuery>,
@@ -476,31 +581,17 @@ fn start_dns_relay(
     std::thread::Builder::new()
         .name("openshell-dns-tcp".to_string())
         .spawn(move || {
-            for accepted in tcp.incoming() {
-                let Ok((stream, peer)) = accepted.and_then(|stream| {
-                    let peer = stream.peer_addr()?;
-                    Ok((stream, peer))
-                }) else {
-                    break;
-                };
-                // One admission authorizes exactly one accepted TCP stream;
-                // no peer mapping needs to outlive this accept.
-                if lock(&tcp_admissions).remove(&peer).is_none() {
-                    tracing::warn!(%peer, "dropping DNS stream from unregistered socket");
-                    continue;
-                }
-                let Ok(worker_slot) = acquire_pending_dns_slot(&tcp_active_workers) else {
-                    tracing::warn!(%peer, "dropping DNS stream because the worker quota is full");
-                    continue;
-                };
-                let tcp_pending = pending.clone();
-                let _ = std::thread::Builder::new()
-                    .name("openshell-dns-tcp-query".to_string())
-                    .spawn(move || {
-                        let _worker_slot = worker_slot;
-                        serve_dns_tcp(stream, tcp_pending);
-                    });
-            }
+            dns_tcp_accept_loop(
+                || {
+                    tcp.accept().and_then(|(stream, _)| {
+                        let peer = stream.peer_addr()?;
+                        Ok((stream, peer))
+                    })
+                },
+                tcp_admissions,
+                tcp_active_workers,
+                pending,
+            );
         })
         .map_err(|error| io::Error::other(format!("start TCP DNS relay: {error}")))?;
     Ok(relay)
@@ -3355,5 +3446,218 @@ mod tests {
             client.join().expect("join client").expect("DNS client"),
             [0, 3, 4, 5, 6]
         );
+    }
+
+    #[test]
+    fn dns_tcp_accept_errors_map_to_keep_serving_actions() {
+        for error in [
+            io::Error::from_raw_os_error(libc::EMFILE),
+            io::Error::from_raw_os_error(libc::ENFILE),
+        ] {
+            assert_eq!(
+                dns_tcp_accept_error_action(&error),
+                DnsTcpAcceptErrorAction::Backoff
+            );
+        }
+        for error in [
+            io::Error::new(io::ErrorKind::Interrupted, "interrupted"),
+            io::Error::from_raw_os_error(libc::ECONNABORTED),
+            io::Error::from_raw_os_error(libc::ENOTCONN),
+            io::Error::from_raw_os_error(libc::EPROTO),
+            io::Error::from_raw_os_error(libc::ENETUNREACH),
+        ] {
+            assert_eq!(
+                dns_tcp_accept_error_action(&error),
+                DnsTcpAcceptErrorAction::Skip
+            );
+        }
+        assert_eq!(
+            dns_tcp_accept_error_action(&io::Error::from_raw_os_error(libc::EBADF)),
+            DnsTcpAcceptErrorAction::Stop
+        );
+    }
+
+    #[test]
+    fn dns_tcp_relay_survives_transient_accept_errors() {
+        use std::io::{Read as _, Write as _};
+
+        // A real accepted TCP pair, so the loop serves an actual stream.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind relay peer");
+        let mut client =
+            TcpStream::connect(listener.local_addr().unwrap()).expect("connect client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        let (stream, peer) = listener.accept().expect("accept client");
+
+        let tcp_admissions = Arc::new(Mutex::new(HashMap::new()));
+        lock(&tcp_admissions).insert(
+            peer,
+            SocketIdentity {
+                listener_generation: 0,
+                inode: 0,
+                cookie: 0,
+            },
+        );
+        let (pending_tx, mut pending_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
+        let mut accepts = 0_u32;
+        let mut stream = Some(stream);
+        let relay = std::thread::spawn(move || {
+            dns_tcp_accept_loop(
+                || {
+                    accepts += 1;
+                    match accepts {
+                        1 => Err(io::Error::from_raw_os_error(libc::EMFILE)),
+                        2 => Err(io::Error::from_raw_os_error(libc::ECONNABORTED)),
+                        3 => Ok((
+                            stream
+                                .take()
+                                .expect("accept source served its stream twice"),
+                            peer,
+                        )),
+                        4 => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+                        _ => panic!("DNS TCP accept loop kept accepting past its stop error"),
+                    }
+                },
+                tcp_admissions,
+                Arc::new(AtomicUsize::new(0)),
+                pending_tx,
+            );
+        });
+
+        // Both earlier accept errors were survived: the query still round-trips.
+        client
+            .write_all(&[0, 3, b'a', b'b', b'c'])
+            .expect("write DNS query");
+        let query = pending_rx
+            .blocking_recv()
+            .expect("relay queued the DNS query after transient accept errors");
+        assert_eq!(query.request, [0, 3, b'a', b'b', b'c']);
+        query
+            .response
+            .send(Ok(vec![0, 2, 0x01, 0x02]))
+            .expect("answer the DNS query");
+        let mut answer = [0_u8; 4];
+        client.read_exact(&mut answer).expect("read DNS answer");
+        assert_eq!(answer, [0, 2, 0x01, 0x02]);
+        relay.join().expect("accept loop thread panicked");
+    }
+
+    #[test]
+    fn dns_tcp_relay_survives_a_peer_that_resets_before_peer_addr() {
+        use std::io::{Read as _, Write as _};
+
+        // The accept source reproduces the production wiring of
+        // start_dns_relay: accept the stream, then resolve the peer with
+        // peer_addr, which fails once the peer reset while its connection
+        // was still queued.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind relay listener");
+        let address = listener.local_addr().expect("relay address");
+        let reset_client = socket2::Socket::new(
+            socket2::Domain::for_address(address),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .expect("reset client socket");
+        reset_client
+            .connect(&address.into())
+            .expect("connect reset client");
+        // Zero linger makes the close an RST while the connection is still
+        // queued, which is what makes `peer_addr` fail with ENOTCONN.
+        reset_client
+            .set_linger(Some(Duration::ZERO))
+            .expect("zero linger");
+        drop(reset_client);
+        // Let the RST land before the accept loop starts, so the first
+        // accepted stream is the reset one.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut client = TcpStream::connect(address).expect("connect healthy client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        let peer = client.local_addr().expect("healthy peer address");
+        let tcp_admissions = Arc::new(Mutex::new(HashMap::new()));
+        lock(&tcp_admissions).insert(
+            peer,
+            SocketIdentity {
+                listener_generation: 0,
+                inode: 0,
+                cookie: 0,
+            },
+        );
+        let (pending_tx, mut pending_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
+        let first_peer_addr_error = Arc::new(Mutex::new(None::<io::ErrorKind>));
+        let observed_error = first_peer_addr_error.clone();
+        // Test-only stop signal: once set, the accept source reports an
+        // unrecoverable error so the loop ends instead of leaking its thread.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_relay = stop.clone();
+        let relay = std::thread::spawn(move || {
+            dns_tcp_accept_loop(
+                || {
+                    if stop_relay.load(Ordering::Relaxed) {
+                        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+                    }
+                    listener
+                        .accept()
+                        .and_then(|(stream, _)| match stream.peer_addr() {
+                            Ok(peer) => Ok((stream, peer)),
+                            Err(error) => {
+                                *lock(&observed_error) = Some(error.kind());
+                                Err(error)
+                            }
+                        })
+                },
+                tcp_admissions,
+                Arc::new(AtomicUsize::new(0)),
+                pending_tx,
+            );
+        });
+
+        // The reset peer reached the production wiring: accept succeeded and
+        // peer_addr failed, so the loop must have hit its skip path.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock(&first_peer_addr_error).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let kind = lock(&first_peer_addr_error).expect("reset peer produced a peer_addr error");
+        assert_eq!(
+            kind,
+            io::ErrorKind::NotConnected,
+            "the reset peer's peer_addr error must be a skip-not-stop kind"
+        );
+
+        // The relay outlived the reset peer: the healthy query round-trips.
+        client
+            .write_all(&[0, 3, b'x', b'y', b'z'])
+            .expect("write DNS query");
+        let query = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), pending_rx.recv())
+                    .await
+                    .expect("relay queued the DNS query after the reset peer")
+                    .expect("pending DNS queue stayed open")
+            });
+        assert_eq!(query.request, [0, 3, b'x', b'y', b'z']);
+        query
+            .response
+            .send(Ok(vec![0, 2, 0x01, 0x02]))
+            .expect("answer the DNS query");
+        let mut answer = [0_u8; 4];
+        client.read_exact(&mut answer).expect("read DNS answer");
+        assert_eq!(answer, [0, 2, 0x01, 0x02]);
+        assert!(
+            !relay.is_finished(),
+            "the DNS TCP accept loop stopped after the reset peer"
+        );
+
+        // Stop the relay without leaking its thread into later tests.
+        stop.store(true, Ordering::Relaxed);
+        let _wakeup = TcpStream::connect(address).expect("wake the accept loop");
+        relay.join().expect("accept loop thread panicked");
     }
 }
