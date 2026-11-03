@@ -1,8 +1,8 @@
-# Sandbox conformance suite
+# Conformance suites
 
-The `sandbox` crate holds testkit suites for sandbox behavior that every compute
-driver must provide. It is a member of the `conformance` workspace. Each file in
-`tests/` is one suite.
+The `conformance` crate holds the testkit suites for sandbox behavior that every
+compute driver must provide. The family is this one crate, its own workspace.
+Each file in `tests/` is one suite.
 
 | Suite | Covers |
 |---|---|
@@ -23,14 +23,14 @@ environments).
 
 ## Running it
 
-[TESTING.md](../../../../TESTING.md) covers running it against a local Docker
+[TESTING.md](../../../TESTING.md) covers running it against a local Docker
 gateway and in a tmachine VM, as CI does.
 
 ## Adding a test
 
 Add a `#[testkit::test]` function to a suite, or a new file in `tests/` for a new
 area. No playbook, test archive or workflow entry is needed: the runner builds
-and runs every test in the package.
+and runs every test in the crate.
 
 ## What a test may assert
 
