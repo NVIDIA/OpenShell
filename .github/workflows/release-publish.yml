@@ -36,6 +36,8 @@ on:
         required: true
         type: string
     secrets:
+      BUF_TOKEN:
+        required: false
       SNAPCRAFT_STORE_CREDENTIALS:
         required: false
       FERN_TOKEN:
@@ -507,6 +509,31 @@ jobs:
             release/openshell-prover-checksums-sha256.txt
           retention-days: 90
           if-no-files-found: error
+
+  publish-protos:
+    name: Publish Protobuf Schemas
+    needs: release
+    if: ${{ !inputs.is-prerelease }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source-sha }}
+
+      - uses: ./.github/actions/setup-nix
+
+      - name: Push release schemas to Buf
+        env:
+          BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
+          SOURCE_CONTROL_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ inputs.source-sha }}
+        run: |
+          nix develop -c \
+            buf push proto --label "${RELEASE_TAG}" \
+            --source-control-url "${SOURCE_CONTROL_URL}"
 
   publish-snap:
     name: Publish Snap
