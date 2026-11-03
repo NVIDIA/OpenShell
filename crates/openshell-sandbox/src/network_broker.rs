@@ -27,7 +27,7 @@ use openshell_isolation_interface::contract::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-const SOCKET_CAPACITY: usize = 4_096;
+pub const SOCKET_CAPACITY: usize = 4_096;
 const SOCKET_FD_HEADROOM: usize = 64;
 const OPEN_QUEUE_CAPACITY: usize = 256;
 const DNS_QUEUE_CAPACITY: usize = 256;
