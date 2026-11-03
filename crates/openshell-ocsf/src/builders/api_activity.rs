@@ -165,7 +165,7 @@ impl<'a> ApiActivityBuilder<'a> {
     }
 
     #[must_use]
-    pub fn build(mut self) -> OcsfEvent {
+    pub fn build(self) -> OcsfEvent {
         // Only supervisors describe a container on the producing device.
         let mut profiles: Vec<&str> = match self.ctx.origin {
             EventOrigin::Gateway { .. } => vec!["host"],
@@ -200,8 +200,6 @@ impl<'a> ApiActivityBuilder<'a> {
         }
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
-
-        self.ctx.add_sandbox_resource(&mut self.resources);
 
         OcsfEvent::ApiActivity(ApiActivityEvent {
             base,

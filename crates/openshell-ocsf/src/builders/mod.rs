@@ -120,7 +120,7 @@ use std::sync::Arc;
 use crate::OCSF_VERSION;
 use crate::enums::StatusId;
 use crate::events::base_event::BaseEventData;
-use crate::objects::{Container, Device, Endpoint, Image, Metadata, Product, ResourceDetails};
+use crate::objects::{Container, Device, Endpoint, Image, Metadata, Product};
 
 /// Which `OpenShell` component produced an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,7 +238,8 @@ impl EventContext {
                 .filter(|uid| !uid.trim().is_empty())
                 .map(|uid| Image {
                     uid: uid.clone(),
-                    name: self.container_image.clone(),
+                    name: (!self.container_image.trim().is_empty())
+                        .then(|| self.container_image.clone()),
                 }),
         })
     }
@@ -253,25 +254,6 @@ impl EventContext {
         };
         device.container = self.container();
         device
-    }
-
-    /// Identify the affected sandbox without claiming it runs on the gateway device.
-    pub(crate) fn add_sandbox_resource(&self, resources: &mut Vec<ResourceDetails>) {
-        if self.sandbox_id.is_empty() || !matches!(self.origin, EventOrigin::Gateway { .. }) {
-            return;
-        }
-        let existing = resources.iter().position(|r| {
-            r.type_label.as_deref() == Some("sandbox") && r.uid.as_deref() == Some(&self.sandbox_id)
-        });
-        let mut resource = existing.map_or_else(
-            || ResourceDetails::new("sandbox", &self.sandbox_id),
-            |index| resources.remove(index),
-        );
-        if resource.name.is_none() && !self.sandbox_name.is_empty() {
-            resource.name = Some(self.sandbox_name.clone());
-        }
-        // Keep the context sandbox first when an event also names other targets.
-        resources.insert(0, resource);
     }
 
     /// Build the `proxy_endpoint` object for the Network Proxy profile.
@@ -295,14 +277,21 @@ impl EventContext {
             base.set_message(m);
         }
         base.set_device(self.device());
-        // These classes have no resources attribute. Keep gateway attribution
-        // in the standard extension object rather than on the gateway device.
-        if matches!(self.origin, EventOrigin::Gateway { .. })
-            && !self.sandbox_id.is_empty()
-            && !matches!(base.class_uid, 6003 | 2004)
-        {
+        // Only trusted context identity may route an event to a sandbox.
+        // Resources can name request-supplied targets, including denied ones.
+        if matches!(self.origin, EventOrigin::Gateway { .. }) && !self.sandbox_id.is_empty() {
             base.add_unmapped("sandbox_id", self.sandbox_id.clone());
-            base.add_unmapped("sandbox_name", self.sandbox_name.clone());
+            if !self.sandbox_name.is_empty() {
+                base.add_unmapped("sandbox_name", self.sandbox_name.clone());
+            }
+        }
+        if self
+            .container_image_uid
+            .as_ref()
+            .is_none_or(|uid| uid.trim().is_empty())
+            && !self.container_image.trim().is_empty()
+        {
+            base.add_unmapped("container_image", self.container_image.clone());
         }
     }
 }
@@ -450,6 +439,54 @@ pub(crate) fn test_gateway_context() -> EventContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_identity_preserves_references_and_omits_missing_names() {
+        for uid in [None, Some(""), Some(" "), Some("sha256:resolved-workload")] {
+            for reference in ["", " ", "registry.example/workload:latest"] {
+                let mut ctx = test_sandbox_context();
+                ctx.container_image_uid = uid.map(str::to_string);
+                ctx.container_image = reference.into();
+                let resolved = uid.filter(|uid| !uid.trim().is_empty());
+                for (class, event) in sample_events(&ctx) {
+                    let json = event.to_json().unwrap();
+                    openshell_ocsf_validate::validate_event(&json)
+                        .unwrap_or_else(|error| panic!("{class}: {error}"));
+                    let image = &json["device"]["container"]["image"];
+                    if class != "authentication" && resolved.is_some() {
+                        assert_eq!(image["uid"].as_str(), resolved);
+                        assert_eq!(
+                            image.get("name").and_then(serde_json::Value::as_str),
+                            (!reference.trim().is_empty()).then_some(reference)
+                        );
+                    } else {
+                        assert!(image.is_null());
+                    }
+                    assert_eq!(
+                        json["unmapped"]["container_image"].as_str(),
+                        (resolved.is_none() && !reference.trim().is_empty()).then_some(reference)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_gateway_class_routes_only_by_context_identity() {
+        for sandbox_id in ["", "sb-context"] {
+            let mut ctx = test_gateway_context();
+            ctx.sandbox_id = sandbox_id.into();
+            for (class, event) in sample_events(&ctx) {
+                let json = event.to_json().unwrap();
+                assert_eq!(
+                    event.sandbox_id(),
+                    (!sandbox_id.is_empty()).then_some(sandbox_id),
+                    "{class}"
+                );
+                assert!(json["unmapped"].get("sandbox_name").is_none(), "{class}");
+            }
+        }
+    }
 
     #[test]
     fn resolved_container_image_matches_schema() {

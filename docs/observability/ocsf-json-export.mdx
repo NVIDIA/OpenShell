@@ -141,16 +141,16 @@ Windows MXC gateway records use `%PROGRAMDATA%\OpenShell\logs` or `OPENSHELL_OCS
 
 ## JSON Record Structure
 
-Gateway-produced records use the `OpenShell Gateway` product identity; supervisor records use `OpenShell Sandbox Supervisor`. The producing device and the affected sandbox are separate identities. Gateway records keep the gateway host in `device`. API Activity and Detection Finding identify affected sandboxes in `resources` entries with `type: "sandbox"`, `uid`, and `name`. Other gateway event classes that have no `resources` attribute use `unmapped.sandbox_id` and `unmapped.sandbox_name`. Authentication records do not attach a sandbox container.
+Gateway-produced records use the `OpenShell Gateway` product identity; supervisor records use `OpenShell Sandbox Supervisor`. Gateway records keep the gateway host in `device` and use `unmapped.sandbox_id` and, when available, `unmapped.sandbox_name` for sandbox attribution from the event context. API Activity `resources` describe request targets and do not determine sandbox log routing or the OTLP `openshell.sandbox.id` attribute. Cross-sandbox authorization denials remain gateway-wide, even when a resource names the requested sandbox. Authentication records do not attach a sandbox container.
 
 For gateway-produced records, `device.os.name` and `device.os.type_id` identify the OS running the gateway process: Linux (200), Windows (100), or macOS (300). Linux supervisor records continue to report Linux, regardless of the gateway's OS. A native macOS gateway therefore reports macOS while its Linux sandboxes report Linux; a gateway running inside a Linux container reports Linux, even on a Mac host.
 
 `metadata.uid` uniquely identifies an event and stays unchanged when that record is serialized again. For supervisor records, use `device.container.uid` to associate the event with its sandbox and `device.container.name` for the sandbox name. These records declare the `container` profile in `metadata.profiles`. Records without a sandbox association omit `device.container`.
 
-Docker and Podman supervisor records include `device.container.image.uid`, the immutable workload image ID resolved at launch, and `device.container.image.name`, the requested image reference. The UID identifies the workload image, even when a mutable tag later changes. Records omit `device.container.image` when the driver has not supplied a resolved image UID, including Kubernetes supervisor records.
+Docker and Podman supervisor records include `device.container.image.uid`, the immutable workload image ID resolved at launch, and `device.container.image.name` when the requested image reference is available. The UID identifies the workload image, even when a mutable tag later changes. When the driver has not supplied a resolved image UID, including Kubernetes, VM, and shared-supervisor records, events omit `device.container.image` and preserve any known image reference in `unmapped.container_image`.
 
 <Warning>
-Sandbox identity has moved from top-level `container` to `device.container` for supervisor records, and to `resources` or `unmapped` for gateway records, to conform to OCSF 1.8.0. Update SIEM mappings and parsers, including XSIAM content pack rules that read `container.uid` or `container.name`, to use the paths for the producing component.
+Sandbox identity has moved from top-level `container` to `device.container` for supervisor records, and to `unmapped.sandbox_id` and `unmapped.sandbox_name` for gateway records, to conform to OCSF 1.8.0. Update SIEM mappings and parsers, including XSIAM content pack rules that read `container.uid` or `container.name`, to use the paths for the producing component. Image-based filters should also read `unmapped.container_image` when `device.container.image` is absent.
 </Warning>
 
 Some fields depend on the event class:

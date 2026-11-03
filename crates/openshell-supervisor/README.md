@@ -41,8 +41,10 @@ Dedicated Docker and Podman drivers pass the workload image reference and its
 resolved immutable ID through `OPENSHELL_CONTAINER_IMAGE` and
 `OPENSHELL_CONTAINER_IMAGE_UID`. The binary carries these into
 `SandboxInstanceConfig` and the instance's `EventContext`; OCSF builders emit
-`device.container.image` only when the ID is nonempty. Hosted Kubernetes
-instances currently carry only the image reference and omit the image object.
+`device.container.image` only when the ID is nonempty. Without an ID, known
+workload image references are preserved in `unmapped.container_image`. Hosted
+Kubernetes instances currently carry only the image reference and omit the image
+object.
 Everything else, including credential renewal, policy, provider credentials and
 token grants, middleware credentials, the backend connection, and the access
 plane, is created by the instance. Gateway clients receive a `GatewayEndpoint`,

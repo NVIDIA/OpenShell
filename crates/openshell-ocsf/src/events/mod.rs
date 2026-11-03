@@ -140,25 +140,14 @@ impl OcsfEvent {
         }
     }
 
-    /// Sandbox attribution across supervisor and gateway event classes.
+    /// Context-derived sandbox attribution, never request-supplied resources.
     #[must_use]
     pub fn sandbox_id(&self) -> Option<&str> {
-        let resources = match self {
-            Self::ApiActivity(event) => event.resources.as_deref(),
-            Self::DetectionFinding(event) => event.resources.as_deref(),
-            _ => None,
-        };
         self.base()
             .device
             .as_ref()
             .and_then(|device| device.container.as_ref())
             .and_then(|container| container.uid.as_deref())
-            .or_else(|| {
-                resources?
-                    .iter()
-                    .find(|resource| resource.type_label.as_deref() == Some("sandbox"))
-                    .and_then(|resource| resource.uid.as_deref())
-            })
             .or_else(|| self.base().unmapped.as_ref()?.get("sandbox_id")?.as_str())
             .filter(|id| !id.is_empty())
     }

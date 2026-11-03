@@ -104,19 +104,15 @@ impl<'a> AuthenticationBuilder<'a> {
             self.severity,
             metadata,
         );
-        if let Some(status) = self.status {
-            base.set_status(status);
-        }
+        self.ctx
+            .apply_common_fields(&mut base, self.status, self.message);
         if let Some(detail) = self.status_detail {
             base.set_status_detail(detail);
         }
-        if let Some(message) = self.message {
-            base.set_message(message);
-        }
         // Authentication identifies the authenticating device, not a workload container.
-        let mut device = self.ctx.device();
-        device.container = None;
-        base.set_device(device);
+        if let Some(device) = base.device.as_mut() {
+            device.container = None;
+        }
 
         OcsfEvent::Authentication(AuthenticationEvent {
             base,

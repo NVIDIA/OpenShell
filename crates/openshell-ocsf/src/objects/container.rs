@@ -27,7 +27,8 @@ pub struct Image {
     pub uid: String,
 
     /// Image name (e.g., "ghcr.io/openshell/sandbox:latest").
-    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[cfg(test)]
@@ -41,7 +42,7 @@ mod tests {
             uid: Some("sandbox-abc123".to_string()),
             image: Some(Image {
                 uid: "sha256:0123456789abcdef".to_string(),
-                name: "ghcr.io/openshell/sandbox:latest".to_string(),
+                name: Some("ghcr.io/openshell/sandbox:latest".to_string()),
             }),
         };
 

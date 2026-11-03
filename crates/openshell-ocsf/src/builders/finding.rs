@@ -7,7 +7,7 @@ use crate::builders::{ContextRef, EventOrigin};
 use crate::enums::{ActionId, ActivityId, ConfidenceId, DispositionId, RiskLevelId, SeverityId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{DetectionFindingEvent, OcsfEvent};
-use crate::objects::{Attack, Evidence, FindingInfo, Remediation, ResourceDetails};
+use crate::objects::{Attack, Evidence, FindingInfo, Remediation};
 
 /// Builder for Detection Finding [2004] events.
 pub struct DetectionFindingBuilder<'a> {
@@ -26,7 +26,6 @@ pub struct DetectionFindingBuilder<'a> {
     message: Option<String>,
     log_source: Option<String>,
     correlation_uid: Option<String>,
-    resources: Vec<ResourceDetails>,
     unmapped: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -49,7 +48,6 @@ impl<'a> DetectionFindingBuilder<'a> {
             message: None,
             log_source: None,
             correlation_uid: None,
-            resources: Vec::new(),
             unmapped: serde_json::Map::new(),
         }
     }
@@ -94,13 +92,6 @@ impl<'a> DetectionFindingBuilder<'a> {
         self
     }
 
-    /// Add a resource affected by the finding.
-    #[must_use]
-    pub fn resource(mut self, resource: ResourceDetails) -> Self {
-        self.resources.push(resource);
-        self
-    }
-
     /// Add a remediation description.
     #[must_use]
     pub fn remediation(mut self, desc: &str) -> Self {
@@ -130,7 +121,7 @@ impl<'a> DetectionFindingBuilder<'a> {
     }
 
     #[must_use]
-    pub fn build(mut self) -> OcsfEvent {
+    pub fn build(self) -> OcsfEvent {
         let activity_name = self.activity.finding_label().to_string();
         // Only supervisors describe a container on the producing device.
         let profiles: &[&str] = match self.ctx.origin {
@@ -158,11 +149,8 @@ impl<'a> DetectionFindingBuilder<'a> {
         }
         self.ctx.apply_common_fields(&mut base, None, self.message);
 
-        self.ctx.add_sandbox_resource(&mut self.resources);
-
         OcsfEvent::DetectionFinding(DetectionFindingEvent {
             base,
-            resources: (!self.resources.is_empty()).then_some(self.resources),
             finding_info: self
                 .finding_info
                 .unwrap_or_else(|| FindingInfo::new("unknown", "Unknown Finding")),
@@ -196,7 +184,7 @@ mod tests {
     use crate::builders::{test_gateway_context, test_sandbox_context};
 
     #[test]
-    fn gateway_finding_identifies_sandbox_resources() {
+    fn gateway_finding_identifies_context_sandbox_in_unmapped() {
         // Gateway-wide findings name no sandbox; MXC findings name the
         // sandbox they concern.
         for (sandbox_id, profiles) in [
@@ -221,10 +209,10 @@ mod tests {
             );
             assert_eq!(json["metadata"]["profiles"], profiles, "{sandbox_id:?}");
             assert!(json["device"].get("container").is_none());
+            assert!(json.get("resources").is_none());
             assert_eq!(
-                json.get("resources").is_some(),
-                !sandbox_id.is_empty(),
-                "{sandbox_id:?}"
+                json["unmapped"]["sandbox_id"].as_str(),
+                (!sandbox_id.is_empty()).then_some(sandbox_id)
             );
         }
     }

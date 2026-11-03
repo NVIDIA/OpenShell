@@ -4671,7 +4671,7 @@ mod tests {
         );
         let image = bindings.event_context.container().unwrap().image.unwrap();
         assert_eq!(image.uid, "sha256:workload");
-        assert_eq!(image.name, "registry.example/agent:latest");
+        assert_eq!(image.name.as_deref(), Some("registry.example/agent:latest"));
         let error = run_sandbox_with_backend(
             &backend_setup::OpenShellBackendSetup,
             config,

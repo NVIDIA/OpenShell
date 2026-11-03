@@ -150,7 +150,7 @@ fn supervisor_events_still_carry_their_sandbox_container() {
 }
 
 #[test]
-fn gateway_sandbox_attribution_uses_resources_or_unmapped() {
+fn gateway_sandbox_attribution_uses_context_even_with_other_resources() {
     use openshell_ocsf::{ApiActivityBuilder, DetectionFindingBuilder, OcsfEvent, ResourceDetails};
 
     let mut ctx = gateway_ctx();
@@ -162,9 +162,7 @@ fn gateway_sandbox_attribution_uses_resources_or_unmapped() {
             .resource(ResourceDetails::new("sandbox", "sb-other"))
             .resource(ResourceDetails::new("sandbox", "sb-1"))
             .build(),
-        DetectionFindingBuilder::new(&ctx)
-            .resource(ResourceDetails::new("workspace", "ws-1"))
-            .build(),
+        DetectionFindingBuilder::new(&ctx).build(),
         ConfigStateChangeBuilder::new(&ctx).build(),
     ];
     for event in events {
@@ -181,21 +179,18 @@ fn gateway_sandbox_attribution_uses_resources_or_unmapped() {
                 .any(|profile| profile == "container")
         );
         assert_eq!(event.sandbox_id(), Some("sb-1"));
-        if event.class_uid() == 5019 {
-            assert!(json.get("resources").is_none());
-            assert_eq!(json["unmapped"]["sandbox_id"], "sb-1");
-            assert_eq!(json["unmapped"]["sandbox_name"], "agent-01");
-        } else {
+        assert_eq!(json["unmapped"]["sandbox_id"], "sb-1");
+        assert_eq!(json["unmapped"]["sandbox_name"], "agent-01");
+        if event.class_uid() == 6003 {
             let resources = json["resources"].as_array().unwrap();
             assert_eq!(
                 resources[0],
-                serde_json::json!({
-                    "type": "sandbox", "uid": "sb-1", "name": "agent-01"
-                })
+                serde_json::json!({"type": "workspace", "uid": "ws-1"})
             );
             assert_eq!(resources.iter().filter(|r| r["uid"] == "sb-1").count(), 1);
-            assert!(resources.iter().any(|r| r["type"] == "workspace"));
-            assert!(json.get("unmapped").is_none());
+            assert!(resources.iter().any(|r| r["uid"] == "sb-other"));
+        } else {
+            assert!(json.get("resources").is_none());
         }
         let decoded: OcsfEvent = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(decoded.sandbox_id(), Some("sb-1"));
@@ -214,7 +209,8 @@ fn gateway_authentication_does_not_attach_a_container_or_resources() {
     openshell_ocsf_validate::validate_event(&json).unwrap();
     assert!(json["device"].get("container").is_none());
     assert!(json.get("resources").is_none());
-    assert!(event.sandbox_id().is_none());
+    assert_eq!(event.sandbox_id(), Some("sb-1"));
+    assert!(json["unmapped"].get("sandbox_name").is_none());
 }
 
 #[test]

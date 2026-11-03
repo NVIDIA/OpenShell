@@ -542,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_resource_and_unmapped_attribution_reach_otlp() {
+    fn gateway_context_attribution_reaches_otlp() {
         use openshell_ocsf::{ApiActivityBuilder, DetectionFindingBuilder, EventOrigin};
         let mut ctx = event_context("sandbox-1");
         ctx.origin = EventOrigin::Gateway {
@@ -560,6 +560,22 @@ mod tests {
             );
             assert_eq!(body(&record), native(&event));
         }
+    }
+
+    #[test]
+    fn requested_sandbox_resource_does_not_become_otlp_identity() {
+        use openshell_ocsf::{ApiActivityBuilder, EventOrigin, ResourceDetails};
+        let mut ctx = event_context("");
+        ctx.origin = EventOrigin::Gateway {
+            name: "gateway".into(),
+        };
+        let event = ApiActivityBuilder::new(&ctx, "GetSandbox")
+            .resource(ResourceDetails::new("sandbox", "requested-sandbox"))
+            .build();
+        let record = record(&event);
+        assert!(attribute(&record, "openshell.sandbox.id").is_none());
+        assert_eq!(body(&record), native(&event));
+        assert_eq!(native(&event)["resources"][0]["uid"], "requested-sandbox");
     }
 
     #[test]

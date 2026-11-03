@@ -350,7 +350,7 @@ where
             && let Some(ocsf) = openshell_ocsf::clone_current_event()
         {
             // The structured bridge carries no tracing fields. Route by the
-            // affected sandbox, not by the gateway that produced the event.
+            // trusted context identity, never by request-supplied resources.
             visitor.sandbox_id = ocsf.sandbox_id().map(str::to_string);
             visitor.message = Some(ocsf.format_shorthand());
         }
@@ -419,6 +419,53 @@ fn display_level(target: &str, level: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cross_sandbox_denials_remain_gateway_wide() {
+        use crate::auth::{audit, principal::test_support};
+        use tracing_subscriber::prelude::*;
+
+        let bus = TracingLogBus::new();
+        let mut receiver = bus.subscribe("sb-victim");
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(bus.layer())
+            .with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            for target in ["sb-victim", "sb-nonexistent-1", "sb-nonexistent-2"] {
+                audit::emit_authorization_denial_for(
+                    "/openshell.v1.OpenShell/GetSandbox",
+                    &audit::test_support::origin(),
+                    &test_support::sandbox("sb-attacker"),
+                    audit::AuthzDenial::CrossSandbox { sandbox_id: target },
+                );
+            }
+        });
+
+        let events = capture.json_events();
+        assert_eq!(events.len(), 6, "each denial must retain both audit events");
+        for event in &events {
+            openshell_ocsf_validate::validate_event(event).unwrap();
+        }
+        for event in capture.events() {
+            assert!(event.sandbox_id().is_none());
+        }
+        assert_eq!(events[0]["resources"][0]["uid"], "sb-victim");
+        assert!(receiver.try_recv().is_err());
+        assert!(bus.tail("sb-victim", 10).is_empty());
+        let inner = bus.inner.lock().unwrap();
+        assert_eq!(
+            inner.per_id.len(),
+            1,
+            "only the subscribed sandbox may exist"
+        );
+        assert!(inner.per_id.contains_key("sb-victim"));
+        drop(inner);
+        assert!(
+            bus.seq.lock().is_empty(),
+            "denials must allocate no sandbox cursors"
+        );
+    }
 
     #[test]
     fn gateway_ocsf_reaches_sandbox_tail_and_live_stream() {
