@@ -72,15 +72,46 @@ pub fn apply_supervisor_prelude() -> Result<()> {
     Ok(())
 }
 
-pub fn apply(policy: &SandboxPolicy) -> Result<()> {
+/// Both sandbox seccomp filters, compiled before `fork`.
+///
+/// The forked child only runs [`PreparedSeccomp::install`]; all rule
+/// building, BPF compilation, and logging happen parent-side.
+pub struct PreparedSeccomp {
+    main: seccompiler::BpfProgram,
+    compatibility: seccompiler::BpfProgram,
+}
+
+/// Compile both sandbox seccomp filters parent-side.
+///
+/// This is the pre-fork half of the spawn path; the child installs the
+/// returned programs with [`PreparedSeccomp::install`].
+pub fn prepare(policy: &SandboxPolicy) -> Result<PreparedSeccomp> {
     let allow_inet = matches!(policy.network.mode, NetworkMode::Proxy | NetworkMode::Allow);
-    let main_filter = build_filter(allow_inet)?;
-    let compatibility_filter = build_compatibility_filter()?;
+    Ok(PreparedSeccomp {
+        main: build_filter(allow_inet)?,
+        compatibility: build_compatibility_filter()?,
+    })
+}
 
-    set_no_new_privs()?;
-    apply_runtime_filters(&main_filter, &compatibility_filter)?;
+impl PreparedSeccomp {
+    /// Install the prebuilt filters in the required order.
+    ///
+    /// This runs in the forked child before `exec` and must stay free of
+    /// allocation, tracing, and OCSF emission on the success path. Only the
+    /// hard-error return may allocate (std's `pre_exec` machinery allocates
+    /// on `Err` anyway).
+    pub fn install(&self) -> Result<()> {
+        set_no_new_privs()?;
+        apply_runtime_filters(&self.main, &self.compatibility)
+    }
+}
 
-    Ok(())
+fn allowed_socket_domains(allow_inet: bool) -> Vec<i32> {
+    let mut domains = vec![libc::AF_UNIX, libc::AF_NETLINK];
+    if allow_inet {
+        domains.extend([libc::AF_INET, libc::AF_INET6]);
+    }
+    domains
 }
 
 fn build_filter(allow_inet: bool) -> Result<seccompiler::BpfProgram> {
@@ -194,10 +225,7 @@ fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>
     // --- Socket domain allowlist ---
     // AF_NETLINK is narrowed further below: only NETLINK_ROUTE (protocol 0)
     // is allowed, for getifaddrs(3).
-    let mut allowed_domains = vec![libc::AF_UNIX, libc::AF_NETLINK];
-    if allow_inet {
-        allowed_domains.extend([libc::AF_INET, libc::AF_INET6]);
-    }
+    let allowed_domains = allowed_socket_domains(allow_inet);
     debug!(?allowed_domains, "Restricting socket domains via seccomp");
     add_socket_domain_allowlist(&mut rules, libc::SYS_socket, &allowed_domains)?;
     // socketpair(2) is only meaningful for AF_UNIX here; other families either
@@ -389,9 +417,20 @@ fn add_masked_arg_rule(
 )]
 mod tests {
     use super::*;
+    use openshell_core::policy::{FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy};
 
     // These tests cover both filter construction (rule map shape and BPF
     // compilation) and selected runtime behavior on Linux via forked children.
+
+    fn test_policy(mode: NetworkMode) -> SandboxPolicy {
+        SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy { mode, proxy: None },
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy::default(),
+        }
+    }
 
     #[test]
     fn build_filter_proxy_mode_compiles() {
@@ -630,12 +669,8 @@ mod tests {
         );
     }
 
-    unsafe fn install_runtime_filters_in_child(
-        main_filter: &seccompiler::BpfProgram,
-        compatibility_filter: &seccompiler::BpfProgram,
-    ) {
-        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-        if let Err(err) = apply_runtime_filters(main_filter, compatibility_filter) {
+    unsafe fn install_runtime_filters_in_child(prepared: &PreparedSeccomp) {
+        if let Err(err) = prepared.install() {
             let msg = format!("failed to install runtime seccomp filters: {err}\n");
             libc::write(2, msg.as_ptr().cast(), msg.len());
             libc::_exit(1);
@@ -721,15 +756,14 @@ mod tests {
     #[test]
     fn behavioral_clone3_returns_enosys() {
         // clone3 uses a separate filter that returns ENOSYS (not EPERM) so
-        // glibc falls back to clone.
-        let main_filter = build_filter(true).unwrap();
-        let compatibility_filter = build_compatibility_filter().unwrap();
-        // Apply in the same order as apply(): compatibility filter first, main filter second.
+        // glibc falls back to clone. Compile parent-side with prepare() and
+        // install in the forked child, as the production spawn path does.
+        let prepared = prepare(&test_policy(NetworkMode::Proxy)).unwrap();
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             unsafe {
-                install_runtime_filters_in_child(&main_filter, &compatibility_filter);
+                install_runtime_filters_in_child(&prepared);
                 let ret = libc::syscall(libc::SYS_clone3, 0 as libc::c_ulong, 0 as libc::c_ulong);
                 let errno = *libc::__errno_location();
                 if ret == -1 && errno == libc::ENOSYS {
@@ -757,15 +791,14 @@ mod tests {
 
     #[test]
     fn behavioral_third_filter_install_blocked_after_startup() {
-        let main_filter = build_filter(true).unwrap();
-        let compatibility_filter = build_compatibility_filter().unwrap();
+        let prepared = prepare(&test_policy(NetworkMode::Proxy)).unwrap();
         let third_filter = build_compatibility_filter().unwrap();
 
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             unsafe {
-                install_runtime_filters_in_child(&main_filter, &compatibility_filter);
+                install_runtime_filters_in_child(&prepared);
                 match apply_filter(&third_filter) {
                     Err(seccompiler::Error::Seccomp(e))
                         if e.raw_os_error() == Some(libc::EPERM) =>
@@ -792,6 +825,92 @@ mod tests {
         assert!(
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "additional seccomp filter installation should be blocked after startup"
+        );
+    }
+
+    #[test]
+    fn behavioral_prepared_filters_install_in_forked_child() {
+        // Reproduces the production child path for #5180: both filters are
+        // compiled in the parent via prepare(), and the forked child only
+        // installs them, child self-protection first, in the
+        // enforce_capability_free order. Each probe targets one filter's
+        // unique outcome so a subset install or an order swap fails the
+        // test instead of merely confirming "some filter is active".
+        const CLOSE_RANGE_UNSHARE: libc::c_ulong = 1 << 1;
+        let prepared = prepare(&test_policy(NetworkMode::Proxy)).unwrap();
+        let mut child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
+            .expect("prepare child self-protection filter");
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                if let Err(err) = child_hardening.install() {
+                    let msg = format!("failed to install child self-protection filter: {err}\n");
+                    libc::write(2, msg.as_ptr().cast(), msg.len());
+                    libc::_exit(1);
+                }
+                if let Err(err) = prepared.install() {
+                    let msg = format!("failed to install prepared seccomp filters: {err}\n");
+                    libc::write(2, msg.as_ptr().cast(), msg.len());
+                    libc::_exit(1);
+                }
+
+                // Main filter: memfd_create is blocked with EPERM only by
+                // the ordinary workload filter.
+                let ret = libc::syscall(
+                    libc::SYS_memfd_create,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                );
+                let errno = *libc::__errno_location();
+                if ret != -1 || errno != libc::EPERM {
+                    let msg = format!(
+                        "memfd_create: expected EPERM from the main filter, got ret={ret} errno={errno}\n"
+                    );
+                    libc::write(2, msg.as_ptr().cast(), msg.len());
+                    libc::_exit(1);
+                }
+
+                // Compatibility filter: pidfd_open is reported unavailable
+                // with ENOSYS, an errno the EPERM main filter cannot produce.
+                let ret =
+                    libc::syscall(libc::SYS_pidfd_open, 1 as libc::c_ulong, 0 as libc::c_ulong);
+                let errno = *libc::__errno_location();
+                if ret != -1 || errno != libc::ENOSYS {
+                    let msg = format!(
+                        "pidfd_open: expected ENOSYS from the compatibility filter, got ret={ret} errno={errno}\n"
+                    );
+                    libc::write(2, msg.as_ptr().cast(), msg.len());
+                    libc::_exit(1);
+                }
+
+                // Child self-protection filter: close_range with
+                // CLOSE_RANGE_UNSHARE is blocked with EPERM only here.
+                let ret = libc::syscall(
+                    libc::SYS_close_range,
+                    3 as libc::c_ulong,
+                    libc::c_ulong::from(u32::MAX),
+                    CLOSE_RANGE_UNSHARE,
+                );
+                let errno = *libc::__errno_location();
+                if ret != -1 || errno != libc::EPERM {
+                    let msg = format!(
+                        "close_range(CLOSE_RANGE_UNSHARE): expected EPERM from the child self-protection filter, got ret={ret} errno={errno}\n"
+                    );
+                    libc::write(2, msg.as_ptr().cast(), msg.len());
+                    libc::_exit(1);
+                }
+
+                libc::_exit(0);
+            }
+        }
+
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "prepared filters must install in the forked child with every filter's role intact"
         );
     }
 
@@ -875,8 +994,10 @@ mod tests {
         const AF_KCM: i32 = 41;
         const AF_SMC: i32 = 43;
         if std::env::var_os(CHILD_MARKER).is_some() {
-            set_no_new_privs().expect("set no_new_privs");
-            apply_filter(&build_filter(true).unwrap()).expect("apply proxy-mode filter");
+            prepare(&test_policy(NetworkMode::Proxy))
+                .expect("prepare proxy-mode sandbox filters")
+                .install()
+                .expect("install proxy-mode sandbox filters");
             let create = |domain: i32, kind: socket2::Type| {
                 socket2::Socket::new(socket2::Domain::from(domain), kind, None)
                     .map(drop)
