@@ -427,7 +427,8 @@ Suites:
   lifecycle, the CLI, persistent workspaces, file transfer, and the policy
   advisor. Driver E2E runs it with `openshell-conformance` against the lane's
   gateway and writes a JUnit report under `results/`; set
-  `OPENSHELL_CONFORMANCE_BIN` to use a prebuilt program. The
+  `OPENSHELL_CONFORMANCE_BIN` to use a prebuilt program, as Branch E2E does
+  with the static build it makes once per architecture. The
   installed-artifact conformance lanes run the same crate through
   `openshell-test-runner` (see above).
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or

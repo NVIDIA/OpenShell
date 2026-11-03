@@ -17,6 +17,10 @@ on:
         required: false
         type: string
         default: ""
+      prebuilt-conformance:
+        required: false
+        type: boolean
+        default: false
       external-driver-binary:
         required: false
         type: string
@@ -52,6 +56,8 @@ jobs:
           persist-credentials: false
 
       - uses: ./.github/actions/setup-e2e-cli
+        with:
+          conformance: ${{ inputs.prebuilt-conformance }}
 
       - uses: ./.github/actions/setup-e2e-gateway
         with:
