@@ -1341,7 +1341,8 @@ export class SandboxClient {
     }
   }
 
-  // Poll until the sandbox is ready. The timeout bounds the returned promise,
+  // Poll until the sandbox is ready; a sandbox that completes, stops, errors or
+  // is suspended first is an error. The timeout bounds the returned promise,
   // not just the sleep loop: each poll RPC carries the remaining deadline (and
   // any caller signal), so a stalled get() is aborted rather than hanging.
   async waitReady(name: string, timeoutSecs: number, options?: WaitOptions | null): Promise<SandboxRef> {
@@ -1361,7 +1362,10 @@ export class SandboxClient {
       } catch (e) {
         throw mapWaitError(e, name, deadline, signal, pollOptions.signal);
       }
-      if (ref.phase === 'ready' || ref.phase === 'completed') return ref;
+      if (ref.phase === 'ready') return ref;
+      if (ref.phase === 'completed') {
+        throw new SdkError('connect', `sandbox '${name}' completed before becoming ready`);
+      }
       if (ref.phase === 'stopped') throw new SdkError('connect', `sandbox '${name}' stopped before becoming ready`);
       if (ref.phase === 'error') throw new SdkError('connect', `sandbox '${name}' entered error phase`);
       if (ref.phase === 'suspending' || ref.phase === 'suspended') {
