@@ -141,7 +141,13 @@ pub struct BackendDescriptor {
 }
 
 /// Exact non-root identity selected before the immutable workload is created.
+///
+/// Validation and normalization run in [`ResolvedWorkloadIdentity::new`] and
+/// again when a value is decoded from a serialized descriptor: deserialization
+/// routes through the same constructor, so an invalid identity fails to decode
+/// instead of bypassing the contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawResolvedWorkloadIdentity")]
 pub struct ResolvedWorkloadIdentity {
     /// Effective and real user ID used by sandbox and all workload children.
     pub uid: u32,
@@ -184,6 +190,32 @@ impl ResolvedWorkloadIdentity {
             source,
             resource_digest,
         })
+    }
+}
+
+/// Unvalidated wire shape of [`ResolvedWorkloadIdentity`], existing only so
+/// serde decoding can route through [`ResolvedWorkloadIdentity::new`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawResolvedWorkloadIdentity {
+    uid: u32,
+    gid: u32,
+    supplementary_gids: Vec<u32>,
+    source: String,
+    resource_digest: String,
+}
+
+impl TryFrom<RawResolvedWorkloadIdentity> for ResolvedWorkloadIdentity {
+    type Error = BackendError;
+
+    fn try_from(raw: RawResolvedWorkloadIdentity) -> Result<Self, Self::Error> {
+        Self::new(
+            raw.uid,
+            raw.gid,
+            raw.supplementary_gids,
+            raw.source,
+            raw.resource_digest,
+        )
     }
 }
 
