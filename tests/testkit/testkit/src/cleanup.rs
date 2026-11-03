@@ -26,6 +26,20 @@ struct Hook {
     run: HookFn,
 }
 
+impl Hook {
+    fn new<F, Fut>(name: String, key: Option<String>, hook: F) -> Self
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result> + Send + 'static,
+    {
+        Self {
+            name,
+            key,
+            run: Box::new(move || hook().boxed()),
+        }
+    }
+}
+
 /// An ordered list of cleanup hooks, shared by a test's context and the
 /// handles that register or cancel hooks.
 #[derive(Clone, Default)]
@@ -40,7 +54,7 @@ impl Cleanup {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result> + Send + 'static,
     {
-        self.insert(name.into(), None, hook);
+        lock(&self.hooks).push(Hook::new(name.into(), None, hook));
     }
 
     /// Add a hook unless one with `key` is registered, in which case the
@@ -50,32 +64,15 @@ impl Cleanup {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result> + Send + 'static,
     {
-        if !self.contains(key) {
-            self.insert(name.into(), Some(key.to_string()), hook);
+        let mut hooks = lock(&self.hooks);
+        if !hooks.iter().any(|hook| hook.key.as_deref() == Some(key)) {
+            hooks.push(Hook::new(name.into(), Some(key.to_string()), hook));
         }
     }
 
     /// Drop the hook registered with `key`, if any, without running it.
     pub(crate) fn remove(&self, key: &str) {
         lock(&self.hooks).retain(|hook| hook.key.as_deref() != Some(key));
-    }
-
-    fn contains(&self, key: &str) -> bool {
-        lock(&self.hooks)
-            .iter()
-            .any(|hook| hook.key.as_deref() == Some(key))
-    }
-
-    fn insert<F, Fut>(&self, name: String, key: Option<String>, hook: F)
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = Result> + Send + 'static,
-    {
-        lock(&self.hooks).push(Hook {
-            name,
-            key,
-            run: Box::new(move || hook().boxed()),
-        });
     }
 
     /// Run every hook, last registered first, each limited to `timeout`. A

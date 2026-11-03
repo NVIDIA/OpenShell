@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_sandbox_is_deleted_by_cleanup() {
+    async fn sandbox_tracked_twice_is_deleted_once() {
         // The gateway isn't running, so the delete fails and is reported.
         let failure = outcome(async |cx: &mut Context| {
             cx.track("leaked");
@@ -186,9 +186,10 @@ mod tests {
             failure.starts_with("[test] passed, but cleanup failed: delete sandbox leaked: "),
             "{failure}"
         );
-        assert!(
-            !failure.contains("; "),
-            "tracked twice, deleted once: {failure}"
+        assert_eq!(
+            failure.matches("delete sandbox leaked").count(),
+            1,
+            "{failure}"
         );
     }
 }
