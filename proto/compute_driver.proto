@@ -168,16 +168,23 @@ message ResourceCapabilities {
   CpuResourceCapabilities cpu = 1;
   MemoryResourceCapabilities memory = 2;
   GpuResourceCapabilities gpu = 3;
+  openshell.sandbox.v1.SampledResourceBudgetCapabilities sampled_budget = 4;
 }
 
 message CpuResourceCapabilities {
   // The driver accepts and enforces a portable CPU limit.
   bool limit_supported = 1;
+  // Required for a negotiated resource contract. Absence means unreported.
+  openshell.sandbox.v1.ResourceEnforcement limit_enforcement = 2;
+  openshell.sandbox.v1.ResourceEnforcement request_enforcement = 3;
 }
 
 message MemoryResourceCapabilities {
   // The driver accepts and enforces a portable memory limit.
   bool limit_supported = 1;
+  // Required for a negotiated resource contract. Absence means unreported.
+  openshell.sandbox.v1.ResourceEnforcement limit_enforcement = 2;
+  openshell.sandbox.v1.ResourceEnforcement request_enforcement = 3;
 }
 
 message GpuResourceCapabilities {
@@ -314,6 +321,8 @@ message DriverFenceEvidence {
 message ResourceRequirements {
   // GPU requirements for the sandbox. Presence indicates a GPU request.
   GpuResourceRequirements gpu = 1;
+  // Explicit opt-in to weaker sampled budgets; never inferred from hard limits.
+  openshell.sandbox.v1.SampledResourceBudget sampled_budget = 4;
 }
 
 // Driver GPU resource requirements.

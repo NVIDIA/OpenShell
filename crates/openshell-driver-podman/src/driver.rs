@@ -713,6 +713,36 @@ impl PodmanComputeDriver {
     }
 
     /// Report driver capabilities.
+    fn resource_capabilities() -> ResourceCapabilities {
+        ResourceCapabilities {
+            cpu: Some(CpuResourceCapabilities {
+                limit_supported: true,
+                limit_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                    kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::KernelLimit
+                        as i32,
+                    scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container
+                        as i32,
+                }),
+                ..Default::default()
+            }),
+            memory: Some(MemoryResourceCapabilities {
+                limit_supported: true,
+                limit_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                    kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::KernelLimit
+                        as i32,
+                    scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container
+                        as i32,
+                }),
+                ..Default::default()
+            }),
+            gpu: Some(GpuResourceCapabilities {
+                default_selection_supported: true,
+                count_selection_supported: true,
+            }),
+            sampled_budget: None,
+        }
+    }
+
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, ComputeDriverError> {
         Ok(GetCapabilitiesResponse {
             resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
@@ -726,25 +756,14 @@ impl PodmanComputeDriver {
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: false,
-            resource_capabilities: Some(ResourceCapabilities {
-                cpu: Some(CpuResourceCapabilities {
-                    limit_supported: true,
-                }),
-                memory: Some(MemoryResourceCapabilities {
-                    limit_supported: true,
-                }),
-                gpu: Some(GpuResourceCapabilities {
-                    default_selection_supported: true,
-                    count_selection_supported: true,
-                }),
-            }),
+            resource_capabilities: Some(Self::resource_capabilities()),
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
             extension: Some(openshell_core::extension_protocol::extension_metadata(
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/podman",
                 openshell_core::VERSION,
-                [],
+                [openshell_core::extension_protocol::COMPUTE_RESOURCE_CONTRACT.to_string()],
             )),
         })
     }
@@ -772,6 +791,13 @@ impl PodmanComputeDriver {
             sandbox,
         )
         .map_err(|error| ComputeDriverError::Precondition(error.message().into()))?;
+        openshell_core::resource_contract::validate_request(
+            sandbox,
+            Some(&Self::resource_capabilities()),
+            true,
+        )
+        .map_err(|error| ComputeDriverError::Precondition(error.into()))?;
+        container::validate_resource_limits(sandbox).map_err(ComputeDriverError::Precondition)?;
         let gpu_requirements = sandbox
             .spec
             .as_ref()
@@ -2739,6 +2765,7 @@ mod tests {
     fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
         ResourceRequirements {
             gpu: Some(GpuResourceRequirements { count }),
+            ..Default::default()
         }
     }
 

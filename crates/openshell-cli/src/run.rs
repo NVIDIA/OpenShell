@@ -651,7 +651,10 @@ pub async fn sandbox_create(
         None
     };
 
-    let resource_requirements = gpu_requirements.map(|gpu| ResourceRequirements { gpu: Some(gpu) });
+    let resource_requirements = gpu_requirements.map(|gpu| ResourceRequirements {
+        gpu: Some(gpu),
+        ..Default::default()
+    });
 
     let main_terminal = tty_override
         .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
@@ -3380,6 +3383,7 @@ pub async fn sandbox_template_create(
     image: Option<&str>,
     cpu: Option<&str>,
     memory: Option<&str>,
+    sampled_budget: Option<openshell_core::proto::sandbox::v1::SampledResourceBudget>,
     gpu_requirements: Option<GpuResourceRequirements>,
     driver_config_json: Option<&str>,
     ready_within: Option<&str>,
@@ -3392,7 +3396,11 @@ pub async fn sandbox_template_create(
     tls: &TlsOptions,
     suppress_credential_warnings: bool,
 ) -> Result<()> {
-    let resources = if cpu.is_some() || memory.is_some() || gpu_requirements.is_some() {
+    let resources = if cpu.is_some()
+        || memory.is_some()
+        || gpu_requirements.is_some()
+        || sampled_budget.is_some()
+    {
         Some(SandboxResources {
             cpu: cpu
                 .map(validate_cpu_quantity)
@@ -3403,6 +3411,7 @@ pub async fn sandbox_template_create(
                 .transpose()?
                 .unwrap_or_default(),
             gpu: gpu_requirements,
+            sampled_budget,
         })
     } else {
         None
@@ -3413,6 +3422,19 @@ pub async fn sandbox_template_create(
     let desired_service_level = build_template_service_level(ready_within, max_burst)?;
 
     let mut client = grpc_client(server, tls).await?;
+    if sampled_budget.is_some()
+        && !client
+            .health(openshell_core::proto::HealthRequest {})
+            .await
+            .into_diagnostic()?
+            .into_inner()
+            .supports_sampled_resource_budget
+    {
+        return Err(miette!(
+            "gateway does not acknowledge sampled resource budgets; upgrade it before creating this template"
+        ));
+    }
+
     let profile_catalog = fetch_provider_profile_catalog(&mut client, workspace)
         .await
         .unwrap_or_default();
@@ -3461,6 +3483,25 @@ pub async fn sandbox_template_create(
         template.object_name().bold()
     );
     Ok(())
+}
+
+pub fn sampled_resource_budget(
+    cpu_time: Option<&str>,
+    resident_bytes: Option<u64>,
+) -> Result<Option<openshell_core::proto::sandbox::v1::SampledResourceBudget>> {
+    if cpu_time.is_none() && resident_bytes.is_none() {
+        return Ok(None);
+    }
+    let budget = openshell_core::proto::sandbox::v1::SampledResourceBudget {
+        cpu_time: cpu_time
+            .map(parse_duration_to_ms)
+            .transpose()?
+            .map(duration_ms_to_proto),
+        resident_bytes,
+    };
+    openshell_core::resource_contract::validate_sampled_budget(&budget)
+        .map_err(|error| miette!("{error}"))?;
+    Ok(Some(budget))
 }
 
 fn build_template_service_level(
@@ -3691,6 +3732,12 @@ fn sandbox_template_to_json(template: &SandboxWorkloadTemplate) -> serde_json::V
                         .map_or_else(|| serde_json::json!("default"), serde_json::Value::from);
                     resources_json.insert("gpu".to_string(), value);
                 }
+                if let Some(budget) = &resources.sampled_budget {
+                    resources_json.insert("sampled_budget".into(), serde_json::json!({
+                        "cpu_time": budget.cpu_time.map(|d| serde_json::json!({"seconds": d.seconds.to_string(), "nanos": d.nanos})),
+                        "resident_bytes": budget.resident_bytes.map(|n| n.to_string()),
+                    }));
+                }
                 if !resources_json.is_empty() {
                     obj.insert(
                         "resources".to_string(),
@@ -3777,6 +3824,18 @@ fn print_sandbox_template_detail(template: &SandboxWorkloadTemplate) {
             workload.environment.len()
         );
         if let Some(resources) = &workload.resources {
+            if let Some(budget) = &resources.sampled_budget {
+                if let Some(cpu) = budget.cpu_time.as_ref() {
+                    println!(
+                        "  Sampled CPU-time budget: {}.{:09} s",
+                        cpu.seconds, cpu.nanos
+                    );
+                }
+                if let Some(resident) = budget.resident_bytes {
+                    println!("  Sampled resident-memory budget: {resident} bytes");
+                }
+                println!("  Budgets terminate on observed excess; sampling can overshoot.");
+            }
             println!(
                 "  {} {}",
                 "CPU:".dimmed(),
@@ -8262,6 +8321,7 @@ mod tests {
     fn provisioning_timeout_message_includes_condition_and_gpu_hint() {
         let resource_requirements = ResourceRequirements {
             gpu: Some(GpuResourceRequirements { count: None }),
+            ..Default::default()
         };
         let message = provisioning_timeout_message(
             120,
@@ -8283,7 +8343,10 @@ mod tests {
 
     #[test]
     fn provisioning_timeout_message_omits_gpu_hint_without_gpu_requirements() {
-        let resource_requirements = ResourceRequirements { gpu: None };
+        let resource_requirements = ResourceRequirements {
+            gpu: None,
+            ..Default::default()
+        };
         let message = provisioning_timeout_message(120, Some(&resource_requirements), None);
 
         assert_eq!(message, "sandbox provisioning timed out after 120s");

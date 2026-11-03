@@ -87,7 +87,10 @@ func copyGatewayInfo(info *types.GatewayInfo) *types.GatewayInfo {
 	cp := *info
 	if info.ComputeDrivers != nil {
 		cp.ComputeDrivers = make([]types.ComputeDriverInfo, len(info.ComputeDrivers))
-		copy(cp.ComputeDrivers, info.ComputeDrivers)
+		for index, driver := range info.ComputeDrivers {
+			cp.ComputeDrivers[index] = driver
+			cp.ComputeDrivers[index].Resources = copyResourceCapabilities(driver.Resources)
+		}
 	}
 	if info.Extensions != nil {
 		cp.Extensions = make([]types.ExtensionInfo, len(info.Extensions))
@@ -108,4 +111,34 @@ func copyCurrentUser(user *types.CurrentUser) *types.CurrentUser {
 	cp.Roles = copyStringSlice(user.Roles)
 	cp.Scopes = copyStringSlice(user.Scopes)
 	return &cp
+}
+
+func copyResourceValue[T any](value *T) *T {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
+}
+func copyResourceDomain(c *types.ResourceDomainCapabilities) *types.ResourceDomainCapabilities {
+	result := copyResourceValue(c)
+	if result != nil {
+		result.LimitEnforcement = copyResourceValue(c.LimitEnforcement)
+		result.RequestEnforcement = copyResourceValue(c.RequestEnforcement)
+	}
+	return result
+}
+func copyResourceCapabilities(c *types.ResourceCapabilities) *types.ResourceCapabilities {
+	result := copyResourceValue(c)
+	if result != nil {
+		result.CPU = copyResourceDomain(c.CPU)
+		result.Memory = copyResourceDomain(c.Memory)
+		result.GPU = copyResourceValue(c.GPU)
+		result.SampledBudget = copyResourceValue(c.SampledBudget)
+		if result.SampledBudget != nil {
+			result.SampledBudget.SamplingInterval = copyResourceValue(c.SampledBudget.SamplingInterval)
+			result.SampledBudget.CPUTimeResolution = copyResourceValue(c.SampledBudget.CPUTimeResolution)
+		}
+	}
+	return result
 }

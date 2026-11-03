@@ -24,6 +24,7 @@ import (
 )
 
 type mockSandboxServer struct {
+	sampledBudgetAck bool
 	pb.UnimplementedOpenShellServer
 	mu                   sync.Mutex
 	sandboxes            map[string]*pb.Sandbox
@@ -53,6 +54,12 @@ type mockSandboxServer struct {
 	getLogsResp    *pb.GetSandboxLogsResponse
 	getLogsErr     error
 	getLogsRequest *pb.GetSandboxLogsRequest // recorded request
+}
+
+func (s *mockSandboxServer) Health(context.Context, *pb.HealthRequest) (*pb.HealthResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return &pb.HealthResponse{SupportsSampledResourceBudget: s.sampledBudgetAck}, nil
 }
 
 func newMockSandboxServer() *mockSandboxServer {
@@ -329,12 +336,19 @@ func TestSandboxCreate(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
+	resident := uint64(1<<54 + 1)
 	spec := &SandboxSpec{
-		LogLevel:    "debug",
-		Environment: map[string]string{"FOO": "bar"},
-		Providers:   []string{"claude"},
+		SampledBudget: &SampledResourceBudget{ResidentBytes: &resident},
+		LogLevel:      "debug",
+		Environment:   map[string]string{"FOO": "bar"},
+		Providers:     []string{"claude"},
 	}
 	labels := map[string]string{"env": "dev"}
+
+	_, err := client.Create(context.Background(), "default", "probe", spec)
+	require.Error(t, err)
+	assert.Nil(t, mock.createRequest)
+	mock.sampledBudgetAck = true
 
 	result, err := client.Create(
 		context.Background(),
@@ -367,6 +381,9 @@ func TestSandboxCreate(t *testing.T) {
 	assert.Equal(t, pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_STRIP, mock.createRequest.GetServiceExposures()[0].GetAuthorizationMode())
 	assert.Equal(t, "metrics", mock.createRequest.GetServiceExposures()[1].GetService())
 	assert.Equal(t, pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH, mock.createRequest.GetServiceExposures()[1].GetAuthorizationMode())
+	assert.Equal(t, resident, *mock.createRequest.GetSpec().GetResourceRequirements().GetSampledBudget().ResidentBytes)
+	assert.Equal(t, resident, *result.Spec.SampledBudget.ResidentBytes)
+
 }
 
 // Callers that passed nil for the old positional labels parameter still compile

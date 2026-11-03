@@ -311,6 +311,7 @@ fn list_string_driver_config(field: &str, values: &[&str]) -> prost_types::Struc
 fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
     ResourceRequirements {
         gpu: Some(GpuResourceRequirements { count }),
+        ..Default::default()
     }
 }
 
@@ -1401,6 +1402,9 @@ async fn tracing_in_process_stream_leaves_status_unset_when_dropped() {
 fn parse_cpu_limit_supports_cores_and_millicores() {
     assert_eq!(parse_cpu_limit("250m").unwrap(), Some(250_000_000));
     assert_eq!(parse_cpu_limit("2").unwrap(), Some(2_000_000_000));
+    for value in ["0.0000000001", "1e100", "9223372036854775807m"] {
+        assert!(parse_cpu_limit(value).is_err(), "{value}");
+    }
     assert!(parse_cpu_limit("0").is_err());
 }
 
@@ -1408,6 +1412,9 @@ fn parse_cpu_limit_supports_cores_and_millicores() {
 fn parse_memory_limit_supports_binary_quantities() {
     assert_eq!(parse_memory_limit("512Mi").unwrap(), Some(536_870_912));
     assert_eq!(parse_memory_limit("1G").unwrap(), Some(1_000_000_000));
+    for value in ["0.1", "999999999999999999999Ei"] {
+        assert!(parse_memory_limit(value).is_err(), "{value}");
+    }
     assert!(parse_memory_limit("12XB").is_err());
 }
 

@@ -409,6 +409,114 @@ func (SupervisorMiddlewareBinding) EnumDescriptor() ([]byte, []int) {
 	return file_sandbox_proto_rawDescGZIP(), []int{6}
 }
 
+type ResourceEnforcementKind int32
+
+const (
+	ResourceEnforcementKind_RESOURCE_ENFORCEMENT_KIND_UNSPECIFIED  ResourceEnforcementKind = 0
+	ResourceEnforcementKind_RESOURCE_ENFORCEMENT_KIND_UNSUPPORTED  ResourceEnforcementKind = 1
+	ResourceEnforcementKind_RESOURCE_ENFORCEMENT_KIND_KERNEL_LIMIT ResourceEnforcementKind = 2
+	// Admission by the platform scheduler, not dedicated physical capacity.
+	ResourceEnforcementKind_RESOURCE_ENFORCEMENT_KIND_SCHEDULER_REQUEST ResourceEnforcementKind = 3
+)
+
+// Enum value maps for ResourceEnforcementKind.
+var (
+	ResourceEnforcementKind_name = map[int32]string{
+		0: "RESOURCE_ENFORCEMENT_KIND_UNSPECIFIED",
+		1: "RESOURCE_ENFORCEMENT_KIND_UNSUPPORTED",
+		2: "RESOURCE_ENFORCEMENT_KIND_KERNEL_LIMIT",
+		3: "RESOURCE_ENFORCEMENT_KIND_SCHEDULER_REQUEST",
+	}
+	ResourceEnforcementKind_value = map[string]int32{
+		"RESOURCE_ENFORCEMENT_KIND_UNSPECIFIED":       0,
+		"RESOURCE_ENFORCEMENT_KIND_UNSUPPORTED":       1,
+		"RESOURCE_ENFORCEMENT_KIND_KERNEL_LIMIT":      2,
+		"RESOURCE_ENFORCEMENT_KIND_SCHEDULER_REQUEST": 3,
+	}
+)
+
+func (x ResourceEnforcementKind) Enum() *ResourceEnforcementKind {
+	p := new(ResourceEnforcementKind)
+	*p = x
+	return p
+}
+
+func (x ResourceEnforcementKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ResourceEnforcementKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_sandbox_proto_enumTypes[7].Descriptor()
+}
+
+func (ResourceEnforcementKind) Type() protoreflect.EnumType {
+	return &file_sandbox_proto_enumTypes[7]
+}
+
+func (x ResourceEnforcementKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ResourceEnforcementKind.Descriptor instead.
+func (ResourceEnforcementKind) EnumDescriptor() ([]byte, []int) {
+	return file_sandbox_proto_rawDescGZIP(), []int{7}
+}
+
+type ResourceEnforcementScope int32
+
+const (
+	ResourceEnforcementScope_RESOURCE_ENFORCEMENT_SCOPE_UNSPECIFIED     ResourceEnforcementScope = 0
+	ResourceEnforcementScope_RESOURCE_ENFORCEMENT_SCOPE_PROCESS         ResourceEnforcementScope = 1
+	ResourceEnforcementScope_RESOURCE_ENFORCEMENT_SCOPE_CONTAINER       ResourceEnforcementScope = 2
+	ResourceEnforcementScope_RESOURCE_ENFORCEMENT_SCOPE_SANDBOX_ACCOUNT ResourceEnforcementScope = 3
+	ResourceEnforcementScope_RESOURCE_ENFORCEMENT_SCOPE_VIRTUAL_MACHINE ResourceEnforcementScope = 4
+)
+
+// Enum value maps for ResourceEnforcementScope.
+var (
+	ResourceEnforcementScope_name = map[int32]string{
+		0: "RESOURCE_ENFORCEMENT_SCOPE_UNSPECIFIED",
+		1: "RESOURCE_ENFORCEMENT_SCOPE_PROCESS",
+		2: "RESOURCE_ENFORCEMENT_SCOPE_CONTAINER",
+		3: "RESOURCE_ENFORCEMENT_SCOPE_SANDBOX_ACCOUNT",
+		4: "RESOURCE_ENFORCEMENT_SCOPE_VIRTUAL_MACHINE",
+	}
+	ResourceEnforcementScope_value = map[string]int32{
+		"RESOURCE_ENFORCEMENT_SCOPE_UNSPECIFIED":     0,
+		"RESOURCE_ENFORCEMENT_SCOPE_PROCESS":         1,
+		"RESOURCE_ENFORCEMENT_SCOPE_CONTAINER":       2,
+		"RESOURCE_ENFORCEMENT_SCOPE_SANDBOX_ACCOUNT": 3,
+		"RESOURCE_ENFORCEMENT_SCOPE_VIRTUAL_MACHINE": 4,
+	}
+)
+
+func (x ResourceEnforcementScope) Enum() *ResourceEnforcementScope {
+	p := new(ResourceEnforcementScope)
+	*p = x
+	return p
+}
+
+func (x ResourceEnforcementScope) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ResourceEnforcementScope) Descriptor() protoreflect.EnumDescriptor {
+	return file_sandbox_proto_enumTypes[8].Descriptor()
+}
+
+func (ResourceEnforcementScope) Type() protoreflect.EnumType {
+	return &file_sandbox_proto_enumTypes[8]
+}
+
+func (x ResourceEnforcementScope) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ResourceEnforcementScope.Descriptor instead.
+func (ResourceEnforcementScope) EnumDescriptor() ([]byte, []int) {
+	return file_sandbox_proto_rawDescGZIP(), []int{8}
+}
+
 // Sandbox security policy configuration.
 type SandboxPolicy struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -2696,6 +2804,211 @@ func (x *SupervisorMiddlewareService) GetBindings() []SupervisorMiddlewareBindin
 	return nil
 }
 
+// Explicit budgets observed across a sandbox account. These are not CPU-rate
+// quotas or hard memory limits. Empty budgets are invalid.
+type SampledResourceBudget struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	CpuTime       *durationpb.Duration   `protobuf:"bytes,1,opt,name=cpu_time,json=cpuTime,proto3" json:"cpu_time,omitempty"`
+	ResidentBytes *uint64                `protobuf:"varint,2,opt,name=resident_bytes,json=residentBytes,proto3,oneof" json:"resident_bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SampledResourceBudget) Reset() {
+	*x = SampledResourceBudget{}
+	mi := &file_sandbox_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SampledResourceBudget) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SampledResourceBudget) ProtoMessage() {}
+
+func (x *SampledResourceBudget) ProtoReflect() protoreflect.Message {
+	mi := &file_sandbox_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SampledResourceBudget.ProtoReflect.Descriptor instead.
+func (*SampledResourceBudget) Descriptor() ([]byte, []int) {
+	return file_sandbox_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *SampledResourceBudget) GetCpuTime() *durationpb.Duration {
+	if x != nil {
+		return x.CpuTime
+	}
+	return nil
+}
+
+func (x *SampledResourceBudget) GetResidentBytes() uint64 {
+	if x != nil && x.ResidentBytes != nil {
+		return *x.ResidentBytes
+	}
+	return 0
+}
+
+// Mechanism and aggregation boundary for a resource request.
+type ResourceEnforcement struct {
+	state         protoimpl.MessageState   `protogen:"open.v1"`
+	Kind          ResourceEnforcementKind  `protobuf:"varint,1,opt,name=kind,proto3,enum=openshell.sandbox.v1.ResourceEnforcementKind" json:"kind,omitempty"`
+	Scope         ResourceEnforcementScope `protobuf:"varint,2,opt,name=scope,proto3,enum=openshell.sandbox.v1.ResourceEnforcementScope" json:"scope,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResourceEnforcement) Reset() {
+	*x = ResourceEnforcement{}
+	mi := &file_sandbox_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResourceEnforcement) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResourceEnforcement) ProtoMessage() {}
+
+func (x *ResourceEnforcement) ProtoReflect() protoreflect.Message {
+	mi := &file_sandbox_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResourceEnforcement.ProtoReflect.Descriptor instead.
+func (*ResourceEnforcement) Descriptor() ([]byte, []int) {
+	return file_sandbox_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *ResourceEnforcement) GetKind() ResourceEnforcementKind {
+	if x != nil {
+		return x.Kind
+	}
+	return ResourceEnforcementKind_RESOURCE_ENFORCEMENT_KIND_UNSPECIFIED
+}
+
+func (x *ResourceEnforcement) GetScope() ResourceEnforcementScope {
+	if x != nil {
+		return x.Scope
+	}
+	return ResourceEnforcementScope_RESOURCE_ENFORCEMENT_SCOPE_UNSPECIFIED
+}
+
+type SampledResourceBudgetCapabilities struct {
+	state                  protoimpl.MessageState   `protogen:"open.v1"`
+	CpuTimeSupported       bool                     `protobuf:"varint,1,opt,name=cpu_time_supported,json=cpuTimeSupported,proto3" json:"cpu_time_supported,omitempty"`
+	ResidentBytesSupported bool                     `protobuf:"varint,2,opt,name=resident_bytes_supported,json=residentBytesSupported,proto3" json:"resident_bytes_supported,omitempty"`
+	Scope                  ResourceEnforcementScope `protobuf:"varint,3,opt,name=scope,proto3,enum=openshell.sandbox.v1.ResourceEnforcementScope" json:"scope,omitempty"`
+	// Sleep between completed observations; collection adds latency. This is
+	// neither an enforcement deadline nor a bound on overshoot. Short-lived
+	// processes may escape observation.
+	SamplingInterval  *durationpb.Duration `protobuf:"bytes,4,opt,name=sampling_interval,json=samplingInterval,proto3" json:"sampling_interval,omitempty"`
+	TerminateOnExcess bool                 `protobuf:"varint,5,opt,name=terminate_on_excess,json=terminateOnExcess,proto3" json:"terminate_on_excess,omitempty"`
+	// Smallest exactly representable CPU-time request.
+	CpuTimeResolution *durationpb.Duration `protobuf:"bytes,6,opt,name=cpu_time_resolution,json=cpuTimeResolution,proto3" json:"cpu_time_resolution,omitempty"`
+	// A per-process CPU-time kernel limit also accompanies the sampled budget.
+	// It may use a coarser resolution than the account-wide observation.
+	PerProcessCpuLimit bool `protobuf:"varint,7,opt,name=per_process_cpu_limit,json=perProcessCpuLimit,proto3" json:"per_process_cpu_limit,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *SampledResourceBudgetCapabilities) Reset() {
+	*x = SampledResourceBudgetCapabilities{}
+	mi := &file_sandbox_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SampledResourceBudgetCapabilities) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SampledResourceBudgetCapabilities) ProtoMessage() {}
+
+func (x *SampledResourceBudgetCapabilities) ProtoReflect() protoreflect.Message {
+	mi := &file_sandbox_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SampledResourceBudgetCapabilities.ProtoReflect.Descriptor instead.
+func (*SampledResourceBudgetCapabilities) Descriptor() ([]byte, []int) {
+	return file_sandbox_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *SampledResourceBudgetCapabilities) GetCpuTimeSupported() bool {
+	if x != nil {
+		return x.CpuTimeSupported
+	}
+	return false
+}
+
+func (x *SampledResourceBudgetCapabilities) GetResidentBytesSupported() bool {
+	if x != nil {
+		return x.ResidentBytesSupported
+	}
+	return false
+}
+
+func (x *SampledResourceBudgetCapabilities) GetScope() ResourceEnforcementScope {
+	if x != nil {
+		return x.Scope
+	}
+	return ResourceEnforcementScope_RESOURCE_ENFORCEMENT_SCOPE_UNSPECIFIED
+}
+
+func (x *SampledResourceBudgetCapabilities) GetSamplingInterval() *durationpb.Duration {
+	if x != nil {
+		return x.SamplingInterval
+	}
+	return nil
+}
+
+func (x *SampledResourceBudgetCapabilities) GetTerminateOnExcess() bool {
+	if x != nil {
+		return x.TerminateOnExcess
+	}
+	return false
+}
+
+func (x *SampledResourceBudgetCapabilities) GetCpuTimeResolution() *durationpb.Duration {
+	if x != nil {
+		return x.CpuTimeResolution
+	}
+	return nil
+}
+
+func (x *SampledResourceBudgetCapabilities) GetPerProcessCpuLimit() bool {
+	if x != nil {
+		return x.PerProcessCpuLimit
+	}
+	return false
+}
+
 var File_sandbox_proto protoreflect.FileDescriptor
 
 const file_sandbox_proto_rawDesc = "" +
@@ -2916,7 +3229,22 @@ const file_sandbox_proto_rawDesc = "" +
 	"\baudience\x18\x06 \x01(\tR\baudience\x128\n" +
 	"\x18allow_insecure_transport\x18\a \x01(\bR\x16allowInsecureTransport\x12^\n" +
 	"\x0ebinding_policy\x18\b \x01(\x0e27.openshell.sandbox.v1.SupervisorMiddlewareBindingPolicyR\rbindingPolicy\x12M\n" +
-	"\bbindings\x18\t \x03(\x0e21.openshell.sandbox.v1.SupervisorMiddlewareBindingR\bbindingsJ\x04\b\x04\x10\x05R\atimeout*\x97\x01\n" +
+	"\bbindings\x18\t \x03(\x0e21.openshell.sandbox.v1.SupervisorMiddlewareBindingR\bbindingsJ\x04\b\x04\x10\x05R\atimeout\"\x8c\x01\n" +
+	"\x15SampledResourceBudget\x124\n" +
+	"\bcpu_time\x18\x01 \x01(\v2\x19.google.protobuf.DurationR\acpuTime\x12*\n" +
+	"\x0eresident_bytes\x18\x02 \x01(\x04H\x00R\rresidentBytes\x88\x01\x01B\x11\n" +
+	"\x0f_resident_bytes\"\x9e\x01\n" +
+	"\x13ResourceEnforcement\x12A\n" +
+	"\x04kind\x18\x01 \x01(\x0e2-.openshell.sandbox.v1.ResourceEnforcementKindR\x04kind\x12D\n" +
+	"\x05scope\x18\x02 \x01(\x0e2..openshell.sandbox.v1.ResourceEnforcementScopeR\x05scope\"\xc7\x03\n" +
+	"!SampledResourceBudgetCapabilities\x12,\n" +
+	"\x12cpu_time_supported\x18\x01 \x01(\bR\x10cpuTimeSupported\x128\n" +
+	"\x18resident_bytes_supported\x18\x02 \x01(\bR\x16residentBytesSupported\x12D\n" +
+	"\x05scope\x18\x03 \x01(\x0e2..openshell.sandbox.v1.ResourceEnforcementScopeR\x05scope\x12F\n" +
+	"\x11sampling_interval\x18\x04 \x01(\v2\x19.google.protobuf.DurationR\x10samplingInterval\x12.\n" +
+	"\x13terminate_on_excess\x18\x05 \x01(\bR\x11terminateOnExcess\x12I\n" +
+	"\x13cpu_time_resolution\x18\x06 \x01(\v2\x19.google.protobuf.DurationR\x11cpuTimeResolution\x121\n" +
+	"\x15per_process_cpu_limit\x18\a \x01(\bR\x12perProcessCpuLimit*\x97\x01\n" +
 	"\x0eNetworkTlsMode\x12 \n" +
 	"\x1cNETWORK_TLS_MODE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15NETWORK_TLS_MODE_SKIP\x10\x01\x12\"\n" +
@@ -2948,7 +3276,18 @@ const file_sandbox_proto_rawDesc = "" +
 	")SUPERVISOR_MIDDLEWARE_BINDING_UNSPECIFIED\x10\x00\x12>\n" +
 	":SUPERVISOR_MIDDLEWARE_BINDING_HTTP_REQUEST_PRE_CREDENTIALS\x10\x01\x12:\n" +
 	"6SUPERVISOR_MIDDLEWARE_BINDING_HTTP_RESPONSE_PRE_RETURN\x10\x02\x12C\n" +
-	"?SUPERVISOR_MIDDLEWARE_BINDING_WEBSOCKET_MESSAGE_PRE_CREDENTIALS\x10\x03b\x06proto3"
+	"?SUPERVISOR_MIDDLEWARE_BINDING_WEBSOCKET_MESSAGE_PRE_CREDENTIALS\x10\x03*\xcc\x01\n" +
+	"\x17ResourceEnforcementKind\x12)\n" +
+	"%RESOURCE_ENFORCEMENT_KIND_UNSPECIFIED\x10\x00\x12)\n" +
+	"%RESOURCE_ENFORCEMENT_KIND_UNSUPPORTED\x10\x01\x12*\n" +
+	"&RESOURCE_ENFORCEMENT_KIND_KERNEL_LIMIT\x10\x02\x12/\n" +
+	"+RESOURCE_ENFORCEMENT_KIND_SCHEDULER_REQUEST\x10\x03*\xf8\x01\n" +
+	"\x18ResourceEnforcementScope\x12*\n" +
+	"&RESOURCE_ENFORCEMENT_SCOPE_UNSPECIFIED\x10\x00\x12&\n" +
+	"\"RESOURCE_ENFORCEMENT_SCOPE_PROCESS\x10\x01\x12(\n" +
+	"$RESOURCE_ENFORCEMENT_SCOPE_CONTAINER\x10\x02\x12.\n" +
+	"*RESOURCE_ENFORCEMENT_SCOPE_SANDBOX_ACCOUNT\x10\x03\x12.\n" +
+	"*RESOURCE_ENFORCEMENT_SCOPE_VIRTUAL_MACHINE\x10\x04b\x06proto3"
 
 var (
 	file_sandbox_proto_rawDescOnce sync.Once
@@ -2962,110 +3301,121 @@ func file_sandbox_proto_rawDescGZIP() []byte {
 	return file_sandbox_proto_rawDescData
 }
 
-var file_sandbox_proto_enumTypes = make([]protoimpl.EnumInfo, 7)
-var file_sandbox_proto_msgTypes = make([]protoimpl.MessageInfo, 35)
+var file_sandbox_proto_enumTypes = make([]protoimpl.EnumInfo, 9)
+var file_sandbox_proto_msgTypes = make([]protoimpl.MessageInfo, 38)
 var file_sandbox_proto_goTypes = []any{
-	(NetworkTlsMode)(0),                    // 0: openshell.sandbox.v1.NetworkTlsMode
-	(NetworkEnforcementMode)(0),            // 1: openshell.sandbox.v1.NetworkEnforcementMode
-	(NetworkAccessPreset)(0),               // 2: openshell.sandbox.v1.NetworkAccessPreset
-	(SettingScope)(0),                      // 3: openshell.sandbox.v1.SettingScope
-	(PolicySource)(0),                      // 4: openshell.sandbox.v1.PolicySource
-	(SupervisorMiddlewareBindingPolicy)(0), // 5: openshell.sandbox.v1.SupervisorMiddlewareBindingPolicy
-	(SupervisorMiddlewareBinding)(0),       // 6: openshell.sandbox.v1.SupervisorMiddlewareBinding
-	(*SandboxPolicy)(nil),                  // 7: openshell.sandbox.v1.SandboxPolicy
-	(*FilesystemPolicy)(nil),               // 8: openshell.sandbox.v1.FilesystemPolicy
-	(*LandlockPolicy)(nil),                 // 9: openshell.sandbox.v1.LandlockPolicy
-	(*ProcessPolicy)(nil),                  // 10: openshell.sandbox.v1.ProcessPolicy
-	(*NetworkPolicyRule)(nil),              // 11: openshell.sandbox.v1.NetworkPolicyRule
-	(*NetworkMiddlewareConfig)(nil),        // 12: openshell.sandbox.v1.NetworkMiddlewareConfig
-	(*MiddlewareEndpointSelector)(nil),     // 13: openshell.sandbox.v1.MiddlewareEndpointSelector
-	(*NetworkCredentialBinding)(nil),       // 14: openshell.sandbox.v1.NetworkCredentialBinding
-	(*NetworkEndpoint)(nil),                // 15: openshell.sandbox.v1.NetworkEndpoint
-	(*McpOptions)(nil),                     // 16: openshell.sandbox.v1.McpOptions
-	(*GraphqlOperation)(nil),               // 17: openshell.sandbox.v1.GraphqlOperation
-	(*L7DenyRule)(nil),                     // 18: openshell.sandbox.v1.L7DenyRule
-	(*L7Rule)(nil),                         // 19: openshell.sandbox.v1.L7Rule
-	(*L7Allow)(nil),                        // 20: openshell.sandbox.v1.L7Allow
-	(*L7QueryMatcher)(nil),                 // 21: openshell.sandbox.v1.L7QueryMatcher
-	(*NetworkBinary)(nil),                  // 22: openshell.sandbox.v1.NetworkBinary
-	(*GetSandboxConfigRequest)(nil),        // 23: openshell.sandbox.v1.GetSandboxConfigRequest
-	(*GetGatewayConfigRequest)(nil),        // 24: openshell.sandbox.v1.GetGatewayConfigRequest
-	(*GetGatewayConfigResponse)(nil),       // 25: openshell.sandbox.v1.GetGatewayConfigResponse
-	(*SettingValue)(nil),                   // 26: openshell.sandbox.v1.SettingValue
-	(*EffectiveSetting)(nil),               // 27: openshell.sandbox.v1.EffectiveSetting
-	(*SandboxConfigSnapshot)(nil),          // 28: openshell.sandbox.v1.SandboxConfigSnapshot
-	(*GetSandboxConfigResponse)(nil),       // 29: openshell.sandbox.v1.GetSandboxConfigResponse
-	(*SandboxServiceRoute)(nil),            // 30: openshell.sandbox.v1.SandboxServiceRoute
-	(*SupervisorMiddlewareService)(nil),    // 31: openshell.sandbox.v1.SupervisorMiddlewareService
-	nil,                                    // 32: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry
-	nil,                                    // 33: openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry
-	nil,                                    // 34: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry
-	nil,                                    // 35: openshell.sandbox.v1.L7DenyRule.QueryEntry
-	nil,                                    // 36: openshell.sandbox.v1.L7DenyRule.ParamsEntry
-	nil,                                    // 37: openshell.sandbox.v1.L7Allow.QueryEntry
-	nil,                                    // 38: openshell.sandbox.v1.L7Allow.ParamsEntry
-	nil,                                    // 39: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
-	nil,                                    // 40: openshell.sandbox.v1.SandboxConfigSnapshot.SettingsEntry
-	nil,                                    // 41: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
-	(*structpb.Struct)(nil),                // 42: google.protobuf.Struct
-	(*datamodelv1.WorkspaceSelector)(nil),  // 43: openshell.datamodel.v1.WorkspaceSelector
-	(*durationpb.Duration)(nil),            // 44: google.protobuf.Duration
+	(NetworkTlsMode)(0),                       // 0: openshell.sandbox.v1.NetworkTlsMode
+	(NetworkEnforcementMode)(0),               // 1: openshell.sandbox.v1.NetworkEnforcementMode
+	(NetworkAccessPreset)(0),                  // 2: openshell.sandbox.v1.NetworkAccessPreset
+	(SettingScope)(0),                         // 3: openshell.sandbox.v1.SettingScope
+	(PolicySource)(0),                         // 4: openshell.sandbox.v1.PolicySource
+	(SupervisorMiddlewareBindingPolicy)(0),    // 5: openshell.sandbox.v1.SupervisorMiddlewareBindingPolicy
+	(SupervisorMiddlewareBinding)(0),          // 6: openshell.sandbox.v1.SupervisorMiddlewareBinding
+	(ResourceEnforcementKind)(0),              // 7: openshell.sandbox.v1.ResourceEnforcementKind
+	(ResourceEnforcementScope)(0),             // 8: openshell.sandbox.v1.ResourceEnforcementScope
+	(*SandboxPolicy)(nil),                     // 9: openshell.sandbox.v1.SandboxPolicy
+	(*FilesystemPolicy)(nil),                  // 10: openshell.sandbox.v1.FilesystemPolicy
+	(*LandlockPolicy)(nil),                    // 11: openshell.sandbox.v1.LandlockPolicy
+	(*ProcessPolicy)(nil),                     // 12: openshell.sandbox.v1.ProcessPolicy
+	(*NetworkPolicyRule)(nil),                 // 13: openshell.sandbox.v1.NetworkPolicyRule
+	(*NetworkMiddlewareConfig)(nil),           // 14: openshell.sandbox.v1.NetworkMiddlewareConfig
+	(*MiddlewareEndpointSelector)(nil),        // 15: openshell.sandbox.v1.MiddlewareEndpointSelector
+	(*NetworkCredentialBinding)(nil),          // 16: openshell.sandbox.v1.NetworkCredentialBinding
+	(*NetworkEndpoint)(nil),                   // 17: openshell.sandbox.v1.NetworkEndpoint
+	(*McpOptions)(nil),                        // 18: openshell.sandbox.v1.McpOptions
+	(*GraphqlOperation)(nil),                  // 19: openshell.sandbox.v1.GraphqlOperation
+	(*L7DenyRule)(nil),                        // 20: openshell.sandbox.v1.L7DenyRule
+	(*L7Rule)(nil),                            // 21: openshell.sandbox.v1.L7Rule
+	(*L7Allow)(nil),                           // 22: openshell.sandbox.v1.L7Allow
+	(*L7QueryMatcher)(nil),                    // 23: openshell.sandbox.v1.L7QueryMatcher
+	(*NetworkBinary)(nil),                     // 24: openshell.sandbox.v1.NetworkBinary
+	(*GetSandboxConfigRequest)(nil),           // 25: openshell.sandbox.v1.GetSandboxConfigRequest
+	(*GetGatewayConfigRequest)(nil),           // 26: openshell.sandbox.v1.GetGatewayConfigRequest
+	(*GetGatewayConfigResponse)(nil),          // 27: openshell.sandbox.v1.GetGatewayConfigResponse
+	(*SettingValue)(nil),                      // 28: openshell.sandbox.v1.SettingValue
+	(*EffectiveSetting)(nil),                  // 29: openshell.sandbox.v1.EffectiveSetting
+	(*SandboxConfigSnapshot)(nil),             // 30: openshell.sandbox.v1.SandboxConfigSnapshot
+	(*GetSandboxConfigResponse)(nil),          // 31: openshell.sandbox.v1.GetSandboxConfigResponse
+	(*SandboxServiceRoute)(nil),               // 32: openshell.sandbox.v1.SandboxServiceRoute
+	(*SupervisorMiddlewareService)(nil),       // 33: openshell.sandbox.v1.SupervisorMiddlewareService
+	(*SampledResourceBudget)(nil),             // 34: openshell.sandbox.v1.SampledResourceBudget
+	(*ResourceEnforcement)(nil),               // 35: openshell.sandbox.v1.ResourceEnforcement
+	(*SampledResourceBudgetCapabilities)(nil), // 36: openshell.sandbox.v1.SampledResourceBudgetCapabilities
+	nil,                                   // 37: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry
+	nil,                                   // 38: openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry
+	nil,                                   // 39: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry
+	nil,                                   // 40: openshell.sandbox.v1.L7DenyRule.QueryEntry
+	nil,                                   // 41: openshell.sandbox.v1.L7DenyRule.ParamsEntry
+	nil,                                   // 42: openshell.sandbox.v1.L7Allow.QueryEntry
+	nil,                                   // 43: openshell.sandbox.v1.L7Allow.ParamsEntry
+	nil,                                   // 44: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
+	nil,                                   // 45: openshell.sandbox.v1.SandboxConfigSnapshot.SettingsEntry
+	nil,                                   // 46: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
+	(*structpb.Struct)(nil),               // 47: google.protobuf.Struct
+	(*datamodelv1.WorkspaceSelector)(nil), // 48: openshell.datamodel.v1.WorkspaceSelector
+	(*durationpb.Duration)(nil),           // 49: google.protobuf.Duration
 }
 var file_sandbox_proto_depIdxs = []int32{
-	8,  // 0: openshell.sandbox.v1.SandboxPolicy.filesystem:type_name -> openshell.sandbox.v1.FilesystemPolicy
-	9,  // 1: openshell.sandbox.v1.SandboxPolicy.landlock:type_name -> openshell.sandbox.v1.LandlockPolicy
-	10, // 2: openshell.sandbox.v1.SandboxPolicy.process:type_name -> openshell.sandbox.v1.ProcessPolicy
-	32, // 3: openshell.sandbox.v1.SandboxPolicy.network_policies:type_name -> openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry
-	33, // 4: openshell.sandbox.v1.SandboxPolicy.network_middlewares:type_name -> openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry
-	15, // 5: openshell.sandbox.v1.NetworkPolicyRule.endpoints:type_name -> openshell.sandbox.v1.NetworkEndpoint
-	22, // 6: openshell.sandbox.v1.NetworkPolicyRule.binaries:type_name -> openshell.sandbox.v1.NetworkBinary
-	42, // 7: openshell.sandbox.v1.NetworkMiddlewareConfig.config:type_name -> google.protobuf.Struct
-	13, // 8: openshell.sandbox.v1.NetworkMiddlewareConfig.endpoints:type_name -> openshell.sandbox.v1.MiddlewareEndpointSelector
+	10, // 0: openshell.sandbox.v1.SandboxPolicy.filesystem:type_name -> openshell.sandbox.v1.FilesystemPolicy
+	11, // 1: openshell.sandbox.v1.SandboxPolicy.landlock:type_name -> openshell.sandbox.v1.LandlockPolicy
+	12, // 2: openshell.sandbox.v1.SandboxPolicy.process:type_name -> openshell.sandbox.v1.ProcessPolicy
+	37, // 3: openshell.sandbox.v1.SandboxPolicy.network_policies:type_name -> openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry
+	38, // 4: openshell.sandbox.v1.SandboxPolicy.network_middlewares:type_name -> openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry
+	17, // 5: openshell.sandbox.v1.NetworkPolicyRule.endpoints:type_name -> openshell.sandbox.v1.NetworkEndpoint
+	24, // 6: openshell.sandbox.v1.NetworkPolicyRule.binaries:type_name -> openshell.sandbox.v1.NetworkBinary
+	47, // 7: openshell.sandbox.v1.NetworkMiddlewareConfig.config:type_name -> google.protobuf.Struct
+	15, // 8: openshell.sandbox.v1.NetworkMiddlewareConfig.endpoints:type_name -> openshell.sandbox.v1.MiddlewareEndpointSelector
 	0,  // 9: openshell.sandbox.v1.NetworkEndpoint.tls:type_name -> openshell.sandbox.v1.NetworkTlsMode
 	1,  // 10: openshell.sandbox.v1.NetworkEndpoint.enforcement:type_name -> openshell.sandbox.v1.NetworkEnforcementMode
 	2,  // 11: openshell.sandbox.v1.NetworkEndpoint.access:type_name -> openshell.sandbox.v1.NetworkAccessPreset
-	19, // 12: openshell.sandbox.v1.NetworkEndpoint.rules:type_name -> openshell.sandbox.v1.L7Rule
-	18, // 13: openshell.sandbox.v1.NetworkEndpoint.deny_rules:type_name -> openshell.sandbox.v1.L7DenyRule
-	34, // 14: openshell.sandbox.v1.NetworkEndpoint.graphql_persisted_queries:type_name -> openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry
-	16, // 15: openshell.sandbox.v1.NetworkEndpoint.mcp:type_name -> openshell.sandbox.v1.McpOptions
-	14, // 16: openshell.sandbox.v1.NetworkEndpoint.credential_binding:type_name -> openshell.sandbox.v1.NetworkCredentialBinding
-	35, // 17: openshell.sandbox.v1.L7DenyRule.query:type_name -> openshell.sandbox.v1.L7DenyRule.QueryEntry
-	36, // 18: openshell.sandbox.v1.L7DenyRule.params:type_name -> openshell.sandbox.v1.L7DenyRule.ParamsEntry
-	20, // 19: openshell.sandbox.v1.L7Rule.allow:type_name -> openshell.sandbox.v1.L7Allow
-	37, // 20: openshell.sandbox.v1.L7Allow.query:type_name -> openshell.sandbox.v1.L7Allow.QueryEntry
-	38, // 21: openshell.sandbox.v1.L7Allow.params:type_name -> openshell.sandbox.v1.L7Allow.ParamsEntry
-	43, // 22: openshell.sandbox.v1.GetSandboxConfigRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	39, // 23: openshell.sandbox.v1.GetGatewayConfigResponse.settings:type_name -> openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
-	26, // 24: openshell.sandbox.v1.EffectiveSetting.value:type_name -> openshell.sandbox.v1.SettingValue
+	21, // 12: openshell.sandbox.v1.NetworkEndpoint.rules:type_name -> openshell.sandbox.v1.L7Rule
+	20, // 13: openshell.sandbox.v1.NetworkEndpoint.deny_rules:type_name -> openshell.sandbox.v1.L7DenyRule
+	39, // 14: openshell.sandbox.v1.NetworkEndpoint.graphql_persisted_queries:type_name -> openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry
+	18, // 15: openshell.sandbox.v1.NetworkEndpoint.mcp:type_name -> openshell.sandbox.v1.McpOptions
+	16, // 16: openshell.sandbox.v1.NetworkEndpoint.credential_binding:type_name -> openshell.sandbox.v1.NetworkCredentialBinding
+	40, // 17: openshell.sandbox.v1.L7DenyRule.query:type_name -> openshell.sandbox.v1.L7DenyRule.QueryEntry
+	41, // 18: openshell.sandbox.v1.L7DenyRule.params:type_name -> openshell.sandbox.v1.L7DenyRule.ParamsEntry
+	22, // 19: openshell.sandbox.v1.L7Rule.allow:type_name -> openshell.sandbox.v1.L7Allow
+	42, // 20: openshell.sandbox.v1.L7Allow.query:type_name -> openshell.sandbox.v1.L7Allow.QueryEntry
+	43, // 21: openshell.sandbox.v1.L7Allow.params:type_name -> openshell.sandbox.v1.L7Allow.ParamsEntry
+	48, // 22: openshell.sandbox.v1.GetSandboxConfigRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
+	44, // 23: openshell.sandbox.v1.GetGatewayConfigResponse.settings:type_name -> openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
+	28, // 24: openshell.sandbox.v1.EffectiveSetting.value:type_name -> openshell.sandbox.v1.SettingValue
 	3,  // 25: openshell.sandbox.v1.EffectiveSetting.scope:type_name -> openshell.sandbox.v1.SettingScope
-	7,  // 26: openshell.sandbox.v1.SandboxConfigSnapshot.policy:type_name -> openshell.sandbox.v1.SandboxPolicy
-	40, // 27: openshell.sandbox.v1.SandboxConfigSnapshot.settings:type_name -> openshell.sandbox.v1.SandboxConfigSnapshot.SettingsEntry
+	9,  // 26: openshell.sandbox.v1.SandboxConfigSnapshot.policy:type_name -> openshell.sandbox.v1.SandboxPolicy
+	45, // 27: openshell.sandbox.v1.SandboxConfigSnapshot.settings:type_name -> openshell.sandbox.v1.SandboxConfigSnapshot.SettingsEntry
 	4,  // 28: openshell.sandbox.v1.SandboxConfigSnapshot.policy_source:type_name -> openshell.sandbox.v1.PolicySource
-	31, // 29: openshell.sandbox.v1.SandboxConfigSnapshot.supervisor_middleware_services:type_name -> openshell.sandbox.v1.SupervisorMiddlewareService
-	30, // 30: openshell.sandbox.v1.SandboxConfigSnapshot.service_routes:type_name -> openshell.sandbox.v1.SandboxServiceRoute
-	7,  // 31: openshell.sandbox.v1.GetSandboxConfigResponse.policy:type_name -> openshell.sandbox.v1.SandboxPolicy
-	41, // 32: openshell.sandbox.v1.GetSandboxConfigResponse.settings:type_name -> openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
+	33, // 29: openshell.sandbox.v1.SandboxConfigSnapshot.supervisor_middleware_services:type_name -> openshell.sandbox.v1.SupervisorMiddlewareService
+	32, // 30: openshell.sandbox.v1.SandboxConfigSnapshot.service_routes:type_name -> openshell.sandbox.v1.SandboxServiceRoute
+	9,  // 31: openshell.sandbox.v1.GetSandboxConfigResponse.policy:type_name -> openshell.sandbox.v1.SandboxPolicy
+	46, // 32: openshell.sandbox.v1.GetSandboxConfigResponse.settings:type_name -> openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
 	4,  // 33: openshell.sandbox.v1.GetSandboxConfigResponse.policy_source:type_name -> openshell.sandbox.v1.PolicySource
-	31, // 34: openshell.sandbox.v1.GetSandboxConfigResponse.supervisor_middleware_services:type_name -> openshell.sandbox.v1.SupervisorMiddlewareService
-	30, // 35: openshell.sandbox.v1.GetSandboxConfigResponse.service_routes:type_name -> openshell.sandbox.v1.SandboxServiceRoute
-	44, // 36: openshell.sandbox.v1.SupervisorMiddlewareService.request_timeout:type_name -> google.protobuf.Duration
+	33, // 34: openshell.sandbox.v1.GetSandboxConfigResponse.supervisor_middleware_services:type_name -> openshell.sandbox.v1.SupervisorMiddlewareService
+	32, // 35: openshell.sandbox.v1.GetSandboxConfigResponse.service_routes:type_name -> openshell.sandbox.v1.SandboxServiceRoute
+	49, // 36: openshell.sandbox.v1.SupervisorMiddlewareService.request_timeout:type_name -> google.protobuf.Duration
 	5,  // 37: openshell.sandbox.v1.SupervisorMiddlewareService.binding_policy:type_name -> openshell.sandbox.v1.SupervisorMiddlewareBindingPolicy
 	6,  // 38: openshell.sandbox.v1.SupervisorMiddlewareService.bindings:type_name -> openshell.sandbox.v1.SupervisorMiddlewareBinding
-	11, // 39: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry.value:type_name -> openshell.sandbox.v1.NetworkPolicyRule
-	12, // 40: openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry.value:type_name -> openshell.sandbox.v1.NetworkMiddlewareConfig
-	17, // 41: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry.value:type_name -> openshell.sandbox.v1.GraphqlOperation
-	21, // 42: openshell.sandbox.v1.L7DenyRule.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	21, // 43: openshell.sandbox.v1.L7DenyRule.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	21, // 44: openshell.sandbox.v1.L7Allow.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	21, // 45: openshell.sandbox.v1.L7Allow.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	26, // 46: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.SettingValue
-	27, // 47: openshell.sandbox.v1.SandboxConfigSnapshot.SettingsEntry.value:type_name -> openshell.sandbox.v1.EffectiveSetting
-	27, // 48: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.EffectiveSetting
-	49, // [49:49] is the sub-list for method output_type
-	49, // [49:49] is the sub-list for method input_type
-	49, // [49:49] is the sub-list for extension type_name
-	49, // [49:49] is the sub-list for extension extendee
-	0,  // [0:49] is the sub-list for field type_name
+	49, // 39: openshell.sandbox.v1.SampledResourceBudget.cpu_time:type_name -> google.protobuf.Duration
+	7,  // 40: openshell.sandbox.v1.ResourceEnforcement.kind:type_name -> openshell.sandbox.v1.ResourceEnforcementKind
+	8,  // 41: openshell.sandbox.v1.ResourceEnforcement.scope:type_name -> openshell.sandbox.v1.ResourceEnforcementScope
+	8,  // 42: openshell.sandbox.v1.SampledResourceBudgetCapabilities.scope:type_name -> openshell.sandbox.v1.ResourceEnforcementScope
+	49, // 43: openshell.sandbox.v1.SampledResourceBudgetCapabilities.sampling_interval:type_name -> google.protobuf.Duration
+	49, // 44: openshell.sandbox.v1.SampledResourceBudgetCapabilities.cpu_time_resolution:type_name -> google.protobuf.Duration
+	13, // 45: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry.value:type_name -> openshell.sandbox.v1.NetworkPolicyRule
+	14, // 46: openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry.value:type_name -> openshell.sandbox.v1.NetworkMiddlewareConfig
+	19, // 47: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry.value:type_name -> openshell.sandbox.v1.GraphqlOperation
+	23, // 48: openshell.sandbox.v1.L7DenyRule.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	23, // 49: openshell.sandbox.v1.L7DenyRule.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	23, // 50: openshell.sandbox.v1.L7Allow.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	23, // 51: openshell.sandbox.v1.L7Allow.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	28, // 52: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.SettingValue
+	29, // 53: openshell.sandbox.v1.SandboxConfigSnapshot.SettingsEntry.value:type_name -> openshell.sandbox.v1.EffectiveSetting
+	29, // 54: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.EffectiveSetting
+	55, // [55:55] is the sub-list for method output_type
+	55, // [55:55] is the sub-list for method input_type
+	55, // [55:55] is the sub-list for extension type_name
+	55, // [55:55] is the sub-list for extension extendee
+	0,  // [0:55] is the sub-list for field type_name
 }
 
 func init() { file_sandbox_proto_init() }
@@ -3080,13 +3430,14 @@ func file_sandbox_proto_init() {
 		(*SettingValue_IntValue)(nil),
 		(*SettingValue_BytesValue)(nil),
 	}
+	file_sandbox_proto_msgTypes[25].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_sandbox_proto_rawDesc), len(file_sandbox_proto_rawDesc)),
-			NumEnums:      7,
-			NumMessages:   35,
+			NumEnums:      9,
+			NumMessages:   38,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

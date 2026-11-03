@@ -261,6 +261,7 @@ impl OpenShell for OpenShellService {
         Ok(Response::new(HealthResponse {
             status: ServiceStatus::Healthy.into(),
             version: openshell_core::VERSION.to_string(),
+            supports_sampled_resource_budget: true,
         }))
     }
 
@@ -970,14 +971,19 @@ fn public_resource_capabilities(
     resources: openshell_core::proto::compute::v1::ResourceCapabilities,
 ) -> ResourceCapabilities {
     ResourceCapabilities {
+        sampled_budget: resources.sampled_budget,
         cpu: resources.cpu.as_ref().map(|cpu| CpuResourceCapabilities {
             limit_supported: cpu.limit_supported,
+            limit_enforcement: cpu.limit_enforcement,
+            request_enforcement: cpu.request_enforcement,
         }),
         memory: resources
             .memory
             .as_ref()
             .map(|memory| MemoryResourceCapabilities {
                 limit_supported: memory.limit_supported,
+                limit_enforcement: memory.limit_enforcement,
+                request_enforcement: memory.request_enforcement,
             }),
         gpu: resources.gpu.as_ref().map(|gpu| GpuResourceCapabilities {
             default_selection_supported: gpu.default_selection_supported,
@@ -1315,19 +1321,33 @@ mod tests {
         let driver_capabilities = DriverResourceCapabilities {
             cpu: Some(DriverCpuResourceCapabilities {
                 limit_supported: true,
+                limit_enforcement: Some(openshell_core::proto::sandbox::v1::ResourceEnforcement {
+                    kind: openshell_core::proto::sandbox::v1::ResourceEnforcementKind::KernelLimit
+                        as i32,
+                    scope: openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container
+                        as i32,
+                }),
+                ..Default::default()
             }),
             memory: Some(DriverMemoryResourceCapabilities {
                 limit_supported: false,
+                ..Default::default()
             }),
             gpu: Some(DriverGpuResourceCapabilities {
                 default_selection_supported: true,
                 count_selection_supported: true,
             }),
+            sampled_budget: None,
         };
 
         let capabilities = public_resource_capabilities(driver_capabilities);
 
-        assert!(capabilities.cpu.expect("CPU capabilities").limit_supported);
+        let cpu = capabilities.cpu.expect("CPU capabilities");
+        assert!(cpu.limit_supported);
+        assert_eq!(
+            cpu.limit_enforcement.unwrap().scope,
+            openshell_core::proto::sandbox::v1::ResourceEnforcementScope::Container as i32
+        );
         assert!(
             !capabilities
                 .memory

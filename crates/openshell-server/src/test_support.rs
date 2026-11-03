@@ -267,6 +267,22 @@ impl FakeComputeDriver {
         self.with_state(|state| state.calls.clear());
     }
 
+    pub fn set_resource_contract(
+        &self,
+        supported: bool,
+        resources: Option<openshell_core::proto::compute::v1::ResourceCapabilities>,
+    ) {
+        self.with_state(|state| {
+            let metadata = state.capabilities.extension.as_mut().unwrap();
+            let capability = openshell_core::extension_protocol::COMPUTE_RESOURCE_CONTRACT;
+            metadata.supported_capabilities.retain(|c| c != capability);
+            if supported {
+                metadata.supported_capabilities.push(capability.into());
+            }
+            state.capabilities.resource_capabilities = resources;
+        });
+    }
+
     pub fn set_admission_acknowledgement(&self, acknowledgement: String) {
         self.with_state(|state| state.capabilities.resource_admission_policy = acknowledgement);
     }

@@ -29,6 +29,7 @@ export type {
   ProviderChange,
   ProviderChangeOptions,
   ProviderRef,
+  SampledResourceBudget,
   SandboxConfig,
   SandboxFromTemplateSpec,
   SandboxPhaseName,

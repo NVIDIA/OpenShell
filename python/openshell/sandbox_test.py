@@ -21,7 +21,7 @@ import pytest
 from google.protobuf.struct_pb2 import Struct
 
 import openshell.sandbox as sandbox_module
-from openshell._proto import openshell_pb2, openshell_pb2_grpc
+from openshell._proto import openshell_pb2, openshell_pb2_grpc, sandbox_pb2
 from openshell.mutations import DeletionOutcome
 from openshell.sandbox import (
     _OIDC_TOKEN_EXPIRY_GRACE_SECONDS,
@@ -2110,10 +2110,19 @@ class _FakeSandboxStub:
         self.delete_template_request: (
             openshell_pb2.DeleteSandboxTemplateRequest | None
         ) = None
+        self.sampled_budget_ack = False
         self._listed = listed or []
         self._listed_pages = listed_pages
         self.list_requests: list[openshell_pb2.ListSandboxesRequest] = []
         self._templates: list[openshell_pb2.SandboxWorkloadTemplate] = []
+
+    def Health(
+        self, request: object, timeout: float | None = None
+    ) -> openshell_pb2.HealthResponse:
+        _ = request, timeout
+        return openshell_pb2.HealthResponse(
+            supports_sampled_resource_budget=self.sampled_budget_ack
+        )
 
     def GetSandbox(
         self,
@@ -2426,6 +2435,7 @@ def test_create_from_template_rejects_empty_workload_template() -> None:
 
 def test_sandbox_template_create_builds_template_from_public_fields() -> None:
     stub = _FakeSandboxStub()
+    stub.sampled_budget_ack = True
     client = _template_client_with_fake_stub(stub)
 
     created = client.create(
@@ -2438,6 +2448,7 @@ def test_sandbox_template_create_builds_template_from_public_fields() -> None:
         cpu="1",
         memory="512Mi",
         gpu_count=2,
+        sampled_budget=sandbox_pb2.SampledResourceBudget(resident_bytes=4096),
         driver_config={"kubernetes": {"runtime_class_name": "kata"}},
     )
 
@@ -2456,6 +2467,40 @@ def test_sandbox_template_create_builds_template_from_public_fields() -> None:
     config = template.spec.driver_config["kubernetes"]
     assert isinstance(config, Struct)
     assert config["runtime_class_name"] == "kata"
+
+    assert template.spec.workload.resources.sampled_budget.resident_bytes == 4096
+
+
+@pytest.mark.parametrize("template", [False, True])
+def test_sampled_budget_requires_gateway_acknowledgement(template: bool) -> None:
+    stub = _FakeSandboxStub()
+    budget = sandbox_pb2.SampledResourceBudget(resident_bytes=4096)
+    if template:
+        template_client = _template_client_with_fake_stub(stub)
+
+        def write() -> object:
+            return template_client.create(
+                workspace="default", name="budget", sampled_budget=budget
+            )
+    else:
+        client = _client_with_fake_stub(stub)
+        spec = openshell_pb2.SandboxSpec()
+        spec.resource_requirements.sampled_budget.CopyFrom(budget)
+
+        def write() -> object:
+            return client.create(workspace="default", name="budget", spec=spec)
+
+    with pytest.raises(SandboxError, match="does not acknowledge"):
+        write()
+    assert stub.create_request is None
+    assert stub.create_template_request is None
+    stub.sampled_budget_ack = True
+    write()
+    assert (
+        (stub.create_template_request is not None)
+        if template
+        else (stub.create_request is not None)
+    )
 
 
 def test_sandbox_template_create_materializes_default_workload() -> None:

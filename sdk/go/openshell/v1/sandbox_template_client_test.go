@@ -24,6 +24,7 @@ import (
 )
 
 type mockSandboxTemplateServer struct {
+	sampledBudgetAck bool
 	pb.UnimplementedOpenShellServer
 	mu sync.Mutex
 
@@ -38,6 +39,12 @@ type mockSandboxTemplateServer struct {
 	getErr    error
 	listErr   error
 	deleteErr error
+}
+
+func (s *mockSandboxTemplateServer) Health(context.Context, *pb.HealthRequest) (*pb.HealthResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return &pb.HealthResponse{SupportsSampledResourceBudget: s.sampledBudgetAck}, nil
 }
 
 func newMockSandboxTemplateServer() *mockSandboxTemplateServer {
@@ -129,7 +136,8 @@ func TestSandboxTemplateCreate(t *testing.T) {
 	defer cleanup()
 	gpuCount := uint32(1)
 
-	template, err := client.Create(context.Background(), "default", &SandboxWorkloadTemplate{
+	resident := uint64(4096)
+	input := &SandboxWorkloadTemplate{
 		Name: "gpu-kata",
 		Labels: map[string]string{
 			"team": "platform",
@@ -139,9 +147,10 @@ func TestSandboxTemplateCreate(t *testing.T) {
 				Image:       "nvcr.io/nvidia/openshell:latest",
 				Environment: map[string]string{"NVIDIA_VISIBLE_DEVICES": "all"},
 				Resources: &SandboxResources{
-					CPU:    "2",
-					Memory: "8Gi",
-					GPU:    &SandboxGPURequirements{Count: &gpuCount},
+					SampledBudget: &SampledResourceBudget{ResidentBytes: &resident},
+					CPU:           "2",
+					Memory:        "8Gi",
+					GPU:           &SandboxGPURequirements{Count: &gpuCount},
 				},
 			},
 			DriverConfig: map[string]any{
@@ -154,8 +163,12 @@ func TestSandboxTemplateCreate(t *testing.T) {
 				},
 			},
 		},
-	})
-
+	}
+	_, err := client.Create(context.Background(), "default", input)
+	require.Error(t, err)
+	assert.Nil(t, mock.createRequest)
+	mock.sampledBudgetAck = true
+	template, err := client.Create(context.Background(), "default", input)
 	require.NoError(t, err)
 	require.NotNil(t, template)
 	assert.Equal(t, "gpu-kata", template.Name)
@@ -172,6 +185,8 @@ func TestSandboxTemplateCreate(t *testing.T) {
 	require.NotNil(t, mock.createRequest.Template.Spec.Workload.Resources.Gpu.Count)
 	assert.Equal(t, uint32(1), *mock.createRequest.Template.Spec.Workload.Resources.Gpu.Count)
 	assert.Equal(t, durationpb.New(45*time.Second), mock.createRequest.Template.Spec.DesiredServiceLevel.Startup.ReadyWithin)
+	assert.Equal(t, resident, *mock.createRequest.Template.Spec.Workload.Resources.SampledBudget.ResidentBytes)
+
 }
 
 func TestSandboxTemplateCreate_RejectsNilTemplate(t *testing.T) {

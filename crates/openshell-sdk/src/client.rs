@@ -158,16 +158,21 @@ impl OpenShellClient {
         })
     }
 
+    // Public Health acknowledges wire/admission support without requiring the
+    // elevated GetGatewayInfo permission. Driver support remains authoritative.
+    async fn require_sampled_budget_support(&self) -> Result<()> {
+        let health = self
+            .unary(|mut grpc| async move { grpc.health(proto::HealthRequest {}).await })
+            .await?;
+        if !health.supports_sampled_resource_budget {
+            return Err(SdkError::InvalidConfig { message: "gateway does not acknowledge sampled resource budgets; upgrade it before creating this workload".into(), status: None });
+        }
+        Ok(())
+    }
+
     /// Create a new sandbox from a curated [`SandboxSpec`].
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
-        let request = create_sandbox_request(spec);
-        let response = self
-            .unary(|mut grpc| {
-                let request = request.clone();
-                async move { grpc.create_sandbox(request).await }
-            })
-            .await?;
-        sandbox_from_create_response(response)
+        self.workspace("default").create_sandbox(spec).await
     }
 
     /// Create a new sandbox from a workspace-scoped workload template name.
@@ -190,17 +195,9 @@ impl OpenShellClient {
         &self,
         template: SandboxWorkloadTemplate,
     ) -> Result<SandboxWorkloadTemplate> {
-        let response = self
-            .unary(|mut grpc| {
-                let request = proto::CreateSandboxTemplateRequest {
-                    request_id: String::new(),
-                    template: Some(template.clone()),
-                    workspace_scope: Some(proto::workspace_selector("default")),
-                };
-                async move { grpc.create_sandbox_template(request).await }
-            })
-            .await?;
-        sandbox_template_from_response(response.template)
+        self.workspace("default")
+            .create_sandbox_template(template)
+            .await
     }
 
     /// Fetch a reusable sandbox template by name from the default workspace.
@@ -1005,6 +1002,9 @@ impl WorkspaceScopedClient {
 
     /// Create a new sandbox in this workspace.
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
+        if spec.sampled_budget.is_some() {
+            self.client.require_sampled_budget_support().await?;
+        }
         let mut request = create_sandbox_request(spec);
         request.workspace_scope = Some(proto::workspace_selector(&self.workspace));
         let response = self
@@ -1039,6 +1039,16 @@ impl WorkspaceScopedClient {
         &self,
         template: SandboxWorkloadTemplate,
     ) -> Result<SandboxWorkloadTemplate> {
+        if template
+            .spec
+            .as_ref()
+            .and_then(|s| s.workload.as_ref())
+            .and_then(|w| w.resources.as_ref())
+            .and_then(|r| r.sampled_budget.as_ref())
+            .is_some()
+        {
+            self.client.require_sampled_budget_support().await?;
+        }
         let response = self
             .client
             .unary(|mut grpc| {
@@ -1468,6 +1478,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         environment,
         providers,
         gpu,
+        sampled_budget,
         command,
         tty,
         service_exposures,
@@ -1477,9 +1488,11 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         image,
         ..proto::SandboxTemplate::default()
     });
-    let resource_requirements = gpu.then_some(proto::ResourceRequirements {
-        gpu: Some(proto::GpuResourceRequirements { count: None }),
-    });
+    let resource_requirements =
+        (gpu || sampled_budget.is_some()).then_some(proto::ResourceRequirements {
+            gpu: gpu.then_some(proto::GpuResourceRequirements { count: None }),
+            sampled_budget,
+        });
     proto::CreateSandboxRequest {
         request_id: String::new(),
         spec: Some(proto::SandboxSpec {

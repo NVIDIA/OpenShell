@@ -53,3 +53,18 @@ type HealthInterface interface {
 	GetGatewayInfo(ctx context.Context) (*GatewayInfo, error)
 	GetCurrentUser(ctx context.Context) (*CurrentUser, error)
 }
+
+// ResourceCapabilities reports the configured compute driver's resource guarantees.
+type ResourceCapabilities = types.ResourceCapabilities
+
+// ResourceDomainCapabilities describes resource limit and request enforcement.
+type ResourceDomainCapabilities = types.ResourceDomainCapabilities
+
+// ResourceEnforcement identifies the mechanism and scope of a resource guarantee.
+type ResourceEnforcement = types.ResourceEnforcement
+
+// GPUResourceCapabilities describes supported GPU selection methods.
+type GPUResourceCapabilities = types.GPUResourceCapabilities
+
+// SampledBudgetCapabilities describes supported sampled workload budgets.
+type SampledBudgetCapabilities = types.SampledBudgetCapabilities

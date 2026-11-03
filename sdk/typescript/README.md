@@ -348,3 +348,7 @@ mise run e2e:sdk:ts:exec    # public interactive helper against an isolated Dock
 ```
 
 Formatting and linting are handled by [Biome](https://biomejs.dev) (`biome.json`): 2-space indent, single quotes, semicolons, 120-column width. Generated `src/gen/` is excluded. `sdk:ts:lint` runs in CI as part of `sdk:ts:ci`.
+
+## Next minor raw message migration
+
+Raw Health responses add `supportsSampledResourceBudget`. Complete object literals need the false default, or use a generated message builder. Resource requirement/capability messages also gain optional enforcement and budget fields. This change belongs to the next minor release; it is not a patch-source-compatibility claim. Upgrade gateway writers together so older protobuf writers cannot discard the new metadata.

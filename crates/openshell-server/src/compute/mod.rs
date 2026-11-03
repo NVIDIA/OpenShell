@@ -685,7 +685,14 @@ impl AcquiredRemoteDriverEndpoint {
 struct RemoteComputeDriver {
     client: RemoteComputeDriverClient,
     configuration_updates_client: openshell_core::proto::compute::v1::compute_driver_configuration_updates_client::ComputeDriverConfigurationUpdatesClient<tonic::service::interceptor::InterceptedService<Channel, TraceContextInterceptor>>,
-    admission_acknowledgement: Arc<StdMutex<Option<String>>>,
+    admission_handshake: Arc<StdMutex<Option<RemoteAdmissionHandshake>>>,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteAdmissionHandshake {
+    policy: String,
+    resource_contract: bool,
+    resources: Option<DriverResourceCapabilities>,
 }
 
 type RemoteComputeDriverClient = ComputeDriverClient<
@@ -697,7 +704,7 @@ impl RemoteComputeDriver {
         Self {
             client: ComputeDriverClient::with_interceptor(channel.clone(), TraceContextInterceptor),
             configuration_updates_client: openshell_core::proto::compute::v1::compute_driver_configuration_updates_client::ComputeDriverConfigurationUpdatesClient::with_interceptor(channel, TraceContextInterceptor),
-            admission_acknowledgement: Arc::new(StdMutex::new(None)),
+            admission_handshake: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -707,7 +714,7 @@ impl RemoteComputeDriver {
 
     async fn verify_admission_policy(&self, external_isolation: bool) -> Result<(), Status> {
         let expected = self
-            .admission_acknowledgement
+            .admission_handshake
             .lock()
             .map_err(|_| Status::internal("admission handshake lock poisoned"))?
             .clone()
@@ -728,13 +735,34 @@ impl RemoteComputeDriver {
                 "remote compute driver no longer supports isolation backend registration; restart the gateway after upgrading the driver",
             ));
         }
-        if current.resource_admission_policy != expected {
+        if current.resource_admission_policy != expected.policy {
             return Err(Status::failed_precondition(
                 "remote driver admission policy changed; restart gateway after configuring matching policy",
             ));
         }
+        verify_resource_contract(expected.resource_contract, &expected.resources, &current)?;
         Ok(())
     }
+}
+
+fn verify_resource_contract(
+    negotiated: bool,
+    resources: &Option<DriverResourceCapabilities>,
+    current: &openshell_core::proto::compute::v1::GetCapabilitiesResponse,
+) -> Result<(), Status> {
+    if negotiated
+        && (!current.extension.as_ref().is_some_and(|metadata| {
+            metadata
+                .supported_capabilities
+                .iter()
+                .any(|cap| cap == openshell_core::extension_protocol::COMPUTE_RESOURCE_CONTRACT)
+        }) || &current.resource_capabilities != resources)
+    {
+        return Err(Status::failed_precondition(
+            "compute resource contract changed; restart the gateway after updating the driver",
+        ));
+    }
+    Ok(())
 }
 
 #[tonic::async_trait]
@@ -765,10 +793,18 @@ impl ComputeDriver for RemoteComputeDriver {
     {
         let mut client = self.client();
         let response = client.get_capabilities(request).await?;
-        self.admission_acknowledgement
+        self.admission_handshake
             .lock()
             .map_err(|_| Status::internal("admission handshake lock poisoned"))?
-            .get_or_insert_with(|| response.get_ref().resource_admission_policy.clone());
+            .get_or_insert_with(|| RemoteAdmissionHandshake {
+                policy: response.get_ref().resource_admission_policy.clone(),
+                resource_contract: response.get_ref().extension.as_ref().is_some_and(|e| {
+                    e.supported_capabilities
+                        .iter()
+                        .any(|c| c == openshell_core::extension_protocol::COMPUTE_RESOURCE_CONTRACT)
+                }),
+                resources: response.get_ref().resource_capabilities,
+            });
         Ok(response)
     }
 
@@ -1262,7 +1298,50 @@ impl ComputeRuntime {
         if let Some(spec) = driver_sandbox.spec.as_mut() {
             spec.isolation_backend.clone_from(&self.isolation_backend);
         }
+        openshell_core::resource_contract::validate_request(
+            &driver_sandbox,
+            self.driver_info.resource_capabilities.as_ref(),
+            self.driver_info
+                .negotiated_extension
+                .supported_capabilities
+                .iter()
+                .any(|cap| cap == openshell_core::extension_protocol::COMPUTE_RESOURCE_CONTRACT),
+        )
+        .map_err(Status::failed_precondition)?;
         Ok(driver_sandbox)
+    }
+
+    /// Verify current guarantees before claiming lifecycle work or consuming staging.
+    async fn admit_driver_sandbox_for_launch(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<DriverSandbox, Status> {
+        let projected = self.driver_sandbox_for_launch(sandbox)?;
+        let negotiated = self
+            .driver_info
+            .negotiated_extension
+            .supported_capabilities
+            .iter()
+            .any(|cap| cap == openshell_core::extension_protocol::COMPUTE_RESOURCE_CONTRACT);
+        if negotiated {
+            let current = self
+                .driver
+                .call(
+                    openshell_otel::rpc::GET_CAPABILITIES,
+                    Some(sandbox.object_id()),
+                    |driver| async move {
+                        driver
+                            .get_capabilities(Request::new(GetCapabilitiesRequest {
+                                gateway: Some(gateway_metadata(ExtensionFamily::Compute)),
+                            }))
+                            .await
+                    },
+                )
+                .await?
+                .into_inner();
+            verify_resource_contract(true, &self.driver_info.resource_capabilities, &current)?;
+        }
+        Ok(projected)
     }
 
     fn driver_start_request(
@@ -1458,7 +1537,7 @@ impl ComputeRuntime {
                 .as_ref()
                 .and_then(|spec| spec.template.as_ref()),
         )?;
-        let mut driver_sandbox = self.driver_sandbox_for_launch(sandbox)?;
+        let mut driver_sandbox = self.admit_driver_sandbox_for_launch(sandbox).await?;
         if let Some(spec) = driver_sandbox.spec.as_mut() {
             spec.await_main_process_attachment = await_main_process_attachment;
         }
@@ -1623,6 +1702,7 @@ impl ComputeRuntime {
                 .as_ref()
                 .and_then(|spec| spec.template.as_ref()),
         )?;
+        self.admit_driver_sandbox_for_launch(&sandbox).await?;
         let sandbox_id = sandbox.object_id().to_string();
         let mut sandbox = sandbox;
         let metadata = sandbox
@@ -2403,6 +2483,7 @@ impl ComputeRuntime {
             if phase == SandboxPhase::Ready {
                 return Ok(current);
             }
+            self.admit_driver_sandbox_for_launch(&current).await?;
             let provisioning_timeout =
                 phase == SandboxPhase::Error && provisioning_deadline::timed_out(&current);
             if provisioning_timeout
@@ -4291,6 +4372,11 @@ impl ComputeRuntime {
                 continue;
             }
 
+            if let Err(error) = self.admit_driver_sandbox_for_launch(&sandbox).await {
+                warn!(sandbox_id, %error, "Rejected changed recovered resource guarantees");
+                failed += 1;
+                continue;
+            }
             if let Err(error) = sandbox_runtime_generation(&sandbox) {
                 warn!(sandbox_id, %error, "Persisted sandbox runtime identity is invalid");
                 authentication_failed(sandbox.object_id());
@@ -4561,6 +4647,10 @@ impl ComputeRuntime {
                             error.message(),
                         )
                         .await;
+                        continue;
+                    }
+                    if let Err(error) = self.admit_driver_sandbox_for_launch(&sandbox).await {
+                        warn!(%error, "Rejected changed pending resource guarantees");
                         continue;
                     }
                     let sandbox_id = sandbox.object_id().to_string();
@@ -5046,6 +5136,9 @@ impl ComputeRuntime {
 
         let sandbox_name = current.object_name().to_string();
         self.validate_isolation_backend_binding(&current)
+            .map_err(|error| error.to_string())?;
+        self.admit_driver_sandbox_for_launch(&current)
+            .await
             .map_err(|error| error.to_string())?;
         let already_claimed = current
             .status
@@ -7137,6 +7230,7 @@ fn driver_sandbox_spec_from_public(
         policy: spec.policy.clone(),
         resource_requirements: spec.resource_requirements.as_ref().map(|requirements| {
             DriverSandboxResourceRequirements {
+                sampled_budget: requirements.sampled_budget,
                 gpu: requirements
                     .gpu
                     .as_ref()
@@ -8767,6 +8861,7 @@ mod tests {
         let public = SandboxSpec {
             resource_requirements: Some(openshell_core::proto::ResourceRequirements {
                 gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(2) }),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -12629,6 +12724,7 @@ mod tests {
             Some(&SandboxSpec {
                 resource_requirements: Some(openshell_core::proto::ResourceRequirements {
                     gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -16739,6 +16835,7 @@ mod tests {
             spec: Some(SandboxSpec {
                 resource_requirements: Some(openshell_core::proto::ResourceRequirements {
                     gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -18459,59 +18556,211 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn retained_resource_refusal_precedes_lifecycle_claim_and_stop() {
+        use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
+        use openshell_core::proto::sandbox::v1::{
+            ResourceEnforcement, ResourceEnforcementKind, ResourceEnforcementScope,
+        };
+        for remove_contract in [false, true] {
+            for mode in 0..4 {
+                let directory = tempfile::tempdir().unwrap();
+                let socket = directory.path().join("resource-drift.sock");
+                let driver = FakeComputeDriver::new().with_gateway_manages_lifecycle();
+                driver.set_resource_contract(
+                    true,
+                    Some(DriverResourceCapabilities {
+                        cpu: Some(
+                            openshell_core::proto::compute::v1::CpuResourceCapabilities {
+                                limit_supported: true,
+                                limit_enforcement: Some(ResourceEnforcement {
+                                    kind: ResourceEnforcementKind::KernelLimit as i32,
+                                    scope: ResourceEnforcementScope::Container as i32,
+                                }),
+                                ..Default::default()
+                            },
+                        ),
+                        ..Default::default()
+                    }),
+                );
+                let _server = driver.serve_uds(&socket).unwrap();
+                let endpoint = connect_remote_compute_driver("external-test", &socket)
+                    .await
+                    .unwrap();
+                let store = Arc::new(crate::persistence::test_store().await);
+                crate::ensure_default_workspace(&store).await.unwrap();
+                let runtime = ComputeRuntime::new_remote_driver(
+                    endpoint,
+                    store,
+                    SandboxIndex::new(),
+                    SandboxWatchBus::new(),
+                    TracingLogBus::new(),
+                    Arc::new(SupervisorSessionRegistry::new()),
+                )
+                .await
+                .unwrap();
+                driver.set_resource_contract(!remove_contract, None);
+                driver.clear_calls();
+                let mut sandbox = sandbox_record("retained", "retained", SandboxPhase::Stopped);
+                sandbox.spec = Some(SandboxSpec {
+                    template: Some(SandboxTemplate {
+                        resources: Some(
+                            openshell_core::proto_struct::json_object_to_struct(
+                                serde_json::json!({"limits": {"cpu": "1"}})
+                                    .as_object()
+                                    .unwrap()
+                                    .clone(),
+                            )
+                            .unwrap(),
+                        ),
+                        ..Default::default()
+                    }),
+                    restart_policy: SandboxRestartPolicy::Always as i32,
+                    ..Default::default()
+                });
+                if mode == 1 {
+                    apply_main_process_restart(
+                        &mut sandbox,
+                        "previous-main",
+                        9,
+                        openshell_core::time::now_ms()
+                            .saturating_sub(RESTART_TERMINAL_DELIVERY_GRACE_MS + 1),
+                    );
+                }
+                if mode == 2 {
+                    sandbox.set_phase(SandboxPhase::Ready as i32);
+                }
+                if mode == 3 {
+                    sandbox.set_phase(SandboxPhase::Starting as i32);
+                }
+                runtime.store.put_message(&sandbox).await.unwrap();
+                let before = runtime
+                    .store
+                    .get_message::<Sandbox>("retained")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match mode {
+                    0 => {
+                        let error = runtime
+                            .start_sandbox("default", "retained")
+                            .await
+                            .unwrap_err();
+                        assert_eq!(error.code(), Code::FailedPrecondition);
+                        assert!(error.message().contains("resource contract changed"));
+                    }
+                    1 => {
+                        let error = runtime
+                            .restart_sandbox_runtime("retained")
+                            .await
+                            .unwrap_err();
+                        assert!(error.contains("resource contract changed"), "{error}");
+                    }
+                    2 => {
+                        runtime
+                            .start_persisted_sandboxes_with_authentication(
+                                |_| async {
+                                    panic!(
+                                        "changed guarantees must precede recovered authentication"
+                                    )
+                                },
+                                |_| async { Ok(()) },
+                                |_| {},
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    _ => {
+                        runtime
+                            .recover_persisted_lifecycle_transitions()
+                            .await
+                            .unwrap();
+                    }
+                }
+                let after = runtime
+                    .store
+                    .get_message::<Sandbox>("retained")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    after, before,
+                    "refusal must preserve generation, lifecycle, and restart schedule"
+                );
+                assert_eq!(
+                    driver.calls(),
+                    vec![FakeComputeDriverCall::GetCapabilities],
+                    "current guarantees must be checked before driver STOP/START"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn remote_compute_driver_rejects_policy_changes_before_forwarding() {
         use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("admission.sock");
-        let driver = FakeComputeDriver::new();
-        let _server = driver.serve_uds(&socket_path).unwrap();
-        let endpoint = connect_remote_compute_driver("external-test", &socket_path)
-            .await
-            .unwrap();
-        let remote = RemoteComputeDriver::new(endpoint.channel);
-        remote
-            .get_capabilities(Request::new(GetCapabilitiesRequest {
-                gateway: Some(gateway_metadata(ExtensionFamily::Compute)),
-            }))
-            .await
-            .unwrap();
-        driver.set_admission_acknowledgement(String::new());
-        driver.clear_calls();
-        let sandbox = DriverSandbox::default();
-        let status = remote
-            .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
-                sandbox: Some(sandbox.clone()),
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(status.code(), Code::FailedPrecondition);
-        assert!(
+        for change in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let socket_path = dir.path().join("admission.sock");
+            let driver = FakeComputeDriver::new();
+            driver.set_resource_contract(true, Some(DriverResourceCapabilities::default()));
+            let _server = driver.serve_uds(&socket_path).unwrap();
+            let endpoint = connect_remote_compute_driver("external-test", &socket_path)
+                .await
+                .unwrap();
+            let remote = RemoteComputeDriver::new(endpoint.channel);
             remote
-                .create_sandbox(Request::new(CreateSandboxRequest {
-                    sandbox: Some(sandbox)
+                .get_capabilities(Request::new(GetCapabilitiesRequest {
+                    gateway: Some(gateway_metadata(ExtensionFamily::Compute)),
                 }))
                 .await
-                .is_err()
-        );
-        assert!(
-            remote
-                .start_sandbox(Request::new(StartSandboxRequest::default()))
+                .unwrap();
+            match change {
+                0 => driver.set_admission_acknowledgement(String::new()),
+                1 => {
+                    driver
+                        .set_resource_contract(false, Some(DriverResourceCapabilities::default()));
+                }
+                _ => driver.set_resource_contract(true, None),
+            }
+            driver.clear_calls();
+            let sandbox = DriverSandbox::default();
+            let status = remote
+                .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
+                    sandbox: Some(sandbox.clone()),
+                }))
                 .await
-                .is_err()
-        );
-        let status = openshell_core::compute::ComputeDriver::update_sandbox_configuration(
-            &remote,
-            Request::new(
-                openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest::default(),
-            ),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(status.code(), Code::FailedPrecondition);
-        assert_eq!(
-            driver.calls(),
-            vec![FakeComputeDriverCall::GetCapabilities; 4]
-        );
+                .unwrap_err();
+            assert_eq!(status.code(), Code::FailedPrecondition);
+            assert!(
+                remote
+                    .create_sandbox(Request::new(CreateSandboxRequest {
+                        sandbox: Some(sandbox)
+                    }))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                remote
+                    .start_sandbox(Request::new(StartSandboxRequest::default()))
+                    .await
+                    .is_err()
+            );
+            let status = openshell_core::compute::ComputeDriver::update_sandbox_configuration(
+                &remote,
+                Request::new(
+                    openshell_core::proto::compute::v1::UpdateSandboxConfigurationRequest::default(
+                    ),
+                ),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(status.code(), Code::FailedPrecondition);
+            assert_eq!(
+                driver.calls(),
+                vec![FakeComputeDriverCall::GetCapabilities; 4]
+            );
+        }
     }
 
     #[tokio::test]

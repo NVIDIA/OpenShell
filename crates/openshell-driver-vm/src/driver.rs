@@ -1534,6 +1534,24 @@ impl VmDriver {
     }
 
     #[must_use]
+    fn resource_capabilities(gpu_supported: bool) -> ResourceCapabilities {
+        ResourceCapabilities {
+            cpu: Some(CpuResourceCapabilities {
+                limit_supported: false,
+                ..Default::default()
+            }),
+            memory: Some(MemoryResourceCapabilities {
+                limit_supported: false,
+                ..Default::default()
+            }),
+            gpu: Some(GpuResourceCapabilities {
+                default_selection_supported: gpu_supported,
+                count_selection_supported: gpu_supported,
+            }),
+            sampled_budget: None,
+        }
+    }
+
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
         let mut extension = openshell_core::extension_protocol::extension_metadata(
             openshell_core::extension_protocol::ExtensionFamily::Compute,
@@ -1544,6 +1562,9 @@ impl VmDriver {
         extension
             .required_capabilities
             .push(openshell_core::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION.to_string());
+        extension
+            .supported_capabilities
+            .push(openshell_core::extension_protocol::COMPUTE_RESOURCE_CONTRACT.to_string());
         GetCapabilitiesResponse {
             resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
                 allow_driver_config: self.config.allow_driver_config,
@@ -1556,18 +1577,7 @@ impl VmDriver {
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: false,
-            resource_capabilities: Some(ResourceCapabilities {
-                cpu: Some(CpuResourceCapabilities {
-                    limit_supported: false,
-                }),
-                memory: Some(MemoryResourceCapabilities {
-                    limit_supported: false,
-                }),
-                gpu: Some(GpuResourceCapabilities {
-                    default_selection_supported: self.config.gpu_enabled,
-                    count_selection_supported: self.config.gpu_enabled,
-                }),
-            }),
+            resource_capabilities: Some(Self::resource_capabilities(self.config.gpu_enabled)),
             rootfs_tar_staging_dir: self
                 .config
                 .rootfs_tar_staging_dir()
@@ -5541,6 +5551,8 @@ fn decode_launch_authentication(
 
 #[allow(clippy::result_large_err)]
 fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Status> {
+    openshell_core::resource_contract::validate_request(sandbox, None, true)
+        .map_err(Status::failed_precondition)?;
     validate_sandbox_id(&sandbox.id)?;
 
     let spec = sandbox
@@ -9575,6 +9587,7 @@ mod tests {
     fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
         ResourceRequirements {
             gpu: Some(GpuResourceRequirements { count }),
+            ..Default::default()
         }
     }
 
@@ -9946,7 +9959,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_vm_sandbox_accepts_template_resources_as_noop() {
+    fn validate_vm_sandbox_rejects_unenforced_template_resources() {
         use openshell_core::proto::compute::v1::DriverResourceRequirements;
 
         let sandbox = Sandbox {
@@ -9964,8 +9977,10 @@ mod tests {
             }),
             ..Default::default()
         };
-        validate_vm_sandbox(&sandbox, false)
-            .expect("template.resources should be accepted and ignored");
+        assert_eq!(
+            validate_vm_sandbox(&sandbox, false).unwrap_err().code(),
+            Code::FailedPrecondition
+        );
     }
 
     #[test]
