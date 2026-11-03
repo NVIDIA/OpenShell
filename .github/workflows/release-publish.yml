@@ -531,8 +531,8 @@ jobs:
           BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
           SOURCE_CONTROL_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ inputs.source-sha }}
         run: |
-          nix shell --inputs-from . nixpkgs#buf -c \
-            buf push --exclude-unnamed --label "${RELEASE_TAG}" \
+          nix develop -c \
+            buf push proto --label "${RELEASE_TAG}" \
             --source-control-url "${SOURCE_CONTROL_URL}"
 
   publish-snap:
