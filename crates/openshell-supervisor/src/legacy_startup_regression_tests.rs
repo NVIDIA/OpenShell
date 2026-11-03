@@ -271,13 +271,20 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         sandbox_token: openshell_core::jwt::SecretJwt::parse("test-sandbox-token").unwrap(),
         sandbox_expires_at: 0,
         ssh_host_private_key: None,
+        traces_otlp_headers: None,
         ocsf_otlp_headers: None,
+        agent_otlp_headers: None,
+        otlp_tls: Vec::new(),
+        traces_otlp_tls: None,
+        ocsf_otlp_tls: None,
+        agent_otlp_tls: None,
     };
     let setup = HeldBackendSetup {
         session_id,
         probe: probe.clone(),
     };
     let config = SandboxInstanceConfig {
+        app_router: None,
         command: vec!["true".into()],
         workdir: None,
         timeout_secs: 0,

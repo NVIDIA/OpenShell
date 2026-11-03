@@ -332,6 +332,7 @@ fn kubernetes_config(
 ) -> openshell_core::Result<openshell_driver_kubernetes::KubernetesComputeConfig> {
     let mut config: openshell_driver_kubernetes::KubernetesComputeConfig =
         context.driver_config()?;
+    config.sandbox_runtime.app_listener.common = context.app_listener_config();
     config.sandbox_runtime_image = prefer_environment(
         config.sandbox_runtime_image,
         std::env::var(openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV).ok(),
@@ -749,3 +750,7 @@ mod tests {
         assert!(<VmFactory as openshell_server::ComputeDriverFactory>::supports_network_supervisor_trust(&VmFactory));
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/support/environment.rs"]
+mod test_environment;

@@ -292,6 +292,8 @@ fn spawn_supervisor_token_refresh(
 }
 pub use auth::audit::ConnectionSource;
 pub use multiplex::{MultiplexService, MultiplexedService};
+pub use otel_tracing::gateway_trace_headers;
+use otel_tracing::supervisor_otlp_headers;
 pub use persistence::Store;
 use sandbox_index::SandboxIndex;
 use sandbox_watch::SandboxWatchBus;
@@ -738,7 +740,12 @@ pub(crate) async fn run_server(
         shutdown_rx.clone(),
     )
     .await?;
-    compute.configure_supervisor_ocsf_headers(otel_tracing::supervisor_ocsf_headers(
+    compute.configure_supervisor_otlp_headers(supervisor_otlp_headers(
+        config_file
+            .as_ref()
+            .and_then(|file| file.openshell.gateway.otlp.as_ref()),
+    ));
+    compute.configure_supervisor_otlp_tls(otel_tracing::supervisor_otlp_tls(
         config_file
             .as_ref()
             .and_then(|file| file.openshell.gateway.otlp.as_ref()),
@@ -1716,6 +1723,14 @@ pub struct ComputeDriverConfigContext<'a> {
 }
 
 impl ComputeDriverConfigContext<'_> {
+    #[must_use]
+    pub fn app_listener_config(&self) -> openshell_core::app_listener::AppListenerConfig {
+        self.driver_startup
+            .file
+            .map(|file| file.openshell.supervisor.app_listener.clone())
+            .unwrap_or_default()
+    }
+
     #[must_use]
     pub fn driver_name(&self) -> &str {
         self.driver_name

@@ -19,7 +19,7 @@ Set an OTLP collector endpoint in `gateway.toml`:
 endpoint = "https://backend:4317"
 ```
 
-In the Helm chart, set the table under `gatewayConfig`. The gateway passes the endpoint to the compute drivers and sandbox supervisors it starts, and supervisors connect to the collector directly, so it must be reachable from sandboxes too. For a separate trace collector, OTLP/HTTP, TLS, sampling, and the other settings, refer to [OTLP Export](/how-it-works/gateways/configuration#otlp-export).
+In the Helm chart, set the table under `gatewayConfig`. The gateway passes the endpoint to the compute drivers and sandbox supervisors it starts, and supervisors connect to the collector directly, so it must be reachable from sandboxes too. For a separate trace collector, OTLP/HTTP, headers, TLS, sampling, and the other settings, refer to [OTLP Export](/how-it-works/gateways/configuration#otlp-export).
 
 ## What Is Traced
 

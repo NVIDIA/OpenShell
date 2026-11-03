@@ -228,6 +228,9 @@ async fn main() -> Result<()> {
         openshell_otel::DriverTracingConfig {
             endpoint: args.otlp.endpoint.as_deref(),
             protocol: args.otlp.protocol.into(),
+            ca_file: args.otlp.ca_file.as_deref(),
+            cert_file: args.otlp.cert_file.as_deref(),
+            key_file: args.otlp.key_file.as_deref(),
             gateway_name: args.gateway_name.as_deref(),
             service_version: VERSION,
             log_level: &args.log_level,
@@ -279,6 +282,8 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(openshell_core::config::default_supervisor_image),
             supervisor_image_pull_policy: args.supervisor_image_pull_policy,
             sandbox_runtime: KubernetesSandboxRuntimeConfig {
+                app_listener:
+                    openshell_driver_kubernetes::config::KubernetesAppListenerConfig::default(),
                 boundary_port: args.sandbox_runtime_boundary_port,
             },
             https_proxy: args.https_proxy,

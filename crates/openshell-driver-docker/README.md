@@ -10,7 +10,9 @@ falls back to `/var/run/docker.sock` when no candidate responds.
 When the gateway configures `[openshell.gateway.otlp]`, the in-process driver
 exports spans to the same OTLP collector, over its configured protocol, as
 `openshell-driver-docker`. The standalone driver accepts
-`OPENSHELL_OTLP_ENDPOINT` and `OPENSHELL_OTLP_PROTOCOL`, continues W3C trace
+`OPENSHELL_OTLP_ENDPOINT` and `OPENSHELL_OTLP_PROTOCOL`, with
+`OPENSHELL_OTLP_CA_FILE`, `OPENSHELL_OTLP_CERT_FILE`, and
+`OPENSHELL_OTLP_KEY_FILE` for an `https://` collector, continues W3C trace
 context from gateway RPC
 metadata, and flushes spans during graceful shutdown. When
 `[openshell.gateway.otlp.agent]` is enabled, the driver also sets

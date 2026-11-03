@@ -398,6 +398,8 @@ pub struct SupervisorPool {
     takeovers_from: tokio::time::Instant,
     /// When each desired route without an owner record was first seen.
     unowned_since: Mutex<HashMap<String, tokio::time::Instant>>,
+    /// When each route's owner term was first seen with its process gone.
+    owner_gone_since: Mutex<HashMap<String, (u64, tokio::time::Instant)>>,
     /// Takeover credentials minted for terms of members this replica serves.
     minted: Mutex<HashMap<(String, u64), (SandboxInstanceTakeover, tokio::time::Instant)>>,
     /// Launch material loaded for instances owned by members this replica
@@ -693,6 +695,7 @@ impl SupervisorPool {
             unowned_grace: UNOWNED_GRACE,
             takeovers_from: tokio::time::Instant::now() + TAKEOVER_STARTUP_GRACE,
             unowned_since: Mutex::new(HashMap::new()),
+            owner_gone_since: Mutex::new(HashMap::new()),
             minted: Mutex::new(HashMap::new()),
             materials: Mutex::new(HashMap::new()),
             withdrawn_since: Mutex::new(HashMap::new()),
@@ -2088,6 +2091,8 @@ impl SupervisorPool {
         // report describes a process that may be gone, so it renders no
         // verdict until a new term is granted.
         let mut unconfirmed = BTreeSet::new();
+        // Routes whose granted owner's process is gone, not just leaving.
+        let mut gone = BTreeSet::new();
         for (route, instance) in &desired {
             if stopping.contains(route) {
                 continue;
@@ -2108,6 +2113,9 @@ impl SupervisorPool {
                     if !matches!(failure, Ok(None)) {
                         unconfirmed.insert(route.clone());
                     }
+                    if matches!(failure, Ok(Some("expired" | "restarted"))) {
+                        gone.insert(route.clone());
+                    }
                     match failure {
                         Ok(Some(cause)) if takeovers_allowed => {
                             self.take_over(record, cause, &ring, &members, &charges)
@@ -2124,6 +2132,7 @@ impl SupervisorPool {
             match outcome {
                 Ok(Reconciled::Changed(record)) => {
                     unconfirmed.remove(route);
+                    gone.remove(route);
                     recharge(
                         &mut charges,
                         route,
@@ -2135,6 +2144,7 @@ impl SupervisorPool {
                     owners.insert(route.clone(), *record);
                 }
                 Ok(Reconciled::Removed) => {
+                    gone.remove(route);
                     let previous = owners.remove(route);
                     recharge(
                         &mut charges,
@@ -2157,15 +2167,43 @@ impl SupervisorPool {
         self.remove_stale_reports(&owners, &report_rows).await;
         let reports = reports_of_owners(&owners, &report_rows, &unconfirmed);
         let materials = self.load_materials(&owners, &desired).await;
+        let expired = self.expired_routes(&owners, &gone);
         // Only granted terms are served; pending intents stay recorded for
         // the next pass.
         if let Some(view) = self
-            .view(&members, &owners, &desired, materials, reports)
+            .view(&members, &owners, &desired, materials, reports, expired)
             .await
         {
             self.controller.update_pool(view, listed_at);
         }
         Ok(())
+    }
+
+    /// Routes whose owner term's process has been gone longer than the
+    /// runtime's recovery deadline plus [`MEMBER_TTL`], so the runtime has
+    /// ended the workload. A takeover starts a new term and clears this.
+    fn expired_routes(
+        &self,
+        owners: &BTreeMap<String, OwnerRecord>,
+        gone: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let now = tokio::time::Instant::now();
+        let limit = Duration::from_secs(u64::from(self.controller.pool_recovery_timeout_secs()))
+            + MEMBER_TTL;
+        let mut since = lock(&self.owner_gone_since);
+        since.retain(|route, (auth_epoch, _)| {
+            gone.contains(route)
+                && owners
+                    .get(route)
+                    .is_some_and(|record| record.payload.auth_epoch == *auth_epoch)
+        });
+        gone.iter()
+            .filter_map(|route| {
+                let auth_epoch = owners.get(route)?.payload.auth_epoch;
+                let (_, first_seen) = since.entry(route.clone()).or_insert((auth_epoch, now));
+                (now.duration_since(*first_seen) >= limit).then(|| route.clone())
+            })
+            .collect()
     }
 
     /// Remove the owner records of instances that are no longer desired: at
@@ -2698,6 +2736,7 @@ impl SupervisorPool {
         desired: &BTreeMap<String, AssignmentRecord>,
         assignments: BTreeMap<String, SandboxInstanceAssignment>,
         reports: BTreeMap<String, SandboxInstanceStatus>,
+        expired: BTreeSet<String>,
     ) -> Option<PoolView> {
         let served = self
             .controller
@@ -2719,6 +2758,7 @@ impl SupervisorPool {
             desired: desired.keys().cloned().collect(),
             assignments,
             reports,
+            expired,
         };
         let mut current_terms = std::collections::HashSet::new();
         for record in owners.values() {
@@ -4101,6 +4141,47 @@ mod tests {
             pool.reconcile_once().await.unwrap();
             assert_eq!(published_report(&pool, &route), Some((2, true)));
         }
+    }
+
+    /// An instance whose owner's process is gone reads as absent once the
+    /// runtime's recovery deadline has passed without a takeover; a leaving
+    /// owner's instance never does, and a takeover clears the deadline.
+    #[tokio::test]
+    async fn an_instance_whose_owner_is_gone_past_the_recovery_deadline_is_absent() {
+        use openshell_supervisor_control::ObservedInstance;
+        let fixture = Fixture::new().await;
+        fixture.member("m1", "p1", false).await;
+        let route = fixture.fill("m1", "p1", 1).await.remove(0);
+        let pool = fixture.replica("gw-a");
+        pool.reconcile_once().await.unwrap();
+        let limit = Duration::from_secs(u64::from(pool.controller.pool_recovery_timeout_secs()))
+            + MEMBER_TTL;
+        let backdate = || {
+            for (_, first_seen) in lock(&pool.owner_gone_since).values_mut() {
+                *first_seen = first_seen.checked_sub(limit).unwrap();
+            }
+        };
+
+        // A leaving owner still runs its instance.
+        fixture.member("m1", "p1", true).await;
+        pool.reconcile_once().await.unwrap();
+        backdate();
+        pool.reconcile_once().await.unwrap();
+        assert_eq!(pool.controller.observed(&route), ObservedInstance::NoHost);
+
+        // Its process is gone: no verdict until the deadline has passed.
+        fixture.remove_member("m1").await;
+        pool.reconcile_once().await.unwrap();
+        assert_eq!(pool.controller.observed(&route), ObservedInstance::NoHost);
+        backdate();
+        pool.reconcile_once().await.unwrap();
+        assert_eq!(pool.controller.observed(&route), ObservedInstance::Absent);
+
+        // A takeover grants a new term, which is not expired.
+        fixture.member("m2", "p2", false).await;
+        pool.reconcile_once().await.unwrap();
+        assert_eq!(fixture.owner(&route).await.unwrap().member_id, "m2");
+        assert_eq!(pool.controller.observed(&route), ObservedInstance::NoHost);
     }
 
     /// One more instance than a listing page, the live one listed last and

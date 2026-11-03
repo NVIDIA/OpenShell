@@ -114,7 +114,7 @@ pub enum ObservedInstance {
     /// assigned this route.
     Pending,
     /// The host reconciled to that snapshot (or the route is not assigned)
-    /// and does not host the route.
+    /// and does not host the route, or the pool reports the route expired.
     Absent,
     /// The host's latest report of the instance.
     Reported(SandboxInstanceStatus),
@@ -187,6 +187,9 @@ pub struct PoolView {
     /// gateway replica that serves the owner, for judging instances whose
     /// owner streams to another replica.
     pub reports: BTreeMap<String, SandboxInstanceStatus>,
+    /// Routes whose owner's process has been gone past the runtime's
+    /// recovery deadline, so the runtime has ended their workloads.
+    pub expired: BTreeSet<String>,
 }
 
 impl std::fmt::Debug for PoolView {
@@ -198,6 +201,7 @@ impl std::fmt::Debug for PoolView {
             .field("desired", &self.desired)
             .field("assignments", &self.assignments.keys().collect::<Vec<_>>())
             .field("reports", &self.reports.keys().collect::<Vec<_>>())
+            .field("expired", &self.expired)
             .finish()
     }
 }
@@ -757,6 +761,9 @@ impl SupervisorHostController {
         let desired = lock(&self.inner.desired);
         let pool = lock(&self.inner.pool);
         let observed = lock(&self.inner.observed);
+        if pool.view.expired.contains(route) {
+            return ObservedInstance::Absent;
+        }
         let Some(owner) = pool.view.owners.get(route) else {
             return ObservedInstance::NoHost;
         };
@@ -1480,6 +1487,7 @@ mod tests {
                 .collect(),
             owners,
             reports: BTreeMap::new(),
+            expired: BTreeSet::new(),
         }
     }
 
