@@ -149,6 +149,15 @@ mod tests {
                     .expect("continue ordinary file open");
                 continue;
             }
+            if syscall == libc::SYS_prlimit64 {
+                // The spawned child lowers its core limit with `prlimit64(0,
+                // ...)` in its pre-exec hook, which the inherited listener
+                // intercepts.
+                listener
+                    .respond_continue(notification.id)
+                    .expect("continue self limit");
+                continue;
+            }
             #[cfg(target_arch = "x86_64")]
             if syscall == libc::SYS_open {
                 listener

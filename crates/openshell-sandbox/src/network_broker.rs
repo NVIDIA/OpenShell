@@ -719,6 +719,12 @@ fn dispatch_notification(
             &queues.workload_frozen,
         );
     }
+    if crate::linux::process_sched::MEDIATED_PROCESS_SCHED_SYSCALLS
+        .iter()
+        .any(|&(mediated, _)| mediated == syscall)
+    {
+        return crate::linux::process_sched::mediate_process_sched(&listener, notification);
+    }
     if syscall == libc::SYS_socket {
         return create_socket(
             &registry,
@@ -3877,5 +3883,469 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         let _wakeup = TcpStream::connect(address).expect("wake the accept loop");
         relay.join().expect("accept loop thread panicked");
+    }
+
+    /// Linux `struct rlimit64` used by the raw `prlimit64` probes.
+    #[repr(C)]
+    struct Rlimit64 {
+        current: u64,
+        maximum: u64,
+    }
+
+    /// Linux `struct sched_attr` version 0 used by the raw `sched_setattr` probe.
+    #[repr(C)]
+    struct SchedAttr {
+        size: u32,
+        sched_policy: u32,
+        sched_flags: u64,
+        sched_nice: i32,
+        sched_priority: u32,
+        sched_runtime: u64,
+        sched_deadline: u64,
+        sched_period: u64,
+    }
+
+    /// Errno of one failed libc result, or `None` when it succeeded.
+    fn errno(result: libc::c_long) -> Option<i32> {
+        if result == -1 {
+            io::Error::last_os_error().raw_os_error()
+        } else {
+            None
+        }
+    }
+
+    /// Read one task's current nice value, distinguishing `-1` from an error.
+    ///
+    /// `getpriority` returns `-1` for both a valid nice level and a failure, so
+    /// `errno` decides. The caller must not feed an ambiguous failure into
+    /// `setpriority`, where it would surface as a mediation error instead.
+    fn read_priority(which: libc::c_uint, who: libc::id_t) -> Result<libc::c_int, i32> {
+        // SAFETY: `__errno_location` returns this thread's live errno storage
+        // and `getpriority` reads only scalar arguments.
+        unsafe {
+            *libc::__errno_location() = 0;
+            let nice = libc::getpriority(which, who);
+            let error = *libc::__errno_location();
+            if nice == -1 && error != 0 {
+                Err(error)
+            } else {
+                Ok(nice)
+            }
+        }
+    }
+
+    /// Run `operation` on a filtered launcher thread that a live broker serves.
+    ///
+    /// The launcher thread inherits the workload listener, so every mediated
+    /// syscall inside `operation` blocks until the broker answers it.
+    fn mediated<T: Send + 'static>(operation: impl FnOnce() -> T + Send + 'static) -> T {
+        let (launcher, listener) =
+            crate::linux::workload_launcher::start().expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        launcher.execute(operation).expect("launcher result")
+    }
+
+    /// Re-apply the caller's current CPU affinity to `pid`.
+    ///
+    /// Re-applying the current mask always succeeds in the kernel and needs no
+    /// capability, so the result reports only whether mediation let the call
+    /// through.
+    fn affinity_errno(pid: libc::pid_t) -> Option<i32> {
+        // SAFETY: the mask is live storage of the declared size and the call
+        // runs on the launcher thread while the broker answers it.
+        unsafe {
+            let mut mask: libc::cpu_set_t = std::mem::zeroed();
+            let size = size_of::<libc::cpu_set_t>();
+            assert_eq!(
+                libc::sched_getaffinity(0, size, &raw mut mask),
+                0,
+                "sched_getaffinity: {}",
+                io::Error::last_os_error()
+            );
+            errno(libc::c_long::from(libc::sched_setaffinity(
+                pid,
+                size,
+                &raw const mask,
+            )))
+        }
+    }
+
+    /// Every mediated call re-applies the caller's current settings, read back
+    /// first, so the continued syscall changes nothing and needs no capability.
+    #[test]
+    fn scheduling_and_limit_calls_allow_the_callers_thread_group() {
+        let results = mediated(|| {
+            // SAFETY: all buffers passed to the kernel are live for the call
+            // and the launcher thread blocks until the broker answers.
+            unsafe {
+                let tid = libc::pid_t::try_from(libc::syscall(libc::SYS_gettid))
+                    .expect("thread ID fits pid_t");
+                let mut param: libc::sched_param = std::mem::zeroed();
+                assert_eq!(libc::sched_getparam(0, &raw mut param), 0);
+                let policy = libc::sched_getscheduler(0);
+                assert!(policy >= 0, "sched_getscheduler call failed");
+                let mut attr: SchedAttr = std::mem::zeroed();
+                attr.size = u32::try_from(size_of::<SchedAttr>()).expect("attribute size fits u32");
+                assert_eq!(
+                    libc::syscall(
+                        libc::SYS_sched_getattr,
+                        0,
+                        &raw mut attr,
+                        size_of::<SchedAttr>(),
+                        0,
+                    ),
+                    0,
+                    "sched_getattr: {}",
+                    io::Error::last_os_error()
+                );
+                let mut limits = Rlimit64 {
+                    current: 0,
+                    maximum: 0,
+                };
+                assert_eq!(
+                    libc::syscall(
+                        libc::SYS_prlimit64,
+                        0,
+                        libc::c_long::from(libc::RLIMIT_CORE),
+                        std::ptr::null::<Rlimit64>(),
+                        &raw mut limits,
+                    ),
+                    0,
+                    "prlimit64 query: {}",
+                    io::Error::last_os_error()
+                );
+                (
+                    affinity_errno(0),
+                    affinity_errno(tid),
+                    affinity_errno(libc::getpid()),
+                    errno(libc::c_long::from(libc::sched_setparam(
+                        0,
+                        &raw const param,
+                    ))),
+                    errno(libc::c_long::from(libc::sched_setscheduler(
+                        0,
+                        policy,
+                        &raw const param,
+                    ))),
+                    errno(libc::syscall(
+                        libc::SYS_sched_setattr,
+                        0,
+                        &raw const attr,
+                        0,
+                    )),
+                    errno(libc::syscall(
+                        libc::SYS_prlimit64,
+                        0,
+                        libc::c_long::from(libc::RLIMIT_CORE),
+                        &raw const limits,
+                        std::ptr::null::<Rlimit64>(),
+                    )),
+                )
+            }
+        });
+        assert_eq!(results, (None, None, None, None, None, None, None));
+    }
+
+    #[test]
+    fn setpriority_allows_the_callers_group() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (hold_tx, hold_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let sibling = std::thread::spawn(move || {
+            // SAFETY: gettid has no arguments or side effects.
+            ready_tx
+                .send(unsafe { libc::syscall(libc::SYS_gettid) })
+                .expect("report sibling tid");
+            let _ = hold_rx.recv();
+        });
+        let sibling_tid = libc::id_t::try_from(ready_rx.recv().expect("sibling tid"))
+            .expect("sibling tid fits id_t");
+        let results = mediated(move || {
+            // SAFETY: each call names a live task in the caller's thread group
+            // and re-applies that task's current nice value. A failed read
+            // fails the test here rather than masquerading as a filter error.
+            unsafe {
+                let leader_nice = read_priority(libc::PRIO_PROCESS, libc::getpid().cast_unsigned())
+                    .expect("read leader nice value");
+                let sibling_nice = read_priority(libc::PRIO_PROCESS, sibling_tid)
+                    .expect("read sibling nice value");
+                let self_nice = read_priority(libc::PRIO_PROCESS, 0).expect("read self nice value");
+                (
+                    errno(libc::c_long::from(libc::setpriority(
+                        libc::PRIO_PROCESS,
+                        0,
+                        self_nice,
+                    ))),
+                    errno(libc::c_long::from(libc::setpriority(
+                        libc::PRIO_PROCESS,
+                        libc::getpid().cast_unsigned(),
+                        leader_nice,
+                    ))),
+                    errno(libc::c_long::from(libc::setpriority(
+                        libc::PRIO_PROCESS,
+                        sibling_tid,
+                        sibling_nice,
+                    ))),
+                )
+            }
+        });
+        drop(hold_tx);
+        sibling.join().expect("join sibling");
+        assert_eq!(results, (None, None, None));
+    }
+
+    #[test]
+    fn scheduling_and_limit_calls_deny_another_thread_group() {
+        let mut target = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn target");
+        let target_tgid = libc::pid_t::try_from(target.id()).expect("target PID fits pid_t");
+        let (affinity, limits) = mediated(move || {
+            // SAFETY: the target is this test's live disposable child, the
+            // affinity mask is the caller's own, and both limit pointers are
+            // null, so the continued call would only validate the target.
+            unsafe {
+                (
+                    affinity_errno(target_tgid),
+                    errno(libc::syscall(
+                        libc::SYS_prlimit64,
+                        target_tgid,
+                        libc::c_long::from(libc::RLIMIT_CORE),
+                        std::ptr::null::<Rlimit64>(),
+                        std::ptr::null::<Rlimit64>(),
+                    )),
+                )
+            }
+        });
+        let _ = target.kill();
+        let _ = target.wait();
+        assert_eq!(affinity, Some(libc::EPERM));
+        assert_eq!(limits, Some(libc::EPERM));
+    }
+
+    /// The broker resolves every `sched_set*` target against the caller's
+    /// thread group, not only affinity.
+    ///
+    /// Both halves run on one notification stream: the caller's own settings
+    /// are re-applied to `pid 0` and to a disposable child that shares the
+    /// test's real user ID. Each continued call would therefore succeed in the
+    /// kernel, so a syscall missing from the notified set lets the foreign call
+    /// through, and one missing from the dispatch match fails the self call.
+    #[test]
+    fn scheduling_calls_distinguish_own_and_foreign_thread_groups() {
+        let mut target = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn target");
+        let target_tgid = libc::pid_t::try_from(target.id()).expect("target PID fits pid_t");
+        let results = mediated(move || {
+            // SAFETY: the parameter, policy, and attributes are read back from
+            // the launcher thread, and every pointer is live for the call.
+            unsafe {
+                let mut param: libc::sched_param = std::mem::zeroed();
+                assert_eq!(libc::sched_getparam(0, &raw mut param), 0, "sched_getparam");
+                let policy = libc::sched_getscheduler(0);
+                assert!(policy >= 0, "sched_getscheduler");
+                let mut attr: SchedAttr = std::mem::zeroed();
+                attr.size = u32::try_from(size_of::<SchedAttr>()).expect("attribute size fits u32");
+                assert_eq!(
+                    libc::syscall(
+                        libc::SYS_sched_getattr,
+                        0,
+                        &raw mut attr,
+                        size_of::<SchedAttr>(),
+                        0,
+                    ),
+                    0,
+                    "sched_getattr: {}",
+                    io::Error::last_os_error()
+                );
+                (
+                    errno(libc::c_long::from(libc::sched_setparam(
+                        0,
+                        &raw const param,
+                    ))),
+                    errno(libc::c_long::from(libc::sched_setscheduler(
+                        0,
+                        policy,
+                        &raw const param,
+                    ))),
+                    errno(libc::syscall(
+                        libc::SYS_sched_setattr,
+                        0,
+                        &raw const attr,
+                        0,
+                    )),
+                    errno(libc::c_long::from(libc::sched_setparam(
+                        target_tgid,
+                        &raw const param,
+                    ))),
+                    errno(libc::c_long::from(libc::sched_setscheduler(
+                        target_tgid,
+                        policy,
+                        &raw const param,
+                    ))),
+                    errno(libc::syscall(
+                        libc::SYS_sched_setattr,
+                        target_tgid,
+                        &raw const attr,
+                        0,
+                    )),
+                )
+            }
+        });
+        let _ = target.kill();
+        let _ = target.wait();
+        assert_eq!(
+            results,
+            (
+                None,
+                None,
+                None,
+                Some(libc::EPERM),
+                Some(libc::EPERM),
+                Some(libc::EPERM)
+            )
+        );
+    }
+
+    #[test]
+    fn setpriority_denies_other_groups_and_group_selectors() {
+        let mut target = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn target");
+        let target_tgid = libc::id_t::try_from(target.id()).expect("target PID fits id_t");
+        let (process, group, user) = mediated(move || {
+            // SAFETY: scalar arguments only; the broker decides before the
+            // kernel resolves any of the targets.
+            unsafe {
+                (
+                    errno(libc::c_long::from(libc::setpriority(
+                        libc::PRIO_PROCESS,
+                        target_tgid,
+                        0,
+                    ))),
+                    errno(libc::c_long::from(libc::setpriority(libc::PRIO_PGRP, 0, 0))),
+                    errno(libc::c_long::from(libc::setpriority(libc::PRIO_USER, 0, 0))),
+                )
+            }
+        });
+        let _ = target.kill();
+        let _ = target.wait();
+        assert_eq!(process, Some(libc::EPERM));
+        assert_eq!(group, Some(libc::EPERM));
+        assert_eq!(user, Some(libc::EPERM));
+    }
+
+    /// Invalid `setpriority` arguments keep the errno the kernel returns.
+    ///
+    /// An unknown selector is a usage error the kernel rejects with EINVAL, and
+    /// a negative PID names no process, so neither is a policy denial. Both
+    /// calls are decided by the broker before the kernel resolves a target.
+    #[test]
+    fn setpriority_reports_native_errno_for_invalid_arguments() {
+        let results = mediated(|| {
+            // SAFETY: scalar arguments only; the broker decides before any
+            // target is resolved, so no call can be applied to a task.
+            unsafe {
+                (
+                    errno(libc::syscall(
+                        libc::SYS_setpriority,
+                        42,
+                        libc::c_long::from(libc::getpid()),
+                        0,
+                    )),
+                    errno(libc::syscall(
+                        libc::SYS_setpriority,
+                        libc::c_long::from(libc::PRIO_PROCESS),
+                        -1,
+                        0,
+                    )),
+                )
+            }
+        });
+        assert_eq!(results, (Some(libc::EINVAL), Some(libc::ESRCH)));
+    }
+
+    /// A negative target keeps each mediated syscall's native errno.
+    ///
+    /// The `sched_setparam`/`sched_setscheduler`/`sched_setattr` trio rejects a
+    /// negative PID with EINVAL before any process lookup, while affinity,
+    /// priority, and limit calls fail their lookup with ESRCH. Both are usage
+    /// errors the broker must not turn into a policy denial.
+    #[test]
+    fn negative_targets_keep_each_syscalls_native_errno() {
+        let results = mediated(|| {
+            // SAFETY: scalar arguments and live stack buffers only; a negative
+            // target resolves to no task, so nothing is reconfigured.
+            unsafe {
+                let param: libc::sched_param = std::mem::zeroed();
+                let mut attr: SchedAttr = std::mem::zeroed();
+                attr.size = u32::try_from(size_of::<SchedAttr>()).expect("attribute size fits u32");
+                let mask: libc::cpu_set_t = std::mem::zeroed();
+                let mask_size = size_of::<libc::cpu_set_t>();
+                (
+                    errno(libc::c_long::from(libc::sched_setparam(
+                        -1,
+                        &raw const param,
+                    ))),
+                    errno(libc::c_long::from(libc::sched_setscheduler(
+                        -1,
+                        libc::SCHED_OTHER,
+                        &raw const param,
+                    ))),
+                    errno(libc::syscall(
+                        libc::SYS_sched_setattr,
+                        libc::c_long::from(-1),
+                        &raw const attr,
+                        0,
+                    )),
+                    errno(libc::syscall(
+                        libc::SYS_sched_setaffinity,
+                        libc::c_long::from(-1),
+                        mask_size,
+                        &raw const mask,
+                    )),
+                    errno(libc::syscall(
+                        libc::SYS_setpriority,
+                        libc::c_long::from(libc::PRIO_PROCESS),
+                        libc::c_long::from(-1),
+                        0,
+                    )),
+                    errno(libc::syscall(
+                        libc::SYS_prlimit64,
+                        libc::c_long::from(-1),
+                        0,
+                        0,
+                        0,
+                    )),
+                )
+            }
+        });
+        assert_eq!(
+            results,
+            (
+                Some(libc::EINVAL),
+                Some(libc::EINVAL),
+                Some(libc::EINVAL),
+                Some(libc::ESRCH),
+                Some(libc::ESRCH),
+                Some(libc::ESRCH),
+            )
+        );
+    }
+
+    #[test]
+    fn scheduling_calls_report_esrch_for_a_vanished_target() {
+        let mut target = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn target");
+        let target_tgid = libc::pid_t::try_from(target.id()).expect("target PID fits pid_t");
+        target.kill().expect("kill target");
+        target.wait().expect("reap target");
+        let result = mediated(move || affinity_errno(target_tgid));
+        assert_eq!(result, Some(libc::ESRCH));
     }
 }

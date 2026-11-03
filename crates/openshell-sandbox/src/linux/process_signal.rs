@@ -25,6 +25,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::linux::proc_status::thread_group_id;
 use crate::linux::seccomp_notify::{Notification, NotificationListener};
 use crate::linux::task_memory;
 
@@ -190,23 +191,6 @@ fn retain_signal_target(tid: u32, sandbox_tgid: u32) -> io::Result<(OwnedFd, u32
     let fd = i32::try_from(fd).map_err(|_| io::Error::other("pidfd does not fit RawFd"))?;
     // SAFETY: successful pidfd_open transferred this descriptor to the caller.
     Ok((unsafe { OwnedFd::from_raw_fd(fd) }, target_group))
-}
-
-fn thread_group_id(tid: u32) -> io::Result<u32> {
-    let status = std::fs::read_to_string(format!("/proc/{tid}/status")).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            io::Error::from_raw_os_error(libc::ESRCH)
-        } else {
-            error
-        }
-    })?;
-    status
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("Tgid:")
-                .and_then(|value| value.trim().parse::<u32>().ok())
-        })
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::ESRCH))
 }
 
 #[cfg(test)]
