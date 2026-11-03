@@ -231,3 +231,11 @@ These helpers use the raw client's authentication slot. They do not perform OIDC
 - Async-only. Tonic is async-native; callers needing a blocking call can wrap
   with their own runtime.
 - The curated surface will grow as more RPCs graduate from `raw`.
+
+## Next minor API migration
+
+This source-breaking API change targets the next minor release and must not be backported into the `0.1.x` patch series.
+
+Raw `SandboxStatus` adds optional `launch_policy`, exposing the retained generation, policy document and digest under existing policy-read authorization. Provider credential values and environment data are not included. Complete generated Rust status literals must add `launch_policy: None` or use `..Default::default()`.
+
+Legacy wire payloads retain their field identities and decode the new field as absent. Upgrade gateway writers together because older writers can drop retained launch state. A negotiated launch without retained input fails closed. Stop and explicitly start the sandbox to claim a new generation; retries and recovery do not replace an already claimed generation's input. Frozen sandboxes keep their original accepted policy.

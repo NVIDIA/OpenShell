@@ -32,7 +32,7 @@ specific time:
 | `network_policies` | Destinations each binary can reach, and the requests it can send. | Sandbox network proxy. | While the sandbox runs. |
 | `network_middlewares` | Additional inspection, transformation, or blocking of traffic that network rules allow. | Sandbox network proxy. | While the sandbox runs. |
 
-Filesystem, Landlock, and process settings are fixed once the sandbox starts.
+Filesystem, Landlock, and process settings stay fixed while the sandbox runs.
 Network rules and middleware can change while it runs, unless the sandbox was
 created with `--frozen`, as described in [How
 Changes Take

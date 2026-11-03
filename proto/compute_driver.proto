@@ -535,6 +535,11 @@ message StartSandboxRequest {
   // output. Older gateways omit the field, preserving the original start
   // contract on the wire.
   optional DriverSandbox sandbox = 9;
+  // Required when openshell.compute.launch-policy is negotiated. The driver
+  // checks document/hash agreement and the request generation before launch.
+  // Same-generation retries must retain the identical input. Legacy drivers
+  // keep their existing supervisor-delivered startup policy behavior.
+  openshell.sandbox.v1.SandboxLaunchPolicy launch_policy = 10;
 }
 
 message SuspendSandboxRequest {

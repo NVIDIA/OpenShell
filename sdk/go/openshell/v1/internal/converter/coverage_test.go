@@ -137,7 +137,7 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 	// lifecycle bookkeeping remains available through the raw protobuf API.
 	// Image updates are raw-only; their pending reconciliation intent and
 	// monotonic image revision bookkeeping are not part of the curated status model.
-	skipped := fieldSet{"main_process_instance_id": true, "configuration_activated": true, "provisioning": true, "image_update": true, "image_revision": true}
+	skipped := fieldSet{"main_process_instance_id": true, "configuration_activated": true, "provisioning": true, "image_update": true, "image_revision": true, "launch_policy": true}
 
 	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, skipped)
 }

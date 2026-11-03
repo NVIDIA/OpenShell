@@ -127,6 +127,7 @@ pub enum FakeComputeDriverCall {
         /// gateways. Keeping it in the fake makes compatibility and
         /// reconciliation tests able to verify the start contract.
         sandbox: Option<DriverSandbox>,
+        launch_policy: Option<Box<openshell_core::proto::SandboxLaunchPolicy>>,
     },
     DeleteSandbox {
         sandbox_id: String,
@@ -536,6 +537,7 @@ impl ComputeDriver for FakeComputeDriver {
                 launch_authentication: request.launch_authentication,
                 generation_id: request.generation_id,
                 sandbox: request.sandbox,
+                launch_policy: request.launch_policy.map(Box::new),
             });
         });
         Ok(Response::new(StartSandboxResponse::default()))

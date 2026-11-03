@@ -1911,6 +1911,10 @@ async fn handle_start_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<StartSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
+    state
+        .compute
+        .configure_launch_policy_state(state)
+        .map_err(Status::failed_precondition)?;
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let resolved = resolve_and_authorize_sandbox_name(
