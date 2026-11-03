@@ -46,6 +46,11 @@ test-group = "kubernetes-shared-supervisor-pool"
 filter = "test(/^scaling_a_supervisor_pool_up_and_down_keeps_its_sandboxes_running$/)"
 slow-timeout = { period = "60s", terminate-after = 20 }
 
+# Three bounded rollouts (up to 5 minutes each) and four settle and exec rounds.
+[[profile.e2e-kubernetes.overrides]]
+filter = "test(/^pool_sessions_follow_their_supervisors_gateway$/)"
+slow-timeout = { period = "60s", terminate-after = 20 }
+
 # Relative to the profile store dir (`e2e/rust/target/nextest/e2e-kubernetes/`).
 [profile.e2e-kubernetes.junit]
 path = "../../../../../results/e2e-kubernetes.xml"

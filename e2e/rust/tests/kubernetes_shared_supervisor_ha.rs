@@ -478,6 +478,10 @@ async fn assert_tree(step: &str, routes: &[String], gone: &[String]) -> Vec<Bran
     })
     .await;
     assert!(
+        !last.is_empty(),
+        "{step}: no pool records for {routes:?}; TREE may not match the gateway's `objects` schema"
+    );
+    assert!(
         settled.is_ok(),
         "{step}: sessions did not settle on their supervisor's gateway within {SETTLE_DEADLINE:?}: {last:#?}"
     );
@@ -488,6 +492,7 @@ async fn assert_tree(step: &str, routes: &[String], gone: &[String]) -> Vec<Bran
 /// new port-forward outlives the test, so later tests keep the CLI's address.
 struct GatewayForward {
     port: u16,
+    child: Option<tokio::process::Child>,
 }
 
 impl GatewayForward {
@@ -505,7 +510,7 @@ impl GatewayForward {
             .as_u64()
             .and_then(|port| u16::try_from(port).ok())
             .expect("gateway_port");
-        Self { port }
+        Self { port, child: None }
     }
 
     async fn reachable(&self) -> bool {
@@ -514,34 +519,48 @@ impl GatewayForward {
             .is_ok()
     }
 
-    async fn ensure(&self) {
-        if self.reachable().await {
-            return;
-        }
-        kubectl_command()
-            .args([
-                "-n",
-                &release_namespace(),
-                "port-forward",
-                &format!("svc/{}", release()),
-                &format!("{}:8080", self.port),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(false)
-            .spawn()
-            .expect("spawn kubectl port-forward");
-        let opened = tokio::time::timeout(Duration::from_secs(30), async {
-            while !self.reachable().await {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+    /// Returns once the port answers through a live port-forward: the
+    /// harness's, or one this started that has not exited, for example after
+    /// losing the port to a dying predecessor.
+    async fn ensure(&mut self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
+        loop {
+            let ours_alive = self
+                .child
+                .as_mut()
+                .map(|child| matches!(child.try_wait(), Ok(None)));
+            match (ours_alive, self.reachable().await) {
+                (None | Some(true), true) => return,
+                (Some(true), false) => {}
+                _ => {
+                    self.child = Some(
+                        kubectl_command()
+                            .args([
+                                "-n",
+                                &release_namespace(),
+                                "port-forward",
+                                &format!("svc/{}", release()),
+                                &format!("{}:8080", self.port),
+                            ])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .kill_on_drop(false)
+                            .spawn()
+                            .expect("spawn kubectl port-forward"),
+                    );
+                }
             }
-        })
-        .await;
-        assert!(opened.is_ok(), "port-forward on {} never opened", self.port);
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no live port-forward on {}",
+                self.port
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 }
 
-async fn assert_exec(step: &str, forward: &GatewayForward, sandboxes: &[SandboxGuard]) {
+async fn assert_exec(step: &str, forward: &mut GatewayForward, sandboxes: &[SandboxGuard]) {
     for sandbox in sandboxes {
         let mut last = String::new();
         let reached = tokio::time::timeout(SETTLE_DEADLINE, async {
@@ -638,7 +657,7 @@ async fn pool_sessions_follow_their_supervisors_gateway() {
     );
     wait_until_attached(&supervisor_pods().await).await;
 
-    let forward = GatewayForward::new();
+    let mut forward = GatewayForward::new();
     forward.ensure().await;
     let mut sandboxes = Vec::new();
     for _ in 0..SANDBOXES {
@@ -653,25 +672,25 @@ async fn pool_sessions_follow_their_supervisors_gateway() {
         routes.push(generation(&sandbox.name).await.route);
     }
     let branches = assert_tree("start", &routes, &[]).await;
-    assert_exec("start", &forward, &sandboxes).await;
+    assert_exec("start", &mut forward, &sandboxes).await;
 
     let crashed = vec![branches[0].supervisor_gateway.clone()];
     force_delete(&crashed[0]).await;
     rollout("status", &gateway).await;
     assert_tree("gateway crash", &routes, &crashed).await;
-    assert_exec("gateway crash", &forward, &sandboxes).await;
+    assert_exec("gateway crash", &mut forward, &sandboxes).await;
 
     let restarted = gateway_pods().await;
     kubectl(&["-n", &release_namespace(), "rollout", "restart", &gateway]).await;
     rollout("status", &gateway).await;
     let branches = assert_tree("gateway rolling restart", &routes, &restarted).await;
-    assert_exec("gateway rolling restart", &forward, &sandboxes).await;
+    assert_exec("gateway rolling restart", &mut forward, &sandboxes).await;
 
     let crashed = vec![branches[0].member.clone()];
     force_delete(&crashed[0]).await;
     rollout("status", &supervisor).await;
     assert_tree("supervisor crash", &routes, &crashed).await;
-    assert_exec("supervisor crash", &forward, &sandboxes).await;
+    assert_exec("supervisor crash", &mut forward, &sandboxes).await;
 
     forward.ensure().await;
     drop(sandboxes);
