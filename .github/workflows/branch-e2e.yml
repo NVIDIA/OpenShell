@@ -4,7 +4,12 @@ on:
   push:
     branches:
       - "pull-request/[0-9]+"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      run-gpu-e2e:
+        description: Run GPU E2E checks for this manual run
+        type: boolean
+        default: true
 
 permissions: {}
 
@@ -38,6 +43,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           LABELS_JSON: ${{ steps.gate.outputs.labels_json }}
+          MANUAL_RUN_GPU_E2E: ${{ inputs['run-gpu-e2e'] }}
         shell: bash
         run: |
           set -euo pipefail
@@ -50,7 +56,7 @@ jobs:
               ;;
             *)
               run_core_e2e=true
-              run_gpu_e2e=true
+              run_gpu_e2e="${MANUAL_RUN_GPU_E2E:-true}"
               run_kubernetes_ha_e2e=false
               run_kubernetes_credential_drivers_e2e=false
               ;;
