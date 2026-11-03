@@ -40,15 +40,18 @@ async fn long_running_exec_delete(cx: &mut Context) -> testkit::Result {
 Cleanup runs after every test, whether it passes, fails, or panics. It
 deletes the sandboxes created through `cx.sandbox(...)` or tracked with
 `cx.track(name)`, and runs the hooks registered with `cx.on_cleanup`. Register
-a hook right after creating anything else, such as a provider:
+a hook for anything else a test creates, such as a provider. Register it before
+the create when the delete succeeds for a missing resource, so it also covers a
+create the gateway applied but the CLI reported as failed:
 
 ```rust
-cx.cli(["provider", "create", "--name", &provider /* ... */]).await?.success()?;
 let cli = cx.cli_handle();
+let name = provider.clone();
 cx.on_cleanup(format!("delete provider {provider}"), async move || {
-    cli.run(["provider", "delete", &provider]).await?.success()?;
+    cli.run(["provider", "delete", &name]).await?.success()?;
     Ok(())
 });
+cx.cli(["provider", "create", "--name", &provider /* ... */]).await?.success()?;
 ```
 
 Hooks and sandbox deletes run one at a time, last registered first, each

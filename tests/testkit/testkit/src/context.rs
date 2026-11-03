@@ -137,16 +137,21 @@ impl Context {
     /// is reported and the remaining hooks still run; it fails a test whose
     /// body passed.
     ///
+    /// `provider delete` succeeds for a missing provider, so this registers
+    /// the hook before the create. It then also covers a create the gateway
+    /// applied but the CLI reported as failed.
+    ///
     /// ```ignore
     /// let cli = cx.cli_handle();
     /// let provider = cx.name("provider");
+    /// let name = provider.clone();
+    /// cx.on_cleanup(format!("delete provider {provider}"), async move || {
+    ///     cli.run(["provider", "delete", &name]).await?.success()?;
+    ///     Ok(())
+    /// });
     /// cx.cli(["provider", "create", "--name", &provider /* ... */])
     ///     .await?
     ///     .success()?;
-    /// cx.on_cleanup(format!("delete provider {provider}"), async move || {
-    ///     cli.run(["provider", "delete", &provider]).await?.success()?;
-    ///     Ok(())
-    /// });
     /// ```
     pub fn on_cleanup<F, Fut>(&self, name: impl Into<String>, hook: F)
     where

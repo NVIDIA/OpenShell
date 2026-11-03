@@ -27,10 +27,14 @@ async fn revoked_refresh_grant_requires_user_reauthorization(cx: &mut Context) -
     let profile = write_profile(&profile_id, kc.keycloak())?;
     let profile_path = profile.path().to_string_lossy().into_owned();
 
+    // Register each delete before its create, so cleanup also covers a create
+    // the gateway applied but the CLI reported as failed. Both deletes succeed
+    // when there is nothing to delete.
+    delete_on_cleanup(&kc, "profile", &profile_id);
     kc.cli(["profile", "import", "--file", &profile_path])
         .await?
         .success()?;
-    delete_on_cleanup(&kc, "profile", &profile_id);
+    delete_on_cleanup(&kc, "provider", &provider);
     kc.cli_with_env(
         &[(CREDENTIAL_KEY, &grant.access_token)],
         [
@@ -46,7 +50,6 @@ async fn revoked_refresh_grant_requires_user_reauthorization(cx: &mut Context) -
     )
     .await?
     .success()?;
-    delete_on_cleanup(&kc, "provider", &provider);
     let client_id = format!("client_id={}", kc.keycloak().client_id());
     kc.cli_with_env(
         &[("KEYCLOAK_REFRESH_TOKEN", &grant.refresh_token)],
