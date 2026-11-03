@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::AtomicI32;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -22,6 +22,7 @@ static MANAGED_CHILDREN: LazyLock<Mutex<HashMap<i32, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static REAPER_EVENT_FD: AtomicI32 = AtomicI32::new(-1);
+static PROC_CHILDREN_SUPPORT_REPORTED: AtomicBool = AtomicBool::new(false);
 const REAPER_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(test)]
 static REAPER_SCAN_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -74,6 +75,14 @@ impl RegistryGuard {
     pub fn contains(&self, pid: i32) -> bool {
         self.0.contains_key(&pid)
     }
+
+    /// Remove exactly this supervised-child registration. A newer
+    /// registration for a reused PID is preserved.
+    pub fn unregister(&mut self, child: ManagedChild) {
+        if self.0.get(&child.pid) == Some(&child.generation) {
+            self.0.remove(&child.pid);
+        }
+    }
 }
 
 /// Lock the registry for an atomic spawn-and-register or inspect-and-reap
@@ -94,11 +103,7 @@ pub fn register(pid: u32) -> Option<ManagedChild> {
 /// Remove exactly this supervised-child registration. A newer registration
 /// for a reused PID is preserved.
 pub fn unregister(child: ManagedChild) {
-    if let Ok(mut children) = MANAGED_CHILDREN.lock()
-        && children.get(&child.pid) == Some(&child.generation)
-    {
-        children.remove(&child.pid);
-    }
+    lock().unregister(child);
 }
 
 /// Return `true` if `pid` is currently in the supervised-child set.
@@ -227,23 +232,113 @@ fn reap_unmanaged_children_once() -> io::Result<usize> {
 }
 
 fn direct_child_pids() -> io::Result<HashSet<i32>> {
+    scan_task_children(
+        std::path::Path::new("/proc/self/task"),
+        &PROC_CHILDREN_SUPPORT_REPORTED,
+    )
+}
+
+/// Collect the child PIDs listed by every task directory below `task_root`.
+///
+/// Missing children support is reported through `reported` (see
+/// [`report_missing_support_once`]).
+fn scan_task_children(
+    task_root: &std::path::Path,
+    reported: &AtomicBool,
+) -> io::Result<HashSet<i32>> {
     let mut children = HashSet::new();
-    for task in std::fs::read_dir("/proc/self/task")? {
+    let mut saw_children_file = false;
+    let mut saw_task_without_children = false;
+    for task in std::fs::read_dir(task_root)? {
         let task = task?;
-        let path = task.path().join("children");
-        let contents = match std::fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        children.extend(
+        match read_task_children(&task.path())? {
+            TaskChildren::Pids(pids) => {
+                saw_children_file = true;
+                children.extend(pids);
+            }
+            TaskChildren::VanishedTask => {}
+            TaskChildren::UnsupportedKernel => saw_task_without_children = true,
+        }
+    }
+    // Corroborate before reporting: an environment without children-file
+    // support exposes no children file for any task, while a teardown or
+    // TID-reuse race on a supported kernel strands at most one task
+    // directory without its file while the rest still list theirs.
+    if saw_task_without_children && !saw_children_file {
+        report_missing_support_once(reported);
+    }
+    Ok(children)
+}
+
+/// The `children` entries of one task directory.
+#[derive(Debug, PartialEq, Eq)]
+enum TaskChildren {
+    /// Positive child PIDs listed by the kernel.
+    Pids(Vec<i32>),
+    /// The task exited while the directory listing was being walked.
+    VanishedTask,
+    /// No `children` file is exposed for a task directory that still exists,
+    /// so children cannot be discovered from procfs.
+    UnsupportedKernel,
+}
+
+fn read_task_children(task_dir: &std::path::Path) -> io::Result<TaskChildren> {
+    match std::fs::read_to_string(task_dir.join("children")) {
+        Ok(contents) => Ok(TaskChildren::Pids(
             contents
                 .split_ascii_whitespace()
                 .filter_map(|value| value.parse::<i32>().ok())
-                .filter(|pid| *pid > 0),
-        );
+                .filter(|pid| *pid > 0)
+                .collect(),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if task_dir.try_exists()? {
+                Ok(TaskChildren::UnsupportedKernel)
+            } else {
+                Ok(TaskChildren::VanishedTask)
+            }
+        }
+        Err(error) => Err(error),
     }
-    Ok(children)
+}
+
+/// Emit the missing-support warning and detection finding the first time
+/// `reported` flips from false to true, and do nothing afterwards.
+fn report_missing_support_once(reported: &AtomicBool) {
+    if reported
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    tracing::warn!(
+        "no /proc/self/task/*/children: the orphan reaper cannot discover \
+         children (kernel built without CONFIG_PROC_CHILDREN, or restricted \
+         procfs such as gVisor or a subset=pid mount)"
+    );
+    openshell_ocsf::ocsf_emit!(
+        openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(openshell_ocsf::ActivityId::Open)
+            .severity(openshell_ocsf::SeverityId::Medium)
+            .confidence(openshell_ocsf::ConfidenceId::High)
+            .is_alert(true)
+            .finding_info(
+                openshell_ocsf::FindingInfo::new(
+                    "proc-children-unavailable",
+                    "Sandbox Orphan Reaper Unavailable",
+                )
+                .with_desc(
+                    "No task under /proc/self/task exposes a children file, so \
+                     the sandbox orphan reaper cannot discover unmanaged \
+                     children, and exited descendants accumulate as zombies \
+                     until the process limit. The likely causes are a kernel \
+                     built without CONFIG_PROC_CHILDREN or restricted procfs \
+                     (for example gVisor or a subset=pid mount).",
+                )
+            )
+            .message("orphan reaper unavailable: no /proc/self/task/*/children")
+            .build()
+    );
 }
 
 #[cfg(test)]
@@ -251,9 +346,34 @@ mod tests {
     use super::*;
     use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
     use nix::unistd::Pid;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+    use std::sync::Arc;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// Sink for the plain `tracing` events emitted alongside OCSF events.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
+        }
+    }
 
     fn fork_exiting_child() -> i32 {
         // SAFETY: the child does not run Rust code after fork; it exits through
@@ -441,6 +561,53 @@ mod tests {
     }
 
     #[test]
+    fn unregister_recovers_from_a_poisoned_registry() {
+        let pid = 1_000_003_u32;
+        let child = lock().register(pid).expect("register child");
+
+        // Poison the registry mutex exactly as a panicking holder would. The
+        // deliberate panic prints through the default hook; swapping the
+        // process-global hook here would swallow the diagnostics of a
+        // sibling test that fails at the same moment.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _registry = lock();
+            panic!("poison the managed-children registry");
+        }));
+
+        unregister(child);
+        assert!(!is_managed(i32::try_from(pid).expect("test pid")));
+    }
+
+    #[test]
+    fn task_children_classification_distinguishes_missing_support() {
+        let dir = tempfile::tempdir().expect("create procfs stand-in");
+
+        // A task directory without a children file: the kernel was built
+        // without CONFIG_PROC_CHILDREN.
+        let unsupported = dir.path().join("1234");
+        std::fs::create_dir_all(&unsupported).expect("create task directory");
+        assert_eq!(
+            read_task_children(&unsupported).expect("read unsupported task"),
+            TaskChildren::UnsupportedKernel
+        );
+
+        // A live task directory with parseable and unparseable entries.
+        std::fs::write(unsupported.join("children"), "123 456 0 -7 not-a-pid\n")
+            .expect("write children file");
+        assert_eq!(
+            read_task_children(&unsupported).expect("read children"),
+            TaskChildren::Pids(vec![123, 456])
+        );
+
+        // A task directory that vanished mid-scan.
+        let vanished = dir.path().join("5678");
+        assert_eq!(
+            read_task_children(&vanished).expect("read vanished task"),
+            TaskChildren::VanishedTask
+        );
+    }
+
+    #[test]
     fn child_pid_parser_observes_a_live_child() {
         let mut child = Command::new("sleep")
             .arg("30")
@@ -453,5 +620,137 @@ mod tests {
         );
         child.kill().expect("kill child");
         child.wait().expect("wait for child");
+    }
+
+    #[test]
+    fn missing_proc_children_support_is_reported_once() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(capture.clone()).with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(move || writer.clone())
+                    .with_ansi(false),
+            ),
+        );
+
+        // A private latch: the process-wide one is shared with every other
+        // test that scans the real /proc/self/task, so asserting on it would
+        // depend on parallel test ordering.
+        let reported = AtomicBool::new(false);
+        report_missing_support_once(&reported);
+        report_missing_support_once(&reported);
+
+        let events = capture.json_events();
+        assert_eq!(
+            events.len(),
+            1,
+            "the kernel condition must be reported exactly once: {events:?}"
+        );
+        let event = &events[0];
+        assert_eq!(event["class_uid"], 2004);
+        assert_eq!(event["activity_id"], 1);
+        assert_eq!(event["severity_id"], 3);
+        assert_eq!(event["severity"], "Medium");
+        assert_eq!(event["confidence_id"], 3);
+        assert_eq!(event["confidence"], "High");
+        assert_eq!(event["is_alert"].as_bool(), Some(true));
+        assert_eq!(event["finding_info"]["uid"], "proc-children-unavailable");
+        assert_eq!(
+            event["finding_info"]["title"],
+            "Sandbox Orphan Reaper Unavailable"
+        );
+        assert!(
+            event["finding_info"]["desc"]
+                .as_str()
+                .is_some_and(|desc| desc.contains("CONFIG_PROC_CHILDREN")),
+            "finding description: {event:?}"
+        );
+        assert!(
+            event["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("/proc/self/task/*/children")),
+            "finding message: {event:?}"
+        );
+
+        let warnings = logs.text().matches("CONFIG_PROC_CHILDREN").count();
+        assert_eq!(
+            warnings,
+            1,
+            "the warning must also be emitted once: {}",
+            logs.text()
+        );
+    }
+
+    #[test]
+    fn scan_reports_missing_support_only_when_no_task_lists_children() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(capture.clone()).with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(move || writer.clone())
+                    .with_ansi(false),
+            ),
+        );
+
+        let dir = tempfile::tempdir().expect("create procfs stand-in");
+
+        // A task tree where no task exposes a children file: the whole
+        // environment lacks children-file support, so the scan reports it.
+        for tid in ["1234", "5678"] {
+            std::fs::create_dir(dir.path().join(tid)).expect("create task directory");
+        }
+        let reported = AtomicBool::new(false);
+        let pids = scan_task_children(dir.path(), &reported).expect("scan unsupported tree");
+        assert!(pids.is_empty(), "no children can be listed: {pids:?}");
+        assert_eq!(
+            capture.json_events().len(),
+            1,
+            "a fully unsupported task tree must be reported"
+        );
+
+        // A tree where some task still lists its children is a supported
+        // environment that lost a task mid-scan: no report.
+        std::fs::write(dir.path().join("1234").join("children"), "42\n")
+            .expect("write children file");
+        let reported = AtomicBool::new(false);
+        let pids = scan_task_children(dir.path(), &reported).expect("scan mixed tree");
+        assert_eq!(pids, HashSet::from([42]));
+        assert_eq!(
+            capture.json_events().len(),
+            1,
+            "a mixed task tree must not be reported as unsupported"
+        );
+
+        let warnings = logs.text().matches("/proc/self/task/*/children").count();
+        assert_eq!(warnings, 1, "exactly one warning: {}", logs.text());
+    }
+
+    #[test]
+    fn unreadable_task_directory_surfaces_its_error() {
+        // Root bypasses directory permissions, so the read cannot be made to
+        // fail.
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("create procfs stand-in");
+        let task = dir.path().join("9012");
+        std::fs::create_dir(&task).expect("create task directory");
+        std::fs::set_permissions(&task, std::fs::Permissions::from_mode(0o000))
+            .expect("make task directory unreadable");
+
+        let outcome = read_task_children(&task);
+        // Restore search permission first so the stand-in directory can be
+        // removed even when the assertions below fail.
+        std::fs::set_permissions(&task, std::fs::Permissions::from_mode(0o700))
+            .expect("restore task directory permissions");
+
+        let error = outcome
+            .expect_err("an unreadable task directory must surface its error, not classify it");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 }
