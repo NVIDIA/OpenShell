@@ -420,7 +420,9 @@ Suites:
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
 - Conformance (`tests/suites/conformance`) - the testkit `conformance` crate:
   lifecycle, the CLI, persistent workspaces, file transfer, and the policy
-  advisor. Driver E2E runs it with nextest against the lane's gateway. The
+  advisor. Driver E2E runs it with `openshell-conformance` against the lane's
+  gateway and writes a JUnit report under `results/`; set
+  `OPENSHELL_CONFORMANCE_BIN` to use a prebuilt program. The
   installed-artifact conformance lanes run the same crate through
   `openshell-test-runner` (see above).
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
