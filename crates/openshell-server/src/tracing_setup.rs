@@ -71,19 +71,15 @@ pub fn install(
 ) -> (TracingHandle, Option<SetupError>) {
     let driver_otlp = driver.is_some().then_some(otlp).flatten();
     let driver_endpoint = driver_otlp.and_then(OtlpExport::traces_endpoint);
-    let driver_protocol = driver_otlp.map_or(openshell_otel::Protocol::Grpc, |otlp| {
-        otlp.traces_protocol().into()
-    });
-    let driver_headers = driver_otlp
-        .map(OtlpExport::traces_headers)
+    let driver_transport = driver_otlp
+        .map(OtlpExport::traces_transport)
         .unwrap_or_default();
     let (driver_tracer_provider, driver_setup_error) = driver.map_or_else(
         || (None, None),
         |descriptor| {
             descriptor.provider_for(
                 driver_endpoint,
-                driver_protocol,
-                &driver_headers,
+                &driver_transport,
                 openshell_core::VERSION,
                 gateway.name(),
                 gateway.compute_driver(),
