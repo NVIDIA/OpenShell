@@ -117,6 +117,7 @@ struct Observed {
     deny_confirmation: AtomicBool,
     require_networking: AtomicBool,
     active: AtomicBool,
+    attach_error: Mutex<Option<BackendError>>,
     starts: AtomicUsize,
     releases: AtomicUsize,
     suspendable: AtomicBool,
@@ -308,6 +309,10 @@ impl PreparedBackend for TestLaunch {
                 Ok(match request {
                     Request::Attach { .. } => {
                         observed.record("attach");
+                        let attach_error = observed.attach_error.lock().unwrap().take();
+                        if let Some(error) = attach_error {
+                            return Err(error);
+                        }
                         if observed.active.swap(true, Ordering::SeqCst) {
                             return Err(BackendError::Denied("already attached".into()));
                         }
@@ -581,6 +586,46 @@ async fn attachment_receives_live_supervisor_services() {
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
     assert!(setup.observed.services.lock().unwrap().upgrade().is_none());
+}
+
+#[tokio::test]
+async fn attach_refusal_is_marked_as_a_refusal() {
+    let setup = TestSetup::new();
+    setup.observed.active.store(true, Ordering::SeqCst);
+    let error = setup
+        .select()
+        .attach(setup.services(), policy(), agent())
+        .await
+        .err()
+        .expect("an already attached boundary refuses attachment");
+    assert_eq!(
+        error.code().map(|code| code.to_string()).as_deref(),
+        Some(ATTACH_REFUSED)
+    );
+    assert!(error.to_string().contains("already attached"));
+}
+
+#[tokio::test]
+async fn attach_transport_failures_are_not_policy_refusals() {
+    for failure in [
+        BackendError::Attach("mediation transport failed".into()),
+        BackendError::Unavailable("backend unavailable".into()),
+    ] {
+        let setup = TestSetup::new();
+        *setup.observed.attach_error.lock().unwrap() = Some(failure);
+        let error = setup
+            .select()
+            .attach(setup.services(), policy(), agent())
+            .await
+            .err()
+            .expect("backend transport failure must fail startup");
+        assert_ne!(
+            error.code().map(|code| code.to_string()).as_deref(),
+            Some(ATTACH_REFUSED),
+            "infrastructure failures must not be reported as policy denials"
+        );
+        assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test]

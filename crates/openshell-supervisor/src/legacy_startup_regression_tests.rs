@@ -15,11 +15,18 @@ use std::sync::atomic::Ordering;
 use tonic::codegen::tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tonic::codegen::{Body, BoxFuture, BoxStream, Bytes, Service, StdError, http};
 
+#[derive(Clone)]
+struct PolicySyncCase {
+    write: UpdateConfigResponse,
+    snapshot: GetSandboxConfigResponse,
+}
+
 #[derive(Clone, Default)]
 struct LegacyReadyProbe {
     ready_event: Arc<tokio::sync::Notify>,
     premature_ready: Arc<AtomicBool>,
     discovered: Arc<AtomicBool>,
+    policy_sync: Arc<std::sync::Mutex<Option<PolicySyncCase>>>,
 }
 
 #[derive(Clone)]
@@ -132,10 +139,15 @@ where
                     .await
                 }
                 "/openshell.v1.OpenShell/GetSandboxConfig" => {
-                    let mut policy = openshell_policy::restrictive_default_policy();
-                    enrich_proto_baseline_paths(&mut policy);
-                    legacy_unary::<B, GetSandboxConfigRequest, _>(
-                        request,
+                    let scripted = probe
+                        .policy_sync
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|case| case.snapshot.clone());
+                    let snapshot = scripted.unwrap_or_else(|| {
+                        let mut policy = openshell_policy::restrictive_default_policy();
+                        enrich_proto_baseline_paths(&mut policy);
                         GetSandboxConfigResponse {
                             policy: Some(policy),
                             version: 1,
@@ -147,9 +159,9 @@ where
                             policy_source: openshell_core::proto::PolicySource::Sandbox.into(),
                             policy_validation_failure_mode: "fail_closed".into(),
                             ..Default::default()
-                        },
-                    )
-                    .await
+                        }
+                    });
+                    legacy_unary::<B, GetSandboxConfigRequest, _>(request, snapshot).await
                 }
                 "/openshell.v1.OpenShell/GetSandboxProviderEnvironment" => {
                     legacy_unary::<B, GetSandboxProviderEnvironmentRequest, _>(
@@ -173,15 +185,15 @@ where
                     .await
                 }
                 "/openshell.v1.OpenShell/UpdateConfig" => {
-                    legacy_unary::<B, UpdateConfigRequest, _>(
-                        request,
-                        UpdateConfigResponse {
+                    let response = probe.policy_sync.lock().unwrap().as_ref().map_or_else(
+                        || UpdateConfigResponse {
                             version: 1,
                             policy_hash: "legacy-policy".into(),
                             ..Default::default()
                         },
-                    )
-                    .await
+                        |case| case.write.clone(),
+                    );
+                    legacy_unary::<B, UpdateConfigRequest, _>(request, response).await
                 }
                 _ => http::Response::builder()
                     .status(200)
@@ -343,4 +355,49 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         .expect("startup reaches the deliberately held backend")
         .unwrap_err();
     assert!(error.to_string().contains("test boundary remains held"));
+}
+
+#[tokio::test]
+async fn policy_sync_preserves_write_receipt_separately_from_refetched_policy() {
+    for (created, snapshot_version) in [(true, 2), (true, 3), (false, 2)] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let probe = LegacyReadyProbe::default();
+        *probe.policy_sync.lock().unwrap() = Some(PolicySyncCase {
+            write: UpdateConfigResponse {
+                version: 2,
+                created_policy_revision: created,
+                ..Default::default()
+            },
+            snapshot: GetSandboxConfigResponse {
+                version: snapshot_version,
+                policy_source: openshell_core::proto::PolicySource::Sandbox.into(),
+                policy_validation_failure_mode: "fail_closed".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            },
+        });
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(LegacyGateway { probe })
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let gateway = openshell_core::grpc_client::GatewayEndpoint::new(
+            endpoint,
+            openshell_core::grpc_client::GatewayCredentials::from_gateway_token("test-token")
+                .unwrap(),
+        );
+        let synced = openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
+            &gateway,
+            "sandbox",
+            &openshell_policy::restrictive_default_policy(),
+            "default",
+        )
+        .await
+        .expect("sync the policy through the production RPC helper");
+        assert_eq!(synced.snapshot.version, snapshot_version);
+        assert_eq!(synced.created_policy_version, created.then_some(2));
+        server.abort();
+        let _ = server.await;
+    }
 }

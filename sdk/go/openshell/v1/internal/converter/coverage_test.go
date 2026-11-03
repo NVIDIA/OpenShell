@@ -462,3 +462,8 @@ func assertAllFieldsCovered(
 		}
 	}
 }
+
+func TestConverterCoversAllProtoFields_UpdateConfigResponse(t *testing.T) {
+	handled := fieldSet{"version": true, "policy_hash": true, "settings_revision": true, "deleted": true, "annotations": true, "created_policy_revision": true}
+	assertAllFieldsCovered(t, (&pb.UpdateConfigResponse{}).ProtoReflect().Descriptor(), handled, nil)
+}
