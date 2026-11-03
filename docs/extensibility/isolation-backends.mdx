@@ -34,14 +34,14 @@ The supervisor's concrete RPC client, `OpenShellRuntimeBackend`, lives in
 The admission sequence is Attach, Confirm, then StartAgent. No workload code
 runs before StartAgent.
 
-A backend refuses a policy it cannot enforce by returning `Denied` from Attach.
-The sandbox then reports `ConfigurationReady: False (ConfigurationInvalid)`.
-Transport and backend availability failures remain infrastructure failures. The
-backend's reason is in the supervisor log. `openshell policy list` also shows it
-when the gateway acknowledged that this supervisor created the refused startup
-revision. A deduplicated write or a newer operator revision does not establish
-that ownership. Delete the sandbox and create it again with a policy the backend
-accepts.
+A backend failure during client construction, Attach, or Confirm reports
+`ConfigurationReady: False (ConfigurationInvalid)` before workload execution.
+Sandbox status identifies the failed stage and gives a bounded recovery hint.
+The supervisor log retains detailed backend diagnostics. A policy revision the
+gateway acknowledged this startup created, and which the backend refused, shows
+the safe reason in `openshell policy list`. Deduplicated writes and newer
+operator revisions do not establish startup ownership. Follow the recovery hint
+and wait for cleanup before retrying or recreating the sandbox.
 
 External compute drivers advertise `openshell.compute.isolation-backend` to
 accept an operator-selected `IsolationBackendRegistration`, including its Unix,
