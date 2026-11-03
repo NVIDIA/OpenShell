@@ -878,6 +878,7 @@ impl BoundaryRuntime {
             ProcessKindWire::Main,
             program,
             args,
+            None,
             spec.workdir.clone(),
             environment,
         )
@@ -901,10 +902,10 @@ impl BoundaryRuntime {
     }
 
     async fn start_exec(&self, envelope: &RequestEnvelope, spec: ExecSpecWire) -> Response {
-        if spec.shell.is_some() || spec.runtime_helper.is_some() {
+        if spec.runtime_helper.is_some() {
             return guest_error(
                 BoundaryErrorKind::Invalid,
-                "MXC does not support shell exec intent or runtime helpers",
+                "MXC does not support runtime helpers",
             );
         }
         if spec.pty {
@@ -913,6 +914,8 @@ impl BoundaryRuntime {
                 "Windows ConPTY is not enabled for MXC exec",
             );
         }
+        let shell_request = spec.shell.is_some();
+        let launch = windows_launch(spec);
         {
             let mut requests = lock(&self.exec_requests);
             if !requests.insert(envelope.request_id.clone()) {
@@ -930,20 +933,37 @@ impl BoundaryRuntime {
         let environment = workload_environment(
             &self.config.child_env,
             &lock(&self.provider_environment).1,
-            &spec.env,
+            &launch.env,
             &self.proxy_url,
             lock(&self.ca_paths).as_ref(),
         );
-        let process = match ManagedProcess::spawn(
+        let retry = shell_request.then(|| cmd_retry(&launch)).flatten();
+        let spawned = ManagedProcess::spawn(
             id.clone(),
             ProcessKindWire::Exec,
-            spec.program,
-            spec.args,
-            spec.workdir,
-            environment,
+            launch.program,
+            launch.args,
+            launch.raw_command_tail,
+            launch.workdir,
+            environment.clone(),
         )
-        .await
-        {
+        .await;
+        let spawned = match (spawned, retry) {
+            (Err(_), Some(retry)) => {
+                ManagedProcess::spawn(
+                    id.clone(),
+                    ProcessKindWire::Exec,
+                    retry.program,
+                    retry.args,
+                    retry.raw_command_tail,
+                    retry.workdir,
+                    environment,
+                )
+                .await
+            }
+            (spawned, _) => spawned,
+        };
+        let process = match spawned {
             Ok(process) => Arc::new(process),
             Err(error) => return guest_error(BoundaryErrorKind::Process, error),
         };
@@ -1182,6 +1202,123 @@ fn install_ca_environment(
     }
 }
 
+/// The concrete Windows process an exec request resolves to.
+#[derive(Debug, PartialEq, Eq)]
+struct WindowsLaunch {
+    program: String,
+    args: Vec<String>,
+    raw_command_tail: Option<String>,
+    workdir: Option<String>,
+    env: Vec<(String, String)>,
+}
+
+/// Map an exec request onto a Windows process.
+///
+/// Shell intent carries one POSIX command string. When it is the plain form
+/// the gateway builds from an argv, the program runs directly with the original
+/// arguments, environment, and working directory. Any other shell syntax runs
+/// through `cmd.exe /d /s /c`, and a shell with no command starts `cmd.exe`
+/// reading stdin. The login-shell flag has no Windows equivalent.
+fn windows_launch(spec: ExecSpecWire) -> WindowsLaunch {
+    let ExecSpecWire {
+        program,
+        args,
+        shell,
+        env,
+        workdir,
+        ..
+    } = spec;
+    let Some(shell) = shell else {
+        return WindowsLaunch {
+            program,
+            args,
+            raw_command_tail: None,
+            workdir,
+            env,
+        };
+    };
+    let Some(command) = shell.command.filter(|command| !command.trim().is_empty()) else {
+        return WindowsLaunch {
+            program: "cmd.exe".to_string(),
+            args: vec!["/d".to_string(), "/q".to_string()],
+            raw_command_tail: None,
+            workdir,
+            env,
+        };
+    };
+    if let Some(parsed) = crate::posix_command::parse(&command) {
+        let mut argv = parsed.argv.into_iter();
+        let program = argv.next().unwrap_or_default();
+        let mut merged_env = env;
+        merged_env.extend(parsed.env);
+        return WindowsLaunch {
+            program,
+            args: argv.collect(),
+            raw_command_tail: None,
+            workdir: parsed.workdir.or(workdir),
+            env: merged_env,
+        };
+    }
+    WindowsLaunch {
+        program: "cmd.exe".to_string(),
+        args: vec!["/d".to_string(), "/s".to_string(), "/c".to_string()],
+        raw_command_tail: Some(format!("\"{command}\"")),
+        workdir,
+        env,
+    }
+}
+
+/// The `cmd.exe` launch used when a shell request's program cannot be started
+/// directly, as a POSIX shell would report `command not found` itself. It also
+/// resolves `cmd.exe` built-ins such as `echo`, `dir`, and `type`, and returns
+/// cmd's own error text and exit code for a missing program. Without this, a
+/// spawn failure leaves the SSH client waiting for an exit status that never
+/// arrives.
+fn cmd_retry(launch: &WindowsLaunch) -> Option<WindowsLaunch> {
+    if launch.raw_command_tail.is_some() {
+        return None;
+    }
+    let line = std::iter::once(launch.program.as_str())
+        .chain(launch.args.iter().map(String::as_str))
+        .map(quote_windows_argument)
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(WindowsLaunch {
+        program: "cmd.exe".to_string(),
+        args: vec!["/d".to_string(), "/s".to_string(), "/c".to_string()],
+        raw_command_tail: Some(format!("\"{line}\"")),
+        workdir: launch.workdir.clone(),
+        env: launch.env.clone(),
+    })
+}
+
+/// Quote one argument with the Microsoft C runtime command-line rules.
+fn quote_windows_argument(argument: &str) -> String {
+    if !argument.is_empty() && !argument.contains([' ', '\t', '"']) {
+        return argument.to_string();
+    }
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0_usize;
+    for c in argument.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            other => {
+                quoted.push_str(&"\\".repeat(backslashes));
+                quoted.push(other);
+                backslashes = 0;
+            }
+        }
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
 fn workload_environment(
     child: &HashMap<String, String>,
     providers: &HashMap<String, String>,
@@ -1274,6 +1411,7 @@ impl ManagedProcess {
         kind: ProcessKindWire,
         program: String,
         args: Vec<String>,
+        raw_command_tail: Option<String>,
         workdir: Option<String>,
         environment: HashMap<String, String>,
     ) -> Result<Self, String> {
@@ -1287,6 +1425,11 @@ impl ManagedProcess {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .envs(environment);
+        // cmd.exe parses its own command line, so the text after /c must not be
+        // re-quoted with the C runtime rules that `Command::args` applies.
+        if let Some(tail) = raw_command_tail {
+            command.raw_arg(tail);
+        }
         if let Some(workdir) = workdir.filter(|path| !path.trim().is_empty()) {
             command.current_dir(workdir);
         }
@@ -1690,6 +1833,168 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_sandbox_backend::boundary_protocol::ShellSpecWire;
+
+    fn shell_exec(command: Option<&str>) -> ExecSpecWire {
+        ExecSpecWire {
+            program: String::new(),
+            args: Vec::new(),
+            shell: Some(ShellSpecWire {
+                command: command.map(str::to_string),
+                login: true,
+            }),
+            runtime_helper: None,
+            env: vec![("FROM_REQUEST".to_string(), "1".to_string())],
+            workdir: Some(r"C:\default".to_string()),
+            pty: false,
+        }
+    }
+
+    #[test]
+    fn plain_shell_command_runs_the_program_directly() {
+        let launch = windows_launch(shell_exec(Some(
+            r#"cd 'C:\work dir' && A=1 'C:\Program Files\tool.exe' 'it'"'"'s'"#,
+        )));
+        assert_eq!(launch.program, r"C:\Program Files\tool.exe");
+        assert_eq!(launch.args, vec!["it's".to_string()]);
+        assert_eq!(launch.workdir.as_deref(), Some(r"C:\work dir"));
+        assert_eq!(launch.raw_command_tail, None);
+        assert_eq!(
+            launch.env,
+            vec![
+                ("FROM_REQUEST".to_string(), "1".to_string()),
+                ("A".to_string(), "1".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_syntax_runs_through_cmd() {
+        let launch = windows_launch(shell_exec(Some("echo a | findstr a")));
+        assert_eq!(launch.program, "cmd.exe");
+        assert_eq!(launch.args, vec!["/d", "/s", "/c"]);
+        assert_eq!(
+            launch.raw_command_tail.as_deref(),
+            Some("\"echo a | findstr a\"")
+        );
+        assert_eq!(launch.workdir.as_deref(), Some(r"C:\default"));
+    }
+
+    #[test]
+    fn shell_without_command_starts_cmd() {
+        let launch = windows_launch(shell_exec(None));
+        assert_eq!(launch.program, "cmd.exe");
+        assert_eq!(launch.args, vec!["/d", "/q"]);
+    }
+
+    #[test]
+    fn argv_exec_is_unchanged() {
+        let mut spec = shell_exec(None);
+        spec.shell = None;
+        spec.program = "tool.exe".to_string();
+        spec.args = vec!["a b".to_string()];
+        let launch = windows_launch(spec);
+        assert_eq!(launch.program, "tool.exe");
+        assert_eq!(launch.args, vec!["a b".to_string()]);
+        assert_eq!(launch.raw_command_tail, None);
+    }
+
+    #[tokio::test]
+    async fn missing_program_retries_through_cmd() {
+        let launch = windows_launch(shell_exec(Some("no-such-program.exe 'a b'")));
+        let direct = ManagedProcess::spawn(
+            "retry-direct".to_string(),
+            ProcessKindWire::Exec,
+            launch.program.clone(),
+            launch.args.clone(),
+            None,
+            None,
+            HashMap::new(),
+        )
+        .await;
+        assert!(direct.is_err(), "the program does not exist");
+        let retry = cmd_retry(&launch).expect("parsed launches can retry");
+        assert_eq!(
+            retry.raw_command_tail.as_deref(),
+            Some("\"no-such-program.exe \"a b\"\"")
+        );
+        let process = ManagedProcess::spawn(
+            "retry-cmd".to_string(),
+            ProcessKindWire::Exec,
+            retry.program,
+            retry.args,
+            retry.raw_command_tail,
+            None,
+            HashMap::new(),
+        )
+        .await
+        .expect("cmd starts");
+        let status = tokio::time::timeout(Duration::from_secs(10), process.wait())
+            .await
+            .expect("process exits");
+        assert!(
+            matches!(status, ExitStatusWire::Exited(code) if code != 0),
+            "{status:?}"
+        );
+    }
+
+    #[test]
+    fn cmd_fallback_launches_are_not_retried() {
+        let launch = windows_launch(shell_exec(Some("echo a | findstr a")));
+        assert_eq!(cmd_retry(&launch), None);
+    }
+
+    #[test]
+    fn windows_arguments_are_quoted_for_the_c_runtime() {
+        assert_eq!(quote_windows_argument("plain"), "plain");
+        assert_eq!(quote_windows_argument(""), "\"\"");
+        assert_eq!(quote_windows_argument("a b"), "\"a b\"");
+        assert_eq!(quote_windows_argument(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(
+            quote_windows_argument(r"C:\dir with space\"),
+            r#""C:\dir with space\\""#
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_fallback_runs_shell_syntax() {
+        let launch = windows_launch(shell_exec(Some("echo first & echo second")));
+        let process = ManagedProcess::spawn(
+            "cmd-fallback-test".to_string(),
+            ProcessKindWire::Exec,
+            launch.program,
+            launch.args,
+            launch.raw_command_tail,
+            None,
+            HashMap::new(),
+        )
+        .await
+        .expect("launch cmd fallback");
+        let status = tokio::time::timeout(Duration::from_secs(10), process.wait())
+            .await
+            .expect("process exits");
+        assert!(matches!(status, ExitStatusWire::Exited(0)));
+        let mut cursor = process.output.cursor();
+        let output = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut output = Vec::new();
+            loop {
+                let event = cursor.recv().await.expect("retained output event");
+                if event.channel == STREAM_STDOUT {
+                    output.extend(event.payload);
+                }
+                if event.channel == STREAM_EXIT {
+                    return output;
+                }
+            }
+        })
+        .await
+        .expect("stdout is retained");
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            output.contains("first") && output.contains("second"),
+            "{output}"
+        );
+    }
 
     #[test]
     fn exec_environment_keeps_proxy_and_ca_with_refreshed_providers() {
@@ -2009,6 +2314,7 @@ mod tests {
                 "echo relay-free launch".to_string(),
             ],
             None,
+            None,
             HashMap::new(),
         )
         .await
@@ -2054,6 +2360,7 @@ mod tests {
                     "/C".into(),
                     "(for /L %i in (1,1,2000) do @echo output-line) & echo last-error 1>&2".into(),
                 ],
+                None,
                 None,
                 HashMap::new(),
             )

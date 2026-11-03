@@ -42,6 +42,7 @@ const DEFAULT_IMAGE_SENTINEL: &str = "mxc:process-container";
 const HOST_AUTH_BUNDLE_FILE: &str = "supervisor-auth.json";
 /// Directory in the sandbox host state directory for the proxy CA files.
 const HOST_PROXY_TLS_DIR: &str = "proxy-tls";
+const HOST_SSH_SERVER_NAME: &str = "supervisor-ssh";
 const HOST_RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
 const BOUNDARY_CONFIG_FILE: &str = "boundary.json";
 const BOUNDARY_TLS_CERT_FILE: &str = "sandbox.crt";
@@ -907,6 +908,13 @@ fn supervisor_command(
         .env(
             openshell_core::sandbox_env::PROXY_TLS_DIR,
             context.host_state_dir.join(HOST_PROXY_TLS_DIR),
+        )
+        // Enables the supervisor's SSH server for exec, connect, and file
+        // transfer. On Windows the server is reached in process, so this path
+        // only names the server; no socket is created.
+        .env(
+            openshell_core::sandbox_env::SSH_SOCKET_PATH,
+            context.host_state_dir.join(HOST_SSH_SERVER_NAME),
         )
         .env(
             openshell_core::sandbox_env::LOG_LEVEL,

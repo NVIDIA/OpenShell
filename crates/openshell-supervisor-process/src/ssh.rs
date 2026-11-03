@@ -6,16 +6,18 @@
 mod input;
 mod upload;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod exec_input_tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod upload_tests;
 
 use crate::main_session::{MainOutput, MainSession};
 #[cfg(unix)]
 use libc;
-use miette::{IntoDiagnostic, Result};
+#[cfg(unix)]
+use miette::IntoDiagnostic;
+use miette::Result;
 use openshell_core::VERSION;
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, SeverityId, SshActivityBuilder, StatusId, ocsf_emit,
@@ -25,9 +27,12 @@ use russh::server::{Auth, ChannelOpenHandle, Handle, Session};
 use russh::{ChannelId, ChannelOpenFailure, Sig};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tracing::warn;
 
@@ -40,7 +45,7 @@ const SSH_PEER_TIMEOUT: Duration = Duration::from_mins(1);
 
 mod peer_stream;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "ssh/reconnect_tests.rs"]
 mod reconnect_tests;
 
@@ -70,6 +75,7 @@ fn filter_main_detach_sequence(prefix_pending: &mut bool, data: &[u8]) -> (Vec<u
 /// Perform SSH server initialization: generate a host key, build the config,
 /// and bind the Unix socket listener. Extracted so that startup errors can be
 /// forwarded through the readiness channel rather than being silently logged.
+#[cfg(unix)]
 type SshServerInit = (
     UnixListener,
     Arc<russh::server::Config>,
@@ -91,12 +97,7 @@ pub fn parse_host_key(key: Option<&openshell_core::jwt::SecretSshHostKey>) -> Re
     Ok(key)
 }
 
-fn ssh_server_init(
-    listen_path: &Path,
-    ca_file_paths: &Option<(PathBuf, PathBuf)>,
-    shared_socket: bool,
-    host_key: PrivateKey,
-) -> Result<SshServerInit> {
+fn ssh_server_config(host_key: PrivateKey) -> Arc<russh::server::Config> {
     let mut config = russh::server::Config {
         server_id: russh::SshId::Standard(Cow::Owned(format!("SSH-2.0-OpenShell_{VERSION}"))),
         auth_rejection_time: Duration::from_secs(1),
@@ -106,8 +107,17 @@ fn ssh_server_init(
         ..Default::default()
     };
     config.keys.push(host_key);
+    Arc::new(config)
+}
 
-    let config = Arc::new(config);
+#[cfg(unix)]
+fn ssh_server_init(
+    listen_path: &Path,
+    ca_file_paths: &Option<(PathBuf, PathBuf)>,
+    shared_socket: bool,
+    host_key: PrivateKey,
+) -> Result<SshServerInit> {
+    let config = ssh_server_config(host_key);
     let ca_paths = ca_file_paths.as_ref().map(|p| Arc::new(p.clone()));
 
     // A driver may place the supervisor in another container, so an explicitly
@@ -153,6 +163,7 @@ fn ssh_server_init(
     Ok((listener, config, ca_paths))
 }
 
+#[cfg(unix)]
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub async fn run_ssh_server(
     listen_path: PathBuf,
@@ -241,8 +252,10 @@ pub async fn run_ssh_server(
     }
 }
 
+#[cfg(unix)]
 const MAX_CONSECUTIVE_UNKNOWN_SSH_ACCEPT_ERRORS: u32 = 10;
 
+#[cfg(unix)]
 #[derive(Debug, PartialEq)]
 enum SshAcceptAction {
     Terminal,
@@ -252,6 +265,7 @@ enum SshAcceptAction {
     },
 }
 
+#[cfg(unix)]
 fn classify_ssh_accept_error(
     error: &std::io::Error,
     consecutive_resource_errors: &mut u32,
@@ -333,18 +347,208 @@ fn classify_ssh_accept_error(
     }
 }
 
+/// Windows has no socket hop between the relay and the SSH server: both run in
+/// the supervisor process, so each accepted relay is handed to the server as
+/// one half of an in-memory duplex stream. Nothing outside the supervisor
+/// process can reach the server. The configured socket path is only the
+/// registry key that pairs a relay with its server.
+#[cfg(not(unix))]
+mod in_process {
+    use std::collections::HashMap;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    use tokio::io::DuplexStream;
+    use tokio::sync::mpsc;
+
+    const DUPLEX_BUFFER_BYTES: usize = 256 * 1024;
+    const ACCEPT_BACKLOG: usize = 64;
+
+    type Acceptors = Mutex<HashMap<PathBuf, mpsc::Sender<DuplexStream>>>;
+
+    fn acceptors() -> &'static Acceptors {
+        static ACCEPTORS: OnceLock<Acceptors> = OnceLock::new();
+        ACCEPTORS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Removes the server's acceptor when the server task ends, so later relays
+    /// fail instead of queueing on a dead server.
+    pub(super) struct Registration {
+        key: PathBuf,
+    }
+
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            acceptors()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&self.key);
+        }
+    }
+
+    pub(super) fn register(
+        key: &Path,
+    ) -> Result<(Registration, mpsc::Receiver<DuplexStream>), String> {
+        let mut map = acceptors().lock().unwrap_or_else(PoisonError::into_inner);
+        if map.contains_key(key) {
+            return Err(format!(
+                "an SSH server is already registered for {}",
+                key.display()
+            ));
+        }
+        let (sender, receiver) = mpsc::channel(ACCEPT_BACKLOG);
+        map.insert(key.to_path_buf(), sender);
+        Ok((
+            Registration {
+                key: key.to_path_buf(),
+            },
+            receiver,
+        ))
+    }
+
+    /// Open a connection to the in-process SSH server registered under `key`.
+    pub async fn connect(key: &Path) -> io::Result<DuplexStream> {
+        let sender = acceptors()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "supervisor SSH server is not running",
+                )
+            })?;
+        let (client, server) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
+        sender.send(server).await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "supervisor SSH server stopped",
+            )
+        })?;
+        Ok(client)
+    }
+}
+
+#[cfg(not(unix))]
+pub use in_process::connect as connect_in_process;
+
+#[cfg(all(test, not(unix)))]
+mod in_process_tests {
+    use super::in_process;
+    use std::path::Path;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[tokio::test]
+    async fn connections_reach_only_the_registered_server() {
+        let key = Path::new(r"C:\state\sandbox-a\supervisor-ssh");
+        let (registration, mut accepted) = in_process::register(key).expect("register");
+        assert!(
+            in_process::register(key).is_err(),
+            "a second server cannot claim the same key"
+        );
+
+        let mut client = in_process::connect(key).await.expect("connect");
+        let mut server = accepted.recv().await.expect("server receives the stream");
+        client.write_all(b"ping").await.unwrap();
+        let mut buffer = [0_u8; 4];
+        server.read_exact(&mut buffer).await.unwrap();
+        assert_eq!(&buffer, b"ping");
+
+        let other = in_process::connect(Path::new(r"C:\state\sandbox-b\supervisor-ssh")).await;
+        assert_eq!(
+            other.err().map(|error| error.kind()),
+            Some(std::io::ErrorKind::NotFound)
+        );
+
+        drop(registration);
+        let stopped = in_process::connect(key).await;
+        assert_eq!(
+            stopped.err().map(|error| error.kind()),
+            Some(std::io::ErrorKind::NotFound),
+            "a stopped server no longer accepts connections"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub async fn run_ssh_server(
+    listen_path: PathBuf,
+    ready_tx: tokio::sync::oneshot::Sender<Result<()>>,
+    _ca_file_paths: Option<(PathBuf, PathBuf)>,
+    _shared_socket: bool,
+    port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
+    boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
+    main_session: Option<Arc<MainSession>>,
+    host_key: PrivateKey,
+) -> Result<()> {
+    let config = ssh_server_config(host_key);
+    let (_registration, mut accepted) = match in_process::register(&listen_path) {
+        Ok(registered) => {
+            let _ = ready_tx.send(Ok(()));
+            registered
+        }
+        Err(error) => {
+            let _ = ready_tx.send(Err(miette::miette!(error)));
+            return Ok(());
+        }
+    };
+    ocsf_emit!(
+        SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Listen)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .message("SSH server listening on the supervisor in-process transport")
+            .build()
+    );
+
+    while let Some(stream) = accepted.recv().await {
+        let config = config.clone();
+        let port_forward = port_forward.clone();
+        let boundary_exec = boundary_exec.clone();
+        let main_session = main_session.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_connection(
+                stream,
+                config,
+                port_forward,
+                boundary_exec,
+                main_session,
+                SSH_PEER_TIMEOUT,
+            )
+            .await
+            {
+                ocsf_emit!(
+                    SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .status(StatusId::Failure)
+                        .message(format!("SSH connection failed: {err}"))
+                        .build()
+                );
+            }
+        });
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn handle_connection(
-    stream: tokio::net::UnixStream,
+async fn handle_connection<S>(
+    stream: S,
     config: Arc<russh::server::Config>,
     port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
     boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
     peer_timeout: Duration,
-) -> Result<()> {
-    // Access is gated by the Unix-socket filesystem permissions (root-only),
-    // not by an application-level preface. The supervisor bridges the
-    // gateway's RelayStream directly into this socket.
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    // Access is gated by the Unix-socket filesystem permissions (root-only) or,
+    // on Windows, by the stream never leaving the supervisor process. There is
+    // no application-level preface. The supervisor bridges the gateway's
+    // RelayStream directly into this stream.
     ocsf_emit!(
         SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
@@ -352,7 +556,11 @@ async fn handle_connection(
             .disposition(DispositionId::Allowed)
             .severity(SeverityId::Informational)
             .status(StatusId::Success)
-            .message("SSH connection accepted on supervisor Unix socket")
+            .message(if cfg!(unix) {
+                "SSH connection accepted on supervisor Unix socket"
+            } else {
+                "SSH connection accepted on supervisor in-process transport"
+            })
             .build()
     );
 
@@ -1530,7 +1738,7 @@ fn direct_tcpip_target(
     openshell_isolation_interface::contract::LoopbackTarget::new(ip, port).ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(
     clippy::doc_markdown,
     reason = "Test documentation references protocol and API identifiers."
