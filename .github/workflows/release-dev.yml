@@ -68,6 +68,7 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       supervisor-image-tag: dev
       checkout-ref: ${{ github.sha }}
+      dev-build: true
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 

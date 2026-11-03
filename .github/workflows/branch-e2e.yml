@@ -108,6 +108,7 @@ jobs:
     uses: ./.github/workflows/build-binaries.yml
     with:
       cargo-version: ${{ needs.version.outputs.cargo }}
+      dev-build: true
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
