@@ -66,6 +66,13 @@ type refreshableAuth struct {
 	logger    types.Logger
 	nextRetry time.Time
 	backoff   time.Duration
+	lastErr   error
+}
+
+// usableCached reports whether the cached token has not yet expired.
+// Callers must hold r.mu.
+func (r *refreshableAuth) usableCached() bool {
+	return r.tok != nil && (r.tok.Expiry.IsZero() || time.Now().Before(r.tok.Expiry))
 }
 
 func (r *refreshableAuth) isTokenValid() bool {
@@ -87,13 +94,14 @@ func (r *refreshableAuth) GetRequestMetadata(ctx context.Context, _ ...string) (
 	}
 
 	if !r.nextRetry.IsZero() && time.Now().Before(r.nextRetry) {
-		if r.tok != nil {
+		if r.usableCached() {
 			tok := r.tok.AccessToken
 			r.mu.Unlock()
 			return map[string]string{"authorization": "Bearer " + tok}, nil
 		}
+		err := r.lastErr
 		r.mu.Unlock()
-		return nil, errors.New("openshell: token refresh failed and backoff is active")
+		return nil, err
 	}
 	r.mu.Unlock()
 
@@ -127,8 +135,9 @@ func (r *refreshableAuth) GetRequestMetadata(ctx context.Context, _ ...string) (
 			r.backoff = bo
 			r.nextRetry = time.Now().Add(bo)
 		}
+		r.lastErr = err
 
-		if r.tok != nil {
+		if r.usableCached() {
 			if r.logger != nil {
 				r.logger.Error(err, "token refresh failed, using cached token")
 			}
@@ -144,6 +153,7 @@ func (r *refreshableAuth) GetRequestMetadata(ctx context.Context, _ ...string) (
 	r.tok = tok
 	r.backoff = 0
 	r.nextRetry = time.Time{}
+	r.lastErr = nil
 	return map[string]string{"authorization": "Bearer " + r.tok.AccessToken}, nil
 }
 
@@ -155,6 +165,8 @@ func (r *refreshableAuth) RequireTransportSecurity() bool {
 // and refreshes them before expiry. Concurrent callers share a single
 // in-flight refresh via singleflight. Failed refreshes trigger exponential
 // backoff (1s, 2s, 4s, ..., 30s cap) to avoid amplifying token endpoint outages.
+// After a failed refresh, the cached token is used only until it expires;
+// after that, requests fail with the last refresh error.
 func RefreshableToken(src oauth2.TokenSource, opts ...RefreshOption) (AuthProvider, error) {
 	if src == nil {
 		return nil, errNilTokenSource
