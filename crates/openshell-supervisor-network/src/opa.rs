@@ -9845,10 +9845,25 @@ network_policies:
     }
 
     #[test]
-    fn allowed_ips_mode3_hostless_allows_any_domain() {
+    fn allowed_ips_mode3_matches_raw_ip_and_not_dns_names() {
         let engine = allowed_ips_engine();
-        // Any hostname on port 9443 should match the private_network policy
-        let input = NetworkInput {
+        // Hostless endpoints authorize IP-literal destinations on the port;
+        // DNS-mediated names are governed by named endpoints instead.
+        let raw = NetworkInput {
+            host: "172.16.9.9".into(),
+            port: 9443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&raw).unwrap();
+        assert!(
+            decision.allowed,
+            "Mode 3 (IPs only) should allow raw-IP destinations on matching port: {}",
+            decision.reason
+        );
+        let named = NetworkInput {
             host: "anything.example.com".into(),
             port: 9443,
             binary_path: PathBuf::from("/usr/bin/curl"),
@@ -9856,10 +9871,10 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
         };
-        let decision = engine.evaluate_network(&input).unwrap();
+        let decision = engine.evaluate_network(&named).unwrap();
         assert!(
-            decision.allowed,
-            "Mode 3 (IPs only) should allow any domain on matching port: {}",
+            !decision.allowed,
+            "Mode 3 (IPs only) must not admit DNS-mediated names: {}",
             decision.reason
         );
     }
@@ -9868,7 +9883,7 @@ network_policies:
     fn allowed_ips_mode3_returns_allowed_ips() {
         let engine = allowed_ips_engine();
         let input = NetworkInput {
-            host: "anything.example.com".into(),
+            host: "172.16.9.9".into(),
             port: 9443,
             binary_path: PathBuf::from("/usr/bin/curl"),
             binary_sha256: "unused".into(),
@@ -10217,7 +10232,7 @@ network_policies:
         let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
         // Port 80
         let input80 = NetworkInput {
-            host: "anything.internal".into(),
+            host: "10.1.2.3".into(),
             port: 80,
             binary_path: PathBuf::from("/usr/bin/curl"),
             binary_sha256: "unused".into(),
@@ -10232,7 +10247,7 @@ network_policies:
         );
         // Port 443
         let input443 = NetworkInput {
-            host: "anything.internal".into(),
+            host: "10.1.2.3".into(),
             port: 443,
             binary_path: PathBuf::from("/usr/bin/curl"),
             binary_sha256: "unused".into(),

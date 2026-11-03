@@ -124,15 +124,44 @@ endpoint_allowed(policy, network) if {
 	endpoint.ports[_] == network.port
 }
 
-# Endpoint matching: hostless with allowed_ips — match any host on port.
-# When an endpoint has allowed_ips but no host, it matches any hostname on the
-# given port. The actual IP validation happens in Rust post-DNS-resolution.
+# Endpoint matching: hostless with allowed_ips — raw-IP destinations only.
+# The allowed_ips list is the destination selector for these endpoints, so
+# they authorize connections addressed by IP literal on the given port.
+# DNS-mediated hostname connections are governed by their named endpoints;
+# the range check itself still happens in Rust after the pin. Raw-IPv6
+# destinations carry colons; a hostname always carries letters, so the
+# literal-shaped check cannot match a mediated name.
 endpoint_allowed(policy, network) if {
 	some endpoint
 	endpoint := policy.endpoints[_]
 	object.get(endpoint, "host", "") == ""
 	count(object.get(endpoint, "allowed_ips", [])) > 0
 	endpoint.ports[_] == network.port
+	raw_ip_destination(network.host)
+}
+
+raw_ip_destination(host) if {
+	parts := split(host, ".")
+	count(parts) == 4
+	every part in parts {
+		ipv4_label(part)
+	}
+}
+
+raw_ip_destination(host) if {
+	contains(host, ":")
+}
+
+ipv4_label(s) if {
+	glob.match("[0-9]", [], s)
+}
+
+ipv4_label(s) if {
+	glob.match("[0-9][0-9]", [], s)
+}
+
+ipv4_label(s) if {
+	glob.match("[0-9][0-9][0-9]", [], s)
 }
 
 # Binary matching can be relaxed by trusted runtime configuration. In that
