@@ -2711,6 +2711,7 @@ async fn persist_existing_policy_projection(
     annotations: &HashMap<String, String>,
     current_annotations: &HashMap<String, String>,
     backfill_policy: Option<&ProtoSandboxPolicy>,
+    replace_startup_baseline: bool,
 ) -> Result<HashMap<String, String>, Status> {
     let annotations_match = annotations
         .iter()
@@ -2728,7 +2729,7 @@ async fn persist_existing_policy_projection(
                 crate::policy_store::permits_initial_static_policy_repair(sandbox);
             if let Some(policy) = backfill_policy.as_ref()
                 && let Some(spec) = sandbox.spec.as_mut()
-                && (spec.policy.is_none() || startup_blocked)
+                && (spec.policy.is_none() || (startup_blocked && replace_startup_baseline))
             {
                 spec.policy = Some(policy.clone());
             }
@@ -4618,6 +4619,7 @@ async fn handle_update_config_inner(
                 &req.annotations,
                 &response_annotations,
                 None,
+                false,
             )
             .await?
         };
@@ -4768,6 +4770,7 @@ async fn handle_update_config_inner(
                     &req.annotations,
                     &response_annotations,
                     backfill_policy.as_ref(),
+                    startup_blocked && !sandbox_caller,
                 )
                 .await?;
                 if backfill_policy.is_some() {
@@ -4798,6 +4801,7 @@ async fn handle_update_config_inner(
                 expected_resource_version: req.expected_resource_version,
                 annotations: req.annotations.clone(),
                 backfill_policy: backfill_policy.clone(),
+                replace_startup_baseline: startup_blocked && !sandbox_caller,
             };
 
             match state.store.put_policy_revision_atomic(&write).await {
@@ -7737,6 +7741,7 @@ async fn apply_merge_operations_with_retry(
                     expected_resource_version: context.expected_resource_version,
                     annotations: context.annotations.clone(),
                     backfill_policy: None,
+                    replace_startup_baseline: false,
                 })
                 .await
                 .map(Some)
@@ -8978,6 +8983,123 @@ mod tests {
         let diagnostic = bounded_configuration_diagnostic(&format!("rule\n{}", "é".repeat(1000)));
         assert_eq!(diagnostic.chars().count(), 512);
         assert!(!diagnostic.contains('\n'));
+    }
+
+    #[tokio::test]
+    async fn startup_policy_backfill_preserves_repair_while_waiting_for_mutation_lock() {
+        use openshell_core::proto::{
+            ConfigurationAdmissionState as Admission, SandboxConfigurationAdmission, SandboxPhase,
+        };
+        use std::time::Duration;
+
+        for admission in [Admission::Pending, Admission::Rejected] {
+            let state = test_server_state().await;
+            let sandbox_id = "sb-startup-backfill-race";
+            let sandbox_name = "startup-backfill-race";
+            let image_policy = test_policy_with_rule("image", "image.example.com");
+            let repaired_policy = test_policy_with_rule("repair", "repaired.example.com");
+            let mut sandbox =
+                test_sandbox(sandbox_id, sandbox_name, image_policy.clone(), Vec::new());
+            sandbox.spec.as_mut().unwrap().policy = None;
+            sandbox.set_phase(SandboxPhase::Provisioning.into());
+            let status = sandbox.status.as_mut().unwrap();
+            status.configuration_activated = Some(false);
+            status.configuration_admission = Some(SandboxConfigurationAdmission {
+                state: admission.into(),
+                ..Default::default()
+            });
+            state.store.put_message(&sandbox).await.unwrap();
+
+            let update = |policy| UpdateConfigRequest {
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                policy: Some(policy),
+                ..Default::default()
+            };
+            let repair_request = with_user(Request::new(update(repaired_policy.clone())));
+            let image_request = with_sandbox(Request::new(update(image_policy)), sandbox_id);
+            let fresh_request =
+                with_sandbox(Request::new(update(repaired_policy.clone())), sandbox_id);
+            let held = crate::persistence::lock_order::branch(
+                state
+                    .compute
+                    .mutation_guard(MutationScope::sandbox("default", sandbox_id)),
+            )
+            .await
+            .unwrap();
+
+            let repair_state = state.clone();
+            let repair =
+                tokio::spawn(
+                    async move { handle_update_config(&repair_state, repair_request).await },
+                );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state
+                    .compute
+                    .sandbox_mutation_lock_references_for_tests(sandbox_id)
+                    < 2
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("management repair is first in the lock queue");
+
+            let image_state = state.clone();
+            let image =
+                tokio::spawn(
+                    async move { handle_update_config(&image_state, image_request).await },
+                );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state
+                    .compute
+                    .sandbox_mutation_lock_references_for_tests(sandbox_id)
+                    < 3
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("image upload read the empty baseline and queued behind the repair");
+            drop(held);
+
+            let repaired = repair.await.unwrap().unwrap().into_inner();
+            let error = image
+                .await
+                .unwrap()
+                .expect_err("sandbox backfill must not replace the management baseline");
+            assert_eq!(error.code(), Code::Aborted);
+            let saved = state
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.spec.unwrap().policy, Some(repaired_policy));
+            let latest = state
+                .store
+                .get_latest_policy(sandbox_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(latest.version, i64::from(repaired.version));
+            assert_eq!(latest.policy_hash, repaired.policy_hash);
+            assert_eq!(
+                state
+                    .store
+                    .list_policies(sandbox_id, 10, 0)
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "rejected backfill must not leave an orphan policy revision"
+            );
+            let fresh = handle_update_config(&state, fresh_request)
+                .await
+                .expect("a fresh sync can use the repaired policy")
+                .into_inner();
+            assert_eq!(fresh.version, repaired.version);
+        }
     }
 
     #[tokio::test]
