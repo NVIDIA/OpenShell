@@ -6,6 +6,7 @@ links:
   - https://github.com/NVIDIA/OpenShell/issues/5200
   - https://github.com/NVIDIA/OpenShell/issues/4425
   - https://github.com/NVIDIA/OpenShell/pull/4426
+  - https://github.com/NVIDIA/OpenShell/pull/5202
 ---
 
 # RFC 0022 - Moving the Desktop Drivers to a Separate Repository
