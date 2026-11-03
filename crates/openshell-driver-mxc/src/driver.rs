@@ -14,7 +14,7 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
-use openshell_core::proto_struct::struct_to_json_value;
+use openshell_core::proto_struct::struct_to_typed_json_value;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -239,10 +239,12 @@ fn sandbox_config(sandbox: &DriverSandbox) -> Result<MxcSandboxConfig, tonic::St
                 "mxc requires template.driver_config.mxc with a non-empty command array",
             )
         })?;
-    let config: MxcSandboxConfig =
-        serde_json::from_value(struct_to_json_value(config)).map_err(|error| {
-            tonic::Status::invalid_argument(format!("invalid mxc driver_config: {error}"))
-        })?;
+    let json = struct_to_typed_json_value(config).map_err(|error| {
+        tonic::Status::invalid_argument(format!("invalid mxc driver_config: {error}"))
+    })?;
+    let config: MxcSandboxConfig = serde_json::from_value(json).map_err(|error| {
+        tonic::Status::invalid_argument(format!("invalid mxc driver_config: {error}"))
+    })?;
     if config.command.is_empty() || config.command[0].is_empty() {
         return Err(tonic::Status::invalid_argument(
             "mxc driver_config.command must contain a non-empty executable",

@@ -127,7 +127,10 @@ impl PodmanSandboxDriverConfig {
             return Ok(Self::default());
         };
 
-        serde_json::from_value(proto_struct::struct_to_json_value(config)).map_err(|err| {
+        let json = proto_struct::struct_to_typed_json_value(config).map_err(|err| {
+            ComputeDriverError::InvalidArgument(format!("invalid podman driver_config: {err}"))
+        })?;
+        serde_json::from_value(json).map_err(|err| {
             ComputeDriverError::InvalidArgument(format!("invalid podman driver_config: {err}"))
         })
     }
@@ -1044,7 +1047,8 @@ fn podman_driver_config(
     let Some(config) = template.driver_config.as_ref() else {
         return Ok(PodmanSandboxDriverConfig::default());
     };
-    let json = Value::Object(proto_struct::struct_to_json_object(config));
+    let json = proto_struct::struct_to_typed_json_value(config)
+        .map_err(|err| format!("invalid podman driver_config: {err}"))?;
     let config: PodmanSandboxDriverConfig = serde_json::from_value(json)
         .map_err(|err| format!("invalid podman driver_config: {err}"))?;
     validate_podman_driver_mounts(&config.mounts, enable_bind_mounts)?;
