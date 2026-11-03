@@ -3125,10 +3125,10 @@ mod linux {
                     | RuntimeState::Ready(_) => None,
                 }
             };
-            if matches!(*connection, SupervisorConnectionState::Frozen { .. })
+            if let SupervisorConnectionState::Frozen { recovery_id } = *connection
                 && let Some(process) = process
             {
-                if !process.boundary_runtime.resume() {
+                if !process.boundary_runtime.resume(recovery_id) {
                     return Err((
                         BoundaryErrorKind::Process,
                         "frozen workload could not be resumed".to_string(),
@@ -3226,11 +3226,13 @@ mod linux {
                         | RuntimeState::Ready(_) => None,
                     }
                 };
+                // The recovery identity is allocated before the freeze so a
+                // failed deferred sweep can name it.
+                let recovery_id = self.next_recovery_id.fetch_add(1, Ordering::Relaxed);
                 if let Some(process) = &process {
                     self.network_broker.set_workload_frozen(true);
-                    let _ = process.boundary_runtime.freeze();
+                    let _ = process.boundary_runtime.freeze(recovery_id);
                 }
-                let recovery_id = self.next_recovery_id.fetch_add(1, Ordering::Relaxed);
                 *connection = SupervisorConnectionState::Frozen { recovery_id };
                 recovery_id
             };
@@ -5381,6 +5383,10 @@ mod linux {
         use openshell_sandbox_backend::protobuf::WireMessage as _;
         use openshell_sandbox_backend::runtime_routed::{RuntimeRouter, new_route_handle};
         use rcgen::PKCS_ED25519;
+
+        use crate::boundary_io::test_proc_stat::{
+            ProcessGroupKillGuard, process_group_of, process_parent, process_stopped,
+        };
 
         struct FailedWaitProcess;
 
@@ -9603,17 +9609,6 @@ mod linux {
             }
         }
 
-        /// Whether the process is stopped, as a frozen workload is.
-        fn process_stopped(pid: u32) -> bool {
-            std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                .ok()
-                .and_then(|stat| {
-                    stat.rsplit_once(") ")
-                        .map(|(_, fields)| fields.starts_with('T'))
-                })
-                .unwrap_or(false)
-        }
-
         /// An owner operation holds the ownership guard across `block_on`, a
         /// promotion waits for it, and a DNS answer waits behind the
         /// promotion, on a runtime with a single worker. The answer waits
@@ -9980,6 +9975,177 @@ mod linux {
             }
             assert_eq!(boundary.terminate(&process_id), Response::Terminated);
             let workload = boundary.running_process(&process_id).expect("workload");
+            let terminated_by = std::time::Instant::now() + Duration::from_secs(10);
+            while !workload.has_exited() && std::time::Instant::now() < terminated_by {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(workload.has_exited(), "workload did not exit");
+        }
+
+        /// The deferred descendant sweeps of a freeze and its recovery must
+        /// both be delivered. The disconnect suite only asserts the workload
+        /// root stops, which the synchronous killpg covers regardless of the
+        /// deferral, so this test proves the deferred SIGSTOP reaches a
+        /// descendant outside every registered process group — and the
+        /// deferred SIGCONT continues it after recovery. Without it, an
+        /// implementation that never delivers a batch passes the suite while
+        /// the freeze contract silently weakens.
+        #[test]
+        fn deferred_descendant_sweeps_deliver_across_disconnect_and_recovery() {
+            const CHILD_MARKER: &str = "OPENSHELL_TEST_BOUNDARY_DEFERRED_SWEEP_CHILD";
+            const SANDBOX: &str = "sandbox-deferred-sweep";
+            const GENERATION: &str = "generation-deferred-sweep";
+            if std::env::var_os(CHILD_MARKER).is_none() {
+                run_isolated(
+                    "boundary_server::linux::tests::deferred_descendant_sweeps_deliver_across_disconnect_and_recovery",
+                    CHILD_MARKER,
+                    Duration::from_mins(1),
+                );
+                return;
+            }
+
+            let gateway = TestGateway::new();
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test process runtime");
+            let _entered = process_runtime.enter();
+            // A generous recovery deadline so a loaded CI runner cannot expire
+            // the freeze mid-test; the sweeps themselves take milliseconds.
+            let boundary = takeover_test_runtime_with_recovery(
+                &gateway,
+                SANDBOX,
+                GENERATION,
+                &process_runtime,
+                Some(Duration::from_mins(1)),
+            );
+            let supervisor_instance_id = test_supervisor_instance_id();
+            let owner = boundary
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request((), &gateway.token(SANDBOX, GENERATION, 1)).metadata(),
+                )
+                .expect("owner principal");
+            assert!(matches!(
+                boundary.attach(takeover_test_policy(), false),
+                Response::Attached { .. }
+            ));
+            boundary
+                .commit_attach(&owner, supervisor_instance_id, None, None)
+                .expect("attach owner");
+            assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
+            boundary.commit_confirm(&owner).expect("confirm owner");
+
+            // The workload's descendant leaves the root's process group via
+            // setsid, so only the deferred sweep — not the synchronous
+            // killpg — can stop it.
+            let Response::Started { process_id, .. } = boundary.start_agent(
+                SANDBOX.to_string(),
+                AgentSpecWire {
+                    program: "/bin/sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        "/usr/bin/setsid /bin/sleep 600 & wait".to_string(),
+                    ],
+                    workdir: None,
+                    timeout_secs: 120,
+                    interactive: false,
+                    otlp_relay_active: false,
+                },
+                None,
+                None,
+                0,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ) else {
+                panic!("owner could not start the workload");
+            };
+            let workload = boundary.running_process(&process_id).expect("workload");
+            let root_pid = workload.signaler.pid();
+            // A failed assertion must not orphan the fixtures: each guard
+            // kills its whole group on drop unless disarmed for the normal
+            // cleanup below. The workload root leads the group it was
+            // registered under, and the setsid descendant leads its own.
+            let mut workload_guard = ProcessGroupKillGuard::new(root_pid);
+            let descendant_pid = {
+                let found_by = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let found = std::fs::read_dir("/proc")
+                        .expect("read /proc")
+                        .flatten()
+                        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+                        .find(|pid| process_parent(*pid) == Some(root_pid));
+                    if let Some(pid) = found {
+                        break pid;
+                    }
+                    assert!(
+                        std::time::Instant::now() < found_by,
+                        "the workload never spawned its out-of-group descendant"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            };
+            let mut descendant_guard = ProcessGroupKillGuard::new(descendant_pid);
+            // The descendant separates asynchronously: `setsid` runs after
+            // the fork, so wait for the split before disconnecting.
+            let separated_by = std::time::Instant::now() + Duration::from_secs(5);
+            while process_group_of(descendant_pid) == process_group_of(root_pid) {
+                assert!(
+                    std::time::Instant::now() < separated_by,
+                    "the fixture must keep the descendant off the workload's process group"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            // Losing the supervisor freezes the workload: the root group
+            // stops synchronously, and the deferred sweep must stop the
+            // descendant too.
+            boundary.transport_disconnected(owner.connection_id());
+            assert!(matches!(
+                *lock(&boundary.supervisor_connection),
+                SupervisorConnectionState::Frozen { .. }
+            ));
+            let stopped_by = std::time::Instant::now() + Duration::from_secs(5);
+            while !process_stopped(descendant_pid) {
+                assert!(
+                    std::time::Instant::now() < stopped_by,
+                    "the deferred freeze sweep never stopped the out-of-group descendant"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            // Recovery resumes it: the roots synchronously, the descendant
+            // through the deferred sweep.
+            let replacement = boundary
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request((), &gateway.token(SANDBOX, GENERATION, 1)).metadata(),
+                )
+                .expect("replacement principal");
+            boundary
+                .commit_attach(&replacement, supervisor_instance_id, None, None)
+                .expect("reattach replacement");
+            boundary
+                .commit_confirm(&replacement)
+                .expect("reconfirm replacement");
+            let running_by = std::time::Instant::now() + Duration::from_secs(5);
+            while process_stopped(descendant_pid) {
+                assert!(
+                    std::time::Instant::now() < running_by,
+                    "the deferred resume sweep never continued the out-of-group descendant"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            // Cleanup: kill the out-of-group descendant explicitly, then end
+            // the workload inside the isolated limit.
+            descendant_guard.disarm();
+            workload_guard.disarm();
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(i32::try_from(descendant_pid).unwrap()),
+                nix::sys::signal::SIGKILL,
+            );
+            assert_eq!(boundary.terminate(&process_id), Response::Terminated);
             let terminated_by = std::time::Instant::now() + Duration::from_secs(10);
             while !workload.has_exited() && std::time::Instant::now() < terminated_by {
                 std::thread::sleep(Duration::from_millis(10));
