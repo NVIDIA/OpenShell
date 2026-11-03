@@ -4,14 +4,10 @@ authors:
 state: draft
 links:
   - https://github.com/NVIDIA/OpenShell/issues/4358
+  - https://github.com/NVIDIA/OpenShell/pull/5139
 ---
 
-# RFC 0019 - Credential Issuer Service
-
-<!--
-RFC number 0019 is provisional. Maintainers assign the final number from the
-originating GitHub issue.
--->
+# RFC 0023 - Credential Issuer Service
 
 ## Summary
 
