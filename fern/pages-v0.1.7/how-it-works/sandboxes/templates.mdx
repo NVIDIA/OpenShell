@@ -1,0 +1,65 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Sandbox Templates"
+sidebar-title: "Templates"
+slug: "how-it-works/sandboxes/templates"
+description: "Define reusable sandbox workload settings and create sandboxes from templates."
+keywords: "OpenShell, Sandboxes, Workload Templates, Images, Resources, Compute Drivers"
+---
+
+Sandbox workload templates let workspace admins define reusable runtime shapes for a workspace. A template stores the image, environment, resource requests, and driver-specific configuration that sandboxes should inherit. When you create a sandbox from a template, the create request can still attach providers, labels, and policy, but the workload comes from the named template.
+
+## Create a Template
+
+```shell
+openshell sandbox template create gpu-kata \
+  --image registry.example.com/agent:latest \
+  --cpu 2 \
+  --memory 4Gi \
+  --gpu 1 \
+  --label team=runtime \
+  --env FEATURE_FLAG=on
+```
+
+Use `--gpu` without a count when the template should request the active
+driver's default GPU assignment. Use `--gpu COUNT` when the template needs a
+specific number of GPUs.
+
+For a separate template with driver-specific settings, create it with
+`--driver-config-json`:
+
+```shell
+openshell sandbox template create gpu-kata-custom \
+  --image registry.example.com/agent:latest \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","node_selector":{"pool":"gpu"}}}}'
+```
+
+If you omit `--image`, the gateway applies its default sandbox image when a sandbox is created from the template. Use this when the template should only define resource, environment, or driver settings.
+
+## Create a Sandbox from a Template
+
+```shell
+openshell sandbox create --template gpu-kata --provider github -- claude
+```
+
+The `--template` flag cannot be combined with inline workload flags such as `--from`, `--cpu`, `--memory`, `--gpu`, `--env`, or `--driver-config-json`. Put those values on the template instead. Create-time policy and provider attachments remain part of the sandbox request, so each sandbox can keep its own access boundary.
+
+## Manage Templates
+
+```shell
+openshell sandbox template list
+openshell sandbox template list --label-selector team=runtime
+openshell sandbox template get gpu-kata
+openshell sandbox template delete gpu-kata
+```
+
+Use `--all-workspaces` with `sandbox template list` when you need an admin view across workspaces:
+
+```shell
+openshell sandbox template list --all-workspaces
+```
+
+For JSON or YAML, template list output contains `templates` and
+`next_page_token` fields. Pass the returned token to `--page-token` to
+continue.
