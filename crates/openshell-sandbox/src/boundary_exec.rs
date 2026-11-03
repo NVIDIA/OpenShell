@@ -242,9 +242,7 @@ impl LocalBoundaryExec {
             self.policy.clone(),
             effective_workdir.map(str::to_string),
             #[cfg(target_os = "linux")]
-            prepared,
-            #[cfg(target_os = "linux")]
-            child_hardening,
+            crate::sandbox::linux::ChildSandboxInstall::new(prepared, child_hardening),
         )
         .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(target_os = "linux")]
@@ -352,9 +350,7 @@ impl LocalBoundaryExec {
             effective_workdir.map(str::to_string),
             slave_fd,
             #[cfg(target_os = "linux")]
-            prepared,
-            #[cfg(target_os = "linux")]
-            child_hardening,
+            crate::sandbox::linux::ChildSandboxInstall::new(prepared, child_hardening),
         )
         .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(target_os = "linux")]

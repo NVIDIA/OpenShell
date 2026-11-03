@@ -613,18 +613,22 @@ impl ProcessHandle {
         let prepared_sandbox = prepare_child_sandbox(policy, workspace.root(), &runtime_read_only)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
         #[cfg(target_os = "linux")]
-        let mut child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
+        let child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
             .map_err(|error| miette::miette!("prepare child self-protection filter: {error}"))?;
+        #[cfg(target_os = "linux")]
+        let child_install =
+            sandbox::linux::ChildSandboxInstall::new(prepared_sandbox, child_hardening);
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
         // SAFETY: pre_exec runs after fork but before exec in the child process.
         // setpgid and setns are async-signal-safe and safe to call in this context.
         {
-            // Wrap in Option so we can .take() it out of the FnMut closure.
+            // Rebind as mut so the FnMut closure can run the install, which
+            // takes the prepared sandbox out of its Option.
             // pre_exec is only called once (after fork, before exec).
             #[cfg(target_os = "linux")]
-            let mut prepared_sandbox = prepared_sandbox;
+            let mut child_install = child_install;
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
@@ -640,13 +644,13 @@ impl ProcessHandle {
                     harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
 
                     // Phase 2 (as unprivileged user): Enforce the prepared
-                    // Landlock ruleset via restrict_self() + apply seccomp.
+                    // Landlock ruleset via restrict_self() and install the
+                    // prebuilt seccomp filters.
                     // restrict_self() does not require root.
                     #[cfg(target_os = "linux")]
-                    if let Some(prepared) = prepared_sandbox.take() {
-                        sandbox::linux::enforce_capability_free(prepared, &mut child_hardening)
-                            .map_err(|err| std::io::Error::other(err.to_string()))?;
-                    }
+                    child_install
+                        .enforce()
+                        .map_err(|err| std::io::Error::other(err.to_string()))?;
 
                     Ok(())
                 });

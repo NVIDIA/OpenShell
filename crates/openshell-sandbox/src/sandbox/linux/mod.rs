@@ -14,36 +14,41 @@ use std::sync::Once;
 pub use landlock::require_abi as require_landlock_abi;
 
 /// Opaque handle to a prepared-but-not-yet-enforced sandbox.
-/// Holds the Landlock ruleset with `PathFds` opened before child exec.
+/// Holds the Landlock ruleset with `PathFds` opened before child exec,
+/// plus both seccomp filters already compiled to BPF programs.
 pub struct PreparedSandbox {
     landlock: Vec<landlock::PreparedRuleset>,
-    policy: SandboxPolicy,
+    seccomp: seccomp::PreparedSeccomp,
 }
 
 /// Phase 1: Prepare sandbox restrictions with strict path opening.
 ///
 /// Opens configured paths as the calling identity and handles failures according
-/// to the policy's Landlock compatibility mode.
+/// to the policy's Landlock compatibility mode. Both seccomp filters are
+/// compiled here as well, so the child never builds them after `fork`.
 /// The capability-free launch path uses [`prepare_capability_free`] instead.
 pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<PreparedSandbox> {
     let landlock = landlock::prepare(policy, workdir)?;
+    let seccomp = seccomp::prepare(policy)?;
     Ok(PreparedSandbox {
         landlock: landlock.into_iter().collect(),
-        policy: policy.clone(),
+        seccomp,
     })
 }
 
 /// Phase 1 for already-unprivileged workloads.
 ///
-/// Opens Landlock `PathFds` as the current workload UID.
+/// Opens Landlock `PathFds` as the current workload UID and compiles the
+/// seccomp filters.
 pub fn prepare_current_user(
     policy: &SandboxPolicy,
     workdir: Option<&str>,
 ) -> Result<PreparedSandbox> {
     let landlock = landlock::prepare_current_user(policy, workdir)?;
+    let seccomp = seccomp::prepare(policy)?;
     Ok(PreparedSandbox {
         landlock: landlock.into_iter().collect(),
-        policy: policy.clone(),
+        seccomp,
     })
 }
 
@@ -61,23 +66,21 @@ pub fn prepare_capability_free(
 ) -> Result<PreparedSandbox> {
     let baseline = landlock::prepare_capability_free_baseline()?;
     let user = landlock::prepare_current_user(policy, workdir)?;
+    let seccomp = seccomp::prepare(policy)?;
     let mut landlock = vec![baseline];
     landlock.extend(user);
-    Ok(PreparedSandbox {
-        landlock,
-        policy: policy.clone(),
-    })
+    Ok(PreparedSandbox { landlock, seccomp })
 }
 
 /// Phase 2: Enforce prepared sandbox restrictions in the child before exec.
 ///
-/// Calls `restrict_self()` for Landlock and applies seccomp filters.
-/// Neither operation requires root privileges.
+/// Calls `restrict_self()` for Landlock and installs the prebuilt seccomp
+/// filters. Neither operation requires root privileges.
 pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
     for ruleset in prepared.landlock {
         landlock::enforce(ruleset)?;
     }
-    seccomp::apply(&prepared.policy)?;
+    prepared.seccomp.install()?;
     Ok(())
 }
 
@@ -96,8 +99,46 @@ pub fn enforce_capability_free(
     child_hardening
         .install()
         .map_err(|error| miette::miette!("install child self-protection filter: {error}"))?;
-    seccomp::apply(&prepared.policy)?;
+    prepared.seccomp.install()?;
     Ok(())
+}
+
+/// Everything a spawned workload child installs between fork and exec.
+///
+/// Bundles the prepared Landlock rulesets and prebuilt seccomp filters
+/// ([`PreparedSandbox`]) with the same-UID child self-protection program so a
+/// spawn surface cannot wire one without the other. All compilation and path
+/// opening happens at construction, parent-side; the forked child only
+/// installs.
+pub struct ChildSandboxInstall {
+    prepared: Option<PreparedSandbox>,
+    child_hardening: crate::linux::child_seccomp::ChildHardeningProgram,
+}
+
+impl ChildSandboxInstall {
+    /// Bundle a prepared sandbox (if any) with its child hardening program.
+    #[must_use]
+    pub fn new(
+        prepared: Option<PreparedSandbox>,
+        child_hardening: crate::linux::child_seccomp::ChildHardeningProgram,
+    ) -> Self {
+        Self {
+            prepared,
+            child_hardening,
+        }
+    }
+
+    /// Enforce the bundled restrictions in the forked child before exec.
+    ///
+    /// A no-op when no sandbox was prepared, matching the previous optional
+    /// plumbing: the child hardening program is only installed alongside a
+    /// prepared sandbox.
+    pub(crate) fn enforce(&mut self) -> Result<()> {
+        let Some(prepared) = self.prepared.take() else {
+            return Ok(());
+        };
+        enforce_capability_free(prepared, &mut self.child_hardening)
+    }
 }
 
 /// Apply the supervisor seccomp prelude after privileged bootstrap completes.
