@@ -162,6 +162,10 @@ ocsf_emit!(event);
 
 - If you change sandbox infrastructure, ensure the relevant sandbox e2e path succeeds.
 
+## Release Publishers
+
+- Every release publisher (PyPI, snap, npm, docs, and similar) must stay dispatchable on its own with `workflow_dispatch` as well as `workflow_call`, so a failed publication can be finished without rerunning Release. See the Release workflows section in [CI.md](CI.md).
+
 ## Network Sockets
 
 - On latency-sensitive TCP streams, disable Nagle's algorithm so small
