@@ -2414,12 +2414,12 @@ mod linux {
         fn for_listener(listener: &BoundaryListenerConfig) -> Option<Self> {
             match listener {
                 BoundaryListenerConfig::Vsock { .. }
-                | BoundaryListenerConfig::RuntimeInitiatedVsock { .. }
-                | BoundaryListenerConfig::RuntimeInitiatedUnix { .. } => Some(Self {
+                | BoundaryListenerConfig::RuntimeInitiatedVsock { .. } => Some(Self {
                     run: Arc::new(flush_root_filesystem),
                     timeout: FILESYSTEM_FLUSH_TIMEOUT,
                 }),
                 BoundaryListenerConfig::Unix { .. }
+                | BoundaryListenerConfig::RuntimeInitiatedUnix { .. }
                 | BoundaryListenerConfig::TlsTcp { .. }
                 | BoundaryListenerConfig::RuntimeInitiatedTlsTcp { .. } => None,
             }
@@ -5789,6 +5789,19 @@ mod linux {
         fn availability_test_runtime_with(
             flush: Option<FilesystemFlush>,
         ) -> (Arc<BoundaryRuntime>, String) {
+            availability_test_runtime_with_listener(
+                BoundaryListenerConfig::TlsTcp {
+                    address: "127.0.0.1:5500".parse().unwrap(),
+                    tls: placeholder_server_tls(),
+                },
+                flush,
+            )
+        }
+
+        fn availability_test_runtime_with_listener(
+            listener: BoundaryListenerConfig,
+            flush: Option<FilesystemFlush>,
+        ) -> (Arc<BoundaryRuntime>, String) {
             let (broker, launcher) = test_network_broker();
             let (verification_key, token) = test_auth_material("availability");
             let mut runtime = BoundaryRuntime::new(
@@ -5801,10 +5814,7 @@ mod linux {
                     auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
                     gateway_id: "test-gateway".to_string(),
                     verification_keys: vec![verification_key],
-                    listener: BoundaryListenerConfig::TlsTcp {
-                        address: "127.0.0.1:5500".parse().unwrap(),
-                        tls: placeholder_server_tls(),
-                    },
+                    listener,
                     resource_claims: std::collections::BTreeMap::new(),
                     resource_claim_files: std::collections::BTreeMap::new(),
                     workload_identity: test_workload_identity(),
@@ -6075,14 +6085,22 @@ mod linux {
             };
             let flush = FilesystemFlush::for_listener(&vsock).expect("the VM backend flushes");
             assert_eq!(flush.timeout, FILESYSTEM_FLUSH_TIMEOUT);
-
-            let runtime_unix = BoundaryListenerConfig::RuntimeInitiatedUnix {
-                socket_path: "/run/openshell/vm-control.sock".into(),
+            let runtime_vsock = BoundaryListenerConfig::RuntimeInitiatedVsock {
+                host_port: 5500,
                 tls: tls.clone(),
             };
             assert!(
-                FilesystemFlush::for_listener(&runtime_unix).is_some(),
-                "the VM's runtime-initiated Unix listener must flush"
+                FilesystemFlush::for_listener(&runtime_vsock).is_some(),
+                "the VM's runtime-initiated vsock listener must flush"
+            );
+
+            let runtime_unix = BoundaryListenerConfig::RuntimeInitiatedUnix {
+                socket_path: "/run/openshell/container-control.sock".into(),
+                tls: tls.clone(),
+            };
+            assert!(
+                FilesystemFlush::for_listener(&runtime_unix).is_none(),
+                "runtime-initiated Unix is used by containers and must not flush"
             );
             let unix = BoundaryListenerConfig::Unix {
                 socket_path: "/run/openshell/control.sock".into(),
@@ -6110,6 +6128,24 @@ mod linux {
                 "a TCP-listener boundary must not install a flush"
             );
 
+            assert_eq!(
+                runtime.terminate_boundary().await,
+                Response::BoundaryTerminated
+            );
+            assert_eq!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Terminal
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn runtime_initiated_unix_container_termination_does_not_flush() {
+            let listener = BoundaryListenerConfig::RuntimeInitiatedUnix {
+                socket_path: "/run/openshell/container-control.sock".into(),
+                tls: placeholder_server_tls(),
+            };
+            let (runtime, _token) = availability_test_runtime_with_listener(listener, None);
+            assert!(runtime.filesystem_flush.is_none());
             assert_eq!(
                 runtime.terminate_boundary().await,
                 Response::BoundaryTerminated
