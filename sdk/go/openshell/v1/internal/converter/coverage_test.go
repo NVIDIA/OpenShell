@@ -126,6 +126,7 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 		"current_policy_version":    true,
 		"exit_code":                 true,
 		"configuration_admission":   true,
+		"ingress_admission":         true,
 		"restart_count":             true,
 		"next_restart_time":         true,
 		"main_process_started_time": true,
@@ -461,4 +462,8 @@ func assertAllFieldsCovered(
 			)
 		}
 	}
+}
+
+func TestConverterCoversAllProtoFields_SandboxIngressAdmission(t *testing.T) {
+	assertAllFieldsCovered(t, (&sandboxpb.SandboxIngressAdmission{}).ProtoReflect().Descriptor(), fieldSet{"scope": true, "all_ports": true, "ports": true}, nil)
 }

@@ -826,6 +826,15 @@ Press `c` in the Sandboxes panel to create a sandbox. In the optional Command fi
 
 ## Port Forwarding
 
+Compute drivers can restrict forwarding to an admitted set of ports. Declare
+forward ports when creating the sandbox; unadmitted targets are rejected before
+provisioning or opening a local listener. `openshell sandbox get <name> -o json`
+shows `ingress_admission` with its scope, port list and `all_ports` flag. A
+`shared_host_loopback` scope refers to an operator-approved host service, rather
+than a service isolated inside the sandbox. If an upgraded driver reports
+unknown or missing admission for an existing sandbox, recreate it with the
+required ports. A legacy driver leaves admission absent.
+
 Forward a local port to a running sandbox to access services inside it, such as a web server or database:
 
 ```shell

@@ -48,3 +48,6 @@ func listPageSize(opts []ListOptions) (int32, error) {
 	}
 	return int32(opts[0].PageSize), nil
 }
+
+// WithForwardPorts requests admission of target ports before creating a sandbox.
+var WithForwardPorts = types.WithForwardPorts

@@ -39,6 +39,16 @@ accept an operator-selected `IsolationBackendRegistration`, including its Unix,
 TCP, or vsock endpoint. The driver provisions the resource and delivers the
 backend's trusted launch metadata to the supervisor.
 
+Compute drivers that advertise `openshell.compute.ingress-admission` return
+an immutable ingress envelope from `ValidateSandboxCreate`: unsupported,
+isolated loopback, or explicitly admitted shared-host loopback, with all ports
+or an exact port set. The gateway checks create-time forwarding and exposure
+requests before provisioning and retains the envelope in sandbox status.
+Forwarding clients check it before opening local listeners; the gateway also
+checks live TCP relays and HTTP service routing before reusing connections.
+The isolation backend remains responsible for enforcing the target connection.
+Legacy absence is distinct from missing evidence under the negotiated contract.
+
 ## Who Owns What
 
 | Component | Owns |
@@ -50,3 +60,11 @@ backend's trusted launch metadata to the supervisor.
 For how `openshell-sandbox` enforces the boundary, refer to [Inside the Sandbox
 Boundary](/about/architecture#inside-the-sandbox-boundary). For driver-specific
 workload behavior, refer to [Runtimes](/how-it-works/sandboxes/runtimes).
+
+## Release compatibility
+
+These API changes target the next minor release and must not be backported into the `0.1.x` patch series. Upgrade gateway replicas together because older writers can drop the admitted ingress record.
+
+If a driver negotiated ingress admission but an existing sandbox has no retained record, recreate the sandbox with its required ports. A legacy driver that does not negotiate admission can still omit the record.
+
+For raw message changes, see the [SDK migration notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-sdk/README.md#next-minor-api-migration).

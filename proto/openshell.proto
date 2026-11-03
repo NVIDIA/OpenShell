@@ -1258,6 +1258,9 @@ message SandboxStatus {
   // failures before a configured endpoint or credential could be selected.
   // Matching grant success or a policy, provider, or supervisor reset clears it.
   TokenGrantFailureObservation last_token_grant_failure = 17;
+  // Gateway-retained immutable compute-driver ingress admission. Absence is
+  // legacy behavior only when the selected driver has not negotiated ingress.
+  openshell.sandbox.v1.SandboxIngressAdmission ingress_admission = 19;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -1344,6 +1347,9 @@ message CreateSandboxRequest {
   // registered after the sandbox has been persisted and route only while the
   // sandbox is ready.
   repeated SandboxServiceExposure service_exposures = 9;
+  // Requested local forward targets, checked before provisioning. This does
+  // not open a listener; clients establish the admitted forwards after create.
+  repeated uint32 forward_ports = 10;
 }
 
 // Update selected configuration of a stopped sandbox. Omitted fields are unchanged.

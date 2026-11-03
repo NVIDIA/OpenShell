@@ -1330,6 +1330,7 @@ impl KubernetesComputeDriver {
                 [
                     openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION
                         .to_string(),
+                    openshell_core::extension_protocol::COMPUTE_INGRESS_ADMISSION.to_string(),
                 ],
             )),
         })

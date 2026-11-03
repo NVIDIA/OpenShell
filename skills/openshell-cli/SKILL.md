@@ -823,6 +823,12 @@ CLI forwards ignore SSH multiplexing and automatic backgrounding settings in the
 user's SSH config. Only background forwards are tracked by `forward list` and
 managed by `forward stop`; foreground forwards end when the command exits.
 
+Forwarding and service exposure respect the compute driver's admitted target
+ports. Modern drivers reject unsupported or unadmitted ports before create
+provisioning or a local listener starts. Shared-host loopback scope means the
+target shares the compute host's network namespace; choose a different local
+port when the target already occupies that host port.
+
 Manage or iterate on the sandbox:
 
 ```bash

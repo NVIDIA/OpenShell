@@ -1130,16 +1130,17 @@ func TestTCPListen_TunnelFailureWithContextCancel(t *testing.T) {
 		srv.Stop()
 	}()
 
-	// Resolver always fails: Forward will error on every attempt.
-	resolver := &flippableResolver{
-		failErr: &StatusError{Code: ErrorUnavailable, Message: "permanent failure"},
-	}
+	// Admit the listener, then fail its per-connection tunnel setup.
+	resolver := &flippableResolver{}
 	client := newTCPClient(conn, resolver, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	ln, err := client.Listen(ctx, "default", "my-sandbox", 8080, 0)
 	require.NoError(t, err)
+	resolver.mu.Lock()
+	resolver.failErr = &StatusError{Code: ErrorUnavailable, Message: "permanent failure"}
+	resolver.mu.Unlock()
 
 	// Trigger a connection that will fail tunnel setup.
 	c, err := net.Dial("tcp", ln.Addr().String())
@@ -1155,4 +1156,20 @@ func TestTCPListen_TunnelFailureWithContextCancel(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return ln.Close() == nil
 	}, 5*time.Second, 10*time.Millisecond)
+}
+
+func TestTCPIngressAdmissionBeforeForwardOrListen(t *testing.T) {
+	mock := newMockTCPServer()
+	client, cleanup := setupTCPTest(t, mock)
+	defer cleanup()
+	client.sandboxes = &stubSandboxResolver{ingressAdmission: &SandboxIngressAdmission{Scope: IngressSharedHostLoopback, Ports: []uint32{8080}}}
+	conn, err := client.Forward(context.Background(), "default", "sb", 9090)
+	require.Error(t, err)
+	assert.Nil(t, conn)
+	listener, err := client.Listen(context.Background(), "default", "sb", 9090, 0)
+	require.Error(t, err)
+	assert.Nil(t, listener)
+	mock.mu.Lock()
+	assert.Nil(t, mock.lastInit)
+	mock.mu.Unlock()
 }
