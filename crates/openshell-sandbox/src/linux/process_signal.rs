@@ -25,7 +25,8 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::linux::seccomp_notify::{Notification, NotificationListener};
+use crate::linux::proc_status::thread_group_id;
+use crate::linux::seccomp_notify::{Notification, NotificationListener, scalar_int};
 use crate::linux::task_memory;
 
 /// Emulate one positive-target kill or `rt_sigqueueinfo` notification.
@@ -165,15 +166,6 @@ fn refuse_resume_while_frozen(signal: i32, workload_frozen: &AtomicBool) -> io::
     Ok(())
 }
 
-fn scalar_int(value: u64) -> i32 {
-    let bytes = value.to_ne_bytes();
-    #[cfg(target_endian = "little")]
-    let scalar = [bytes[0], bytes[1], bytes[2], bytes[3]];
-    #[cfg(target_endian = "big")]
-    let scalar = [bytes[4], bytes[5], bytes[6], bytes[7]];
-    i32::from_ne_bytes(scalar)
-}
-
 fn retain_signal_target(tid: u32, sandbox_tgid: u32) -> io::Result<(OwnedFd, u32)> {
     if sandbox_tgid == 0 {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
@@ -190,23 +182,6 @@ fn retain_signal_target(tid: u32, sandbox_tgid: u32) -> io::Result<(OwnedFd, u32
     let fd = i32::try_from(fd).map_err(|_| io::Error::other("pidfd does not fit RawFd"))?;
     // SAFETY: successful pidfd_open transferred this descriptor to the caller.
     Ok((unsafe { OwnedFd::from_raw_fd(fd) }, target_group))
-}
-
-fn thread_group_id(tid: u32) -> io::Result<u32> {
-    let status = std::fs::read_to_string(format!("/proc/{tid}/status")).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            io::Error::from_raw_os_error(libc::ESRCH)
-        } else {
-            error
-        }
-    })?;
-    status
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("Tgid:")
-                .and_then(|value| value.trim().parse::<u32>().ok())
-        })
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::ESRCH))
 }
 
 #[cfg(test)]
