@@ -2968,6 +2968,8 @@ mod tests {
                 replica_id.to_string(),
             );
             let unique = Arc::get_mut(&mut pool).expect("unique");
+            // Seeded members do not heartbeat; expiry tests use timed_replica.
+            unique.member_ttl = Duration::MAX;
             unique.unowned_grace = Duration::ZERO;
             unique.candidate_grace = Duration::ZERO;
             unique.takeovers_from = tokio::time::Instant::now();
