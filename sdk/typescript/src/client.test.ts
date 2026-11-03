@@ -2167,6 +2167,38 @@ describe('ssh sessions', () => {
 });
 
 describe('forward', () => {
+  it('rejects invalid targets before gateway access or binding a local port', async () => {
+    let reads = 0;
+    const sandbox = client({
+      getSandbox: () => {
+        reads++;
+        return readySandbox('sb', 'id');
+      },
+    });
+    for (const targetHost of ['example.com', '192.0.2.1', '::ffff:127.0.0.1', '::1%lo0', '[::1]', '']) {
+      await expect(sandbox.forward('sb', { targetHost, targetPort: 9000 })).rejects.toMatchObject({
+        code: 'invalid_config',
+        message: expect.stringContaining('tcp target host'),
+      });
+    }
+    for (const targetPort of [0, -1, 65536, 1.5, Number.NaN]) {
+      await expect(sandbox.forward('sb', { targetPort })).rejects.toMatchObject({
+        code: 'invalid_config',
+        message: '[invalid_config] tcp target port must be between 1 and 65535',
+      });
+    }
+    expect(reads).toBe(0);
+    for (const [targetHost, normalized] of [
+      [' LOCALHOST ', '127.0.0.1'],
+      ['127.2.3.4', '127.2.3.4'],
+      ['0:0:0:0:0:0:0:1', '::1'],
+    ]) {
+      const handle = await sandbox.forward('sb', { targetHost, targetPort: 9000 });
+      expect(handle.targetHost).toBe(normalized);
+      await handle.close();
+    }
+  });
+
   it('binds a local port and relays bytes both ways, minting + revoking a token', async () => {
     let sshReq: ScopedRequest = {};
     let revokedToken: string | undefined;
