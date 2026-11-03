@@ -629,8 +629,14 @@ impl ProcessHandle {
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
-        // SAFETY: pre_exec runs after fork but before exec in the child process.
-        // setpgid and setns are async-signal-safe and safe to call in this context.
+        // SAFETY: pre_exec runs after fork but before exec in the child of a
+        // multithreaded process. The hook uses raw session/process-group and
+        // TTY syscalls plus harden_child_process (rlimit/prctl), then installs
+        // only parent-prebuilt sandbox state; a best-effort Landlock failure
+        // crosses to the parent as one fixed-size pipe record. The success and
+        // degradation paths allocate nothing and emit no tracing or OCSF; only
+        // a hard error return may allocate, like std's own pre_exec error
+        // reporting.
         {
             // Rebind as mut so the FnMut closure can run the install, which
             // takes the prepared sandbox out of its Option.

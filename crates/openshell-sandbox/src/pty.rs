@@ -64,8 +64,13 @@ pub fn install_pre_exec(
 ) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     let mut install = install;
-    // SAFETY: all allocations and policy compilation happened before spawn;
-    // the hook performs only the audited child transition.
+    // SAFETY: the hook runs after fork in the child of a multithreaded
+    // process. It uses raw session/TTY syscalls and installs only
+    // parent-prebuilt sandbox state (Landlock rulesets, seccomp filters);
+    // a best-effort Landlock failure crosses to the parent as one
+    // fixed-size pipe record. The success and degradation paths allocate
+    // nothing and emit no tracing or OCSF; only a hard error return may
+    // allocate, like std's own pre_exec error reporting.
     unsafe {
         command.pre_exec(move || {
             setsid().map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -93,8 +98,13 @@ pub fn install_pre_exec_no_pty(
 ) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     let mut install = install;
-    // SAFETY: all allocations and policy compilation happened before spawn;
-    // the hook performs only the audited child transition.
+    // SAFETY: the hook runs after fork in the child of a multithreaded
+    // process. It uses raw process-group syscalls and installs only
+    // parent-prebuilt sandbox state (Landlock rulesets, seccomp filters);
+    // a best-effort Landlock failure crosses to the parent as one
+    // fixed-size pipe record. The success and degradation paths allocate
+    // nothing and emit no tracing or OCSF; only a hard error return may
+    // allocate, like std's own pre_exec error reporting.
     unsafe {
         command.pre_exec(move || {
             if libc::setpgid(0, 0) != 0 {
