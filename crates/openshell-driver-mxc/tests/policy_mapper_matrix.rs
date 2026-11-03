@@ -1143,10 +1143,7 @@ fn handled_fields_inventory() {
             m.insert("redactor".to_owned(), middleware_config());
             m
         },
-        // Additional policy payload fields are empty in this YAML fixture.
-        cedar_policy_source: String::new(),
-        provider_credential_rules: std::collections::HashMap::new(),
-        endpoint_settings: Vec::new(),
+        ..Default::default()
     };
 
     // Validate so the test itself doesn't carry a bad policy.
