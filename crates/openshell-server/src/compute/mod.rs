@@ -31,6 +31,7 @@ use hyper_util::rt::TokioIo;
 use openshell_core::extension_protocol::{
     ExtensionFamily, NegotiatedExtension, gateway_metadata, negotiate,
 };
+use openshell_core::filesystem_baseline::FilesystemBaseline;
 #[cfg(test)]
 use openshell_core::proto::ServiceAuthorizationMode;
 use openshell_core::proto::compute::v1::{
@@ -518,6 +519,8 @@ pub struct ComputeDriverInfoSnapshot {
     pub driver_reports_runtime_readiness: bool,
     /// Static portable resource request forms from the startup capability snapshot.
     pub resource_capabilities: Option<DriverResourceCapabilities>,
+    /// Trusted workload proxy prerequisites, present only after negotiation.
+    pub proxy_filesystem_baseline: Option<FilesystemBaseline>,
     /// Directory where rootfs tar files must be staged.
     pub rootfs_tar_staging_dir: String,
     /// Maximum rootfs tar file size in bytes.
@@ -1024,6 +1027,32 @@ impl ComputeRuntime {
             capabilities.extension.clone(),
         )
         .map_err(|error| ComputeError::Message(error.to_string()))?;
+        let declares_baseline =
+            negotiated_extension
+                .supported_capabilities
+                .iter()
+                .any(|capability| {
+                    capability
+                        == openshell_core::extension_protocol::COMPUTE_PROXY_FILESYSTEM_BASELINE
+                });
+        let proxy_filesystem_baseline = match (
+            declares_baseline,
+            capabilities.proxy_filesystem_baseline.clone(),
+        ) {
+            (false, None) => None,
+            (true, Some(descriptor)) => {
+                let baseline = FilesystemBaseline::from(descriptor);
+                baseline
+                    .validate()
+                    .map_err(|error| ComputeError::Message(error.to_string()))?;
+                Some(baseline)
+            }
+            _ => {
+                return Err(ComputeError::Message(
+                    "compute proxy filesystem baseline capability and descriptor must agree".into(),
+                ));
+            }
+        };
         info!(
             configured_driver = %driver_name,
             advertised_driver = %capabilities.driver_name,
@@ -1038,6 +1067,7 @@ impl ComputeRuntime {
             supports_sandbox_authentication: capabilities.supports_sandbox_authentication,
             driver_reports_runtime_readiness: capabilities.driver_reports_runtime_readiness,
             resource_capabilities: capabilities.resource_capabilities,
+            proxy_filesystem_baseline,
             rootfs_tar_staging_dir: capabilities.rootfs_tar_staging_dir,
             rootfs_tar_max_bytes: capabilities.rootfs_tar_max_bytes,
         };
@@ -1361,6 +1391,10 @@ impl ComputeRuntime {
     #[must_use]
     pub fn driver_info_snapshots(&self) -> &[ComputeDriverInfoSnapshot] {
         std::slice::from_ref(&self.driver_info)
+    }
+
+    pub(crate) fn proxy_filesystem_baseline(&self) -> Option<&FilesystemBaseline> {
+        self.driver_info.proxy_filesystem_baseline.as_ref()
     }
 
     #[must_use]
@@ -8545,6 +8579,7 @@ impl ComputeDriver for NoopTestDriver {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                proxy_filesystem_baseline: None,
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
                     ExtensionFamily::Compute,
                     "openshell/noop-test-driver",
@@ -8760,6 +8795,7 @@ pub fn new_test_runtime_with_driver(
             resource_capabilities: None,
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
+            proxy_filesystem_baseline: None,
         },
         telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
@@ -9202,6 +9238,7 @@ mod tests {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                proxy_filesystem_baseline: None,
                 extension: (!self.omit_protocol_metadata).then(|| {
                     let mut metadata = openshell_core::extension_protocol::extension_metadata(
                         ExtensionFamily::Compute,
@@ -9758,6 +9795,7 @@ mod tests {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                proxy_filesystem_baseline: None,
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
                     ExtensionFamily::Compute,
                     "openshell/controlled-test-driver",
@@ -10059,6 +10097,7 @@ mod tests {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                proxy_filesystem_baseline: None,
             },
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,
@@ -19182,6 +19221,83 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             .unwrap_err();
         assert_eq!(error.code(), Code::Unimplemented);
         assert!(runtime.image_update_driver.is_none());
+    }
+
+    #[tokio::test]
+    async fn proxy_filesystem_baseline_handshake_requires_a_valid_matching_descriptor() {
+        use crate::test_support::FakeComputeDriver;
+        use openshell_core::extension_protocol::COMPUTE_PROXY_FILESYSTEM_BASELINE;
+        use openshell_core::proto::compute::v1::ProxyFilesystemBaseline;
+
+        let valid = ProxyFilesystemBaseline {
+            read_only: vec!["/System".into()],
+            read_write: vec!["/dev".into()],
+        };
+        for (declared, descriptor, accepted) in [
+            (false, None, true),
+            (true, Some(ProxyFilesystemBaseline::default()), true),
+            (true, Some(valid.clone()), true),
+            (true, None, false),
+            (false, Some(valid), false),
+            (
+                true,
+                Some(ProxyFilesystemBaseline {
+                    read_only: vec!["/a/../b".into()],
+                    ..Default::default()
+                }),
+                false,
+            ),
+            (
+                true,
+                Some(ProxyFilesystemBaseline {
+                    read_only: vec!["/same".into()],
+                    read_write: vec!["/same".into()],
+                }),
+                false,
+            ),
+            (
+                true,
+                Some(ProxyFilesystemBaseline {
+                    read_only: vec!["/a".into(); 65],
+                    ..Default::default()
+                }),
+                false,
+            ),
+        ] {
+            let expected = descriptor.clone().map(FilesystemBaseline::from);
+            let driver = Arc::new(FakeComputeDriver::new().with_capabilities(
+                GetCapabilitiesResponse {
+                    proxy_filesystem_baseline: descriptor,
+                    extension: Some(openshell_core::extension_protocol::extension_metadata(
+                        ExtensionFamily::Compute,
+                        "openshell/test",
+                        "test",
+                        if declared {
+                            vec![COMPUTE_PROXY_FILESYSTEM_BASELINE.to_string()]
+                        } else {
+                            vec![]
+                        },
+                    )),
+                    ..Default::default()
+                },
+            ));
+            let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+            let result = ComputeRuntime::from_driver(
+                "test".into(),
+                driver,
+                None,
+                store,
+                SandboxIndex::new(),
+                SandboxWatchBus::new(),
+                TracingLogBus::new(),
+                Arc::new(SupervisorSessionRegistry::new()),
+            )
+            .await;
+            assert_eq!(result.is_ok(), accepted);
+            if let Ok(runtime) = result {
+                assert_eq!(runtime.proxy_filesystem_baseline(), expected.as_ref());
+            }
+        }
     }
 
     #[tokio::test]

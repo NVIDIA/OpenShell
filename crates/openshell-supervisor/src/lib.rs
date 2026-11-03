@@ -43,6 +43,7 @@ use std::time::Duration;
 use tracing::{Instrument as _, debug, info, warn};
 
 use openshell_core::PolicyValidationFailureMode;
+use openshell_core::filesystem_baseline::FilesystemBaseline;
 use openshell_supervisor_control::RegistrationTraceContext;
 
 use openshell_ocsf::{
@@ -1223,6 +1224,7 @@ pub async fn run_sandbox_instance(
         Some(image_discovery),
         &RemoteStartupGateway {
             gateway: gateway.clone(),
+            proxy_filesystem_baseline: selected_backend.proxy_filesystem_baseline().cloned(),
         },
     )
     .instrument(tracing::info_span!(parent: &startup, "supervisor.policy.load"))
@@ -2175,80 +2177,32 @@ fn proxy_baseline_paths() -> (Vec<String>, Vec<String>) {
     )
 }
 
-fn enrich_proto_baseline_paths_with<F>(
-    proto: &mut openshell_core::proto::SandboxPolicy,
-    ro: &[String],
-    rw: &[String],
-    path_exists: F,
-) -> bool
-where
-    F: Fn(&str) -> bool,
-{
-    if ro.is_empty() && rw.is_empty() {
-        return false;
-    }
-
-    let fs = proto
-        .filesystem
-        .get_or_insert_with(|| openshell_core::proto::FilesystemPolicy {
-            include_workdir: true,
-            ..Default::default()
-        });
-
-    let mut modified = false;
-    for path in ro {
-        if !fs.read_only.iter().any(|p| p == path) && !fs.read_write.iter().any(|p| p == path) {
-            if !path_exists(path) {
-                debug!(
-                    path,
-                    "Baseline read-only path does not exist, skipping enrichment"
-                );
-                continue;
-            }
-            fs.read_only.push(path.clone());
-            modified = true;
-        }
-    }
-    for path in rw {
-        if fs.read_write.iter().any(|p| p == path) {
-            continue;
-        }
-        if !path_exists(path) {
-            debug!(
-                path,
-                "Baseline read-write path does not exist, skipping enrichment"
-            );
-            continue;
-        }
-        if fs.read_only.iter().any(|p| p == path) {
-            continue;
-        }
-        fs.read_write.push(path.clone());
-        modified = true;
-    }
-
-    modified
-}
-
 /// Ensure a proto `SandboxPolicy` includes the baseline filesystem paths
 /// required by proxy-mode sandboxes. Paths are only added if
 /// missing; user-specified paths are never removed.
 ///
 /// Returns `true` if the policy was modified (caller may want to sync back).
-fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy) -> bool {
+fn enrich_proto_baseline_paths(
+    proto: &mut openshell_core::proto::SandboxPolicy,
+    baseline: Option<&FilesystemBaseline>,
+) -> bool {
     if proto.network_policies.is_empty() {
         return false;
     }
-    let (ro, rw) = proxy_baseline_paths();
-
-    // Baseline paths are system-injected, not user-specified.  Skip paths
-    // that do not exist in this container image to avoid noisy warnings from
-    // Landlock and, more critically, to prevent a single missing baseline
-    // path from abandoning the entire Landlock ruleset under best-effort
-    // mode (see issue #664).
-    let modified = enrich_proto_baseline_paths_with(proto, &ro, &rw, |path| {
-        std::path::Path::new(path).exists()
-    });
+    let modified = if let Some(baseline) = baseline {
+        // Backend-advertised paths belong to the workload namespace, not this
+        // supervisor's host filesystem. They are unconditional prerequisites.
+        baseline.enrich(proto, |_| true)
+    } else {
+        // Legacy Linux image defaults retain existence filtering: a missing
+        // path must not cause Landlock to abandon the ruleset (issue #664).
+        let (read_only, read_write) = proxy_baseline_paths();
+        FilesystemBaseline {
+            read_only,
+            read_write,
+        }
+        .enrich(proto, |path| std::path::Path::new(path).exists())
+    };
 
     if modified {
         ocsf_emit!(
@@ -2284,17 +2238,22 @@ fn proto_sync_payload_for_enriched_policy(
 /// Ensure a `SandboxPolicy` (Rust type) includes the baseline filesystem
 /// paths required by proxy-mode sandboxes. Used for the
 /// local-file code path where no proto is available.
-fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
+fn enrich_sandbox_baseline_paths(
+    policy: &mut SandboxPolicy,
+    baseline: Option<&FilesystemBaseline>,
+) {
     if !matches!(policy.network.mode, NetworkMode::Proxy) {
         return;
     }
-    let (ro, rw) = proxy_baseline_paths();
+    let (ro, rw) = baseline.map_or_else(proxy_baseline_paths, |baseline| {
+        (baseline.read_only.clone(), baseline.read_write.clone())
+    });
 
     let mut modified = false;
     for path in &ro {
         let p = std::path::PathBuf::from(path);
         if !policy.filesystem.read_only.contains(&p) && !policy.filesystem.read_write.contains(&p) {
-            if !p.exists() {
+            if baseline.is_none() && !p.exists() {
                 debug!(
                     path,
                     "Baseline read-only path does not exist, skipping enrichment"
@@ -2310,7 +2269,7 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
         if policy.filesystem.read_only.contains(&p) || policy.filesystem.read_write.contains(&p) {
             continue;
         }
-        if !p.exists() {
+        if baseline.is_none() && !p.exists() {
             debug!(
                 path,
                 "Baseline read-write path does not exist, skipping enrichment"
@@ -2395,7 +2354,7 @@ mod baseline_tests {
             },
         );
 
-        enrich_proto_baseline_paths(&mut policy);
+        enrich_proto_baseline_paths(&mut policy, None);
 
         let filesystem = policy.filesystem.expect("filesystem policy");
         assert!(filesystem.read_only.contains(&"/proc".to_string()));
@@ -2509,7 +2468,7 @@ mod baseline_tests {
         );
         let original = policy.clone();
 
-        let enriched = enrich_proto_baseline_paths(&mut policy);
+        let enriched = enrich_proto_baseline_paths(&mut policy, None);
 
         assert!(!enriched);
         assert_eq!(policy, original);
@@ -2533,7 +2492,7 @@ mod baseline_tests {
             process: ProcessPolicy::default(),
         };
 
-        enrich_sandbox_baseline_paths(&mut policy);
+        enrich_sandbox_baseline_paths(&mut policy, None);
 
         assert!(
             policy.filesystem.read_only.contains(&PathBuf::from("/tmp")),
@@ -2546,6 +2505,57 @@ mod baseline_tests {
                 .contains(&PathBuf::from("/tmp")),
             "baseline enrichment must not promote explicit read_only /tmp to read_write"
         );
+    }
+
+    #[test]
+    fn selected_backend_baseline_replaces_linux_defaults_in_both_policy_formats() {
+        let baseline = FilesystemBaseline {
+            read_only: vec!["/platform-runtime-not-on-host".into()],
+            read_write: vec!["/explicit-read-only".into()],
+        };
+        for baseline in [baseline, FilesystemBaseline::default()] {
+            baseline.validate().unwrap();
+            let mut proto = openshell_policy::restrictive_default_policy();
+            proto.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+                read_only: vec!["/explicit-read-only".into()],
+                ..Default::default()
+            });
+            proto.network_policies.insert(
+                "proxy".into(),
+                openshell_core::proto::NetworkPolicyRule::default(),
+            );
+            enrich_proto_baseline_paths(&mut proto, Some(&baseline));
+            let filesystem = proto.filesystem.unwrap();
+            let mut expected = vec!["/explicit-read-only".to_string()];
+            expected.extend(baseline.read_only.iter().cloned());
+            assert_eq!(filesystem.read_only, expected);
+            assert!(filesystem.read_write.is_empty());
+
+            let mut local = SandboxPolicy {
+                version: 1,
+                filesystem: FilesystemPolicy {
+                    read_only: vec!["/explicit-read-only".into()],
+                    read_write: vec![],
+                    include_workdir: false,
+                },
+                network: NetworkPolicy {
+                    mode: NetworkMode::Proxy,
+                    proxy: None,
+                },
+                landlock: LandlockPolicy::default(),
+                process: ProcessPolicy::default(),
+            };
+            enrich_sandbox_baseline_paths(&mut local, Some(&baseline));
+            assert_eq!(
+                local.filesystem.read_only,
+                expected.iter().map(PathBuf::from).collect::<Vec<_>>()
+            );
+            assert!(local.filesystem.read_write.is_empty());
+            local.network.mode = NetworkMode::Block;
+            let original = local.filesystem.read_only.clone();
+            enrich_sandbox_baseline_paths(&mut local, Some(&baseline));
+            assert_eq!(local.filesystem.read_only, original);
+        }
     }
 }
 
@@ -2624,6 +2634,9 @@ where
 }
 
 trait StartupGateway: Send + Sync {
+    fn proxy_filesystem_baseline(&self) -> Option<FilesystemBaseline> {
+        None
+    }
     fn snapshot(
         &self,
         sandbox: &str,
@@ -2650,6 +2663,7 @@ trait StartupGateway: Send + Sync {
 
 struct RemoteStartupGateway {
     gateway: Option<openshell_core::grpc_client::GatewayEndpoint>,
+    proxy_filesystem_baseline: Option<FilesystemBaseline>,
 }
 
 impl RemoteStartupGateway {
@@ -2661,6 +2675,9 @@ impl RemoteStartupGateway {
 }
 
 impl StartupGateway for RemoteStartupGateway {
+    fn proxy_filesystem_baseline(&self) -> Option<FilesystemBaseline> {
+        self.proxy_filesystem_baseline.clone()
+    }
     async fn snapshot(
         &self,
         sandbox: &str,
@@ -2822,6 +2839,7 @@ async fn load_policy(
         None,
         &RemoteStartupGateway {
             gateway: openshell_gateway,
+            proxy_filesystem_baseline: None,
         },
     )
     .await
@@ -2853,6 +2871,12 @@ async fn load_policy_with_gateway(
     Option<CapturedProviderEnvironment>,
 )> {
     use openshell_core::proto::ConfigurationAdmissionState;
+    let proxy_baseline = gateway.proxy_filesystem_baseline();
+    if let Some(baseline) = &proxy_baseline {
+        baseline
+            .validate()
+            .map_err(|error| miette::miette!(error))?;
+    }
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
         if sandbox_id.is_some() && openshell_gateway.is_some() {
@@ -2906,7 +2930,7 @@ async fn load_policy_with_gateway(
             landlock: config.landlock,
             process: config.process,
         };
-        enrich_sandbox_baseline_paths(&mut policy);
+        enrich_sandbox_baseline_paths(&mut policy, proxy_baseline.as_ref());
         // File mode has no operator-registered middleware to connect.
         return Ok((
             policy,
@@ -2996,7 +3020,7 @@ async fn load_policy_with_gateway(
                 };
                 // Enrich before syncing so the gateway baseline includes
                 // baseline paths from the start.
-                enrich_proto_baseline_paths(&mut discovered);
+                enrich_proto_baseline_paths(&mut discovered, proxy_baseline.as_ref());
                 strip_proto_provider_policy_entries(&mut discovered);
                 // Sync and re-fetch over a single connection to avoid extra
                 // TLS handshakes.
@@ -3057,7 +3081,7 @@ async fn load_policy_with_gateway(
             // a sandbox-sourced policy is written back. The gateway refuses
             // every sandbox policy write while a global policy is active, so a
             // global policy keeps the added paths in this process only.
-            let enriched = enrich_proto_baseline_paths(&mut proto_policy);
+            let enriched = enrich_proto_baseline_paths(&mut proto_policy, proxy_baseline.as_ref());
             let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched)
                 .filter(|_| snapshot.policy_source == openshell_core::proto::PolicySource::Sandbox);
             if let Some(sync_policy) = sync_policy {
@@ -5290,7 +5314,7 @@ network_policies:
     async fn startup_rejects_vm_identity_until_matching_policy_is_available() {
         use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
         let mut policy = proto_policy_fixture();
-        enrich_proto_baseline_paths(&mut policy);
+        enrich_proto_baseline_paths(&mut policy, None);
         policy.process = Some(openshell_core::proto::ProcessPolicy {
             run_as_user: "10000".into(),
             run_as_group: "1001".into(),
@@ -5433,7 +5457,7 @@ network_policies:
     async fn startup_pending_gateway_calls_exhaust_their_budgets() {
         for pending_snapshot in [true, false] {
             let mut policy = proto_policy_fixture();
-            enrich_proto_baseline_paths(&mut policy);
+            enrich_proto_baseline_paths(&mut policy, None);
             let (reports, _reported) = tokio::sync::mpsc::unbounded_channel();
             let gateway = TestStartupGateway {
                 desired: Arc::new(std::sync::Mutex::new(settings_poll_result(
@@ -5558,7 +5582,7 @@ network_policies:
     async fn startup_waits_for_repair_and_retries_stale_activation_before_returning() {
         use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
         let mut policy = proto_policy_fixture();
-        enrich_proto_baseline_paths(&mut policy);
+        enrich_proto_baseline_paths(&mut policy, None);
         let mut rejected = settings_poll_result(Some(policy), 1, PolicySource::Sandbox);
         rejected.configuration_admitted = false;
         let (reports, mut reported) = tokio::sync::mpsc::unbounded_channel();
@@ -6007,7 +6031,7 @@ network_policies:
         // paths, so startup writes an enriched copy back. The repaired policy
         // already carries those paths and needs no write-back.
         let mut repaired = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut repaired));
+        assert!(enrich_proto_baseline_paths(&mut repaired, None));
         assert_refused_startup_write_waits_for_repair(
             settings_poll_result(
                 Some(proto_tcp_policy_fixture()),
@@ -6135,7 +6159,7 @@ network_policies:
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_baseline_repair_before_report_refetches() {
         let mut repaired = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut repaired));
+        assert!(enrich_proto_baseline_paths(&mut repaired, None));
         Box::pin(assert_startup_repair_before_rejection_refetches(
             settings_poll_result(
                 Some(proto_tcp_policy_fixture()),
@@ -6281,7 +6305,7 @@ network_policies:
     async fn startup_policy_write_refusal_write_back_outlasts_the_attempt_limit() {
         // The same limit applies to a refused baseline-path write-back.
         let mut repaired = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut repaired));
+        assert!(enrich_proto_baseline_paths(&mut repaired, None));
         assert_refused_startup_write_waits_for_repair(
             settings_poll_result(
                 Some(proto_tcp_policy_fixture()),
@@ -6378,7 +6402,7 @@ network_policies:
         global.global_policy_version = 1;
         let global_generation = report_generation(&global);
         let mut enriched = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut enriched));
+        assert!(enrich_proto_baseline_paths(&mut enriched, None));
         let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
         let gateway = WriteRefusingStartupGateway {
             desired: Arc::new(std::sync::Mutex::new(global)),

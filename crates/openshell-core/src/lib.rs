@@ -29,6 +29,7 @@ pub mod error;
 pub mod extension_protocol;
 #[cfg(unix)]
 pub mod external_driver_socket;
+pub mod filesystem_baseline;
 pub mod forward;
 pub mod google_cloud;
 pub mod gpu;
