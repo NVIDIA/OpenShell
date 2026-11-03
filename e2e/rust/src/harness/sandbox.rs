@@ -676,7 +676,6 @@ impl SandboxGuard {
         if self.cleaned_up {
             return;
         }
-        self.cleaned_up = true;
 
         // Kill the background child process if present.
         if let Some(ref mut child) = self.child {
@@ -690,6 +689,8 @@ impl SandboxGuard {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
         let _ = cmd.status().await;
+        // Cancellation leaves Drop responsible until the delete command returns.
+        self.cleaned_up = true;
     }
 }
 
@@ -721,6 +722,79 @@ impl Drop for SandboxGuard {
 #[cfg(test)]
 mod tests {
     use super::{has_explicit_sandbox_name, has_explicit_sandbox_workload};
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_cleanup_finishes_deletion_before_drop_returns() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        const CHILD_DIRECTORY: &str = "OPENSHELL_E2E_TEST_CLEANUP_CANCEL_DIR";
+        if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+            let directory = std::path::PathBuf::from(directory);
+            let mut guard = super::SandboxGuard::manage_existing("cleanup-cancellation".into());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut cleanup = std::pin::pin!(guard.cleanup());
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !directory.join("started").exists() {
+                        tokio::select! {
+                            () = &mut cleanup => panic!("delete must remain pending until cancellation"),
+                            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                        }
+                    }
+                })
+                .await
+                .expect("delete command did not start");
+            });
+            drop(guard);
+            assert!(
+                directory.join("completed").exists(),
+                "cancelled cleanup must complete deletion during Drop"
+            );
+            return;
+        }
+
+        // Isolate the binary override from tests running in the parent process.
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("openshell");
+        std::fs::write(
+            &binary,
+            r#"#!/bin/sh
+set -eu
+test "$1" = sandbox
+test "$2" = delete
+test "$3" = cleanup-cancellation
+if [ -f "$OPENSHELL_E2E_TEST_CLEANUP_CANCEL_DIR/started" ]; then
+    : > "$OPENSHELL_E2E_TEST_CLEANUP_CANCEL_DIR/completed"
+    exit 0
+fi
+: > "$OPENSHELL_E2E_TEST_CLEANUP_CANCEL_DIR/started"
+exec sleep 60
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "harness::sandbox::tests::cancelled_cleanup_finishes_deletion_before_drop_returns",
+                "--nocapture",
+            ])
+            .env(CHILD_DIRECTORY, directory.path())
+            .env("OPENSHELL_BIN", &binary)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && directory.path().join("completed").is_file(),
+            "cleanup cancellation regression failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn detects_explicit_sandbox_names() {
