@@ -10698,6 +10698,20 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_state_dirs_stay_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = unique_temp_dir();
+        let dir = base.join("sandboxes").join("sandbox-123");
+        create_private_dir_all(&dir).await.unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[tokio::test]
     async fn sandbox_request_metadata_round_trips_for_start() {
         let base = unique_temp_dir();
