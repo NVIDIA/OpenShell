@@ -207,6 +207,7 @@ impl Listener {
     #[cfg(unix)]
     fn bind_unix(path: &std::path::Path) -> std::io::Result<Self> {
         use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+        openshell_core::unix_socket_path::check(path)?;
         // The driver owns the containing directory. Never replace a live socket,
         // another user's inode, or a non-socket (including symlinks).
         match std::fs::symlink_metadata(path) {
