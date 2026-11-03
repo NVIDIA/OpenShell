@@ -2942,18 +2942,20 @@ pub async fn sandbox_list(
     // Print header
     if all_workspaces {
         println!(
-            "{:<ws_width$}  {:<name_width$}  {:<created_width$}  {}",
+            "{:<ws_width$}  {:<name_width$}  {:<created_width$}  {}  {}",
             "WORKSPACE".bold(),
             "NAME".bold(),
             "CREATED".bold(),
             "PHASE".bold(),
+            "REASON".bold(),
         );
     } else {
         println!(
-            "{:<name_width$}  {:<created_width$}  {}",
+            "{:<name_width$}  {:<created_width$}  {}  {}",
             "NAME".bold(),
             "CREATED".bold(),
             "PHASE".bold(),
+            "REASON".bold(),
         );
     }
 
@@ -2981,25 +2983,40 @@ pub async fn sandbox_list(
                 .as_ref()
                 .map_or(0, |m| proto_timestamp_ms(m.created_time.as_ref())),
         );
+        let reason = sandbox_list_driver_reason(&sandbox);
         if all_workspaces {
             println!(
-                "{:<ws_width$}  {:<name_width$}  {:<created_width$}  {}",
+                "{:<ws_width$}  {:<name_width$}  {:<created_width$}  {}  {}",
                 sandbox.object_workspace().to_string(),
                 sandbox.object_name().to_string(),
                 created,
                 phase_colored,
+                reason,
             );
         } else {
             println!(
-                "{:<name_width$}  {:<created_width$}  {}",
+                "{:<name_width$}  {:<created_width$}  {}  {}",
                 sandbox.object_name().to_string(),
                 created,
                 phase_colored,
+                reason,
             );
         }
     }
 
     Ok(())
+}
+
+fn sandbox_list_driver_reason(sandbox: &Sandbox) -> &str {
+    sandbox
+        .status
+        .as_ref()
+        .and_then(|status| {
+            status.conditions.iter().find(|condition| {
+                condition.r#type == "Ready" && condition.reason == "ComputeDriverMismatch"
+            })
+        })
+        .map_or("-", |condition| condition.message.as_str())
 }
 
 fn configuration_failure_message(sandbox: &Sandbox) -> Option<&str> {

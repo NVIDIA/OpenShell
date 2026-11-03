@@ -2552,6 +2552,7 @@ pub async fn handle_connect_supervisor(
     // record, so registration detects publications the bootstrap may miss.
     let captured_seq = pushes_config.then(|| state.config_delivery.publications());
     let sandbox = require_persisted_sandbox(&state.store, &sandbox_id).await?;
+    state.compute.validate_compute_driver_binding(&sandbox)?;
     // Validate readiness identities before replacing a healthy session.
     let provider_readiness = ProviderReadinessEvidence::from_hello(&hello)?;
 
@@ -3170,6 +3171,89 @@ mod tests {
             state
                 .supervisor_sessions
                 .is_current_session("sb-legacy", &accepted.session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_supervisor_reconnect_and_exit_callbacks_keep_record_unchanged() {
+        use crate::grpc::test_support::{
+            reconnect_supervisor_stream, test_server_state_with_driver,
+        };
+
+        let state = test_server_state_with_driver("docker").await;
+        let mut sandbox = sandbox_record("sb-foreign", "sb-foreign");
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        sandbox.metadata.as_mut().unwrap().annotations.insert(
+            crate::compute::CREATED_BY_DRIVER_ANNOTATION.to_string(),
+            "vm".to_string(),
+        );
+        sandbox
+            .status
+            .get_or_insert_with(Default::default)
+            .main_process_instance_id = "instance".to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+        let stored = state
+            .store
+            .get_message::<Sandbox>("sb-foreign")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let error = reconnect_supervisor_stream(&state, "sb-foreign", StreamFeatures::Legacy)
+            .await
+            .err()
+            .expect("foreign supervisor reconnect must be refused");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("compute driver 'vm'"));
+
+        let error = handle_report_main_process_exit(
+            &state,
+            Request::new(ReportMainProcessExitRequest {
+                sandbox_id: "sb-foreign".into(),
+                instance_id: "instance".into(),
+                exit_code: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("compute driver 'vm'"));
+
+        let error = handle_finalize_main_process_exit(
+            &state,
+            Request::new(openshell_core::proto::FinalizeMainProcessExitRequest {
+                sandbox_id: "sb-foreign".into(),
+                instance_id: "instance".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("compute driver 'vm'"));
+
+        for result in [
+            state
+                .compute
+                .supervisor_session_connected("sb-foreign", "instance")
+                .await,
+            state
+                .compute
+                .supervisor_session_disconnected("sb-foreign", false)
+                .await,
+            state
+                .compute
+                .cleanup_finalized_ephemeral_sandbox("sb-foreign", "instance")
+                .await,
+        ] {
+            assert!(result.unwrap_err().contains("compute driver 'vm'"));
+        }
+        assert_eq!(
+            state
+                .store
+                .get_message::<Sandbox>("sb-foreign")
+                .await
+                .unwrap(),
+            Some(stored),
         );
     }
 
