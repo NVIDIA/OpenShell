@@ -42,7 +42,7 @@ const DNS_RELAY_ADDRESS: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new
     53,
 ));
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const NETWORK_DECISION_TIMEOUT: Duration = Duration::from_secs(30);
+pub const NETWORK_DECISION_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn retry_notification_receive(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(libc::ENOENT)
@@ -240,7 +240,7 @@ impl NetworkBroker {
         Self::start_with_dns_address(listener, DNS_RELAY_ADDRESS, protected_control_port)
     }
 
-    #[cfg(any(test, feature = "perf-harness"))]
+    #[cfg(test)]
     pub(crate) fn start_for_test(listener: NotificationListener) -> io::Result<Self> {
         Self::start_with_dns_address(
             listener,
@@ -268,6 +268,46 @@ impl NetworkBroker {
         protected_control_port: Option<u16>,
         decision_timeout: Duration,
     ) -> io::Result<Self> {
+        Self::start_with_resolver(
+            listener,
+            dns_address,
+            protected_control_port,
+            decision_timeout,
+            ProcfsIdentityResolver::for_pid_namespace(),
+        )
+    }
+
+    /// Test and perf-harness broker whose identity resolution is bounded by
+    /// `identity_root` (the calling process) rather than the PID namespace.
+    ///
+    /// The namespace walk climbs the whole host ancestry and fails where an
+    /// ancestor's `/proc/<pid>/exe` is unreadable (any nondumpable daemon
+    /// directly under init), which would skip the cold hash a test or the
+    /// perf harness's cold-connect load wants to force. A process-tree root
+    /// stops the walk inside the calling process. Production constructors
+    /// keep the namespace scope.
+    #[cfg(any(test, feature = "perf-harness"))]
+    pub(crate) fn start_with_identity_root(
+        listener: NotificationListener,
+        decision_timeout: Duration,
+        identity_root: u32,
+    ) -> io::Result<Self> {
+        Self::start_with_resolver(
+            listener,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            None,
+            decision_timeout,
+            ProcfsIdentityResolver::for_process_tree(identity_root),
+        )
+    }
+
+    fn start_with_resolver(
+        listener: NotificationListener,
+        dns_address: SocketAddr,
+        protected_control_port: Option<u16>,
+        decision_timeout: Duration,
+        identity_resolver: ProcfsIdentityResolver,
+    ) -> io::Result<Self> {
         let listener = Arc::new(listener);
         let (pending_tx, pending_rx) = mpsc::channel(OPEN_QUEUE_CAPACITY);
         let (pending_dns_tx, pending_dns_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
@@ -282,7 +322,7 @@ impl NetworkBroker {
             provider_files: provider_files.clone(),
             workload_frozen: workload_frozen.clone(),
             protected_control_port,
-            identity_resolver: ProcfsIdentityResolver::for_pid_namespace(),
+            identity_resolver,
             pending: pending_tx,
             dns_relay,
             active_opens,
