@@ -3865,7 +3865,7 @@ mod tests {
         inner.config.auth.allow_unauthenticated_users = false;
         inner.config.mtls_auth.enabled = false;
         inner.config.auth.discovery_grants_file = Some(dir.path().join("grants.json"));
-        inner.config.supervisor_app_listener.enabled = false;
+        inner.config.supervisor_app_listener.enabled = true;
         inner.config.tls = Some(openshell_core::TlsConfig {
             cert_path: dir.path().join("server-cert.pem"),
             key_path: dir.path().join("server-key.pem"),
