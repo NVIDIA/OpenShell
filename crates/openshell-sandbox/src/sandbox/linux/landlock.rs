@@ -186,7 +186,10 @@ fn capability_free_baseline_entries(
     )
     .into_diagnostic()?;
     // The reserved root itself must not redirect private child mounts into an
-    // allowed subtree. Pin and validate it independently of the public entries.
+    // allowed subtree. Validate it eagerly and independently of the public
+    // entries: when present it must be a real directory. The descriptor only
+    // backs this check and is dropped before any per-entry descriptor is
+    // opened; exclusion during enumeration is by name plus O_NOFOLLOW.
     // Absence is allowed for qualification before driver bootstrap is staged.
     let _private_root = match openat(
         &root_fd,
