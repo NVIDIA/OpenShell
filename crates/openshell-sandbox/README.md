@@ -25,6 +25,26 @@ the last workload reference to a listener removes it without waiting for registr
 collection. Broker source descriptors always use close-on-exec independently of
 the workload's requested descriptor flags.
 
+External TCP connects run their connect-time identity resolution on a
+per-connect `openshell-network-open` worker, not on the broker thread. The broker
+performs the registry and protected-port checks plus a slot-saturation
+pre-check, acquires one of the bounded resolution permits, and spawns the
+worker; the worker resolves the connecting binary
+(procfs ancestry plus a cold SHA-256 per executable), acquires one of the
+bounded open slots, and queues the open for the supervisor. Three bounds
+apply: the resolution permit, acquired before the spawn, caps concurrent
+open workers; the resolve lock caps cold hashing at one at a time; and the
+open slots, acquired after the resolve, cap opens queued awaiting
+supervisor decisions, so a held slot is bounded by the decision timeout.
+Resolves are
+serialized across the connect workers, so a burst of connects from one
+uncached binary pays one cold hash followed by digest-cache hits, matching
+the aggregate work of the pre-worker serialization on the broker thread.
+Mediated opens therefore never
+queue behind connect-time identity work. Permit, slot, or queue pressure is
+answered with `EAGAIN`, and the resolve stays inside the
+`notification_to_queue` telemetry window.
+
 A boundary configured with `RuntimeInitiatedTlsTcp` binds no listener. It dials
 only the driver-provided supervisor addresses, which must be concrete,
 non-loopback, and share one port, and serves TLS and gRPC over that outbound
