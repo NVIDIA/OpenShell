@@ -837,6 +837,7 @@ mod tests {
             authed_request(WatchServiceRoutesRequest {
                 workspaces: Vec::new(),
                 workspace_scope: request().workspace_scope,
+                workspaces: Vec::new(),
             }),
         )
         .await
