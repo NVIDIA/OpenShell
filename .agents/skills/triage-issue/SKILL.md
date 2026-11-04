@@ -15,6 +15,11 @@ For a specific issue, assess it when requested. For batch triage, first show the
 
 Do not apply an acceptance state, place issues on the roadmap, or make a product investment decision. Do not introduce `agent:*` workflow labels. Follow `SECURITY.md` if the report may disclose a vulnerability; do not copy sensitive details into a public comment.
 
+Follow [Labeling and Notifications](../../../CONTRIBUTING.md#labeling-and-notifications):
+defer area/topic classification labels until the work is accepted. They drive
+subscriber notifications, so technical classification alone must not send
+unaccepted intake to those streams. Continue to record appropriate triage state.
+
 ## Assess one issue
 
 1. Run `gh issue view <id> --json number,title,body,state,labels,author,comments`. Follow Label Discovery in `CONTRIBUTING.md` to retrieve every page of current `state:*` label definitions and resolve unclear meanings. Check for previous triage, new human evidence, an existing owner, and duplicate issues.

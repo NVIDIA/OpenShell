@@ -267,6 +267,11 @@ must be accepted and list the PR author as its submitter or a current assignee.
 The label does not replace the issue-acceptance gate or merge approvals. Do not
 manually apply it as a substitute for satisfying the automated rule.
 
+Apply area/topic classification labels only once the PR represents accepted
+work, following [Labeling and Notifications](../../../CONTRIBUTING.md#labeling-and-notifications).
+These labels drive filtered subscriber notifications, including the GitHub app
+in Slack; do not apply them to unaccepted work just because its scope is known.
+
 ### Monitor Workflow Run (Optional)
 
 If the user asks to wait for a green CI before posting the RFR, use this snippet to monitor the workflow run:
