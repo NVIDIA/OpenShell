@@ -104,8 +104,8 @@ run = "uv run --no-project python -m unittest discover -s tasks/scripts -p check
 hide = true
 
 ["test:accepted-work"]
-description = "Test accepted-work PR labeling"
-run = "uv run --no-project python -m unittest discover -s tasks/scripts -p label_accepted_work_test.py"
+description = "Test the shared accepted-work library"
+run = "uv run --no-project python -m unittest discover -s tasks/scripts -p accepted_work_test.py"
 hide = true
 
 [e2e]

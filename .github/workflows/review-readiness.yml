@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  issues: read
   pull-requests: write
 
 concurrency:
@@ -19,11 +20,11 @@ jobs:
   reviewers:
     name: OpenShell / Review Readiness
     if: >-
-      !github.event.pull_request.draft &&
-      (github.event.action == 'opened' ||
-       github.event.action == 'ready_for_review' ||
-       startsWith(github.event.label.name, 'area:') ||
-       startsWith(github.event.label.name, 'topic:'))
+      github.event.action == 'opened' ||
+      (!github.event.pull_request.draft &&
+       (github.event.action == 'ready_for_review' ||
+        startsWith(github.event.label.name, 'area:') ||
+        startsWith(github.event.label.name, 'topic:')))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -31,18 +32,27 @@ jobs:
       - name: Check out the reviewer roster and helper
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: |
             REVIEWERS.md
+            MAINTAINERS.md
             tasks/scripts/check_review_readiness.py
+            tasks/scripts/accepted_work.py
+            tasks/scripts/check_maintainer_approval.py
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
-      - name: Reconcile reviewer requests
+      - name: Label newly opened accepted work and reconcile reviewers
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_ACTION: ${{ github.event.action }}
+        shell: bash
         run: |
-          python3 tasks/scripts/check_review_readiness.py \
-            --repo "$GH_REPO" --pr "$PR_NUMBER" --apply
+          set -euo pipefail
+          args=(--repo "$GH_REPO" --pr "$PR_NUMBER" --apply)
+          if [ "$PR_ACTION" = opened ]; then
+            args+=(--label-accepted-work)
+          fi
+          python3 tasks/scripts/check_review_readiness.py "${args[@]}"
