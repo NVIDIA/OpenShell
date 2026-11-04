@@ -476,6 +476,13 @@ impl WireMessage for w::ProcessEventWire {
                 }),
             }),
             time: Some(timestamp(u64::try_from(self.time_ms).map_err(invalid)?)?),
+            command_line: self
+                .command_line
+                .as_ref()
+                .map(|command_line| p::CommandLine {
+                    arguments: command_line.arguments.clone(),
+                    truncated: command_line.truncated,
+                }),
         })
     }
     fn from_proto(v: Self::Proto) -> Result<Self, FrameError> {
@@ -505,6 +512,10 @@ impl WireMessage for w::ProcessEventWire {
             executable: v.executable,
             kind,
             time_ms: i64::try_from(millis(required(v.time)?)?).map_err(invalid)?,
+            command_line: v.command_line.map(|command_line| w::CommandLineWire {
+                arguments: command_line.arguments,
+                truncated: command_line.truncated,
+            }),
         })
     }
 }
@@ -619,9 +630,11 @@ impl WireMessage for w::RequestEnvelope {
             W::ReadProcessEvents {
                 after_sequence,
                 executions,
+                command_lines,
             } => P::ReadProcessEvents(p::ReadProcessEvents {
                 after_sequence: *after_sequence,
                 executions: *executions,
+                command_lines: *command_lines,
             }),
         };
         Ok(p::RequestEnvelope {
@@ -694,6 +707,7 @@ impl WireMessage for w::RequestEnvelope {
             P::ReadProcessEvents(v) => W::ReadProcessEvents {
                 after_sequence: v.after_sequence,
                 executions: v.executions,
+                command_lines: v.command_lines,
             },
         };
         // The server derives a fingerprint from decoded typed fields. Clients
@@ -1096,6 +1110,7 @@ mod tests {
                         executable: "/usr/bin/sh".to_string(),
                         kind: w::ProcessEventKindWire::Launched,
                         time_ms: 1_793_750_400_200,
+                        command_line: None,
                     },
                     w::ProcessEventWire {
                         sequence: 5,
@@ -1103,6 +1118,7 @@ mod tests {
                         executable: "/usr/bin/sh".to_string(),
                         kind: w::ProcessEventKindWire::Exited(w::ExitStatusWire::Signaled(9)),
                         time_ms: 1_793_750_401_000,
+                        command_line: None,
                     },
                 ],
                 lost: 3,
@@ -1116,6 +1132,7 @@ mod tests {
         let request = w::Request::ReadProcessEvents {
             after_sequence: 3,
             executions: Some(true),
+            command_lines: Some(false),
         };
         let envelope = w::RequestEnvelope {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -1146,6 +1163,10 @@ mod tests {
                             parent_executable: "/usr/bin/dash".to_string(),
                         },
                         time_ms: 1_793_750_400_310,
+                        command_line: Some(w::CommandLineWire {
+                            arguments: vec!["true".to_string(), "--version".to_string()],
+                            truncated: true,
+                        }),
                     },
                     w::ProcessEventWire {
                         sequence: 7,
@@ -1157,6 +1178,7 @@ mod tests {
                         executable: "/opt/openshell/bin/openshell-sandbox".to_string(),
                         kind: w::ProcessEventKindWire::Suppressed { count: 12 },
                         time_ms: 1_793_750_400_320,
+                        command_line: None,
                     },
                     w::ProcessEventWire {
                         sequence: 8,
@@ -1168,6 +1190,7 @@ mod tests {
                         executable: "/usr/bin/true".to_string(),
                         kind: w::ProcessEventKindWire::Ended(Some(w::ExitStatusWire::Exited(3))),
                         time_ms: 1_793_750_400_330,
+                        command_line: None,
                     },
                     w::ProcessEventWire {
                         sequence: 9,
@@ -1179,6 +1202,7 @@ mod tests {
                         executable: "/usr/bin/true".to_string(),
                         kind: w::ProcessEventKindWire::Ended(None),
                         time_ms: 1_793_750_400_340,
+                        command_line: None,
                     },
                 ],
                 lost: 0,

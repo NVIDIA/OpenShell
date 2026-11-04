@@ -199,6 +199,9 @@ message ReadProcessEvents {
   // the runtime records each exec in the workload from now on; unset keeps
   // its current choice.
   optional bool executions = 2;
+  // Whether the runtime records the command line of each process it records
+  // from now on; unset keeps its current choice.
+  optional bool command_lines = 3;
 }
 
 // No image policy is yaml absent with invalid=false. invalid=true reports an
@@ -259,6 +262,16 @@ message ProcessEvent {
   }
   // When the runtime observed the event.
   google.protobuf.Timestamp time = 6;
+  // The arguments of a launched or executed process, when the runtime
+  // records command lines.
+  CommandLine command_line = 10;
+}
+// Arguments as the process was started with them or, for an exec, as the
+// caller passed them, with bytes that are not UTF-8 replaced. truncated is
+// set when the runtime kept only the first ones.
+message CommandLine {
+  repeated string arguments = 1;
+  bool truncated = 2;
 }
 // The process replaced its image with `executable`.
 message ProcessExecuted {

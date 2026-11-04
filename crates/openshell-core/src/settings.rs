@@ -122,6 +122,13 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         kind: SettingValueKind::Bool,
         allowed_string_values: None,
     },
+    // Whether the sandbox records the arguments of each process it reports
+    // as OCSF Process Activity. Arguments can hold secrets. Defaults to false.
+    RegisteredSetting {
+        key: "ocsf_process_cmdline_enabled",
+        kind: SettingValueKind::Bool,
+        allowed_string_values: None,
+    },
     // Deprecated and ignored: OpenShell emits OCSF 1.8.0 only. Still
     // registered so existing values load; the supervisor reports a set value.
     RegisteredSetting {

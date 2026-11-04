@@ -5,6 +5,8 @@
 //!
 //! Pattern: `<HH:MM:SS.mmm> <severity> <CLASS:ACTIVITY> <action> <key fields> [context]`
 
+use std::fmt::Write as _;
+
 use crate::enums::UserTypeId;
 use crate::events::OcsfEvent;
 use crate::events::base_event::BaseEventData;
@@ -100,6 +102,30 @@ fn escape_quoted_field(text: &str) -> String {
         }
     }
     escaped
+}
+
+/// A command line kept to one line that cannot end its context early:
+/// control and text-direction characters as `\uXXXX`, and `]` escaped.
+fn escape_command_line(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            ']' => escaped.push_str("\\]"),
+            c if c.is_control() || is_direction_control(c) => {
+                let _ = write!(escaped, "\\u{:04x}", u32::from(c));
+            }
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+/// Unicode characters that change how the text around them displays.
+pub fn is_direction_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 fn escape_context_field(text: &str) -> String {
@@ -526,7 +552,7 @@ impl OcsfEvent {
                     .process
                     .cmd_line
                     .as_ref()
-                    .map(|c| format!(" [cmd:{c}]"))
+                    .map(|c| format!(" [cmd:{}]", escape_command_line(c)))
                     .unwrap_or_default();
                 let count_ctx = e
                     .base
@@ -1258,6 +1284,25 @@ mod tests {
         assert_eq!(
             event.format_shorthand(),
             "PROC:OTHER [INFO] openshell-sandbox(1) [count:251]"
+        );
+    }
+
+    #[test]
+    fn process_activity_shorthand_keeps_a_command_line_on_one_line() {
+        let event = OcsfEvent::ProcessActivity(ProcessActivityEvent {
+            base: base(1007, "Process Activity", 1, "System Activity", 1, "Launch"),
+            process: Process::new("/usr/bin/sh", 7)
+                .with_cmd_line("sh -c x\nOCSF NET:OPEN] \u{1b}[31m"),
+            actor: None,
+            launch_type: None,
+            exit_code: None,
+            action: None,
+            disposition: None,
+        });
+
+        assert_eq!(
+            event.format_shorthand(),
+            "PROC:LAUNCH [INFO] /usr/bin/sh(7) [cmd:sh -c x\\u000aOCSF NET:OPEN\\] \\u001b[31m]"
         );
     }
 

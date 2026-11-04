@@ -61,6 +61,7 @@ pub use objects::{
 };
 
 // --- Sanitizers ---
+pub use format::shorthand::is_direction_control;
 pub use sanitize::sanitize_reason_for_audit;
 
 // --- Builders ---
