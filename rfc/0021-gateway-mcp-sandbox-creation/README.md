@@ -793,11 +793,19 @@ and is checked directly.
 to MCP calls. The agent never receives it, and it is not a new credential. A
 token that can be used only for `/mcp` is planned for v1.
 
-**Audit.** Every MCP tool call, refusal and `exec` command is logged through the
-existing OCSF events, with the calling sandbox or user, the user a sandbox
-acts for, the parent, the decision and the reason. For `exec` the event
-records the target, the working directory and the argument list, capped at
-1 KiB, and for jobs the job id and state; it never records stdin or output.
+**Audit.** Every MCP tool call is logged as one OCSF API Activity event with
+the calling sandbox or user as the actor and, for a sandbox, the user it acts
+for (`acting_for`, the root's `created_by`). A refusal by policy or by the
+request, such as not found or a limit, is recorded as denied with its code; an
+internal, unavailable or timed-out call is recorded as allowed but failed, not
+as a denial. The event records each tool's arguments and outcome: the target,
+for `create_sandbox` the template, parent, image and providers given and the
+new sandbox's id, for `list` the parent filter and the count, for `exec` the
+argument list, working directory, timeout and exit code, and for jobs the job
+id, state and exit code. Every field is capped (the argument list at 1 KiB,
+the working directory at 512 bytes, others at 256 bytes) and marks a cut, so
+an event stays under 4 KiB. It never records stdin, environment values,
+output, log lines or any reply body.
 The argument list is kept because "what did it run" is the question operators
 ask, and the gateway's own exec log records the command anyway. Secrets
 belong in providers, not in command lines. Refusals at the supervisor door are logged
