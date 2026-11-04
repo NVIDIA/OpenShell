@@ -54,6 +54,20 @@ jobs:
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
+  codex-security:
+    name: Codex Security (advisory)
+    if: inputs.is-prerelease
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/codex-security.yml
+    with:
+      candidate_ref: ${{ inputs.release-tag }}
+      diagnostics_public_key: ${{ vars.CODEX_SECURITY_DIAGNOSTICS_PUBLIC_KEY }}
+    secrets:
+      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+
   prepare-integration:
     permissions:
       actions: read

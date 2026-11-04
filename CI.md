@@ -248,25 +248,28 @@ scanners upload results directly:
   E2E test code are excluded. It runs nightly on `main`, remains manually
   dispatchable for diagnostics, uploads results to Code Scanning, and retains
   workflow artifacts.
-- `Codex Security Release Qualification` can manually analyze a `vX.Y.Z-pre.N`
-  candidate against the previous stable release. It is temporarily excluded
-  from tagged-release qualification. Each scan reviews the cumulative
+- `Codex Security Release Qualification` runs as an advisory job during
+  prerelease qualification. Each scan reviews the cumulative
   stable-to-candidate diff. It calls
   `https://inference-api.nvidia.com/v1` with
-  `openai/openai/gpt-5.6-sol` at medium reasoning effort. The
+  `openai/openai/gpt-6.1-sol` at high reasoning effort. The
   `CODEX_SECURITY_API_KEY` secret must contain an API key authorized for that
   NVIDIA endpoint. Results are uploaded against the candidate commit on `main`
   under a category shared by the train, for example
   `codex-security/v0.1.1`, so later candidates replace earlier analyses. The
-  slash-qualified NVIDIA model identifier prevents Codex Security 0.1.24 from
-  enforcing `--max-cost`, so the workflow relies on its timeout, serialized
-  concurrency, and the inference account's spend controls. Raw reports are not
-  retained as workflow artifacts. Pre-release creation and stable-promotion
-  enforcement remain part of RFC 0014 and are not implemented by this workflow.
+  scanner is pinned to `0.8.3`; deferred investigations and scope limitations
+  do not turn completed scans into execution failures. Review the reported
+  coverage counts separately. The workflow relies on its timeout, serialized
+  concurrency, and the inference account's spend controls. Raw reports and
+  scanner logs are discarded unless encrypted retention is configured below.
+  Findings and execution failures do not affect
+  prerelease qualification or publication; execution failures produce warnings.
+  It has no schedule or manual trigger.
 
-Findings do not fail these workflows. Tool startup, configuration, build, and
-analysis failures still fail so a broken scanner cannot appear healthy. The
-PR-oriented reports also run on merge groups; CodeQL is not a PR or merge-queue
+Findings do not fail these workflows. Except for the advisory Codex job, tool
+startup, configuration, build, and analysis failures still fail so a broken
+scanner cannot appear healthy. The PR-oriented reports also run on merge groups;
+CodeQL is not a PR or merge-queue
 check. None of these reports are required statuses or gate merges.
 
 Run the workflow-definition scanners locally with:
@@ -280,8 +283,8 @@ nix develop --command zizmor --offline --persona=regular --min-severity=high --n
 
 `Security Scan` (`.github/workflows/security-scan.yml`) calls CodeQL, Trivy,
 Cargo Deny, and Workflow Security Reports (Actionlint/Zizmor) in parallel for a
-release tag. Codex Security is temporarily excluded; its standalone workflow
-remains available for manual investigation. Run the parent manually from
+release tag. Codex Security runs separately as an advisory prerelease
+qualification job. Run the parent manually from
 Actions or call it from another workflow. All applicable children analyze the
 candidate snapshot. Cargo Deny uses its existing NVIDIA self-hosted runner and
 CI container.
@@ -476,11 +479,26 @@ native failure behavior and configured exceptions regardless of the finding
 threshold input; it has no HIGH/CRITICAL filter. Its standalone runs still check
 all dependency policies.
 
-The standalone Codex workflow scans the cumulative diff from `stable_ref` to
+The reusable Codex workflow scans the cumulative diff from `stable_ref` to
 `candidate_ref`. Both inputs
 are tag names, not arbitrary commit SHAs. Omit `stable_ref` to resolve the previous
 stable automatically; set `allow_full_bootstrap: true` to permit a full scan when
 no previous stable exists.
+
+To retain private diagnostics, set the repository variable
+`CODEX_SECURITY_DIAGNOSTICS_PUBLIC_KEY` to an armored GPG public key and keep the
+private key locally. Prerelease qualification captures up to 4 MiB of combined
+scanner output and encrypts it with the available reports before uploading a
+seven-day artifact. Plaintext stays on the ephemeral runner; only ciphertext is
+uploaded. Without the variable, raw scanner output is discarded and only
+sanitized failure diagnostics are retained.
+
+Download the `codex-security-encrypted-RUN_ID-ATTEMPT` artifact and decrypt it in
+a private local directory:
+
+```shell
+gpg --output private-reports.tar.gz --decrypt codex-security-private.tar.gz.gpg
+```
 
 Trivy accepts optional `images` and `charts`, one reference per line. Images can
 use tags or digests, such as `ghcr.io/nvidia/openshell/gateway:0.1.1-pre.1` or
@@ -688,7 +706,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/workflow-security.yml` | Runs informational Actionlint and High-severity Zizmor reports on GitHub-hosted runners. |
 | `.github/workflows/dependency-review.yml` | Reports dependency changes when GitHub Dependency Graph is available; otherwise publishes a neutral warning. |
 | `.github/workflows/codeql.yml` | Runs nightly informational CodeQL analysis on `main` for Rust and the Go, Python, and TypeScript SDKs and retains SARIF artifacts. |
-| `.github/workflows/codex-security.yml` | Scans the cumulative diff from the previous stable release to each pre-release candidate and publishes train-scoped SARIF on `main`. |
+| `.github/workflows/codex-security.yml` | Advisory scan during prerelease qualification; scans the stable-to-candidate diff and publishes train-scoped SARIF on `main`. |
 | `.github/workflows/codex-compatibility.yml` | Reviews branch and cumulative tagged-release compatibility with Codex and retains advisory findings, PR acknowledgements, and coverage; it does not gate merging or publication. |
 | `.github/workflows/trivy-changes.yml` | Blocks pull requests and merge groups that introduce new High or Critical Helm or Dockerfile misconfigurations. |
 | `.github/workflows/trivy-scan.yml` | Manual or reusable scan of supplied OCI image/chart references and deployment configuration. Findings are informational by default and can be configured to fail the workflow. |
