@@ -276,9 +276,6 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 pub const MIN_MAX_CONNECTIONS: u32 = 2;
 
 /// How long a data-pool caller waits for a connection, including opening one.
-///
-/// Requests fail with a retryable error this soon after `PostgreSQL` stops
-/// answering, instead of holding every caller until it returns.
 pub(super) const DATA_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl PostgresStore {
@@ -314,7 +311,6 @@ impl PostgresStore {
             .connect(url)
             .await
             .map_err(|e| match e {
-                // Unreachable server: DNS, routing, or a reset during the handshake.
                 sqlx::Error::Io(_) => PersistenceError::Unavailable(e.to_string()),
                 _ => map_db_error(&e),
             })?;

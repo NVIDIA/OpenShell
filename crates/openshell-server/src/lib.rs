@@ -1358,18 +1358,13 @@ fn spawn_gateway_connection(
 const DATABASE_CONNECT_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
 
 /// Longest delay between attempts to reach an unreachable database at startup.
-///
-/// Kept short: an attempt against a refusing server already retries for the
-/// data pool's whole acquire timeout, so the delay only adds recovery time.
 const DATABASE_CONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 
 /// Connect to the database, retrying while it is unreachable.
 ///
-/// The first unreachable attempt binds the health endpoint, so the startup
-/// probe keeps the pod while `/readyz` reports it not ready. It also starts
-/// listening for `shutdown`, which a gateway running as PID 1 ignores until
-/// then. Returns `None` if `shutdown` completes first, and any other error
-/// without a retry.
+/// The first failed attempt binds the health endpoint and starts listening
+/// for `shutdown`; a gateway running as PID 1 ignores SIGTERM until then.
+/// Returns `None` if `shutdown` completes first.
 async fn connect_store(
     config: &Config,
     database_url: &str,
