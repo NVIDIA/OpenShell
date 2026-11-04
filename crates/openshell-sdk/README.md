@@ -215,8 +215,6 @@ These helpers use the raw client's authentication slot. They do not perform OIDC
 
 ## Next minor API migration
 
-This source-breaking API change targets the next minor release and must not be backported into the `0.1.x` patch series.
-
 Raw `SandboxStatus` adds optional `ingress_admission`, and raw `CreateSandboxRequest` adds `forward_ports`. Compute-driver `ValidateSandboxCreateResponse` also adds optional `ingress_admission`. Complete generated Rust literals must initialize optional descriptors to `None` and ports to an empty vector, or use `..Default::default()`.
 
-Legacy wire payloads retain their field identities and decode the new fields as absent or empty. Upgrade gateway writers together because older writers can drop the admitted record. With a driver that negotiates ingress admission, the gateway rejects forwarding without that record until the sandbox is recreated with admitted ports. Legacy drivers that do not negotiate admission can still omit it.
+Upgrade gateway replicas together. If forwarding reports missing admission after an upgrade, recreate the sandbox with the required service ports.
