@@ -99,7 +99,7 @@ from; all were accepted by the author.
 | Retries | Over MCP, the same name returns the existing sandbox with `already_existed` | Piotr |
 | User check | The root's user must still be a workspace member | Piotr |
 | Deleting a parent | Refused while it has children; `--with-children` is future work | author |
-| Protocol | 2025 MCP revisions, no sessions, calls under 45 s | Piotr |
+| Protocol | 2025 MCP revisions, no sessions, calls under the door's 60 s | Piotr |
 | Credential | Existing sandbox session token, attached by the supervisor | Piotr |
 | Host access | `openshell mcp serve` bridge using the CLI login; `/mcp` refuses browser requests | author |
 
@@ -448,7 +448,7 @@ decided when it is made. Arguments only users may send are described as
 | `create_sandbox` | Create a sandbox and wait until it is ready, up to 45 s | `CreateSandbox` |
 | `list` | List sandboxes and their state | `ListSandboxes` |
 | `exec` | Run a command; with `background: true`, start a job and return its id | `ExecSandbox` |
-| `wait` | Wait for a job, up to 45 s | `ExecSandbox` |
+| `wait` | Wait for a job, up to 40 s | `ExecSandbox` |
 | `delete` | Delete a sandbox | `DeleteSandbox` |
 | `logs` | Read a sandbox's logs, such as startup errors and policy denials | `GetSandboxLogs` |
 
@@ -485,10 +485,11 @@ workspace. From the CLI the existing "already exists" error applies.
 
 **Protocol.** The endpoint speaks the 2025 MCP revisions (2025-06-18 and
 2025-11-25) that most harnesses use today, without MCP sessions, so any
-gateway replica can answer any call. Replies are plain JSON. No call runs
-longer than 45 seconds, below the 60-second timeout common in MCP clients; a
-job still running at the end of a `wait` is reported as `running`, and the
-caller calls `wait` again. Streamed
+gateway replica can answer any call. Replies are plain JSON. Every call ends
+before the 60-second limit of the sandbox door and of common MCP clients: a
+foreground `exec` waits at most 45 seconds and `wait` polls at most 40, which
+leaves room for reading a finished job's output. A job still running at the
+end of a `wait` is reported as `running`, and the caller calls `wait` again. Streamed
 progress and the 2026-07-28 revision are planned for v1.
 
 ### Running work and collecting results
@@ -522,7 +523,7 @@ exec {name: "box", command: ["cargo", "test"]}
 **Long work**, such as a sub-agent, runs as a background job. `exec` with
 `background: true` returns a job id at once, and `wait` returns the job's
 result in the same shape as a foreground `exec`, or `running` after its limit
-(30 seconds by default, 45 at most) so the caller can call it again. A
+(30 seconds by default, 40 at most) so the caller can call it again. A
 background job has no time limit of its own; it runs until it ends or the
 child is deleted. The job id is chosen by the gateway and the child together:
 a number the child assigns, and a random part from the gateway, such as
