@@ -5,9 +5,9 @@
 //! compute driver.
 //!
 //! The test starts an HTTP server where the tests run, which is the host the
-//! gateway runs its sandboxes on, and creates a sandbox from the Python test
-//! image ([`testkit::python_image`]) whose main process requests a page from
-//! that server through the name.
+//! gateway runs its sandboxes on, and runs a client in a sandbox from the
+//! Python test image ([`testkit::python_image`]) that requests a page from that
+//! server through the name.
 
 use testkit::{Context, Error, Result, ResultExt as _};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -57,18 +57,40 @@ async fn python_sandbox_reaches_host_server(cx: &mut Context) -> testkit::Result
     let port = server.port.to_string();
     let image = testkit::python_image();
 
+    // The client runs through `sandbox exec` in a Ready sandbox, not as the
+    // main process. A gateway with several replicas (k3s-ha) can refuse to
+    // attach to a main process that already finished with "sandbox is not
+    // ready" when the request reaches a replica that doesn't hold the
+    // sandbox's session.
     let name = cx.name("hg");
     cx.track(&name);
-    let create = cx
+    cx.cli([
+        "sandbox",
+        "create",
+        "--name",
+        &name,
+        "--from",
+        &image,
+        "--policy",
+        policy.path()?,
+        "--detach",
+        "--no-tty",
+        "--",
+        "sh",
+        "-c",
+        "exec sleep infinity",
+    ])
+    .await?
+    .success()
+    .context(format!("create a sandbox from {image}"))?;
+    cx.adopt(&name).await?.wait_ready().await?;
+
+    let client = cx
         .cli([
             "sandbox",
-            "create",
+            "exec",
             "--name",
             &name,
-            "--from",
-            &image,
-            "--policy",
-            policy.path()?,
             "--no-tty",
             "--",
             VENV_PYTHON,
@@ -78,17 +100,17 @@ async fn python_sandbox_reaches_host_server(cx: &mut Context) -> testkit::Result
         ])
         .await?
         .success()
-        .context(format!("sandbox from {image} runs the client"))?;
+        .context("run the client in the sandbox")?;
     testkit::ensure!(
-        create.stdout.contains("prefix=/sandbox/.venv"),
+        client.stdout.contains("prefix=/sandbox/.venv"),
         "the client did not run in the image's virtual environment:\n{}",
-        create.stdout
+        client.stdout
     );
     testkit::ensure!(
-        create.stdout.contains(&marker),
+        client.stdout.contains(&marker),
         "the client did not get the host server's response:\n{}{}",
-        create.stdout,
-        create.stderr
+        client.stdout,
+        client.stderr
     );
     Ok(())
 }
