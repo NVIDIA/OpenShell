@@ -1712,6 +1712,7 @@ fn preprocess_yaml_data(
             "invalid L7 policy configuration",
         )));
     }
+    raw_schema::validate_endpoint_ambiguities(&data)?;
     // Emit authored warnings only after the candidate passes validation.
     emit_l7_config_warnings(&warnings, "L7 policy validation warning");
 
@@ -9776,6 +9777,7 @@ network_policies:
     endpoints:
       - host: github.com
         port: 443
+        allowed_ips: ["172.66.147.243"]
     binaries:
       - { path: /usr/bin/agent }
 filesystem_policy:
@@ -9852,12 +9854,156 @@ process:
     }
 
     #[test]
-    fn plain_hosted_endpoint_drops_hostless_allowed_ips() {
+    fn hosted_endpoint_keeps_its_validated_allowed_ips() {
         let authorization = host_precedence_authorization("github.com", "/usr/bin/agent");
 
         assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
         assert!(authorization.exact_declared_endpoint_host);
-        assert!(authorization.endpoint_configs.is_empty());
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        assert_eq!(
+            get_str_array(&authorization.endpoint_configs[0], "allowed_ips"),
+            vec!["172.66.147.243"]
+        );
+    }
+
+    #[test]
+    fn hosted_path_is_selected_before_request_path_matching() {
+        let authorization = host_precedence_authorization("example.com", "/usr/bin/agent");
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        let config = crate::l7::parse_l7_config(&authorization.endpoint_configs[0]).unwrap();
+        assert!(config.matches_path("/v1/models"));
+        assert!(!config.matches_path("/v2/models"));
+        // The hostless config is gone at connection time. The relay has no
+        // fallback configuration to select for /v2/models and returns 403.
+    }
+
+    #[test]
+    fn local_path_overrides_preserve_lowered_mcp_restrictions() {
+        let broader = serde_json::json!({
+            "host": "mcp.example.com", "port": 443, "protocol": "mcp",
+            "rules": [{"allow": {"method": "*"}}],
+            "mcp": {"max_body_bytes": 1024}
+        });
+        for options in [
+            serde_json::json!({"mcp": {"strict_tool_names": false}}),
+            serde_json::json!({"mcp": {"versions": ["2025-03-26"]}}),
+            serde_json::json!({"mcp": {"max_body_bytes": 2048}}),
+            serde_json::json!({"mcp_strict_tool_names": false}),
+            serde_json::json!({"mcp_versions": ["2025-03-26"]}),
+            serde_json::json!({"json_rpc_max_body_bytes": 2048}),
+        ] {
+            let mut narrower = broader.clone();
+            narrower.as_object_mut().unwrap().remove("mcp");
+            narrower["path"] = serde_json::json!("/v1/**");
+            narrower
+                .as_object_mut()
+                .unwrap()
+                .extend(options.as_object().unwrap().clone());
+            let data = serde_json::json!({"network_policies": {"mcp": {
+                "endpoints": [broader, narrower], "binaries": [{"path": "/**"}]
+            }}}).to_string();
+            let error = OpaEngine::from_strings(TEST_POLICY, &data)
+                .err()
+                .expect("narrower path must preserve MCP restrictions");
+            assert!(
+                error.to_string().contains("network endpoint ambiguity validation failed")
+            );
+        }
+    }
+
+    #[test]
+    fn local_policy_ingress_rejects_unsafe_overrides_and_preserves_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let rules_path = directory.path().join("policy.rego");
+        let data_path = directory.path().join("data.yaml");
+        std::fs::write(&rules_path, TEST_POLICY).unwrap();
+        let engine = OpaEngine::from_strings(TEST_POLICY, HOST_PRECEDENCE_DATA).unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let broader = serde_json::json!({
+            "port": 443, "allowed_ips": ["8.0.0.0/8"],
+            "protocol": "rest", "access": "full", "enforcement": "enforce"
+        });
+        let safe = serde_json::json!({
+            "host": "api.example.com", "port": 443, "allowed_ips": ["8.8.8.8"],
+            "protocol": "rest", "access": "full", "enforcement": "enforce"
+        });
+        let mut candidates = vec![serde_json::json!({"host": "internal.corp", "port": 443})];
+        for (key, value) in [
+            ("allowed_ips", serde_json::json!(["9.9.9.9"])),
+            ("protocol", serde_json::json!("")),
+            ("protocol", serde_json::json!("sql")),
+            ("enforcement", serde_json::json!("audit")),
+            ("allow_uninspected_credentials", serde_json::json!(true)),
+            ("request_body_credential_rewrite", serde_json::json!(true)),
+            ("websocket_credential_rewrite", serde_json::json!(true)),
+        ] {
+            let mut candidate = safe.clone();
+            candidate[key] = value;
+            candidates.push(candidate);
+        }
+        let mut signed = safe.clone();
+        signed["credential_signing"] = serde_json::json!("sigv4");
+        signed["signing_service"] = serde_json::json!("bedrock");
+        candidates.push(signed);
+        for candidate in candidates {
+            for endpoints in [
+                serde_json::json!([broader, candidate]),
+                serde_json::json!([candidate, broader]),
+            ] {
+                let data = serde_json::json!({"network_policies": {
+                    "private-policy-name": {"endpoints": endpoints, "binaries": [{"path": "/**"}]}
+                }}).to_string();
+                std::fs::write(&data_path, &data).unwrap();
+                for error in [
+                    OpaEngine::from_strings(TEST_POLICY, &data)
+                        .err()
+                        .expect("unsafe strings"),
+                    OpaEngine::from_strings_with_middleware_config(TEST_POLICY, &data, None)
+                        .err()
+                        .expect("unsafe middleware strings"),
+                    OpaEngine::from_files(&rules_path, &data_path)
+                        .err()
+                        .expect("unsafe files"),
+                    OpaEngine::from_files_with_middleware_config(&rules_path, &data_path, None)
+                        .err()
+                        .expect("unsafe middleware files"),
+                    OpaEngine::from_files_for_endpoint_only_proxy(&rules_path, &data_path, None)
+                        .err()
+                        .expect("unsafe proxy files"),
+                    engine.reload(TEST_POLICY, &data).expect_err("unsafe reload"),
+                ] {
+                    assert!(
+                        error.to_string().contains("network endpoint ambiguity validation failed"),
+                        "{error}"
+                    );
+                    assert_safe_load_error(
+                        &error,
+                        &["private-policy-name", "internal.corp", "api.example.com"],
+                    );
+                }
+                assert_eq!(engine.current_generation(), 0);
+                assert!(!guard.is_stale());
+                let (configs, _) = engine
+                    .query_endpoint_configs_with_generation(&NetworkInput {
+                        host: "example.com".into(),
+                        port: 443,
+                        binary_path: PathBuf::from("/usr/bin/agent"),
+                        binary_sha256: "unused".into(),
+                        ancestors: vec![],
+                        cmdline_paths: vec![],
+                    })
+                    .unwrap();
+                assert_eq!(
+                    get_str_array(&configs[0], "allowed_ips"),
+                    vec!["172.66.147.243"]
+                );
+            }
+        }
+        engine.reload(TEST_POLICY, HOST_PRECEDENCE_DATA).unwrap();
+        assert_eq!(engine.current_generation(), 1);
+        assert!(guard.is_stale());
     }
 
     #[test]

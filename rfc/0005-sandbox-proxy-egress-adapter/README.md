@@ -566,14 +566,18 @@ adapter wire middleware separately.
    should one documented policy/endpoint precedence key select the complete
    decision? The initial compatibility refactor does not choose between them.
    **Resolved ([#4662](https://github.com/NVIDIA/OpenShell/issues/4662)):**
-   both, by specificity. Among endpoints whose host, port, path, and binary
-   match, an endpoint that names a host takes precedence over a hostless
-   endpoint, and then the more specific path takes precedence. Binaries filter
+   both, by specificity. Among endpoints whose host, port, and binary match,
+   an endpoint that names a host takes precedence over a hostless endpoint for
+   the connection, before path selection. Among the remaining endpoints, the
+   more specific matching path takes precedence. Binaries filter
    but do not rank. Equally specific endpoints must agree on metadata, or
    policy load rejects them. An endpoint that names a host must be at least as
    restrictive as an overlapping hostless endpoint: its `allowed_ips` must fall
    within the hostless list, and it must not drop TLS termination, L7
-   inspection, or enforcement.
+   inspection, or enforcement. More specific paths must also preserve broader
+   restrictions. Overriding endpoints must preserve the inspection parser and
+   protocol-specific options and must agree on signing and rewrite settings.
+   Local YAML loads and reloads run the same ambiguity checks as protobuf loads.
 2. What mismatch-free observation window is sufficient before the
    deterministic decision replaces the legacy endpoint queries?
 3. Should metadata loopback be modeled as an adapter inside

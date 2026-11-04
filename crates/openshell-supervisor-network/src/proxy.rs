@@ -4767,16 +4767,7 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
     let mut errors = Vec::new();
 
     for entry in raw {
-        // Try as CIDR first, then as bare IP (convert to /32 or /128)
-        let parsed = entry.parse::<ipnet::IpNet>().or_else(|_| {
-            entry
-                .parse::<IpAddr>()
-                .map(|ip| match ip {
-                    IpAddr::V4(v4) => ipnet::IpNet::V4(ipnet::Ipv4Net::from(v4)),
-                    IpAddr::V6(v6) => ipnet::IpNet::V6(ipnet::Ipv6Net::from(v6)),
-                })
-                .map_err(|_| ())
-        });
+        let parsed = openshell_core::net::parse_ip_net(entry);
 
         match parsed {
             Ok(n) => {

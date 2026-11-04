@@ -959,6 +959,10 @@ _policy_endpoint_configs(policy) := [ep |
 # hosted endpoint has no extended config. Otherwise a plain `host:port`
 # endpoint would inherit the hostless endpoint's SSRF allowlist. Allow and
 # deny decisions still union over every matching policy.
+# The validator checks every endpoint pair regardless of binaries. Keep that
+# invariant: this shadowing spans policies and must never discard restrictions
+# on the basis of a narrower binary selector. Path selection happens later in
+# the relay; the host match here intentionally uses only host and port.
 _hosted_endpoint_matches if {
 	some pname
 	_matching_policy_names[pname]

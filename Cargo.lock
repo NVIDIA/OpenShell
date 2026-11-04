@@ -4896,7 +4896,6 @@ name = "openshell-policy"
 version = "0.0.0"
 dependencies = [
  "hickory-proto",
- "ipnet",
  "miette",
  "openshell-core",
  "openshell-policy-schema",

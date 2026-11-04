@@ -149,19 +149,30 @@ request access.
 Settings such as `tls`, `allowed_ips`, `protocol`, and credentials come from the
 most specific endpoint that matches the connection or request, including its
 binary. An endpoint that names a host takes precedence over an endpoint without
-`host`, and a more specific `path` takes precedence over a broader one. Equally
+`host`. This happens at connection time, before path selection: a host endpoint
+with `path: /v1/**` shadows the hostless configuration for the entire connection.
+Requests outside `/v1/**` fail unless another hosted endpoint covers them.
+Among the remaining endpoints, a more specific `path` takes precedence. Equally
 specific endpoints that can match the same host and port must agree on these
 settings, or OpenShell rejects the policy.
 
-An endpoint that names a host must be at least as restrictive as an overlapping
-endpoint without `host`. OpenShell rejects the policy if the endpoint that names
-the host:
+A more selective endpoint must be at least as restrictive as every broader
+endpoint it overrides. This applies to both host and path precedence, regardless
+of binary selectors. OpenShell rejects the policy if the more selective endpoint:
 
-- Sets no `allowed_ips`, or lists addresses outside the other endpoint's
-  `allowed_ips`.
+- Omits `allowed_ips` when the broader endpoint sets it, or lists addresses
+  outside the broader endpoint's `allowed_ips`.
 - Sets `tls: skip` or `protocol: tcp` when the other endpoint does not.
-- Omits `protocol` when the other endpoint inspects requests.
-- Uses `enforcement: audit` when the other endpoint enforces.
+- Omits or changes `protocol` when the broader endpoint inspects requests,
+  including replacing inspection with SQL passthrough.
+- Uses `enforcement: audit` when the broader endpoint enforces.
+- Relaxes encoded-slash handling, body limits, MCP tool-name validation, or the
+  guard against uninspected credential traffic.
+
+Overlapping endpoints must keep signing and credential rewrite settings equal.
+When both inspect requests, they must also agree on MCP versions, persisted-query
+settings and registries, and GraphQL-over-WebSocket classification. These checks
+also apply to local-file policies and reloads.
 
 For example, a rule without `host` that allows public addresses on port 443 can
 coexist with a provider rule that pins `api.example.com` to one address inside
@@ -477,14 +488,16 @@ Use `protocol: graphql` to allow or deny GraphQL operations. APIs such as
 GitHub serve REST and GraphQL on the same host. A REST rule sees every GraphQL
 request as `POST /graphql`, so it cannot tell a query from a mutation. Give each
 API its own endpoint in one rule, and use the endpoint `path` field to send
-`/graphql` requests to the GraphQL rules. This rule allows read-only REST
-requests, GraphQL queries, and the `createIssue` mutation:
+`/graphql` requests to the GraphQL rules. Use disjoint paths for different
+protocols so neither endpoint overrides the other's parser. This rule allows
+read-only repository REST requests, GraphQL queries, and the `createIssue` mutation:
 
 ```yaml
 github_api:
   endpoints:
     - host: api.github.com
       port: 443
+      path: /repos/**
       protocol: rest
       enforcement: enforce
       access: read-only
@@ -504,9 +517,10 @@ github_api:
 ```
 
 OpenShell selects the endpoint whose `path` most specifically matches the
-request, so requests to `/graphql` use the GraphQL rules and all other paths use
-the REST rules. An endpoint without `path` matches all paths. Endpoints that
-share a host and port must agree on `tls` and `allowed_ips`.
+request. Here `/graphql` uses the GraphQL rules, `/repos/**` uses the REST
+rules, and other paths are denied. An endpoint without `path` matches all paths;
+it cannot overlap an endpoint with a different protocol. Endpoints that share a
+host and port must agree on `tls` and `allowed_ips`.
 
 For allow rules, every top-level field in an operation must match. A malformed
 or disallowed operation denies an entire batched request. GraphQL field names
