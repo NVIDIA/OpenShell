@@ -5069,7 +5069,7 @@ pub(super) async fn handle_report_sandbox_configuration(
     state: &Arc<ServerState>,
     request: Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
 ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
-    use openshell_core::proto::ConfigurationAdmissionState;
+    use openshell_core::proto::{ConfigurationAdmissionState, SandboxPhase};
     let sandbox_id = request.get_ref().sandbox_id.clone();
     crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     let mut admission = request
@@ -5086,6 +5086,14 @@ pub(super) async fn handle_report_sandbox_configuration(
         return Err(Status::invalid_argument("admission state is required"));
     }
     let refused_before_start = request.get_ref().refused_before_start;
+    let launch_unconfirmed = admission.error == "openshell.backend.start-agent.unconfirmed";
+    if launch_unconfirmed
+        && (refused_before_start || reported != ConfigurationAdmissionState::Rejected)
+    {
+        return Err(Status::invalid_argument(
+            "an unconfirmed workload launch requires a rejected report without refused_before_start",
+        ));
+    }
     if refused_before_start && reported != ConfigurationAdmissionState::Rejected {
         return Err(Status::invalid_argument(
             "refused_before_start requires a rejected admission",
@@ -5112,13 +5120,15 @@ pub(super) async fn handle_report_sandbox_configuration(
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_name = sandbox.object_name().to_string();
     let workspace = sandbox.object_workspace().to_string();
-    crate::compute::provisioning_deadline::refresh_configuration(
-        &state.store,
-        &mut sandbox,
-        current_time_ms(),
-    )
-    .await
-    .map_err(Status::internal)?;
+    if !launch_unconfirmed {
+        crate::compute::provisioning_deadline::refresh_configuration(
+            &state.store,
+            &mut sandbox,
+            current_time_ms(),
+        )
+        .await
+        .map_err(Status::internal)?;
+    }
     if crate::compute::provisioning_deadline::timed_out(&sandbox) {
         return Err(Status::failed_precondition(
             "provisioning deadline expired; explicitly start the sandbox after cleanup",
@@ -5144,7 +5154,20 @@ pub(super) async fn handle_report_sandbox_configuration(
             "supervisor configuration instance has changed",
         ));
     }
-    if reported == ConfigurationAdmissionState::Accepted {
+    if launch_unconfirmed
+        && current.is_none_or(|current| {
+            current.state != i32::from(ConfigurationAdmissionState::Accepted)
+                || !same_generation(current, &admission)
+        })
+    {
+        return Err(Status::aborted(
+            "unconfirmed workload launch does not match the accepted configuration",
+        ));
+    }
+    if launch_unconfirmed {
+        // The accepted launch can lag a desired policy/provider update.
+        admission = current.expect("accepted generation was checked").clone();
+    } else if reported == ConfigurationAdmissionState::Accepted {
         let mut config_request = Request::new(GetSandboxConfigRequest {
             name: sandbox_name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
@@ -5218,11 +5241,13 @@ pub(super) async fn handle_report_sandbox_configuration(
                 .map_err(Status::internal)?;
             return Err(Status::failed_precondition("provisioning deadline expired"));
         }
-        crate::compute::provisioning_deadline::record_admission_start(record, now_ms)
-            .map_err(Status::internal)?;
-        if reported == ConfigurationAdmissionState::Rejected {
-            crate::compute::provisioning_deadline::record_rejection(record, now_ms)
+        if !launch_unconfirmed {
+            crate::compute::provisioning_deadline::record_admission_start(record, now_ms)
                 .map_err(Status::internal)?;
+            if reported == ConfigurationAdmissionState::Rejected {
+                crate::compute::provisioning_deadline::record_rejection(record, now_ms)
+                    .map_err(Status::internal)?;
+            }
         }
     }
     let updated = state
@@ -5244,7 +5269,34 @@ pub(super) async fn handle_report_sandbox_configuration(
                     .expect("status initialized")
                     .configuration_activated = Some(true);
             }
-            crate::compute::apply_configuration_readiness(sandbox);
+            if launch_unconfirmed {
+                // Lost launch confirmation is a runtime failure, not policy refusal.
+                let status = sandbox.status.as_mut().expect("status initialized");
+                if matches!(
+                    SandboxPhase::try_from(status.phase),
+                    Ok(SandboxPhase::Provisioning | SandboxPhase::Starting | SandboxPhase::Ready)
+                ) || (status.phase == i32::from(SandboxPhase::Error)
+                    && status.exit_code.is_none())
+                {
+                    status.phase = i32::from(SandboxPhase::Error);
+                    status
+                        .conditions
+                        .retain(|condition| condition.r#type != "Ready");
+                    status
+                        .conditions
+                        .push(openshell_core::proto::SandboxCondition {
+                            r#type: "Ready".to_string(),
+                            status: "False".to_string(),
+                            reason: openshell_core::backend_startup::LAUNCH_UNCONFIRMED_CONDITION
+                                .to_string(),
+                            message: openshell_core::backend_startup::LAUNCH_UNCONFIRMED_DIAGNOSTIC
+                                .to_string(),
+                            ..Default::default()
+                        });
+                }
+            } else {
+                crate::compute::apply_configuration_readiness(sandbox);
+            }
         })
         .await
         .map_err(|error| {
@@ -9156,6 +9208,238 @@ mod tests {
         let (_, unknown) = readiness().await;
         assert!(!unknown.message.contains("secret-value"));
         assert!(unknown.message.contains("isolation backend refused"));
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_launch_keeps_accepted_policy_and_does_not_reopen_repair() {
+        use openshell_core::backend_startup::{
+            LAUNCH_UNCONFIRMED_CONDITION, LAUNCH_UNCONFIRMED_DIAGNOSTIC,
+        };
+        use openshell_core::proto::{
+            ConfigurationAdmissionState as Admission, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission, SandboxPhase,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-launch-unconfirmed";
+        let mut sandbox = test_sandbox(
+            sandbox_id,
+            "launch-unconfirmed",
+            openshell_policy::restrictive_default_policy(),
+            Vec::new(),
+        );
+        sandbox.set_phase(SandboxPhase::Provisioning.into());
+        sandbox.status.as_mut().unwrap().provisioning = Some(
+            crate::compute::provisioning_deadline::new_record(current_time_ms()),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        let report = |admission, refused_before_start| {
+            with_sandbox(
+                Request::new(ReportSandboxConfigurationRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    admission: Some(admission),
+                    refused_before_start,
+                    ..Default::default()
+                }),
+                sandbox_id,
+            )
+        };
+        handle_report_sandbox_configuration(
+            &state,
+            report(
+                SandboxConfigurationAdmission {
+                    instance_id: instance_id.clone(),
+                    state: Admission::Pending.into(),
+                    ..Default::default()
+                },
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        let config = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    name: "launch-unconfirmed".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let accepted = SandboxConfigurationAdmission {
+            instance_id,
+            state: Admission::Accepted.into(),
+            policy_version: config.version,
+            policy_hash: config.policy_hash,
+            config_revision: config.config_revision,
+            provider_env_revision: config.provider_env_revision,
+            error: String::new(),
+        };
+        handle_report_sandbox_configuration(&state, report(accepted.clone(), false))
+            .await
+            .unwrap();
+        let before = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut unconfirmed = accepted.clone();
+        unconfirmed.state = Admission::Rejected.into();
+        unconfirmed.error = "openshell.backend.start-agent.unconfirmed".to_string();
+        let mut wrong_generation = unconfirmed.clone();
+        wrong_generation.policy_hash.push('x');
+        assert_eq!(
+            handle_report_sandbox_configuration(&state, report(wrong_generation, false))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Aborted
+        );
+        assert_eq!(
+            handle_report_sandbox_configuration(&state, report(unconfirmed.clone(), true))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+        // A newer desired policy does not supersede the in-flight accepted launch.
+        let mut desired = before.spec.as_ref().unwrap().policy.clone().unwrap();
+        desired.network_policies.insert(
+            "new-endpoint".to_string(),
+            NetworkPolicyRule {
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "launch-unconfirmed".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                policy: Some(desired),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        let before = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        handle_report_sandbox_configuration(&state, report(unconfirmed.clone(), false))
+            .await
+            .unwrap();
+        let mut saved = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let status = saved.status.as_ref().unwrap();
+        assert_eq!(status.configuration_admission.as_ref(), Some(&accepted));
+        assert_eq!(status.configuration_activated, Some(true));
+        assert_eq!(
+            status.provisioning,
+            before.status.as_ref().unwrap().provisioning
+        );
+        assert_eq!(saved.phase(), i32::from(SandboxPhase::Error));
+        assert!(!crate::policy_store::permits_initial_static_policy_repair(
+            &saved
+        ));
+        let ready = status
+            .conditions
+            .iter()
+            .find(|condition| condition.r#type == "Ready")
+            .unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, LAUNCH_UNCONFIRMED_CONDITION);
+        assert_eq!(ready.message, LAUNCH_UNCONFIRMED_DIAGNOSTIC);
+        assert!(status.conditions.iter().any(
+            |condition| condition.r#type == "ConfigurationReady" && condition.status == "True"
+        ));
+
+        // The driver may publish its generic error before this report arrives.
+        saved
+            .status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .iter_mut()
+            .find(|condition| condition.r#type == "Ready")
+            .unwrap()
+            .reason = "ContainerExited".to_string();
+        state.store.put_message(&saved).await.unwrap();
+        handle_report_sandbox_configuration(&state, report(unconfirmed.clone(), false))
+            .await
+            .unwrap();
+        saved = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            saved
+                .status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|condition| condition.r#type == "Ready"
+                    && condition.reason == LAUNCH_UNCONFIRMED_CONDITION)
+        );
+
+        // Known canonical outcomes win over a later ambiguous launch report.
+        for (phase, exit_code, reason) in [
+            (SandboxPhase::Completed, 0, "MainProcessCompleted"),
+            (SandboxPhase::Error, 17, "MainProcessFailed"),
+        ] {
+            saved.set_phase(phase.into());
+            let status = saved.status.as_mut().unwrap();
+            status.exit_code = Some(exit_code);
+            status
+                .conditions
+                .retain(|condition| condition.r#type != "Ready");
+            status
+                .conditions
+                .push(openshell_core::proto::SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: reason.to_string(),
+                    ..Default::default()
+                });
+            state.store.put_message(&saved).await.unwrap();
+            handle_report_sandbox_configuration(&state, report(unconfirmed.clone(), false))
+                .await
+                .unwrap();
+            let terminal = state
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(terminal.phase(), i32::from(phase));
+            assert!(
+                terminal
+                    .status
+                    .unwrap()
+                    .conditions
+                    .iter()
+                    .any(|condition| condition.r#type == "Ready" && condition.reason == reason)
+            );
+        }
     }
 
     #[test]

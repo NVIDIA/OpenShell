@@ -12,6 +12,10 @@ use crate::container::{
 };
 use futures::Stream;
 use openshell_core::ComputeDriverError;
+use openshell_core::backend_startup::{
+    LAUNCH_UNCONFIRMED_CONDITION, LAUNCH_UNCONFIRMED_DIAGNOSTIC, RuntimeStartupFailure,
+    SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED,
+};
 use openshell_core::proto::compute::v1::{
     DriverCondition, DriverSandbox, DriverSandboxStatus, WatchSandboxesDeletedEvent,
     WatchSandboxesEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
@@ -570,6 +574,15 @@ fn condition_from_state(state: &ContainerState) -> DriverCondition {
                     CONDITION_WORKSPACE_VALIDATION_FAILED,
                     WORKSPACE_VALIDATION_FAILED_MESSAGE.to_string(),
                 )
+            } else if state.supervisor_exit_code
+                == Some(i64::from(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED))
+            {
+                (
+                    LAUNCH_UNCONFIRMED_CONDITION,
+                    LAUNCH_UNCONFIRMED_DIAGNOSTIC.to_string(),
+                )
+            } else if let Some(failure) = RuntimeStartupFailure::from_exit_code(state.exit_code) {
+                (failure.condition_reason(), failure.diagnostic().to_string())
             } else if matches!(state.exit_code, 137 | 143) {
                 (
                     CONDITION_RUNTIME_RESTART,
@@ -930,6 +943,28 @@ mod tests {
         state.exit_code = i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED);
         state.supervisor_exit_code = Some(1);
         assert_eq!(condition_from_state(&state).reason, CONDITION_EXITED);
+        state.supervisor_exit_code = Some(i64::from(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED));
+        assert_eq!(
+            condition_from_state(&state).reason,
+            LAUNCH_UNCONFIRMED_CONDITION
+        );
+        assert_eq!(
+            condition_from_state(&state).message,
+            LAUNCH_UNCONFIRMED_DIAGNOSTIC
+        );
+        state.supervisor_exit_code = None;
+        state.exit_code = i64::from(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED);
+        assert_eq!(condition_from_state(&state).reason, CONDITION_EXITED);
+        for failure in [
+            RuntimeStartupFailure::LandlockUnavailable,
+            RuntimeStartupFailure::LandlockEnforcement,
+            RuntimeStartupFailure::Qualification,
+        ] {
+            state.exit_code = i64::from(failure.exit_code());
+            let condition = condition_from_state(&state);
+            assert_eq!(condition.reason, failure.condition_reason());
+            assert_eq!(condition.message, failure.diagnostic());
+        }
     }
 
     #[test]

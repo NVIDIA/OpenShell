@@ -45,6 +45,9 @@ use oci_client::manifest::{
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
 use openshell_core::UpstreamProxyConfig;
+use openshell_core::backend_startup::{
+    LAUNCH_UNCONFIRMED_CONDITION, LAUNCH_UNCONFIRMED_DIAGNOSTIC, SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED,
+};
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::driver_mounts;
 use openshell_core::gpu::{
@@ -5077,11 +5080,23 @@ impl VmDriver {
                         let _ = terminate_vm_process(&mut process.child).await;
                     }
                 }
-                let mut message = status.code().map_or_else(
-                    || format!("{component} process exited"),
-                    |code| format!("{component} process exited with status {code}"),
-                );
+                let launch_unconfirmed = component == "host supervisor"
+                    && status.code() == Some(SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED);
+                let reason = if launch_unconfirmed {
+                    LAUNCH_UNCONFIRMED_CONDITION
+                } else {
+                    "ProcessExited"
+                };
+                let mut message = if launch_unconfirmed {
+                    LAUNCH_UNCONFIRMED_DIAGNOSTIC.to_string()
+                } else {
+                    status.code().map_or_else(
+                        || format!("{component} process exited"),
+                        |code| format!("{component} process exited with status {code}"),
+                    )
+                };
                 if component == "host supervisor"
+                    && !launch_unconfirmed
                     && let Some(state_dir) = state_dir.as_deref()
                     && let Some(stderr) = read_vm_console_tail(
                         &state_dir.join("supervisor.err.log"),
@@ -5092,18 +5107,14 @@ impl VmDriver {
                         .expect("writing to String cannot fail");
                 }
                 if let Some(snapshot) = self
-                    .set_snapshot_condition(
-                        &sandbox_id,
-                        error_condition("ProcessExited", &message),
-                        false,
-                    )
+                    .set_snapshot_condition(&sandbox_id, error_condition(reason, &message), false)
                     .await
                 {
                     self.publish_snapshot(snapshot);
                 }
                 self.publish_platform_event(
                     sandbox_id.clone(),
-                    platform_event("vm", "Warning", "ProcessExited", message),
+                    platform_event("vm", "Warning", reason, message),
                 );
                 let (has_gpu, cleanup_ctx) = {
                     let registry = self.registry.lock().await;
@@ -9337,9 +9348,10 @@ mod tests {
                 .spawn()
                 .unwrap()
         };
-        for (component, child) in [
-            ("VM", spawn_exited_child()),
-            ("host supervisor", running_child()),
+        for (component, child, launch_unconfirmed) in [
+            ("VM", spawn_exited_child(), false),
+            ("host supervisor", running_child(), false),
+            ("host supervisor", running_child(), true),
         ] {
             let temp = tempfile::tempdir().unwrap();
             std::fs::write(temp.path().join("rootfs-console.log"), "agent output\n").unwrap();
@@ -9348,7 +9360,29 @@ mod tests {
             let mut events = driver.events.subscribe();
             insert_test_record(&driver, "sb-exit", temp.path().to_path_buf(), child).await;
 
+            if launch_unconfirmed {
+                let process = driver.registry.lock().await["sb-exit"]
+                    .process
+                    .as_ref()
+                    .unwrap()
+                    .clone();
+                let mut process = process.lock().await;
+                process.supervisor.wait().await.unwrap();
+                process.supervisor = Command::new("sh")
+                    .arg("-c")
+                    .arg("exit 84")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+            }
             driver.monitor_sandbox("sb-exit".to_string()).await;
+            let expected_reason = if launch_unconfirmed {
+                LAUNCH_UNCONFIRMED_CONDITION
+            } else {
+                "ProcessExited"
+            };
 
             let condition = driver.registry.lock().await["sb-exit"]
                 .snapshot
@@ -9358,7 +9392,7 @@ mod tests {
                     status
                         .conditions
                         .iter()
-                        .find(|condition| condition.reason == "ProcessExited")
+                        .find(|condition| condition.reason == expected_reason)
                         .cloned()
                 })
                 .expect("ProcessExited condition");
@@ -9366,17 +9400,22 @@ mod tests {
             while let Ok(event) = events.try_recv() {
                 if let Some(watch_sandboxes_event::Payload::PlatformEvent(platform)) = event.payload
                     && let Some(event) = platform.event
-                    && event.reason == "ProcessExited"
+                    && event.reason == expected_reason
                 {
                     event_message = Some(event.message);
                 }
             }
-            let event_message = event_message.expect("ProcessExited platform event");
+            let event_message = event_message.expect("process failure platform event");
             for message in [&condition.message, &event_message] {
-                assert!(message.starts_with(&format!("{component} process exited")));
+                if launch_unconfirmed {
+                    assert_eq!(message.as_str(), LAUNCH_UNCONFIRMED_DIAGNOSTIC);
+                    assert!(!message.contains("supervisor error"));
+                } else {
+                    assert!(message.starts_with(&format!("{component} process exited")));
+                }
                 assert!(!message.contains("agent output"), "{component}: {message}");
             }
-            if component == "host supervisor" {
+            if !launch_unconfirmed && component == "host supervisor" {
                 assert!(condition.message.contains("supervisor error"));
             }
         }

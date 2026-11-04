@@ -88,11 +88,14 @@ pub struct WorkspaceValidationFailed(String);
 /// The sandbox reports errors across the boundary as text, so a workspace
 /// rejection is recognized here, once, and carried as
 /// [`WorkspaceValidationFailed`] from then on.
-pub fn start_agent_error(message: String) -> miette::Report {
+pub fn start_agent_error(
+    error: openshell_isolation_interface::contract::BackendError,
+) -> miette::Report {
+    let message = error.to_string();
     if message.contains(openshell_core::driver_utils::WORKSPACE_VALIDATION_ERROR_CONTEXT) {
         miette::Report::new(WorkspaceValidationFailed(message))
     } else {
-        miette::miette!(message)
+        backend_setup::startup_error(BackendStartupStage::StartAgent, error)
     }
 }
 
@@ -1674,7 +1677,7 @@ pub async fn run_sandbox_instance(
             sandbox_id: poll_id,
             sandbox: poll_sandbox,
             opa_engine: poll_engine,
-            loaded_policy_origin,
+            loaded_policy_origin: loaded_policy_origin.clone(),
             vm_identity: vm_policy_identity,
             entrypoint_pid: poll_pid,
             interval_secs: poll_interval_secs,
@@ -1730,12 +1733,28 @@ pub async fn run_sandbox_instance(
 
     let (confirmed, backend_name) = remote_ready;
     let exit_code = {
-        let running = confirmed
-            .into_boundary()
-            .start_agent()
-            .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.start_agent"))
-            .await
-            .map_err(|error| start_agent_error(error.to_string()))?;
+        let started =
+            Box::pin(confirmed.into_boundary().start_agent().instrument(
+                tracing::info_span!(parent: &startup, "supervisor.boundary.start_agent"),
+            ))
+            .await;
+        let running = match started {
+            Ok(running) => running,
+            Err(error) => {
+                let error = start_agent_error(error);
+                if let (Some(sandbox_id), Some(gateway)) = (sandbox_id.as_deref(), gateway.as_ref())
+                {
+                    Box::pin(report_backend_startup_failure(
+                        gateway,
+                        sandbox_id,
+                        &loaded_policy_origin,
+                        &error,
+                    ))
+                    .await;
+                }
+                return Err(error);
+            }
+        };
         // Opening can only prepare a restore. Report success after StartAgent
         // has completed restoration, so a late failure is never logged as resumed.
         if let Some(outcome) = running.launch_outcome()
@@ -4229,7 +4248,7 @@ fn enqueue_policy_status(sender: &UnboundedSender<PolicyStatusUpdate>, update: P
     }
 }
 
-/// Report a classified backend failure before the workload has started.
+/// Build an authenticated generation-bound startup failure report.
 fn backend_startup_failure_report(
     sandbox_id: &str,
     origin: &LoadedPolicyOrigin,
@@ -4242,7 +4261,13 @@ fn backend_startup_failure_report(
     else {
         return None;
     };
-    let code = error.code()?.to_string();
+    let mut code = error.code()?.to_string();
+    // Starting is a mutation: a lost reply can follow successful execution.
+    // This path cannot prove that workload execution did not begin.
+    let refused_before_start = !code.starts_with("openshell.backend.start-agent.");
+    if !refused_before_start {
+        code = "openshell.backend.start-agent.unconfirmed".to_string();
+    }
     backend_startup_diagnostic(&code)?;
     Some(openshell_core::proto::ReportSandboxConfigurationRequest {
         sandbox_id: sandbox_id.to_string(),
@@ -4257,11 +4282,11 @@ fn backend_startup_failure_report(
             error: code,
         }),
         expected_instance_id: String::new(),
-        refused_before_start: true,
+        refused_before_start,
     })
 }
 
-/// Report a pre-start failure without replacing the original error. The entire
+/// Report a startup failure without replacing the original error. The entire
 /// best-effort operation, including any policy-history report, has one deadline.
 async fn report_backend_startup_failure(
     gateway: &openshell_core::grpc_client::GatewayEndpoint,
@@ -6800,6 +6825,21 @@ network_policies:
         }
 
         let transient = miette::miette!("unavailable");
+        for failure in [
+            BackendError::Process("launch outcome is unknown".into()),
+            BackendError::Unavailable("reply was lost".into()),
+            BackendError::Denied("already-running inputs differ".into()),
+            BackendError::Terminated("runtime connection was lost".into()),
+        ] {
+            let error = start_agent_error(failure);
+            let request = backend_startup_failure_report("sandbox-id", &origin(&revision), &error)
+                .expect("an uncertain launch has a bounded infrastructure report");
+            assert!(!request.refused_before_start);
+            assert_eq!(
+                request.admission.unwrap().error,
+                "openshell.backend.start-agent.unconfirmed"
+            );
+        }
         assert!(
             backend_startup_failure_report("sandbox-id", &origin(&revision), &transient).is_none()
         );
@@ -6848,6 +6888,7 @@ network_policies:
             BackendStartupStage::Build,
             BackendStartupStage::Attach,
             BackendStartupStage::Confirm,
+            BackendStartupStage::StartAgent,
         ] {
             for failure in [
                 BackendError::Denied("policy rejected".into()),

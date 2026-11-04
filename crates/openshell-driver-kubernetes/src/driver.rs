@@ -50,6 +50,10 @@ use kube::runtime::wait::await_condition;
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
 use openshell_core::NetworkSupervisorTrustBundle;
+use openshell_core::backend_startup::{
+    LAUNCH_UNCONFIRMED_CONDITION, LAUNCH_UNCONFIRMED_DIAGNOSTIC, RuntimeStartupFailure,
+    SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED,
+};
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_GATEWAY_ID, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID,
@@ -4988,6 +4992,7 @@ impl KubernetesComputeDriver {
                     &object,
                 )
                 .await
+                .0
                 {
                     SandboxRuntimeControlAvailability::Available
                     | SandboxRuntimeControlAvailability::Degraded => {}
@@ -5015,6 +5020,7 @@ impl KubernetesComputeDriver {
                     &object,
                 )
                 .await
+                .0
                 {
                     SandboxRuntimeControlAvailability::Available
                     | SandboxRuntimeControlAvailability::Degraded => {}
@@ -6840,36 +6846,94 @@ fn sandbox_runtime_readiness_state(
     }
 }
 
+fn runtime_startup_failure_from_pod(pod: &Pod) -> Option<(&'static str, &'static str)> {
+    let container = pod
+        .spec
+        .as_ref()?
+        .containers
+        .iter()
+        .find(|container| container.name == "agent")?;
+    let command = container.command.as_ref()?;
+    if command.first()? != &format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox")
+        || command.get(1).map(String::as_str) != Some("--bootstrap")
+    {
+        return None;
+    }
+    let terminated = pod
+        .status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .iter()
+        .find(|container| container.name == "agent")?
+        .state
+        .as_ref()?
+        .terminated
+        .as_ref()?;
+    if terminated.signal.is_some_and(|signal| signal != 0)
+        || terminated.reason.as_deref() == Some("OOMKilled")
+    {
+        return None;
+    }
+    let failure = RuntimeStartupFailure::from_exit_code(i64::from(terminated.exit_code))?;
+    Some((failure.condition_reason(), failure.diagnostic()))
+}
+
+fn supervisor_startup_failure_from_pod(pod: &Pod) -> Option<(&'static str, &'static str)> {
+    let terminated = pod
+        .status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .iter()
+        .find(|container| container.name == "supervisor")?
+        .state
+        .as_ref()?
+        .terminated
+        .as_ref()?;
+    if terminated.signal.is_some_and(|signal| signal != 0)
+        || terminated.reason.as_deref() == Some("OOMKilled")
+    {
+        return None;
+    }
+    (terminated.exit_code == SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED)
+        .then_some((LAUNCH_UNCONFIRMED_CONDITION, LAUNCH_UNCONFIRMED_DIAGNOSTIC))
+}
+
 async fn sandbox_runtime_workload_generation_matches(
     client: &Client,
     namespace: &str,
     pod_name: &str,
     sandbox: &DynamicObject,
-) -> SandboxRuntimeControlAvailability {
+) -> (
+    SandboxRuntimeControlAvailability,
+    Option<(&'static str, &'static str)>,
+) {
     let Some(expected_uid) = sandbox
         .metadata
         .annotations
         .as_ref()
         .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID))
     else {
-        return SandboxRuntimeControlAvailability::Unavailable;
+        return (SandboxRuntimeControlAvailability::Unavailable, None);
     };
     let pods = Api::<Pod>::namespaced(client.clone(), namespace);
     match tokio::time::timeout(KUBE_API_TIMEOUT, pods.get_opt(pod_name)).await {
-        Ok(Ok(Some(pod))) if pod.metadata.uid.as_deref() == Some(expected_uid.as_str()) => {
-            SandboxRuntimeControlAvailability::Available
-        }
-        Ok(Ok(_)) => SandboxRuntimeControlAvailability::Unavailable,
+        Ok(Ok(Some(pod))) if pod.metadata.uid.as_deref() == Some(expected_uid.as_str()) => (
+            SandboxRuntimeControlAvailability::Available,
+            runtime_startup_failure_from_pod(&pod),
+        ),
+        Ok(Ok(_)) => (SandboxRuntimeControlAvailability::Unavailable, None),
         Ok(Err(error)) => {
             warn!(pod = pod_name, %error, "could not verify sandbox-runtime workload generation");
-            SandboxRuntimeControlAvailability::Unknown
+            (SandboxRuntimeControlAvailability::Unknown, None)
         }
         Err(_) => {
             warn!(
                 pod = pod_name,
                 "timed out checking sandbox-runtime workload generation"
             );
-            SandboxRuntimeControlAvailability::Unknown
+            (SandboxRuntimeControlAvailability::Unknown, None)
         }
     }
 }
@@ -6879,14 +6943,17 @@ async fn sandbox_runtime_supervisor_generation_matches(
     namespace: &str,
     sandbox_id: &str,
     sandbox: &DynamicObject,
-) -> SandboxRuntimeControlAvailability {
+) -> (
+    SandboxRuntimeControlAvailability,
+    Option<(&'static str, &'static str)>,
+) {
     match supervisor_placement(sandbox) {
         Ok(SupervisorPlacement::Dedicated) => {}
         // The sandbox instance's sandbox is checked with its availability.
         Ok(SupervisorPlacement::Shared { .. }) => {
-            return SandboxRuntimeControlAvailability::Available;
+            return (SandboxRuntimeControlAvailability::Available, None);
         }
-        Err(_) => return SandboxRuntimeControlAvailability::Unavailable,
+        Err(_) => return (SandboxRuntimeControlAvailability::Unavailable, None),
     }
     let Some(expected_uid) = sandbox
         .metadata
@@ -6894,25 +6961,26 @@ async fn sandbox_runtime_supervisor_generation_matches(
         .as_ref()
         .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID))
     else {
-        return SandboxRuntimeControlAvailability::Unavailable;
+        return (SandboxRuntimeControlAvailability::Unavailable, None);
     };
     let names = SandboxRuntimeNames::new(sandbox_id);
     let pods = Api::<Pod>::namespaced(client.clone(), namespace);
     match tokio::time::timeout(KUBE_API_TIMEOUT, pods.get_opt(&names.supervisor_pod)).await {
-        Ok(Ok(Some(pod))) if pod.metadata.uid.as_deref() == Some(expected_uid.as_str()) => {
-            SandboxRuntimeControlAvailability::Available
-        }
-        Ok(Ok(_)) => SandboxRuntimeControlAvailability::Unavailable,
+        Ok(Ok(Some(pod))) if pod.metadata.uid.as_deref() == Some(expected_uid.as_str()) => (
+            SandboxRuntimeControlAvailability::Available,
+            supervisor_startup_failure_from_pod(&pod),
+        ),
+        Ok(Ok(_)) => (SandboxRuntimeControlAvailability::Unavailable, None),
         Ok(Err(error)) => {
             warn!(pod = names.supervisor_pod, %error, "could not verify sandbox-runtime supervisor generation");
-            SandboxRuntimeControlAvailability::Unknown
+            (SandboxRuntimeControlAvailability::Unknown, None)
         }
         Err(_) => {
             warn!(
                 pod = names.supervisor_pod,
                 "timed out checking sandbox-runtime supervisor generation"
             );
-            SandboxRuntimeControlAvailability::Unknown
+            (SandboxRuntimeControlAvailability::Unknown, None)
         }
     }
 }
@@ -6954,8 +7022,11 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
             &sandbox_id,
             &obj,
         ));
-        let (dependencies, workload_generation, supervisor_generation) =
-            tokio::join!(dependencies, workload_generation, supervisor_generation);
+        let (
+            dependencies,
+            (workload_generation, workload_failure),
+            (supervisor_generation, supervisor_failure),
+        ) = tokio::join!(dependencies, workload_generation, supervisor_generation);
         // A transient API read failure is not evidence that the running
         // boundary disappeared. Preserve the CR's published readiness for
         // Unknown and let periodic reconciliation retry.
@@ -6967,6 +7038,21 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
             || supervisor_generation == SandboxRuntimeControlAvailability::Unavailable
         {
             mark_sandbox_runtime_control_unavailable(&mut sandbox);
+        }
+        if sandbox_runtime_should_run(&obj)
+            && let Some((reason, message)) = workload_failure.or(supervisor_failure)
+        {
+            let status = sandbox.status.get_or_insert_with(Default::default);
+            status.conditions.retain(|condition| {
+                condition.r#type != "Ready" && condition.r#type != SANDBOX_SUSPENDED_CONDITION
+            });
+            status.conditions.push(SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: reason.to_string(),
+                message: message.to_string(),
+                transition_time: None,
+            });
         }
     }
     Ok((name, sandbox))
@@ -14449,6 +14535,44 @@ mod tests {
                 && condition.status == "True"
                 && condition.reason == "SandboxRuntimeGenerationStarting"
         }));
+    }
+
+    #[test]
+    fn trusted_pod_exit_reports_fixed_startup_failure() {
+        let mut pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "runtime"},
+            "spec": {"containers": [{"name": "agent", "command": [format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"), "--bootstrap", BOUNDARY_CONFIG_PATH]}]},
+            "status": {"containerStatuses": [{"name": "agent", "image": "test", "imageID": "test", "ready": false, "restartCount": 0, "state": {"terminated": {"exitCode": 81}}}]}
+        })).unwrap();
+        assert_eq!(
+            runtime_startup_failure_from_pod(&pod),
+            Some((
+                RuntimeStartupFailure::LandlockUnavailable.condition_reason(),
+                RuntimeStartupFailure::LandlockUnavailable.diagnostic()
+            ))
+        );
+        pod.spec.as_mut().unwrap().containers[0].command = Some(vec!["untrusted-command".into()]);
+        assert_eq!(runtime_startup_failure_from_pod(&pod), None);
+        let state = &mut pod
+            .status
+            .as_mut()
+            .unwrap()
+            .container_statuses
+            .as_mut()
+            .unwrap()[0];
+        state.name = "supervisor".into();
+        state
+            .state
+            .as_mut()
+            .unwrap()
+            .terminated
+            .as_mut()
+            .unwrap()
+            .exit_code = SUPERVISOR_EXIT_LAUNCH_UNCONFIRMED;
+        assert_eq!(
+            supervisor_startup_failure_from_pod(&pod),
+            Some((LAUNCH_UNCONFIRMED_CONDITION, LAUNCH_UNCONFIRMED_DIAGNOSTIC))
+        );
     }
 
     #[test]
