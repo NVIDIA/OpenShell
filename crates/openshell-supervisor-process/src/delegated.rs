@@ -93,6 +93,7 @@ pub async fn start_boundary_access(
     config_apply_tx: tokio::sync::mpsc::Sender<crate::supervisor_session::ConfigApplyRequest>,
     config_push_updates: tokio::sync::watch::Sender<bool>,
     host_key: Option<russh::keys::PrivateKey>,
+    gateway_home: Option<tokio::sync::watch::Receiver<Option<String>>>,
 ) -> Result<BoundaryAccess> {
     let instance_id = uuid::Uuid::new_v4().to_string();
     let terminating = Arc::new(AtomicBool::new(false));
@@ -130,6 +131,7 @@ pub async fn start_boundary_access(
                     session_id_updates: supervisor_session_updates,
                     config_apply_tx,
                     config_push_updates,
+                    gateway_home,
                 },
             );
             (Some(task), Some(accepted))
@@ -374,6 +376,7 @@ mod tests {
             tokio::sync::mpsc::channel(1).0,
             tokio::sync::watch::channel(false).0,
             None,
+            None,
         )
         .await
         .expect("access without SSH is portable");
@@ -414,6 +417,7 @@ mod tests {
             None,
             tokio::sync::mpsc::channel(1).0,
             tokio::sync::watch::channel(false).0,
+            None,
             None,
         )
         .await;

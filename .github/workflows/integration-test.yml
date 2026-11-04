@@ -20,15 +20,14 @@ on:
         description: Integration-test category, used for the job name and concurrency key
         required: true
         type: string
-        default: feature-specific
+        default: driver-specific
       test-matrix:
         description: JSON array of environment, installer, and testsuite combinations
         required: true
         type: string
         default: >-
           [
-            {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
-            {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"}
+            {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"e2e-podman"}
           ]
 
 permissions:

@@ -30,6 +30,8 @@ In the Helm chart, set the table under `gatewayConfig`. The gateway passes the e
 | Compute drivers | Child spans for each compute-driver operation the gateway performs, from both the gateway's side and the driver's side. |
 | Sandbox supervisors | Supervisor startup, such as loading policy. |
 
+These are OpenShell's own spans. Spans that the agent produces travel separately, through the [agent trace relay](/observability/overview#agent-traces).
+
 Spans for routine or high-volume operations use DEBUG level, and the default INFO level does not export them. These include store operations, health checks, the RPCs that supervisors call on a timer (`GetSandboxConfig` and `ReportProviderReadiness`), and how supervisors handle egress connections. Set the gateway or sandbox log level to `debug` to include them.
 
 ## Span Names

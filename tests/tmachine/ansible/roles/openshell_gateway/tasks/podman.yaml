@@ -31,3 +31,22 @@
   environment:
     HOME: "{{ openshell_gateway_home }}"
     XDG_RUNTIME_DIR: "/run/user/{{ openshell_gateway_uid }}"
+
+# An environment can add [openshell.drivers.podman] settings, such as the
+# user-namespace mode (playbooks/drivers/podman/userns.yaml).
+- name: Check for environment Podman driver settings
+  ansible.builtin.stat:
+    path: /etc/openshell-test/podman-driver.toml
+  register: openshell_gateway_podman_driver_file
+
+- name: Read environment Podman driver settings
+  ansible.builtin.slurp:
+    src: /etc/openshell-test/podman-driver.toml
+  register: openshell_gateway_podman_driver_slurp
+  when: openshell_gateway_podman_driver_file.stat.exists
+
+- name: Select environment Podman driver settings
+  ansible.builtin.set_fact:
+    openshell_gateway_podman_driver_settings: >-
+      {{ openshell_gateway_podman_driver_slurp.content | b64decode | trim
+         if openshell_gateway_podman_driver_file.stat.exists else '' }}
