@@ -645,7 +645,10 @@ request with a parent is refused with "child sandboxes are disabled on this
 gateway". Children that already exist keep their policy sync, and users can
 still list, run commands in, read the logs of and delete them from the CLI.
 Turning the setting off never deletes children, and policy changes keep
-reaching them, so a revocation on a parent still applies.
+reaching them, so a revocation on a parent still applies. The policy sync
+therefore runs whatever the setting says: delivery refuses a child whose copy
+is behind its parent's, so a sync stopped by the setting would cut existing
+children off at their parent's next policy change.
 
 The setting also controls the MCP endpoint: `/mcp` is served only while it is
 on, for users and sandboxes alike, so a gateway that has not opted in exposes
@@ -805,7 +808,9 @@ argument list, working directory, timeout and exit code, and for jobs the job
 id, state and exit code. Every field is capped (the argument list at 1 KiB,
 the working directory at 512 bytes, others at 256 bytes) and marks a cut, so
 an event stays under 4 KiB. It never records stdin, environment values,
-output, log lines or any reply body.
+output, log lines or any reply body. A child that calls `/mcp` records its own
+`created_by` as `acting_for`, which for a child made over MCP is its root,
+`sandbox:<id>`; the user is one step up, in the root's `created_by`.
 The argument list is kept because "what did it run" is the question operators
 ask, and the gateway's own exec log records the command anyway. Secrets
 belong in providers, not in command lines. Refusals at the supervisor door are logged
@@ -937,6 +942,10 @@ reused; its grants, lineage store and result files are not part of this design.
 
 ## Future work
 
+- **Finding a parent's children by an index.** Children are found by scanning
+  the parent's workspace, after every root policy load and for each child
+  that delivery refuses as behind. A lookup indexed by parent id would remove
+  that cost on gateways with many sandboxes.
 - **Listing templates over MCP.** A `list_templates` tool, built on the
   existing `ListSandboxTemplates` RPC, that shows a sandbox only templates
   approved for agents, without their environment values.
