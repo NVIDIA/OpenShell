@@ -20,6 +20,8 @@ OpenShell is agent-first, not agent-only. The distinction matters:
 
 ## First-Time Contributors
 
+Start by using OpenShell. To get guided help, fork the repository, open your agent in your local checkout, and run the `getting-started-with-openshell` skill. It asks what you want to do with OpenShell, helps you run your own agent in a sandbox, and points you toward the community and first issues once you have hands-on experience.
+
 We use a vouch system. This exists because AI makes it trivial to generate plausible-looking but low-quality contributions, and we can no longer trust by default.
 
 1. Open a [Vouch Request](https://github.com/NVIDIA/OpenShell/discussions/new?category=vouch-request) discussion.
@@ -99,6 +101,7 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 
 | Category        | Skill                     | Purpose                                                                                             |
 | --------------- | ------------------------- | --------------------------------------------------------------------------------------------------- |
+| Contributing    | `getting-started-with-openshell` | Guide a prospective contributor from first use to community involvement                     |
 | Contributing    | `create-spike`            | Investigate a problem, produce a structured GitHub issue                                            |
 | Contributing    | `create-rfc`              | Create RFC proposals from the repository template                                                   |
 | Contributing    | `build-from-issue`        | Plan and implement work from a GitHub issue (maintainer workflow)                                   |
