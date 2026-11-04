@@ -443,9 +443,10 @@ Static credential resolution has three independent authorization boundaries:
    endpoints provide the binding by default. An endpointless profile can use a
    sandbox policy endpoint that names the attached provider instance through
    `credential_binding.provider`.
-3. When placement metadata is supported and available, the request location
-   must match the declared header, query parameter, or path-template slot, or an
-   explicitly enabled body/WebSocket rewrite policy.
+3. The request location must match the declared header, query parameter, or
+   path-template slot, or an explicitly enabled body/WebSocket rewrite policy.
+   Without placement metadata, static credentials resolve only in `Authorization`
+   or through those explicit rewrite policies.
 
 All three checks must pass. A provider profile endpoint does not grant network access
 unless provider policy composition or the sandbox's own policy allows the
@@ -466,8 +467,10 @@ for endpoint matching and migration guidance.
 
 The proxy automatically enforces declared placement when the gateway and
 supervisor support it. Moving a header credential into a query parameter, path,
-or unrelated header is denied before forwarding. Credentials without usable
-placement metadata and older components retain legacy endpoint-scoped rewriting.
+or unrelated header is denied before forwarding. A supporting supervisor defaults
+to `Authorization` when placement metadata is absent and rejects malformed
+metadata. Custom placements require a supporting gateway and an explicit profile
+declaration. Older supervisors keep their previous behavior.
 
 | Location | How the agent uses it | Example |
 |---|---|---|

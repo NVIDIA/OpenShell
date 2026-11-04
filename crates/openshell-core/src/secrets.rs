@@ -193,8 +193,6 @@ pub struct RewriteTargetResult {
 /// Credential-specific destinations authorized by the provider profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialPlacement {
-    /// Historical substitution behavior when no placement metadata is delivered.
-    Legacy,
     Header(String),
     QueryParam(String),
     PathTemplate(String),
@@ -213,6 +211,8 @@ pub enum RequestCredentialLocation {
 #[derive(Clone, Default)]
 pub struct SecretResolver {
     by_placeholder: HashMap<String, SecretValue>,
+    // Enabled only by the secret-free policy projection below, never by runtime callers.
+    policy_redaction_only: bool,
     placements: HashMap<String, CredentialPlacement>,
     request_location: Option<RequestCredentialLocation>,
     denied_env_keys: HashSet<String>,
@@ -324,6 +324,7 @@ impl SecretResolver {
         let resolver = |by_placeholder: HashMap<String, SecretValue>| {
             (!by_placeholder.is_empty()).then_some(Self {
                 by_placeholder,
+                policy_redaction_only: false,
                 placements: HashMap::new(),
                 request_location: None,
                 denied_env_keys: HashSet::new(),
@@ -381,6 +382,7 @@ impl SecretResolver {
                 child_env,
                 Some(Self {
                     by_placeholder,
+                    policy_redaction_only: false,
                     placements: HashMap::new(),
                     request_location: None,
                     denied_env_keys: HashSet::new(),
@@ -410,6 +412,7 @@ impl SecretResolver {
         } else {
             Some(Self {
                 by_placeholder,
+                policy_redaction_only: false,
                 placements,
                 request_location: None,
                 denied_env_keys,
@@ -445,6 +448,7 @@ impl SecretResolver {
             .collect();
         Self {
             by_placeholder,
+            policy_redaction_only: self.policy_redaction_only,
             placements: self.placements.clone(),
             request_location: None,
             denied_env_keys,
@@ -471,20 +475,31 @@ impl SecretResolver {
     }
 
     fn placement_permits(&self, placeholder: &str) -> bool {
+        if self.policy_redaction_only {
+            return true;
+        }
         let Some(key) = placeholder_env_key(placeholder) else {
             return true;
         };
-        let Some(placement) = self.placements.get(key) else {
+        // Context-free reads are trusted configuration/expiry lookups only.
+        // Bound credentials still require an actual request destination.
+        if self.request_location.is_none()
+            && !self.identity_bound_env_keys.contains(key)
+            && !self.placements.contains_key(key)
+        {
             return true;
+        }
+        if matches!(
+            self.request_location,
+            Some(RequestCredentialLocation::Body | RequestCredentialLocation::WebSocket)
+        ) {
+            // Only explicit endpoint-policy rewrite wrappers choose these contexts.
+            return true;
+        }
+        let Some(placement) = self.placements.get(key) else {
+            return matches!(self.request_location.as_ref(), Some(RequestCredentialLocation::Header(name)) if name.eq_ignore_ascii_case("authorization"));
         };
         match (placement, self.request_location.as_ref()) {
-            (CredentialPlacement::Legacy, _)
-            | (
-                CredentialPlacement::Header(_)
-                | CredentialPlacement::QueryParam(_)
-                | CredentialPlacement::PathTemplate(_),
-                Some(RequestCredentialLocation::Body | RequestCredentialLocation::WebSocket),
-            ) => true,
             (
                 CredentialPlacement::Header(expected),
                 Some(RequestCredentialLocation::Header(actual)),
@@ -1573,9 +1588,10 @@ pub fn redact_target_for_policy(target: &str) -> Result<String, UnresolvedPlaceh
     }
 
     let (_, resolver) = SecretResolver::from_provider_env(provider_env);
-    let Some(resolver) = resolver else {
+    let Some(mut resolver) = resolver else {
         return Err(unresolved("request_target"));
     };
+    resolver.policy_redaction_only = true;
     rewrite_target_for_eval(target, &resolver).map(|result| result.redacted)
 }
 
@@ -1637,6 +1653,89 @@ mod tests {
         resolver
             .unwrap()
             .with_placements(HashMap::from([("TOKEN".to_string(), placement)]))
+    }
+
+    #[test]
+    fn missing_placement_map_defaults_request_rewriting_to_authorization() {
+        let (_, resolver) = SecretResolver::from_provider_env(HashMap::from([(
+            "TOKEN".into(),
+            "synthetic".into(),
+        )]));
+        let resolver = resolver.unwrap();
+        for token in [
+            "openshell:resolve:env:TOKEN",
+            "vendor-OPENSHELL-RESOLVE-ENV-TOKEN",
+        ] {
+            for scheme in ["Bearer", "token"] {
+                assert_eq!(
+                    resolver
+                        .rewrite_header_value_for_name(
+                            "aUtHoRiZaTiOn",
+                            &format!("{scheme} {token}")
+                        )
+                        .unwrap(),
+                    Some(format!("{scheme} synthetic"))
+                );
+            }
+            let basic = base64::engine::general_purpose::STANDARD.encode(format!("user:{token}"));
+            assert!(
+                resolver
+                    .rewrite_header_value_for_name("Authorization", &format!("Basic {basic}"))
+                    .unwrap()
+                    .is_some()
+            );
+            for name in ["X-Reflect", "X-Api-Key"] {
+                assert!(
+                    resolver
+                        .rewrite_header_value_for_name(name, token)
+                        .unwrap_err()
+                        .is_placement_mismatch()
+                );
+                assert!(
+                    resolver
+                        .rewrite_header_value_for_name(name, &format!("Basic {basic}"))
+                        .unwrap_err()
+                        .is_placement_mismatch()
+                );
+            }
+            for target in [
+                format!("/search?token={token}"),
+                format!(
+                    "/search?token={}&token={}",
+                    fully_percent_encoded(token),
+                    fully_percent_encoded(token)
+                ),
+                format!("/api/{token}"),
+            ] {
+                assert!(
+                    rewrite_target_for_eval(&target, &resolver)
+                        .unwrap_err()
+                        .is_placement_mismatch()
+                );
+            }
+        }
+        // These methods are called only after explicit endpoint-policy opt-in.
+        assert_eq!(
+            resolver
+                .rewrite_text_placeholders(
+                    &mut "openshell:resolve:env:TOKEN".into(),
+                    "request_body"
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            resolver
+                .rewrite_websocket_text_placeholders(&mut "openshell:resolve:env:TOKEN".into())
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            resolver
+                .resolve_current_env_key_checked("TOKEN", "sigv4")
+                .unwrap(),
+            Some("synthetic")
+        );
     }
 
     #[test]
@@ -1843,7 +1942,10 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let resolver = resolver.expect("resolver");
+        let resolver = resolver.expect("resolver").with_placements(HashMap::from([(
+            "CUSTOM_TOKEN".into(),
+            CredentialPlacement::Header("x-api-key".into()),
+        )]));
 
         assert_eq!(
             rewrite_header_line("x-api-key: openshell:resolve:env:CUSTOM_TOKEN", &resolver),
@@ -1922,7 +2024,10 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let resolver = resolver.expect("resolver");
+        let resolver = resolver.expect("resolver").with_placements(HashMap::from([(
+            "CHAT_APP_TOKEN".into(),
+            CredentialPlacement::Header("x-app-token".into()),
+        )]));
 
         assert_eq!(
             rewrite_header_line(
@@ -2001,6 +2106,12 @@ mod tests {
              x-api-key: {token_value}\r\n\
              Content-Length: 0\r\n\r\n"
         );
+        let resolver = resolver.map(|resolver| {
+            resolver.with_placements(HashMap::from([(
+                "CUSTOM_SERVICE_TOKEN".into(),
+                CredentialPlacement::Header("x-api-key".into()),
+            )]))
+        });
 
         let result =
             rewrite_http_header_block(raw.as_bytes(), resolver.as_ref()).expect("should succeed");
@@ -2105,6 +2216,12 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
+        let resolver = resolver.map(|resolver| {
+            resolver.with_placements(HashMap::from([(
+                "YOUTUBE_API_KEY".into(),
+                CredentialPlacement::QueryParam("key".into()),
+            )]))
+        });
         let placeholder = child_env.get("YOUTUBE_API_KEY").unwrap();
 
         let raw = format!(
@@ -2133,6 +2250,12 @@ mod tests {
             .into_iter()
             .collect(),
         );
+        let resolver = resolver.map(|resolver| {
+            resolver.with_placements(HashMap::from([(
+                "API_KEY".into(),
+                CredentialPlacement::QueryParam("token".into()),
+            )]))
+        });
         let placeholder = child_env.get("API_KEY").unwrap();
 
         let raw = format!("GET /api?token={placeholder} HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -2153,6 +2276,12 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
+        let resolver = resolver.map(|resolver| {
+            resolver.with_placements(HashMap::from([(
+                "KEY".into(),
+                CredentialPlacement::QueryParam("key".into()),
+            )]))
+        });
         let placeholder = child_env.get("KEY").unwrap();
 
         let raw = format!("GET /api?key={placeholder}&format=json HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -2294,7 +2423,10 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let resolver = resolver.expect("resolver");
+        let resolver = resolver.expect("resolver").with_placements(HashMap::from([(
+            "TOKEN".into(),
+            CredentialPlacement::PathTemplate("/api/{credential}/data".into()),
+        )]));
         let placeholder = child_env.get("TOKEN").unwrap();
 
         let raw = format!("GET /api/{placeholder}/data HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -2322,7 +2454,10 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let resolver = resolver.expect("resolver");
+        let resolver = resolver.expect("resolver").with_placements(HashMap::from([(
+            "TELEGRAM_TOKEN".into(),
+            CredentialPlacement::PathTemplate("/bot{credential}/sendMessage".into()),
+        )]));
         let placeholder = child_env.get("TELEGRAM_TOKEN").unwrap();
 
         let raw = format!(
@@ -2357,6 +2492,16 @@ mod tests {
         let resolver = resolver.expect("resolver");
         let org_ph = child_env.get("ORG_ID").unwrap();
         let key_ph = child_env.get("API_KEY").unwrap();
+        let resolver = resolver.with_placements(HashMap::from([
+            (
+                "ORG_ID".into(),
+                CredentialPlacement::PathTemplate(format!("/orgs/{{credential}}/keys/{key_ph}")),
+            ),
+            (
+                "API_KEY".into(),
+                CredentialPlacement::PathTemplate(format!("/orgs/{org_ph}/keys/{{credential}}")),
+            ),
+        ]));
 
         let raw = format!("GET /orgs/{org_ph}/keys/{key_ph} HTTP/1.1\r\nHost: x\r\n\r\n");
         let result =
@@ -2390,7 +2535,10 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let resolver = resolver.expect("resolver");
+        let resolver = resolver.expect("resolver").with_placements(HashMap::from([(
+            "TOKEN".into(),
+            CredentialPlacement::PathTemplate("/bot{credential}/method".into()),
+        )]));
         let placeholder = child_env.get("TOKEN").unwrap();
 
         let raw = format!("GET /bot{placeholder}/method?format=json HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -2411,7 +2559,10 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let resolver = resolver.expect("resolver");
+        let resolver = resolver.expect("resolver").with_placements(HashMap::from([(
+            "BAD".into(),
+            CredentialPlacement::PathTemplate("/api/{credential}/data".into()),
+        )]));
         let placeholder = child_env.get("BAD").unwrap();
 
         let raw = format!("GET /api/{placeholder}/data HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -2429,7 +2580,10 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let resolver = resolver.expect("resolver");
+        let resolver = resolver.expect("resolver").with_placements(HashMap::from([(
+            "BAD".into(),
+            CredentialPlacement::PathTemplate("/api/{credential}".into()),
+        )]));
         let placeholder = child_env.get("BAD").unwrap();
 
         let raw = format!("GET /api/{placeholder} HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -2447,7 +2601,10 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let resolver = resolver.expect("resolver");
+        let resolver = resolver.expect("resolver").with_placements(HashMap::from([(
+            "BAD".into(),
+            CredentialPlacement::PathTemplate("/api/{credential}".into()),
+        )]));
         let placeholder = child_env.get("BAD").unwrap();
 
         let raw = format!("GET /api/{placeholder} HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -2465,7 +2622,10 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let resolver = resolver.expect("resolver");
+        let resolver = resolver.expect("resolver").with_placements(HashMap::from([(
+            "BAD".into(),
+            CredentialPlacement::PathTemplate("/api/{credential}".into()),
+        )]));
         let placeholder = child_env.get("BAD").unwrap();
 
         let raw = format!("GET /api/{placeholder} HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -2486,7 +2646,10 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let resolver = resolver.expect("resolver");
+        let resolver = resolver.expect("resolver").with_placements(HashMap::from([(
+            "TOKEN".into(),
+            CredentialPlacement::PathTemplate("/api/{credential}/data".into()),
+        )]));
         let placeholder = child_env.get("TOKEN").unwrap();
 
         // Space in the credential should trigger path validation rejection
@@ -2573,7 +2736,10 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let resolver = resolver.expect("resolver");
+        let resolver = resolver.expect("resolver").with_placements(HashMap::from([(
+            "API_TOKEN".into(),
+            CredentialPlacement::QueryParam("token".into()),
+        )]));
         let encoded = "openshell%3Aresolve%3Aenv%3AAPI_TOKEN";
         let raw = format!("GET /api?token={encoded} HTTP/1.1\r\nHost: x\r\n\r\n");
 
@@ -2595,16 +2761,31 @@ mod tests {
             [
                 ("KEY1".to_string(), "secret1".to_string()),
                 ("KEY2".to_string(), "secret2".to_string()),
+                ("KEY3".to_string(), "secret3".to_string()),
             ]
             .into_iter()
             .collect(),
         );
+        let resolver = resolver.map(|resolver| {
+            resolver.with_placements(HashMap::from([
+                (
+                    "KEY1".into(),
+                    CredentialPlacement::PathTemplate("/api/{credential}".into()),
+                ),
+                (
+                    "KEY2".into(),
+                    CredentialPlacement::QueryParam("token".into()),
+                ),
+                ("KEY3".into(), CredentialPlacement::Header("x-auth".into())),
+            ]))
+        });
         let ph1 = child_env.get("KEY1").unwrap();
         let ph2 = child_env.get("KEY2").unwrap();
+        let ph3 = child_env.get("KEY3").unwrap();
 
         let raw = format!(
             "GET /api/{ph1}?token={ph2} HTTP/1.1\r\n\
-             x-auth: {ph1}\r\n\r\n"
+             x-auth: {ph3}\r\n\r\n"
         );
         let result =
             rewrite_http_header_block(raw.as_bytes(), resolver.as_ref()).expect("should succeed");
@@ -2788,7 +2969,10 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let resolver = resolver.expect("resolver");
+        let resolver = resolver.expect("resolver").with_placements(HashMap::from([(
+            "TOKEN".into(),
+            CredentialPlacement::PathTemplate("/bot{credential}/sendMessage".into()),
+        )]));
         let placeholder = child_env.get("TOKEN").unwrap();
 
         let result = rewrite_target_for_eval(&format!("/bot{placeholder}/sendMessage"), &resolver)
@@ -2806,7 +2990,10 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let resolver = resolver.expect("resolver");
+        let resolver = resolver.expect("resolver").with_placements(HashMap::from([(
+            "KEY".into(),
+            CredentialPlacement::QueryParam("key".into()),
+        )]));
         let placeholder = child_env.get("KEY").unwrap();
 
         let result =
@@ -2904,7 +3091,13 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let resolver = resolver.expect("resolver");
+        let resolver = resolver.expect("resolver").with_placements(HashMap::from([
+            (
+                "TOKEN".into(),
+                CredentialPlacement::PathTemplate("/bot{credential}/method".into()),
+            ),
+            ("KEY".into(), CredentialPlacement::QueryParam("key".into())),
+        ]));
         let tok_ph = child_env.get("TOKEN").unwrap();
         let key_ph = child_env.get("KEY").unwrap();
 

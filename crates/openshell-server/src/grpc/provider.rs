@@ -1554,12 +1554,14 @@ pub(super) fn static_credential_request_metadata(
         };
         let refresh_epochs = refresh_authorization_epochs_by_key(record)?;
         for credential in &profile.credentials {
-            if !has_usable_static_request_metadata(
-                &credential.auth_style,
-                &credential.header_name,
-                &credential.query_param,
-                &credential.path_template,
-            ) {
+            // Keep malformed explicit metadata distinguishable from a wholly
+            // absent declaration. The supervisor validates authored fields and
+            // fails closed; absence selects its default request placement.
+            if credential.auth_style.is_empty()
+                && credential.header_name.is_empty()
+                && credential.query_param.is_empty()
+                && credential.path_template.is_empty()
+            {
                 continue;
             }
             for key in credential.accepted_stored_keys() {
@@ -1600,34 +1602,6 @@ pub(super) fn static_credential_request_metadata(
         }
     }
     Ok(metadata)
-}
-
-const CREDENTIAL_PATH_SLOT: &str = "{credential}";
-
-fn has_usable_static_request_metadata(
-    auth_style: &str,
-    header_name: &str,
-    query_param: &str,
-    path_template: &str,
-) -> bool {
-    match auth_style.trim().to_ascii_lowercase().as_str() {
-        "basic" => true,
-        "header" | "bearer" => header_name.trim().parse::<http::HeaderName>().is_ok(),
-        "query" => {
-            !query_param.trim().is_empty()
-                && !query_param
-                    .chars()
-                    .any(|c| c.is_control() || "&=#?".contains(c))
-        }
-        "path" => {
-            path_template.starts_with('/')
-                && path_template.matches(CREDENTIAL_PATH_SLOT).count() == 1
-                && !path_template
-                    .chars()
-                    .any(|c| c.is_control() || "?#".contains(c))
-        }
-        _ => false,
-    }
 }
 
 fn refresh_authorization_epochs_by_key(
@@ -12280,7 +12254,7 @@ mod tests {
         optional.id = "metadata-optional".into();
         optional.credentials[0].required = false;
         optional.credentials[0].header_name = "x-wrong-owner".into();
-        let sources = ProviderProfileSources::from_test_profiles(vec![owned, optional]);
+        let sources = ProviderProfileSources::from_test_profiles(vec![owned.clone(), optional]);
         let catalog = sources.snapshot_catalog(&store, "default").await.unwrap();
         let record = |name: &str, id: &str, profile: &str| ProviderEnvironmentRecord {
             name: name.into(),
@@ -12345,6 +12319,43 @@ mod tests {
                 .windows(b"synthetic-sensitive-token".len())
                 .any(|window| window == b"synthetic-sensitive-token")
         );
+        // Preserve malformed authored fields for the supervisor to reject;
+        // silently dropping them would incorrectly select its default location.
+        for (style, header, query, path, explicit, valid) in [
+            ("", "", "", "", false, true),
+            (" ", "", "", "", true, false),
+            ("", "x-api-key", "", "", true, false),
+            ("header", "Bad Header", "", "", true, false),
+            ("bearer", "authorization", "api_key", "", true, false),
+            ("query", "", "api?key", "", true, false),
+            ("basic", "x-custom", "", "", true, false),
+            ("basic", "Authorization", "", "", true, true),
+        ] {
+            let mut declared = owned.clone();
+            declared.credentials[0].auth_style = style.into();
+            declared.credentials[0].header_name = header.into();
+            declared.credentials[0].query_param = query.into();
+            declared.credentials[0].path_template = path.into();
+            let sources = ProviderProfileSources::from_test_profiles(vec![declared]);
+            let catalog = sources.snapshot_catalog(&store, "default").await.unwrap();
+            let metadata =
+                static_credential_request_metadata("sandbox", &catalog, &records, &environment)
+                    .unwrap();
+            assert_eq!(
+                metadata.contains_key(&key),
+                explicit,
+                "style {style:?}, header {header:?}"
+            );
+            let installed = openshell_core::provider_credentials::ProviderCredentialState::from_bound_environment(
+                1, environment.environment.clone(), HashMap::new(), metadata,
+                environment.static_credential_bindings.clone(), vec![],
+            );
+            assert_eq!(
+                installed.is_ok(),
+                valid,
+                "style {style:?}, header {header:?}, query {query:?}"
+            );
+        }
         environment.environment.remove("TOKEN");
         assert!(
             static_credential_request_metadata("sandbox", &catalog, &records, &environment)
@@ -12670,6 +12681,9 @@ mod tests {
             credential_state
                 .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "authorization".into()
+                ))
                 .resolve_placeholder(&original_placeholder),
             Some("token-1")
         );
@@ -12725,6 +12739,9 @@ mod tests {
             credential_state
                 .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "authorization".into()
+                ))
                 .resolve_placeholder(&original_placeholder),
             Some("token-2")
         );
@@ -12742,6 +12759,9 @@ mod tests {
             reconstructed
                 .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "authorization".into()
+                ))
                 .resolve_placeholder(&original_placeholder),
             Some("token-2")
         );
@@ -12788,6 +12808,9 @@ mod tests {
             credential_state
                 .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
                 .unwrap()
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "authorization".into()
+                ))
                 .resolve_placeholder(&original_placeholder),
             None
         );

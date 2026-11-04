@@ -178,9 +178,13 @@ refresh configuration, or credential values. The supervisor infers enforcement
 from the auth metadata; the gateway does not enforce placement.
 
 Older supervisors ignore entries without token grants. An older gateway omits
-these entries, so newer supervisors retain legacy behavior. Metadata travels in
-the same captured environment snapshot; no separate service, capability gate,
-or additional lookup is needed.
+these entries, so newer supervisors permit static substitution only in
+`Authorization` or explicitly enabled body/WebSocket rewrite contexts. Custom
+placements require a supporting gateway; upgrade it before the supervisor.
+Explicit authored placement is forwarded even when invalid so the supervisor
+can reject it rather than silently apply the default. Metadata travels in the
+same captured environment snapshot; no separate service, capability gate, or
+additional lookup is needed.
 
 ## Operator credential export
 

@@ -35,6 +35,8 @@ credentials:
     required: true
     auth_style: bearer
     header_name: authorization
+  # OAuth refresh uses a request body, not an HTTP authorization header.
+  # Body substitution requires the endpoint's explicit rewrite policy.
   - name: refresh_token
     description: Codex OAuth refresh token
     env_vars: [CODEX_AUTH_REFRESH_TOKEN]
@@ -45,6 +47,7 @@ credentials:
     required: true
     auth_style: header
     header_name: chatgpt-account-id
+  # OIDC identity claims are not an API authorization credential.
   - name: id_token
     description: Codex OAuth ID token
     env_vars: [CODEX_AUTH_ID_TOKEN]

@@ -728,14 +728,14 @@ def test_imported_openai_profile_allows_native_endpoint_with_attached_provider(
 
 
 @pytest.mark.parametrize(
-    "placement_metadata", [True, False], ids=["metadata", "legacy"]
+    "placement", ["authorization", "missing", "header", "query", "path"]
 )
 def test_static_header_credentials_reject_reflective_request_locations(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
-    placement_metadata: bool,
+    placement: str,
 ) -> None:
-    """Existing metadata selects placement checks while missing metadata stays compatible."""
+    """Missing metadata restricts substitution to Authorization and explicit body rewriting."""
     stub = sandbox_client._stub
     profile_id = f"e2e-placement-{time.time_ns()}"
     secret = "synthetic-placement-secret"
@@ -745,12 +745,20 @@ def test_static_header_credentials_reject_reflective_request_locations(
         port=0,
         rules=[sandbox_pb2.L7Rule(allow=sandbox_pb2.L7Allow(method="*", path="/**"))],
     )
-    if not placement_metadata:
-        profile.credentials[0].auth_style = ""
-        profile.credentials[0].header_name = ""
+    credential = profile.credentials[0]
+    if placement == "missing":
+        credential.auth_style = ""
+        credential.header_name = ""
+    elif placement in {"header", "query", "path"}:
+        credential.auth_style = placement
+        credential.header_name = "x-api-key" if placement == "header" else ""
+        credential.query_param = "api_key" if placement == "query" else ""
+        credential.path_template = (
+            "/credential/{credential}/search" if placement == "path" else ""
+        )
     profile.endpoints[0].request_body_credential_rewrite = True
 
-    def probe_locations(host: str, port: int) -> str:
+    def probe_locations(host: str, port: int, placement: str) -> str:
         import json
         import os
         import urllib.error
@@ -765,7 +773,9 @@ def test_static_header_credentials_reject_reflective_request_locations(
                 + "/search?"
                 + urllib.parse.urlencode({"q": "rust", "per_page": "1", "probe": token})
             ),
-            urllib.request.Request(root + "/search", headers={"X-Api-Key": token}),
+            urllib.request.Request(
+                root + "/search", headers={"X-Other-Credential": token}
+            ),
             urllib.request.Request(
                 root + "/" + urllib.parse.quote(token, safe="") + "/search"
             ),
@@ -794,10 +804,21 @@ def test_static_header_credentials_reject_reflective_request_locations(
                         "link": error.headers.get("Link"),
                     }
                 )
-        request = urllib.request.Request(
-            root + "/search?q=rust&per_page=1",
-            headers={"Authorization": f"token {token}"},
-        )
+        target = "/search?q=rust&per_page=1"
+        headers = {"Authorization": f"token {token}"}
+        if placement == "header":
+            headers = {"x-api-key": token}
+        elif placement == "query":
+            target += "&" + urllib.parse.urlencode({"api_key": token})
+            headers = {}
+        elif placement == "path":
+            target = (
+                "/credential/"
+                + urllib.parse.quote(token, safe="")
+                + "/search?q=rust&per_page=1"
+            )
+            headers = {}
+        request = urllib.request.Request(root + target, headers=headers)
         with urllib.request.urlopen(request, timeout=30) as response:
             valid = {
                 "body": json.loads(response.read()),
@@ -825,28 +846,29 @@ def test_static_header_credentials_reject_reflective_request_locations(
             with sandbox(spec=spec, delete_on_exit=True) as sb:
                 result = sb.exec_python(
                     probe_locations,
-                    args=("host.openshell.internal", port),
+                    args=("host.openshell.internal", port, placement),
                     timeout_seconds=180,
                 )
                 assert result.exit_code == 0, result.stderr
                 payload = json.loads(result.stdout)
                 for result in payload["denied"][:3]:
-                    if placement_metadata:
-                        assert result["status"] == 403, result
-                        assert "credential_placement_mismatch" in result["body"]
-                        assert secret not in result["body"]
-                        assert result["link"] is None
-                    else:
-                        assert result["status"] == 200, result
-                        assert secret in result["body"], result
+                    assert result["status"] == 403, result
+                    assert "credential_placement_mismatch" in result["body"]
+                    assert secret not in result["body"]
+                    assert result["link"] is None
                 body_result = payload["denied"][3]
                 assert body_result["status"] == 200, body_result
                 assert secret in body_result["body"]
-                if not placement_metadata:
-                    assert secret in payload["denied"][0]["link"]
-                assert payload["valid"]["body"]["authorization"] == f"token {secret}"
-                assert "per_page=1&page=2" in payload["valid"]["link"]
-                assert secret not in payload["valid"]["link"]
+                valid = payload["valid"]
+                if placement in {"authorization", "missing"}:
+                    assert valid["body"]["authorization"] == f"token {secret}"
+                elif placement == "header":
+                    assert valid["body"]["x_api_key"] == secret
+                else:
+                    assert secret in valid["body"]["path"]
+                assert "page=2" in valid["link"]
+                if placement in {"authorization", "missing", "header"}:
+                    assert secret not in valid["link"]
 
 
 def test_imported_anthropic_profile_allows_native_endpoint_with_attached_provider(

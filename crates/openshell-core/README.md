@@ -64,8 +64,9 @@ Static credential bindings retain endpoint authorization. The gateway includes
 static `ProviderProfileCredential` auth metadata in the existing runtime
 credential map under `static-env:<ENV_KEY>`. Provider state extracts those entries
 before storing dynamic token grants and compiles placement locally alongside the
-matching static binding. Missing metadata preserves legacy endpoint-scoped
-substitution; malformed reserved metadata fails closed atomically.
+matching static binding. Missing metadata defaults to the `Authorization` header;
+malformed or conflicting reserved metadata fails closed atomically. The same
+header default applies to request rewriting with standalone resolver snapshots.
 
 Request rewriting supplies the actual header name, query key, or path slot.
 Header authorization is independent of authentication scheme, including Basic.

@@ -2883,7 +2883,7 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn legacy_websocket_credential_rewrite_remains_available() {
+    async fn authorization_fallback_preserves_explicit_websocket_rewriting() {
         let state = ProviderCredentialState::from_bound_environment(
             1,
             HashMap::from([("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())]),
@@ -2934,7 +2934,7 @@ network_policies:
         .await;
         assert!(
             result.is_ok(),
-            "legacy placement must preserve WebSocket rewriting: {result:?}"
+            "Authorization fallback must preserve explicit WebSocket rewriting: {result:?}"
         );
 
         drop(relay_write);

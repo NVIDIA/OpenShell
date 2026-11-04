@@ -4326,11 +4326,19 @@ mod tests {
     }
 
     fn placement_test_state() -> ProviderCredentialState {
+        placement_test_state_with_metadata(true)
+    }
+
+    fn placement_test_state_with_metadata(with_metadata: bool) -> ProviderCredentialState {
         ProviderCredentialState::from_bound_environment(
             1,
             TestHashMap::from([("API_TOKEN".into(), "synthetic-private-token".into())]),
             TestHashMap::new(),
-            crate::test_support::header_placement_metadata(&["API_TOKEN"]),
+            if with_metadata {
+                crate::test_support::header_placement_metadata(&["API_TOKEN"])
+            } else {
+                TestHashMap::new()
+            },
             TestHashMap::from([("API_TOKEN".into(), endpoint_binding("provider:API_TOKEN"))]),
             Vec::new(),
         )
@@ -4338,13 +4346,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_legacy_and_strict_credentials_preserve_opt_in_body_and_query_rewriting() {
-        let legacy_binding = endpoint_binding("provider:LEGACY_TOKEN");
+    async fn mixed_declared_and_fallback_credentials_preserve_opt_in_body_rewriting() {
+        let fallback_binding = endpoint_binding("provider:FALLBACK_TOKEN");
         let state = ProviderCredentialState::from_bound_environment(
             1,
             TestHashMap::from([
                 ("STRICT_TOKEN".into(), "strict-private-token".into()),
-                ("LEGACY_TOKEN".into(), "legacy-private-token".into()),
+                ("FALLBACK_TOKEN".into(), "fallback-private-token".into()),
             ]),
             TestHashMap::new(),
             crate::test_support::header_placement_metadata(&["STRICT_TOKEN"]),
@@ -4353,27 +4361,27 @@ mod tests {
                     "STRICT_TOKEN".into(),
                     endpoint_binding("provider:STRICT_TOKEN"),
                 ),
-                ("LEGACY_TOKEN".into(), legacy_binding),
+                ("FALLBACK_TOKEN".into(), fallback_binding),
             ]),
             Vec::new(),
         )
         .expect("mixed placement fixture");
         let snapshot = state.snapshot();
         let strict = &snapshot.child_env["STRICT_TOKEN"];
-        let legacy = &snapshot.child_env["LEGACY_TOKEN"];
+        let fallback = &snapshot.child_env["FALLBACK_TOKEN"];
         let resolver = state
             .resolver_for_endpoint("allowed.example.test", 443, "/allowed/search")
             .unwrap();
-        let body = format!("legacy={legacy}&strict={strict}");
-        let target = format!("/allowed/search?probe={legacy}");
+        let body = format!("fallback={fallback}&strict={strict}");
+        let target = "/allowed/search?probe=literal";
         let raw = format!(
-            "POST {target} HTTP/1.1\r\nHost: allowed.example.test\r\nAuthorization: token {strict}\r\nX-Legacy: {legacy}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST {target} HTTP/1.1\r\nHost: allowed.example.test\r\nAuthorization: token {strict}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
         let request = crate::l7::rest::request_from_buffered_http(
             "POST",
             "/allowed/search",
-            &target,
+            target,
             raw.into_bytes(),
         )
         .unwrap();
@@ -4419,12 +4427,11 @@ mod tests {
         .await
         .unwrap();
         let (headers, body) = service_task.await.unwrap();
-        assert!(headers.contains("/allowed/search?probe=legacy-private-token"));
+        assert!(headers.contains("/allowed/search?probe=literal"));
         assert!(headers.contains("Authorization: token strict-private-token"));
-        assert!(headers.contains("X-Legacy: legacy-private-token"));
         assert_eq!(
             body,
-            "legacy=legacy-private-token&strict=strict-private-token"
+            "fallback=fallback-private-token&strict=strict-private-token"
         );
         assert!(
             resolver
@@ -4530,132 +4537,247 @@ mod tests {
 
     #[tokio::test]
     async fn header_credential_query_reflection_is_denied_before_upstream_write() {
-        let state = placement_test_state();
-        let resolver = state
-            .resolver_for_endpoint("allowed.example.test", 443, "/allowed/search")
-            .unwrap();
-        let token = state.snapshot().child_env["API_TOKEN"].clone();
-        // A pagination service copies extra query parameters into its Link header.
-        // No request bytes may reach it when the parameter contains a header credential.
-        for (target, extra_headers, body, rewrite_body) in [
-            (
-                format!("/allowed/search?q=rust&per_page=1&probe={token}"),
-                String::new(),
-                String::new(),
-                false,
-            ),
-            (
-                "/allowed/search".into(),
-                format!("X-Reflect: {token}\r\n"),
-                String::new(),
-                false,
-            ),
-        ] {
-            let raw = format!(
-                "GET {target} HTTP/1.1\r\nHost: allowed.example.test\r\n{extra_headers}Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            let request = crate::l7::rest::request_from_buffered_http(
-                "GET",
-                "/allowed/search",
-                &target,
-                raw.into_bytes(),
-            )
-            .unwrap();
-            let (mut app, mut client) = tokio::io::duplex(8192);
-            let (mut upstream, mut service) = tokio::io::duplex(8192);
-            let ctx = L7EvalContext {
-                host: "allowed.example.test".into(),
-                port: 443,
-                ..Default::default()
-            };
-            let outcome = relay_http_request_with_credential_rejection(
-                &request,
-                &mut client,
-                &mut upstream,
-                crate::l7::rest::RelayRequestOptions {
-                    resolver: Some(&resolver),
-                    request_body_credential_rewrite: rewrite_body,
+        for with_metadata in [true, false] {
+            let state = placement_test_state_with_metadata(with_metadata);
+            let resolver = state
+                .resolver_for_endpoint("allowed.example.test", 443, "/allowed/search")
+                .unwrap();
+            let token = state.snapshot().child_env["API_TOKEN"].clone();
+            // A pagination service copies extra query parameters into its Link header.
+            // No request bytes may reach it when the parameter contains a header credential.
+            for (target, extra_headers, body, rewrite_body) in [
+                (
+                    format!("/allowed/{token}/search"),
+                    String::new(),
+                    String::new(),
+                    false,
+                ),
+                (
+                    format!("/allowed/search?q=rust&per_page=1&probe={token}"),
+                    String::new(),
+                    String::new(),
+                    false,
+                ),
+                (
+                    "/allowed/search".into(),
+                    format!("X-Reflect: {token}\r\n"),
+                    String::new(),
+                    false,
+                ),
+            ] {
+                let raw = format!(
+                    "GET {target} HTTP/1.1\r\nHost: allowed.example.test\r\n{extra_headers}Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let request = crate::l7::rest::request_from_buffered_http(
+                    "GET",
+                    "/allowed/search",
+                    &target,
+                    raw.into_bytes(),
+                )
+                .unwrap();
+                let (mut app, mut client) = tokio::io::duplex(8192);
+                let (mut upstream, mut service) = tokio::io::duplex(8192);
+                let ctx = L7EvalContext {
+                    host: "allowed.example.test".into(),
+                    port: 443,
                     ..Default::default()
-                },
-                &ctx,
+                };
+                let outcome = relay_http_request_with_credential_rejection(
+                    &request,
+                    &mut client,
+                    &mut upstream,
+                    crate::l7::rest::RelayRequestOptions {
+                        resolver: Some(&resolver),
+                        request_body_credential_rewrite: rewrite_body,
+                        ..Default::default()
+                    },
+                    &ctx,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(outcome.is_none());
+                drop(client);
+                drop(upstream);
+                let mut response = String::new();
+                app.read_to_string(&mut response).await.unwrap();
+                let mut sent = Vec::new();
+                service.read_to_end(&mut sent).await.unwrap();
+                assert!(
+                    sent.is_empty(),
+                    "placement denial must precede all upstream writes"
+                );
+                assert!(response.contains("403 Forbidden"), "{response}");
+                assert!(
+                    response.contains("credential_placement_mismatch"),
+                    "{response}"
+                );
+                assert!(!response.contains("synthetic-private-token"));
+                assert!(!response.contains(&token));
+            }
+            let finding = crate::l7::build_credential_placement_mismatch_finding(
+                "test",
+                "allowed.example.test",
                 None,
             )
-            .await
+            .to_json()
             .unwrap();
-            assert!(outcome.is_none());
-            drop(client);
-            drop(upstream);
-            let mut response = String::new();
-            app.read_to_string(&mut response).await.unwrap();
-            let mut sent = Vec::new();
-            service.read_to_end(&mut sent).await.unwrap();
-            assert!(
-                sent.is_empty(),
-                "placement denial must precede all upstream writes"
+            assert_eq!(
+                finding["finding_info"]["uid"],
+                "openshell.provider_credential.placement_mismatch"
             );
-            assert!(response.contains("403 Forbidden"), "{response}");
-            assert!(
-                response.contains("credential_placement_mismatch"),
-                "{response}"
-            );
-            assert!(!response.contains("synthetic-private-token"));
-            assert!(!response.contains(&token));
         }
-        let finding = crate::l7::build_credential_placement_mismatch_finding(
-            "test",
-            "allowed.example.test",
-            None,
-        )
-        .to_json()
-        .unwrap();
-        assert_eq!(
-            finding["finding_info"]["uid"],
-            "openshell.provider_credential.placement_mismatch"
-        );
     }
 
     #[tokio::test]
     async fn permitted_auth_formats_preserve_pagination_without_disclosing_credentials() {
         use base64::Engine as _;
-        let state = placement_test_state();
-        let resolver = state
-            .resolver_for_endpoint("allowed.example.test", 443, "/allowed/search")
-            .unwrap();
-        let token = state.snapshot().child_env["API_TOKEN"].clone();
-        for (authorization, expected) in [
-            (
-                format!("Bearer {token}"),
-                "Bearer synthetic-private-token".to_owned(),
-            ),
-            (
-                format!("token {token}"),
-                "token synthetic-private-token".to_owned(),
-            ),
-            (
-                format!(
-                    "Basic {}",
-                    base64::engine::general_purpose::STANDARD.encode(format!("user:{token}"))
+        for with_metadata in [true, false] {
+            let state = placement_test_state_with_metadata(with_metadata);
+            let resolver = state
+                .resolver_for_endpoint("allowed.example.test", 443, "/allowed/search")
+                .unwrap();
+            let token = state.snapshot().child_env["API_TOKEN"].clone();
+            for (authorization, expected) in [
+                (
+                    format!("Bearer {token}"),
+                    "Bearer synthetic-private-token".to_owned(),
                 ),
-                format!(
-                    "Basic {}",
-                    base64::engine::general_purpose::STANDARD
-                        .encode("user:synthetic-private-token")
+                (
+                    format!("token {token}"),
+                    "token synthetic-private-token".to_owned(),
                 ),
-            ),
-        ] {
-            let target = "/allowed/search?q=rust&per_page=1";
-            let raw = format!(
-                "GET {target} HTTP/1.1\r\nHost: allowed.example.test\r\nAuthorization: {authorization}\r\n\r\n"
-            );
-            let request = crate::l7::rest::request_from_buffered_http(
-                "GET",
-                "/allowed/search",
-                target,
-                raw.into_bytes(),
+                (
+                    format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD.encode(format!("user:{token}"))
+                    ),
+                    format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD
+                            .encode("user:synthetic-private-token")
+                    ),
+                ),
+            ] {
+                let target = "/allowed/search?q=rust&per_page=1";
+                let raw = format!(
+                    "GET {target} HTTP/1.1\r\nHost: allowed.example.test\r\nAuthorization: {authorization}\r\n\r\n"
+                );
+                let request = crate::l7::rest::request_from_buffered_http(
+                    "GET",
+                    "/allowed/search",
+                    target,
+                    raw.into_bytes(),
+                )
+                .unwrap();
+                let (mut app, mut client) = tokio::io::duplex(8192);
+                let (mut upstream, mut service) = tokio::io::duplex(8192);
+                let service_task = tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    loop {
+                        let mut byte = [0];
+                        service.read_exact(&mut byte).await.unwrap();
+                        bytes.push(byte[0]);
+                        if bytes.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let received = String::from_utf8(bytes).unwrap();
+                    let target = received
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nLink: <https://allowed.example.test{target}&page=2>; rel=\"next\"\r\nContent-Length: 0\r\n\r\n"
+                    );
+                    service.write_all(response.as_bytes()).await.unwrap();
+                    received
+                });
+                crate::l7::rest::relay_http_request_with_options_guarded(
+                    &request,
+                    &mut client,
+                    &mut upstream,
+                    crate::l7::rest::RelayRequestOptions {
+                        resolver: Some(&resolver),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                drop(client);
+                let mut response = String::new();
+                app.read_to_string(&mut response).await.unwrap();
+                let received = service_task.await.unwrap();
+                assert!(
+                    received.contains(&format!("Authorization: {expected}")),
+                    "{received}"
+                );
+                assert!(response.contains("per_page=1&page=2"), "{response}");
+                assert!(!response.contains("synthetic-private-token"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_non_authorization_locations_reach_the_upstream() {
+        for location in ["header", "query", "path"] {
+            let mut metadata = crate::test_support::header_placement_metadata(&["API_TOKEN"]);
+            let declaration = metadata.values_mut().next().unwrap();
+            declaration.auth_style = location.into();
+            declaration.header_name = if location == "header" {
+                "x-api-key"
+            } else {
+                ""
+            }
+            .into();
+            declaration.query_param = if location == "query" { "api_key" } else { "" }.into();
+            declaration.path_template = if location == "path" {
+                "/allowed/{credential}/events"
+            } else {
+                ""
+            }
+            .into();
+            let state = ProviderCredentialState::from_bound_environment(
+                1,
+                TestHashMap::from([("API_TOKEN".into(), "synthetic-private-token".into())]),
+                TestHashMap::new(),
+                metadata,
+                TestHashMap::from([("API_TOKEN".into(), endpoint_binding("provider:API_TOKEN"))]),
+                Vec::new(),
             )
             .unwrap();
-            let (mut app, mut client) = tokio::io::duplex(8192);
+            let token = state.snapshot().child_env["API_TOKEN"].clone();
+            let (target, header, expected) = match location {
+                "header" => (
+                    "/allowed/search".into(),
+                    format!("x-api-key: {token}\r\n"),
+                    "x-api-key: synthetic-private-token",
+                ),
+                "query" => (
+                    format!("/allowed/search?api_key={token}"),
+                    String::new(),
+                    "/allowed/search?api_key=synthetic-private-token",
+                ),
+                _ => (
+                    format!("/allowed/{token}/events"),
+                    String::new(),
+                    "/allowed/synthetic-private-token/events",
+                ),
+            };
+            let path = target.split('?').next().unwrap();
+            let resolver = state
+                .resolver_for_endpoint("allowed.example.test", 443, path)
+                .unwrap();
+            let raw =
+                format!("GET {target} HTTP/1.1\r\nHost: allowed.example.test\r\n{header}\r\n");
+            let request =
+                crate::l7::rest::request_from_buffered_http("GET", path, &target, raw.into_bytes())
+                    .unwrap();
+            let (mut _app, mut client) = tokio::io::duplex(8192);
             let (mut upstream, mut service) = tokio::io::duplex(8192);
             let service_task = tokio::spawn(async move {
                 let mut bytes = Vec::new();
@@ -4667,19 +4789,11 @@ mod tests {
                         break;
                     }
                 }
-                let received = String::from_utf8(bytes).unwrap();
-                let target = received
-                    .lines()
-                    .next()
-                    .unwrap()
-                    .split_whitespace()
-                    .nth(1)
+                service
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
                     .unwrap();
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nLink: <https://allowed.example.test{target}&page=2>; rel=\"next\"\r\nContent-Length: 0\r\n\r\n"
-                );
-                service.write_all(response.as_bytes()).await.unwrap();
-                received
+                String::from_utf8(bytes).unwrap()
             });
             crate::l7::rest::relay_http_request_with_options_guarded(
                 &request,
@@ -4692,16 +4806,9 @@ mod tests {
             )
             .await
             .unwrap();
-            drop(client);
-            let mut response = String::new();
-            app.read_to_string(&mut response).await.unwrap();
-            let received = service_task.await.unwrap();
-            assert!(
-                received.contains(&format!("Authorization: {expected}")),
-                "{received}"
-            );
-            assert!(response.contains("per_page=1&page=2"), "{response}");
-            assert!(!response.contains("synthetic-private-token"));
+            let sent = service_task.await.unwrap();
+            assert!(sent.contains(expected), "{location}: {sent}");
+            assert!(!sent.contains(&token));
         }
     }
 

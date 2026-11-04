@@ -70,7 +70,7 @@ A request can use a static credential only when all of these checks pass:
 | The placeholder belongs to the current attached provider state. | Sandbox provider attachment and current provider record. |
 | The calling binary and destination are allowed. | Effective sandbox network policy. |
 | The host, port, and canonical request path match the credential binding. | Provider profile endpoints, or an explicit sandbox policy binding for an endpointless profile. |
-| When supported placement metadata is available, the request location matches it or an explicit body/WebSocket rewrite policy. | The credential's `auth_style` and its header, query parameter, or path template. |
+| The request location matches declared placement, the default `Authorization` header, or an explicit body/WebSocket rewrite policy. | The credential's `auth_style` and its header, query parameter, or path template. |
 | The HTTP method, path, or protocol operation is allowed when L7 inspection is configured. | Effective sandbox network policy. |
 | The credential has not expired. | Provider credential expiry metadata. |
 
@@ -107,20 +107,34 @@ continue to authorize those locations. Those flags do not authorize arbitrary
 query parameters, URL paths, or unrelated headers. Trusted AWS signing retains
 its existing endpoint authorization.
 
-Credentials without usable placement metadata retain legacy endpoint-scoped
-substitution. This preserves custom profiles, policy-only AWS signers, and Codex
-refresh and ID tokens. The Codex reference profile supplies placement for its
-access token and account header.
+Without placement metadata, the supervisor resolves static credentials only in
+the `Authorization` header, or through the explicit body/WebSocket policies above.
+It rejects malformed placement metadata. A client using `x-api-key`, another
+header, a query parameter, or a path slot needs an explicit credential declaration.
+For example:
 
-Gateway and supervisor upgrades can happen in either order. The gateway forwards
-static auth metadata with the existing provider environment. Older supervisors
-ignore it and keep their previous behavior. New supervisors connected to an older
-gateway receive no static auth metadata and retain legacy behavior. Existing
-credential delivery and wire identities remain unchanged.
+```yaml showLineNumbers={false}
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: header
+    header_name: x-api-key
+```
 
-The hardening takes effect automatically once both components support it and
-usable placement is declared. Existing credential placeholder and update
-lifecycles remain unchanged.
+<Warning>
+Upgrade the gateway before the supervisor when clients use locations other than
+`Authorization`. An older gateway does not forward placement metadata, so a new
+supervisor applies the `Authorization` default even if the imported profile
+declares another location. Older supervisors keep their previous behavior.
+</Warning>
+
+Export and update existing imported profiles with the required placement before
+upgrading the supervisor. Updating example YAML files does not change profiles
+already stored on the gateway. The Codex reference profile declares its access
+token and account header; OAuth tokens sent in request bodies still require the
+endpoint's explicit body rewrite policy. Trusted AWS signing does not require an
+HTTP placement declaration. Credential delivery, wire identities, placeholder
+lifecycles, and update behavior remain unchanged.
 
 Use an explicit sandbox policy binding when the profile intentionally defines
 credentials without defining service endpoints. The policy names the concrete

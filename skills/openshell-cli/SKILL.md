@@ -154,10 +154,14 @@ Usable credential placement is enforced automatically when both gateway and
 supervisor support it. `credential_placement_mismatch` means a placeholder is
 outside its declared header, query parameter, or path-template slot. Match the
 profile. Explicit body/WebSocket rewrite policies retain their documented
-behavior for ordinary credentials. Missing placement metadata or older components
-retain legacy endpoint-scoped substitution; they do not cause withholding by
-themselves. Check provider readiness after changing placement and launch a new
-process if retained references were revoked.
+behavior for ordinary credentials. Without placement metadata, a supporting
+supervisor permits only `Authorization` and those explicit rewrite policies;
+malformed metadata is rejected. For custom headers, query parameters, or path
+slots, update the imported profile with explicit placement and upgrade the
+gateway before the supervisor. Older gateways cannot forward placement metadata;
+older supervisors retain their previous behavior. Updating example YAML does not
+update an imported profile. Check provider readiness after changing placement and
+launch a new process if retained references were revoked.
 
 When an inspected request receives `request_authority_mismatch`, compare its
 HTTP authority with the CONNECT tunnel endpoint. The host and effective port

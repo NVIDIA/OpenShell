@@ -1126,8 +1126,8 @@ fn compile_static_credential_bindings(
     bindings
         .into_iter()
         .map(|(key, binding)| {
-            let placement = placement_metadata.get(&key).map_or(
-                Ok(CredentialPlacement::Legacy),
+            let placement = placement_metadata.get(&key).map_or_else(
+                || Ok(CredentialPlacement::Header("authorization".into())),
                 compile_credential_placement,
             )?;
             let endpoints = binding
@@ -1151,7 +1151,25 @@ fn compile_static_credential_bindings(
 fn compile_credential_placement(
     metadata: &crate::proto::ProviderProfileCredential,
 ) -> Result<CredentialPlacement, StaticCredentialBindingError> {
-    let placement = match metadata.auth_style.trim().to_ascii_lowercase().as_str() {
+    let style = metadata.auth_style.trim().to_ascii_lowercase();
+    let consistent = match style.as_str() {
+        "basic" => {
+            (metadata.header_name.is_empty()
+                || metadata.header_name.eq_ignore_ascii_case("authorization"))
+                && metadata.query_param.is_empty()
+                && metadata.path_template.is_empty()
+        }
+        "header" | "bearer" => metadata.query_param.is_empty() && metadata.path_template.is_empty(),
+        "query" => metadata.header_name.is_empty() && metadata.path_template.is_empty(),
+        "path" => metadata.header_name.is_empty() && metadata.query_param.is_empty(),
+        _ => false,
+    };
+    if !consistent {
+        return Err(binding_error(
+            "static credential placement metadata has conflicting request locations",
+        ));
+    }
+    let placement = match style.as_str() {
         "basic" => CredentialPlacement::Header("authorization".into()),
         "header" | "bearer"
             if !metadata.header_name.trim().is_empty()
@@ -1464,6 +1482,10 @@ mod tests {
         );
     }
 
+    fn authorization_location() -> crate::secrets::RequestCredentialLocation {
+        crate::secrets::RequestCredentialLocation::Header("Authorization".into())
+    }
+
     fn binding(host: &str, port: u32, path: &str) -> StaticCredentialBinding {
         StaticCredentialBinding {
             endpoints: vec![StaticCredentialEndpointBinding {
@@ -1490,12 +1512,115 @@ mod tests {
                 name: "api_key".into(),
                 env_vars: vec!["API_KEY".into()],
                 auth_style: style.into(),
-                header_name: "Authorization".into(),
-                query_param: "api_key".into(),
-                path_template: "/v1/{credential}/events".into(),
+                header_name: if matches!(style, "header" | "bearer" | "basic") {
+                    "Authorization".into()
+                } else {
+                    String::new()
+                },
+                query_param: if style == "query" {
+                    "api_key".into()
+                } else {
+                    String::new()
+                },
+                path_template: if style == "path" {
+                    "/v1/{credential}/events".into()
+                } else {
+                    String::new()
+                },
                 ..Default::default()
             },
         )])
+    }
+
+    #[test]
+    fn metadata_free_static_binding_defaults_to_authorization_across_rotation() {
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            HashMap::from([("API_KEY".into(), "initial".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("API_KEY".into(), binding("api.example.com", 443, "/**"))]),
+            vec![],
+        )
+        .unwrap();
+        let reference = state.snapshot().child_env["API_KEY"].clone();
+        for revision in [7, 8] {
+            if revision == 8 {
+                state
+                    .install_bound_environment(
+                        revision,
+                        HashMap::from([("API_KEY".into(), "rotated".into())]),
+                        HashMap::new(),
+                        HashMap::new(),
+                        HashMap::from([("API_KEY".into(), binding("api.example.com", 443, "/**"))]),
+                        vec![],
+                    )
+                    .unwrap();
+            }
+            let resolver = state
+                .resolver_for_endpoint("api.example.com", 443, "/search")
+                .unwrap();
+            assert!(resolver.resolve_placeholder(&reference).is_none());
+            for token in [
+                reference.clone(),
+                format!("vendor-OPENSHELL-RESOLVE-ENV-v{revision}_API_KEY"),
+                jwt_alias(&reference),
+            ] {
+                assert!(
+                    resolver
+                        .rewrite_header_value_for_name("Authorization", &format!("Bearer {token}"))
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    resolver
+                        .rewrite_header_value_for_name("X-Reflect", &token)
+                        .unwrap_err()
+                        .is_placement_mismatch()
+                );
+                for target in [format!("/search?token={token}"), format!("/api/{token}")] {
+                    assert!(crate::secrets::rewrite_target_for_eval(&target, &resolver).is_err());
+                }
+            }
+            let current = &state.snapshot().child_env["API_KEY"];
+            assert_eq!(
+                resolver
+                    .rewrite_header_value_for_name("Authorization", current)
+                    .unwrap(),
+                Some(if revision == 7 { "initial" } else { "rotated" }.into())
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_custom_header_overrides_authorization_default() {
+        let mut metadata = placement_metadata("header");
+        metadata.values_mut().next().unwrap().header_name = "x-api-key".into();
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            HashMap::from([("API_KEY".into(), "synthetic".into())]),
+            HashMap::new(),
+            metadata,
+            HashMap::from([("API_KEY".into(), binding("api.example.com", 443, "/**"))]),
+            vec![],
+        )
+        .unwrap();
+        let reference = state.snapshot().child_env["API_KEY"].clone();
+        let resolver = state
+            .resolver_for_endpoint("api.example.com", 443, "/search")
+            .unwrap();
+        assert_eq!(
+            resolver
+                .rewrite_header_value_for_name("X-Api-Key", &reference)
+                .unwrap(),
+            Some("synthetic".into())
+        );
+        assert!(
+            resolver
+                .rewrite_header_value_for_name("Authorization", &reference)
+                .unwrap_err()
+                .is_placement_mismatch()
+        );
     }
 
     #[test]
@@ -1540,7 +1665,7 @@ mod tests {
 
     #[test]
     fn malformed_static_metadata_revokes_static_material_and_preserves_real_grants() {
-        for malformed in 0..6 {
+        for malformed in 0..11 {
             let state = ProviderCredentialState::from_bound_environment(
                 7,
                 HashMap::from([("API_KEY".into(), "synthetic".into())]),
@@ -1565,6 +1690,18 @@ mod tests {
                     let value = metadata.remove(&key).unwrap();
                     metadata.insert(format!("{STATIC_CREDENTIAL_METADATA_PREFIX}OTHER"), value);
                 }
+                6 => value.header_name.clear(),
+                7 => value.query_param = "api_key".into(),
+                8 => {
+                    value.auth_style = "path".into();
+                    value.header_name.clear();
+                    value.path_template = "/no-slot".into();
+                }
+                9 => {
+                    value.auth_style = "basic".into();
+                    value.header_name = "x-api-key".into();
+                }
+                10 => value.auth_style.clear(),
                 _ => unreachable!(),
             }
             metadata.insert(
@@ -1635,7 +1772,7 @@ mod tests {
                 &format!("/v1/chat?api_key={reference}"),
                 &resolver,
             );
-            assert_eq!(query.is_ok(), style != Some("header"));
+            assert_eq!(query.is_ok(), style == Some("query"));
             assert_eq!(
                 resolver
                     .rewrite_header_value_for_name("Authorization", &reference)
@@ -1757,7 +1894,12 @@ mod tests {
         let allowed = state
             .resolver_for_endpoint("api.example.com", 443, "/v1/messages?stream=true")
             .expect("resolver");
-        assert_eq!(allowed.resolve_placeholder(placeholder), Some("secret"));
+        assert_eq!(
+            allowed
+                .with_request_location(authorization_location())
+                .resolve_placeholder(placeholder),
+            Some("secret")
+        );
 
         for (host, port, path) in [
             ("example.com", 443, "/v1/messages"),
@@ -1768,7 +1910,7 @@ mod tests {
                 .resolver_for_endpoint(host, port, path)
                 .expect("resolver");
             let error = denied
-                .rewrite_header_value(placeholder)
+                .rewrite_header_value_for_name("Authorization", placeholder)
                 .expect_err("endpoint mismatch must fail closed");
             assert!(error.is_endpoint_mismatch(), "{host}:{port}{path}");
         }
@@ -1807,16 +1949,22 @@ mod tests {
             .resolver_for_endpoint("tools.example.com", 443, "/mcp/local")
             .expect("endpoint resolver");
         assert_eq!(
-            resolver.resolve_placeholder(&stable_placeholder),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&stable_placeholder),
             Some("old")
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:ORDINARY_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:ORDINARY_TOKEN"),
             None,
             "ordinary endpoint-bound credentials remain revision scoped"
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v1_ORDINARY_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v1_ORDINARY_TOKEN"),
             Some("ordinary")
         );
 
@@ -1844,16 +1992,22 @@ mod tests {
             .resolver_for_endpoint("tools.example.com", 443, "/mcp/local")
             .expect("refreshed endpoint resolver");
         assert_eq!(
-            refreshed.resolve_placeholder(&stable_placeholder),
+            refreshed
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&stable_placeholder),
             Some("new")
         );
         assert_eq!(
-            refreshed.resolve_placeholder("openshell:resolve:env:EXTERNAL_ASSERTION"),
+            refreshed
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:EXTERNAL_ASSERTION"),
             None,
             "an identityless current-name alias must remain unavailable"
         );
         assert_eq!(
-            refreshed.resolve_placeholder("openshell:resolve:env:ORDINARY_TOKEN"),
+            refreshed
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:ORDINARY_TOKEN"),
             None
         );
 
@@ -1876,12 +2030,16 @@ mod tests {
             .resolver_for_endpoint("tools.example.com", 443, "/mcp/local")
             .expect("replacement endpoint resolver");
         assert_eq!(
-            replacement.resolve_placeholder(&stable_placeholder),
+            replacement
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&stable_placeholder),
             None,
             "a placeholder issued for an earlier provider identity must be revoked"
         );
         assert_eq!(
-            replacement.resolve_placeholder(&state.snapshot().child_env["EXTERNAL_ASSERTION"]),
+            replacement
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&state.snapshot().child_env["EXTERNAL_ASSERTION"]),
             Some("replacement")
         );
     }
@@ -1935,16 +2093,20 @@ mod tests {
                 .resolver_for_endpoint("api.example.com", 443, "/v1/chat/completions")
                 .expect("authorized endpoint resolver");
             assert!(
-                resolver.resolve_placeholder(&original)
+                resolver
+                    .with_request_location(authorization_location())
+                    .resolve_placeholder(&original)
                     == Some(format!("synthetic-{revision}").as_str())
             );
             assert!(
                 resolver
+                    .with_request_location(authorization_location())
                     .resolve_placeholder("openshell:resolve:env:API_KEY")
                     .is_none()
             );
             assert!(
                 resolver
+                    .with_request_location(authorization_location())
                     .resolve_placeholder("openshell:resolve:env:v1_API_KEY")
                     .is_none()
             );
@@ -1966,6 +2128,7 @@ mod tests {
             reconstructed
                 .resolver_for_endpoint("api.example.com", 443, "/v1/chat/completions")
                 .expect("reconstructed resolver")
+                .with_request_location(authorization_location())
                 .resolve_placeholder(&original)
                 == Some("synthetic-13")
         );
@@ -1977,7 +2140,11 @@ mod tests {
             let resolver = reconstructed
                 .resolver_for_endpoint(host, port, path)
                 .expect("endpoint-scoped resolver");
-            assert!(resolver.rewrite_header_value(&original).is_err());
+            assert!(
+                resolver
+                    .rewrite_header_value_for_name("Authorization", &original)
+                    .is_err()
+            );
         }
 
         // Current-value expiry must not fall back to a previously valid value.
@@ -1995,7 +2162,12 @@ mod tests {
         let resolver = reconstructed
             .resolver_for_endpoint("api.example.com", 443, "/v1/chat/completions")
             .expect("expired resolver");
-        assert!(resolver.resolve_placeholder(&original).is_none());
+        assert!(
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&original)
+                .is_none()
+        );
 
         // An activated detach removes the current binding and all authority for
         // a still-running process, even when it retains its original reference.
@@ -2014,7 +2186,10 @@ mod tests {
         assert!(
             state
                 .resolver_for_endpoint("api.example.com", 443, "/v1/chat/completions")
-                .is_none_or(|resolver| resolver.resolve_placeholder(&original).is_none())
+                .is_none_or(|resolver| resolver
+                    .with_request_location(authorization_location())
+                    .resolve_placeholder(&original)
+                    .is_none())
         );
     }
 
@@ -2141,11 +2316,15 @@ mod tests {
             .resolver_for_endpoint("a.example.com", 443, "/a/check")
             .expect("endpoint A resolver");
         assert_eq!(
-            resolver_a.resolve_placeholder("openshell:resolve:env:v7_KEY_A"),
+            resolver_a
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v7_KEY_A"),
             Some("secret-a")
         );
         assert_eq!(
-            resolver_a.resolve_placeholder("openshell:resolve:env:v7_KEY_B"),
+            resolver_a
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v7_KEY_B"),
             None,
             "credential B must not resolve at endpoint A"
         );
@@ -2154,11 +2333,15 @@ mod tests {
             .resolver_for_endpoint("b.example.com", 443, "/b/check")
             .expect("endpoint B resolver");
         assert_eq!(
-            resolver_b.resolve_placeholder("openshell:resolve:env:v7_KEY_B"),
+            resolver_b
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v7_KEY_B"),
             Some("secret-b")
         );
         assert_eq!(
-            resolver_b.resolve_placeholder("openshell:resolve:env:v7_KEY_A"),
+            resolver_b
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v7_KEY_A"),
             None,
             "credential A must not resolve at endpoint B"
         );
@@ -2197,7 +2380,9 @@ mod tests {
             .resolver_for_endpoint("new.example.com", 443, "/v2/messages")
             .expect("replacement endpoint resolver");
         assert_eq!(
-            replacement.resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
+            replacement
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
             Some("new")
         );
 
@@ -2205,7 +2390,7 @@ mod tests {
             .resolver_for_endpoint("old.example.com", 443, "/v1/messages")
             .expect("restricted resolver");
         let error = removed
-            .rewrite_header_value("openshell:resolve:env:v2_API_KEY")
+            .rewrite_header_value_for_name("Authorization", "openshell:resolve:env:v2_API_KEY")
             .expect_err("replaced endpoint binding must no longer authorize the credential");
         assert!(error.is_endpoint_mismatch());
     }
@@ -2233,7 +2418,12 @@ mod tests {
                 &format!("/bot{placeholder}/sendMessage?stream=true"),
             )
             .expect("syntax-redacted path should select the binding");
-        assert_eq!(resolver.resolve_placeholder(placeholder), Some("secret"));
+        assert_eq!(
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder(placeholder),
+            Some("secret")
+        );
     }
 
     #[test]
@@ -2259,7 +2449,9 @@ mod tests {
             )
             .expect("syntax-redacted alias path should select the binding");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v7_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v7_API_KEY"),
             Some("secret")
         );
     }
@@ -2306,7 +2498,9 @@ mod tests {
             .resolver_for_endpoint("unrelated.example", 1234, "/")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v3_GCP_PROJECT_ID"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v3_GCP_PROJECT_ID"),
             Some("project")
         );
     }
@@ -2361,7 +2555,9 @@ mod tests {
             .resolver_for_endpoint("api.example.com", 443, "/v1")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
             Some("recovered"),
             "a metadata failure must not permanently strand placeholders from the same provider identity"
         );
@@ -2413,7 +2609,9 @@ mod tests {
             .resolver_for_endpoint("api.example.com", 443, "/v1")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
             Some("new"),
             "the running process placeholder should recover against the current same-identity secret"
         );
@@ -2452,11 +2650,15 @@ mod tests {
             .resolver_for_endpoint("api.example.com", 443, "/v1")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
             Some("old")
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
             Some("new")
         );
     }
@@ -2487,6 +2689,7 @@ mod tests {
             state
                 .resolver_for_endpoint("api.example.com", 443, "/v1")
                 .expect("resolver")
+                .with_request_location(authorization_location())
                 .resolve_placeholder(&workload_placeholder),
             None,
             "the expired access token must fail closed"
@@ -2495,7 +2698,10 @@ mod tests {
             state
                 .resolver_for_endpoint("api.example.com", 443, "/v1")
                 .expect("resolver")
-                .rewrite_header_value(&format!("Bearer {}", jwt_alias(&workload_placeholder)))
+                .rewrite_header_value_for_name(
+                    "Authorization",
+                    &format!("Bearer {}", jwt_alias(&workload_placeholder))
+                )
                 .is_err(),
             "wrapping a placeholder must not bypass access-token expiry"
         );
@@ -2516,17 +2722,24 @@ mod tests {
             .resolver_for_endpoint("api.example.com", 443, "/v1")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder(&workload_placeholder),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&workload_placeholder),
             Some("current")
         );
         assert_eq!(
             resolver
-                .rewrite_header_value(&format!("Bearer {}", jwt_alias(&workload_placeholder)))
+                .rewrite_header_value_for_name(
+                    "Authorization",
+                    &format!("Bearer {}", jwt_alias(&workload_placeholder))
+                )
                 .expect("refresh updates the JWT alias"),
             Some("Bearer current".to_string())
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
             None,
             "refresh-managed credentials must not expose revision aliases"
         );
@@ -2568,6 +2781,7 @@ mod tests {
                 state
                     .resolver_for_endpoint("api.example.com", 443, "/v1")
                     .expect("resolver")
+                    .with_request_location(authorization_location())
                     .resolve_placeholder(&workload_placeholder),
                 Some(token.as_str())
             );
@@ -2600,6 +2814,7 @@ mod tests {
             reconstructed
                 .resolver_for_endpoint("api.example.com", 443, "/v1")
                 .expect("resolver")
+                .with_request_location(authorization_location())
                 .resolve_placeholder(&workload_placeholder),
             Some("token-14")
         );
@@ -2607,7 +2822,10 @@ mod tests {
             reconstructed
                 .resolver_for_endpoint("api.example.com", 443, "/v1")
                 .expect("resolver")
-                .rewrite_header_value(&format!("Bearer {}", jwt_alias(&workload_placeholder)))
+                .rewrite_header_value_for_name(
+                    "Authorization",
+                    &format!("Bearer {}", jwt_alias(&workload_placeholder))
+                )
                 .expect("the JWT alias survives supervisor reconstruction"),
             Some("Bearer token-14".to_string())
         );
@@ -2648,10 +2866,18 @@ mod tests {
         let current = state
             .resolver_for_endpoint("new.example.com", 443, "/v2/messages")
             .expect("current resolver");
-        assert_eq!(current.resolve_placeholder(&old_placeholder), None);
+        assert_eq!(
+            current
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&old_placeholder),
+            None
+        );
         assert!(
             current
-                .rewrite_header_value(&format!("Bearer {}", jwt_alias(&old_placeholder)))
+                .rewrite_header_value_for_name(
+                    "Authorization",
+                    &format!("Bearer {}", jwt_alias(&old_placeholder))
+                )
                 .is_err(),
             "a JWT alias must not carry a revoked identity into the new epoch"
         );
@@ -2662,27 +2888,32 @@ mod tests {
         ] {
             assert!(
                 current
-                    .rewrite_header_value(&format!("Bearer {alias}"))
+                    .rewrite_header_value_for_name("Authorization", &format!("Bearer {alias}"))
                     .is_err(),
                 "identityless and malformed JWT aliases must fail closed"
             );
         }
         assert_eq!(
-            current.resolve_placeholder(&state.snapshot().child_env["API_KEY"]),
+            current
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&state.snapshot().child_env["API_KEY"]),
             Some("new")
         );
         let wrong_endpoint = state
             .resolver_for_endpoint("old.example.com", 443, "/v1/messages")
             .expect("endpoint-scoped resolver");
         let error = wrong_endpoint
-            .rewrite_header_value(&state.snapshot().child_env["API_KEY"])
+            .rewrite_header_value_for_name("Authorization", &state.snapshot().child_env["API_KEY"])
             .expect_err("new handle must not resolve at the old endpoint");
         assert!(error.is_endpoint_mismatch());
         let error = wrong_endpoint
-            .rewrite_header_value(&format!(
-                "Bearer {}",
-                jwt_alias(&state.snapshot().child_env["API_KEY"])
-            ))
+            .rewrite_header_value_for_name(
+                "Authorization",
+                &format!(
+                    "Bearer {}",
+                    jwt_alias(&state.snapshot().child_env["API_KEY"])
+                ),
+            )
             .expect_err("JWT wrapping preserves endpoint authorization");
         assert!(error.is_endpoint_mismatch());
     }
@@ -2727,7 +2958,9 @@ mod tests {
             .resolver_for_endpoint("api.example.com", 443, "/v2/inference")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v50_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v50_API_KEY"),
             Some("secret-6"),
             "an aged-out placeholder may use the current secret across revisions in both numeric directions while its provider identity is unchanged"
         );
@@ -2769,26 +3002,35 @@ mod tests {
             .resolver_for_endpoint("b.example.com", 443, "/v1")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder(&format!("openshell:resolve:env:v{}_API_KEY", u64::MAX)),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&format!("openshell:resolve:env:v{}_API_KEY", u64::MAX)),
             None,
             "an opaque revision from another provider identity must fail closed even when it is numerically greater"
         );
         assert!(
             resolver
-                .rewrite_header_value(&format!(
-                    "Bearer {}",
-                    jwt_alias(&format!("openshell:resolve:env:v{}_API_KEY", u64::MAX))
-                ))
+                .rewrite_header_value_for_name(
+                    "Authorization",
+                    &format!(
+                        "Bearer {}",
+                        jwt_alias(&format!("openshell:resolve:env:v{}_API_KEY", u64::MAX))
+                    )
+                )
                 .is_err(),
             "a JWT alias must not resolve a replacement provider's credential"
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:API_KEY"),
             None,
             "an identityless canonical placeholder must not resolve a replacement provider"
         );
         assert_eq!(
-            resolver.resolve_placeholder("vendor-OPENSHELL-RESOLVE-ENV-API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("vendor-OPENSHELL-RESOLVE-ENV-API_KEY"),
             None,
             "an identityless provider alias must not resolve a replacement provider"
         );
@@ -2831,17 +3073,23 @@ mod tests {
             .resolver_for_endpoint("b.example.com", 443, "/v1")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
             None,
             "a placeholder issued before detach must not resolve to a replacement provider"
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:API_KEY"),
             None,
             "an identityless canonical placeholder must not cross a failed refresh into a replacement identity"
         );
         assert_eq!(
-            resolver.resolve_placeholder("vendor-OPENSHELL-RESOLVE-ENV-API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("vendor-OPENSHELL-RESOLVE-ENV-API_KEY"),
             None,
             "an identityless provider alias must not cross a failed refresh into a replacement identity"
         );
@@ -2885,12 +3133,16 @@ mod tests {
             .resolver_for_endpoint("a.example.com", 443, "/v1")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
             None,
             "a successful empty environment represents detach and must invalidate old membership"
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v4_API_KEY"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v4_API_KEY"),
             Some("reattached")
         );
     }
@@ -2923,19 +3175,27 @@ mod tests {
 
         let resolver = state.resolver().expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
             Some("old")
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v11_GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v11_GITHUB_TOKEN"),
             Some("new")
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:GITHUB_TOKEN"),
             Some("new")
         );
         assert_eq!(
-            resolver.resolve_placeholder("provider-OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("provider-OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN"),
             Some("new")
         );
     }
@@ -2954,15 +3214,21 @@ mod tests {
         assert!(state.snapshot().child_env.is_empty());
         let resolver = state.resolver().expect("old resolver retained");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
             Some("old")
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:GITHUB_TOKEN"),
             None
         );
         assert_eq!(
-            resolver.resolve_placeholder("provider-OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("provider-OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN"),
             None
         );
     }
@@ -2992,11 +3258,15 @@ mod tests {
 
         let resolver = state.resolver().expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
             None
         );
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v11_GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v11_GITHUB_TOKEN"),
             Some("new")
         );
     }
@@ -3360,11 +3630,15 @@ mod tests {
             .resolver_for_endpoint("api.example.com", 443, "/")
             .unwrap();
         assert_eq!(
-            resolver.resolve_placeholder(&old_placeholder),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&old_placeholder),
             Some("first-secret")
         );
         assert_eq!(
-            resolver.resolve_placeholder(&live.snapshot().child_env["API_KEY"]),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&live.snapshot().child_env["API_KEY"]),
             Some("second-secret"),
         );
     }
@@ -3423,7 +3697,12 @@ mod tests {
         let resolver = observer
             .resolver_for_endpoint("api.example.com", 443, "/")
             .unwrap();
-        assert!(resolver.resolve_placeholder(&old_placeholder).is_none());
+        assert!(
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder(&old_placeholder)
+                .is_none()
+        );
     }
 
     #[test]
@@ -3588,7 +3867,9 @@ mod tests {
 
         let resolver = state.resolver().expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
             Some("new-19")
         );
     }
@@ -3613,7 +3894,9 @@ mod tests {
 
         let resolver = state.resolver().expect("retained resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
+            resolver
+                .with_request_location(authorization_location())
+                .resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
             None
         );
     }
