@@ -86,13 +86,7 @@ impl HttpMiddlewareExchange {
         crate::l7::rest::HttpResponseMiddlewareRelay {
             chain: &self.chain,
             runner: &self.runner,
-            request_context: openshell_core::proto::RequestContext {
-                request_id: self.request_id.clone(),
-                sandbox_id: sandbox.sandbox_id.clone(),
-                sandbox: sandbox.sandbox_name.clone(),
-                workspace: ctx.workspace.clone(),
-                originating_process: None,
-            },
+            request_context: ctx.middleware_request_context(self.request_id.clone(), &sandbox),
             target: openshell_core::proto::HttpRequestTarget {
                 scheme: scheme.to_string(),
                 host: ctx.host.clone(),
@@ -716,6 +710,7 @@ fn middleware_request_input_with_id(
         sandbox_id: sandbox.sandbox_id.clone(),
         sandbox_name: sandbox.sandbox_name.clone(),
         workspace: ctx.workspace.clone(),
+        originating_process: ctx.originating_process(),
         scheme: scheme.into(),
         host: ctx.host.clone(),
         port: ctx.port,
@@ -1218,7 +1213,12 @@ mod tests {
             workspace: "wrks-default".into(),
             policy_name: "api-policy".into(),
             binary_path: "/usr/bin/curl".into(),
-            ancestors: Vec::new(),
+            middleware_process: Some(openshell_core::proto::Process {
+                binary: "/usr/bin/curl".into(),
+                pid: 42,
+                ancestors: vec!["/usr/bin/claude".into()],
+            }),
+            ancestors: vec!["/usr/bin/claude".into()],
             cmdline_paths: Vec::new(),
             secret_resolver: None,
             ..Default::default()
@@ -1247,6 +1247,14 @@ mod tests {
         assert_eq!(input.sandbox_id, "sbx-123");
         assert_eq!(input.workspace, "wrks-default");
         assert_eq!(input.request_id, "exchange-123");
+        assert_eq!(
+            input.originating_process,
+            Some(openshell_core::proto::Process {
+                binary: "/usr/bin/curl".into(),
+                pid: 42,
+                ancestors: vec!["/usr/bin/claude".into()],
+            })
+        );
     }
 
     #[tokio::test]

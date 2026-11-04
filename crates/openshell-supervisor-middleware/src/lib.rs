@@ -38,9 +38,9 @@ use openshell_core::proto::middleware::v1::supervisor_middleware_server::Supervi
 use openshell_core::proto::{
     Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestTarget,
     MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest, NetworkMiddlewareConfig,
-    RequestContext, SandboxPolicy, SupervisorMiddlewareBinding, SupervisorMiddlewareOperation,
-    SupervisorMiddlewarePhase, SupervisorMiddlewareService, ValidateConfigRequest,
-    ValidateConfigResponse,
+    Process, RequestContext, SandboxPolicy, SupervisorMiddlewareBinding,
+    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
+    ValidateConfigRequest, ValidateConfigResponse,
 };
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
@@ -299,6 +299,42 @@ pub const MAX_MIDDLEWARE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_MIDDLEWARE_CONFIG_BYTES: usize = 64 * 1024;
 /// Largest encoded request identity context attached to one evaluation.
 pub const MAX_MIDDLEWARE_CONTEXT_BYTES: usize = 4 * 1024;
+
+/// Add the admitted connection's process identity without making an otherwise
+/// valid request context exceed the middleware envelope limit.
+///
+/// Keep ancestors from the nearest parent outward. Omit a leaf that cannot fit.
+pub fn request_context_with_process(
+    mut context: RequestContext,
+    process: Option<Process>,
+) -> RequestContext {
+    let Some(mut process) = process.filter(|process| !process.binary.is_empty()) else {
+        return context;
+    };
+    let ancestors = std::mem::take(&mut process.ancestors);
+    context.originating_process = Some(process);
+    if context.encoded_len() > MAX_MIDDLEWARE_CONTEXT_BYTES {
+        context.originating_process = None;
+        return context;
+    }
+    for ancestor in ancestors {
+        let process = context
+            .originating_process
+            .as_mut()
+            .expect("process is present");
+        process.ancestors.push(ancestor);
+        if context.encoded_len() > MAX_MIDDLEWARE_CONTEXT_BYTES {
+            context
+                .originating_process
+                .as_mut()
+                .expect("process is present")
+                .ancestors
+                .pop();
+            break;
+        }
+    }
+    context
+}
 /// Largest encoded destination and request target attached to one evaluation.
 pub const MAX_MIDDLEWARE_TARGET_BYTES: usize = 32 * 1024;
 /// Largest number of request header lines exposed to one middleware.
@@ -466,6 +502,8 @@ pub struct HttpRequestInput {
     pub sandbox_id: String,
     pub sandbox_name: String,
     pub workspace: String,
+    /// Identity resolved when the connection was admitted, if available.
+    pub originating_process: Option<Process>,
     pub scheme: String,
     pub host: String,
     pub port: u16,
@@ -1694,6 +1732,7 @@ impl ChainRunner {
             sandbox_id,
             sandbox_name,
             workspace,
+            originating_process,
             scheme,
             host,
             port,
@@ -1707,13 +1746,16 @@ impl ChainRunner {
         // The request envelope is moved into one stable chain state. Built-ins
         // borrow these values for every stage; only the gRPC adapter clones them
         // when an operator service requires an owned protobuf message.
-        let context = RequestContext {
-            request_id,
-            sandbox_id,
-            sandbox: sandbox_name,
-            workspace,
-            originating_process: None,
-        };
+        let context = request_context_with_process(
+            RequestContext {
+                request_id,
+                sandbox_id,
+                sandbox: sandbox_name,
+                workspace,
+                originating_process: None,
+            },
+            originating_process,
+        );
         let target = HttpRequestTarget {
             scheme,
             host,
@@ -2107,6 +2149,82 @@ mod tests {
 
     use tokio_stream::wrappers::TcpListenerStream;
 
+    #[test]
+    fn process_context_keeps_nearest_ancestors_within_limit() {
+        let base = RequestContext {
+            request_id: "request".into(),
+            sandbox_id: "sandbox".into(),
+            sandbox: "sandbox-name".into(),
+            workspace: "workspace".into(),
+            originating_process: None,
+        };
+        let ancestors: Vec<String> = (0..100)
+            .map(|index| format!("/usr/bin/parent-{index}-{}", "x".repeat(128)))
+            .collect();
+        let context = request_context_with_process(
+            base.clone(),
+            Some(Process {
+                binary: "/usr/bin/curl".into(),
+                pid: 42,
+                ancestors: ancestors.clone(),
+            }),
+        );
+        let process = context.originating_process.as_ref().expect("leaf fits");
+        assert_eq!(process.binary, "/usr/bin/curl");
+        assert_eq!(process.pid, 42);
+        assert!(!process.ancestors.is_empty());
+        assert!(process.ancestors.len() < ancestors.len());
+        assert_eq!(process.ancestors, ancestors[..process.ancestors.len()]);
+        assert!(context.encoded_len() <= MAX_MIDDLEWARE_CONTEXT_BYTES);
+
+        let oversized_leaf = request_context_with_process(
+            base.clone(),
+            Some(Process {
+                binary: "x".repeat(MAX_MIDDLEWARE_CONTEXT_BYTES),
+                pid: 42,
+                ancestors: Vec::new(),
+            }),
+        );
+        assert_eq!(oversized_leaf, base);
+        assert_eq!(request_context_with_process(base.clone(), None), base);
+    }
+
+    #[tokio::test]
+    async fn websocket_preflight_receives_originating_process() {
+        let service = OpenAiRedactionService::default();
+        let observed = Arc::clone(&service.preflight);
+        let runner = ChainRunner::from_endpoint(Arc::new(service));
+        let mut input = websocket_preflight_input("caller-session");
+        let process = Process {
+            binary: "/usr/bin/curl".into(),
+            pid: 42,
+            ancestors: vec!["/usr/bin/claude".into()],
+        };
+        input.originating_process = Some(process.clone());
+
+        let outcome = runner
+            .preflight_websocket(
+                &[websocket_entry(
+                    "scope",
+                    "test/openai-websocket-redactor",
+                    0,
+                    OnError::FailClosed,
+                )],
+                input,
+            )
+            .await
+            .expect("preflight");
+        assert!(outcome.allowed);
+        let preflight = observed.lock().expect("preflight lock");
+        let context = preflight
+            .as_ref()
+            .expect("preflight")
+            .context
+            .as_ref()
+            .expect("context");
+        assert_eq!(context.originating_process.as_ref(), Some(&process));
+    }
+
     fn proto_duration(value: &str) -> prost_types::Duration {
         let duration = match (value.strip_suffix("ms"), value.strip_suffix('s')) {
             (Some(milliseconds), _) => {
@@ -2178,6 +2296,7 @@ mod tests {
             sandbox_id: "sbx-id".into(),
             sandbox_name: "sbx-name".into(),
             workspace: "wrks-default".into(),
+            originating_process: None,
             scheme: "https".into(),
             host: "api.example.com".into(),
             port: 443,
@@ -2318,6 +2437,11 @@ mod tests {
             .map(|entry| std::ptr::from_ref(&entry.entry.config).addr())
             .collect();
         let mut request = input("payload");
+        request.originating_process = Some(Process {
+            binary: "/usr/bin/curl".into(),
+            pid: 42,
+            ancestors: vec!["/usr/bin/claude".into()],
+        });
         request.headers = vec![("x-test".into(), "value".into())];
         let expected_body = request.body.as_ptr().addr();
         let expected_request_id = request.request_id.as_ptr().addr();
@@ -2334,7 +2458,7 @@ mod tests {
         assert_eq!(outcome.body.as_ptr().addr(), expected_body);
         assert_eq!(received.len(), 2);
         assert_eq!(received[0].phase, SupervisorMiddlewarePhase::PreCredentials);
-        assert!(!received[0].originating_process_present);
+        assert!(received[0].originating_process_present);
         assert_eq!(received[0].request_id, expected_request_id);
         assert_eq!(received[0].host, expected_host);
         assert_eq!(received[0].first_header_name, expected_header_name);
@@ -3484,6 +3608,11 @@ mod tests {
             on_error: OnError::FailClosed,
         };
         let mut request = input("payload");
+        request.originating_process = Some(Process {
+            binary: "/usr/bin/curl".into(),
+            pid: 42,
+            ancestors: vec!["/usr/bin/claude".into(), "/usr/bin/bash".into()],
+        });
         request.headers = vec![
             ("x-api-key".into(), "first-value".into()),
             ("accept".into(), "application/json".into()),
@@ -3520,7 +3649,14 @@ mod tests {
         assert_eq!(context.sandbox_id, "sbx-id");
         assert_eq!(context.sandbox, "sbx-name");
         assert_eq!(context.workspace, "wrks-default");
-        assert!(context.originating_process.is_none());
+        assert_eq!(
+            context.originating_process.as_ref(),
+            Some(&Process {
+                binary: "/usr/bin/curl".into(),
+                pid: 42,
+                ancestors: vec!["/usr/bin/claude".into(), "/usr/bin/bash".into()],
+            })
+        );
         let target = received[0].target.as_ref().expect("request target");
         assert_eq!(target.scheme, "https");
         assert_eq!(target.host, "api.example.com");
@@ -5122,6 +5258,7 @@ mod tests {
             sandbox_id: "sandbox".into(),
             sandbox_name: "sandbox-name".into(),
             workspace: "wrks-default".into(),
+            originating_process: None,
             scheme: "wss".into(),
             host: "api.openai.com".into(),
             port: 443,
@@ -5566,6 +5703,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -5634,6 +5772,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -5698,6 +5837,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -5771,6 +5911,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -5857,6 +5998,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: None,
                     scheme: "ws".into(),
                     host: "api.openai.com".into(),
                     port: 80,
@@ -6154,6 +6296,7 @@ mod tests {
                     sandbox_id: "sandbox".into(),
                     sandbox_name: "sandbox-name".into(),
                     workspace: "wrks-default".into(),
+                    originating_process: None,
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,

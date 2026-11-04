@@ -51,6 +51,26 @@ impl Process {
         self
     }
 
+    /// Build a process chain from resolved ancestor names, nearest parent first.
+    ///
+    /// Each element is preserved as one name even if it contains an arrow.
+    #[must_use]
+    pub fn from_ancestor_names(binary: &str, pid: &str, ancestors: &[String]) -> Self {
+        let mut process = Self::new(binary, pid.parse::<i64>().unwrap_or(0));
+        let mut chain: Option<Self> = None;
+        for name in ancestors.iter().rev() {
+            let ancestor = Self::new(name, 0);
+            chain = Some(match chain {
+                Some(parent) => ancestor.with_parent(parent),
+                None => ancestor,
+            });
+        }
+        if let Some(parent) = chain {
+            process.parent_process = Some(Box::new(parent));
+        }
+        process
+    }
+
     /// Build a process chain from bypass detection fields.
     ///
     /// Parses an ancestors string like "bash -> node" into a parent chain.
@@ -147,6 +167,20 @@ mod tests {
         assert_eq!(parent.name, "init");
         let grandparent = parent.parent_process.as_ref().unwrap();
         assert_eq!(grandparent.name, "bash");
+    }
+
+    #[test]
+    fn ancestor_name_with_arrow_remains_one_process() {
+        let names = vec![
+            "/opt/parent -> helper".to_string(),
+            "/usr/bin/init".to_string(),
+        ];
+        let process = Process::from_ancestor_names("/usr/bin/child", "42", &names);
+        let parent = process.parent_process.as_ref().unwrap();
+        assert_eq!(parent.name, "/opt/parent -> helper");
+        let grandparent = parent.parent_process.as_ref().unwrap();
+        assert_eq!(grandparent.name, "/usr/bin/init");
+        assert!(grandparent.parent_process.is_none());
     }
 
     #[test]

@@ -8,6 +8,17 @@ stdin. Re-executing the test binary checks multiple holders with the same binary
 identity; executing a different binary checks ambiguous shared-socket identity.
 The fixture kills and reaps the child when the parent test ends.
 
+## Middleware caller context
+
+The L7 relay retains the process identity resolved at connection admission and
+passes its binary path, PID, and nearest-first executable ancestors to request,
+response preflight, and WebSocket preflight middleware contexts. The middleware
+runtime trims distant ancestors to keep the encoded context within 4 KiB. If
+attribution is unavailable, a path cannot be represented as UTF-8, or the
+binary cannot fit, the process field is absent. When multiple same-identity
+processes hold the socket, the process field retains their common binary and
+ancestry but reports PID zero because the sender cannot be identified.
+
 The manual proxy performance baseline still counts allocations. Its test-only
 global allocator uses `openshell-driver-vm::allocation_tracking`; the unsafe
 allocator implementation belongs to the VM crate. The VM dependency disables
@@ -41,3 +52,19 @@ at debug, and emits no OCSF denial event: a standard OpenTelemetry SDK retries
 for the life of the agent, and one event per retry would flood the OCSF log.
 The supervisor installs its OTLP relay receiver as the handler while the agent
 trace relay is active.
+
+## Upstream socket audit
+
+Allowed CONNECT and transparent TCP `NetworkActivity` events record the
+immediate upstream socket's local and peer addresses in
+`unmapped.upstream_socket_local` and `unmapped.upstream_socket_peer` when both
+socket address lookups succeed. A local lookup failure omits the local
+address but preserves the existing transparent TCP peer field. A peer lookup
+failure omits the tuple. Neither failure stops the allowed connection. The
+local address is captured from the connected `PrefixedStream` before relay starts.
+For a direct connection without address translation, it matches the peer
+address observed by the receiver.
+When the destination uses an upstream proxy, the peer address names that
+proxy; a bypassed destination names the direct receiver. These
+events also include `unmapped.binary_sha256` when the executable digest was
+available to the authorization decision. The relay byte stream is unchanged.

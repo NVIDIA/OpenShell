@@ -153,6 +153,26 @@ Some fields depend on the event class:
 - Process Activity records from the sandbox name the `openshell-sandbox` launcher as `actor.process`.
 - `connection_info` carries `direction_id` and `direction`. OpenShell reports Unknown (`0`) where it does not track the direction.
 
+Allowed CONNECT and transparent TCP `NetworkActivity` events include the
+immediate upstream socket tuple in `unmapped.upstream_socket_local` and
+`unmapped.upstream_socket_peer` when socket address lookup succeeds. A local
+address lookup failure omits the local field but retains the existing peer
+field on transparent TCP events. A peer lookup failure omits both fields.
+Neither failure stops the connection. IPv4 uses
+`IP:port`; IPv6 uses `[IP]:port`. On a direct connection without address
+translation, the receiver's accepted socket sees
+`unmapped.upstream_socket_local` as its peer address. Compare both ends of the
+parsed socket tuple to distinguish concurrent connections. Normalize
+IPv4-mapped IPv6 addresses on dual-stack receivers before comparing. If the
+destination uses an operator upstream proxy, these fields describe the
+connection to that proxy. A bypassed destination records the direct receiver.
+The event's `actor.process` names the resolved executable and ancestors, and
+`unmapped.binary_sha256` contains the executable digest used for authorization
+when available. The default shorthand log does not print the new socket tuple,
+digest, or ancestor chain; enable `ocsf_json_enabled` to export them. The event
+does not add bytes to the TCP stream. JSON export is best-effort, so use the
+event for attribution rather than an in-band access decision at the receiver.
+
 Each JSONL file line, or the payload after the stderr marker, is a complete OCSF v1.8.0 JSON object. Records validate against OCSF v1.8.0 except for the top-level `container` object, which OCSF does not define at the event level. Here is an example of a network connection event:
 
 ```json
