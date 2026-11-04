@@ -238,6 +238,17 @@ struct Args {
     /// Stdin is a driver-owned liveness pipe. EOF means the driver exited.
     #[arg(long, hide = true)]
     parent_liveness_stdin: bool,
+
+    /// Attach and policy-discover request timeout, in milliseconds. Slow
+    /// VM-backed runtimes (CoCo/peer-pods) need longer than the default for
+    /// the remote boundary to boot before the supervisor gives up.
+    #[arg(
+        long,
+        env = "OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS",
+        default_value = "300000",
+        value_parser = clap::value_parser!(u64).range(1000..=86_400_000)
+    )]
+    attach_request_timeout_ms: u64,
 }
 
 #[cfg(unix)]
@@ -657,6 +668,9 @@ fn main() -> Result<()> {
                     auth_bundle,
                     admitted_isolation_backend: Some(admitted_backend),
                     main_exit_marker: args.main_exit_marker,
+                    attach_request_timeout: std::time::Duration::from_millis(
+                        args.attach_request_timeout_ms,
+                    ),
                     trace_context: openshell_supervisor::trace_context_from_environment(),
                     provider_workload_api_socket: std::env::var_os(
                         openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
@@ -880,6 +894,29 @@ fn supervisor_exit(result: Result<i32>) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_timeout_arguments_reject_invalid_values() {
+        for value in ["0", "999", "86400001", "invalid"] {
+            assert!(
+                Args::try_parse_from([
+                    "openshell-supervisor",
+                    "--attach-request-timeout-ms",
+                    value
+                ])
+                .is_err()
+            );
+        }
+        for value in ["1000", "900000", "86400000"] {
+            assert!(
+                Args::try_parse_from([
+                    "openshell-supervisor",
+                    "--attach-request-timeout-ms",
+                    value
+                ])
+                .is_ok()
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]

@@ -52,10 +52,6 @@ const ATTACH_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// callers retry whole calls above this; past boot, exhausting this window
 /// means the remote boundary (or its launcher) is gone rather than still starting.
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
-/// Bound on a routed sandbox instance's first connection. The instance is
-/// registered before its workload Pod is scheduled and its image pulled; the
-/// driver reaps a bootstrap that is still incomplete after the same interval.
-const ROUTED_FIRST_CONNECT_TIMEOUT: Duration = Duration::from_mins(5);
 /// Bounds the liveness check that decides whether a stream failure lost the
 /// whole connection.
 const CONNECTION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -159,6 +155,7 @@ impl BoundaryTransport {
     async fn connect(
         &self,
         descriptor: &SandboxRuntimeDescriptor,
+        initial_connect_timeout: Duration,
     ) -> Result<BoundaryDuplexStream, BackendError> {
         let connector = match &self.0 {
             TransportSource::Dial => None,
@@ -176,7 +173,7 @@ impl BoundaryTransport {
                 let window = if registration.has_connected() {
                     CONNECT_RETRY_TIMEOUT
                 } else {
-                    ROUTED_FIRST_CONNECT_TIMEOUT
+                    initial_connect_timeout
                 };
                 return tokio::time::timeout(window, registration.accept(&descriptor.tls))
                     .await
@@ -327,6 +324,7 @@ pub struct OpenShellRuntimeBackend {
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
+    attach_request_timeout: Duration,
     delegated: Option<DelegatedRuntime>,
     resume: Option<ResumeLaunch>,
     takeover: Option<BoundaryTakeover>,
@@ -355,9 +353,11 @@ impl OpenShellRuntimeBackend {
         descriptor: SandboxRuntimeDescriptor,
         bearer: openshell_core::jwt::SessionBearerTokenSlot,
         transport: BoundaryTransport,
+        attach_request_timeout: Duration,
     ) -> Result<(Option<String>, bool), BackendError> {
         let mut client = BoundaryClient::new(descriptor, bearer);
         client.transport = transport;
+        client.attach_request_timeout = attach_request_timeout;
         client.discover_policy().await
     }
 
@@ -371,6 +371,7 @@ impl OpenShellRuntimeBackend {
             ca_file_paths,
             provider_credentials,
             sandbox_bearer,
+            attach_request_timeout: ATTACH_REQUEST_TIMEOUT,
             delegated: None,
             resume: None,
             takeover: None,
@@ -411,6 +412,7 @@ impl OpenShellRuntimeBackend {
         descriptor: SandboxRuntimeDescriptor,
         driver_descriptor: Vec<u8>,
         bearer: openshell_core::jwt::SessionBearerTokenSlot,
+        attach_request_timeout: Duration,
     ) -> Result<(Option<String>, bool), BackendError> {
         Self::discover_registered_policy_with_resume(
             backend_name,
@@ -418,6 +420,7 @@ impl OpenShellRuntimeBackend {
             driver_descriptor,
             bearer,
             None,
+            attach_request_timeout,
         )
         .await
     }
@@ -429,13 +432,22 @@ impl OpenShellRuntimeBackend {
         driver_descriptor: Vec<u8>,
         bearer: openshell_core::jwt::SessionBearerTokenSlot,
         resume: Option<ResumeLaunch>,
+        attach_request_timeout: Duration,
     ) -> Result<(Option<String>, bool), BackendError> {
         crate::delegated::validate_backend_name(&backend_name)?;
         validate_runtime_coordinates(&descriptor)?;
         let mut client =
             BoundaryClient::with_backend(descriptor, bearer, backend_name, driver_descriptor);
         client.resume = resume;
+        client.attach_request_timeout = attach_request_timeout;
         client.discover_policy().await
+    }
+
+    /// Set the initial attachment and image-policy discovery budget.
+    #[must_use]
+    pub fn with_attach_request_timeout(mut self, timeout: Duration) -> Self {
+        self.attach_request_timeout = timeout;
+        self
     }
 
     /// Use the transport selected for the descriptor this backend will attach.
@@ -505,6 +517,7 @@ impl OpenShellRuntimeBackend {
             descriptor.payload.clone(),
         );
         client.transport = self.transport.clone();
+        client.attach_request_timeout = self.attach_request_timeout;
         client.resume.clone_from(&self.resume);
         if let Some(takeover) = &self.takeover {
             client.supervisor_instance_id = takeover.supervisor_instance_id;
@@ -1584,6 +1597,7 @@ struct BoundaryClient {
     backend_supports_suspend: AtomicBool,
     supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
+    attach_request_timeout: Duration,
     grpc_channel: tokio::sync::Mutex<Option<CachedGrpcChannel>>,
     mediation: tokio::sync::Mutex<Option<Arc<ClientMediationSession>>>,
     mediation_open: tokio::sync::Mutex<()>,
@@ -1787,6 +1801,7 @@ impl BoundaryClient {
             backend_supports_suspend: AtomicBool::new(false),
             supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId::new(),
             sandbox_bearer,
+            attach_request_timeout: ATTACH_REQUEST_TIMEOUT,
             grpc_channel: tokio::sync::Mutex::new(None),
             mediation: tokio::sync::Mutex::new(None),
             mediation_open: tokio::sync::Mutex::new(()),
@@ -1871,7 +1886,7 @@ impl BoundaryClient {
         let remember_attach = matches!(request, Request::Attach { .. });
         let remember_confirm = matches!(request, Request::Confirm);
         let timeout = if remember_attach || matches!(request, Request::DiscoverPolicy) {
-            ATTACH_REQUEST_TIMEOUT
+            self.attach_request_timeout
         } else {
             REQUEST_TIMEOUT
         };
@@ -2457,6 +2472,7 @@ impl BoundaryClient {
     ) -> Result<(tonic::transport::Channel, Arc<TransportAbort>), BackendError> {
         let runtime_descriptor = self.runtime_descriptor.clone();
         let source = self.transport.clone();
+        let initial_connect_timeout = self.attach_request_timeout;
         let transport = Arc::new(TransportAbort::default());
         let connector_transport = transport.clone();
         let authority = match &runtime_descriptor.transport {
@@ -2490,7 +2506,7 @@ impl BoundaryClient {
                         return Err(AbortableTransport::aborted_error());
                     }
                     source
-                        .connect(&runtime_descriptor)
+                        .connect(&runtime_descriptor, initial_connect_timeout)
                         .await
                         .map(|inner| TokioIo::new(AbortableTransport { inner, abort }))
                         .map_err(|error| std::io::Error::other(error.to_string()))
@@ -3044,6 +3060,7 @@ mod tests {
 
     use crate::isolation_protocol::exchange_frame;
     use rustls::pki_types::PrivateKeyDer;
+    use std::future::{Future as _, poll_fn};
     use std::path::PathBuf;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -3493,6 +3510,7 @@ mod tests {
                 tls_runtime_descriptor(address, client_tls),
                 test_bearer(&"a".repeat(32)),
                 BoundaryTransport::default(),
+                ATTACH_REQUEST_TIMEOUT,
             )
             .await;
             assert!(
@@ -3536,6 +3554,7 @@ mod tests {
                 tls_runtime_descriptor(address, client_tls),
                 test_bearer(&"a".repeat(32)),
                 BoundaryTransport::default(),
+                ATTACH_REQUEST_TIMEOUT,
             )
             .await;
             assert!(
@@ -4158,6 +4177,123 @@ mod tests {
     struct TestCertificate {
         client_tls: SandboxTlsClientConfig,
         server_config: Arc<rustls::ServerConfig>,
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_initial_timeout_bounds_attach_and_discovery() {
+        for attach in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let descriptor = tls_runtime_descriptor(
+                listener.local_addr().unwrap(),
+                test_certificate().client_tls,
+            );
+            let mut client = BoundaryClient::new(descriptor, test_bearer(&"a".repeat(32)));
+            client.transport =
+                BoundaryTransport::connector(Arc::new(ReverseTestConnector(listener)));
+            client.attach_request_timeout = Duration::from_secs(2);
+            let request = if attach {
+                Request::Attach {
+                    supervisor_instance_id: client.supervisor_instance_id,
+                    policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
+                    supervisor_takeover: None,
+                    supervisor_recovery_timeout_secs: None,
+                }
+            } else {
+                Request::DiscoverPolicy
+            };
+            let mut waiting = Box::pin(client.call_idempotent(request));
+            poll_fn(|context| {
+                assert!(waiting.as_mut().poll(context).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            tokio::time::advance(Duration::from_secs(2)).await;
+            let result = poll_fn(|context| {
+                let Poll::Ready(result) = waiting.as_mut().poll(context) else {
+                    panic!("initial request must finish at its configured two-second deadline");
+                };
+                Poll::Ready(result)
+            })
+            .await;
+            assert!(matches!(result, Err(BackendError::Unavailable(message))
+                if message.contains("idempotent control request timed out")));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_routed_bootstrap_wait_preserves_reconnect_window() {
+        let certificate = test_certificate();
+        let mut descriptor =
+            tls_runtime_descriptor("127.0.0.1:1".parse().unwrap(), certificate.client_tls);
+        let router =
+            crate::runtime_routed::RuntimeRouter::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let route = crate::runtime_routed::new_route_handle();
+        descriptor.transport = SandboxTransport::RuntimeInitiatedRouted {
+            authority: "sandbox.test".to_string(),
+            route: route.clone(),
+        };
+        let registration = router.register(&route, &descriptor.tls).unwrap();
+        let transport = BoundaryTransport::routed(&descriptor, registration.clone()).unwrap();
+        let budget = Duration::from_mins(15);
+        let mut waiting = Box::pin(transport.connect(&descriptor, budget));
+        poll_fn(|context| {
+            assert!(waiting.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_mins(6)).await;
+        poll_fn(|context| {
+            assert!(
+                waiting.as_mut().poll(context).is_pending(),
+                "configured bootstrap survives the old five-minute ceiling"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        // Real socket/TLS progress uses a normal clock; virtual time is only
+        // needed to cross the long bootstrap and recovery deadlines.
+        tokio::time::resume();
+        let address = router.local_addr();
+        let runtime = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(&crate::runtime_routed::encode_route_preface(&route).unwrap())
+                .await
+                .unwrap();
+            tokio_rustls::TlsAcceptor::from(certificate.server_config)
+                .accept(stream)
+                .await
+                .unwrap()
+        });
+        let stream = tokio::time::timeout(Duration::from_secs(5), &mut waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(waiting);
+        assert!(registration.has_connected());
+        drop(stream);
+        drop(runtime.await.unwrap());
+
+        tokio::time::pause();
+        let mut reconnect = Box::pin(transport.connect(&descriptor, budget));
+        poll_fn(|context| {
+            assert!(reconnect.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(29)).await;
+        poll_fn(|context| {
+            assert!(reconnect.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        // Resuming real I/O can leave the paused clock between Tokio's 1 ms timer ticks.
+        let result = tokio::time::timeout(Duration::from_millis(1), &mut reconnect)
+            .await
+            .expect("routed reconnect must finish within one timer tick after thirty seconds");
+        assert!(matches!(result, Err(BackendError::Unavailable(message))
+            if message.contains("timed out waiting for the sandbox runtime to connect")));
     }
 
     fn test_certificate() -> TestCertificate {

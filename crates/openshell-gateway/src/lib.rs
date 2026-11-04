@@ -342,6 +342,32 @@ fn kubernetes_config(
         config.supervisor_image,
         std::env::var(openshell_core::config::SUPERVISOR_IMAGE_ENV).ok(),
     );
+    if let Some(raw) = std::env::var_os("OPENSHELL_RUNTIME_BOOTSTRAP_GRACE_MS") {
+        let raw = raw.to_str().ok_or_else(|| {
+            openshell_core::Error::config(
+                "OPENSHELL_RUNTIME_BOOTSTRAP_GRACE_MS must be an integer number of milliseconds",
+            )
+        })?;
+        let grace = raw.parse::<u64>().map_err(|_| {
+            openshell_core::Error::config(
+                "OPENSHELL_RUNTIME_BOOTSTRAP_GRACE_MS must be an integer number of milliseconds",
+            )
+        })?;
+        config.runtime_bootstrap_grace_ms = grace;
+    }
+    if let Some(raw) = std::env::var_os("OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS") {
+        let raw = raw.to_str().ok_or_else(|| {
+            openshell_core::Error::config(
+                "OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS must be an integer number of milliseconds",
+            )
+        })?;
+        let timeout = raw.parse::<u64>().map_err(|_| {
+            openshell_core::Error::config(
+                "OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS must be an integer number of milliseconds",
+            )
+        })?;
+        config.sandbox_attach_request_timeout_ms = Some(timeout);
+    }
     if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
         config.workspace_default_storage_size = size;
     }

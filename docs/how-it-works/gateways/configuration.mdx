@@ -54,6 +54,28 @@ Debian and RPM user services, place them in
 `~/.config/openshell/gateway.env`; the service supplies that file to both
 preflight and gateway startup.
 
+### Slow sandbox startup
+
+Slow isolation backends may need longer startup windows. These settings default
+to `300000` milliseconds (5 minutes); allowed values are `1000` through
+`86400000`. Environment variables override TOML values.
+
+| Setting | Scope | Environment variable |
+|---|---|---|
+| `provisioning_repair_window_ms` | `[openshell.gateway]`: configuration repair after admission starts | `OPENSHELL_PROVISIONING_REPAIR_WINDOW_MS` |
+| `runtime_bootstrap_grace_ms` | `[openshell.drivers.kubernetes]`: sandbox startup | `OPENSHELL_RUNTIME_BOOTSTRAP_GRACE_MS` |
+| `sandbox_attach_request_timeout_ms` | `[openshell.drivers.kubernetes]`: dedicated supervisor startup | `OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS` |
+
+For a 15-minute Kubernetes startup window, set both driver settings to `900000`.
+For shared supervisors, set `OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS=900000` on each
+shared host's deployment; the driver setting does not change those deployments.
+A directly launched supervisor also accepts `--attach-request-timeout-ms`.
+
+Restart the affected gateway and supervisors for new settings to take effect.
+Existing admission deadlines are preserved. After a sandbox times out, wait for
+cleanup, then explicitly start it again. The CLI wait timeout and the separate
+image-preparation timeout do not change these windows.
+
 `name` assigns an operator-facing identity to the gateway installation. Set it with `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`. It defaults to `openshell`; the Helm chart defaults it to the chart fullname so all replicas in one installation share a name. Chart fullnames are only unique within their Kubernetes namespace, so set `server.name` explicitly when one collector receives telemetry from multiple namespaces or clusters. This identity is independent of client-side gateway aliases, TLS names, and `gateway_jwt.gateway_id`.
 
 ## Package-Managed Locations
@@ -281,6 +303,9 @@ ssh_session_ttl_secs  = 3600
 # Absolute image preparation and initial supervisor startup budget.
 # Applies to new attempts only; allowed values are 1 through 86400 seconds.
 image_preparation_timeout_seconds = 1800
+
+# Admission repair window in milliseconds; existing deadlines are preserved.
+provisioning_repair_window_ms = 300000
 
 # Reject invalid policy generations securely by default. Set
 # "retain_last_valid" only when availability takes priority.
@@ -1276,6 +1301,9 @@ service_account_name           = "openshell-sandbox"
 default_image                  = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy              = "if_not_present"
 image_pull_secrets             = ["regcred"]
+# Startup windows in milliseconds; defaults are 300000.
+# runtime_bootstrap_grace_ms = 900000
+# sandbox_attach_request_timeout_ms = 900000
 # Defaults to the gateway version; override to pin a specific build.
 # sandbox_runtime_image        = "ghcr.io/nvidia/openshell/sandbox:<version>"
 sandbox_runtime_image_pull_policy = "if_not_present"

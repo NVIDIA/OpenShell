@@ -29,6 +29,14 @@ struct Args {
         default_value = "{}"
     )]
     admission_config_json: openshell_core::resource_admission::DriverAdmissionConfig,
+    /// Runtime bootstrap budget in milliseconds.
+    #[arg(long, env = "OPENSHELL_RUNTIME_BOOTSTRAP_GRACE_MS", default_value = "300000",
+        value_parser = clap::value_parser!(u64).range(1000..=86_400_000))]
+    runtime_bootstrap_grace_ms: u64,
+    /// Initial attachment budget passed to dedicated supervisor Pods.
+    #[arg(long, env = "OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS",
+        value_parser = clap::value_parser!(u64).range(1000..=86_400_000))]
+    sandbox_attach_request_timeout_ms: Option<u64>,
     /// Public compute-driver Unix socket used by an external gateway.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     bind_socket: Option<PathBuf>,
@@ -286,6 +294,8 @@ async fn main() -> Result<()> {
                     openshell_driver_kubernetes::config::KubernetesAppListenerConfig::default(),
                 boundary_port: args.sandbox_runtime_boundary_port,
             },
+            runtime_bootstrap_grace_ms: args.runtime_bootstrap_grace_ms,
+            sandbox_attach_request_timeout_ms: args.sandbox_attach_request_timeout_ms,
             https_proxy: args.https_proxy,
             no_proxy: args.no_proxy,
             proxy_auth_secret_name: args.proxy_auth_secret_name,
@@ -365,6 +375,23 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_timeout_arguments_reject_invalid_values() {
+        for flag in [
+            "--runtime-bootstrap-grace-ms",
+            "--sandbox-attach-request-timeout-ms",
+        ] {
+            for value in ["0", "999", "86400001", "invalid"] {
+                assert!(
+                    Args::try_parse_from(["openshell-driver-kubernetes", flag, value]).is_err()
+                );
+            }
+            for value in ["1000", "900000", "86400000"] {
+                assert!(Args::try_parse_from(["openshell-driver-kubernetes", flag, value]).is_ok());
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

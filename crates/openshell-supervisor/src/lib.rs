@@ -920,6 +920,8 @@ pub struct SandboxInstanceConfig {
     pub auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     pub admitted_isolation_backend: Option<String>,
     pub main_exit_marker: Option<std::path::PathBuf>,
+    /// Initial boundary attachment and image-policy discovery budget.
+    pub attach_request_timeout: Duration,
     /// Parent of the startup span.
     pub trace_context: Option<RegistrationTraceContext>,
     /// SPIFFE Workload API socket for provider token grants; absent fails closed.
@@ -1092,6 +1094,7 @@ pub async fn run_sandbox_instance(
         auth_bundle,
         admitted_isolation_backend,
         main_exit_marker,
+        attach_request_timeout,
         trace_context,
         provider_workload_api_socket,
         proxy_tls,
@@ -1181,7 +1184,7 @@ pub async fn run_sandbox_instance(
     }
     let startup_status = startup.in_scope(openshell_otel::ErrorStatusGuard::current);
     let (image_yaml, invalid_image) = selected_backend
-        .discover_policy(sandbox_bearer.clone())
+        .discover_policy(sandbox_bearer.clone(), attach_request_timeout)
         .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.discover_policy"))
         .await?;
     let image_discovery = if invalid_image {
@@ -1337,6 +1340,7 @@ pub async fn run_sandbox_instance(
                 ca_file_paths: ca_file_paths.clone(),
                 provider_credentials: provider_credentials.clone(),
                 sandbox_bearer,
+                attach_request_timeout,
                 takeover,
                 supervisor_recovery_timeout_secs,
             },
@@ -4707,6 +4711,7 @@ mod tests {
             auth_bundle,
             admitted_isolation_backend: None,
             main_exit_marker: None,
+            attach_request_timeout: Duration::from_mins(5),
             trace_context: None,
             provider_workload_api_socket: None,
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
