@@ -2002,6 +2002,7 @@ impl PodmanComputeDriver {
         durable_sandbox: Option<&DriverSandbox>,
     ) -> Result<(), ComputeDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let _start = self.lifecycle_event_fences.begin_start(sandbox_id);
         // Verify before inspecting or modifying either member of the pair.
         // The durable snapshot is used only if a stopped generation must be
         // reconciled; it never comes from Podman's mutable inspect response.
@@ -2328,14 +2329,55 @@ impl PodmanComputeDriver {
                 .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
                 .or_else(|| driver_sandbox_from_list_entry(entry)))
         } else {
-            Ok(driver_sandbox_from_list_entry(entry))
+            Ok(self.driver_sandbox_from_polled_entry(entry).await)
         }
+    }
+
+    /// Build a polled snapshot from a list entry that was not inspected as a
+    /// running workload. A workload whose start is in progress is reported as
+    /// starting unless it shows a new exit, because the gateway applies polled
+    /// snapshots without waiting for the start to finish.
+    async fn driver_sandbox_from_polled_entry(
+        &self,
+        entry: &ContainerListEntry,
+    ) -> Option<DriverSandbox> {
+        if matches!(entry.state.as_str(), "exited" | "stopped")
+            && let Some(sandbox_id) = entry.labels.get(LABEL_SANDBOX_ID)
+            && self.lifecycle_event_fences.start_in_progress(sandbox_id)
+        {
+            match self.client.inspect_container(&entry.id).await {
+                Ok(inspect)
+                    if self
+                        .lifecycle_event_fences
+                        .polled_workload_still_starting(sandbox_id, &inspect.state) =>
+                {
+                    debug!(
+                        sandbox_id = %sandbox_id,
+                        container = %entry.id,
+                        status = %inspect.state.status,
+                        "Reporting polled sandbox as starting while its start is in progress"
+                    );
+                    return watcher::starting_driver_sandbox_from_list_entry(entry);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        container = %entry.id,
+                        error = %error,
+                        "Failed to inspect stopped container during start, falling back to list entry"
+                    );
+                }
+            }
+        }
+        driver_sandbox_from_list_entry(entry)
     }
 
     /// List all managed sandboxes.
     ///
-    /// Only inspects running containers (to get health status). Non-running
-    /// containers are built directly from the list entry data.
+    /// Inspects running containers (to get health status) and stopped
+    /// containers whose start is in progress. Other containers are built
+    /// directly from the list entry data.
     pub async fn list_sandboxes(&self) -> Result<Vec<DriverSandbox>, ComputeDriverError> {
         let entries = self
             .client
@@ -2365,7 +2407,7 @@ impl PodmanComputeDriver {
                 }
             }
             // Non-running containers (or inspect fallback): build from list data.
-            if let Some(sandbox) = driver_sandbox_from_list_entry(entry) {
+            if let Some(sandbox) = self.driver_sandbox_from_polled_entry(entry).await {
                 sandboxes.push(sandbox);
             }
         }
@@ -3062,6 +3104,126 @@ mod tests {
 
         let _ = fs::remove_file(stop_socket);
         let _ = fs::remove_file(start_socket);
+    }
+
+    const PREVIOUS_EXIT: &str = "2026-08-12T16:39:13.123456789Z";
+    const EXITED_WORKLOAD_LIST: &str = r#"[{"Id":"ctr-1","Names":["openshell-sandbox-demo"],"State":"exited","Labels":{"openshell.ai/sandbox-id":"sandbox-1","openshell.ai/sandbox-name":"demo","openshell.ai/sandbox-workspace":"default"}}]"#;
+
+    fn exited_workload_inspect(finished_at: &str) -> StubResponse {
+        StubResponse::new(
+            StatusCode::OK,
+            format!(
+                r#"{{"Id":"ctr-1","Name":"openshell-sandbox-demo","State":{{"Status":"exited","Running":false,"ExitCode":0,"FinishedAt":"{finished_at}"}},"Config":{{}}}}"#
+            ),
+        )
+    }
+
+    fn ready_condition(sandbox: Option<DriverSandbox>) -> (String, String) {
+        let condition = sandbox
+            .expect("sandbox should be reported")
+            .status
+            .expect("sandbox should have a status")
+            .conditions
+            .into_iter()
+            .find(|condition| condition.r#type == "Ready")
+            .expect("sandbox should have a Ready condition");
+        (condition.status, condition.reason)
+    }
+
+    #[tokio::test]
+    async fn polled_snapshot_during_restart_does_not_report_the_previous_exit() {
+        let (socket, requests, handle) = spawn_podman_stub(
+            "poll-during-start",
+            vec![
+                StubResponse::new(StatusCode::OK, EXITED_WORKLOAD_LIST),
+                exited_workload_inspect(PREVIOUS_EXIT),
+                StubResponse::new(StatusCode::OK, EXITED_WORKLOAD_LIST),
+                exited_workload_inspect(PREVIOUS_EXIT),
+                // The workload starts between the list and the inspect.
+                StubResponse::new(StatusCode::OK, EXITED_WORKLOAD_LIST),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"ctr-1","Name":"openshell-sandbox-demo","State":{"Status":"running","Running":true,"StartedAt":"2026-08-12T16:39:14Z","FinishedAt":"2026-08-12T16:39:13.123456789Z"},"Config":{}}"#,
+                ),
+            ],
+        );
+        let driver = test_driver(socket.clone());
+        driver
+            .lifecycle_event_fences
+            .record_previous_exit("sandbox-1", Some(PREVIOUS_EXIT));
+        let _start = driver.lifecycle_event_fences.begin_start("sandbox-1");
+        let starting = ("False".to_string(), "ContainerStarting".to_string());
+
+        assert_eq!(
+            ready_condition(driver.get_sandbox("sandbox-1").await.unwrap()),
+            starting
+        );
+        let mut listed = driver.list_sandboxes().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(ready_condition(listed.pop()), starting);
+        assert_eq!(
+            ready_condition(driver.get_sandbox("sandbox-1").await.unwrap()),
+            starting
+        );
+
+        handle.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 6);
+        let _ = fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn polled_snapshot_reports_a_new_exit_and_any_exit_after_start() {
+        let (socket, requests, handle) = spawn_podman_stub(
+            "poll-new-exit",
+            vec![
+                StubResponse::new(StatusCode::OK, EXITED_WORKLOAD_LIST),
+                exited_workload_inspect("2026-08-12T16:40:00.5Z"),
+                // Once the start has returned, the list entry is reported
+                // without an inspect, including a failed start's previous exit.
+                StubResponse::new(StatusCode::OK, EXITED_WORKLOAD_LIST),
+                StubResponse::new(StatusCode::OK, EXITED_WORKLOAD_LIST),
+            ],
+        );
+        let driver = test_driver(socket.clone());
+        driver
+            .lifecycle_event_fences
+            .record_previous_exit("sandbox-1", Some(PREVIOUS_EXIT));
+        let exited = ("False".to_string(), "ContainerExited".to_string());
+
+        let start = driver.lifecycle_event_fences.begin_start("sandbox-1");
+        assert_eq!(
+            ready_condition(driver.get_sandbox("sandbox-1").await.unwrap()),
+            exited
+        );
+        drop(start);
+        assert_eq!(
+            ready_condition(driver.get_sandbox("sandbox-1").await.unwrap()),
+            exited
+        );
+        let mut listed = driver.list_sandboxes().await.unwrap();
+        assert_eq!(ready_condition(listed.pop()), exited);
+
+        handle.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 4);
+        let _ = fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn failed_start_is_no_longer_in_progress() {
+        let (socket, _requests, handle) = spawn_podman_stub(
+            "failed-start",
+            vec![StubResponse::new(StatusCode::OK, "[]")],
+        );
+        let driver = test_driver(socket.clone());
+
+        let result = driver
+            .start_sandbox("sandbox-1", "generation-1", &[], None)
+            .await;
+
+        assert!(matches!(result, Err(ComputeDriverError::NotFound)));
+        assert!(!driver.lifecycle_event_fences.start_in_progress("sandbox-1"));
+        handle.await.unwrap();
+        let _ = fs::remove_file(socket);
     }
 
     #[tokio::test]

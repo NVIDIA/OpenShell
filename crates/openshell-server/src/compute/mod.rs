@@ -14068,6 +14068,69 @@ mod tests {
         );
     }
 
+    // Gateway side of the Podman start contract. The reconcile sweep applies
+    // polled snapshots without waiting for an in-progress start. While a start
+    // is in progress, the Podman driver reports a stopped workload that still
+    // shows its previous exit as ContainerStarting. Such a snapshot keeps the
+    // sandbox Starting, and the start completes. This passes without the
+    // #5258 fix; the driver test
+    // polled_snapshot_during_restart_does_not_report_the_previous_exit covers
+    // the regression.
+    #[tokio::test]
+    async fn reconcile_snapshot_during_start_keeps_the_sandbox_starting() {
+        let driver = ControlledDriver::new();
+        driver.block_start();
+        let sandbox = sandbox_record(
+            "sb-start-reconcile",
+            "sandbox-start-reconcile",
+            SandboxPhase::Stopped,
+        );
+        let mut polled = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        polled.status = Some(make_driver_status(make_driver_condition(
+            "ContainerStarting",
+            "Container start in progress",
+        )));
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(polled.clone())));
+        let runtime = test_runtime(driver.clone()).await;
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let start_runtime = runtime.clone();
+        let sandbox_name = sandbox.object_name().to_string();
+        let start =
+            tokio::spawn(
+                async move { start_runtime.start_sandbox("default", &sandbox_name).await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
+            .await
+            .expect("start did not reach the driver");
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.reconcile_snapshot_sandbox(polled, i64::MAX),
+        )
+        .await
+        .expect("reconciliation must not wait for the start")
+        .unwrap();
+        let phase_during_start = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .phase();
+        assert_eq!(phase_during_start, SandboxPhase::Starting as i32);
+
+        driver.release_start();
+        start.await.unwrap().unwrap();
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
+    }
+
     #[tokio::test]
     async fn live_container_exit_during_start_still_transitions_to_error() {
         for reason in [

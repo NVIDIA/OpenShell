@@ -16,9 +16,9 @@ use openshell_core::proto::compute::v1::{
     DriverCondition, DriverSandbox, DriverSandboxStatus, WatchSandboxesDeletedEvent,
     WatchSandboxesEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
@@ -43,30 +43,70 @@ pub type WatchStream =
 /// the sandbox from `Starting` to `Error`.
 #[derive(Clone, Debug, Default)]
 pub struct LifecycleEventFences {
-    previous_finished_at: Arc<Mutex<HashMap<String, String>>>,
+    state: Arc<Mutex<LifecycleFenceState>>,
+}
+
+#[derive(Debug, Default)]
+struct LifecycleFenceState {
+    previous_finished_at: HashMap<String, String>,
+    starts_in_progress: HashSet<String>,
+}
+
+/// Marks a sandbox start as in progress until it is dropped.
+#[must_use = "the start is only in progress while this guard is held"]
+pub struct StartInProgress {
+    fences: LifecycleEventFences,
+    sandbox_id: String,
+}
+
+impl Drop for StartInProgress {
+    fn drop(&mut self) {
+        self.fences
+            .lock()
+            .starts_in_progress
+            .remove(&self.sandbox_id);
+    }
 }
 
 impl LifecycleEventFences {
-    pub fn record_previous_exit(&self, sandbox_id: &str, finished_at: Option<&str>) {
-        let mut fences = self
-            .previous_finished_at
+    fn lock(&self) -> MutexGuard<'_, LifecycleFenceState> {
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn begin_start(&self, sandbox_id: &str) -> StartInProgress {
+        self.lock()
+            .starts_in_progress
+            .insert(sandbox_id.to_string());
+        StartInProgress {
+            fences: self.clone(),
+            sandbox_id: sandbox_id.to_string(),
+        }
+    }
+
+    pub fn start_in_progress(&self, sandbox_id: &str) -> bool {
+        self.lock().starts_in_progress.contains(sandbox_id)
+    }
+
+    pub fn record_previous_exit(&self, sandbox_id: &str, finished_at: Option<&str>) {
+        let mut state = self.lock();
         match finished_at.filter(|finished_at| !finished_at.is_empty()) {
             Some(finished_at) => {
-                fences.insert(sandbox_id.to_string(), finished_at.to_string());
+                state
+                    .previous_finished_at
+                    .insert(sandbox_id.to_string(), finished_at.to_string());
             }
             None => {
-                fences.remove(sandbox_id);
+                state.previous_finished_at.remove(sandbox_id);
             }
         }
     }
 
     pub fn remove(&self, sandbox_id: &str) {
-        self.previous_finished_at
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(sandbox_id);
+        let mut state = self.lock();
+        state.previous_finished_at.remove(sandbox_id);
+        state.starts_in_progress.remove(sandbox_id);
     }
 
     fn matches_previous_exit(
@@ -84,11 +124,36 @@ impl LifecycleEventFences {
         let Some(finished_at) = state.finished_at.as_deref() else {
             return false;
         };
-        self.previous_finished_at
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.lock()
+            .previous_finished_at
             .get(sandbox_id)
             .is_some_and(|previous| previous == finished_at)
+    }
+
+    /// Whether a polled workload that the container list reported as not
+    /// running is still starting rather than failed.
+    ///
+    /// The gateway's reconcile sweep polls sandboxes without waiting for an
+    /// in-progress start. Until the start runs the workload again, inspect
+    /// still shows the exit recorded before the start, and the workload can
+    /// also be running again by the time it is inspected. Neither is a failure
+    /// of the new run. An exit with a different `FinishedAt` is, and once the
+    /// start has returned every exit is reported.
+    pub fn polled_workload_still_starting(&self, sandbox_id: &str, state: &ContainerState) -> bool {
+        let fences = self.lock();
+        if !fences.starts_in_progress.contains(sandbox_id) {
+            return false;
+        }
+        match state.status.as_str() {
+            "running" => true,
+            "exited" | "stopped" => state.finished_at.as_deref().is_some_and(|finished_at| {
+                fences
+                    .previous_finished_at
+                    .get(sandbox_id)
+                    .is_some_and(|previous| previous == finished_at)
+            }),
+            _ => false,
+        }
     }
 }
 
@@ -493,14 +558,6 @@ pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverS
 
 /// Build a `DriverSandbox` from a container list entry (no inspect needed).
 pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<DriverSandbox> {
-    let sandbox_id = entry.labels.get(LABEL_SANDBOX_ID)?.clone();
-    let sandbox_name = entry
-        .labels
-        .get(LABEL_SANDBOX_NAME)
-        .cloned()
-        .unwrap_or_default();
-    let workspace = entry.labels.get(LABEL_SANDBOX_WORKSPACE).cloned()?;
-
     let (reason, status_str, message) = match entry.state.as_str() {
         "running" => (
             CONDITION_RUNNING,
@@ -513,13 +570,8 @@ pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<Driv
         "removing" => ("ContainerRemoving", "False", String::new()),
         _ => ("Unknown", "Unknown", String::new()),
     };
-
-    Some(build_driver_sandbox(
-        sandbox_id,
-        sandbox_name,
-        workspace,
-        entry.names.first().cloned().unwrap_or_default(),
-        short_id(&entry.id),
+    driver_sandbox_from_list_entry_with_condition(
+        entry,
         DriverCondition {
             r#type: "Ready".to_string(),
             status: status_str.to_string(),
@@ -527,6 +579,45 @@ pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<Driv
             message,
             transition_time: None,
         },
+    )
+}
+
+/// Build a `DriverSandbox` that reports a start in progress for a container
+/// list entry. See [`LifecycleEventFences::polled_workload_still_starting`].
+pub fn starting_driver_sandbox_from_list_entry(
+    entry: &ContainerListEntry,
+) -> Option<DriverSandbox> {
+    driver_sandbox_from_list_entry_with_condition(
+        entry,
+        DriverCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: CONDITION_STARTING.to_string(),
+            message: "Container start in progress".to_string(),
+            transition_time: None,
+        },
+    )
+}
+
+fn driver_sandbox_from_list_entry_with_condition(
+    entry: &ContainerListEntry,
+    condition: DriverCondition,
+) -> Option<DriverSandbox> {
+    let sandbox_id = entry.labels.get(LABEL_SANDBOX_ID)?.clone();
+    let sandbox_name = entry
+        .labels
+        .get(LABEL_SANDBOX_NAME)
+        .cloned()
+        .unwrap_or_default();
+    let workspace = entry.labels.get(LABEL_SANDBOX_WORKSPACE).cloned()?;
+
+    Some(build_driver_sandbox(
+        sandbox_id,
+        sandbox_name,
+        workspace,
+        entry.names.first().cloned().unwrap_or_default(),
+        short_id(&entry.id),
+        condition,
         entry.state == "removing",
     ))
 }
@@ -767,6 +858,46 @@ mod tests {
             "sandbox-1",
             &previous_exit,
         ));
+    }
+
+    #[test]
+    fn lifecycle_fence_reports_polled_previous_exit_as_starting_only_during_start() {
+        let fences = LifecycleEventFences::default();
+        fences.record_previous_exit("sandbox-1", Some("2026-08-12T16:39:13.123456789Z"));
+        let previous_exit = ContainerState {
+            status: "exited".to_string(),
+            running: false,
+            exit_code: 0,
+            oom_killed: false,
+            health: None,
+            started_at: Some("2026-08-12T16:38:58Z".to_string()),
+            finished_at: Some("2026-08-12T16:39:13.123456789Z".to_string()),
+            supervisor_exit_code: None,
+            startup_diagnostic: None,
+        };
+        let mut new_exit = previous_exit.clone();
+        new_exit.finished_at = Some("2026-08-12T16:39:13.5Z".to_string());
+        let mut running = previous_exit.clone();
+        running.status = "running".to_string();
+        running.running = true;
+
+        // A stopped sandbox, or one whose start has already failed, reports
+        // the exit.
+        assert!(!fences.polled_workload_still_starting("sandbox-1", &previous_exit));
+
+        let start = fences.begin_start("sandbox-1");
+        assert!(fences.polled_workload_still_starting("sandbox-1", &previous_exit));
+        assert!(fences.polled_workload_still_starting("sandbox-1", &running));
+        assert!(!fences.polled_workload_still_starting("sandbox-1", &new_exit));
+        assert!(!fences.polled_workload_still_starting("sandbox-2", &previous_exit));
+        drop(start);
+        assert!(!fences.start_in_progress("sandbox-1"));
+        assert!(!fences.polled_workload_still_starting("sandbox-1", &previous_exit));
+
+        let _start = fences.begin_start("sandbox-1");
+        fences.remove("sandbox-1");
+        assert!(!fences.start_in_progress("sandbox-1"));
+        assert!(!fences.polled_workload_still_starting("sandbox-1", &previous_exit));
     }
 
     #[test]
