@@ -51,6 +51,12 @@ def event(number, login, *, human=False, removed=False):
     }
 
 
+def request_error(status, message):
+    return subprocess.CalledProcessError(
+        1, "gh", output=json.dumps({"status": str(status), "message": message})
+    )
+
+
 class RegistryTests(unittest.TestCase):
     def test_reads_only_membership_rows_and_allows_empty_categories(self):
         text = DOCUMENT.replace(
@@ -273,6 +279,126 @@ class ReconciliationTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_unavailable_members_do_not_block_other_requests_or_cleanup(self):
+        categories = {"area:runtime": {"alice", "bob", "carol"}}
+        before = pr("area:runtime", requested=("old", "manual", "engaged"))
+        after = pr(
+            "area:runtime", requested=("old", "manual", "engaged", "alice", "carol")
+        )
+        unavailable = request_error(
+            422, "Reviews may only be requested from collaborators."
+        )
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            plan, api, _ = self.run_routing(
+                categories,
+                snapshots=[
+                    reviewers(
+                        requested=("old", "manual", "engaged"),
+                        manual=("manual",),
+                        engaged=("engaged",),
+                    ),
+                    reviewers(
+                        requested=("old", "manual", "engaged", "alice", "carol"),
+                        manual=("manual",),
+                        engaged=("engaged",),
+                    ),
+                ],
+                responses=[before, unavailable, None, unavailable, None, after, None],
+            )
+        self.assertEqual(plan, routing.ReviewPlan(("alice", "carol"), ("old",)))
+        self.assertEqual(
+            api.call_args_list,
+            [
+                mock.call(PULL),
+                *[
+                    mock.call(
+                        f"{PULL}/requested_reviewers",
+                        method="POST",
+                        data={"reviewers": members},
+                    )
+                    for members in (
+                        ["alice", "bob", "carol"],
+                        ["alice"],
+                        ["bob"],
+                        ["carol"],
+                    )
+                ],
+                mock.call(PULL),
+                mock.call(
+                    f"{PULL}/requested_reviewers",
+                    method="DELETE",
+                    data={"reviewers": ["old"]},
+                ),
+            ],
+        )
+        self.assertIn("@bob", errors.getvalue())
+        self.assertNotIn("@alice", errors.getvalue())
+        self.assertNotIn("@carol", errors.getvalue())
+
+    def test_single_unavailable_reviewer_is_reported_without_retrying(self):
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            plan, api, _ = self.run_routing(
+                {"area:runtime": {"alice"}},
+                snapshots=[reviewers()],
+                responses=[
+                    pr("area:runtime"),
+                    request_error(
+                        422, "Reviews may only be requested from collaborators."
+                    ),
+                ],
+            )
+        self.assertEqual(plan, routing.ReviewPlan((), ()))
+        self.assertEqual(api.call_count, 2)
+        self.assertIn("@alice", errors.getvalue())
+
+    def test_other_request_failures_still_fail_without_removing_reviewers(self):
+        failures = [
+            request_error(403, "Resource not accessible by integration"),
+            request_error(422, "Validation Failed"),
+            request_error(503, "Service unavailable"),
+            subprocess.CalledProcessError(1, "gh", output="not JSON"),
+        ]
+        for failure in failures:
+            for retry in (False, True):
+                with (
+                    self.subTest(failure=failure.stdout, retry=retry),
+                    mock.patch.object(
+                        routing,
+                        "_api",
+                        side_effect=[
+                            pr("area:runtime", requested=("old",)),
+                            *(
+                                [
+                                    request_error(
+                                        422,
+                                        "Reviews may only be requested from collaborators.",
+                                    ),
+                                    None,
+                                ]
+                                if retry
+                                else []
+                            ),
+                            failure,
+                        ],
+                    ) as api,
+                    mock.patch.object(
+                        routing,
+                        "_load_reviewers",
+                        return_value=reviewers(requested=("old",)),
+                    ),
+                ):
+                    with self.assertRaises(subprocess.CalledProcessError) as raised:
+                        routing.check_review_readiness(CATEGORIES, REPO, 42, apply=True)
+                    self.assertIs(raised.exception, failure)
+                    self.assertFalse(
+                        any(
+                            call.kwargs.get("method") == "DELETE"
+                            for call in api.call_args_list
+                        )
+                    )
 
     def test_empty_area_does_not_block_topic_reviewers(self):
         categories = {"area:runtime": set(), "topic:policy": {"carol"}}
