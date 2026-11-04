@@ -131,6 +131,9 @@ the consumed sandbox bootstrap from a copy in the supervisor's private
 filesystem, verifies the fence, and starts the same pair. A failed supervisor
 start stops the workload. Delete removes the companion first, then the workload,
 channel, workspace, and driver-owned secrets. User-owned volumes are retained.
+The previous run's exit must not fail a restart. Watch ignores stop events that
+still show the exit recorded before the start. Until the start returns, polled
+snapshots report such a workload as starting. A new exit is still reported.
 
 Only workload containers appear in sandbox list/watch results. Readiness uses
 the supervisor's private health socket; there is no shell, legacy marker, or
