@@ -2,6 +2,12 @@
 
 ## Running Tests
 
+The general E2E commands below use Linux sandbox runtimes. For native Windows,
+use a [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows)
+checkout and the [native Windows validation](#native-windows-validation) lane.
+Windows implementation and releases remain on that branch when this testing
+guide is also published on `main`.
+
 ```bash
 mise run test          # Rust + Python unit tests
 mise run e2e           # End-to-end tests (starts a Docker-backed gateway)

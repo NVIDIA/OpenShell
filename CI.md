@@ -75,6 +75,7 @@ For an intentional minor-train incompatibility, record the Buf finding,
 linked issue, consumer impact, and migration plan in the PR. Keep the finding
 visible; do not disable the job or add a broad Buf ignore rule.
 
+<<<<<<< HEAD
 ### Remove the v0.1.6 exception
 
 Squash-merge [PR #4976](https://github.com/NVIDIA/OpenShell/pull/4976) so the
@@ -92,6 +93,8 @@ Validate the reverted workflow with Actionlint and run the normal protobuf check
 before merging the cleanup. Reverting the whole PR restores normal enforcement
 and removes the exception mechanism; do not leave the bypass support behind.
 
+=======
+>>>>>>> github-live/windows
 ### Windows validation
 
 Native Windows implementation and releases use the

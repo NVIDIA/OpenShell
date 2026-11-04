@@ -33,6 +33,9 @@ specific time:
 | `network_policies` | Destinations each binary can reach, and the requests it can send. | Sandbox network proxy. | While the sandbox runs. |
 | `network_middlewares` | Additional inspection, transformation, or blocking of traffic that network rules allow. | Sandbox network proxy. | While the sandbox runs. |
 
+For native Windows filesystem enforcement and proxy limitations, see
+[Windows policy controls](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md#runtime-and-current-limits).
+
 Filesystem, Landlock, process, and UI settings are fixed once the sandbox starts.
 Network rules and middleware can change while it runs, as described in [How
 Changes Take

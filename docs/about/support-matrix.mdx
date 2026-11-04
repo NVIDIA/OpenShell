@@ -148,10 +148,13 @@ Install the software for the compute driver you use:
 
 ## Workload Images
 
-OpenShell accepts standard Linux OCI images. The built-in default workload is
+Docker, Podman, Kubernetes, and MicroVM accept standard Linux OCI images. The built-in default workload is
 `nvcr.io/nvidia/base/ubuntu:24.04` for `linux/amd64` and `linux/arm64`. It is a
 minimal Ubuntu Noble userspace and does not bundle agent CLIs. Operators can
 change the default, and users can select an explicit image with `--from`.
+
+Native Windows MXC runs host commands rather than OCI images. See the
+[Windows guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md).
 
 ## Container Images
 
