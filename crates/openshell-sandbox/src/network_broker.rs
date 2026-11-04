@@ -451,6 +451,7 @@ fn dns_tcp_accept_error_action(error: &io::Error) -> DnsTcpAcceptErrorAction {
 /// completes, must not stop the relay: TCP DNS keeps serving for the rest of
 /// the sandbox's life.
 fn dns_tcp_accept_loop(
+    address: SocketAddr,
     mut accept: impl FnMut() -> io::Result<(TcpStream, SocketAddr)>,
     tcp_admissions: Arc<Mutex<HashMap<SocketAddr, SocketIdentity>>>,
     active_workers: Arc<AtomicUsize>,
@@ -481,9 +482,19 @@ fn dns_tcp_accept_loop(
                     continue;
                 }
                 DnsTcpAcceptErrorAction::Stop => {
-                    tracing::warn!(%error, "stopping the DNS TCP relay accept loop");
                     // Dual-emit: the relay stopping is a security finding
                     // (an unavailable control), not just an operational one.
+                    openshell_ocsf::ocsf_emit!(
+                        openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                            .activity(openshell_ocsf::ActivityId::Fail)
+                            .severity(openshell_ocsf::SeverityId::High)
+                            .status(openshell_ocsf::StatusId::Failure)
+                            .src_endpoint_addr(address.ip(), address.port())
+                            .connection_info(openshell_ocsf::ConnectionInfo::new("tcp"))
+                            .status_detail(error.to_string())
+                            .message("DNS TCP relay stopped serving; TCP DNS mediation unavailable")
+                            .build()
+                    );
                     openshell_ocsf::ocsf_emit!(
                         openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
                             .activity(openshell_ocsf::ActivityId::Open)
@@ -582,6 +593,7 @@ fn start_dns_relay(
         .name("openshell-dns-tcp".to_string())
         .spawn(move || {
             dns_tcp_accept_loop(
+                address,
                 || {
                     tcp.accept().and_then(|(stream, _)| {
                         let peer = stream.peer_addr()?;
@@ -3478,13 +3490,46 @@ mod tests {
     }
 
     #[test]
+    fn dns_tcp_relay_stop_emits_network_failure_and_finding() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _capture = capture.install();
+        let address = SocketAddr::from(([127, 0, 0, 1], 1053));
+        let error = io::Error::from_raw_os_error(libc::EBADF);
+        let (pending, _pending_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
+
+        dns_tcp_accept_loop(
+            address,
+            || Err(io::Error::from_raw_os_error(libc::EBADF)),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicUsize::new(0)),
+            pending,
+        );
+
+        let events = capture.json_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["class_uid"], 4001);
+        assert_eq!(events[0]["activity_id"], 4);
+        assert_eq!(events[0]["status_id"], 2);
+        assert_eq!(events[0]["src_endpoint"]["ip"], "127.0.0.1");
+        assert_eq!(events[0]["src_endpoint"]["port"], 1053);
+        assert_eq!(events[0]["connection_info"]["protocol_name"], "tcp");
+        assert_eq!(events[0]["status_detail"], error.to_string());
+        assert_eq!(events[1]["class_uid"], 2004);
+        assert_eq!(events[0]["message"], events[1]["message"]);
+        assert_eq!(
+            events[1]["finding_info"]["uid"],
+            "sandbox-dns-tcp-relay-stopped"
+        );
+    }
+
+    #[test]
     fn dns_tcp_relay_survives_transient_accept_errors() {
         use std::io::{Read as _, Write as _};
 
         // A real accepted TCP pair, so the loop serves an actual stream.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind relay peer");
-        let mut client =
-            TcpStream::connect(listener.local_addr().unwrap()).expect("connect client");
+        let address = listener.local_addr().expect("relay address");
+        let mut client = TcpStream::connect(address).expect("connect client");
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("client read timeout");
@@ -3504,6 +3549,7 @@ mod tests {
         let mut stream = Some(stream);
         let relay = std::thread::spawn(move || {
             dns_tcp_accept_loop(
+                address,
                 || {
                     accepts += 1;
                     match accepts {
@@ -3595,6 +3641,7 @@ mod tests {
         let stop_relay = stop.clone();
         let relay = std::thread::spawn(move || {
             dns_tcp_accept_loop(
+                address,
                 || {
                     if stop_relay.load(Ordering::Relaxed) {
                         return Err(io::Error::from_raw_os_error(libc::EINVAL));
