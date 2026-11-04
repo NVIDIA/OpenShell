@@ -4460,6 +4460,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-credential-issuer"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "hyper-util",
+ "openshell-core",
+ "openshell-crypto",
+ "openshell-driver-db-credstore",
+ "openshell-driver-kubernetes-secrets",
+ "openshell-driver-vault",
+ "prost-types",
+ "rustix 1.1.4",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tonic",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "openshell-crypto"
 version = "0.0.0"
 dependencies = [
@@ -5111,10 +5133,8 @@ dependencies = [
  "notify",
  "openshell-bootstrap",
  "openshell-core",
+ "openshell-credential-issuer",
  "openshell-crypto",
- "openshell-driver-db-credstore",
- "openshell-driver-kubernetes-secrets",
- "openshell-driver-vault",
  "openshell-extension-core",
  "openshell-gateway-interceptors",
  "openshell-ocsf",
