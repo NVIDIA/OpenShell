@@ -94,8 +94,8 @@ qualification. Branch checks compare the prospective merge tree with its target,
 using workflow-revision review tooling and the target's tag-derived train policy.
 Release qualification reviews the cumulative diff from the previous reachable
 stable release to the exact candidate commit, using the same tag-derived
-patch/minor policy as the protobuf check. It reviews public Rust, Python, Go,
-and TypeScript SDKs, API behavior, CLI contracts, configuration, policy, Helm,
+patch/minor policy as the protobuf check. It reviews public Rust, Python, and
+TypeScript SDKs, API behavior, CLI contracts, configuration, policy, Helm,
 and persisted state.
 Both Codex workflows share the `codex-release-review` concurrency group with
 `queue: max`, so only one review runs at a time and up to 100 pending reviews
@@ -245,7 +245,7 @@ scanners upload results directly:
   warn-only mode. A preflight turns an unavailable GitHub Dependency Graph into
   a warning, so the workflow remains neutral until the repository feature is
   available.
-- `CodeQL` analyzes product Rust code, examples, and the Go, Python, and
+- `CodeQL` analyzes product Rust code, examples, and the Python and
   TypeScript SDKs. Rust `cfg(test)` blocks, Rust integration-test targets, and
   E2E test code are excluded. It runs nightly on `main`, remains manually
   dispatchable for diagnostics, uploads results to Code Scanning, and retains
@@ -707,7 +707,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/e2e-label-help.yml` | When a `test:e2e*` label is applied, posts a PR comment telling the maintainer the next manual step (re-run an existing workflow run, or `/ok to test <SHA>` to refresh the mirror). |
 | `.github/workflows/workflow-security.yml` | Runs informational Actionlint and High-severity Zizmor reports on GitHub-hosted runners. |
 | `.github/workflows/dependency-review.yml` | Reports dependency changes when GitHub Dependency Graph is available; otherwise publishes a neutral warning. |
-| `.github/workflows/codeql.yml` | Runs nightly informational CodeQL analysis on `main` for Rust and the Go, Python, and TypeScript SDKs and retains SARIF artifacts. |
+| `.github/workflows/codeql.yml` | Runs nightly informational CodeQL analysis on `main` for Rust and the Python and TypeScript SDKs and retains SARIF artifacts. |
 | `.github/workflows/codex-security.yml` | Advisory scan during prerelease qualification; scans the stable-to-candidate diff and publishes train-scoped SARIF on `main`. |
 | `.github/workflows/codex-compatibility.yml` | Reviews branch and cumulative tagged-release compatibility with Codex and retains advisory findings, PR acknowledgements, and coverage; it does not gate merging or publication. |
 | `.github/workflows/trivy-changes.yml` | Blocks pull requests and merge groups that introduce new High or Critical Helm or Dockerfile misconfigurations. |
@@ -726,7 +726,7 @@ Each step that publishes to an external registry, store, or site lives in its ow
 | `.github/workflows/release-auto-tag.yml` | Weekdays at 14:00 Europe/Zurich, tags the next `-pre.N` on `main` when commits landed since the latest one, then dispatches Pre-release. It skips when the train has no `-pre.1` or its version is already stable, so push each train's `-pre.1` tag by hand. |
 | `.github/workflows/release-prerelease.yml` | Pre-release orchestrator, triggered by prerelease tag pushes or dispatched by Release Auto-Tag or manually. A tagless dispatch creates the next candidate on its branch; explicit tags select existing candidates. Builds, then publishes and qualifies in parallel. Qualification failure fails the run and sends the failure notification; published artifacts remain available. |
 | `.github/workflows/release-build.yml` | Shared version computation, binary and image builds, and package builds. Validates that the tag matches the caller's release kind. |
-| `.github/workflows/release-publish.yml` | Shared artifact assembly, OCI image tags and Helm chart publication, and package publication. Stable releases also publish release-labeled public schemas to Buf (`BUF_TOKEN` required) and GitHub Releases, and call the snap, npm, and Go SDK publishers. The Python SDK is released from [ai-openshell/sdk-python](https://github.com/ai-openshell/sdk-python), so no GitHub Release carries a wheel. |
+| `.github/workflows/release-publish.yml` | Shared artifact assembly, OCI image tags and Helm chart publication, and package publication. Stable releases also publish release-labeled public schemas to Buf (`BUF_TOKEN` required) and GitHub Releases, and call the snap and npm publishers. The Python SDK is released from [ai-openshell/sdk-python](https://github.com/ai-openshell/sdk-python), so no GitHub Release carries a wheel. |
 | `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by prerelease previews, notes-only previews, and stable releases. Stable releases reuse the promoted prerelease's preview when available. |
 | `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev, Release, and Pre-release without Store credentials or publication. |
