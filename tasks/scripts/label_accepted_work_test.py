@@ -43,18 +43,12 @@ def reference(number=1, repository=REPO):
 
 
 def connection(nodes, *, more=False, cursor=None):
-    return {
-        "data": {
-            "repository": {
-                "pullRequest": {
-                    "closingIssuesReferences": {
-                        "nodes": nodes,
-                        "pageInfo": {"hasNextPage": more, "endCursor": cursor},
-                    }
-                }
-            }
-        }
+    linked = {
+        "nodes": nodes,
+        "pageInfo": {"hasNextPage": more, "endCursor": cursor},
     }
+    pull = {"closingIssuesReferences": linked}
+    return {"data": {"repository": {"pullRequest": pull}}}
 
 
 class AcceptanceTests(unittest.TestCase):
@@ -212,11 +206,11 @@ class AcceptanceTests(unittest.TestCase):
                 list(labeling.AcceptedWork(REPO, {"maintainer"}).closing_issues(7))
 
     def test_missing_pagination_cursor_fails(self):
-        with mock.patch.object(
-            labeling, "_api", return_value=connection([], more=True)
+        with (
+            mock.patch.object(labeling, "_api", return_value=connection([], more=True)),
+            self.assertRaisesRegex(ValueError, "cursor"),
         ):
-            with self.assertRaisesRegex(ValueError, "cursor"):
-                list(labeling.AcceptedWork(REPO, {"maintainer"}).closing_issues(7))
+            list(labeling.AcceptedWork(REPO, {"maintainer"}).closing_issues(7))
 
     def test_permissions_and_shared_issues_are_cached_within_one_sweep(self):
         evaluator = labeling.AcceptedWork(REPO, {"maintainer"})
@@ -296,17 +290,19 @@ class ReconciliationTests(unittest.TestCase):
                 evaluator, "accepted", side_effect=[True, ValueError("lookup failed")]
             ),
             mock.patch.object(labeling, "_api") as api,
+            self.assertRaisesRegex(ValueError, "lookup failed"),
         ):
-            with self.assertRaisesRegex(ValueError, "lookup failed"):
-                evaluator.reconcile([pr(), pr(number=8)], apply=True)
+            evaluator.reconcile([pr(), pr(number=8)], apply=True)
         api.assert_not_called()
 
     def test_mutation_failure_propagates(self):
-        with mock.patch.object(labeling, "_api", side_effect=OSError("denied")):
-            with self.assertRaisesRegex(OSError, "denied"):
-                labeling.AcceptedWork(REPO, {"maintainer"}).reconcile(
-                    [pr(author="maintainer")], apply=True
-                )
+        with (
+            mock.patch.object(labeling, "_api", side_effect=OSError("denied")),
+            self.assertRaisesRegex(OSError, "denied"),
+        ):
+            labeling.AcceptedWork(REPO, {"maintainer"}).reconcile(
+                [pr(author="maintainer")], apply=True
+            )
 
     def test_fresh_run_reflects_acceptance_assignment_and_permission_changes(self):
         for first, second in (
@@ -376,8 +372,13 @@ class ApiAndCliTests(unittest.TestCase):
                 self.assertEqual(
                     labeling.main(
                         [
-                            "--repo", REPO, "--maintainers", str(path),
-                            "--pr", "7", "--apply",
+                            "--repo",
+                            REPO,
+                            "--maintainers",
+                            str(path),
+                            "--pr",
+                            "7",
+                            "--apply",
                         ]
                     ),
                     1,
