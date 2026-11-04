@@ -885,8 +885,8 @@ openshell forward service my-sandbox --target-host 127.0.0.1 --target-port 8080 
 ```
 
 The target host must be a loopback IP address or `localhost`, and the target
-port must be between 1 and 65535. The CLI and TypeScript SDK reject invalid
-targets before opening a local listener. The gateway also validates each target.
+port must be between 1 and 65535. Invalid targets are rejected before a local
+listener opens.
 
 ## SSH Config
 
