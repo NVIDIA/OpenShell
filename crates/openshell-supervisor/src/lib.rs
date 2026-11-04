@@ -25,6 +25,7 @@ mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
 mod otlp_relay;
+mod process_activity;
 mod provider_readiness;
 pub mod sandbox_instance_host;
 pub mod shared_host;
@@ -1730,6 +1731,7 @@ pub async fn run_sandbox_instance(
         }
         let _app_listener =
             app_instance.map(|instance| instance.start(running.loopback_connector()));
+        let process_activity = running.process_events().map(process_activity::start);
         let agent = running.agent();
         let boundary_access = openshell_supervisor_process::delegated::start_boundary_access(
             sandbox_id.as_deref(),
@@ -1826,6 +1828,7 @@ pub async fn run_sandbox_instance(
             // TerminateBoundary or publish a main-process exit. Dropping the
             // access plane closes this supervisor's gateway session.
             instance_readiness.release();
+            drop(process_activity);
             drop(running);
             drop(boundary_access);
             // The workload is frozen, so no new spans arrive. Export what the

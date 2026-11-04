@@ -2904,7 +2904,7 @@ mod linux {
                     .map(|()| true)
                     .map_err(|error| error.to_string()),
                 // Waiting reads status and may block for the process lifetime.
-                Request::Wait { .. } => self
+                Request::Wait { .. } | Request::ReadProcessEvents { .. } => self
                     .connections
                     .require_active(principal)
                     .map(|()| true)
@@ -3418,6 +3418,14 @@ mod linux {
                     provider_files,
                 ),
                 Request::Wait { process_id } => self.wait(&process_id),
+                Request::ReadProcessEvents { after_sequence } => {
+                    let (events, lost) = crate::process_events::log().read(
+                        after_sequence,
+                        crate::process_events::MAX_READ,
+                        crate::process_events::READ_WAIT,
+                    );
+                    Response::ProcessEvents { events, lost }
+                }
                 Request::Signal { process_id, signal } => self.signal(&process_id, signal),
                 Request::Terminate { process_id } => self.terminate(&process_id),
                 Request::Resize {
@@ -8982,6 +8990,21 @@ mod linux {
                     .all(|process| process.kind == ProcessKindWire::Main)
             );
 
+            // Reading process events holds no ownership guard, so a long
+            // poll never delays a promotion; only the owner in force reads.
+            let read_events = Request::ReadProcessEvents { after_sequence: 0 };
+            assert!(
+                boundary
+                    .authorize_request(&old, &read_events)
+                    .expect("the owner reads process events")
+                    .is_none()
+            );
+            assert!(
+                boundary
+                    .authorize_request(&candidate, &read_events)
+                    .is_err()
+            );
+
             // The owner is authorized for an operation and, still holding
             // that authorization, starts an exec the replacement's staged
             // snapshot does not show.
@@ -9055,9 +9078,16 @@ mod linux {
                     provider_files: std::collections::HashMap::new(),
                 },
                 Request::TerminateBoundary,
+                read_events.clone(),
             ] {
                 assert!(boundary.authorize_request(&old, &request).is_err());
             }
+            assert!(
+                boundary
+                    .authorize_request(&candidate, &read_events)
+                    .expect("the promoted owner reads process events")
+                    .is_none()
+            );
             let resumed = boundary.running_process(&process_id).expect("workload");
             assert!(!resumed.has_exited());
 
