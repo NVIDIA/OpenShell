@@ -115,6 +115,12 @@ it. For a protocol in which the server sends first, such as SMTP, set
 Use an inspected endpoint when the request, not only the destination,
 determines the risk, such as allowing reads but not writes on an API.
 
+When inspected endpoints overlap, the most specific matching endpoint `path`
+selects the request protocol. Allow rules from matching endpoints using that
+protocol combine. Rules using another protocol cannot authorize the request;
+for example, a broader REST rule cannot allow a method excluded by a JSON-RPC
+route. Matching deny rules still take precedence over allows.
+
 ### Enforcement
 
 The `enforcement` field on an inspected endpoint decides what happens when a

@@ -93,6 +93,16 @@ network_policies:
     endpoints:
       - host: {host}
         port: {port}
+        protocol: rest
+        enforcement: enforce
+        access: read-write
+        allowed_ips:
+          - "10.0.0.0/8"
+          - "172.0.0.0/8"
+          - "192.168.0.0/16"
+          - "fc00::/7"
+      - host: {host}
+        port: {port}
         path: /rpc
         protocol: json-rpc
         enforcement: enforce
@@ -357,6 +367,12 @@ def raw_jsonrpc_status(method, params, label):
     return raw_http_status(label, request)
 
 results = {{
+    # The broad REST endpoint still permits requests outside the RPC route.
+    "rest_route_allowed": raw_http_status("rest_route_allowed", (
+        f"POST /api/status HTTP/1.1\r\n"
+        f"Host: {{HOST}}:{{PORT}}\r\n"
+        f"Content-Length: 0\r\nConnection: close\r\n\r\n"
+    ).encode()),
     # forward proxy — method-only allow rules
     "forward_method_initialize_allowed": post_jsonrpc("forward_method_initialize_allowed", "initialize", {{"protocolVersion": "2025-11-25", "capabilities": {{}}}}),
     "forward_method_tools_list_allowed": post_jsonrpc("forward_method_tools_list_allowed", "tools/list"),
@@ -365,6 +381,7 @@ results = {{
     "forward_method_tools_call_allowed": post_jsonrpc("forward_method_tools_call_allowed", "tools/call", {{"name": "read_status"}}),
     "forward_method_tools_call_with_unmatched_params_allowed": post_jsonrpc("forward_method_tools_call_with_unmatched_params_allowed", "tools/call", {{"name": "blocked_action", "arguments": {{"scope": "ignored"}}}}),
     "forward_method_tools_delete_denied": post_jsonrpc("forward_method_tools_delete_denied", "tools/delete", {{"name": "purge_cache"}}),
+    "forward_unlisted_method_denied": post_jsonrpc("forward_unlisted_method_denied", "admin.delete"),
 
     # forward proxy — batch: all requests allowed
     "forward_batch_all_allowed": post_jsonrpc_batch("forward_batch_all_allowed", [
@@ -387,6 +404,7 @@ results = {{
     "raw_method_tools_call_allowed": raw_jsonrpc_status("tools/call", {{"name": "read_status"}}, "raw_method_tools_call_allowed"),
     "raw_method_tools_call_with_unmatched_params_allowed": raw_jsonrpc_status("tools/call", {{"name": "blocked_action", "arguments": {{"scope": "ignored"}}}}, "raw_method_tools_call_with_unmatched_params_allowed"),
     "raw_method_tools_delete_denied": raw_jsonrpc_status("tools/delete", {{"name": "purge_cache"}}, "raw_method_tools_delete_denied"),
+    "raw_unlisted_method_denied": raw_jsonrpc_status("admin.delete", None, "raw_unlisted_method_denied"),
 }}
 results.update(DETAILS)
 print(json.dumps(results, sort_keys=True))
@@ -400,6 +418,7 @@ print(json.dumps(results, sort_keys=True))
         .expect("sandbox create");
 
     for (key, expected) in [
+        ("rest_route_allowed", 200),
         // forward proxy — allowed
         ("forward_method_initialize_allowed", 200),
         ("forward_method_tools_list_allowed", 200),
@@ -410,6 +429,7 @@ print(json.dumps(results, sort_keys=True))
         ),
         // forward proxy — method denied
         ("forward_method_tools_delete_denied", 403),
+        ("forward_unlisted_method_denied", 403),
         // forward proxy — batch
         ("forward_batch_all_allowed", 200),
         ("forward_batch_one_denied", 403),
@@ -422,6 +442,7 @@ print(json.dumps(results, sort_keys=True))
         ("raw_method_tools_call_with_unmatched_params_allowed", 200),
         // raw socket path — method denied
         ("raw_method_tools_delete_denied", 403),
+        ("raw_unlisted_method_denied", 403),
     ] {
         let expected_fragment = format!(r#""{key}": {expected}"#);
         assert!(
