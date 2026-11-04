@@ -37,11 +37,8 @@ runs before StartAgent.
 A backend refuses a policy it cannot enforce by returning `Denied` from Attach.
 The sandbox then reports `ConfigurationReady: False (ConfigurationInvalid)`.
 Transport and backend availability failures remain infrastructure failures. The
-backend's reason is in the supervisor log. `openshell policy list` also shows it
-when the gateway acknowledged that this supervisor created the refused startup
-revision. A deduplicated write or a newer operator revision does not establish
-that ownership. Delete the sandbox and create it again with a policy the backend
-accepts.
+backend's reason is in the supervisor log. Delete the sandbox and create it
+again with a policy the backend accepts.
 
 External compute drivers advertise `openshell.compute.isolation-backend` to
 accept an operator-selected `IsolationBackendRegistration`, including its Unix,
@@ -62,6 +59,6 @@ workload behavior, refer to [Runtimes](/how-it-works/sandboxes/runtimes).
 
 ## Release compatibility
 
-These API changes target the next minor release and must not be backported into the `0.1.x` patch series. Upgrade gateway replicas and supervisors together before relying on startup refusal reporting. Older writers can drop the new refusal and policy-creation metadata.
+These API changes target the next minor release and must not be backported into the `0.1.x` patch series. Upgrade gateway replicas and supervisors together before relying on startup refusal reporting.
 
 For raw Rust and TypeScript message changes, see the [SDK migration notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-sdk/README.md#next-minor-api-migration).
