@@ -3742,7 +3742,7 @@ mod tests {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject};
         let dir = tempdir().unwrap();
         let (ca, ca_key) = generate_test_certs_with_ca(dir.path());
-        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "application-user");
@@ -3804,7 +3804,7 @@ mod tests {
                 let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[addr])
                     .await
                     .unwrap();
-                let mut stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+                let mut stream = TlsConnector::from(Arc::new(config))
                     .connect(ServerName::try_from("localhost").unwrap(), stream)
                     .await
                     .unwrap();
