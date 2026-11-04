@@ -178,8 +178,9 @@ message Sandbox {
   // Set by the gateway when the sandbox is created as a child. Absent on roots.
   // Never changes after creation.
   SandboxParent parent = 21;
-  // Set by the gateway on every new sandbox: the user who created it.
-  // Never changes after creation. Absent on sandboxes created before this field.
+  // Set by the gateway on every new sandbox: the user who created it, or
+  // `sandbox:<id>` when a root sandbox created it through MCP. Never changes
+  // after creation. Absent on sandboxes created before this field.
   string created_by = 22;
 }
 
@@ -764,6 +765,10 @@ rules above apply only to sandbox callers.
 
 **The user who started the root must still have access.** When a user creates
 a sandbox, the gateway records that user in its read-only `created_by` field.
+When a root creates a child through MCP, the child records the root instead,
+as `sandbox:<id>`, the same form the audit log uses: `created_by` names whoever
+decided to create the sandbox, and the user a root acts for is the root's own
+`created_by`.
 Every time a root creates a child through MCP, the gateway checks that this
 user is still a member of the workspace with at least the user role. If not,
 the create is refused with "the user who started this sandbox no longer has
@@ -902,6 +907,10 @@ reused; its grants, lineage store and result files are not part of this design.
   The child is told why and the gateway logs it once per parent version; the
   fix is a parent policy that can be copied.
 - **No GPU for children created by agents without a template.**
+- **`created_by` holds two forms**, a user's subject or `sandbox:<id>`, so an
+  identity provider subject that starts with `sandbox:` would read like a
+  sandbox. Nothing decides access from a child's `created_by`, so the worst
+  case is a misleading record.
 - **Roots with driver configuration** cannot create children through MCP,
   because it can set isolation, devices and mounts that are not safe to copy;
   create their children with the CLI.
