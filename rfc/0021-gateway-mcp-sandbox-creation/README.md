@@ -90,7 +90,7 @@ from; all were accepted by the author.
 | MCP path | Tools call RPCs through the normal router, so interceptors run | author |
 | Callers | Agents in root sandboxes and users on the host (`openshell mcp serve`) | author |
 | Enabling | Gateway setting, off by default, also gating `/mcp`; no grants | Piotr |
-| Limit | `max_concurrent_children` per parent, default 10; deletes free slots | author, team call |
+| Limit | `max_concurrent_children` per parent, default 10; a slot frees when a delete finishes | author, team call |
 | Policy | Child uses the parent's policy, copied and kept in sync | author |
 | Child policy changes | Refused, including proposals; narrowing planned for v1 | drew (narrowing) |
 | Image and resources | Users: all create options, a deliberate departure from drew's "inherited from the parent"; agents: copy the parent or use a template approved for agents | Piotr (copy), author (templates) |
@@ -658,8 +658,10 @@ means no children even when the feature is on. The gateway refuses values above
 1,000 at startup.
 
 Every child that exists counts, whether it is starting, running, stopped or
-failed, because a stopped child still holds a name and storage. Deleting a
-child frees its slot. Creating a child takes the gateway's mutation lock on
+failed, because a stopped child still holds a name and storage. A child keeps
+its slot until its delete finishes, because its compute resources may still
+run until then; a refusal says how many children are still being deleted, so
+an agent knows to retry. Creating a child takes the gateway's mutation lock on
 the parent as well as on the new child, then re-reads the parent, counts its
 children and inserts the child's record. On PostgreSQL the lock is also held
 in the database, so two creates for the same parent cannot both take the last
