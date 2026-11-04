@@ -1152,23 +1152,8 @@ fn compile_credential_placement(
     metadata: &crate::proto::ProviderProfileCredential,
 ) -> Result<CredentialPlacement, StaticCredentialBindingError> {
     let style = metadata.auth_style.trim().to_ascii_lowercase();
-    let consistent = match style.as_str() {
-        "basic" => {
-            (metadata.header_name.is_empty()
-                || metadata.header_name.eq_ignore_ascii_case("authorization"))
-                && metadata.query_param.is_empty()
-                && metadata.path_template.is_empty()
-        }
-        "header" | "bearer" => metadata.query_param.is_empty() && metadata.path_template.is_empty(),
-        "query" => metadata.header_name.is_empty() && metadata.path_template.is_empty(),
-        "path" => metadata.header_name.is_empty() && metadata.query_param.is_empty(),
-        _ => false,
-    };
-    if !consistent {
-        return Err(binding_error(
-            "static credential placement metadata has conflicting request locations",
-        ));
-    }
+    // Authored profiles may retain fields for other auth styles. Only the
+    // selected style grants a location; unused fields grant no authority.
     let placement = match style.as_str() {
         "basic" => CredentialPlacement::Header("authorization".into()),
         "header" | "bearer"
@@ -1624,18 +1609,57 @@ mod tests {
     }
 
     #[test]
-    fn static_metadata_infers_locations_without_becoming_a_token_grant() {
+    fn static_metadata_selects_one_location_and_preserves_other_providers() {
         for style in ["bearer", "header", "basic", "query", "path"] {
+            let env = HashMap::from([
+                ("API_KEY".into(), "synthetic".into()),
+                ("OTHER_KEY".into(), "other-secret".into()),
+            ]);
+            let mut other_binding = binding("other.example.com", 443, "/**");
+            other_binding.credential_identity = "provider-b:OTHER_KEY".into();
+            let bindings = HashMap::from([
+                ("API_KEY".into(), binding("api.example.com", 443, "/**")),
+                ("OTHER_KEY".into(), other_binding),
+            ]);
             let state = ProviderCredentialState::from_bound_environment(
                 7,
-                HashMap::from([("API_KEY".into(), "synthetic".into())]),
+                env.clone(),
                 HashMap::new(),
-                placement_metadata(style),
-                HashMap::from([("API_KEY".into(), binding("api.example.com", 443, "/**"))]),
+                HashMap::new(),
+                bindings.clone(),
                 vec![],
             )
             .unwrap();
+            // Older documented profiles populated all three placement fields.
+            // Only auth_style's selected field may grant request authority.
+            let mut metadata = placement_metadata(style);
+            let declaration = metadata.values_mut().next().unwrap();
+            declaration.header_name = if style == "basic" {
+                "x-unused-for-basic"
+            } else {
+                "Authorization"
+            }
+            .into();
+            declaration.query_param = "api_key".into();
+            declaration.path_template = "/v1/{credential}/events".into();
+            assert_eq!(
+                state
+                    .install_bound_environment(8, env, HashMap::new(), metadata, bindings, vec![])
+                    .unwrap(),
+                2
+            );
             assert!(state.snapshot().dynamic_credentials.is_empty());
+            assert_eq!(
+                state
+                    .resolver_for_endpoint("other.example.com", 443, "/")
+                    .unwrap()
+                    .rewrite_header_value_for_name(
+                        "Authorization",
+                        &state.snapshot().child_env["OTHER_KEY"],
+                    )
+                    .unwrap(),
+                Some("other-secret".into())
+            );
             let reference = state.snapshot().child_env["API_KEY"].clone();
             let resolver = state
                 .resolver_for_endpoint("api.example.com", 443, "/v1/chat")
@@ -1691,15 +1715,15 @@ mod tests {
                     metadata.insert(format!("{STATIC_CREDENTIAL_METADATA_PREFIX}OTHER"), value);
                 }
                 6 => value.header_name.clear(),
-                7 => value.query_param = "api_key".into(),
+                7 => value.header_name = "Bad Header".into(),
                 8 => {
                     value.auth_style = "path".into();
                     value.header_name.clear();
                     value.path_template = "/no-slot".into();
                 }
                 9 => {
-                    value.auth_style = "basic".into();
-                    value.header_name = "x-api-key".into();
+                    value.auth_style = "query".into();
+                    value.query_param = "api?key".into();
                 }
                 10 => value.auth_style.clear(),
                 _ => unreachable!(),

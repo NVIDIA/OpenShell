@@ -12326,9 +12326,17 @@ mod tests {
             (" ", "", "", "", true, false),
             ("", "x-api-key", "", "", true, false),
             ("header", "Bad Header", "", "", true, false),
-            ("bearer", "authorization", "api_key", "", true, false),
+            ("bearer", "authorization", "api_key", "", true, true),
+            (
+                "bearer",
+                "authorization",
+                "api_key",
+                "/v1/{credential}/resources",
+                true,
+                true,
+            ),
             ("query", "", "api?key", "", true, false),
-            ("basic", "x-custom", "", "", true, false),
+            ("basic", "x-custom", "", "", true, true),
             ("basic", "Authorization", "", "", true, true),
         ] {
             let mut declared = owned.clone();

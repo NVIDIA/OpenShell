@@ -102,6 +102,11 @@ credentials only in the `{credential}` slot of their path template. Header names
 are case-insensitive. An `Authorization` binding accepts Bearer, token, and Basic
 authentication.
 
+The credential's `auth_style` selects its placement. Fields for other styles are
+ignored, so a bearer credential with unused `query_param` or `path_template`
+fields still resolves only in its declared header. An invalid selected placement
+is rejected.
+
 Existing endpoint policies that enable request-body or WebSocket text rewriting
 continue to authorize those locations. Those flags do not authorize arbitrary
 query parameters, URL paths, or unrelated headers. Trusted AWS signing retains

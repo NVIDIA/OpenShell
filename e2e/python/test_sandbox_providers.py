@@ -728,7 +728,8 @@ def test_imported_openai_profile_allows_native_endpoint_with_attached_provider(
 
 
 @pytest.mark.parametrize(
-    "placement", ["authorization", "missing", "header", "query", "path"]
+    "placement",
+    ["authorization", "missing", "header", "query", "path", "unused-fields"],
 )
 def test_static_header_credentials_reject_reflective_request_locations(
     sandbox: Callable[..., Sandbox],
@@ -749,6 +750,11 @@ def test_static_header_credentials_reject_reflective_request_locations(
     if placement == "missing":
         credential.auth_style = ""
         credential.header_name = ""
+    elif placement == "unused-fields":
+        credential.auth_style = "bearer"
+        credential.header_name = "Authorization"
+        credential.query_param = "api_key"
+        credential.path_template = "/v1/{credential}/resources"
     elif placement in {"header", "query", "path"}:
         credential.auth_style = placement
         credential.header_name = "x-api-key" if placement == "header" else ""
@@ -767,18 +773,25 @@ def test_static_header_credentials_reject_reflective_request_locations(
 
         token = os.environ["API_TOKEN"]
         root = f"http://{host}:{port}"
+        query_key = "api_key" if placement == "unused-fields" else "probe"
+        encoded_token = urllib.parse.quote(token, safe="")
+        token_path = (
+            f"/v1/{encoded_token}/resources"
+            if placement == "unused-fields"
+            else f"/{encoded_token}/search"
+        )
         requests = [
             urllib.request.Request(
                 root
                 + "/search?"
-                + urllib.parse.urlencode({"q": "rust", "per_page": "1", "probe": token})
+                + urllib.parse.urlencode(
+                    {"q": "rust", "per_page": "1", query_key: token}
+                )
             ),
             urllib.request.Request(
                 root + "/search", headers={"X-Other-Credential": token}
             ),
-            urllib.request.Request(
-                root + "/" + urllib.parse.quote(token, safe="") + "/search"
-            ),
+            urllib.request.Request(root + token_path),
             urllib.request.Request(
                 root + "/search",
                 data=urllib.parse.urlencode({"token": token}).encode(),
@@ -860,14 +873,14 @@ def test_static_header_credentials_reject_reflective_request_locations(
                 assert body_result["status"] == 200, body_result
                 assert secret in body_result["body"]
                 valid = payload["valid"]
-                if placement in {"authorization", "missing"}:
+                if placement in {"authorization", "missing", "unused-fields"}:
                     assert valid["body"]["authorization"] == f"token {secret}"
                 elif placement == "header":
                     assert valid["body"]["x_api_key"] == secret
                 else:
                     assert secret in valid["body"]["path"]
                 assert "page=2" in valid["link"]
-                if placement in {"authorization", "missing", "header"}:
+                if placement in {"authorization", "missing", "header", "unused-fields"}:
                     assert secret not in valid["link"]
 
 
