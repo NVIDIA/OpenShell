@@ -138,8 +138,10 @@ snapshots report such a workload as starting. A new exit is still reported.
 Only workload containers appear in sandbox list/watch results. Readiness uses
 the supervisor's private health socket; there is no shell, legacy marker, or
 TCP-listener shortcut. Watch reconciliation and supervisor exit/removal events
-stop a running workload whose companion is unavailable. The gateway also
-requires the authenticated supervisor session before publishing Ready.
+stop a running workload whose companion is unavailable. A restart starts the
+workload before its exited companion, so the companion exit that the start
+recorded is not contained until the start returns. The gateway also requires
+the authenticated supervisor session before publishing Ready.
 
 ## Mounts, GPUs, and configuration
 

@@ -2099,8 +2099,11 @@ impl PodmanComputeDriver {
             self.client
                 .stop_container(&supervisor, self.config.stop_timeout_secs)
                 .await?;
-            self.wait_for_container_stopped(sandbox_id, &supervisor)
+            let supervisor_finished_at = self
+                .wait_for_container_stopped(sandbox_id, &supervisor)
                 .await?;
+            self.lifecycle_event_fences
+                .record_supervisor_restart(sandbox_id, supervisor_finished_at.as_deref());
             let archive = self
                 .client
                 .copy_from_container(&supervisor, crate::isolation::RESTART_METADATA_PATH)
@@ -2323,11 +2326,13 @@ impl PodmanComputeDriver {
             return Ok(None);
         };
         if entry.state == "running" {
-            Ok(watcher::inspect_workload(&self.client, &entry.id)
-                .await
-                .ok()
-                .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
-                .or_else(|| driver_sandbox_from_list_entry(entry)))
+            Ok(
+                watcher::inspect_workload(&self.client, &self.lifecycle_event_fences, &entry.id)
+                    .await
+                    .ok()
+                    .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
+                    .or_else(|| driver_sandbox_from_list_entry(entry)),
+            )
         } else {
             Ok(self.driver_sandbox_from_polled_entry(entry).await)
         }
@@ -2389,7 +2394,13 @@ impl PodmanComputeDriver {
         for entry in &entries {
             if entry.state == "running" {
                 // Running containers need inspect for health check status.
-                match watcher::inspect_workload(&self.client, &entry.id).await {
+                match watcher::inspect_workload(
+                    &self.client,
+                    &self.lifecycle_event_fences,
+                    &entry.id,
+                )
+                .await
+                {
                     Ok(inspect) => {
                         if let Some(sandbox) = driver_sandbox_from_inspect(&inspect) {
                             sandboxes.push(sandbox);
