@@ -5264,16 +5264,16 @@ pub(super) async fn handle_rotate_provider_credential(
     if credential_key.is_empty() {
         return Err(Status::invalid_argument("credential_key is required"));
     }
-    let refresh_state = crate::provider_refresh::refresh_provider_credential(
-        state.store.as_ref(),
+    let refreshed = openshell_credential_issuer::refresh::CredentialRefresh::rotate(
+        &state.refresh,
         &workspace,
-        &state.credentials,
-        Some(&state.compute),
         provider_name,
         credential_key,
     )
     .await?;
-    publish_provider_change(state, &workspace, provider_name);
+    crate::provider_refresh::publish_change(state, &refreshed);
+    let refresh_state =
+        crate::storage_proto::StoredProviderCredentialRefreshStateV2::from(&refreshed);
 
     replay_facts.refresh(&refresh_state)?;
     Ok(Response::new(RotateProviderCredentialResponse {

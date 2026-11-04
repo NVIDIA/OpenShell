@@ -248,11 +248,9 @@ async fn retrieve(
         ensure_refreshable(refresh)?;
         if minted.insert(refresh.object_id().to_string()) {
             refresh_audit.attempts += 1;
-            crate::provider_refresh::refresh_from_snapshot(
-                state.store.as_ref(),
-                &state.credentials,
-                Some(&state.compute),
-                refresh.clone(),
+            openshell_credential_issuer::refresh::CredentialRefresh::ensure_fresh(
+                &state.refresh,
+                refresh.into(),
             )
             .await
             .map_err(sanitize)?;
