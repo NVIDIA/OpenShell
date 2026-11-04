@@ -258,19 +258,10 @@ automatically on issue-label events.
 Created PR [#123](https://github.com/OWNER/REPO/pull/123)
 ```
 
-### Accepted-Work Classification
-
-The `Accepted Work` workflow manages the PR's acceptance label using the definition
-in [CONTRIBUTING.md](../../../CONTRIBUTING.md#accepted-work). For an author without
-maintainer membership or target-repository write access, the same closing issue
-must be accepted and list the PR author as its submitter or a current assignee.
-The label does not replace the issue-acceptance gate or merge approvals. Do not
-manually apply it as a substitute for satisfying the automated rule.
-
-Apply area/topic classification labels only once the PR represents accepted
-work, following [Labeling and Notifications](../../../CONTRIBUTING.md#labeling-and-notifications).
-These labels drive filtered subscriber notifications, including the GitHub app
-in Slack; do not apply them to unaccepted work just because its scope is known.
+Follow the shared [accepted-work definition](../../../CONTRIBUTING.md#accepted-work)
+and [Labeling and Notifications](../../../CONTRIBUTING.md#labeling-and-notifications)
+when applying classification labels. Review-readiness applies the acceptance label
+to qualifying PRs when they open; this does not replace existing PR requirements.
 
 ### Monitor Workflow Run (Optional)
 
