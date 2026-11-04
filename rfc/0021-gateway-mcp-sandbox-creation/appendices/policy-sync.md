@@ -1,0 +1,180 @@
+# Appendix: Policy Sync Between Parents and Children
+
+> This is an appendix to the [RFC](../README.md). Please familiarize yourself with the RFC before reading this.
+
+This appendix shows how a parent's policy reaches its children and what happens in each edge case, as built on the `feat/child-sandboxes/patkraw` branch. In short:
+
+- A child's supervisor still writes its startup policy back. The gateway answers OK and stores nothing.
+- Children always fail closed, whatever failure mode the gateway uses.
+- While a `fail_closed` parent is blocked by a rejected policy, the gateway blocks its children at delivery.
+- A child that missed a copy catches up when its supervisor connects and at gateway start.
+- A provider the parent loses is detached from its children in the same sync.
+- A child whose parent record is gone is stopped.
+
+## What OpenShell already had
+
+Most of the machinery is the gateway's existing per-sandbox policy handling; the feature adds one sync function and a few refusals on top of it.
+
+- **Per-sandbox policy history** with versions, hashes and a load status per version, reported by each supervisor.
+- **Delivery by push and poll**, so a sandbox picks up a new version within seconds or when it reconnects.
+- **Failure modes** (`fail_closed`, `retain_last_valid`) for a supervisor that cannot load a version.
+- **Mutation locks** per sandbox, which the child create, the sync and parent deletes share.
+- **Provider attach and detach** with an attachment epoch, so a supervisor drops a detached credential.
+
+## Normal case: the parent's policy changes
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant GW as Gateway
+    participant Lead as Lead supervisor
+    participant Child as Child supervisor
+    User->>GW: policy set lead
+    GW->>GW: validate, store lead v8 as pending
+    GW->>Lead: deliver v8 by push or poll
+    Lead->>Lead: apply network rules
+    Lead->>GW: report v8 loaded
+    GW->>GW: record v8 loaded, lead is a root, start sync in background
+    Note over GW: lock lead, list its children, unlock
+    loop each live child, one at a time
+        GW->>GW: lock lead and child
+        GW->>GW: detach providers lead no longer has
+        GW->>GW: check tag
+        alt child tag older than v8
+            GW->>GW: write cleaned copy of v8, tagged parent v8
+        else child already at v8 or newer
+            GW->>GW: skip
+        end
+    end
+    GW->>Child: re-push every child
+    Child->>GW: fetch snapshot, mode always fail_closed
+    Child->>Child: apply copy of v8
+    Child->>GW: report loaded
+```
+
+## What the gateway serves a child
+
+```mermaid
+flowchart TD
+    A["Child supervisor asks for its config"] --> B{"Is the parent blocked?<br/>fail_closed parent rejected<br/>a newer revision"}
+    B -- yes --> C["Not admitted:<br/>parent sandbox 'lead' rejected its latest policy"]
+    C --> D["Child denies all new egress"]
+    B -- no --> E["Serve the child's newest revision,<br/>a copy of the parent's,<br/>plus the child's own providers,<br/>mode fail_closed"]
+    E --> F{"Does the copy load on the child?"}
+    F -- yes --> G["Child enforces exactly the parent's policy"]
+    F -- no --> H["Child fails closed and denies all new egress"]
+```
+
+## Who can change a child's policy
+
+```mermaid
+flowchart LR
+    U["User: policy set or policy add"] --> R1["Refused: change the parent's policy"]
+    AP["User: approve, approve all, undo"] --> R1
+    PR["Child's proposals:<br/>from denials or policy.local"] --> R2["Returned as rejected,<br/>never stored, no prover run"]
+    WB["Child's supervisor:<br/>startup path write-back"] --> R3["Answered OK, nothing stored,<br/>supervisor re-reads the parent's copy"]
+    SY["Gateway sync from the parent"] --> OK["Stored as the child's next revision"]
+    PA["Proposal on the parent"] --> PV["Prover check, then approve"] --> PL["Parent loads it"] --> SY
+```
+
+## A `fail_closed` parent rejects a policy, then is fixed
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant GW as Gateway
+    participant Lead as Lead supervisor
+    participant Child as Child supervisor
+    User->>GW: policy set lead v9, which has a mistake
+    GW->>Lead: deliver v9
+    Lead->>GW: report v9 failed
+    Note over Lead: lead denies all new egress
+    GW->>GW: lead is blocked, sync writes nothing
+    GW->>Child: re-push every child
+    Child->>GW: fetch snapshot
+    GW-->>Child: not admitted, parent rejected its latest policy
+    Note over Child: child denies all new egress, history unchanged
+    Note over GW: new children of lead are refused while it is blocked
+    User->>GW: policy set lead v10, fixed
+    GW->>Lead: deliver v10
+    Lead->>GW: report v10 loaded
+    GW->>GW: lead unblocked, copy v10 into child
+    GW->>Child: re-push every child
+    Child->>GW: fetch snapshot
+    GW-->>Child: admitted, copy of v10
+    Note over Child: child enforces v10 again
+```
+
+## A child catches up
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Child as Child supervisor
+    participant GW as Gateway
+    Note over Child: offline while lead moved to v8
+    Child->>GW: connect
+    GW->>GW: lock lead and child, detach lost providers, copy v8 if behind
+    Note over GW: capped at 2 s; on timeout the error is logged and the session goes on
+    GW-->>Child: first configuration, copy of v8
+    Note over GW: at gateway start, every root's children are synced in the background
+```
+
+## A child's parent is gone
+
+```mermaid
+flowchart TD
+    A["Child supervisor asks for its config"] --> B{"Parent record found by id?"}
+    B -- "store error" --> E["Logged; nothing is decided"]
+    B -- yes --> N["Normal delivery"]
+    B -- no --> C["Not admitted:<br/>the parent sandbox no longer exists"]
+    C --> D["Child denies all new egress"]
+    D --> S["Stopped on reconnect or at gateway start;<br/>record and files kept; start and resume refused"]
+```
+
+A root created later under the same name is not the parent, because the parent is looked up by id.
+
+## A child is created while a sync runs
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Create as Child create
+    participant Sync as Sync for lead v8
+    participant Lock as Lead's lock
+    Create->>Lock: take lead and new child
+    Create->>Create: read lead's enforced policy, save child
+    Create->>Lock: release
+    Sync->>Lock: take lead
+    Sync->>Sync: read lead v8, list children, new child included
+    Sync->>Lock: release
+    Note over Create,Sync: The lock serializes the two. A create either finishes before<br/>the list and gets synced, or starts after v8 is recorded and copies v8 itself.
+```
+
+## Other edge cases
+
+| Situation | What happens | Why |
+|---|---|---|
+| Child created while the parent has no loaded revision | Refused | A child copies only a policy the parent enforces |
+| Two syncs finish out of order, v8 then v7 | v7 is skipped | The child's tag already says v8; a sync only moves a child forward |
+| Sync runs twice for v8 | The second run writes nothing | The tag check makes it safe to repeat |
+| One child's lock times out during a sync | Its siblings are still synced; the error is logged and reported at the end | One stuck child must not hold a revocation back from the others |
+| The child's newest revision has no parent tag | It counts as behind and gets re-copied | Nothing but the sync may decide a child's policy |
+| The parent's copy binds a provider the child lacks | Child is not admitted and fails closed | Children never keep access the parent lost |
+| Gateway set to `retain_last_valid` | The parent keeps that mode; children always use `fail_closed` | A child that kept its old copy could keep revoked access |
+| Parent uses `retain_last_valid` and has a newer pending or failed revision | Children copy the parent's loaded revision | Children get what the parent enforces |
+| Child's image needs a system path its parent's image lacks | The path is not added; something in the child may get "permission denied" | Child = parent exactly; the gateway log shows the dropped write |
+| Parent is unblocked but the child's copy is already current | The re-push of every child admits it again | This is why re-push runs on every sync, not only when it writes |
+| Provider attach on a child | Allowed only if the parent has the provider, checked under the parent's lock | A child's providers are a subset of its parent's |
+| Global policy active, parent has no policy history | Child create is refused | There is no parent revision to copy |
+| Parent is deleted while it has live children | Refused: "has N child sandboxes; delete them first" | No orphaned children |
+| A child is offline during a parent change | It gets the copy when it reconnects | Delivery is asynchronous |
+
+## Still open
+
+- **No periodic retry.** A failed copy waits for the parent's next load, the child's next connect or the next gateway start.
+- **Parent delete and child create across replicas.** Deleting a sandbox takes the parent's lock only within one gateway process, so on two replicas both can succeed; the child is then stopped as an orphan.
+- **Stopping an orphan by name.** The stop re-reads the child by name and checks its id, but a short window remains before the stop; closing it needs a stop by id in the compute layer.
+- **A detach on a root waits at most 10 s** for its children; the rest catch up on connect or at gateway start.
