@@ -799,6 +799,7 @@ impl SharedHost {
             sandbox_id: Some(registration.sandbox_id),
             sandbox: Some(registration.sandbox_name),
             container_image: registration.container_image,
+            container_image_uid: None,
             openshell_endpoint: Some(self.gateway_endpoint.clone()),
             gateway_home: Some(self.gateway_home.subscribe()),
             policy_rules: None,

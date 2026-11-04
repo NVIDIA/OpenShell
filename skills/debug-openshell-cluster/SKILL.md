@@ -229,6 +229,13 @@ rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
 The published supervisor image uses a shell-free distroless Debian 13 base.
+For Docker and Podman, supervisor OCSF `device.container.image.uid` identifies
+the workload image fixed at launch, and `image.name` carries its requested
+reference. Compare the UID with engine inspection of the workload container;
+the supervisor companion uses a separate image. An absent image object means
+the driver did not supply an immutable image ID; Kubernetes currently omits it.
+When no image UID is available, `unmapped.container_image` preserves any known
+workload image reference, including for VM and shared-supervisor records.
 For custom builds using `SUPERVISOR_BASE_IMAGE`, check the selected base's GNU
 runtime libraries, CA certificates, and inherited user and working directory.
 Use container logs, engine inspection and the configured exec health probe for
