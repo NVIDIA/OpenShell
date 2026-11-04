@@ -360,10 +360,8 @@ For a compute driver that advertises sampled account budgets, use
 These explicit budgets terminate on observed excess; collection and sampling
 can overshoot. They are distinct from `--cpu` core-rate limits and `--memory`
 hard limits. Inspect `gateway info` for driver guarantees; ordinary workspace
-users do not need its administrator permission to use budgets. Budget-bearing
-writes check the public gateway protocol acknowledgement and fail on older
-gateways rather than discarding the fields. Unsupported drivers reject the
-request before provisioning.
+users do not need its administrator permission to use budgets. Budget requests
+fail before provisioning if the gateway or driver does not support them.
 
 ### Manage sandbox workload templates
 

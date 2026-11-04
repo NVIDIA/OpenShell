@@ -93,13 +93,11 @@ observation and overshoot has no fixed bound. These budgets do not satisfy a
 hard CPU-rate or memory quota. First-party container and VM drivers currently
 reject sampled budgets; external drivers may provide them.
 
-Before writing budget-bearing requests or templates, curated SDKs and the CLI
-require `HealthResponse.supports_sampled_resource_budget`. This public protocol
-acknowledgement prevents older gateways from silently discarding the request;
-it does not promise driver support. Raw API callers must check it too. Use a
-homogeneous upgraded gateway deployment: a probe cannot make mixed-version
-load-balancer routing atomic. The gateway and driver remain responsible for
-resource admission before provisioning and on retained launches.
+Raw API clients must check `HealthResponse.supports_sampled_resource_budget`
+before sending sampled budgets. The CLI and curated SDKs check it automatically.
+This confirms that the gateway preserves budget fields; driver support is
+reported separately. Upgrade all gateway replicas before using sampled budgets,
+because older versions can discard budget fields.
 
 ## Credential Drivers
 
@@ -126,9 +124,3 @@ Drivers exchange peer metadata with the gateway and advertise their extension
 family capability. Upgrade both peers together when the protocol version
 changes. Refer to [Extension Protocol Negotiation](/extensibility/overview#protocol-negotiation)
 for the negotiation contract.
-
-## Release compatibility
-
-These API changes target the next minor release and must not be backported into the `0.1.x` patch series. Upgrade gateway replicas together before sending sampled budgets. An older replica can discard budget fields even if another replica acknowledged support.
-
-For raw Rust and TypeScript field changes and defaults, see the [SDK migration notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-sdk/README.md#next-minor-api-migration).
