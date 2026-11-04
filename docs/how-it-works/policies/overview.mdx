@@ -87,8 +87,9 @@ both views.
 
 ### Global Policy
 
-A gateway administrator can apply one policy to every sandbox on the gateway.
-The global policy replaces each sandbox's own policy rather than limiting it.
+A gateway administrator can apply one policy across the gateway. The global
+policy replaces a sandbox's own policy rather than limiting it. Frozen
+sandboxes keep their accepted snapshot.
 While it is active, OpenShell blocks sandbox policy changes and proposal
 approvals, and suppresses provider-contributed network rules. Deleting the
 global policy restores normal policy selection and provider rules. Refer to
