@@ -4771,6 +4771,7 @@ mod linux {
                     })
                 }
                 BoundaryListenerConfig::Unix { socket_path, tls } => {
+                    openshell_core::unix_socket_path::check(socket_path)?;
                     remove_owned_stale_control_socket(socket_path)?;
                     let listener = std::os::unix::net::UnixListener::bind(socket_path)?;
                     // Mutual TLS makes a same-UID pathname replacement a
