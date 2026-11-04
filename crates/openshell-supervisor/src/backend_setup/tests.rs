@@ -600,7 +600,7 @@ async fn attach_refusal_is_marked_as_a_refusal() {
         .expect("an already attached boundary refuses attachment");
     assert_eq!(
         error.code().map(|code| code.to_string()).as_deref(),
-        Some(ATTACH_REFUSED)
+        Some("openshell.backend.attach.denied")
     );
     assert!(error.to_string().contains("already attached"));
 }
@@ -619,11 +619,7 @@ async fn attach_transport_failures_are_not_policy_refusals() {
             .await
             .err()
             .expect("backend transport failure must fail startup");
-        assert_ne!(
-            error.code().map(|code| code.to_string()).as_deref(),
-            Some(ATTACH_REFUSED),
-            "infrastructure failures must not be reported as policy denials"
-        );
+        assert!(!is_backend_refusal(&error));
         assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 0);
     }
 }
@@ -952,7 +948,13 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
         .observed
         .deny_confirmation
         .store(true, Ordering::SeqCst);
-    assert!(startup(false).await.is_err());
+    let error = startup(false)
+        .await
+        .expect_err("confirmation must refuse startup");
+    assert_eq!(
+        error.code().map(|code| code.to_string()).as_deref(),
+        Some("openshell.backend.confirm.unsupported")
+    );
     assert_eq!(
         setup.observed.events(),
         [

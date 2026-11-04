@@ -242,6 +242,10 @@ the image/effective policy or provider configuration. The supervisor remains
 alive while the workload stays unstarted. Inspect `openshell sandbox get` and
 repair the desired configuration with a complete policy replacement or provider
 change; do not treat a healthy container as proof that the workload is ready.
+If the reported failure names backend client construction, attachment, or
+isolation confirmation, follow the recovery hint and inspect cleanup status
+before restarting or recreating the sandbox. In-place policy repair may be
+unavailable.
 If the 300-second provisioning repair window expires, the gateway records
 `ProvisioningTimedOut` and stops workload and supervisor compute. Inspect
 `provisioning` in sandbox JSON and TUI NOTES to distinguish cleanup pending from

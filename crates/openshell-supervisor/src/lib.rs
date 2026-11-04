@@ -43,6 +43,7 @@ use std::time::Duration;
 use tracing::{Instrument as _, debug, info, warn};
 
 use openshell_core::PolicyValidationFailureMode;
+use openshell_core::backend_startup::{BackendStartupStage, backend_startup_diagnostic};
 use openshell_supervisor_control::RegistrationTraceContext;
 
 use openshell_ocsf::{
@@ -1342,7 +1343,7 @@ pub async fn run_sandbox_instance(
         Ok(attached) => attached,
         Err(error) => {
             if let (Some(sandbox_id), Some(gateway)) = (sandbox_id.as_deref(), gateway.as_ref()) {
-                Box::pin(report_attach_refusal(
+                Box::pin(report_backend_startup_failure(
                     gateway,
                     sandbox_id,
                     &loaded_policy_origin,
@@ -1430,11 +1431,27 @@ pub async fn run_sandbox_instance(
     let adopts_running_agent = remote_boundary.0.adopts_running_agent();
     let (bound, backend_name, ca_file_paths) = remote_boundary;
     let confirm = Box::pin(async {
-        let ready = bound
+        let ready = match bound
             .confirm()
             .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.confirm"))
             .await
-            .map_err(|error| miette::miette!(error.to_string()))?;
+        {
+            Ok(ready) => ready,
+            Err(error) => {
+                let error = backend_setup::startup_error(BackendStartupStage::Confirm, error);
+                if let (Some(sandbox_id), Some(gateway)) = (sandbox_id.as_deref(), gateway.as_ref())
+                {
+                    report_backend_startup_failure(
+                        gateway,
+                        sandbox_id,
+                        &loaded_policy_origin,
+                        &error,
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        };
         info!(backend = %backend_name, "Isolation boundary enforcement confirmed");
         Ok::<_, miette::Report>(ready)
     });
@@ -4212,9 +4229,8 @@ fn enqueue_policy_status(sender: &UnboundedSender<PolicyStatusUpdate>, update: P
     }
 }
 
-/// The report that the backend refused, at Attach, the configuration this start
-/// accepted. Only a refusal qualifies: `Unavailable` can succeed on the next start.
-fn attach_refusal_report(
+/// Report a classified backend failure before the workload has started.
+fn backend_startup_failure_report(
     sandbox_id: &str,
     origin: &LoadedPolicyOrigin,
     error: &miette::Report,
@@ -4226,12 +4242,8 @@ fn attach_refusal_report(
     else {
         return None;
     };
-    if error
-        .code()
-        .is_none_or(|code| code.to_string() != backend_setup::ATTACH_REFUSED)
-    {
-        return None;
-    }
+    let code = error.code()?.to_string();
+    backend_startup_diagnostic(&code)?;
     Some(openshell_core::proto::ReportSandboxConfigurationRequest {
         sandbox_id: sandbox_id.to_string(),
         admission: Some(openshell_core::proto::SandboxConfigurationAdmission {
@@ -4241,34 +4253,48 @@ fn attach_refusal_report(
             policy_hash: revision.policy_hash.clone(),
             config_revision: revision.config_revision,
             provider_env_revision: revision.provider_env_revision,
-            error: error.to_string(),
+            // Carry only a bounded machine code, never backend diagnostics.
+            error: code,
         }),
         expected_instance_id: String::new(),
         refused_before_start: true,
     })
 }
 
-/// Report an Attach refusal before the supervisor exits. The gateway records
-/// the accepted configuration as refused, and a revision this start wrote ends
-/// Failed with the backend's message. Both reports are best effort, and the
-/// refusal report gets a single bounded attempt so exit is not held up.
-async fn report_attach_refusal(
+/// Report a pre-start failure without replacing the original error. The entire
+/// best-effort operation, including any policy-history report, has one deadline.
+async fn report_backend_startup_failure(
     gateway: &openshell_core::grpc_client::GatewayEndpoint,
     sandbox_id: &str,
     origin: &LoadedPolicyOrigin,
     error: &miette::Report,
 ) {
-    if let Some(request) = attach_refusal_report(sandbox_id, origin, error)
-        && let Err(report_error) = grpc_attempt(
-            "Attach refusal report",
-            openshell_core::grpc_client::report_sandbox_configuration_request(gateway, request),
-        )
-        .await
-    {
-        warn!(error = %report_error, "Failed to report the isolation backend refusal");
-    }
-    if let Some(revision) = refused_startup_revision(origin, error) {
-        report_initial_policy_failure(gateway, sandbox_id, Some(revision), error).await;
+    let Some(request) = backend_startup_failure_report(sandbox_id, origin, error) else {
+        return;
+    };
+    let code = request
+        .admission
+        .as_ref()
+        .map_or("", |admission| admission.error.as_str());
+    let safe_message = backend_startup_diagnostic(code).unwrap_or_else(|| {
+        "The isolation backend refused the admitted configuration before workload execution"
+            .to_string()
+    });
+    let operation = async {
+        if let Err(report_error) =
+            openshell_core::grpc_client::report_sandbox_configuration_request(gateway, request)
+                .await
+        {
+            warn!(error = %report_error, "Failed to report the isolation backend failure");
+        }
+        if let Some(revision) = refused_startup_revision(origin, error) {
+            let safe_error = miette::miette!(safe_message);
+            report_initial_policy_failure(gateway, sandbox_id, Some(revision), &safe_error).await;
+        }
+        Ok(())
+    };
+    if let Err(report_error) = grpc_attempt("Backend startup failure reports", operation).await {
+        warn!(error = %report_error, "Backend startup failure reporting did not complete");
     }
 }
 
@@ -4288,10 +4314,7 @@ fn refused_startup_revision<'a>(
     else {
         return None;
     };
-    error
-        .code()
-        .is_some_and(|code| code.to_string() == backend_setup::ATTACH_REFUSED)
-        .then_some(revision)
+    backend_setup::is_backend_refusal(error).then_some(revision)
 }
 
 /// Best-effort `FAILED` acknowledgement when initial policy construction or
@@ -6645,7 +6668,12 @@ network_policies:
             )
             .await
             .expect("startup must retry and accept the canonical snapshot");
-            let denial = miette::miette!(code = backend_setup::ATTACH_REFUSED, "policy denied");
+            let denial = backend_setup::startup_error(
+                BackendStartupStage::Attach,
+                openshell_isolation_interface::contract::BackendError::Denied(
+                    "policy denied".into(),
+                ),
+            );
             assert_eq!(
                 refused_startup_revision(&bundle.4, &denial).is_some(),
                 owned,
@@ -6705,6 +6733,7 @@ network_policies:
     #[test]
     fn attach_refusal_reports_the_accepted_generation_as_refused() {
         use openshell_core::proto::ConfigurationAdmissionState;
+        use openshell_isolation_interface::contract::BackendError;
 
         let mut revision = LoadedPolicyRevision::from_snapshot(&settings_poll_result(
             Some(proto_policy_fixture()),
@@ -6717,9 +6746,12 @@ network_policies:
             has_last_valid_policy: true,
             written_at_startup: false,
         };
-        let refusal = miette::miette!(code = backend_setup::ATTACH_REFUSED, "refused");
+        let refusal = backend_setup::startup_error(
+            BackendStartupStage::Attach,
+            BackendError::Denied("refused".into()),
+        );
 
-        let request = attach_refusal_report("sandbox-id", &origin(&revision), &refusal)
+        let request = backend_startup_failure_report("sandbox-id", &origin(&revision), &refusal)
             .expect("a refusal of the accepted generation is reported");
         assert!(request.refused_before_start);
         let admission = request.admission.unwrap();
@@ -6744,18 +6776,51 @@ network_policies:
             )
         );
 
+        for (stage, failure) in [
+            (
+                BackendStartupStage::Build,
+                BackendError::Descriptor("secret launch payload".into()),
+            ),
+            (
+                BackendStartupStage::Attach,
+                BackendError::Unavailable("secret endpoint".into()),
+            ),
+            (
+                BackendStartupStage::Confirm,
+                BackendError::Denied("secret policy".into()),
+            ),
+        ] {
+            let error = backend_setup::startup_error(stage, failure);
+            let request = backend_startup_failure_report("sandbox-id", &origin(&revision), &error)
+                .expect("classified startup failures must be reported");
+            let code = request.admission.unwrap().error;
+            assert!(code.starts_with(&format!("openshell.backend.{}.", stage.code())));
+            assert!(!code.contains("secret"));
+            assert!(backend_startup_diagnostic(&code).is_some());
+        }
+
         let transient = miette::miette!("unavailable");
-        assert!(attach_refusal_report("sandbox-id", &origin(&revision), &transient).is_none());
         assert!(
-            attach_refusal_report("sandbox-id", &LoadedPolicyOrigin::LocalOverride, &refusal)
-                .is_none()
+            backend_startup_failure_report("sandbox-id", &origin(&revision), &transient).is_none()
+        );
+        assert!(
+            backend_startup_failure_report(
+                "sandbox-id",
+                &LoadedPolicyOrigin::LocalOverride,
+                &refusal
+            )
+            .is_none()
         );
         revision.admission_instance_id = None;
-        assert!(attach_refusal_report("sandbox-id", &origin(&revision), &refusal).is_none());
+        assert!(
+            backend_startup_failure_report("sandbox-id", &origin(&revision), &refusal).is_none()
+        );
     }
 
     #[test]
     fn attach_refusal_fails_only_the_revision_this_start_wrote() {
+        use openshell_isolation_interface::contract::BackendError;
+
         let revision = LoadedPolicyRevision::from_snapshot(&settings_poll_result(
             Some(proto_policy_fixture()),
             3,
@@ -6766,7 +6831,10 @@ network_policies:
             has_last_valid_policy: true,
             written_at_startup,
         };
-        let refusal = miette::miette!(code = backend_setup::ATTACH_REFUSED, "refused");
+        let refusal = backend_setup::startup_error(
+            BackendStartupStage::Attach,
+            BackendError::Denied("refused".into()),
+        );
         let transient = miette::miette!("unavailable");
 
         assert_eq!(
@@ -6776,6 +6844,28 @@ network_policies:
         assert!(refused_startup_revision(&origin(true), &transient).is_none());
         assert!(refused_startup_revision(&origin(false), &refusal).is_none());
         assert!(refused_startup_revision(&LoadedPolicyOrigin::LocalOverride, &refusal).is_none());
+        for stage in [
+            BackendStartupStage::Build,
+            BackendStartupStage::Attach,
+            BackendStartupStage::Confirm,
+        ] {
+            for failure in [
+                BackendError::Denied("policy rejected".into()),
+                BackendError::Attach("mediation transport failed".into()),
+                BackendError::Unavailable("retry after cleanup".into()),
+                BackendError::Confirm("confirmation failed".into()),
+                BackendError::Process("process failed".into()),
+            ] {
+                let refused = stage == BackendStartupStage::Attach
+                    && matches!(failure, BackendError::Denied(_));
+                let error = backend_setup::startup_error(stage, failure);
+                assert_eq!(
+                    refused_startup_revision(&origin(true), &error).is_some(),
+                    refused
+                );
+                assert_eq!(backend_setup::is_backend_refusal(&error), refused);
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]

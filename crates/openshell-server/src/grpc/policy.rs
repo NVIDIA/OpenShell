@@ -5091,6 +5091,9 @@ pub(super) async fn handle_report_sandbox_configuration(
             "refused_before_start requires a rejected admission",
         ));
     }
+    let startup_diagnostic = refused_before_start
+        .then(|| openshell_core::backend_startup::backend_startup_diagnostic(&admission.error))
+        .flatten();
     let Some(_mutation_guard) = state
         .compute
         .sandbox_mutation_guard_by_id(&sandbox_id)
@@ -5172,14 +5175,17 @@ pub(super) async fn handle_report_sandbox_configuration(
             Ok(config) if !config.get_ref().configuration_error.is_empty() => config.into_inner().configuration_error,
             _ => "Effective configuration could not be activated; replace the policy or repair attached providers".to_string(),
         };
-        if let Some(current) = current
-            && current.state == i32::from(ConfigurationAdmissionState::Accepted)
-        {
-            if refused_before_start && same_generation(current, &admission) {
-                // The runtime refused what it accepted, so the workload never
-                // started on it. Runtime text stays out of public status.
-                admission.error = "The isolation backend refused this configuration before the workload started; create the sandbox again with a policy the backend accepts".to_string();
-            } else {
+        if let Some(current) = current {
+            let accepted = current.state == i32::from(ConfigurationAdmissionState::Accepted);
+            let rejected = current.state == i32::from(ConfigurationAdmissionState::Rejected);
+            if refused_before_start
+                && (accepted || rejected)
+                && same_generation(current, &admission)
+            {
+                // A retry of the same failed generation retains its diagnostic.
+                // Only exact known codes are projected; legacy/raw text stays out.
+                admission.error = startup_diagnostic.unwrap_or_else(|| "The isolation backend refused this configuration before the workload started; create the sandbox again with a policy the backend accepts".to_string());
+            } else if accepted {
                 // A rejected desired update does not invalidate an accepted runtime.
                 let error = admission.error;
                 admission = current.clone();
@@ -9121,7 +9127,8 @@ mod tests {
         assert!(same_generation(&refused, &refused));
         assert!(!same_generation(&refused, &other_generation));
 
-        handle_report_sandbox_configuration(&state, report(refused, true))
+        refused.error = "openshell.backend.confirm.denied".to_string();
+        handle_report_sandbox_configuration(&state, report(refused.clone(), true))
             .await
             .unwrap();
         let (admission_state, ready) = readiness().await;
@@ -9131,10 +9138,24 @@ mod tests {
             ("False", "ConfigurationInvalid")
         );
         assert!(
-            ready.message.contains("isolation backend refused"),
+            ready.message.contains("isolation confirmation"),
             "{ready:?}"
         );
         assert!(!ready.message.contains("backend text"), "{ready:?}");
+        let first_message = ready.message;
+        handle_report_sandbox_configuration(&state, report(refused.clone(), true))
+            .await
+            .unwrap();
+        let (_, repeated) = readiness().await;
+        assert_eq!(repeated.message, first_message);
+
+        refused.error = "openshell.backend.confirm.denied\nBearer secret-value".to_string();
+        handle_report_sandbox_configuration(&state, report(refused, true))
+            .await
+            .unwrap();
+        let (_, unknown) = readiness().await;
+        assert!(!unknown.message.contains("secret-value"));
+        assert!(unknown.message.contains("isolation backend refused"));
     }
 
     #[test]
