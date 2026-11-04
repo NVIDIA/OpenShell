@@ -12,6 +12,7 @@
 //! [`crate::test_env`]).
 
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::process::{ExitCode, ExitStatus, Output};
 use std::time::Duration;
@@ -20,7 +21,7 @@ use anyhow::{Context, Result, ensure};
 use tmachine::Session;
 use tmachine::config::Config;
 
-use crate::bundle::{Bundle, PROFILE, READY_BINARY};
+use crate::bundle::{Bundle, PROFILE, READY_BINARY, TOOL_CONFIG, TOOL_NAME};
 use crate::test_env;
 
 const GUEST_DIR: &str = "/var/tmp/openshell-tests";
@@ -114,6 +115,8 @@ pub struct Run<'a> {
     pub bundle: &'a Bundle,
     /// A nextest filterset (`-E`) narrowing the tests in the bundle.
     pub filter: Option<&'a str>,
+    /// How many tests run at once.
+    pub test_threads: NonZeroUsize,
     /// Where `junit.xml`, `nextest.log` and, after a failure, the guest's
     /// `diagnostics/` go.
     pub results: &'a Path,
@@ -282,37 +285,10 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
         )?;
     }
 
-    let archive = format!("{guest}/tests.tar.zst");
-    let extract = format!("{guest}/extract");
-    let config = format!("{guest}/nextest.toml");
     let mut nextest = vec!["env"];
     nextest.extend(env.iter().map(String::as_str));
-    nextest.extend([
-        "cargo-nextest",
-        "nextest",
-        "run",
-        "--archive-file",
-        &archive,
-        "--workspace-remap",
-        guest,
-        "--extract-to",
-        &extract,
-        "--extract-overwrite",
-        "--config-file",
-        &config,
-        "--profile",
-        PROFILE,
-        "--no-capture",
-        // Tests share one gateway and the guest has 4 GiB; run them serially
-        // whatever --no-capture implies.
-        "--test-threads",
-        "1",
-        "--no-tests",
-        "fail",
-    ]);
-    if let Some(filter) = run.filter {
-        nextest.extend(["-E", filter]);
-    }
+    let args = nextest_args(guest, run.test_threads, run.filter);
+    nextest.extend(args.iter().map(String::as_str));
     // nextest writes its output to a file in the guest, so a run that times
     // out or loses SSH still leaves a log for `collect_results`. The guest
     // shell exports the published variables itself, so their values, which
@@ -329,6 +305,47 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
         output.status,
         &run.results.join(NEXTEST_LOG),
     ))
+}
+
+/// The `cargo-nextest` command line that runs the bundle unpacked at `guest`.
+///
+/// The runner's profile is a tool config, so the family's
+/// `.config/nextest.toml` in the remapped workspace overrides it. Tests share
+/// one gateway and the guest has 4 GiB, so they run one at a time unless the
+/// run asks for more threads. A serial run uses `--no-capture`, which runs
+/// tests one at a time and streams their output into the log. A parallel run
+/// can't, so nextest captures each test's output and shows it when the test
+/// fails.
+fn nextest_args(guest: &str, test_threads: NonZeroUsize, filter: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "cargo-nextest",
+        "nextest",
+        "run",
+        "--archive-file",
+        &format!("{guest}/tests.tar.zst"),
+        "--workspace-remap",
+        guest,
+        "--extract-to",
+        &format!("{guest}/extract"),
+        "--extract-overwrite",
+        "--tool-config-file",
+        &format!("{TOOL_NAME}:{guest}/{TOOL_CONFIG}"),
+        "--profile",
+        PROFILE,
+        "--no-tests",
+        "fail",
+    ]
+    .map(String::from)
+    .into();
+    if test_threads.get() == 1 {
+        args.push("--no-capture".to_string());
+    } else {
+        args.extend(["--test-threads".to_string(), test_threads.to_string()]);
+    }
+    if let Some(filter) = filter {
+        args.extend(["-E".to_string(), filter.to_string()]);
+    }
+    args
 }
 
 /// Copy the nextest log and the JUnit report out of the guest, whether or not
@@ -523,6 +540,27 @@ mod tests {
                 "must not collect {unwanted:?}"
             );
         }
+    }
+
+    #[test]
+    fn nextest_runs_serially_with_output_unless_asked_for_threads() {
+        let one = NonZeroUsize::MIN;
+        let serial = nextest_args("/g", one, None);
+        assert!(serial.contains(&"--no-capture".to_string()));
+        // nextest ignores --test-threads with --no-capture, and warns.
+        assert!(!serial.contains(&"--test-threads".to_string()));
+        assert!(serial.windows(2).any(|w| w
+            == [
+                "--tool-config-file",
+                "openshell-test-runner:/g/runner-nextest.toml"
+            ]));
+        assert!(!serial.contains(&"--config-file".to_string()));
+        assert!(!serial.contains(&"-E".to_string()));
+
+        let parallel = nextest_args("/g", NonZeroUsize::new(4).unwrap(), Some("test(a)"));
+        assert!(!parallel.contains(&"--no-capture".to_string()));
+        assert!(parallel.windows(2).any(|w| w == ["--test-threads", "4"]));
+        assert!(parallel.ends_with(&["-E".to_string(), "test(a)".to_string()]));
     }
 
     #[test]
