@@ -1014,23 +1014,34 @@ async fn set_failed(context: &LifecycleContext, message: &str) {
 }
 
 fn sandbox_config(sandbox: &DriverSandbox) -> Result<MxcSandboxConfig, tonic::Status> {
-    let config = sandbox
+    let driver_config = sandbox
         .spec
         .as_ref()
         .and_then(|spec| spec.template.as_ref())
-        .and_then(|template| template.driver_config.as_ref())
-        .ok_or_else(|| {
-            tonic::Status::invalid_argument(
-                "mxc requires template.driver_config.mxc with command and cwd",
-            )
-        })?;
-    let config: MxcSandboxConfig =
-        serde_json::from_value(struct_to_json_value(config)).map_err(|error| {
+        .and_then(|template| template.driver_config.as_ref());
+    let config = match driver_config {
+        // The MXC-specific `--driver-config-json` is the most deliberately
+        // targeted input, so it takes priority over the generic command.
+        Some(config) => serde_json::from_value(struct_to_json_value(config)).map_err(|error| {
             tonic::Status::invalid_argument(format!("invalid mxc driver_config: {error}"))
-        })?;
+        })?,
+        // The driver-agnostic `sandbox create -- <COMMAND>` syntax. The working
+        // directory also hosts boundary state, so it must be writable by the
+        // gateway user; use a per-sandbox directory under its temp folder.
+        None => MxcSandboxConfig {
+            command: sandbox
+                .spec
+                .as_ref()
+                .map(|spec| spec.command.clone())
+                .unwrap_or_default(),
+            cwd: default_sandbox_cwd(&sandbox.id)?,
+            denied_paths: Vec::new(),
+        },
+    };
     if config.command.first().is_none_or(String::is_empty) {
         return Err(tonic::Status::invalid_argument(
-            "mxc driver_config.command must contain an executable",
+            "mxc sandbox command must contain an executable: set it with \
+             `sandbox create -- <COMMAND>` or `--driver-config-json`",
         ));
     }
     let mut denied_paths = Vec::with_capacity(config.denied_paths.len());
@@ -1360,6 +1371,19 @@ fn path_key(path: &str) -> Vec<String> {
         .collect()
 }
 
+fn default_sandbox_cwd(sandbox_id: &str) -> Result<String, tonic::Status> {
+    let directory = std::env::temp_dir()
+        .join("openshell-mxc")
+        .join(safe_component(sandbox_id)?);
+    std::fs::create_dir_all(&directory).map_err(|error| {
+        tonic::Status::internal(format!(
+            "create default MXC working directory {}: {error}",
+            directory.display()
+        ))
+    })?;
+    Ok(directory.display().to_string())
+}
+
 fn launch_authentication(
     sandbox: &DriverSandbox,
 ) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, tonic::Status> {
@@ -1668,6 +1692,37 @@ fn platform_event(sandbox_id: String, reason: &str, message: String) -> WatchSan
 // the driver. Keep lifecycle/security tests below during their migration.
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generic_command_is_used_without_driver_config() {
+        let sandbox = DriverSandbox {
+            id: "generic-command-sandbox".to_string(),
+            spec: Some(DriverSandboxSpec {
+                command: vec!["cmd.exe".into(), "/c".into(), "exit".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let config = sandbox_config(&sandbox).expect("generic command is accepted");
+        assert_eq!(config.command, vec!["cmd.exe", "/c", "exit"]);
+        let cwd = Path::new(&config.cwd);
+        assert!(cwd.is_absolute() && cwd.is_dir(), "{}", config.cwd);
+        assert!(cwd.ends_with("generic-command-sandbox"));
+        let _ = std::fs::remove_dir(cwd);
+
+        let empty = DriverSandbox {
+            id: "empty-command-sandbox".to_string(),
+            spec: Some(DriverSandboxSpec::default()),
+            ..Default::default()
+        };
+        let error = sandbox_config(&empty).expect_err("a command is required");
+        assert!(error.message().contains("sandbox create -- <COMMAND>"));
+        let _ = std::fs::remove_dir(
+            std::env::temp_dir()
+                .join("openshell-mxc")
+                .join("empty-command-sandbox"),
+        );
+    }
+
     #[test]
     fn mxc_driver_command_reaches_supervisor_without_generic_command() {
         let command = vec![

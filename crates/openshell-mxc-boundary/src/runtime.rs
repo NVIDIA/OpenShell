@@ -873,12 +873,13 @@ impl BoundaryRuntime {
         );
         let process_id = format!("{}:main:0", self.config.generation);
         let (program, args) = agent_command(spec.clone());
+        let (args, raw_command_tail) = cmd_verbatim_tail(&program, args);
         let process = match ManagedProcess::spawn(
             process_id.clone(),
             ProcessKindWire::Main,
             program,
             args,
-            None,
+            raw_command_tail,
             spec.workdir.clone(),
             environment,
         )
@@ -1247,14 +1248,15 @@ fn windows_launch(spec: ExecSpecWire) -> WindowsLaunch {
         };
     };
     if let Some(parsed) = crate::posix_command::parse(&command) {
-        let mut argv = parsed.argv.into_iter();
-        let program = argv.next().unwrap_or_default();
+        let mut words = parsed.argv.into_iter();
+        let program = words.next().unwrap_or_default();
         let mut merged_env = env;
         merged_env.extend(parsed.env);
+        let (args, raw_command_tail) = cmd_verbatim_tail(&program, words.collect());
         return WindowsLaunch {
             program,
-            args: argv.collect(),
-            raw_command_tail: None,
+            args,
+            raw_command_tail,
             workdir: parsed.workdir.or(workdir),
             env: merged_env,
         };
@@ -1266,6 +1268,26 @@ fn windows_launch(spec: ExecSpecWire) -> WindowsLaunch {
         workdir,
         env,
     }
+}
+
+/// `cmd.exe /c` treats the rest of its command line as command text and does not
+/// apply the C runtime quoting rules, so a quoted path such as `>"C:\x.txt"`
+/// would reach it as `\"`. Pass everything after `/c` or `/k` verbatim, wrapped
+/// in `/s` quotes, as a terminal would. Other programs keep their arguments.
+fn cmd_verbatim_tail(program: &str, args: Vec<String>) -> (Vec<String>, Option<String>) {
+    let is_cmd = Path::new(program)
+        .file_stem()
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("cmd"));
+    let command_flag = args
+        .iter()
+        .position(|arg| arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k"));
+    let (true, Some(flag)) = (is_cmd, command_flag) else {
+        return (args, None);
+    };
+    let mut args = args;
+    let text = args.split_off(flag + 1).join(" ");
+    args.insert(flag, "/s".to_string());
+    (args, Some(format!("\"{text}\"")))
 }
 
 /// The `cmd.exe` launch used when a shell request's program cannot be started
@@ -1885,6 +1907,50 @@ mod tests {
         let launch = windows_launch(shell_exec(None));
         assert_eq!(launch.program, "cmd.exe");
         assert_eq!(launch.args, vec!["/d", "/q"]);
+    }
+
+    #[test]
+    fn cmd_command_text_is_passed_verbatim() {
+        let launch = windows_launch(shell_exec(Some(
+            r#"'C:\Windows\System32\cmd.exe' /v:on /c '>"C:\dir\out.txt" echo !value!'"#,
+        )));
+        assert_eq!(launch.program, r"C:\Windows\System32\cmd.exe");
+        assert_eq!(launch.args, vec!["/v:on", "/s", "/c"]);
+        assert_eq!(
+            launch.raw_command_tail.as_deref(),
+            Some(r#"">"C:\dir\out.txt" echo !value!""#)
+        );
+        assert_eq!(cmd_retry(&launch), None, "cmd launches are not retried");
+    }
+
+    #[tokio::test]
+    async fn cmd_writes_a_quoted_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("out file.txt");
+        let command = format!(
+            "cmd.exe /c {}",
+            openshell_core::forward::shell_escape(&format!(">\"{}\" echo written", path.display()))
+        );
+        let launch = windows_launch(shell_exec(Some(&command)));
+        let process = ManagedProcess::spawn(
+            "cmd-quoted-path".to_string(),
+            ProcessKindWire::Exec,
+            launch.program,
+            launch.args,
+            launch.raw_command_tail,
+            None,
+            HashMap::new(),
+        )
+        .await
+        .expect("cmd starts");
+        let status = tokio::time::timeout(Duration::from_secs(10), process.wait())
+            .await
+            .expect("process exits");
+        assert!(matches!(status, ExitStatusWire::Exited(0)), "{status:?}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("file written").trim(),
+            "written"
+        );
     }
 
     #[test]
