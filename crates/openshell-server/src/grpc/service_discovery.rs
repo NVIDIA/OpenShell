@@ -333,7 +333,6 @@ mod tests {
             &state,
             authed_request(WatchServiceRoutesRequest {
                 workspace_scope: request().workspace_scope,
-                ..Default::default()
             }),
         )
         .await
