@@ -45,8 +45,9 @@ mod unix {
     use std::future::Future;
     use std::os::unix::process::CommandExt as _;
     use std::pin::Pin;
+    use std::path::Path;
     use std::process::{Command, Output, Stdio};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use testkit::{Test, TestInfo};
 
@@ -136,7 +137,7 @@ mod unix {
         },
     ];
 
-    pub static CHECKS: [Test; 3] = [
+    pub static CHECKS: [Test; 4] = [
         check("nextest_interface", || {
             Box::pin(async { nextest_interface() })
         }),
@@ -145,6 +146,9 @@ mod unix {
         }),
         check("a_program_without_tests_fails", || {
             Box::pin(async { a_program_without_tests_fails() })
+        }),
+        check("ready_fails_without_a_gateway", || {
+            Box::pin(async { ready_fails_without_a_gateway() })
         }),
     ];
 
@@ -253,4 +257,29 @@ mod unix {
         }
     }
 
+    /// Point the gateway lookup at a closed port, away from any registered
+    /// gateways.
+    fn without_gateway(mut command: Command, config: &Path) -> Command {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let endpoint = format!("http://{}", closed.local_addr().expect("address"));
+        drop(closed);
+        command
+            .env("XDG_CONFIG_HOME", config)
+            .env("OPENSHELL_GATEWAY_ENDPOINT", endpoint)
+            .env_remove("OPENSHELL_GATEWAY")
+            .env("OPENSHELL_BIN", config.join("no-openshell"));
+        command
+    }
+
+    fn ready_fails_without_a_gateway() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let started = Instant::now();
+        let ready = output(without_gateway(
+            program("registered", &["ready", "--timeout", "1"]),
+            dir.path(),
+        ));
+        assert_eq!(ready.status.code(), Some(2));
+        assert!(stderr(&ready).contains("not ready after 1s"));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
 }

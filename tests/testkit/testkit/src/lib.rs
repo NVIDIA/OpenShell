@@ -34,6 +34,7 @@ pub mod gateway;
 mod image;
 mod poll;
 pub mod program;
+mod ready;
 mod registry;
 mod run;
 
@@ -49,6 +50,7 @@ pub use image::{BASE_IMAGE_ENV, DEFAULT_BASE_IMAGE, base_image};
 pub use openshell_sdk as sdk;
 pub use poll::{Poll, poll_until};
 pub use program::main;
+pub use ready::check as check_ready;
 pub use registry::Test;
 pub use run::{TestInfo, run};
 pub use testkit_macros::test;

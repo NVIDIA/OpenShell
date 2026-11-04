@@ -12,8 +12,10 @@
 //! }
 //! ```
 //!
-//! It has one subcommand so far: `list [FILTER]...` prints each test's name
-//! and description.
+//! It has two subcommands so far:
+//!
+//! - `list [FILTER]...` prints each test's name and description.
+//! - `ready [--timeout SECS]` waits for the gateway, as `testkit-ready` does.
 //!
 //! Any other arguments are libtest's, so the program also works as a
 //! `harness = false` test target under `cargo test` and nextest: it answers
@@ -24,6 +26,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
@@ -93,14 +96,33 @@ enum Command {
         /// Show tests whose name contains any of these (all if none).
         filters: Vec<String>,
     },
+    /// Wait until the gateway is healthy and the CLI reaches it. Exits 2 if
+    /// it is not ready in time.
+    Ready {
+        /// How long to wait, in seconds.
+        #[arg(long, default_value = "60", value_name = "SECS", value_parser = seconds)]
+        timeout: Duration,
+    },
 }
 
-fn command(_program: &str, tests: &'static [Test], command: Command) -> ExitCode {
+/// A positive, finite number of seconds.
+fn seconds(value: &str) -> Result<Duration, String> {
+    let seconds: f64 = value
+        .parse()
+        .map_err(|_| format!("{value:?} is not a number"))?;
+    Duration::try_from_secs_f64(seconds)
+        .ok()
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| format!("{value:?} is not a positive number of seconds"))
+}
+
+fn command(program: &str, tests: &'static [Test], command: Command) -> ExitCode {
     match command {
         Command::List { filters } => {
             list(tests, filters);
             ExitCode::SUCCESS
         }
+        Command::Ready { timeout } => ready(program, timeout),
     }
 }
 
@@ -128,6 +150,25 @@ fn describe(test: &Test) -> String {
         (false, _) => description.to_string(),
         (true, None) => format!("{description} [ignored]"),
         (true, Some(reason)) => format!("{description} [ignored: {reason}]"),
+    }
+}
+
+fn ready(program: &str, timeout: Duration) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("{program}: start the async runtime: {error}");
+            return ExitCode::from(ERROR_EXIT);
+        }
+    };
+    // A gateway that is not ready means the tests cannot run.
+    if runtime.block_on(crate::ready::check(program, timeout)) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(ERROR_EXIT)
     }
 }
 
