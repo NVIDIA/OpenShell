@@ -608,39 +608,6 @@ jobs:
 
       - name: Test release qualification summary
         run: mise run test:qualification-summary
-  sdk-go-freeze:
-    # The Go SDK moved to ai-openshell/sdk-go (#5031). Its directory stays only
-    # until the final deprecated sdk/go tag exists, so PRs must not add or change
-    # files in it. Deleting files is allowed (the removal PR), and so are the
-    # moved notice and the deprecation comment in README.md and go.mod.
-    # Merge queue runs skip this job; the PR already passed it on its mirror.
-    name: Go SDK Freeze
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Reject changes to sdk/go
-        env:
-          BASE_SHA: ${{ needs.pr_metadata.outputs.base_sha }}
-        run: |
-          set -euo pipefail
-          changed=$(git diff --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- \
-            sdk/go ':!sdk/go/README.md' ':!sdk/go/go.mod')
-          if [ -z "$changed" ]; then
-            echo "No added or changed files under sdk/go."
-            exit 0
-          fi
-          echo "::error title=Go SDK moved::The Go SDK moved to https://github.com/ai-openshell/sdk-go. Drop the sdk/go changes from this PR and open SDK changes there. Regenerated bindings are not needed here; sdk-go regenerates them from core releases."
-          echo "Changed files under sdk/go:"
-          echo "$changed"
-          exit 1
-
   python-sdk-freeze:
     # The Python SDK moved to ai-openshell/sdk-python (#5287), which imported it
     # at v0.1.7. Its files stay only until core removes them, so PRs must not

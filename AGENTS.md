@@ -196,10 +196,9 @@ Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-reposito
 - Sign off on each commit for DCO compliance. Use the `--signoff` option to `git commit` to add the `Signed-off-by` footer to ensure the user's configured email address is used.
 - Never mention Claude or any AI agent in commits, PR descriptions, or issues (no author attribution, no Co-Authored-By, no "Generated with" footers)
 
-## Go SDK (`sdk/go/`)
+## Go SDK
 
-- The Go SDK moved to [ai-openshell/sdk-go](https://github.com/ai-openshell/sdk-go) (module `github.com/ai-openshell/sdk-go`). Open SDK changes there.
-- `sdk/go/` is frozen until it is removed; Branch Checks fails PRs that change it. Proto changes do not need regenerated Go bindings.
+- The Go SDK lives in [ai-openshell/sdk-go](https://github.com/ai-openshell/sdk-go) (module `github.com/ai-openshell/sdk-go`). Open SDK changes, including dependency and security updates, there; proto changes here need no Go bindings.
 
 ## Python SDK (`python/openshell/`)
 

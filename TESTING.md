@@ -124,8 +124,7 @@ plugin through its Windows `.cmd` launcher, and installs the matching locked
 ARM64 Rolldown binding when Node itself is ARM64. The helper preserves lockfile
 resolution; it must not upgrade unrelated test dependencies.
 
-`mise run --skip-tools go:ci` retains race detection except on Windows ARM64,
-where Go does not support it. Windows token-file tests explicitly skip POSIX
+Windows token-file tests explicitly skip POSIX
 mode-bit assertions; those skips do not establish Windows ACL protection.
 Use a checkout with LF text files when running Unix-shell fixture checks.
 
