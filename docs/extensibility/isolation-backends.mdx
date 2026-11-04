@@ -39,6 +39,12 @@ accept an operator-selected `IsolationBackendRegistration`, including its Unix,
 TCP, or vsock endpoint. The driver provisions the resource and delivers the
 backend's trusted launch metadata to the supervisor.
 
+Drivers advertising `openshell.compute.launch-policy` must launch workloads
+with the policy supplied in `StartSandbox`. Retries and recovery of the same
+launch use that policy. These drivers support [policy changes between
+runs](/how-it-works/policies/manage-policies#update-a-stopped-sandbox) for
+non-frozen sandboxes.
+
 ## Who Owns What
 
 | Component | Owns |
@@ -50,3 +56,9 @@ backend's trusted launch metadata to the supervisor.
 For how `openshell-sandbox` enforces the boundary, refer to [Inside the Sandbox
 Boundary](/about/architecture#inside-the-sandbox-boundary). For driver-specific
 workload behavior, refer to [Runtimes](/how-it-works/sandboxes/runtimes).
+
+## Release compatibility
+
+Upgrade all gateway replicas together before using launch-policy support.
+Older gateway versions can lose the saved launch policy. If a launch fails
+because that policy is missing, stop and start the sandbox explicitly.

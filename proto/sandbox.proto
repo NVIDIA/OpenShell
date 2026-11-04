@@ -17,6 +17,14 @@ import "datamodel.proto";
 // - Public sandbox resource types live in `openshell.proto`.
 // - Internal compute-driver sandbox observation types live in `compute_driver.proto`.
 
+// Gateway-owned immutable policy input for one compute launch generation.
+// Live policy reload remains a separate configuration-admission operation.
+message SandboxLaunchPolicy {
+  string generation_id = 1;
+  SandboxPolicy policy = 2;
+  string policy_hash = 3;
+}
+
 // Sandbox security policy configuration.
 message SandboxPolicy {
   // Policy version.

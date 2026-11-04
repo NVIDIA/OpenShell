@@ -943,6 +943,7 @@ pub struct ComputeRuntime {
     /// coordinates one for the in-process driver.
     supervisor_host: Option<openshell_supervisor_control::SupervisorHostController>,
     service_route_index: Arc<OnceLock<Arc<crate::service_routing::ServiceRouteIndex>>>,
+    launch_policy_state: Arc<OnceLock<Weak<crate::ServerState>>>,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -1058,6 +1059,7 @@ impl ComputeRuntime {
             supervisor_otlp_tls: Arc::new(OnceLock::new()),
             supervisor_host: None,
             service_route_index: Arc::new(OnceLock::new()),
+            launch_policy_state: Arc::new(OnceLock::new()),
         })
     }
 
@@ -1267,6 +1269,67 @@ impl ComputeRuntime {
         Ok(driver_sandbox)
     }
 
+    pub(crate) fn configure_launch_policy_state(
+        &self,
+        state: &Arc<crate::ServerState>,
+    ) -> Result<(), String> {
+        if !self.supports_launch_policy() {
+            return Ok(());
+        }
+        if let Some(existing) = self.launch_policy_state.get() {
+            return if existing.ptr_eq(&Arc::downgrade(state)) {
+                Ok(())
+            } else {
+                Err(
+                    "compute launch policy resolver is already bound to another server state"
+                        .into(),
+                )
+            };
+        }
+        self.launch_policy_state
+            .set(Arc::downgrade(state))
+            .map_err(|_| "compute launch policy resolver initialization raced".into())
+    }
+
+    pub(crate) fn supports_launch_policy(&self) -> bool {
+        self.driver_info
+            .negotiated_extension
+            .supported_capabilities
+            .iter()
+            .any(|capability| {
+                capability == openshell_core::extension_protocol::COMPUTE_LAUNCH_POLICY
+            })
+    }
+
+    async fn capture_launch_policy(
+        &self,
+        sandbox: &Sandbox,
+        generation_id: String,
+    ) -> Result<Option<Box<openshell_core::proto::SandboxLaunchPolicy>>, Status> {
+        if !self.supports_launch_policy() {
+            return Ok(None);
+        }
+        let state = self.launch_policy_state.get().and_then(Weak::upgrade)
+            .ok_or_else(|| Status::failed_precondition("compute launch policy resolver is unavailable; initialize it before lifecycle recovery"))?;
+        let snapshot = Box::pin(crate::grpc::policy::build_sandbox_config_snapshot(
+            &state, sandbox,
+        ))
+        .await?;
+        if !snapshot.configuration_admitted {
+            return Err(Status::failed_precondition(
+                "current sandbox configuration is not admitted; repair it before start",
+            ));
+        }
+        let input = openshell_core::proto::SandboxLaunchPolicy {
+            generation_id,
+            policy: snapshot.policy,
+            policy_hash: snapshot.policy_hash,
+        };
+        openshell_core::launch_policy::validate_launch_policy(&input, &input.generation_id)
+            .map_err(Status::failed_precondition)?;
+        Ok(Some(Box::new(input)))
+    }
+
     fn driver_start_request(
         &self,
         sandbox: &Sandbox,
@@ -1297,6 +1360,20 @@ impl ComputeRuntime {
             resume: resume.is_some(),
             restart_if_restore_fails: resume.unwrap_or(false),
             sandbox: Some(driver_sandbox),
+            launch_policy: if self.supports_launch_policy() {
+                let input = sandbox.status.as_ref().and_then(|status| status.launch_policy.clone())
+                    .ok_or_else(|| Status::failed_precondition("sandbox has no admitted launch policy; stop and start it to claim a new generation"))?;
+                openshell_core::launch_policy::validate_launch_policy(
+                    &input,
+                    sandbox_runtime_generation(sandbox)
+                        .map_err(Status::failed_precondition)?
+                        .as_str(),
+                )
+                .map_err(Status::failed_precondition)?;
+                Some(*input)
+            } else {
+                None
+            },
         })
     }
 
@@ -1635,6 +1712,25 @@ impl ComputeRuntime {
             ISOLATION_BACKEND_ANNOTATION.into(),
             self.isolation_backend_name().into(),
         );
+
+        if self.supports_launch_policy() {
+            let policy = runtime_inputs.effective_policy.clone().ok_or_else(|| {
+                Status::failed_precondition("the compute driver requires an admitted create policy")
+            })?;
+            let input = openshell_core::proto::SandboxLaunchPolicy {
+                generation_id: sandbox_runtime_generation(&sandbox)
+                    .map_err(Status::failed_precondition)?
+                    .into_string(),
+                policy_hash: openshell_core::policy_identity::deterministic_policy_hash(&policy),
+                policy: Some(policy),
+            };
+            openshell_core::launch_policy::validate_launch_policy(&input, &input.generation_id)
+                .map_err(Status::failed_precondition)?;
+            sandbox
+                .status
+                .get_or_insert_with(Default::default)
+                .launch_policy = Some(Box::new(input));
+        }
 
         // Strip the staging token from the public sandbox before anything
         // persists it: the object store copy is readable by every member of the
@@ -2369,7 +2465,28 @@ impl ComputeRuntime {
         let sandbox_id = candidate.object_id().to_string();
         let sandbox_name = candidate.object_name().to_string();
         let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
-        let sandbox_guard = self.lock_sandbox_for_lifecycle(&lifecycle_guard).await;
+        // Capture policy and commit its generation under the same global/workspace
+        // fence as policy and provider writers, including other gateway replicas.
+        let sandbox_guard = if self.supports_launch_policy() {
+            (
+                Some(
+                    self.mutation_guard(MutationScope::sandbox(
+                        candidate.object_workspace(),
+                        &sandbox_id,
+                    ))
+                    .await
+                    .map_err(|error| {
+                        Status::unavailable(format!("lock launch policy inputs failed: {error}"))
+                    })?,
+                ),
+                None,
+            )
+        } else {
+            (
+                None,
+                Some(self.lock_sandbox_for_lifecycle(&lifecycle_guard).await),
+            )
+        };
         let mut current = self
             .store
             .get_message::<Sandbox>(&sandbox_id)
@@ -2476,6 +2593,9 @@ impl ComputeRuntime {
                 Vec::new()
             };
             let expected_resource_version = sandbox_resource_version(&current);
+            let launch_policy = self
+                .capture_launch_policy(&current, next_identity.runtime_generation.to_string())
+                .await?;
             let next_identity_for_update = next_identity.clone();
             match self
                 .store
@@ -2487,6 +2607,11 @@ impl ComputeRuntime {
                             StartIntent::Start => ("Starting", "Sandbox start requested"),
                             StartIntent::Resume { .. } => ("Resuming", "Sandbox resume requested"),
                         };
+                        sandbox
+                            .status
+                            .get_or_insert_with(Default::default)
+                            .launch_policy
+                            .clone_from(&launch_policy);
                         apply_lifecycle_phase(
                             sandbox,
                             SandboxPhase::Starting,
@@ -2588,6 +2713,13 @@ impl ComputeRuntime {
             if let Some(spec) = driver_sandbox.spec.as_mut() {
                 spec.launch_authentication
                     .clone_from(&launch_authentication);
+                if self.supports_launch_policy() {
+                    spec.policy = starting
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.launch_policy.as_ref())
+                        .and_then(|input| input.policy.clone());
+                }
             }
             Some(driver_sandbox)
         } else {
@@ -5024,7 +5156,21 @@ impl ComputeRuntime {
         }
 
         let lifecycle_guard = self.lifecycle_gates.lock_for(sandbox_id).await;
-        let sandbox_guard = self.lock_sandbox_for_lifecycle(&lifecycle_guard).await;
+        let sandbox_guard = if self.supports_launch_policy() {
+            let Some(guard) = self
+                .sandbox_mutation_guard_by_id(sandbox_id)
+                .await
+                .map_err(|error| error.to_string())?
+            else {
+                return Ok(());
+            };
+            (Some(guard), None)
+        } else {
+            (
+                None,
+                Some(self.lock_sandbox_for_lifecycle(&lifecycle_guard).await),
+            )
+        };
         let Some(current) = self
             .store
             .get_message::<Sandbox>(sandbox_id)
@@ -5061,6 +5207,16 @@ impl ComputeRuntime {
         } else {
             Some(next_runtime_identity(&current).map_err(|status| status.to_string())?)
         };
+        let launch_policy = if let Some(identity) = next_identity.as_ref() {
+            self.capture_launch_policy(&current, identity.runtime_generation.to_string())
+                .await
+                .map_err(|error| error.to_string())?
+        } else {
+            current
+                .status
+                .as_ref()
+                .and_then(|status| status.launch_policy.clone())
+        };
         let claimed = if already_claimed && sandbox_provisioning_attempt_id(&current).is_none() {
             current.clone()
         } else {
@@ -5077,6 +5233,11 @@ impl ComputeRuntime {
                         {
                             identity.write(&mut metadata.annotations);
                         }
+                        sandbox
+                            .status
+                            .get_or_insert_with(Default::default)
+                            .launch_policy
+                            .clone_from(&launch_policy);
                         provisioning_operation::claim_record(sandbox);
                         let status = sandbox.status.get_or_insert_with(Default::default);
                         set_next_restart_at_ms(status, 0);
@@ -7578,6 +7739,7 @@ fn public_status_from_driver(
         next_restart_time: None,
         main_process_started_time: None,
         last_token_grant_failure: None,
+        launch_policy: None,
     }
 }
 
@@ -7734,6 +7896,9 @@ fn apply_driver_snapshot(
             .configuration_admission
             .clone_from(&current_status.configuration_admission);
         status.configuration_activated = current_status.configuration_activated;
+        status
+            .launch_policy
+            .clone_from(&current_status.launch_policy);
         status.provisioning.clone_from(&current_status.provisioning);
     }
     if old_phase != phase {
@@ -8657,6 +8822,7 @@ pub fn new_test_runtime_with_driver(
         supervisor_otlp_tls: Arc::new(OnceLock::new()),
         supervisor_host: None,
         service_route_index: Arc::new(OnceLock::new()),
+        launch_policy_state: Arc::new(OnceLock::new()),
     }
 }
 
@@ -9861,6 +10027,7 @@ mod tests {
             supervisor_otlp_tls: Arc::new(OnceLock::new()),
             supervisor_host: None,
             service_route_index: Arc::new(OnceLock::new()),
+            launch_policy_state: Arc::new(OnceLock::new()),
         }
     }
 
@@ -16029,59 +16196,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_sandbox_update_without_status_preserves_existing_status() {
-        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
-        sandbox.status = Some(SandboxStatus {
-            conditions: vec![SandboxCondition {
-                r#type: "Ready".to_string(),
-                status: "True".to_string(),
-                reason: "DependenciesReady".to_string(),
-                message: "Pod is Ready".to_string(),
-                transition_time: None,
-            }],
-            current_policy_version: 7,
-            ..Default::default()
-        });
-        sandbox.set_phase(SandboxPhase::Ready as i32);
-        runtime.store.put_message(&sandbox).await.unwrap();
+    async fn apply_sandbox_update_preserves_gateway_owned_status() {
+        for observed_status in [
+            None,
+            Some(make_driver_status(DriverCondition {
+                status: "True".into(),
+                ..make_driver_condition("DependenciesReady", "Pod is Ready")
+            })),
+        ] {
+            let mut runtime = test_runtime(Arc::new(TestDriver::default())).await;
+            runtime.driver_info.driver_reports_runtime_readiness = true;
+            let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+            sandbox.status = Some(SandboxStatus {
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: "DependenciesReady".to_string(),
+                    message: "Pod is Ready".to_string(),
+                    transition_time: None,
+                }],
+                current_policy_version: 7,
+                ..Default::default()
+            });
+            sandbox.set_phase(SandboxPhase::Ready as i32);
+            let launch_policy = openshell_core::proto::SandboxLaunchPolicy {
+                generation_id: sandbox_runtime_generation(&sandbox).unwrap().into_string(),
+                policy: Some(openshell_policy::restrictive_default_policy()),
+                policy_hash: "retained-identity".into(),
+            };
+            sandbox.status.as_mut().unwrap().launch_policy = Some(Box::new(launch_policy.clone()));
+            runtime.store.put_message(&sandbox).await.unwrap();
 
-        runtime
-            .apply_sandbox_update(DriverSandbox {
-                id: "sb-1".to_string(),
-                name: "sandbox-a".to_string(),
-                namespace: "default".to_string(),
-                spec: None,
-                status: None,
-                workspace: "default".to_string(),
-            })
-            .await
-            .unwrap();
+            runtime
+                .apply_sandbox_update(DriverSandbox {
+                    id: "sb-1".to_string(),
+                    name: "sandbox-a".to_string(),
+                    namespace: "default".to_string(),
+                    spec: None,
+                    status: observed_status,
+                    workspace: "default".to_string(),
+                })
+                .await
+                .unwrap();
 
-        let stored = runtime
-            .store
-            .get_message::<Sandbox>("sb-1")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            SandboxPhase::try_from(stored.phase()).unwrap(),
-            SandboxPhase::Ready
-        );
-        assert_eq!(stored.current_policy_version(), 7);
-        let ready = stored
-            .status
-            .as_ref()
-            .and_then(|status| {
-                status
-                    .conditions
-                    .iter()
-                    .find(|condition| condition.r#type == "Ready")
-            })
-            .unwrap();
-        assert_eq!(ready.status, "True");
-        assert_eq!(ready.reason, "DependenciesReady");
-        assert_eq!(ready.message, "Pod is Ready");
+            let stored = runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                SandboxPhase::try_from(stored.phase()).unwrap(),
+                SandboxPhase::Ready
+            );
+            assert_eq!(stored.current_policy_version(), 7);
+            assert_eq!(
+                stored.status.as_ref().unwrap().launch_policy.as_deref(),
+                Some(&launch_policy)
+            );
+            let ready = stored
+                .status
+                .as_ref()
+                .and_then(|status| {
+                    status
+                        .conditions
+                        .iter()
+                        .find(|condition| condition.r#type == "Ready")
+                })
+                .unwrap();
+            assert_eq!(ready.status, "True");
+            assert_eq!(ready.reason, "DependenciesReady");
+            assert_eq!(ready.message, "Pod is Ready");
+        }
     }
 
     #[tokio::test]
@@ -18451,6 +18637,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             resume: false,
             restart_if_restore_fails: false,
             sandbox: None,
+            launch_policy: None,
         };
         let with_snapshot = StartSandboxRequest {
             sandbox: Some(DriverSandbox {
@@ -18686,6 +18873,452 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             .unwrap_err();
         assert_eq!(error.code(), Code::Unimplemented);
         assert!(runtime.image_update_driver.is_none());
+    }
+
+    #[tokio::test]
+    async fn stopped_static_policy_updates_require_launch_negotiation() {
+        use crate::grpc::test_support::{authed_request, test_server_state};
+        use openshell_core::proto::open_shell_server::OpenShell;
+        for negotiated in [false, true] {
+            for phase in [SandboxPhase::Stopped, SandboxPhase::Ready] {
+                let mut state = test_server_state().await;
+                if negotiated {
+                    Arc::get_mut(&mut state)
+                        .unwrap()
+                        .compute
+                        .driver_info
+                        .negotiated_extension
+                        .supported_capabilities
+                        .push(openshell_core::extension_protocol::COMPUTE_LAUNCH_POLICY.into());
+                }
+                let mut sandbox = sandbox_record("static-policy", "static-policy", phase);
+                sandbox.spec = Some(SandboxSpec {
+                    policy: Some(openshell_policy::restrictive_default_policy()),
+                    ..Default::default()
+                });
+                sandbox.status.as_mut().unwrap().configuration_activated = Some(true);
+                state.store.put_message(&sandbox).await.unwrap();
+                let mut replacement = openshell_policy::restrictive_default_policy();
+                replacement
+                    .filesystem
+                    .as_mut()
+                    .unwrap()
+                    .read_write
+                    .retain(|path| path != "/tmp");
+                let service = crate::OpenShellService::new(state.clone());
+                let request = |policy| {
+                    authed_request(openshell_core::proto::UpdateConfigRequest {
+                        sandbox: "static-policy".into(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                        policy: Some(policy),
+                        ..Default::default()
+                    })
+                };
+                let result = service.update_config(request(replacement.clone())).await;
+                if negotiated && phase == SandboxPhase::Stopped {
+                    result.unwrap();
+                    let saved = state
+                        .store
+                        .get_message::<Sandbox>("static-policy")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        saved.spec.unwrap().policy.unwrap().filesystem,
+                        replacement.filesystem
+                    );
+
+                    // A live additive revision stays desired until the next launch.
+                    state
+                        .store
+                        .update_message_cas::<Sandbox, _>("static-policy", 0, |sandbox| {
+                            sandbox.set_phase(SandboxPhase::Ready.into());
+                        })
+                        .await
+                        .unwrap();
+                    let mut desired = replacement.clone();
+                    desired
+                        .filesystem
+                        .as_mut()
+                        .unwrap()
+                        .read_write
+                        .push("/next-launch-data".into());
+                    let live_update = service
+                        .update_config(request(desired.clone()))
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    let saved = state
+                        .store
+                        .get_message::<Sandbox>("static-policy")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        saved.spec.unwrap().policy.unwrap().filesystem,
+                        replacement.filesystem
+                    );
+
+                    state
+                        .store
+                        .update_message_cas::<Sandbox, _>("static-policy", 0, |sandbox| {
+                            sandbox.set_phase(SandboxPhase::Stopped.into());
+                        })
+                        .await
+                        .unwrap();
+                    let stopped_update = service
+                        .update_config(request(desired.clone()))
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    assert_eq!(
+                        stopped_update.version, live_update.version,
+                        "same desired revision uses dedup projection"
+                    );
+                    let saved = state
+                        .store
+                        .get_message::<Sandbox>("static-policy")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        saved.spec.unwrap().policy.unwrap().filesystem,
+                        desired.filesystem
+                    );
+                } else {
+                    assert_eq!(result.unwrap_err().code(), Code::InvalidArgument);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_policy_is_current_at_claim_and_stable_across_retries_and_recovery() {
+        use crate::grpc::test_support::{authed_request, test_server_state};
+        use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
+        use openshell_core::extension_protocol::COMPUTE_LAUNCH_POLICY;
+        use openshell_core::proto::open_shell_server::OpenShell;
+        use openshell_core::proto::{SandboxLaunchPolicy, UpdateConfigRequest};
+
+        for frozen in [false, true] {
+            let mut state = test_server_state().await;
+            let driver = Arc::new(
+                FakeComputeDriver::new().with_capabilities(GetCapabilitiesResponse {
+                    driver_name: "test".into(),
+                    gateway_manages_lifecycle: true,
+                    resource_admission_policy:
+                        openshell_core::resource_admission::DriverAdmissionConfig::default()
+                            .acknowledgement(),
+                    extension: Some(openshell_core::extension_protocol::extension_metadata(
+                        ExtensionFamily::Compute,
+                        "openshell/test",
+                        "test",
+                        [COMPUTE_LAUNCH_POLICY.to_string()],
+                    )),
+                    ..Default::default()
+                }),
+            );
+            let compute = ComputeRuntime::from_driver(
+                "test".into(),
+                driver.clone(),
+                None,
+                state.store.clone(),
+                SandboxIndex::new(),
+                SandboxWatchBus::new(),
+                TracingLogBus::new(),
+                Arc::new(SupervisorSessionRegistry::new()),
+            )
+            .await
+            .unwrap();
+            Arc::get_mut(&mut state).unwrap().compute = compute;
+            state.compute.configure_launch_policy_state(&state).unwrap();
+            let service = crate::OpenShellService::new(state.clone());
+            let mut sandbox =
+                sandbox_record("launch-policy", "launch-policy", SandboxPhase::Stopped);
+            let mut initial = openshell_policy::restrictive_default_policy();
+            initial
+                .filesystem
+                .as_mut()
+                .unwrap()
+                .read_write
+                .push("/old-grant".into());
+            sandbox.spec = Some(SandboxSpec {
+                policy: Some(initial.clone()),
+                restart_policy: SandboxRestartPolicy::Always as i32,
+                ..Default::default()
+            });
+            if frozen {
+                state.store.create_frozen_sandbox(&sandbox).await.unwrap();
+                let stored = state
+                    .store
+                    .get_message::<Sandbox>("launch-policy")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                state
+                    .store
+                    .accept_frozen_sandbox_configuration(
+                        stored,
+                        openshell_core::proto::FrozenSandboxPolicy {
+                            policy: Some(initial.clone()),
+                            policy_hash: openshell_core::policy_identity::deterministic_policy_hash(
+                                &initial,
+                            ),
+                            policy_source: openshell_core::proto::PolicySource::Sandbox as i32,
+                            version: 1,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                state.store.put_message(&sandbox).await.unwrap();
+            }
+            let original = initial.clone();
+            let mut narrowed = initial;
+            narrowed
+                .filesystem
+                .as_mut()
+                .unwrap()
+                .read_write
+                .retain(|path| path != "/old-grant");
+            let update = UpdateConfigRequest {
+                sandbox: "launch-policy".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                policy: Some(narrowed.clone()),
+                ..Default::default()
+            };
+            let result = service.update_config(authed_request(update.clone())).await;
+            if frozen {
+                assert_eq!(result.unwrap_err().code(), Code::FailedPrecondition);
+            } else {
+                result.unwrap();
+                service.update_config(authed_request(update)).await.unwrap();
+            }
+            let expected = if frozen { &original } else { &narrowed };
+            // A provider/profile writer owns Workspace X. A launch must not capture
+            // or claim its generation until that writer has completed.
+            let writer = state
+                .compute
+                .mutation_guard(MutationScope::Workspace("default"))
+                .await
+                .unwrap();
+            let before_claim = state
+                .store
+                .get_message::<Sandbox>("launch-policy")
+                .await
+                .unwrap()
+                .unwrap();
+            let start_state = state.clone();
+            let mut start = tokio::spawn(async move {
+                Box::pin(
+                    start_state
+                        .compute
+                        .start_sandbox("default", "launch-policy"),
+                )
+                .await
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut start)
+                    .await
+                    .is_err(),
+                "launch must wait for the effective-policy writer"
+            );
+            assert_eq!(
+                state
+                    .store
+                    .get_message::<Sandbox>("launch-policy")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                before_claim,
+                "generation claim must remain unchanged while the writer owns its scope"
+            );
+            drop(writer);
+            let starting = start.await.unwrap().unwrap();
+            let admitted = starting
+                .status
+                .as_ref()
+                .unwrap()
+                .launch_policy
+                .clone()
+                .unwrap();
+            assert_eq!(admitted.policy.as_ref(), Some(expected));
+            assert_eq!(
+                admitted.generation_id,
+                sandbox_runtime_generation(&starting).unwrap().as_str()
+            );
+            assert_ne!(
+                admitted.generation_id,
+                sandbox_runtime_generation(&sandbox).unwrap().as_str()
+            );
+            assert_eq!(
+                starting.spec.as_ref().unwrap().policy.as_ref(),
+                Some(expected)
+            );
+
+            // A desired network revision after the claim is not permission to
+            // change the signed input of an already committed launch generation.
+            let mut later = narrowed.clone();
+            later.network_policies.insert(
+                "later".into(),
+                openshell_core::proto::NetworkPolicyRule {
+                    endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                        host: "later.example.com".into(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            let later_result = service
+                .update_config(authed_request(UpdateConfigRequest {
+                    sandbox: "launch-policy".into(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    policy: Some(later.clone()),
+                    ..Default::default()
+                }))
+                .await;
+            if frozen {
+                assert_eq!(later_result.unwrap_err().code(), Code::FailedPrecondition);
+            } else {
+                later_result.unwrap();
+            }
+            state
+                .compute
+                .start_sandbox("default", "launch-policy")
+                .await
+                .unwrap();
+            state.compute.start_persisted_sandboxes().await.unwrap();
+            let inputs: Vec<SandboxLaunchPolicy> = driver
+                .calls()
+                .into_iter()
+                .filter_map(|call| match call {
+                    FakeComputeDriverCall::StartSandbox { launch_policy, .. } => {
+                        launch_policy.map(|policy| *policy)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                inputs.len() >= 3,
+                "explicit start, retry and recovery reach the real driver"
+            );
+            assert!(inputs.iter().all(|input| input == admitted.as_ref()));
+            let mut corrupted = starting;
+            corrupted
+                .status
+                .as_mut()
+                .unwrap()
+                .launch_policy
+                .as_mut()
+                .unwrap()
+                .policy_hash = "wrong".into();
+            assert_eq!(
+                state
+                    .compute
+                    .driver_start_request(&corrupted, vec![], String::new())
+                    .unwrap_err()
+                    .code(),
+                Code::FailedPrecondition
+            );
+            let mut due = state
+                .store
+                .get_message::<Sandbox>("launch-policy")
+                .await
+                .unwrap()
+                .unwrap();
+            apply_main_process_restart(
+                &mut due,
+                "previous-main",
+                9,
+                openshell_core::time::now_ms()
+                    .saturating_sub(RESTART_TERMINAL_DELIVERY_GRACE_MS + 1),
+            );
+            state.store.put_message(&due).await.unwrap();
+            let before_restart_claim = state
+                .store
+                .get_message::<Sandbox>("launch-policy")
+                .await
+                .unwrap()
+                .unwrap();
+            let writer = state
+                .compute
+                .mutation_guard(MutationScope::Workspace("default"))
+                .await
+                .unwrap();
+            let stops_before = driver
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, FakeComputeDriverCall::StopSandbox { .. }))
+                .count();
+            let restart_state = state.clone();
+            let mut restart = tokio::spawn(async move {
+                Box::pin(
+                    restart_state
+                        .compute
+                        .restart_sandbox_runtime("launch-policy"),
+                )
+                .await
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut restart)
+                    .await
+                    .is_err(),
+                "automatic generation capture must wait for a provider writer"
+            );
+            assert_eq!(
+                state
+                    .store
+                    .get_message::<Sandbox>("launch-policy")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                before_restart_claim,
+                "automatic restart must not claim or stop before the writer finishes"
+            );
+            assert_eq!(
+                driver
+                    .calls()
+                    .iter()
+                    .filter(|call| matches!(call, FakeComputeDriverCall::StopSandbox { .. }))
+                    .count(),
+                stops_before,
+                "automatic restart must not stop the retained runtime while the writer owns its scope"
+            );
+            drop(writer);
+            restart.await.unwrap().unwrap();
+            let restarted = state
+                .store
+                .get_message::<Sandbox>("launch-policy")
+                .await
+                .unwrap()
+                .unwrap();
+            let next_input = restarted
+                .status
+                .as_ref()
+                .unwrap()
+                .launch_policy
+                .as_ref()
+                .unwrap();
+            assert_ne!(next_input.generation_id, admitted.generation_id);
+            assert_eq!(
+                next_input.policy.as_ref(),
+                Some(if frozen { &original } else { &later })
+            );
+            let latest_start = driver
+                .calls()
+                .into_iter()
+                .rev()
+                .find_map(|call| match call {
+                    FakeComputeDriverCall::StartSandbox { launch_policy, .. } => {
+                        launch_policy.map(|policy| *policy)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(&latest_start, next_input.as_ref());
+        }
     }
 
     #[tokio::test]

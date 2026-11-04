@@ -1387,6 +1387,9 @@ message SandboxStatus {
   // failures before a configured endpoint or credential could be selected.
   // Matching grant success or a policy, provider, or supervisor reset clears it.
   TokenGrantFailureObservation last_token_grant_failure = 17;
+  // Gateway-owned launch input, atomically captured with the generation claim.
+  // Retried and recovered launches reuse this input, even if desired policy changes.
+  openshell.sandbox.v1.SandboxLaunchPolicy launch_policy = 18;
 }
 
 // Non-secret policy and provider authorization captured by frozen creation.

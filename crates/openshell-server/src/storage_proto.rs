@@ -186,11 +186,11 @@ mod tests {
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "db384845930befbf4e4764059ce28df15d6b69f7410f789893fbba9db1b594d3";
+        "32ae42eaa0f349d23cc208a423fe645ebad2cd94f887d415bd399a42f7a697a5";
     const DURABLE_SCHEMA_SHA256: &str =
-        "c7a86a700ab2beb5479b769fbe3b154f5dbbcc7bf6a7ca22845d4730bd18147c";
+        "c5ed1f9d729730fd091036a8ad0b68e385c2d858d2c30f88108f9a19f58835b5";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "53f3864940fe0e829a1ae129fb35e379d5ab7010b738169f617a990c678bca51";
+        "b33dfceb126b8b1d2370036993abcacf393a5c09b2e54e45c07603d16cf63b8c";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -748,9 +748,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (351, 31),
-                (105, 22),
-                (90, 22),
+                (352, 31),
+                (106, 22),
+                (91, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -808,6 +808,7 @@ mod tests {
         assert!(status.configuration_admission.is_none());
         assert_eq!(status.configuration_activated, None);
         assert!(status.provisioning.is_none());
+        assert!(status.launch_policy.is_none());
         assert!(!crate::policy_store::permits_initial_static_policy_repair(
             &sandbox
         ));
