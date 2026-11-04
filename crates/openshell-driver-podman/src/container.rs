@@ -681,8 +681,7 @@ fn parse_podman_cpu_limit(
         .map(Some)
         .ok_or_else(|| {
             ComputeDriverError::Precondition(format!(
-                "invalid podman cpu limit '{}'; expected positive cores or millicores",
-                quantity
+                "invalid podman cpu limit '{quantity}'; expected positive cores or millicores"
             ))
         })
 }
@@ -698,8 +697,7 @@ fn parse_podman_memory_limit(
     };
     parse_memory_to_bytes(quantity).map(Some).ok_or_else(|| {
         ComputeDriverError::Precondition(format!(
-            "invalid podman memory limit '{}'; expected positive bytes or a Kubernetes-style quantity",
-            quantity
+            "invalid podman memory limit '{quantity}'; expected positive bytes or a Kubernetes-style quantity"
         ))
     })
 }
