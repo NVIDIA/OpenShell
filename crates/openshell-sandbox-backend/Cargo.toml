@@ -44,6 +44,7 @@ rustix = { workspace = true, features = ["fs", "process"] }
 
 [dev-dependencies]
 jsonwebtoken = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true
