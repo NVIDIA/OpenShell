@@ -182,6 +182,7 @@ pub struct SharedHostConfig {
 /// The sandbox instance registry and the routed runtime listener its
 /// instances claim routes on, reconciled to the gateway's assignments.
 pub struct SharedHost {
+    app_listener: Option<crate::app_listener::HostHandle>,
     host: SandboxInstanceHost,
     router: Arc<RuntimeRouter>,
     gateway_endpoint: String,
@@ -209,6 +210,10 @@ pub struct SharedHost {
     leaving: watch::Sender<bool>,
     /// A gateway currently accepts this host's stream.
     gateway_connected: watch::Sender<bool>,
+    /// Peer endpoint of the gateway replica accepting this host's stream;
+    /// hosted instances dial their sessions there. Empty when that replica
+    /// has none, and `None` while no replica accepts the stream.
+    gateway_home: watch::Sender<Option<String>>,
     /// Recovery deadline (seconds) the latest snapshot offers the runtimes
     /// of instances this host starts or takes over; `None` keeps the runtime
     /// default.
@@ -287,10 +292,15 @@ impl From<SandboxInstanceHostError> for ControlError {
 impl SharedHost {
     /// Bind the routed runtime listener and prepare the instance root.
     pub fn start(config: SharedHostConfig) -> Result<Arc<Self>> {
+        let app_listener = crate::app_listener::Config::from_env()?
+            .map(crate::app_listener::Config::bind)
+            .transpose()?
+            .map(crate::app_listener::BoundListener::start);
         let host = SandboxInstanceHost::new(config.instance_root)?;
         let router = RuntimeRouter::bind(config.runtime_listen)
             .map_err(|error| miette::miette!("{error}"))?;
         Ok(Arc::new(Self {
+            app_listener,
             host,
             router,
             gateway_endpoint: config.gateway_endpoint,
@@ -303,6 +313,7 @@ impl SharedHost {
             deferred_reports: Mutex::new(BTreeMap::new()),
             leaving: watch::Sender::new(false),
             gateway_connected: watch::Sender::new(false),
+            gateway_home: watch::Sender::new(None),
             recovery_timeout_secs: Mutex::new(None),
             #[cfg(test)]
             reconcile_probe: ReconcileProbe::default(),
@@ -776,6 +787,10 @@ impl SharedHost {
         crate::sandbox_instance_host::prepare_private_dir(&trust_dir).map_err(failure)?;
         let ssh_socket = dir.join("ssh.sock");
         let config = crate::SandboxInstanceConfig {
+            app_router: self
+                .app_listener
+                .as_ref()
+                .map(crate::app_listener::HostHandle::router),
             command: main_process.command,
             workdir: registration.workdir,
             timeout_secs: 0,
@@ -784,7 +799,9 @@ impl SharedHost {
             sandbox_id: Some(registration.sandbox_id),
             sandbox: Some(registration.sandbox_name),
             container_image: registration.container_image,
+            container_image_uid: None,
             openshell_endpoint: Some(self.gateway_endpoint.clone()),
+            gateway_home: Some(self.gateway_home.subscribe()),
             policy_rules: None,
             policy_data: None,
             ssh_socket_path: Some(ssh_socket.to_string_lossy().into_owned()),
@@ -816,6 +833,7 @@ impl SharedHost {
             // The shared host has no per-instance collector endpoint yet, so
             // hosted instances do not relay agent traces.
             otlp_agent_endpoint: None,
+            otlp_agent_protocol: openshell_core::sandbox_env::OtlpProtocol::Grpc,
         };
         crate::sandbox_instance_host::sandbox_instance_launch(
             Box::new(crate::backend_setup::RoutedBackendSetup::new(
@@ -984,8 +1002,13 @@ fn status_message(host: &SharedHost, applied_revision: u64) -> HostMessage {
 /// Why one gateway stream ended.
 enum StreamEnd {
     /// The gateway rejected or closed the stream; reconnect after a backoff.
-    /// `accepted` records whether the gateway had accepted the host.
-    Lost { accepted: bool },
+    /// `accepted` records whether the gateway had accepted the host, and
+    /// `redial` is the replica that accepted it: the next attempt goes there
+    /// first, as after a token expiry, so the hosted sessions stay in place.
+    Lost {
+        accepted: bool,
+        redial: Option<String>,
+    },
 }
 
 /// What a gateway sends a host on its assignment stream.
@@ -996,28 +1019,32 @@ type GatewayInbound = std::pin::Pin<
 /// Opens a host's assignment stream: hands the gateway the host's outbound
 /// messages and returns the gateway's.
 trait GatewayConnector: Send + Sync {
-    /// Connect and attach, each stage bounded by `deadline`.
-    fn open(
-        &self,
+    /// Connect to `endpoint`, or the configured endpoint when `None`, and
+    /// attach, each stage bounded by `deadline`.
+    fn open<'a>(
+        &'a self,
         outbound: tokio::sync::mpsc::Receiver<HostMessage>,
         deadline: tokio::time::Instant,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + '_>>;
+        endpoint: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + 'a>>;
 }
 
 impl GatewayConnector for GatewayLink {
-    fn open(
-        &self,
+    fn open<'a>(
+        &'a self,
         outbound: tokio::sync::mpsc::Receiver<HostMessage>,
         deadline: tokio::time::Instant,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + '_>> {
+        endpoint: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + 'a>> {
         Box::pin(async move {
-            if !self.endpoint.starts_with("https://") {
+            let endpoint = endpoint.unwrap_or(&self.endpoint);
+            if !endpoint.starts_with("https://") {
                 return Err("the supervisor token requires an https gateway endpoint".to_string());
             }
             let token = self
                 .read_token()
                 .map_err(|error| format!("no usable supervisor token: {error}"))?;
-            let connect = openshell_core::grpc_client::connect_gateway_channel(&self.endpoint);
+            let connect = openshell_core::grpc_client::connect_gateway_channel(endpoint);
             let channel = tokio::time::timeout_at(deadline, connect)
                 .await
                 .map_err(|_| "connecting to the gateway timed out".to_string())?
@@ -1067,6 +1094,7 @@ async fn attach_with(
     // attempt bound depends on it, so the attempt after the covered
     // unanswered ones is still quick.
     let mut unanswered = 0_u32;
+    let mut redial = None;
     tokio::pin!(shutdown);
     loop {
         connection_epoch += 1;
@@ -1079,10 +1107,15 @@ async fn attach_with(
             }),
         };
         let attempt_timeout = timings.attempt_timeout(unanswered);
-        let StreamEnd::Lost { accepted } = tokio::select! {
-            end = run_stream(&host, connector.as_ref(), &reconciler, hello, &timings, attempt_timeout) => end,
+        let end = tokio::select! {
+            end = run_stream(&host, connector.as_ref(), &reconciler, hello, &timings, attempt_timeout, redial.as_deref()) => end,
             () = &mut shutdown => return reconciler.shut_down().await,
         };
+        let StreamEnd::Lost {
+            accepted,
+            redial: next,
+        } = end;
+        redial = next;
         if accepted {
             failed = 0;
             unanswered = 0;
@@ -1093,6 +1126,7 @@ async fn attach_with(
         let backoff = timings.backoff(failed, jitter_sample());
         tracing::info!(
             retry_in_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+            redial = redial.as_deref().unwrap_or_default(),
             "gateway assignment stream lost; hosted sandbox instances keep running"
         );
         tokio::select! {
@@ -1341,8 +1375,15 @@ async fn run_stream(
     hello: HostHello,
     timings: &StreamTimings,
     attempt_timeout: Duration,
+    endpoint: Option<&str>,
 ) -> StreamEnd {
-    let lost = |accepted| StreamEnd::Lost { accepted };
+    let lost = |accepted: bool| StreamEnd::Lost {
+        accepted,
+        redial: accepted
+            .then(|| host.gateway_home.borrow().clone())
+            .flatten()
+            .filter(|endpoint| !endpoint.is_empty()),
+    };
     // One deadline covers saying hello, connecting, attaching, and being
     // accepted, so a slow stage leaves less time for the next; the reconnect
     // budget counts on it.
@@ -1372,7 +1413,7 @@ async fn run_stream(
     {
         return lost(false);
     }
-    let opened = tokio::time::timeout_at(deadline, connector.open(rx, deadline))
+    let opened = tokio::time::timeout_at(deadline, connector.open(rx, deadline, endpoint))
         .await
         .unwrap_or_else(|_| Err("connecting to the gateway timed out".to_string()));
     let mut inbound = match opened {
@@ -1417,6 +1458,7 @@ async fn run_stream(
                     Some(host_gateway_message::Payload::Accepted(accepted_message)) => {
                         accepted = true;
                         host.gateway_connected.send_replace(true);
+                        host.gateway_home.send_replace(Some(accepted_message.peer_endpoint.clone()));
                         tracing::info!(session = %accepted_message.session_id, "gateway accepted the supervisor host");
                         // A pool gateway detects failed members by silence,
                         // so it asks for more frequent heartbeats.
@@ -1517,6 +1559,7 @@ async fn run_stream(
         }
     };
     host.gateway_connected.send_replace(false);
+    host.gateway_home.send_replace(None);
     end
 }
 
@@ -1929,6 +1972,8 @@ mod tests {
     struct Opened {
         /// When the host asked for it.
         at: tokio::time::Instant,
+        /// The replica the host redialed, or `None` for the Service.
+        endpoint: Option<String>,
         outbound: tokio::sync::mpsc::Receiver<HostMessage>,
         inbound: tokio::sync::mpsc::Sender<Result<HostGatewayMessage, tonic::Status>>,
     }
@@ -1942,13 +1987,15 @@ mod tests {
     }
 
     impl GatewayConnector for FakeGateway {
-        fn open(
-            &self,
+        fn open<'a>(
+            &'a self,
             outbound: tokio::sync::mpsc::Receiver<HostMessage>,
             _deadline: tokio::time::Instant,
-        ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + '_>>
+            endpoint: Option<&'a str>,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + 'a>>
         {
             let at = tokio::time::Instant::now();
+            let endpoint = endpoint.map(str::to_string);
             self.calls.lock().unwrap().push(at);
             let attempt = self
                 .plan
@@ -1965,6 +2012,7 @@ mod tests {
                 let (inbound, stream) = tokio::sync::mpsc::channel(1);
                 let _ = self.opened.send(Opened {
                     at,
+                    endpoint,
                     outbound,
                     inbound,
                 });
@@ -1982,6 +2030,10 @@ mod tests {
     }
 
     fn accepted() -> HostGatewayMessage {
+        accepted_by("")
+    }
+
+    fn accepted_by(peer_endpoint: &str) -> HostGatewayMessage {
         gateway_message(host_gateway_message::Payload::Accepted(
             openshell_core::proto::supervisor_host::v1::HostAccepted {
                 session_id: "session".to_string(),
@@ -1989,6 +2041,7 @@ mod tests {
                     seconds: 1,
                     nanos: 0,
                 }),
+                peer_endpoint: peer_endpoint.to_string(),
             },
         ))
     }
@@ -2218,6 +2271,50 @@ mod tests {
         );
         assert!(attempt >= pool_timing::HOST_ATTEMPT_TIMEOUT);
         assert_eq!(gateway.calls.lock().unwrap().len(), 2);
+    }
+
+    /// Hosted instances dial the replica that accepted the host, until its
+    /// stream is lost.
+    #[tokio::test(start_paused = true)]
+    async fn the_accepting_replica_is_the_hosted_instances_gateway() {
+        let (host, _gateway, mut streams, _root) =
+            attach_pool_host(vec![Attempt::Now, Attempt::Hang]);
+        let mut home = host.gateway_home.subscribe();
+        let stream = streams.recv().await.unwrap();
+        stream
+            .inbound
+            .send(Ok(accepted_by("https://gw-a:8443")))
+            .await
+            .unwrap();
+        home.wait_for(|home| home.as_deref() == Some("https://gw-a:8443"))
+            .await
+            .unwrap();
+        drop(stream);
+        home.wait_for(Option::is_none).await.unwrap();
+    }
+
+    /// A host whose accepted stream is lost, as on token expiry, redials the
+    /// replica that accepted it, so the hosted sessions stay in place; when
+    /// that replica does not accept it, the host goes back to the Service.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_stream_redials_its_replica_once() {
+        let (_host, _gateway, mut streams, _root) =
+            attach_pool_host(vec![Attempt::Now, Attempt::Now, Attempt::Now]);
+        let first = streams.recv().await.unwrap();
+        assert_eq!(first.endpoint, None);
+        first
+            .inbound
+            .send(Ok(accepted_by("https://gw-a:8443")))
+            .await
+            .unwrap();
+        drop(first);
+
+        let refused = streams.recv().await.unwrap();
+        assert_eq!(refused.endpoint.as_deref(), Some("https://gw-a:8443"));
+        drop(refused);
+
+        let next = streams.recv().await.unwrap();
+        assert_eq!(next.endpoint, None);
     }
 
     /// A replica that keeps writing but stops reading fills the host's

@@ -77,6 +77,23 @@ on:
         required: false
         type: string
         default: "gateway sandbox supervisor"
+      enforce-network-policy:
+        description: "Install a policy-enforcing CNI for listener isolation checks"
+        required: false
+        type: boolean
+        default: false
+      listener-topology:
+        required: false
+        type: string
+        default: "dedicated"
+      listener-delivery:
+        required: false
+        type: string
+        default: "push"
+      listener-takeover:
+        required: false
+        type: string
+        default: "graceful"
 
 permissions:
   actions: read
@@ -129,6 +146,14 @@ jobs:
           registry-username: ${{ github.actor }}
           registry-password: ${{ secrets.GITHUB_TOKEN }}
           mise-version: ${{ inputs.mise-version }}
+          enforce-network-policy: ${{ inputs.enforce-network-policy }}
+
+      - name: Preload listener workload and client fixture
+        if: inputs.e2e-task == 'e2e:kubernetes:app-listener'
+        run: |
+          docker pull --platform linux/amd64 python:3.12-slim
+          docker image save --platform linux/amd64 --output "$RUNNER_TEMP/listener-python.tar" python:3.12-slim
+          kind load image-archive "$RUNNER_TEMP/listener-python.tar" --name "$KIND_CLUSTER_NAME"
 
       - name: Run Kubernetes E2E
         env:
@@ -142,4 +167,15 @@ jobs:
           IMAGE_TAG: ${{ inputs.image-tag }}
           OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
           E2E_TASK: ${{ inputs.e2e-task }}
+          OPENSHELL_E2E_APP_TOPOLOGY: ${{ inputs.listener-topology }}
+          OPENSHELL_E2E_APP_DELIVERY: ${{ inputs.listener-delivery }}
+          OPENSHELL_E2E_APP_TAKEOVER: ${{ inputs.listener-takeover }}
         run: mise run --no-deps --skip-deps "$E2E_TASK"
+
+      - name: Upload listener test evidence
+        if: always() && inputs.e2e-task == 'e2e:kubernetes:app-listener'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: listener-${{ inputs.listener-topology }}-${{ inputs.listener-delivery }}-${{ inputs.listener-takeover }}
+          path: results/app-listener/
+          if-no-files-found: warn

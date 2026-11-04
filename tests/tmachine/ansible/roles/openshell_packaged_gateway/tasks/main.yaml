@@ -21,6 +21,17 @@
     name: openshell_gateway
     tasks_from: "{{ openshell_gateway_driver }}.yaml"
 
+# The packaged gateway's configuration comes from its environment file, so it
+# can't apply an environment's Podman driver settings. Fail rather than test a
+# gateway without them.
+- name: Require no environment Podman driver settings
+  ansible.builtin.assert:
+    that:
+      - not (openshell_gateway_podman_driver_settings | default(''))
+    fail_msg: >-
+      This environment configures Podman driver settings, which only the
+      binaries installer applies.
+
 - name: Create packaged gateway environment directory
   become: true
   ansible.builtin.file:
