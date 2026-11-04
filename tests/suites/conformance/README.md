@@ -50,9 +50,8 @@ lists the same tests as nextest.
 ## Adding a test
 
 Add a `#[testkit::test]` function to a suite, or for a new area, a new file in
-`src/` and a `mod` line for it in `src/lib.rs`. No playbook, test archive or
-workflow entry is needed: the runner builds and runs every test in the
-crate, and `openshell-conformance` includes it.
+`src/` and a `mod` line for it in `src/lib.rs`. `openshell-conformance`
+includes every test in the crate.
 
 ## What a test may assert
 
