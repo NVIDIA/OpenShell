@@ -22,6 +22,8 @@ pub const SUSPEND_RESUME_CAPABILITY: &str = "openshell.sandbox.suspend-resume";
 pub const SUPERVISOR_TAKEOVER_CAPABILITY: &str = "openshell.sandbox.supervisor-takeover";
 /// Optional: the runtime serves `ReadProcessEvents`.
 pub const PROCESS_EVENTS_CAPABILITY: &str = "openshell.sandbox.process-events";
+/// Optional: the runtime records each exec when `ReadProcessEvents` asks.
+pub const PROCESS_EXEC_EVENTS_CAPABILITY: &str = "openshell.sandbox.process-exec-events";
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 1 };
 
 /// The built-in runtime supports fresh launches and supervisor takeover;
@@ -37,6 +39,7 @@ pub fn metadata(implementation: &str) -> PeerMetadata {
             SANDBOX_PROTOCOL_CAPABILITY.to_string(),
             SUPERVISOR_TAKEOVER_CAPABILITY.to_string(),
             PROCESS_EVENTS_CAPABILITY.to_string(),
+            PROCESS_EXEC_EVENTS_CAPABILITY.to_string(),
         ],
         required_capabilities: required,
     }
