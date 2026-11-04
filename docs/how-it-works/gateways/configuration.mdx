@@ -600,7 +600,7 @@ Allow enough retention and disk space for shipper outages. Graceful shutdown all
 
 ## OTLP Export
 
-`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP. Omit the table to disable export. Its `endpoint` is the collector for every signal the gateway exports and, on its own, enables trace export. `[openshell.gateway.otlp.traces]` sends spans to a different collector. [OCSF log export](#ocsf-log-export) is off until `[openshell.gateway.otlp.ocsf]` sets `enabled = true`, and the [agent trace relay](#agent-trace-relay) is off until `[openshell.gateway.otlp.agent]` sets `enabled = true`. Each can use its own collector.
+`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP. Omit the table to disable export. Its `endpoint` is the collector for every signal the gateway exports and, on its own, enables trace export. `[openshell.gateway.otlp.traces]` sends spans to a different collector. [OCSF log export](#ocsf-log-export) is off until `[openshell.gateway.otlp.ocsf]` sets `enabled = true`, and the [agent trace relay](#agent-trace-relay) is off until `[openshell.gateway.otlp.agent]` sets `enabled = true`. Each can use its own collector. [OTLP Collectors](/observability/overview#otlp-collectors) shows where each signal goes.
 
 The gateway already uses the Rust `tracing` framework for structured logs sent to stdout and the sandbox log stream. Enabling this section adds an OpenTelemetry layer to the same tracing subscriber. It exports span trees to an OTLP collector without exporting, replacing, or redirecting the existing diagnostic log events.
 
