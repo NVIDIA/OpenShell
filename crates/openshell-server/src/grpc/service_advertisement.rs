@@ -15,7 +15,7 @@ use tonic::Status;
 
 use crate::ServerState;
 use crate::compute::{COMPUTE_RUNTIME_IDENTITY_ANNOTATION, MutationScope};
-use crate::persistence::{ObjectCursor, WriteCondition, current_time_ms};
+use crate::persistence::{ObjectCursor, ObjectRecord, WriteCondition, current_time_ms};
 use crate::supervisor_owner::{OWNER_TTL, OwnerGuard, SupervisorOwnerIndex};
 
 pub const OBJECT_TYPE: &str = "supervisor_service_installation";
@@ -451,6 +451,49 @@ pub async fn is_current(state: &ServerState, record: &Installation) -> Result<bo
     Ok(validate_routes(&report, &config.service_routes).is_ok())
 }
 
+const CLEANUP_PAGE_SIZE: u16 = 128;
+const CLEANUP_RECORD_TIMEOUT: Duration = Duration::from_secs(1);
+
+async fn cleanup_record(state: &ServerState, record: ObjectRecord) -> Result<(), Status> {
+    let installation: Installation = serde_json::from_slice(&record.payload)
+        .map_err(|_| Status::internal("invalid stored service installation"))?;
+    if installation.expires_at_ms <= current_time_ms() || !is_current(state, &installation).await? {
+        // Conditional deletion cannot erase a concurrent renewal.
+        state
+            .store
+            .delete_if(OBJECT_TYPE, &record.id, record.resource_version)
+            .await
+            .map_err(|_| Status::unavailable("service installation cleanup failed"))?;
+    }
+    Ok(())
+}
+
+async fn cleanup_page<F, Fut>(
+    page: Vec<ObjectRecord>,
+    cursor: &mut Option<ObjectCursor>,
+    mut process: F,
+) where
+    F: FnMut(ObjectRecord) -> Fut,
+    Fut: Future<Output = Result<(), Status>>,
+{
+    let last_page = page.len() < usize::from(CLEANUP_PAGE_SIZE);
+    for record in page {
+        let next = ObjectCursor::from(&record);
+        if !matches!(
+            tokio::time::timeout(CLEANUP_RECORD_TIMEOUT, process(record)).await,
+            Ok(Ok(()))
+        ) {
+            tracing::debug!("service installation cleanup attempt failed or timed out");
+        }
+        // Commit progress before the sweep can be cancelled. A failed bounded
+        // attempt leaves the record intact and revisits it on the next scan.
+        *cursor = Some(next);
+    }
+    if last_page {
+        *cursor = None;
+    }
+}
+
 pub fn spawn_cleanup(state: Arc<ServerState>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     tokio::spawn(async move {
         let mut cursor: Option<ObjectCursor> = None;
@@ -464,31 +507,14 @@ pub fn spawn_cleanup(state: Arc<ServerState>, mut shutdown: tokio::sync::watch::
             let sweep = async {
                 let page = state
                     .store
-                    .list_by_type_after(OBJECT_TYPE, cursor.as_ref(), 128)
-                    .await
-                    .map_err(|_| ())?;
-                let next = (page.len() == 128)
-                    .then(|| ObjectCursor::from(page.last().expect("full page")));
-                for record in page {
-                    let installation: Installation =
-                        serde_json::from_slice(&record.payload).map_err(|_| ())?;
-                    if installation.expires_at_ms <= current_time_ms()
-                        || matches!(is_current(&state, &installation).await, Ok(false))
-                    {
-                        // Conditional deletion cannot erase a concurrent renewal.
-                        let _ = state
-                            .store
-                            .delete_if(OBJECT_TYPE, &record.id, record.resource_version)
-                            .await;
-                    }
-                }
-                Ok::<_, ()>(next)
+                    .list_by_type_after(OBJECT_TYPE, cursor.as_ref(), u32::from(CLEANUP_PAGE_SIZE))
+                    .await?;
+                cleanup_page(page, &mut cursor, |record| cleanup_record(&state, record)).await;
+                Ok::<_, crate::persistence::PersistenceError>(())
             };
             tokio::select! {
                 _ = shutdown.changed() => return,
-                result = tokio::time::timeout(Duration::from_secs(5), sweep) => {
-                    if let Ok(Ok(next)) = result { cursor = next; }
-                }
+                _ = tokio::time::timeout(Duration::from_secs(5), sweep) => {}
             }
         }
     });
@@ -497,6 +523,133 @@ pub fn spawn_cleanup(state: Arc<ServerState>, mut shutdown: tokio::sync::watch::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cleanup_test_record(index: usize) -> ObjectRecord {
+        ObjectRecord {
+            object_type: OBJECT_TYPE.into(),
+            id: format!("{index:04}"),
+            name: format!("{index:04}"),
+            workspace: "default".into(),
+            payload: Vec::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            labels: None,
+            resource_version: 1,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_resumes_timed_out_pages_and_wraps_after_the_final_page() {
+        let records: Vec<_> = (0..130).map(cleanup_test_record).collect();
+        let mut cursor: Option<ObjectCursor> = None;
+        let processed = std::sync::Mutex::new(Vec::new());
+        let mut sweeps = 0;
+        loop {
+            let page = records
+                .iter()
+                .filter(|record| cursor.as_ref().is_none_or(|c| record.id > c.id))
+                .take(usize::from(CLEANUP_PAGE_SIZE))
+                .cloned()
+                .collect();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                cleanup_page(page, &mut cursor, |record| {
+                    let processed = &processed;
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(900)).await;
+                        processed.lock().unwrap().push(record.id);
+                        Ok(())
+                    }
+                }),
+            )
+            .await;
+            sweeps += 1;
+            if cursor.is_none() {
+                assert!(result.is_ok());
+                break;
+            }
+            assert!(sweeps < 40, "cleanup did not advance");
+        }
+        assert!(sweeps > 1);
+        assert_eq!(
+            *processed.lock().unwrap(),
+            records.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+        );
+        // The final partial page resets the cursor so retained records are revisited.
+        assert!(cursor.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_skips_failed_and_stalled_attempts_without_starving_later_records() {
+        let mut cursor = None;
+        let processed = std::sync::Mutex::new(Vec::new());
+        cleanup_page(
+            (0..3).map(cleanup_test_record).collect(),
+            &mut cursor,
+            |record| {
+                let processed = &processed;
+                async move {
+                    match record.id.as_str() {
+                        "0000" => Err(Status::internal("malformed record")),
+                        "0001" => std::future::pending().await,
+                        _ => {
+                            processed.lock().unwrap().push(record.id);
+                            Ok(())
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(*processed.lock().unwrap(), vec!["0002"]);
+        assert!(cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_concurrent_renewals_and_rejects_malformed_records() {
+        let (state, owner, mut report) = installed_fixture().await;
+        accept(&state, &owner, &report, current_time_ms() + 10_000)
+            .await
+            .unwrap();
+        let id = "service-installation:sandbox";
+        let row = state.store.get(OBJECT_TYPE, id).await.unwrap().unwrap();
+        let mut expired: Installation = serde_json::from_slice(&row.payload).unwrap();
+        expired.expires_at_ms = 0;
+        state
+            .store
+            .put_if(
+                OBJECT_TYPE,
+                id,
+                &row.name,
+                &row.workspace,
+                &serde_json::to_vec(&expired).unwrap(),
+                None,
+                WriteCondition::MatchResourceVersion(row.resource_version),
+            )
+            .await
+            .unwrap();
+        let stale = state.store.get(OBJECT_TYPE, id).await.unwrap().unwrap();
+        report.lease_sequence += 1;
+        accept(&state, &owner, &report, current_time_ms() + 10_000)
+            .await
+            .unwrap();
+        let renewed = state.store.get(OBJECT_TYPE, id).await.unwrap().unwrap();
+        let _ = cleanup_record(&state, stale).await;
+        assert_eq!(
+            state
+                .store
+                .get(OBJECT_TYPE, id)
+                .await
+                .unwrap()
+                .unwrap()
+                .resource_version,
+            renewed.resource_version
+        );
+        let mut malformed = renewed;
+        malformed.payload = b"invalid JSON".to_vec();
+        assert!(cleanup_record(&state, malformed).await.is_err());
+        assert!(state.store.get(OBJECT_TYPE, id).await.unwrap().is_some());
+    }
 
     fn route() -> SandboxServiceRoute {
         SandboxServiceRoute {
