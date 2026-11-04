@@ -255,8 +255,48 @@ jobs:
       rpm-release: ${{ needs.version.outputs.rpm_release }}
       cargo-version: ${{ needs.version.outputs.cargo }}
 
+  # Test inputs don't depend on the packages, so build them while the packages
+  # build instead of in prepare-integration.
+  build-tmachine-test-inputs:
+    name: Build tmachine test inputs
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.run_integration == 'true'
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: ./.github/actions/setup-nix
+      - name: Build test archives
+        run: |
+          # Retry dependency preparation, then generate artifacts once.
+          nix build --no-link .#build-artifacts-test-archives || nix build --no-link .#build-artifacts-test-archives
+          nix run .#build-artifacts-test-archives
+      - name: Build test workload images
+        run: |
+          # Retry dependency preparation, then generate artifacts once.
+          nix build --no-link .#build-artifacts-test-images || nix build --no-link .#build-artifacts-test-images
+          nix run .#build-artifacts-test-images
+      - name: Package Helm chart
+        run: |
+          # Retry dependency preparation, then generate artifacts once.
+          nix build --no-link .#build-artifacts-helm || nix build --no-link .#build-artifacts-helm
+          nix run .#build-artifacts-helm
+      - name: Upload tmachine test inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openshell-tmachine-test-inputs
+          path: artifacts
+          compression-level: 0
+          retention-days: 5
+          if-no-files-found: error
+
   prepare-integration:
-    needs: [pr_metadata, build-binaries, build-images, build-deb, build-rpm]
+    needs: [pr_metadata, build-binaries, build-images, build-deb, build-rpm, build-tmachine-test-inputs]
     if: needs.pr_metadata.outputs.run_integration == 'true'
     permissions:
       actions: read
@@ -266,6 +306,7 @@ jobs:
     with:
       deb-artifact-name: deb-linux-amd64
       rpm-artifact-name: rpm-linux-x86_64
+      test-inputs-artifact-name: openshell-tmachine-test-inputs
 
   # Run driver-independent conformance tests.
   conformance-integration:
