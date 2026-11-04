@@ -181,8 +181,9 @@ by `OPENSHELL_BIN`. See
 [tests/testkit/README.md](tests/testkit/README.md) for how to write and run
 tests.
 
-Suites live under `tests/suites/<family>/`. Each family is a Cargo workspace
-with its own lockfile. Run the `conformance` suites against a local Docker
+Suites live under `tests/suites/`, in Cargo workspaces with their own
+lockfiles: `conformance`, `features`, and one workspace per driver suite under
+`drivers/<driver>`. Run the `conformance` suites against a local Docker
 gateway with:
 
 ```shell
@@ -218,7 +219,12 @@ Adapted from the handover notes in NVIDIA/OpenShell#4629 by Evan Lezar.
 ### Running suites in a tmachine environment (`tests/runner/`)
 
 `openshell-test-runner` runs a test family inside a tmachine VM, against the
-OpenShell that the VM's installer set up.
+OpenShell that the VM's installer set up. `--family` is the path of the
+workspace under `tests/suites/`, such as `conformance` or `drivers/podman`, and
+`--package` narrows it to some of its packages. It must name a workspace, so
+`drivers` alone fails. The `family` input of the `E2E Suites` workflow instead
+selects every row whose family is that name or lies under it, so `drivers`
+selects all the driver suites.
 
 ```shell
 nix run .#openshell-test-runner -- \
@@ -245,9 +251,10 @@ A flaky or broken test is marked `#[ignore = "<issue link>"]`, which takes it
 out of every environment until it's fixed.
 
 **CI.** `.github/workflows/e2e-suites.yml` lists the environments and suites as
-an explicit matrix and runs the runner once per row. Branch E2E calls it when
-the `test:e2e` label is set, and a failure fails the Core E2E result. To run
-a suite in another environment on CI, add a row.
+an explicit matrix and runs the runner once per row. Branch E2E calls it once
+per family when the `test:e2e` label is set, and a failure fails the Core E2E
+result. Release Dev and Release Qualification run the conformance and feature
+families. To run a suite in another environment on CI, add a row.
 
 ### Adding a feature suite
 
@@ -261,11 +268,9 @@ suite, with a name that says what the suite tests.
 2. Write the tests in `tests/*.rs` as `#[testkit::test]` functions.
 3. Re-lock the workspace: `cargo metadata --manifest-path
    tests/suites/features/Cargo.toml`, then
-   `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`.
-4. Add `cargo fmt` and `cargo clippy` lines for the package (`-p <name>`) to
-   `tasks/rust.toml` and to the Format and Lint steps in
-   `.github/workflows/branch-checks.yml`.
-5. Add a row for the suite to the matrix in `.github/workflows/e2e-suites.yml`.
+   `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`. `cargo fmt`
+   and `cargo clippy` already cover every package in the workspace.
+4. Add a row for the suite to the matrix in `.github/workflows/e2e-suites.yml`.
 
 If the feature only needs the gateway, run the suite in an existing
 environment such as `ubuntu-docker-rootful`, and skip the rest of this
@@ -287,8 +292,8 @@ service.
   values never appear in a runner command. Values are taken literally, without
   quoting.
 - **Fixture.** Put the service's fixture in a support crate under
-  `tests/support/<service>`, so any suite can depend on it, or reuse the
-  existing one. It defines the variable names as constants and a
+  `tests/support/<service>`, named `<service>-support`, so any suite can
+  depend on it, or reuse the existing one. It defines the variable names as constants and a
   `<Service>Context::new(cx)` that reads them, waits for the service, and
   wraps the testkit `Context`. Each test calls it on its first line.
   Nextest runs each test in its own process, so the fixture builds its
@@ -511,7 +516,6 @@ Run the portable subset in a disposable rootless Podman guest:
 ```shell
 nix run .#build-artifacts
 nix run .#tmachine -- test fedora-podman-rootless binaries e2e-podman
-nix run .#tmachine -- test fedora-podman-rootless binaries driver-podman
 ```
 
 Print the exact tmachine archive selection as a shell `PODMAN_CI_TESTS` array:
@@ -522,22 +526,38 @@ nix run .#generate-podman-e2e-ci-tests
 
 The `e2e-podman` testsuite runs a nextest archive built with the corresponding
 Rust feature and preloads its Python workload image into the rootless Podman
-store. The separate `driver-podman` testsuite compares OpenShell and direct
-Podman user-namespace mappings for the default, `auto`, `keep-id`, and private
-profiles. The E2E archive excludes binaries that still depend on wrapper-owned
+store. The E2E archive excludes binaries that still depend on wrapper-owned
 gateway controls, SPIFFE fixtures, the caller driver-config setting, or other
-guest setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
-binary. `tests/tmachine/artifacts.nix` keeps the follow-up exclusions explicit and uses
+guest setup. `tests/tmachine/artifacts.nix` keeps the follow-up exclusions explicit and uses
 the same filter for the generated inventory, so excluded binaries cannot appear
 as false passes or silently re-enter the archive.
 
-The `oci-image` feature testsuite (`tests/suites/features/oci-image`) checks
-OCI image identity and working-directory behavior shared by the Docker and
-Podman drivers against installed deb packages on Ubuntu and rpm packages on
-Fedora. CI runs it on Docker rootful, Podman rootful, and Podman rootless guests:
+Driver suites live in `tests/suites/drivers/<driver>`, with the package named
+after the driver. Each driver suite is its own workspace with its own lockfile,
+so a change to one driver's tests or dependencies doesn't touch another's. Add
+a new one to the `rust:format`, `rust:format:check` and `rust:lint` tasks, the
+matching lines in `branch-checks.yml`, and `ALIGNED_WORKSPACES`. The Podman
+driver suite (`tests/suites/drivers/podman`) compares OpenShell and direct
+Podman user-namespace mappings.
+Each `fedora-podman-{rootful,rootless}-userns-<mode>` environment configures
+the gateway with one mode (`default`, `auto`, `keep-id` or `private`); only the
+`binaries` installer applies it:
 
 ```shell
-nix run .#tmachine -- test ubuntu-docker-rootful deb oci-image
+nix run .#openshell-test-runner -- \
+  --environment fedora-podman-rootless-userns-keep-id --installer binaries \
+  --gateway tmachine --family drivers/podman
+```
+
+The `oci-image` feature suite (`tests/suites/features/oci-image`) checks OCI
+image identity and working-directory behavior shared by the Docker and Podman
+drivers against installed deb packages on Ubuntu and rpm packages on Fedora.
+CI runs it on Docker rootful, Podman rootful, and Podman rootless guests:
+
+```shell
+nix run .#openshell-test-runner -- \
+  --environment ubuntu-docker-rootful --installer deb \
+  --family features --package oci-image
 ```
 
 The shared suite also runs in the existing ARM64 Docker E2E workflow for

@@ -407,6 +407,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "container-engine-support"
+version = "0.0.0"
+dependencies = [
+ "openshell-testkit",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1487,7 +1496,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "keycloak"
+name = "keycloak-support"
 version = "0.0.0"
 dependencies = [
  "openshell-testkit",
@@ -2175,6 +2184,14 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
+name = "podman-support"
+version = "0.0.0"
+dependencies = [
+ "container-engine-support",
+ "openshell-testkit",
+]
 
 [[package]]
 name = "potential_utf"

@@ -165,10 +165,13 @@ selected. DEB and RPM packages build only when integration qualification is sele
 the DEB on Ubuntu with Docker and installs the CLI and gateway RPMs on Fedora with
 rootful and rootless Podman. These lanes run conformance using the matching runtime
 images. Release Dev, Release, and Pre-release use the same package installers.
-Fedora provider-refresh tests also use RPMs. The Podman driver-specific suites
-retain the binary installer because their fixtures configure its system service,
-local HTTP gateway, and CLI path. The manual Integration Tests workflow defaults
-to the package installers and downloads the packages selected by its matrix.
+The feature suites (`tests/suites/features`) run the same way, on the
+package installers. The Podman driver suite (`tests/suites/drivers/podman`) and the
+`e2e-podman` lane retain the binary installer because they configure its system
+service, local HTTP gateway, and CLI path. The driver suite and `e2e-podman` run
+only in `Branch E2E Checks`. The manual Integration Tests workflow runs the
+remaining tmachine testsuites, such as `e2e-podman`, and downloads the packages
+selected by its matrix.
 
 Three opt-in labels enable the long-running E2E suites:
 

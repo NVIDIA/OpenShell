@@ -71,6 +71,10 @@ fails. A killed test process skips cleanup, so names are unique to the run.
   create, so a create that fails after the gateway accepted it is still cleaned
   up. `cx.adopt(name)` returns a `Sandbox` handle for one the CLI created.
 - `cx.expect_listed` and `cx.expect_absent` to check a sandbox in list and get.
+- `cx.expect_compute_driver(name)` to fail unless the gateway runs only that
+  compute driver. Driver suites call it first.
+- `testkit::base_image()` for the image to create sandboxes from or build on:
+  `OPENSHELL_TEST_BASE_IMAGE`, or OpenShell's default sandbox image.
 - `cx.cli([...])` to run the installed CLI against the same gateway, with
   `success()`, `failure()`, and `json()` on the output. `cx.cli_handle()`
   returns that CLI for code that can't borrow `cx`, such as a cleanup hook.

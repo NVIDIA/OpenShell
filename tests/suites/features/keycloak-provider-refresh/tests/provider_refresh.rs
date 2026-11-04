@@ -4,13 +4,11 @@
 //! Provider OAuth refresh against Keycloak.
 //!
 //! Keycloak is only the provider's token issuer here; the CLI still reaches
-//! the gateway the usual way. Ported from
-//! `tests/suites/features/provider-refresh/keycloak`, which tmachine's
-//! `provider-refresh` testsuite runs until the required lanes switch.
+//! the gateway the usual way.
 
 use std::io::Write as _;
 
-use keycloak::KeycloakContext;
+use keycloak_support::KeycloakContext;
 use testkit::{CliOutput, Context, Error, ResultExt as _};
 
 const CREDENTIAL_KEY: &str = "KEYCLOAK_ACCESS_TOKEN";
@@ -136,7 +134,7 @@ fn combined(output: &CliOutput) -> String {
 
 fn write_profile(
     profile_id: &str,
-    keycloak: &keycloak::Keycloak,
+    keycloak: &keycloak_support::Keycloak,
 ) -> testkit::Result<tempfile::NamedTempFile> {
     let issuer_token_url = keycloak.token_endpoint();
     let profile = format!(
