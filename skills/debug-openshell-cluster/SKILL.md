@@ -936,6 +936,41 @@ kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec
 # Should show items filter for ca.crt from openshell-server-tls
 ```
 
+#### Secure metrics TLS
+
+When `metrics.tls.enabled=true`, the dedicated metrics listener uses its own
+TLS configuration and, when requested, an independent scraper client CA. Do
+not use the gateway client CA: sandbox workloads receive gateway client
+credentials, so trusting that CA here would grant them metrics access. The
+chart fails rendering when `metrics.tls.clientCaSecretName` matches
+`server.tls.clientCaSecretName` or `server.tls.clientTlsSecretName`; that
+check is by name only. Inspect
+the rendered configuration and the read-only Secret mounts before debugging the
+scraper:
+
+```bash
+kubectl -n openshell get configmap openshell-config \
+  -o jsonpath='{.data.gateway\.toml}' | grep -A6 '^\[openshell\.gateway\.metrics_tls\]'
+kubectl -n openshell get statefulset openshell \
+  -o jsonpath='{.spec.template.spec.volumes[?(@.name=="metrics-tls-cert")]}{"\n"}{.spec.template.spec.volumes[?(@.name=="metrics-tls-client-ca")]}' | jq .
+kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=200 | grep -E 'metrics.*TLS|listener=metrics'
+```
+
+`metrics-tls-cert` must reference a Secret with `tls.crt` and `tls.key`; when
+mTLS is enabled, `metrics-tls-client-ca` must reference a Secret with `ca.crt`.
+An absent mount means the release was rendered without metrics TLS. A failed
+certificate reload retains the previous working listener; correct the Secret
+contents rather than disabling verification. Configure the scraper with the
+metrics server CA and, for mTLS, its dedicated client certificate and key. Do
+not use `insecureSkipVerify`.
+
+A Secret that exists with malformed contents leaves the metrics listener
+disabled while the gateway remains available; it never falls back to
+plaintext. A missing Secret, or a client CA Secret without a `ca.crt` key,
+never reaches the gateway: kubelet fails the non-optional volume mounts and
+the pod does not start (`FailedMount`). Correct the Secret and restart the
+gateway before retrying the scrape.
+
 If `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
 is set, the gateway should still render `[openshell.gateway.gateway_jwt]` and
 mount the `sandbox-jwt` Secret.
