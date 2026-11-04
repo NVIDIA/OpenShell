@@ -12,16 +12,23 @@
 //! }
 //! ```
 //!
-//! It has two subcommands so far:
+//! It has three subcommands:
 //!
 //! - `list [FILTER]...` prints each test's name and description.
 //! - `ready [--timeout SECS]` waits for the gateway, as `testkit-ready` does.
+//! - `run [FILTER]...` runs tests one at a time, each in its own process with
+//!   a timeout. Unix only.
 //!
 //! Any other arguments are libtest's, so the program also works as a
 //! `harness = false` test target under `cargo test` and nextest: it answers
 //! `--list --format terse`, `--ignored`, and `<name> --exact --nocapture`.
 //! In that mode tests run in the program's own process, one at a time unless
 //! `--test-threads` says otherwise.
+
+#[cfg(unix)]
+mod process;
+#[cfg(unix)]
+mod supervisor;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -32,6 +39,8 @@ use clap::{Parser, Subcommand};
 
 use crate::registry::{RESERVED_NAMES, Selection, TESTS, Test, validate};
 
+/// Exit code when a test failed.
+const FAILED_EXIT: u8 = 1;
 /// Exit code when tests could not run, including usage errors.
 const ERROR_EXIT: u8 = 2;
 /// Set by `run` for the test processes it starts.
@@ -103,6 +112,22 @@ enum Command {
         #[arg(long, default_value = "60", value_name = "SECS", value_parser = seconds)]
         timeout: Duration,
     },
+    /// Run tests one at a time, each in its own process. Exits 1 if a test
+    /// failed and 2 if tests could not run.
+    Run {
+        /// Run tests whose name contains any of these (all if none).
+        filters: Vec<String>,
+        /// Run ignored tests too.
+        #[arg(long)]
+        include_ignored: bool,
+        /// Stop a test that runs longer than this, in seconds. Longer than
+        /// testkit's own step timeouts, so those report first.
+        #[arg(long, default_value = "900", value_name = "SECS", value_parser = seconds)]
+        timeout: Duration,
+        /// How long a stopped test has between SIGTERM and SIGKILL, in seconds.
+        #[arg(long, default_value = "10", value_name = "SECS", value_parser = seconds)]
+        grace: Duration,
+    },
 }
 
 /// A positive, finite number of seconds.
@@ -123,7 +148,59 @@ fn command(program: &str, tests: &'static [Test], command: Command) -> ExitCode 
             ExitCode::SUCCESS
         }
         Command::Ready { timeout } => ready(program, timeout),
+        Command::Run {
+            filters,
+            include_ignored,
+            timeout,
+            grace,
+        } => run(
+            program,
+            tests,
+            Selection {
+                filters,
+                include_ignored,
+            },
+            timeout,
+            grace,
+        ),
     }
+}
+
+#[cfg(unix)]
+fn run(
+    program: &str,
+    tests: &'static [Test],
+    selection: Selection,
+    timeout: Duration,
+    grace: Duration,
+) -> ExitCode {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            eprintln!("{program}: find this program's path: {error}");
+            return ExitCode::from(ERROR_EXIT);
+        }
+    };
+    let options = supervisor::Options {
+        selection,
+        timeout,
+        grace,
+    };
+    supervisor::run(program, &exe, tests, &options)
+}
+
+#[cfg(not(unix))]
+fn run(
+    program: &str,
+    _tests: &'static [Test],
+    _selection: Selection,
+    _timeout: Duration,
+    _grace: Duration,
+) -> ExitCode {
+    eprintln!(
+        "{program}: `run` is only supported on Unix; run the tests with cargo test or nextest"
+    );
+    ExitCode::from(ERROR_EXIT)
 }
 
 /// One line per test: name and description, in aligned columns.
@@ -230,10 +307,61 @@ fn program_name(args: &[OsString]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
+    use std::time::Duration;
+
+    use clap::Parser;
+
+    use super::{Cli, Command};
 
     #[test]
     fn cli_is_consistent() {
         <Cli as clap::CommandFactory>::command().debug_assert();
+    }
+
+    #[test]
+    fn run_parses_selection_and_limits() {
+        let cli = Cli::try_parse_from([
+            "p",
+            "run",
+            "smoke",
+            "life",
+            "--include-ignored",
+            "--timeout",
+            "1.5",
+        ])
+        .unwrap();
+        let Command::Run {
+            filters,
+            include_ignored,
+            timeout,
+            grace,
+        } = cli.command
+        else {
+            panic!("not run");
+        };
+        assert_eq!(filters, ["smoke", "life"]);
+        assert!(include_ignored);
+        assert_eq!(timeout, Duration::from_millis(1500));
+        assert_eq!(grace, Duration::from_secs(10));
+
+        let Command::Ready { timeout } = Cli::try_parse_from(["p", "ready"]).unwrap().command
+        else {
+            panic!("not ready");
+        };
+        assert_eq!(timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn rejects_bad_limits() {
+        for bad in ["0", "-1", "soon", "inf", "NaN"] {
+            assert!(
+                Cli::try_parse_from(["p", "run", "--timeout", bad]).is_err(),
+                "{bad}"
+            );
+            assert!(
+                Cli::try_parse_from(["p", "ready", "--timeout", bad]).is_err(),
+                "{bad}"
+            );
+        }
     }
 }

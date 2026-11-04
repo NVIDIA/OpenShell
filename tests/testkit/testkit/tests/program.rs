@@ -44,9 +44,9 @@ async fn registered_ignored(_cx: &mut testkit::Context) -> testkit::Result {
 mod unix {
     use std::future::Future;
     use std::os::unix::process::CommandExt as _;
-    use std::pin::Pin;
     use std::path::Path;
-    use std::process::{Command, Output, Stdio};
+    use std::pin::Pin;
+    use std::process::{Child, Command, Output, Stdio};
     use std::time::{Duration, Instant};
 
     use testkit::{Test, TestInfo};
@@ -137,7 +137,7 @@ mod unix {
         },
     ];
 
-    pub static CHECKS: [Test; 4] = [
+    pub static CHECKS: [Test; 11] = [
         check("nextest_interface", || {
             Box::pin(async { nextest_interface() })
         }),
@@ -149,6 +149,25 @@ mod unix {
         }),
         check("ready_fails_without_a_gateway", || {
             Box::pin(async { ready_fails_without_a_gateway() })
+        }),
+        check("run_reports_every_outcome", || {
+            Box::pin(async { run_reports_every_outcome() })
+        }),
+        check("run_exit_codes", || Box::pin(async { run_exit_codes() })),
+        check("timeout_kills_the_process_group", || {
+            Box::pin(async { timeout_kills_the_process_group() })
+        }),
+        check("sigterm_is_followed_by_sigkill", || {
+            Box::pin(async { sigterm_is_followed_by_sigkill() })
+        }),
+        check("interrupt_stops_the_test_and_the_run", || {
+            Box::pin(async { interrupt_stops_the_test_and_the_run() })
+        }),
+        check("a_passing_test_leaves_nothing_behind", || {
+            Box::pin(async { a_passing_test_leaves_nothing_behind() })
+        }),
+        check("registered_tests_run_through_testkit", || {
+            Box::pin(async { registered_tests_run_through_testkit() })
         }),
     ];
 
@@ -281,5 +300,145 @@ mod unix {
         assert_eq!(ready.status.code(), Some(2));
         assert!(stderr(&ready).contains("not ready after 1s"));
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    fn is_alive(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks the process exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Wait for a killed helper to go: once its parent is gone, init reaps it.
+    fn assert_gone(pid: libc::pid_t) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while is_alive(pid) {
+            assert!(Instant::now() < deadline, "helper {pid} outlived its test");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn read_pid(path: &Path) -> libc::pid_t {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(path)
+                && let Ok(pid) = pid.trim().parse()
+            {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "the hanging test never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn run_reports_every_outcome() {
+        let run = output(program("fixtures", &["run", "passes", "fails", "ignored"]));
+        assert_eq!(run.status.code(), Some(1));
+        // Test output is passed through.
+        assert!(stdout(&run).contains("passes: stdout"));
+        assert!(stderr(&run).contains("passes: stderr"));
+        assert!(stderr(&run).contains("1 passed, 1 failed, 1 skipped"));
+        assert!(stderr(&run).contains("FAIL fixture::fails: test failed"));
+    }
+
+    fn run_exit_codes() {
+        let pass = output(program("fixtures", &["run", "passes"]));
+        assert_eq!(pass.status.code(), Some(0));
+        let ignored = output(program(
+            "fixtures",
+            &["run", "ignored", "--include-ignored"],
+        ));
+        assert_eq!(ignored.status.code(), Some(0));
+        assert!(stderr(&ignored).contains("1 passed, 0 failed"));
+        // Selecting nothing to run is not a pass.
+        for args in [&["run", "nothing-matches"][..], &["run", "ignored"]] {
+            let none = output(program("fixtures", args));
+            assert_eq!(none.status.code(), Some(2), "{args:?}");
+            assert!(stderr(&none).contains("no tests to run"));
+        }
+        let usage = output(program("fixtures", &["run", "--timeout", "0"]));
+        assert_eq!(usage.status.code(), Some(2));
+    }
+
+    fn timeout_kills_the_process_group() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("pid");
+        let mut command = program(
+            "fixtures",
+            &["run", "hangs", "--timeout", "1", "--grace", "5"],
+        );
+        command.env(PID_FILE_ENV, &pid_file);
+        let started = Instant::now();
+        let run = output(command);
+        assert_eq!(run.status.code(), Some(1));
+        // `SIGTERM` stops the test well inside the grace period.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(stderr(&run).contains("TIMEOUT fixture::hangs: timed out after 1s"));
+        assert_gone(read_pid(&pid_file));
+    }
+
+    fn sigterm_is_followed_by_sigkill() {
+        let started = Instant::now();
+        let run = output(program(
+            "fixtures",
+            &[
+                "run",
+                "ignores_sigterm",
+                "--timeout",
+                "0.2",
+                "--grace",
+                "0.5",
+            ],
+        ));
+        assert_eq!(run.status.code(), Some(1));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(700), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+        assert!(stderr(&run).contains("TIMEOUT fixture::ignores_sigterm"));
+    }
+
+    fn interrupt_stops_the_test_and_the_run() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("pid");
+        let mut command = program("fixtures", &["run", "hangs", "passes", "--grace", "5"]);
+        command
+            .env(PID_FILE_ENV, &pid_file)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child: Child = command.spawn().expect("start the run");
+        let helper = read_pid(&pid_file);
+        // SAFETY: plain syscall to our own child, not yet reaped.
+        unsafe {
+            libc::kill(
+                libc::pid_t::try_from(child.id()).expect("pid"),
+                libc::SIGTERM,
+            );
+        }
+        let run = child.wait_with_output().expect("wait for the run");
+        eprintln!("{}", String::from_utf8_lossy(&run.stderr));
+        assert_eq!(run.status.code(), Some(2));
+        assert!(stderr(&run).contains("ERROR fixture::hangs: interrupted"));
+        assert_gone(helper);
+    }
+
+    fn a_passing_test_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("pid");
+        let mut command = program("fixtures", &["run", "leaves_a_helper"]);
+        command.env(PID_FILE_ENV, &pid_file);
+        let run = output(command);
+        assert_eq!(run.status.code(), Some(0));
+        assert_gone(read_pid(&pid_file));
+    }
+
+    fn registered_tests_run_through_testkit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let run = output(without_gateway(program("registered", &["run"]), dir.path()));
+        assert_eq!(run.status.code(), Some(1));
+        // `testkit::run` logs the description and the gateway.
+        assert!(stderr(&run).contains("[registered_needs_a_gateway] Needs a gateway."));
+        assert!(stderr(&run).contains("1 failed, 1 skipped"));
     }
 }
