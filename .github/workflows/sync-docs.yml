@@ -163,7 +163,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: "0.10.12"
+          version: "0.13.4"
           python-version: "3.13"
 
       - name: Update docs snapshot

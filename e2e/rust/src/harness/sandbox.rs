@@ -29,7 +29,7 @@ pub const E2E_WORKLOAD_IMAGE: &str = "openshell/e2e-python:dev";
 /// Preserve the existing pullable fixture for E2E lanes that cannot build the
 /// local container-engine fixture.
 #[cfg(not(any(feature = "e2e-docker", feature = "e2e-podman")))]
-pub const E2E_WORKLOAD_IMAGE: &str = "ghcr.io/astral-sh/uv:0.12.17-python3.12-trixie-slim@sha256:9a59bb7206905ccaae4f7dab222fbac47c125a21e5fc16f43f427cd6c940ade3";
+pub const E2E_WORKLOAD_IMAGE: &str = "ghcr.io/astral-sh/uv:0.13.4-python3.12-trixie-slim@sha256:0d42b7b065ada5139af940bf3fb178b926675450e786badc854c9f73736cc6c4";
 
 /// Extract the sandbox name from CLI create output.
 ///

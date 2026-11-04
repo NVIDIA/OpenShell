@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-FROM public.ecr.aws/docker/library/node:22-bookworm-slim
+FROM public.ecr.aws/docker/library/node:22.23.4-bookworm-slim@sha256:5991875dfb80938dd8a6ba3fe3e96fd04929e70792762b3319d8caadbbe229bc
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates iproute2 \

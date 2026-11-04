@@ -50,11 +50,28 @@
         "type": "github"
       }
     },
+    "nixpkgs-uv": {
+      "locked": {
+        "lastModified": 1792514193,
+        "narHash": "sha256-q8qbDVZy0GmabhCOnQTqFVho1hgJd85GePju462d7mc=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "7bfe60fe75d8c7171b95e6ec2d610d4778cc549b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "7bfe60fe75d8c7171b95e6ec2d610d4778cc549b",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",
         "nixpkgs-test-guest": "nixpkgs-test-guest",
+        "nixpkgs-uv": "nixpkgs-uv",
         "rust-overlay": "rust-overlay",
         "treefmt-nix": "treefmt-nix"
       }
