@@ -573,13 +573,29 @@ pub fn print_sandbox_header(
 // Sandbox provisioning helpers
 // ---------------------------------------------------------------------------
 
+/// Summarize why a sandbox is not ready yet.
+///
+/// A failing `PodScheduled` condition (for example `Unschedulable` with the
+/// scheduler's "0/N nodes are available" message) is preferred because the
+/// `Ready` condition may be replaced by a less specific reason such as
+/// `ConfigurationPending` while the pod cannot be placed.
 pub fn ready_false_condition_message(
     status: Option<&openshell_core::proto::SandboxStatus>,
 ) -> Option<String> {
-    let condition = status?.conditions.iter().find(|condition| {
-        condition.r#type == "Ready" && condition.status.eq_ignore_ascii_case("false")
-    })?;
+    let conditions = &status?.conditions;
+    let false_condition_message = |condition_type: &str| {
+        conditions
+            .iter()
+            .filter(|condition| {
+                condition.r#type == condition_type && condition.status.eq_ignore_ascii_case("false")
+            })
+            .find_map(condition_summary)
+    };
 
+    false_condition_message("PodScheduled").or_else(|| false_condition_message("Ready"))
+}
+
+fn condition_summary(condition: &openshell_core::proto::SandboxCondition) -> Option<String> {
     if condition.message.is_empty() {
         if condition.reason.is_empty() {
             None

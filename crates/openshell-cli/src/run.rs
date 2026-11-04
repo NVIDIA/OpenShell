@@ -8259,6 +8259,93 @@ mod tests {
     }
 
     #[test]
+    fn ready_false_condition_message_prefers_unschedulable_pod_scheduled_condition() {
+        let status = SandboxStatus {
+            agent_pod: "pending-pod".to_string(),
+            conditions: vec![
+                SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ConfigurationPending".to_string(),
+                    message: "Waiting for effective configuration validation".to_string(),
+                    transition_time: None,
+                },
+                SandboxCondition {
+                    r#type: "PodScheduled".to_string(),
+                    status: "False".to_string(),
+                    reason: "Unschedulable".to_string(),
+                    message: "0/11 nodes are available: 11 Insufficient cpu.".to_string(),
+                    transition_time: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ready_false_condition_message(Some(&status)).as_deref(),
+            Some("Unschedulable: 0/11 nodes are available: 11 Insufficient cpu.")
+        );
+    }
+
+    #[test]
+    fn ready_false_condition_message_ignores_scheduled_pod_condition() {
+        let status = SandboxStatus {
+            agent_pod: "scheduled-pod".to_string(),
+            conditions: vec![
+                SandboxCondition {
+                    r#type: "PodScheduled".to_string(),
+                    status: "True".to_string(),
+                    reason: String::new(),
+                    message: String::new(),
+                    transition_time: None,
+                },
+                SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ConfigurationPending".to_string(),
+                    message: "Waiting for effective configuration validation".to_string(),
+                    transition_time: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ready_false_condition_message(Some(&status)).as_deref(),
+            Some("ConfigurationPending: Waiting for effective configuration validation")
+        );
+    }
+
+    #[test]
+    fn ready_false_condition_message_falls_back_when_pod_scheduled_has_no_detail() {
+        let status = SandboxStatus {
+            agent_pod: "pending-pod".to_string(),
+            conditions: vec![
+                SandboxCondition {
+                    r#type: "PodScheduled".to_string(),
+                    status: "False".to_string(),
+                    reason: String::new(),
+                    message: String::new(),
+                    transition_time: None,
+                },
+                SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ConfigurationPending".to_string(),
+                    message: String::new(),
+                    transition_time: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ready_false_condition_message(Some(&status)).as_deref(),
+            Some("ConfigurationPending")
+        );
+    }
+
+    #[test]
     fn provisioning_timeout_message_includes_condition_and_gpu_hint() {
         let resource_requirements = ResourceRequirements {
             gpu: Some(GpuResourceRequirements { count: None }),
