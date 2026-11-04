@@ -457,7 +457,7 @@ impl BoundaryLoopbackConnector for LocalLoopbackConnector {
             runtime.ensure_active()?;
         }
         let addr = std::net::SocketAddr::new(target.host(), target.port());
-        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[addr])
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(addr)
             .await
             .map_err(|e| BackendError::Process(format!("port-forward connect to {addr}: {e}")))?;
         if let Some(runtime) = &self.runtime {

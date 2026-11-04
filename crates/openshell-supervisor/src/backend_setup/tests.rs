@@ -897,9 +897,12 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
     assert!(!readiness.exists());
     assert!(!marker.exists());
     assert!(
-        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, health_port))
-            .await
-            .is_err()
+        openshell_core::net::connect_tcp_nodelay_best_effort((
+            std::net::Ipv4Addr::LOCALHOST,
+            health_port
+        ))
+        .await
+        .is_err()
     );
     setup
         .observed
@@ -925,9 +928,12 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
     assert!(!readiness.exists());
     assert!(!marker.exists());
     assert!(
-        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, health_port))
-            .await
-            .is_err()
+        openshell_core::net::connect_tcp_nodelay_best_effort((
+            std::net::Ipv4Addr::LOCALHOST,
+            health_port
+        ))
+        .await
+        .is_err()
     );
 
     setup
@@ -939,7 +945,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             loop {
                 if marker.exists()
                     && tokio::net::UnixStream::connect(&readiness).await.is_ok()
-                    && tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, health_port))
+                    && openshell_core::net::connect_tcp_nodelay_best_effort((std::net::Ipv4Addr::LOCALHOST, health_port))
                         .await
                         .is_ok()
                 {
@@ -976,9 +982,12 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
     // Listener tasks are aborted on drop; let the runtime reap their sockets.
     tokio::task::yield_now().await;
     assert!(
-        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, health_port))
-            .await
-            .is_err()
+        openshell_core::net::connect_tcp_nodelay_best_effort((
+            std::net::Ipv4Addr::LOCALHOST,
+            health_port
+        ))
+        .await
+        .is_err()
     );
 }
 

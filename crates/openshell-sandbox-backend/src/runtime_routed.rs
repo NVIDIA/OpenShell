@@ -590,7 +590,7 @@ mod tests {
         route: &str,
         identity: &SandboxTlsMaterial,
     ) -> std::io::Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
-        let mut stream = tokio::net::TcpStream::connect(router).await?;
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(router).await?;
         stream
             .write_all(&encode_route_preface(route).unwrap())
             .await?;
@@ -599,7 +599,9 @@ mod tests {
 
     /// A redirect-aware runtime: negotiate `route` with the router.
     async fn negotiate(router: SocketAddr, route: &str) -> (tokio::net::TcpStream, RouteReply) {
-        let mut stream = tokio::net::TcpStream::connect(router).await.unwrap();
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(router)
+            .await
+            .unwrap();
         let reply = negotiate_route(&mut stream, route).await.unwrap();
         (stream, reply)
     }
@@ -756,7 +758,9 @@ mod tests {
         );
 
         // A version 1 runtime cannot follow a redirect and gets no reply.
-        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+            .await
+            .unwrap();
         stream
             .write_all(&encode_route_preface(&elsewhere).unwrap())
             .await

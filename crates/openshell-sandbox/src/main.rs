@@ -1113,6 +1113,10 @@ fn probe_tcp_dns_socket_round_trip() -> Result<()> {
 
     const DNS_QUERY: &[u8] =
         b"\x56\x78\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05probe\x09openshell\x04test\x00\x00\x01\x00\x01";
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the probe checks that setsockopt succeeds through the mediated path"
+    )]
     let mut stream = std::net::TcpStream::connect("127.0.0.53:53").into_diagnostic()?;
     stream.set_nodelay(true).into_diagnostic()?;
     stream

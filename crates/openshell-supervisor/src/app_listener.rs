@@ -1102,7 +1102,7 @@ mod tests {
         host: &str,
         extra: &str,
     ) -> String {
-        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[f.address])
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(f.address)
             .await
             .unwrap();
         let server_name = rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap();
@@ -1131,7 +1131,7 @@ mod tests {
         use http_body_util::BodyExt as _;
 
         let f = fixture();
-        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[f.address])
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(f.address)
             .await
             .unwrap();
         let tls = tokio_rustls::TlsConnector::from(f.tls.clone())
@@ -1430,7 +1430,7 @@ mod tests {
     #[tokio::test]
     async fn websocket_echo_closes_on_route_withdrawal() {
         let f = fixture();
-        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[f.address])
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(f.address)
             .await
             .unwrap();
         let name = rustls::pki_types::ServerName::try_from(HOST.to_string()).unwrap();
@@ -1480,7 +1480,7 @@ mod tests {
 
     async fn sandbox_websocket(f: &Fixture, sandbox: &str, service: &str) -> TestWebSocket {
         let host = format!("default--{sandbox}--{service}.svc.openshell.internal");
-        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[f.address])
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(f.address)
             .await
             .unwrap();
         let name = rustls::pki_types::ServerName::try_from(host.clone()).unwrap();

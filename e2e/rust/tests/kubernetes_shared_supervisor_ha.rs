@@ -513,6 +513,10 @@ impl GatewayForward {
         Self { port, child: None }
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the e2e workspace does not depend on openshell-core"
+    )]
     async fn reachable(&self) -> bool {
         tokio::net::TcpStream::connect(("127.0.0.1", self.port))
             .await

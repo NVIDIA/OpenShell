@@ -1938,9 +1938,10 @@ mod tests {
             Some(SandboxInstancePhaseReport::Supervising)
         );
         assert!(kept_stops.try_recv().is_err());
-        let mut stream = tokio::net::TcpStream::connect(host.router.local_addr())
-            .await
-            .unwrap();
+        let mut stream =
+            openshell_core::net::connect_tcp_nodelay_best_effort(host.router.local_addr())
+                .await
+                .unwrap();
         assert_eq!(
             openshell_sandbox_backend::runtime_routed::negotiate_route(&mut stream, elsewhere)
                 .await
