@@ -212,6 +212,7 @@ configuration, and access control.
 | Signal | Metrics | Use |
 |---|---|---|
 | Sessions per replica | `openshell_server_supervisor_sessions` | Placement and skew. Do not scale on it. |
+| Session placement | `openshell_server_supervisor_session_redirects_total`, `openshell_server_supervisor_session_off_ring_admissions_total`, `openshell_server_gateway_ring_members` | On gateways that place supervisor sessions by ring, redirects and off-ring admissions rise when a replica stops or joins. A sustained off-ring rate while membership is stable means replicas disagree on the ring or redirect dials fail. Once a rollout settles, every pod's ring size equals the number of gateway replicas. Under `supervisor_topology: gateway`, the shared supervisor's host moves sessions, so redirects and off-ring admissions do not reflect them. |
 | Relay utilization | `openshell_server_relay_pending`, `openshell_server_relay_pending_capacity` | Graph it. It is transient and usually near 0, so alert on rejections instead. |
 | Relay rejections | `openshell_server_relay_rejected_total` | Alert on any increase. |
 | Relay claims | `openshell_server_relay_claim_duration_seconds`, `openshell_server_relay_expired_total` | Supervisor connect-back time for exec, SSH, forwarding, and service traffic, including relays requested through peers. A high 99th percentile while rejections stay flat points at the supervisor or its node, not at relay capacity. Relays not claimed within 10 seconds are missing from the histogram and count as expired, so alert on any increase. |
@@ -552,7 +553,9 @@ SQLite file is not an HA deployment.
 By default, the Kubernetes driver runs a supervisor Pod for each sandbox. With
 the multi-tenant topology, a shared supervisor Deployment hosts many sandboxes,
 and each sandbox keeps its own policy and identity. Supervisor replicas are
-independent of the gateway replica count.
+independent of the gateway replica count. Because the shared supervisor's host
+places its sessions, sandbox moves under this topology do not appear in the
+gateway placement metrics listed in [Monitor Capacity](#monitor-capacity).
 
 Enable the topology in your release values. Run at least two supervisor
 replicas so sandboxes can fail over:

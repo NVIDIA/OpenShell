@@ -1077,6 +1077,14 @@ impl ComputeRuntime {
         self.supervisor_host.as_ref()
     }
 
+    /// Whether this gateway places supervisor sessions by the placement ring. A gateway
+    /// coordinating a shared supervisor does not: the host moves those sessions, so a
+    /// redirected hello is not an off-ring admission there and the counter is not exported.
+    #[must_use]
+    pub fn places_supervisor_sessions_by_ring(&self) -> bool {
+        self.supervisor_host().is_none()
+    }
+
     pub(crate) fn configure_ssh_identities(
         &self,
         credentials: crate::credentials::CredentialRuntime,

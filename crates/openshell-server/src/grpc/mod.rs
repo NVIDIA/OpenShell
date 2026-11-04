@@ -1001,7 +1001,8 @@ pub mod test_support {
         Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
     };
     use crate::compute::{
-        NoopTestDriver, new_test_runtime, new_test_runtime_for_driver, new_test_runtime_with_driver,
+        ComputeRuntime, NoopTestDriver, new_test_runtime, new_test_runtime_for_driver,
+        new_test_runtime_with_driver,
     };
     use crate::persistence::Store;
     use crate::sandbox_index::SandboxIndex;
@@ -1076,10 +1077,33 @@ pub mod test_support {
         features: StreamFeatures,
         connection_epoch: u64,
     ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        connect_supervisor_stream_with_hello(
+            state,
+            SupervisorHello {
+                sandbox_id: sandbox_id.into(),
+                instance_id: "instance".into(),
+                supports_config_push: features == StreamFeatures::Apply,
+                connection_epoch,
+                supports_provider_readiness: false,
+                redirected: false,
+                supports_session_redirect: false,
+            },
+        )
+        .await
+    }
+
+    /// Serve `state` on loopback and open a supervisor stream that sends
+    /// `hello` as-is, authenticated as the sandbox the hello names. Returns
+    /// the gRPC status when the gateway rejects the stream before accepting
+    /// it.
+    pub async fn connect_supervisor_stream_with_hello(
+        state: &Arc<ServerState>,
+        hello: SupervisorHello,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let principal = Principal::Sandbox(SandboxPrincipal {
-            sandbox_id: sandbox_id.to_string(),
+            sandbox_id: hello.sandbox_id.clone(),
             source: SandboxIdentitySource::BootstrapJwt {
                 issuer: "openshell-gateway:test".to_string(),
                 auth_epoch: None,
@@ -1106,15 +1130,7 @@ pub mod test_support {
         let (outbound, rx) = mpsc::channel(4);
         outbound
             .send(SupervisorMessage {
-                payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
-                    sandbox_id: sandbox_id.into(),
-                    instance_id: "instance".into(),
-                    supports_config_push: features == StreamFeatures::Apply,
-                    connection_epoch,
-                    supports_provider_readiness: false,
-                    redirected: false,
-                    supports_session_redirect: false,
-                })),
+                payload: Some(supervisor_message::Payload::Hello(hello)),
             })
             .await
             .unwrap();
@@ -1188,9 +1204,60 @@ pub mod test_support {
         state
     }
 
+    const IN_MEMORY_DATABASE_URL: &str = "sqlite::memory:?cache=shared";
+
+    /// Config shared by the in-memory test states. `database_url` is recorded
+    /// only when the state claims one; a caller-supplied store leaves it unset.
+    fn test_gateway_config(database_url: Option<&str>) -> Config {
+        let config = Config::new(None).with_credential_drivers(["test-static"]);
+        match database_url {
+            Some(url) => config.with_database_url(url),
+            None => config,
+        }
+    }
+
+    /// Assemble a test state from the pieces the builders below vary on: the
+    /// store, the compute runtime, and the config.
+    fn test_server_state_from_parts(
+        store: Arc<Store>,
+        compute: ComputeRuntime,
+        config: Config,
+    ) -> Arc<ServerState> {
+        with_test_provider_profile_sources(Arc::new(ServerState::new(
+            config,
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+        )))
+    }
+
     /// Build an in-memory `ServerState` for unit tests.
     pub async fn test_server_state() -> Arc<ServerState> {
         test_server_state_with_driver("test").await
+    }
+
+    /// Build a test state whose compute runtime coordinates a shared supervisor host, the
+    /// regime a gateway under `supervisor_topology: gateway` runs: it moves supervisor
+    /// sessions from the host instead of placing them by ring. The bare controller is enough
+    /// for code that only reads its presence.
+    pub async fn test_server_state_with_supervisor_host() -> Arc<ServerState> {
+        let store = Arc::new(Store::connect(IN_MEMORY_DATABASE_URL).await.unwrap());
+        crate::ensure_default_workspace(&store).await.unwrap();
+        seed_example_provider_profiles(&store).await;
+        let compute = new_test_runtime(store.clone())
+            .await
+            .with_supervisor_host(Some(
+                openshell_supervisor_control::SupervisorHostController::new(),
+            ));
+        test_server_state_from_parts(
+            store,
+            compute,
+            test_gateway_config(Some(IN_MEMORY_DATABASE_URL)),
+        )
     }
 
     /// Build a test state for a gateway with nothing imported.
@@ -1210,37 +1277,22 @@ pub mod test_support {
         driver_name: &str,
         driver: Arc<NoopTestDriver>,
     ) -> Arc<ServerState> {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
+        let store = Arc::new(Store::connect(IN_MEMORY_DATABASE_URL).await.unwrap());
         crate::ensure_default_workspace(&store).await.unwrap();
         seed_example_provider_profiles(&store).await;
         let compute = new_test_runtime_with_driver(store.clone(), driver_name, driver);
-        with_test_provider_profile_sources(Arc::new(ServerState::new(
-            Config::new(None)
-                .with_database_url("sqlite::memory:?cache=shared")
-                .with_credential_drivers(["test-static"]),
+        test_server_state_from_parts(
             store,
             compute,
-            SandboxIndex::new(),
-            SandboxWatchBus::new(),
-            TracingLogBus::new(),
-            Arc::new(SupervisorSessionRegistry::new()),
-            None,
-        )))
+            test_gateway_config(Some(IN_MEMORY_DATABASE_URL)),
+        )
     }
 
     async fn test_server_state_for_driver(
         driver_name: &str,
         seed_profiles: bool,
     ) -> Arc<ServerState> {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
+        let store = Arc::new(Store::connect(IN_MEMORY_DATABASE_URL).await.unwrap());
         crate::ensure_default_workspace(&store).await.unwrap();
         if seed_profiles {
             seed_example_provider_profiles(&store).await;
@@ -1250,18 +1302,22 @@ pub mod test_support {
         } else {
             new_test_runtime_for_driver(store.clone(), driver_name).await
         };
-        with_test_provider_profile_sources(Arc::new(ServerState::new(
-            Config::new(None)
-                .with_database_url("sqlite::memory:?cache=shared")
-                .with_credential_drivers(["test-static"]),
+        test_server_state_from_parts(
             store,
             compute,
-            SandboxIndex::new(),
-            SandboxWatchBus::new(),
-            TracingLogBus::new(),
-            Arc::new(SupervisorSessionRegistry::new()),
-            None,
-        )))
+            test_gateway_config(Some(IN_MEMORY_DATABASE_URL)),
+        )
+    }
+
+    /// Build a test state on a store the caller provides, such as a disposable
+    /// `PostgreSQL` schema. Like the states above, it sets up the default
+    /// workspace, test compute runtime, provider sources, and credential
+    /// drivers, but configures no database URL and seeds no provider profiles.
+    pub async fn test_server_state_for_store(store: Store) -> Arc<ServerState> {
+        let store = Arc::new(store);
+        crate::ensure_default_workspace(&store).await.unwrap();
+        let compute = new_test_runtime(store.clone()).await;
+        test_server_state_from_parts(store, compute, test_gateway_config(None))
     }
 
     /// Build a test state whose compute driver fails the requested number of
@@ -1269,27 +1325,16 @@ pub mod test_support {
     pub async fn test_server_state_with_workspace_cleanup_failures(
         failures: usize,
     ) -> Arc<ServerState> {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
+        let store = Arc::new(Store::connect(IN_MEMORY_DATABASE_URL).await.unwrap());
         crate::ensure_default_workspace(&store).await.unwrap();
         seed_example_provider_profiles(&store).await;
         let driver = Arc::new(NoopTestDriver::failing_workspace_deletes(failures));
         let compute = new_test_runtime_with_driver(store.clone(), "test", driver);
-        with_test_provider_profile_sources(Arc::new(ServerState::new(
-            Config::new(None)
-                .with_database_url("sqlite::memory:?cache=shared")
-                .with_credential_drivers(["test-static"]),
+        test_server_state_from_parts(
             store,
             compute,
-            SandboxIndex::new(),
-            SandboxWatchBus::new(),
-            TracingLogBus::new(),
-            Arc::new(SupervisorSessionRegistry::new()),
-            None,
-        )))
+            test_gateway_config(Some(IN_MEMORY_DATABASE_URL)),
+        )
     }
 }
 

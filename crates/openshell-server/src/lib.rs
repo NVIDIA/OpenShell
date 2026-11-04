@@ -381,7 +381,9 @@ pub struct ServerState {
 
     /// Latest placement ring, refreshed from live gateway membership. Decides
     /// which replica *should* own a sandbox; the owner record in the store
-    /// remains authoritative for which one does.
+    /// remains authoritative for which one does. Production code writes it
+    /// only through `gateway_members::publish_ring`, which keeps the
+    /// ring-members gauge in step.
     pub gateway_ring: Arc<std::sync::RwLock<gateway_ring::GatewayRing>>,
 
     /// Peer endpoints of live replicas, keyed by replica ID. Refreshed
@@ -1104,6 +1106,7 @@ pub(crate) async fn run_server(
             gateway_metrics::install_global_recorder(
                 supervisor_session::RELAY_CAPACITY,
                 store.mutation_lock_connections(),
+                state.compute.places_supervisor_sessions_by_ring(),
             )
             .map(|prometheus_handle| (metrics_bind_address, prometheus_handle))
         })
@@ -3954,6 +3957,52 @@ mod tests {
         assert!(
             !start_attempted.load(Ordering::SeqCst),
             "persisted sandbox start must not run before the gateway listener is bound"
+        );
+    }
+
+    /// `run_server` installs the process-wide recorder with the off-ring gate it derives from
+    /// the compute runtime it built, so a gateway coordinating a shared supervisor starts with
+    /// no `openshell_server_supervisor_session_off_ring_admissions_total` series at all: no
+    /// HELP, no TYPE, no zero value. The regime tests call `describe_and_initialize` with a
+    /// literal bool, so this is the only test that exercises `install_global_recorder`. It pins
+    /// the predicate the production call site passes instead of starting `run_server`.
+    #[tokio::test]
+    async fn install_global_recorder_gates_the_off_ring_series_from_the_compute_runtime() {
+        let pool_state = crate::grpc::test_support::test_server_state_with_supervisor_host().await;
+        let ring_state = crate::grpc::test_support::test_server_state().await;
+        assert!(
+            !pool_state.compute.places_supervisor_sessions_by_ring(),
+            "a gateway coordinating a shared supervisor does not export the off-ring counter"
+        );
+        assert!(
+            ring_state.compute.places_supervisor_sessions_by_ring(),
+            "a gateway placing supervisor sessions by ring exports the off-ring counter"
+        );
+
+        // The recorder installs once per process, so this test covers the regime the
+        // operator-facing contract cares about: a pool gateway must start with no series. The
+        // `describe_and_initialize` tests cover the mirrored true flag.
+        let handle = super::gateway_metrics::install_global_recorder(
+            super::supervisor_session::RELAY_CAPACITY,
+            None,
+            pool_state.compute.places_supervisor_sessions_by_ring(),
+        )
+        .expect("install the process-wide recorder from the test process");
+
+        let rendered = handle.render();
+        let off_ring = super::gateway_metrics::SUPERVISOR_SESSION_OFF_RING_ADMISSIONS_TOTAL;
+        assert!(
+            !rendered.contains(off_ring),
+            "a shared-supervisor gateway must export no {off_ring} HELP, TYPE, or value"
+        );
+        // The rest of the catalog is still described and zero-initialized.
+        assert!(
+            rendered.contains("# HELP openshell_server_supervisor_sessions "),
+            "the recorder still initializes the supervisor session gauge"
+        );
+        assert!(
+            rendered.contains("# HELP openshell_server_supervisor_session_redirects_total "),
+            "the recorder still initializes the redirect counter"
         );
     }
 }
