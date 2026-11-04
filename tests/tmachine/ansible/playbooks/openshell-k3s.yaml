@@ -63,6 +63,7 @@
     # Tests run in the guest, so host.openshell.internal must resolve to the
     # node itself. QEMU user networking gives every boot the same guest
     # address (10.0.2.15), so the value stays valid when the disk is reused.
+    # The node can also list an IPv6 address after it, so take the IPv4 one.
     - name: Discover the K3s node address
       ansible.builtin.command:
         argv:
@@ -74,9 +75,15 @@
           - --output=jsonpath={.items[0].status.addresses[?(@.type=="InternalIP")].address}
       register: k3s_node_address
       changed_when: false
-      until: k3s_node_address.rc == 0 and k3s_node_address.stdout is match('^[0-9.]+$')
+      until: >-
+        k3s_node_address.rc == 0
+        and k3s_node_address.stdout.split() | select('match', '^[0-9.]+$') | list | length > 0
       retries: 30
       delay: 2
+
+    - name: Select the K3s node IPv4 address
+      ansible.builtin.set_fact:
+        k3s_node_ipv4: "{{ k3s_node_address.stdout.split() | select('match', '^[0-9.]+$') | first }}"
 
     - name: Write OpenShell Helm values
       ansible.builtin.copy:
@@ -107,7 +114,7 @@
             auth:
               allowUnauthenticatedUsers: true
             disableTls: true
-            hostGatewayIP: "{{ k3s_node_address.stdout }}"
+            hostGatewayIP: "{{ k3s_node_ipv4 }}"
             telemetryEnabled: false
 
     - name: Write OpenShell Helm values overlay
