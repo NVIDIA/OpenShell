@@ -447,6 +447,22 @@ pub struct BinaryIdentity {
     /// Absolute script/interpreter paths drawn from the process cmdlines.
     /// Diagnostic context; never authorizes.
     pub cmdline_paths: Vec<PathBuf>,
+    /// Process that owns the connection. Audit context; never authorizes.
+    /// `None` when the backend cannot observe it.
+    #[serde(default)]
+    pub process: Option<ProcessInstance>,
+}
+
+/// One process in the workload's PID namespace. A PID can be reused after the
+/// process exits; the start time tells the two processes apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessInstance {
+    /// Thread-group ID.
+    pub pid: u32,
+    /// Parent's thread-group ID.
+    pub parent_pid: u32,
+    /// Start time in milliseconds since the Unix epoch.
+    pub start_time_ms: i64,
 }
 
 /// A SHA-256 digest, kept typed so the identity field is not coupled to its

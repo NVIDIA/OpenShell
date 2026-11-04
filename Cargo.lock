@@ -4343,6 +4343,7 @@ version = "0.0.0"
 dependencies = [
  "openshell-crypto",
  "openshell-isolation-interface",
+ "rustix 1.1.4",
 ]
 
 [[package]]

@@ -261,6 +261,7 @@ impl WireMessage for w::BinaryIdentityWire {
                     executable,
                     ancestors,
                     cmdline_paths,
+                    process,
                 } => R::Resolved(p::ResolvedBinaryIdentity {
                     executable: Some(executable.to_proto()?),
                     ancestors: ancestors
@@ -271,6 +272,17 @@ impl WireMessage for w::BinaryIdentityWire {
                         .iter()
                         .map(|v| path(v))
                         .collect::<Result<_, _>>()?,
+                    process: process
+                        .map(|v| -> Result<_, FrameError> {
+                            Ok(p::ProcessInstance {
+                                pid: v.pid,
+                                parent_pid: v.parent_pid,
+                                start_time: Some(timestamp(
+                                    u64::try_from(v.start_time_ms).map_err(invalid)?,
+                                )?),
+                            })
+                        })
+                        .transpose()?,
                 }),
                 Self::Failed { message } => R::Failed(message.clone()),
             }),
@@ -287,6 +299,17 @@ impl WireMessage for w::BinaryIdentityWire {
                     .map(w::ExecutableIdentityWire::from_proto)
                     .collect::<Result<_, _>>()?,
                 cmdline_paths: v.cmdline_paths.into_iter().map(PathBuf::from).collect(),
+                process: v
+                    .process
+                    .map(|v| -> Result<_, FrameError> {
+                        Ok(c::ProcessInstance {
+                            pid: v.pid,
+                            parent_pid: v.parent_pid,
+                            start_time_ms: i64::try_from(millis(required(v.start_time)?)?)
+                                .map_err(invalid)?,
+                        })
+                    })
+                    .transpose()?,
             },
             R::Failed(message) => Self::Failed { message },
         })
@@ -941,6 +964,38 @@ mod tests {
         spec.otlp_relay_active = true;
         let decoded = w::AgentSpecWire::from_proto(spec.to_proto().unwrap()).unwrap();
         assert!(decoded.otlp_relay_active);
+    }
+
+    #[test]
+    fn binary_identity_carries_the_owning_process_only_when_present() {
+        let resolved = |process| {
+            w::BinaryIdentityWire::from(Ok(c::BinaryIdentity {
+                executable: c::ExecutableIdentity {
+                    path: "/usr/bin/curl".into(),
+                    digest: Some("a".repeat(64).parse().unwrap()),
+                },
+                ancestors: vec![],
+                cmdline_paths: vec![],
+                process,
+            }))
+        };
+        let process = c::ProcessInstance {
+            pid: 57,
+            parent_pid: 42,
+            start_time_ms: 1_793_750_400_123,
+        };
+        for identity in [resolved(Some(process)), resolved(None)] {
+            let decoded = w::BinaryIdentityWire::from_proto(identity.to_proto().unwrap()).unwrap();
+            assert_eq!(decoded, identity);
+        }
+
+        let mut missing_start = resolved(Some(process)).to_proto().unwrap();
+        let Some(p::binary_identity::Result::Resolved(resolved)) = missing_start.result.as_mut()
+        else {
+            panic!("resolved identity");
+        };
+        resolved.process.as_mut().unwrap().start_time = None;
+        assert!(w::BinaryIdentityWire::from_proto(missing_start).is_err());
     }
 
     #[test]

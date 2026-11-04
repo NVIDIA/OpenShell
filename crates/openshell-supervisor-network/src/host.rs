@@ -204,6 +204,7 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         },
         ancestors: Vec::new(),
         cmdline_paths: Vec::new(),
+        process: None,
     };
     let proxy = ProxyHandle::start_with_bind_addr(
         &proxy_policy,

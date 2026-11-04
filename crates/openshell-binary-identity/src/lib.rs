@@ -11,7 +11,7 @@
 
 use openshell_isolation_interface::contract::{BinaryIdentity, ResolveError};
 #[cfg(target_os = "linux")]
-use openshell_isolation_interface::contract::{ExecutableIdentity, Sha256Digest};
+use openshell_isolation_interface::contract::{ExecutableIdentity, ProcessInstance, Sha256Digest};
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
@@ -152,7 +152,56 @@ fn resolve_linux_process(
         executable: executable_identity,
         ancestors,
         cmdline_paths,
+        process: process_instance(&snapshot),
     })
+}
+
+/// The process that owns `snapshot`'s task. A connection's task can be any
+/// thread, so the PID and start time are the thread-group leader's. Audit
+/// context only: unreadable values leave the identity without a process.
+#[cfg(target_os = "linux")]
+fn process_instance(snapshot: &ProcessSnapshot) -> Option<ProcessInstance> {
+    let pid = snapshot.thread_group;
+    let start_time = if pid == snapshot.pid {
+        snapshot.start_time
+    } else {
+        process_stat(pid).ok()?.1
+    };
+    Some(ProcessInstance {
+        pid,
+        parent_pid: snapshot.parent_pid,
+        start_time_ms: start_time_ms(start_time)?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn thread_group_id(tid: u32) -> Result<u32, ResolveError> {
+    let path = format!("/proc/{tid}/status");
+    std::fs::read_to_string(&path)
+        .map_err(|error| ResolveError::Failed(format!("read {path}: {error}")))?
+        .lines()
+        .find_map(|line| line.strip_prefix("Tgid:"))
+        .and_then(|value| value.trim().parse().ok())
+        .ok_or_else(|| ResolveError::Failed(format!("parse {path}: missing Tgid")))
+}
+
+/// Convert a `/proc/<pid>/stat` start time, in clock ticks since boot, to
+/// milliseconds since the Unix epoch.
+#[cfg(target_os = "linux")]
+fn start_time_ms(ticks: u64) -> Option<i64> {
+    static BOOT_TIME_SECS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let boot_secs = (*BOOT_TIME_SECS.get_or_init(|| {
+        std::fs::read_to_string("/proc/stat")
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("btime "))?
+            .trim()
+            .parse()
+            .ok()
+    }))?;
+    let ticks_per_sec = rustix::param::clock_ticks_per_second();
+    let since_boot_ms = ticks.checked_mul(1_000)?.checked_div(ticks_per_sec)?;
+    i64::try_from(boot_secs.checked_mul(1_000)?.checked_add(since_boot_ms)?).ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -181,6 +230,7 @@ fn resolve_open_executable(
 #[derive(Debug, PartialEq, Eq)]
 struct ProcessSnapshot {
     pid: u32,
+    thread_group: u32,
     parent_pid: u32,
     binary_path: std::path::PathBuf,
     executable_device: u64,
@@ -262,6 +312,7 @@ fn open_process_snapshot(pid: u32) -> Result<(ProcessSnapshot, std::fs::File), R
     let (parent_pid, start_time) = process_stat(pid)?;
     let snapshot = ProcessSnapshot {
         pid,
+        thread_group: thread_group_id(pid)?,
         parent_pid,
         binary_path,
         executable_device: metadata.dev(),
@@ -288,6 +339,7 @@ fn validate_process_snapshot(pid: u32, expected: &ProcessSnapshot) -> Result<(),
     let (parent_pid, start_time) = process_stat(pid)?;
     let current = ProcessSnapshot {
         pid,
+        thread_group: thread_group_id(pid)?,
         parent_pid,
         binary_path: executable_path(pid)?,
         executable_device: metadata.dev(),
@@ -395,7 +447,8 @@ fn collect_ancestor_processes(
 ) -> Result<Vec<(ProcessSnapshot, std::fs::File)>, ResolveError> {
     const MAX_DEPTH: usize = 64;
 
-    if ancestor_root == Some(process.pid) {
+    // A thread of the root process has the root's ancestry.
+    if ancestor_root == Some(process.thread_group) {
         return Ok(Vec::new());
     }
 
@@ -577,6 +630,50 @@ mod tests {
             resolve_open_executable(&snapshot, &mut executable, &cache, &mut pending).unwrap();
         assert_eq!(reused.digest, Some(sentinel));
         assert!(cache.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn identity_names_the_process_that_owns_a_thread() {
+        let pid = std::process::id();
+        let resolver = ProcfsIdentityResolver::for_process_tree(pid);
+        let leader = resolver
+            .resolve(pid)
+            .expect("resolve leader")
+            .process
+            .expect("leader process");
+
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let link = std::fs::read_link("/proc/thread-self").expect("read thread-self");
+            let tid: u32 = link
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.parse().ok())
+                .expect("thread ID");
+            tid_tx.send(tid).unwrap();
+            let _ = done_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        let from_thread = resolver.resolve(tid).expect("resolve thread");
+        done_tx.send(()).unwrap();
+        thread.join().unwrap();
+
+        assert_ne!(tid, pid);
+        assert!(from_thread.ancestors.is_empty());
+        assert_eq!(from_thread.process, Some(leader));
+        assert_eq!(leader.pid, pid);
+        assert_eq!(leader.parent_pid, std::os::unix::process::parent_id());
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        // btime has one-second resolution.
+        assert!(leader.start_time_ms <= now_ms + 1_000);
+        assert!(now_ms - leader.start_time_ms < 600_000);
     }
 
     #[test]

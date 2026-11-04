@@ -4123,6 +4123,7 @@ mod tests {
                     },
                     ancestors: Vec::new(),
                     cmdline_paths: Vec::new(),
+                    process: None,
                 },
                 timing: crate::boundary_protocol::MediationTimingWire::default(),
             };

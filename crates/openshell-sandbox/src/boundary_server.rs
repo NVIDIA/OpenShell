@@ -8484,6 +8484,7 @@ mod linux {
                     },
                     ancestors: Vec::new(),
                     cmdline_paths: Vec::new(),
+                    process: None,
                 })
             };
             assert!(boundary.binary_pins.admit(tool('a')).is_ok());
