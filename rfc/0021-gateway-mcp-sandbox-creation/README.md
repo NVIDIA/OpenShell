@@ -906,7 +906,9 @@ reused; its grants, lineage store and result files are not part of this design.
 - **An approved template is approved for every agent in the workspace.** The
   `openshell.ai/agent-usable` label is per template, not per parent, so any
   root in the workspace can start children from it. Administrators should
-  label only templates whose image they would let any agent there run.
+  label only templates whose image they would let any agent there run, and
+  whose binary paths and users match the policies of the roots that will use
+  them.
 - **Downgrading the gateway turns children into roots.** An older gateway does
   not know the `parent` field and drops it the next time it saves a child's
   record. The child becomes a root that keeps its copied policy and providers
@@ -925,6 +927,14 @@ reused; its grants, lineage store and result files are not part of this design.
   The child is told why and the gateway logs it once per parent version; the
   fix is a parent policy that can be copied.
 - **No GPU for children created by agents without a template.**
+- **A child's policy is written for its parent's image.** A child that runs a
+  different image, from a template or a user's `--image`, keeps the parent's
+  binary paths, filesystem paths and process user. Programs at other paths
+  are denied network access, paths the parent's image lacks are inaccessible,
+  and the child's own baseline paths are dropped with its startup write-back.
+  If none of the listed filesystem paths exist in the child's image, the
+  default `best_effort` Landlock mode runs it without filesystem rules and
+  logs a high-severity finding. Narrowing a child's policy is the planned fix.
 - **`created_by` holds two forms**, a user's subject or `sandbox:<id>`, so an
   identity provider subject that starts with `sandbox:` would read like a
   sandbox. Nothing decides access from a child's `created_by`, so the worst
