@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use miette::Result;
 use openshell_core::SandboxSessionId;
+use openshell_core::filesystem_baseline::FilesystemBaseline;
 use openshell_core::jwt::{SessionBearerTokenSlot, SupervisorAuthBundle};
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_isolation_interface::AgentSpec;
@@ -58,6 +59,13 @@ pub trait BackendSetup: Sync {
     /// Name chosen by trusted composition and checked against admission before decoding.
     fn backend_name(&self) -> &str;
 
+    /// Trusted proxy prerequisites. `None` retains legacy Linux image defaults;
+    /// an explicit empty baseline suppresses them. Match the compute driver's
+    /// advertised baseline so policy admission precedes immutable signing.
+    fn proxy_filesystem_baseline(&self) -> Option<FilesystemBaseline> {
+        None
+    }
+
     /// Decode native launch data without starting workload code. The returned
     /// identity must describe the same resource retained by the prepared backend.
     fn decode(
@@ -91,6 +99,7 @@ pub struct SelectedBackend {
     descriptor: BackendDescriptor,
     identity: LaunchIdentity,
     prepared: Box<dyn PreparedBackend>,
+    proxy_filesystem_baseline: Option<FilesystemBaseline>,
 }
 
 impl SelectedBackend {
@@ -137,16 +146,28 @@ impl SelectedBackend {
                 "supervisor authentication bundle does not match runtime generation"
             ));
         }
+        let proxy_filesystem_baseline = setup.proxy_filesystem_baseline();
+        if let Some(baseline) = &proxy_filesystem_baseline {
+            baseline
+                .validate()
+                .map_err(|error| miette::miette!(error))?;
+        }
         Ok(Self {
             descriptor,
             identity,
             prepared,
+            proxy_filesystem_baseline,
         })
     }
 
     /// Return the backend name already matched to the admitted selection.
     pub fn backend_name(&self) -> &str {
         &self.descriptor.backend_name
+    }
+
+    /// Baseline captured only after admitted name and launch identity checks.
+    pub fn proxy_filesystem_baseline(&self) -> Option<&FilesystemBaseline> {
+        self.proxy_filesystem_baseline.as_ref()
     }
 
     /// Carry the selected backend's VM identity constraint into policy handling.

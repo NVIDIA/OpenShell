@@ -4326,6 +4326,7 @@ mod tests {
                     default_image: "test/image:latest".to_string(),
                     rootfs_tar_staging_dir: directory.path().to_string_lossy().into_owned(),
                     rootfs_tar_max_bytes: 1024,
+                    proxy_filesystem_baseline: None,
                     resource_admission_policy: admission.acknowledgement(),
                     extension: Some(metadata),
                     ..Default::default()

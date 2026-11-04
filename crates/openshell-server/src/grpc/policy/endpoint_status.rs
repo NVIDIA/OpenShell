@@ -4,13 +4,15 @@
 //! Passive network results for configured tool server endpoints.
 
 use super::{
-    apply_effective_policy_context, canonical_policy_record_identity,
-    compute_provider_env_revision_with_catalog_and_policy_bindings,
-    current_effective_policy_for_sandbox, decode_policy_from_global_settings,
+    apply_backend_proxy_baseline, apply_captured_policy_context, canonical_policy_record_identity,
+    compute_provider_env_revision_from_records_and_policy_bindings,
+    current_effective_policy_from_records, decode_policy_from_global_settings,
     deterministic_policy_hash, load_global_settings, policy_static_credential_endpoint_bindings,
+    provider_policy_context_from_records,
 };
 use crate::ServerState;
 use crate::compute::MutationScope;
+use crate::grpc::provider::{ProviderEnvironmentRecord, load_provider_environment_records};
 use crate::persistence::{
     ObjectCursor, ObjectId, ObjectListQuery, ObjectWorkspace, PersistenceError,
 };
@@ -263,15 +265,23 @@ async fn current_endpoint_context(
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), workspace)
         .await?;
-    let policy = current_effective_policy_for_sandbox(
+    let provider_names = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.clone())
+        .unwrap_or_default();
+    let records =
+        load_provider_environment_records(state.store.as_ref(), workspace, &provider_names).await?;
+    let (mut policy, source) = current_effective_policy_from_records(
         state,
         &catalog,
-        workspace,
         sandbox,
         sandbox.object_id(),
+        &records,
     )
     .await?;
-    derive_endpoint_context(state, sandbox, &catalog, policy).await
+    apply_backend_proxy_baseline(state, &mut policy, source)?;
+    derive_endpoint_context(&catalog, &records, policy, source)
 }
 
 async fn active_endpoint_context(
@@ -328,16 +338,10 @@ async fn endpoint_context_for_loaded_policy_with_inputs(
         .as_ref()
         .map(|spec| spec.providers.clone())
         .unwrap_or_default();
-    let policy = if let Some(global_policy) = global_policy {
-        apply_effective_policy_context(
-            state,
-            catalog,
-            workspace,
-            &provider_names,
-            global_policy.clone(),
-            PolicySource::Global,
-        )
-        .await?
+    let records =
+        load_provider_environment_records(state.store.as_ref(), workspace, &provider_names).await?;
+    let (policy, source) = if let Some(global_policy) = global_policy {
+        (global_policy.clone(), PolicySource::Global)
     } else {
         let record = state
             .store
@@ -345,42 +349,33 @@ async fn endpoint_context_for_loaded_policy_with_inputs(
             .await
             .map_err(|error| Status::internal(format!("fetch policy revision failed: {error}")))?
             .ok_or_else(|| Status::not_found("policy revision not found"))?;
-        let policy = canonical_policy_record_identity(&record)?.0;
-        apply_effective_policy_context(
-            state,
-            catalog,
-            workspace,
-            &provider_names,
-            policy,
+        (
+            canonical_policy_record_identity(&record)?.0,
             PolicySource::Sandbox,
         )
-        .await?
     };
-    derive_endpoint_context(state, sandbox, catalog, policy).await
+    let mut policy = apply_captured_policy_context(
+        provider_policy_context_from_records(catalog, &records),
+        policy,
+        source,
+    )?;
+    apply_backend_proxy_baseline(state, &mut policy, source)?;
+    derive_endpoint_context(catalog, &records, policy, source)
 }
 
-async fn derive_endpoint_context(
-    state: &ServerState,
-    sandbox: &Sandbox,
+fn derive_endpoint_context(
     catalog: &EffectiveProviderProfileCatalog,
+    records: &[ProviderEnvironmentRecord],
     policy: ProtoSandboxPolicy,
+    source: PolicySource,
 ) -> Result<EndpointContext, Status> {
-    let workspace = sandbox.object_workspace();
-    let provider_names = sandbox
-        .spec
-        .as_ref()
-        .map(|spec| spec.providers.clone())
-        .unwrap_or_default();
     let bindings = policy_static_credential_endpoint_bindings(Some(&policy))?;
-    let provider_env_revision = compute_provider_env_revision_with_catalog_and_policy_bindings(
-        state.store.as_ref(),
+    let provider_env_revision = compute_provider_env_revision_from_records_and_policy_bindings(
         catalog,
-        workspace,
-        &provider_names,
+        records,
         &bindings,
-    )
-    .await?;
-
+        matches!(source, PolicySource::Global).then_some(&policy),
+    )?;
     Ok(EndpointContext {
         policy_hash: deterministic_policy_hash(&policy),
         provider_env_revision,

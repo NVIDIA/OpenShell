@@ -133,7 +133,7 @@ where
                 }
                 "/openshell.v1.OpenShell/GetSandboxConfig" => {
                     let mut policy = openshell_policy::restrictive_default_policy();
-                    enrich_proto_baseline_paths(&mut policy);
+                    enrich_proto_baseline_paths(&mut policy, None);
                     legacy_unary::<B, GetSandboxConfigRequest, _>(
                         request,
                         GetSandboxConfigResponse {
