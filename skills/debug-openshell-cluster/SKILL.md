@@ -154,6 +154,13 @@ when neither that CA nor the package-managed local CA is available. Kubernetes
 projects only the gateway CA from a Secret into supervisor Pods; supervisors
 authenticate gateway RPCs with sandbox bearer tokens.
 
+For per-user Docker gateways sharing one daemon, check each user's
+`[openshell.drivers.docker].scope_by_host_uid` setting and the UID running that
+gateway. The option is off by default. If startup reports resources under the
+unscoped `sandbox_label`, use the original gateway to delete those sandboxes
+and stop it before enabling the option. Follow the Docker section of the published gateway
+configuration guide for the port and Docker daemon trust limits.
+
 Custom names use `[openshell.drivers.<name>].socket_path`. A launch-time `--compute-driver-socket` override may also use `docker`, `podman`, `kubernetes`, or `vm`; the endpoint then takes precedence over built-in construction. First-party standalone drivers require the socket parent directory to be owned by the driver's effective UID, force its mode to `0700`, create the socket with mode `0600`, and accept only peers with that same UID. Check the parent and socket separately with `stat`; a gateway running under a different UID cannot connect even when filesystem permissions or group membership would otherwise allow it. Operator-supplied drivers must provide equivalent access control appropriate to their implementation. Check gateway logs for connection errors, `GetCapabilities` failures, missing peer metadata, protocol-major mismatch, unmet required capabilities, or an unexpected advertised driver name. `openshell gateway info` reports successful startup negotiations. The advertised name is diagnostic metadata; negotiated features control optional behavior. The gateway does not create or supervise operator-supplied driver processes or sockets.
 
 For the Kubernetes Secrets credential driver, every provider credential lives in
