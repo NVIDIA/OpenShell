@@ -84,6 +84,20 @@ To disable:
 openshell settings set --global --key ocsf_json_enabled --value false
 ```
 
+### Record each exec
+
+Set `ocsf_process_exec_enabled` to also record a Process Activity `Launch` for each exec in the workload, such as each command a shell runs. Like `ocsf_json_enabled`, it applies globally or per sandbox and takes effect on the next poll cycle.
+
+```shell
+openshell settings set my-sandbox --key ocsf_process_exec_enabled --value true
+```
+
+The sandbox records up to 500 execs at once and 200 per second after that. Execs over that rate are not recorded; a Process Activity record with `activity_name` `Other`, `status` `Failure`, and the number in `count` takes their place. A process that forks without exec, and an exec of a file that does not exist or is not executable, produce no record.
+
+The sandbox writes the record when the workload requests the exec, so the exec can still fail afterward, and the record names the file the request named at that moment. These records have an `Unknown` action, disposition, and status.
+
+Each process recorded this way also gets a Process Activity `Terminate` when it exits, named by the last file it requested to exec. On Linux 6.15 and later it carries `exit_code`; on earlier kernels only when the sandbox read the exit before the process's parent collected it, and otherwise its `status` is `Unknown` and it has no `exit_code`. The sandbox watches up to 1,024 running processes, fewer when its open-file limit is low; a process it cannot watch is counted in the `Other` record instead.
+
 ### Windows MXC gateways
 
 MXC audit events originate in the Windows gateway rather than an in-sandbox
@@ -150,7 +164,7 @@ For gateway-produced records, `device.os.name` and `device.os.type_id` identify 
 Some fields depend on the event class:
 
 - SSH Activity records name the supervisor's SSH server as `dst_endpoint`, with `svc_name: "ssh"` and the listen socket path in `name`, because the server listens on a Unix socket rather than a network address.
-- Process Activity records from the sandbox name the `openshell-sandbox` launcher as `actor.process`. The supervisor records a `Launch` and a `Terminate` for the sandbox entrypoint and for the process each exec or SSH session starts. `Terminate` carries `exit_code`, which is 128 plus the signal number when a signal ended the process. `time` is when the sandbox observed the launch or exit. A replacement supervisor can report a launch or exit again with the same `metadata.uid`, so deduplicate Process Activity on that field. `process.pid` and `process.created_time` match the network events from the same process.
+- Process Activity records cover the sandbox entrypoint and the process each exec or SSH session starts, which name the `openshell-sandbox` launcher as `actor.process`, and with `ocsf_process_exec_enabled` each exec in the workload. The supervisor records a `Launch` and a `Terminate` for the entrypoint and for each session process. An exec is a `Launch` with `launch_type` `Exec`: `process` is the new executable, `actor.process` is the same process before the exec, and `parent_process` names its parent. A process that exec recorded exits as a `Terminate` whose `actor.process` is the process itself. `Terminate` carries `exit_code` when the sandbox read it, which is 128 plus the signal number when a signal ended the process. `time` is when the sandbox observed the launch, exec, or exit. A replacement supervisor can report one again with the same `metadata.uid`, so deduplicate Process Activity on that field. A Process Activity record with `activity_name` `Other` and `status` `Failure` reports in `count` how many process events were not recorded or were lost before the supervisor read them. `process.pid` and `process.created_time` match the network events from the same process.
 - Network and HTTP Activity records for connections the sandbox runtime mediates name the process that opened the connection as `actor.process`, with its `pid` as the sandbox sees it and its start time in `created_time`. When the parent process is identified, `parent_process` carries its `pid`. A `pid` can be reused after its process exits; `pid` and `created_time` together identify one process.
 - `connection_info` carries `direction_id` and `direction`. OpenShell reports Unknown (`0`) where it does not track the direction.
 

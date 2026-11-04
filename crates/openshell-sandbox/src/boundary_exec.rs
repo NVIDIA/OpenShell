@@ -719,7 +719,14 @@ mod tests {
         std::thread::spawn(move || {
             while let Ok(notification) = listener.receive() {
                 let syscall = i64::from(notification.syscall);
-                if syscall == libc::SYS_openat || syscall == libc::SYS_openat2 {
+                if [
+                    libc::SYS_openat,
+                    libc::SYS_openat2,
+                    libc::SYS_execve,
+                    libc::SYS_execveat,
+                ]
+                .contains(&syscall)
+                {
                     let _ = listener.respond_continue(notification.id);
                 } else {
                     #[cfg(target_arch = "x86_64")]

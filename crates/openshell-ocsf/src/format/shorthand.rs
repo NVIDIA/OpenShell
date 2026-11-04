@@ -528,8 +528,13 @@ impl OcsfEvent {
                     .as_ref()
                     .map(|c| format!(" [cmd:{c}]"))
                     .unwrap_or_default();
+                let count_ctx = e
+                    .base
+                    .count
+                    .map(|c| format!(" [count:{c}]"))
+                    .unwrap_or_default();
 
-                format!("PROC:{activity} {sev} {proc_str}{exit_ctx}{cmd_ctx}")
+                format!("PROC:{activity} {sev} {proc_str}{exit_ctx}{cmd_ctx}{count_ctx}")
             }
 
             Self::DetectionFinding(e) => {
@@ -1234,6 +1239,26 @@ mod tests {
 
         let shorthand = event.format_shorthand();
         assert_eq!(shorthand, "PROC:TERMINATE [INFO] python3(42) [exit:0]");
+    }
+
+    #[test]
+    fn process_activity_shorthand_shows_the_count() {
+        let mut base = base(1007, "Process Activity", 1, "System Activity", 99, "Other");
+        base.set_count(251);
+        let event = OcsfEvent::ProcessActivity(ProcessActivityEvent {
+            base,
+            process: Process::new("openshell-sandbox", 1),
+            actor: None,
+            launch_type: None,
+            exit_code: None,
+            action: None,
+            disposition: None,
+        });
+
+        assert_eq!(
+            event.format_shorthand(),
+            "PROC:OTHER [INFO] openshell-sandbox(1) [count:251]"
+        );
     }
 
     #[test]

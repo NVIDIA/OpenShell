@@ -56,6 +56,10 @@ pub struct BaseEventData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_detail: Option<String>,
 
+    /// How many occurrences this event stands for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+
     /// Event metadata (schema version, product, profiles).
     pub metadata: Metadata,
 
@@ -109,6 +113,9 @@ impl Serialize for BaseEventData {
         if let Some(ref detail) = self.status_detail {
             map.serialize_entry("status_detail", detail)?;
         }
+        if let Some(count) = self.count {
+            map.serialize_entry("count", &count)?;
+        }
         map.serialize_entry("metadata", &self.metadata)?;
         if let Some(ref device) = self.device {
             map.serialize_entry("device", device)?;
@@ -158,6 +165,7 @@ impl BaseEventData {
             status: None,
             message: None,
             status_detail: None,
+            count: None,
             metadata,
             device: None,
             container: None,
@@ -179,6 +187,11 @@ impl BaseEventData {
     /// Set message.
     pub fn set_message(&mut self, message: impl Into<String>) {
         self.message = Some(message.into());
+    }
+
+    /// Set how many occurrences this event stands for.
+    pub fn set_count(&mut self, count: u64) {
+        self.count = Some(count);
     }
 
     /// Set status detail.

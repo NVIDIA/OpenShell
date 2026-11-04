@@ -47,7 +47,7 @@ impl WorkloadLauncher {
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         self.jobs
             .send(Box::new(move || {
-                let _ = result_tx.send(operation());
+                let _ = result_tx.send(crate::process_events::runtime_spawn(operation));
             }))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "workload launcher stopped"))?;
         result_rx.recv().map_err(|_| {
@@ -124,6 +124,27 @@ mod tests {
     #[test]
     fn one_listener_mediates_launcher_and_inherited_child() {
         let (launcher, listener) = start().expect("start launcher");
+        let listener = Arc::new(listener);
+        // The spawn returns once the child's exec completes, so the exec
+        // notification is answered while the launcher is still spawning.
+        let (socket_tx, socket_rx) = mpsc::channel();
+        let serving = listener.clone();
+        thread::spawn(move || {
+            loop {
+                let notification = serving.receive().expect("receive child syscall");
+                let syscall = i64::from(notification.syscall);
+                if syscall == libc::SYS_execve || syscall == libc::SYS_execveat {
+                    serving
+                        .respond_continue(notification.id)
+                        .expect("continue exec");
+                    continue;
+                }
+                let _ = socket_tx.send(notification);
+                if syscall == libc::SYS_socket {
+                    return;
+                }
+            }
+        });
         let executable = std::env::current_exe().expect("test executable");
         let mut child = launcher
             .execute(move || {
@@ -138,7 +159,7 @@ mod tests {
             .expect("launcher result")
             .expect("spawn child");
         let notification = loop {
-            let notification = listener.receive().expect("receive child syscall");
+            let notification = socket_rx.recv().expect("receive child syscall");
             let syscall = i64::from(notification.syscall);
             if syscall == libc::SYS_socket {
                 break notification;

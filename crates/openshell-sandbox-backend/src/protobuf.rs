@@ -455,25 +455,55 @@ impl WireMessage for w::ProcessEventWire {
             sequence: self.sequence,
             process: Some(process_to_proto(&self.process)?),
             executable: self.executable.clone(),
-            event: Some(match self.kind {
+            event: Some(match &self.kind {
                 w::ProcessEventKindWire::Launched => E::Launched(p::ProcessLaunched {}),
                 w::ProcessEventKindWire::Exited(status) => E::Exited(status.to_proto()?),
+                w::ProcessEventKindWire::Executed {
+                    previous_executable,
+                    parent_executable,
+                } => E::Executed(p::ProcessExecuted {
+                    previous_executable: previous_executable.clone(),
+                    parent_executable: parent_executable.clone(),
+                }),
+                w::ProcessEventKindWire::Suppressed { count } => {
+                    E::Suppressed(p::ProcessEventsSuppressed { count: *count })
+                }
+                w::ProcessEventKindWire::Ended(status) => E::Ended(p::ProcessEnded {
+                    status: status
+                        .as_ref()
+                        .map(w::ExitStatusWire::to_proto)
+                        .transpose()?,
+                }),
             }),
             time: Some(timestamp(u64::try_from(self.time_ms).map_err(invalid)?)?),
         })
     }
     fn from_proto(v: Self::Proto) -> Result<Self, FrameError> {
         use p::process_event::Event as E;
+        let kind = match required(v.event)? {
+            E::Launched(_) => w::ProcessEventKindWire::Launched,
+            E::Exited(status) => {
+                w::ProcessEventKindWire::Exited(w::ExitStatusWire::from_proto(status)?)
+            }
+            E::Executed(executed) => w::ProcessEventKindWire::Executed {
+                previous_executable: executed.previous_executable,
+                parent_executable: executed.parent_executable,
+            },
+            E::Suppressed(suppressed) => w::ProcessEventKindWire::Suppressed {
+                count: suppressed.count,
+            },
+            E::Ended(ended) => w::ProcessEventKindWire::Ended(
+                ended
+                    .status
+                    .map(w::ExitStatusWire::from_proto)
+                    .transpose()?,
+            ),
+        };
         Ok(Self {
             sequence: v.sequence,
             process: process_from_proto(required(v.process)?)?,
             executable: v.executable,
-            kind: match required(v.event)? {
-                E::Launched(_) => w::ProcessEventKindWire::Launched,
-                E::Exited(status) => {
-                    w::ProcessEventKindWire::Exited(w::ExitStatusWire::from_proto(status)?)
-                }
-            },
+            kind,
             time_ms: i64::try_from(millis(required(v.time)?)?).map_err(invalid)?,
         })
     }
@@ -586,8 +616,12 @@ impl WireMessage for w::RequestEnvelope {
             }),
             W::OpenMediation => P::OpenMediation(p::OpenMediation {}),
             W::AcceptNetwork => P::AcceptNetwork(p::AcceptNetwork {}),
-            W::ReadProcessEvents { after_sequence } => P::ReadProcessEvents(p::ReadProcessEvents {
+            W::ReadProcessEvents {
+                after_sequence,
+                executions,
+            } => P::ReadProcessEvents(p::ReadProcessEvents {
                 after_sequence: *after_sequence,
+                executions: *executions,
             }),
         };
         Ok(p::RequestEnvelope {
@@ -659,6 +693,7 @@ impl WireMessage for w::RequestEnvelope {
             P::AcceptNetwork(_) => W::AcceptNetwork,
             P::ReadProcessEvents(v) => W::ReadProcessEvents {
                 after_sequence: v.after_sequence,
+                executions: v.executions,
             },
         };
         // The server derives a fingerprint from decoded typed fields. Clients
@@ -1078,7 +1113,10 @@ mod tests {
             response
         );
 
-        let request = w::Request::ReadProcessEvents { after_sequence: 3 };
+        let request = w::Request::ReadProcessEvents {
+            after_sequence: 3,
+            executions: Some(true),
+        };
         let envelope = w::RequestEnvelope {
             request_id: uuid::Uuid::new_v4().to_string(),
             payload_digest: String::new(),
@@ -1087,6 +1125,69 @@ mod tests {
         };
         let decoded = w::RequestEnvelope::from_proto(envelope.to_proto().unwrap()).unwrap();
         assert_eq!(decoded.request, request);
+    }
+
+    #[test]
+    fn exec_suppressed_and_ended_events_round_trip() {
+        let response = w::ResponseEnvelope {
+            request_id: "r".to_string(),
+            response: w::Response::ProcessEvents {
+                events: vec![
+                    w::ProcessEventWire {
+                        sequence: 6,
+                        process: c::ProcessInstance {
+                            pid: 58,
+                            parent_pid: 57,
+                            start_time_ms: 1_793_750_400_300,
+                        },
+                        executable: "/usr/bin/true".to_string(),
+                        kind: w::ProcessEventKindWire::Executed {
+                            previous_executable: "/usr/bin/dash".to_string(),
+                            parent_executable: "/usr/bin/dash".to_string(),
+                        },
+                        time_ms: 1_793_750_400_310,
+                    },
+                    w::ProcessEventWire {
+                        sequence: 7,
+                        process: c::ProcessInstance {
+                            pid: 1,
+                            parent_pid: 0,
+                            start_time_ms: 1_793_750_000_000,
+                        },
+                        executable: "/opt/openshell/bin/openshell-sandbox".to_string(),
+                        kind: w::ProcessEventKindWire::Suppressed { count: 12 },
+                        time_ms: 1_793_750_400_320,
+                    },
+                    w::ProcessEventWire {
+                        sequence: 8,
+                        process: c::ProcessInstance {
+                            pid: 58,
+                            parent_pid: 57,
+                            start_time_ms: 1_793_750_400_300,
+                        },
+                        executable: "/usr/bin/true".to_string(),
+                        kind: w::ProcessEventKindWire::Ended(Some(w::ExitStatusWire::Exited(3))),
+                        time_ms: 1_793_750_400_330,
+                    },
+                    w::ProcessEventWire {
+                        sequence: 9,
+                        process: c::ProcessInstance {
+                            pid: 59,
+                            parent_pid: 57,
+                            start_time_ms: 1_793_750_400_300,
+                        },
+                        executable: "/usr/bin/true".to_string(),
+                        kind: w::ProcessEventKindWire::Ended(None),
+                        time_ms: 1_793_750_400_340,
+                    },
+                ],
+                lost: 0,
+            },
+        };
+        assert_eq!(
+            w::ResponseEnvelope::from_proto(response.to_proto().unwrap()).unwrap(),
+            response
+        );
     }
 
     #[test]
