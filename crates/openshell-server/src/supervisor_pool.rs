@@ -49,10 +49,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openshell_core::jwt::{SandboxId, SupervisorTakeover};
-use openshell_core::proto::datamodel::v1::{CredentialHandle, ObjectMeta, Provider};
+use openshell_core::proto::datamodel::v1::CredentialHandle;
 use openshell_core::proto::{Sandbox, SandboxPhase};
 use openshell_core::time::now_ms;
 use openshell_core::{ObjectId as _, ObjectWorkspace as _};
+use openshell_credential_issuer::SecretOwner;
 use openshell_supervisor_control::pool_timing::RECORD_WRITE_BOUND;
 use openshell_supervisor_control::proto::{
     SandboxInstanceAssignment, SandboxInstancePhase, SandboxInstanceStatus, SandboxInstanceTakeover,
@@ -740,14 +741,9 @@ fn decode_report(record: &ObjectRecord) -> Option<ReportPayload> {
     (record.id == report_object_id(&payload.route, payload.auth_epoch)).then_some(payload)
 }
 
-/// The synthetic credential owner of one sandbox's launch material, scoped
-/// like the sandbox's SSH host key.
-fn material_owner(payload: &AssignmentPayload) -> (String, &str, &str) {
-    (
-        format!("sandbox-instance-{}", payload.sandbox_id),
-        payload.workspace.as_str(),
-        payload.sandbox_id.as_str(),
-    )
+/// The credential owner of one sandbox assignment's launch material.
+fn material_owner(payload: &AssignmentPayload) -> SecretOwner<'_> {
+    SecretOwner::supervisor_instance(&payload.workspace, &payload.sandbox_id)
 }
 
 /// Whether `generation` of `sandbox` can still run: the sandbox exists,
@@ -1446,13 +1442,10 @@ impl SupervisorPool {
     ) -> Result<CredentialHandle, String> {
         let value = std::str::from_utf8(material)
             .map_err(|_| "sandbox instance launch material is not UTF-8".to_string())?;
-        let (name, workspace, owner_id) = material_owner(payload);
         let handles = self
             .credentials
-            .store_provider_credentials_with_object_id(
-                &name,
-                workspace,
-                owner_id,
+            .store_secrets_with_object_id(
+                material_owner(payload),
                 &Uuid::new_v4().to_string(),
                 &HashMap::from([(LAUNCH_MATERIAL_KEY.to_string(), value.to_string())]),
                 &HashMap::new(),
@@ -1473,20 +1466,13 @@ impl SupervisorPool {
     async fn load_material(&self, payload: &AssignmentPayload) -> Result<Vec<u8>, String> {
         let handle = CredentialHandle::decode(payload.material_handle.as_slice())
             .map_err(|_| "invalid launch material credential handle".to_string())?;
-        let (name, workspace, owner_id) = material_owner(payload);
-        let owner = Provider {
-            metadata: Some(ObjectMeta {
-                id: owner_id.to_string(),
-                name,
-                workspace: workspace.to_string(),
-                ..Default::default()
-            }),
-            credential_handles: HashMap::from([(LAUNCH_MATERIAL_KEY.to_string(), handle)]),
-            ..Default::default()
-        };
         let mut resolved = self
             .credentials
-            .resolve_provider_handles(&owner, 0)
+            .resolve_secrets(
+                material_owner(payload),
+                &HashMap::from([(LAUNCH_MATERIAL_KEY.to_string(), handle)]),
+                0,
+            )
             .await
             .map_err(|status| {
                 format!(
@@ -1506,12 +1492,9 @@ impl SupervisorPool {
         payload: &AssignmentPayload,
         handle: CredentialHandle,
     ) -> Result<(), String> {
-        let (name, workspace, owner_id) = material_owner(payload);
         self.credentials
-            .delete_provider_credential_handles(
-                &name,
-                workspace,
-                owner_id,
+            .delete_secrets(
+                material_owner(payload),
                 &HashMap::from([(LAUNCH_MATERIAL_KEY.to_string(), handle)]),
             )
             .await
