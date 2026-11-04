@@ -314,6 +314,40 @@ def _add_accepted_label(repository: str, pr: dict, evidence: dict) -> None:
         raise ValueError("Could not apply accepted-work label with evidence")
 
 
+def _non_collaborator_rejection(error: subprocess.CalledProcessError) -> bool:
+    try:
+        body = json.loads(error.stdout)
+    except (TypeError, ValueError):
+        return False
+    return (
+        isinstance(body, dict)
+        and str(body.get("status")) == "422"
+        and isinstance(body.get("message"), str)
+        and body["message"].startswith(
+            "Reviews may only be requested from collaborators."
+        )
+    )
+
+
+def _request_reviewers(endpoint: str, reviewers: tuple[str, ...]) -> tuple[str, ...]:
+    try:
+        _api(endpoint, method="POST", data={"reviewers": list(reviewers)})
+    except subprocess.CalledProcessError as error:
+        if not _non_collaborator_rejection(error):
+            raise
+        if len(reviewers) > 1:
+            return tuple(
+                login for login in reviewers if _request_reviewers(endpoint, (login,))
+            )
+        print(
+            f"::warning::Cannot request review from @{reviewers[0]}: "
+            "GitHub requires repository collaborator access.",
+            file=sys.stderr,
+        )
+        return ()
+    return reviewers
+
+
 def check_review_readiness(
     categories: dict[str, set[str]],
     repository: str,
@@ -359,7 +393,7 @@ def check_review_readiness(
     if apply:
         endpoint = f"{pull}/requested_reviewers"
         if plan.add:
-            _api(endpoint, method="POST", data={"reviewers": list(plan.add)})
+            plan = replace(plan, add=_request_reviewers(endpoint, plan.add))
         if plan.remove:
             # Re-read human choices and engagement immediately before removals.
             latest = _api(pull)
