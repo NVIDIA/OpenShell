@@ -2066,9 +2066,10 @@ impl ComputeRuntime {
         let (previous, stopping) = loop {
             provisioning_operation::ensure_operation_settled(&current)?;
             let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
-            if matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
-                || is_failed_main_process_result(&current)
-            {
+            // A terminal main process does not prove the retained compute is
+            // stopped: its supervisor can still own sessions and processes.
+            // Only a previously confirmed driver stop is already settled.
+            if phase == SandboxPhase::Stopped {
                 self.cleanup_stopped_sandbox_sessions(&current)
                     .await
                     .map_err(Status::internal)?;
@@ -2088,11 +2089,14 @@ impl ComputeRuntime {
             // and repeats configuration admission for the retained sandbox.
             if !matches!(
                 phase,
-                SandboxPhase::Ready | SandboxPhase::Stopping | SandboxPhase::Error
+                SandboxPhase::Ready
+                    | SandboxPhase::Completed
+                    | SandboxPhase::Stopping
+                    | SandboxPhase::Error
             ) && !automatic_restart
             {
                 return Err(Status::failed_precondition(format!(
-                    "sandbox must be Ready, Error, or in an automatic restart to stop (current phase: {phase:?})"
+                    "sandbox must be Ready, Completed, Error, or in an automatic restart to stop (current phase: {phase:?})"
                 )));
             }
 
@@ -12472,6 +12476,104 @@ mod tests {
             .unwrap();
         assert_eq!(ready.phase(), SandboxPhase::Ready as i32);
         assert_eq!(driver.start_calls(), 2, "ready start is idempotent");
+    }
+
+    #[tokio::test]
+    async fn terminal_main_process_stop_reclaims_compute_before_restart() {
+        for exit_code in [0, 9] {
+            let driver = ControlledDriver::new();
+            let runtime = test_runtime(driver.clone()).await;
+            let mut sandbox =
+                sandbox_record("sb-terminal", "sandbox-terminal", SandboxPhase::Ready);
+            apply_main_process_exit(&mut sandbox, "instance-finished", exit_code);
+            let specification = sandbox.spec.clone();
+            runtime.store.put_message(&sandbox).await.unwrap();
+            let session = ssh_session_record("terminal-session", sandbox.object_id());
+            runtime.store.put_message(&session).await.unwrap();
+            register_test_supervisor_session(&runtime, sandbox.object_id());
+
+            let stopped = runtime
+                .stop_sandbox("default", sandbox.object_name())
+                .await
+                .unwrap();
+
+            assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
+            assert_eq!(
+                stopped.spec, specification,
+                "stop retains the workload specification"
+            );
+            assert_eq!(
+                driver.stop_calls(),
+                1,
+                "a terminal command can leave live compute"
+            );
+            assert_eq!(
+                driver.start_calls(),
+                0,
+                "stop must not replay a finished command"
+            );
+            assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+            assert!(
+                runtime
+                    .store
+                    .get_message::<SshSession>(session.object_id())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            let stopped_again = runtime
+                .stop_sandbox("default", sandbox.object_name())
+                .await
+                .unwrap();
+            assert_eq!(stopped_again.phase(), SandboxPhase::Stopped as i32);
+            assert_eq!(driver.stop_calls(), 1, "confirmed stop remains idempotent");
+
+            let starting = runtime
+                .start_sandbox("default", sandbox.object_name())
+                .await
+                .unwrap();
+            assert_eq!(starting.phase(), SandboxPhase::Starting as i32);
+            assert_eq!(driver.start_calls(), 1);
+            assert_eq!(starting.status.unwrap().exit_code, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_main_process_stop_failure_does_not_claim_stopped() {
+        for exit_code in [0, 9] {
+            let driver = ControlledDriver::new();
+            driver.set_stop_outcome(ControlledLifecycleOutcome::Error("stop unavailable"));
+            driver.set_get_outcome(ControlledGetOutcome::Missing);
+            let runtime = test_runtime(driver.clone()).await;
+            let mut sandbox = sandbox_record(
+                "sb-terminal-fail",
+                "sandbox-terminal-fail",
+                SandboxPhase::Ready,
+            );
+            apply_main_process_exit(&mut sandbox, "instance-finished", exit_code);
+            runtime.store.put_message(&sandbox).await.unwrap();
+
+            let error = runtime
+                .stop_sandbox("default", sandbox.object_name())
+                .await
+                .unwrap_err();
+
+            assert_eq!(driver.stop_calls(), 1);
+            assert_eq!(driver.start_calls(), 0);
+            assert!(error.message().contains("stop unavailable"));
+            let retained = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                retained.phase(),
+                SandboxPhase::Stopping as i32,
+                "an unresolved runtime must remain recoverable rather than claim Stopped"
+            );
+        }
     }
 
     #[tokio::test]

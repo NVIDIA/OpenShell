@@ -527,6 +527,10 @@ stopped or completed. Starting a retained `Completed` or
 invalidates SSH sessions from the previous runtime generation. Delete remains
 the operation that removes retained state.
 
+Stopping a retained `Completed` or `Error/MainProcessFailed` sandbox terminates
+its remaining compute and waits for `Stopped`. Stop does not run the canonical
+command again; a subsequent explicit start launches the new instance.
+
 The sandbox's SSH host identity survives stop/start and runtime restarts.
 API clients can read its public fingerprint from the sandbox resource or
 SSH-session response and pin it to the sandbox ID. Recreating a deleted
