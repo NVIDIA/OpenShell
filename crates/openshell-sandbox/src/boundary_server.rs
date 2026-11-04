@@ -3421,9 +3421,13 @@ mod linux {
                 Request::ReadProcessEvents {
                     after_sequence,
                     executions,
+                    command_lines,
                 } => {
                     if let Some(executions) = executions {
                         crate::process_events::set_record_executions(executions);
+                    }
+                    if let Some(command_lines) = command_lines {
+                        crate::process_events::set_record_command_lines(command_lines);
                     }
                     let (events, lost) = crate::process_events::log().read(
                         after_sequence,
@@ -9001,6 +9005,7 @@ mod linux {
             let read_events = Request::ReadProcessEvents {
                 after_sequence: 0,
                 executions: None,
+                command_lines: None,
             };
             assert!(
                 boundary

@@ -867,6 +867,9 @@ pub enum Request {
         /// Whether the runtime records each exec in the workload from now on.
         /// `None` keeps its current choice.
         executions: Option<bool>,
+        /// Whether the runtime records each process's command line from now
+        /// on. `None` keeps its current choice.
+        command_lines: Option<bool>,
     },
 }
 
@@ -984,10 +987,12 @@ impl fmt::Debug for Request {
             Self::ReadProcessEvents {
                 after_sequence,
                 executions,
+                command_lines,
             } => formatter
                 .debug_struct("ReadProcessEvents")
                 .field("after_sequence", after_sequence)
                 .field("executions", executions)
+                .field("command_lines", command_lines)
                 .finish(),
         }
     }
@@ -1071,6 +1076,17 @@ pub struct ProcessEventWire {
     pub kind: ProcessEventKindWire,
     /// When the runtime observed the event, in milliseconds since the epoch.
     pub time_ms: i64,
+    /// The arguments of a launched or executed process, when recorded.
+    #[serde(default)]
+    pub command_line: Option<CommandLineWire>,
+}
+
+/// A process's arguments, `truncated` when only the first were kept.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandLineWire {
+    pub arguments: Vec<String>,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

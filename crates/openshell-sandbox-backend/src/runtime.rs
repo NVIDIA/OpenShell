@@ -927,17 +927,20 @@ impl ProcessEventSource {
     /// Events after `after_sequence` and how many of those the runtime no
     /// longer retains. Returns empty when none arrive within the runtime's
     /// read wait. `executions` sets whether the runtime records each exec
-    /// from now on; it is ignored unless [`Self::records_executions`].
+    /// from now on, and is ignored unless [`Self::records_executions`];
+    /// `command_lines` sets whether it records each process's arguments.
     pub async fn read(
         &self,
         after_sequence: u64,
         executions: Option<bool>,
+        command_lines: Option<bool>,
     ) -> Result<(Vec<crate::boundary_protocol::ProcessEventWire>, u64), BackendError> {
         let response = self
             .client
             .call_wait(Request::ReadProcessEvents {
                 after_sequence,
                 executions: executions.filter(|_| self.records_executions()),
+                command_lines,
             })
             .await?;
         let Response::ProcessEvents { events, lost } = response else {
