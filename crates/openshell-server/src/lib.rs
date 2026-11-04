@@ -3843,7 +3843,7 @@ mod tests {
         use rustls::pki_types::CertificateDer;
         let dir = tempdir().unwrap();
         let (ca, ca_key) = generate_test_certs_with_ca(dir.path());
-        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "discovery-proxy");
@@ -3857,7 +3857,7 @@ mod tests {
         let key_pem = client_key.serialize_pem().unwrap();
         let client_pem_key = key_pem.clone();
         let fingerprint = hex::encode(openshell_crypto::sha256(client_cert.as_ref()).unwrap());
-        std::fs::write(dir.path().join("grants.json"),serde_json::to_vec(&serde_json::json!({"readers":[{"certificate_sha256":fingerprint,"all_workspaces":true}]})).unwrap()).unwrap();
+        fs::write(dir.path().join("grants.json"),serde_json::to_vec(&serde_json::json!({"readers":[{"certificate_sha256":fingerprint,"all_workspaces":true}]})).unwrap()).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut state = test_state(addr, false).await;
@@ -3935,7 +3935,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(watch.message().await.unwrap().is_some());
-        std::fs::write(dir.path().join("grants.json"), r#"{"readers":[]}"#).unwrap();
+        fs::write(dir.path().join("grants.json"), r#"{"readers":[]}"#).unwrap();
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(3), watch.message())
                 .await
