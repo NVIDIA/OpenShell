@@ -160,13 +160,43 @@ jobs:
     secrets:
       BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
       SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+
+  publish-fern-docs:
+    name: Sync and Publish Fern Docs
+    needs: [build, publish]
+    permissions:
+      contents: write
+    uses: ./.github/workflows/sync-docs.yml
+    with:
+      operation: sync
+      channel: stable
+      source_ref: ${{ needs.build.outputs.source_sha }}
+      release_version: ${{ needs.build.outputs.semver }}
+      version_slug: v${{ needs.build.outputs.semver }}
+      display_name: Latest (v${{ needs.build.outputs.semver }})
+      publish: true
+    secrets:
       FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
-      GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
-      GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
+
+  check-publication:
+    name: Check Stable Publication
+    needs: [promote, build, release-notes, publish, publish-fern-docs]
+    if: ${{ always() && !inputs.notes-only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Require every stable publisher to succeed
+        shell: bash
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          jq -e 'all(.[]; .result == "success")' <<<"${NEEDS}"
 
   notify-release-failure:
     name: Notify Release Failure
-    needs: [promote, build, release-notes, publish]
+    needs: [promote, build, release-notes, publish, publish-fern-docs, check-publication]
     if: failure()
     runs-on: ubuntu-latest
     timeout-minutes: 2

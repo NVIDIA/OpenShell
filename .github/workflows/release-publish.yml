@@ -40,12 +40,6 @@ on:
         required: false
       SNAPCRAFT_STORE_CREDENTIALS:
         required: false
-      FERN_TOKEN:
-        required: false
-      GITLAB_CI_TRIGGER_TOKEN:
-        required: false
-      GITLAB_CI_TRIGGER_URL:
-        required: false
 
 permissions:
   contents: read
@@ -68,8 +62,6 @@ jobs:
       id-token: write
       attestations: write
       artifact-metadata: write
-    outputs:
-      wheel_filenames: ${{ steps.wheel_filenames.outputs.wheel_filenames }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -151,8 +143,7 @@ jobs:
           path: release/
           merge-multiple: true
 
-      - name: Capture wheel filenames
-        id: wheel_filenames
+      - name: Verify wheel count
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -161,8 +152,6 @@ jobs:
             echo "expected exactly one Python wheel, found ${#wheels[@]}" >&2
             exit 1
           fi
-          wheel_filename=$(basename "${wheels[0]}")
-          echo "wheel_filenames=${wheel_filename}" >> "$GITHUB_OUTPUT"
 
       - name: Generate checksums
         run: |
@@ -354,8 +343,6 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
-    outputs:
-      wheel_filenames: ${{ needs.assemble.outputs.wheel_filenames }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ !inputs.is-prerelease && inputs.make-latest }}
@@ -535,6 +522,19 @@ jobs:
             buf push proto --label "${RELEASE_TAG}" \
             --source-control-url "${SOURCE_CONTROL_URL}"
 
+  publish-pypi:
+    name: Publish Python Wheel
+    needs: release
+    if: ${{ !inputs.is-prerelease }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/wheel-publish.yml
+    with:
+      release-tag: ${{ inputs.release-tag }}
+      source-sha: ${{ inputs.source-sha }}
+      python-version: ${{ inputs.python-version }}
+
   publish-snap:
     name: Publish Snap
     needs: release
@@ -590,38 +590,6 @@ jobs:
       version: ${{ inputs.semver }}
       source-sha: ${{ inputs.source-sha }}
 
-  trigger-wheel-publish:
-    name: Trigger Wheel Publish
-    needs: release
-    if: ${{ !inputs.is-prerelease }}
-    uses: ./.github/workflows/wheel-publish.yml
-    with:
-      release-tag: ${{ inputs.release-tag }}
-      source-sha: ${{ inputs.source-sha }}
-      python-version: ${{ inputs.python-version }}
-      wheel-filenames: ${{ needs.release.outputs.wheel_filenames }}
-    secrets:
-      GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
-      GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
-
-  publish-fern-docs:
-    name: Sync and Publish Fern Docs
-    needs: [release, publish-sdk-typescript, trigger-wheel-publish]
-    if: ${{ !inputs.is-prerelease }}
-    permissions:
-      contents: write
-    uses: ./.github/workflows/sync-docs.yml
-    with:
-      operation: sync
-      channel: stable
-      source_ref: ${{ inputs.source-sha }}
-      release_version: ${{ inputs.semver }}
-      version_slug: v${{ inputs.semver }}
-      display_name: Latest (v${{ inputs.semver }})
-      publish: true
-    secrets:
-      FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
-
   # GitHub treats skipped jobs as passing, so a publisher that never ran would
   # leave the run green. Fail when any publisher expected for this release kind
   # did not succeed, so callers' failure notifications fire.
@@ -632,12 +600,11 @@ jobs:
       - tag-ghcr-release
       - release-helm
       - release
+      - publish-pypi
       - publish-snap
       - publish-prerelease-snap
       - publish-sdk-typescript
       - tag-sdk-go
-      - trigger-wheel-publish
-      - publish-fern-docs
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -653,7 +620,7 @@ jobs:
           if [[ "${IS_PRERELEASE}" == "true" ]]; then
             expected+=(publish-prerelease-snap)
           else
-            expected+=(publish-sdk-typescript tag-sdk-go trigger-wheel-publish publish-fern-docs)
+            expected+=(publish-pypi publish-sdk-typescript tag-sdk-go)
             if [[ "${MAKE_LATEST}" == "true" ]]; then
               expected+=(publish-snap)
             fi
