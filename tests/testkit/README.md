@@ -37,9 +37,27 @@ async fn long_running_exec_delete(cx: &mut Context) -> testkit::Result {
   refused, assert the failure in the body, for example with
   `cx.cli([...]).await?.failure()?` and `testkit::ensure!`.
 
-Cleanup runs after every test, whether it passes, fails, or panics. It only
-deletes sandboxes created through `cx.sandbox(...)`. Delete anything else a
-test creates, such as providers, in the test itself.
+Cleanup runs after every test, whether it passes, fails, or panics. It
+deletes the sandboxes created through `cx.sandbox(...)` or tracked with
+`cx.track(name)`, and runs the hooks registered with `cx.on_cleanup`. Register
+a hook for anything else a test creates, such as a provider. Register it before
+the create when the delete succeeds for a missing resource, so it also covers a
+create the gateway applied but the CLI reported as failed:
+
+```rust
+let cli = cx.cli_handle();
+let name = provider.clone();
+cx.on_cleanup(format!("delete provider {provider}"), async move || {
+    cli.run(["provider", "delete", &name]).await?.success()?;
+    Ok(())
+});
+cx.cli(["provider", "create", "--name", &provider /* ... */]).await?.success()?;
+```
+
+Hooks and sandbox deletes run one at a time, last registered first, each
+limited to `testkit::CLEANUP_TIMEOUT`. A failure, panic, or timeout is
+reported, the remaining hooks still run, and a test that otherwise passed
+fails. A killed test process skips cleanup, so names are unique to the run.
 
 ## What a test can do
 
@@ -54,7 +72,9 @@ test creates, such as providers, in the test itself.
   up. `cx.adopt(name)` returns a `Sandbox` handle for one the CLI created.
 - `cx.expect_listed` and `cx.expect_absent` to check a sandbox in list and get.
 - `cx.cli([...])` to run the installed CLI against the same gateway, with
-  `success()`, `failure()`, and `json()` on the output.
+  `success()`, `failure()`, and `json()` on the output. `cx.cli_handle()`
+  returns that CLI for code that can't borrow `cx`, such as a cleanup hook.
+- `cx.on_cleanup(name, hook)` to remove something when the test ends.
 - `cx.client()` for SDK calls testkit does not wrap.
 - `poll_until` for waiting on other state.
 
