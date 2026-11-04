@@ -671,10 +671,9 @@ an agent knows to retry. Creating a child takes the gateway's mutation lock on
 the parent as well as on the new child, then re-reads the parent, counts its
 children and inserts the child's record. On PostgreSQL the lock is also held
 in the database, so two creates for the same parent cannot both take the last
-slot, even across gateway replicas. Deleting a sandbox takes the parent's lock
-only within one gateway process today, so a create and a delete of the same
-parent on two different replicas can both succeed; the child is then handled
-as an orphan (see [Lifecycle](#lifecycle)). The limit lives in the create
+slot, even across gateway replicas. Deleting a root takes the same lock, so a
+delete waits for a create of its child on any replica and then refuses; other
+lifecycle paths keep their lock within one gateway process. The limit lives in the create
 path; operators who need other quotas can add them with gateway interceptors.
 
 ### Lifecycle
@@ -705,9 +704,8 @@ command from discarding results nobody has collected. A sandbox calling
 of their own.
 
 **A child whose parent is missing is stopped.** Because creating a child and
-deleting its parent take the same lock in one gateway, a child can lose its
-parent only through a crash, a bug, or a create and a delete racing on two
-gateway replicas. Such a child is refused configuration at once, so it denies
+deleting its parent take the same lock on every replica, a child can lose its
+parent only through a crash or a bug. Such a child is refused configuration at once, so it denies
 new network access. When its supervisor reconnects or the gateway starts, the
 gateway stops it as `openshell sandbox stop` would, which ends its processes
 and with them its use of credentials and any open connections. The record and
@@ -921,10 +919,6 @@ reused; its grants, lineage store and result files are not part of this design.
 
 - **A timed-out command keeps running.** Foreground `exec` reports a timeout
   but does not stop the command; deleting the child does.
-- **A parent delete and a child create can race across replicas.** Deleting a
-  sandbox takes the parent's lock only within one gateway process, so the two
-  can both succeed on different replicas. The child is then stopped as an
-  orphan.
 - **A parent policy that cannot be copied refuses its children for good.**
   The child is told why and the gateway logs it once per parent version; the
   fix is a parent policy that can be copied.
@@ -970,7 +964,7 @@ reused; its grants, lineage store and result files are not part of this design.
   `sandbox delete` and `with_children: true` on the MCP `delete` tool would
   delete the children first and the parent last. It needs its own design for
   the order of deletes, a child delete that fails partway, children created
-  during the delete, and the cross-replica race above.
+  during the delete.
 - **Narrowing a child's policy.** A child created with a stricter policy than
   its parent, checked to fit inside the parent's.
 - **Child policy proposals.** A child's proposal routed to its parent's inbox,
