@@ -39,7 +39,10 @@ pub use context::{
 };
 pub use error::{Error, Result, ResultExt};
 pub use gateway::Gateway;
-pub use image::{BASE_IMAGE_ENV, DEFAULT_BASE_IMAGE, base_image};
+pub use image::{
+    BASE_IMAGE_ENV, DEFAULT_BASE_IMAGE, DEFAULT_PYTHON_IMAGE, PYTHON_IMAGE_ENV, base_image,
+    python_image,
+};
 pub use openshell_sdk as sdk;
 pub use poll::{Poll, poll_until};
 pub use run::{TestInfo, run};
