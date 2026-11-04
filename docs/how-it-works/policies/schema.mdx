@@ -55,6 +55,11 @@ These defaults and the filesystem path restrictions below also apply when the su
 Each path must be absolute, must not contain `..`, and must not exceed 4096
 bytes. `read_write` cannot contain `/`. A policy can list at most 256 paths.
 
+Policy paths can follow system symlinks only when the workload cannot modify
+any containing directory. A symlink beneath a directory the workload owns or
+can write causes launch to fail, including in `best_effort` mode. List the
+target directory directly for links inside a writable workspace.
+
 ```yaml showLineNumbers={false}
 filesystem_policy:
   include_workdir: true
@@ -69,8 +74,8 @@ filesystem_policy:
 | `compatibility` | string | `best_effort` | `best_effort` or `hard_requirement` |
 
 Both values skip individual paths that are missing or that the workload cannot
-open. They differ when none of the listed paths can be applied, or when Landlock
-fails to enforce the policy's rules:
+open. If none of the listed paths can be applied, launch fails in either mode.
+They differ when Landlock fails to build or enforce the policy's rules:
 
 | Value | Behavior |
 |---|---|

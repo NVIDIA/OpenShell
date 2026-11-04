@@ -197,7 +197,19 @@ async fn exec_start_failure_keeps_ssh_session_usable() {
 
         let mut rejected = client.channel_open_session().await.unwrap();
         rejected.exec(true, "first").await.unwrap();
-        assert!(matches!(rejected.wait().await, Some(ChannelMsg::Failure)));
+        assert!(matches!(rejected.wait().await, Some(ChannelMsg::Success)));
+        match rejected.wait().await {
+            Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                assert!(String::from_utf8_lossy(&data).contains("test boundary admission failure"));
+            }
+            event => panic!("expected boundary failure diagnostic, got {event:?}"),
+        }
+        assert!(matches!(
+            rejected.wait().await,
+            Some(ChannelMsg::ExitStatus { exit_status: 1 })
+        ));
+        assert!(matches!(rejected.wait().await, Some(ChannelMsg::Eof)));
+        assert!(matches!(rejected.wait().await, Some(ChannelMsg::Close)));
 
         let mut channel = start_exec(&client).await;
         control.stdout.shutdown().await.unwrap();

@@ -519,6 +519,10 @@ network_policies:
 ```
 
 The `filesystem_policy` and `landlock` sections above are sensible defaults.
+Use actual target paths for symlinks inside writable workspaces. Policy paths
+that traverse symlinks beneath workload-owned or writable directories fail
+launch even in `best_effort` mode; system aliases through protected directories
+remain supported. A policy with no usable filesystem paths also fails launch.
 Process identity is omitted so the selected compute driver can choose it. For
 Docker and Podman, each omitted identity field falls back to the image's OCI
 `USER`. Tell the user these are defaults and may need adjustment for their

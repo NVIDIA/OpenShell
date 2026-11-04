@@ -701,11 +701,15 @@ impl russh::server::Handler for SshHandler {
         // endings.  Forcing a PTY here caused CRLF translation which made
         // VS Code misdetect the platform as Windows (and then try to run
         // `powershell`).
+        let terminal = self
+            .channels
+            .get(&channel)
+            .is_some_and(|state| state.pty_request.is_some());
         match self.start_shell(channel, session.handle(), None).await {
             Ok(()) => session.channel_success(channel)?,
             Err(error) => {
                 warn!(%error, ?channel, "failed to start boundary shell");
-                session.channel_failure(channel)?;
+                self.finish_failed_start(channel, session, &error, terminal)?;
             }
         }
         Ok(())
@@ -730,6 +734,10 @@ impl russh::server::Handler for SshHandler {
             session.channel_success(channel)?;
             return Ok(());
         }
+        let terminal = self
+            .channels
+            .get(&channel)
+            .is_some_and(|state| state.pty_request.is_some());
         match self
             .start_shell(channel, session.handle(), Some(command))
             .await
@@ -737,7 +745,7 @@ impl russh::server::Handler for SshHandler {
             Ok(()) => session.channel_success(channel)?,
             Err(error) => {
                 warn!(%error, ?channel, "failed to start boundary exec");
-                session.channel_failure(channel)?;
+                self.finish_failed_start(channel, session, &error, terminal)?;
             }
         }
         Ok(())
@@ -1232,6 +1240,39 @@ impl SshHandler {
         // messages for other channels. Exit status needs no output credit.
         warn!(?channel, "{reason}; terminating exec");
         session.exit_status_request(channel, 74)?;
+        session.eof(channel)?;
+        session.close(channel)?;
+        Ok(())
+    }
+
+    /// Complete an accepted command request whose boundary process cannot start.
+    /// Request failure alone leaves clients waiting for command output or exit.
+    fn finish_failed_start(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+        error: &anyhow::Error,
+        terminal: bool,
+    ) -> anyhow::Result<()> {
+        if let Some(mut state) = self.channels.remove(&channel) {
+            state.input_task.take();
+            // A PTY resize can fail after spawning. Release that process too.
+            if let Some(process) = state.process.take() {
+                tokio::spawn(async move {
+                    if let Err(error) = process.terminate().await {
+                        warn!(%error, "failed to terminate exec after startup failure");
+                    }
+                });
+            }
+        }
+        let line_ending = if terminal { "\r\n" } else { "\n" };
+        session.channel_success(channel)?;
+        session.extended_data(
+            channel,
+            1,
+            format!("openshell: cannot start command: {error}{line_ending}").into_bytes(),
+        )?;
+        session.exit_status_request(channel, 1)?;
         session.eof(channel)?;
         session.close(channel)?;
         Ok(())
@@ -1967,6 +2008,77 @@ mod tests {
             next_main_event(&mut channel).await,
             russh::ChannelMsg::Close
         ));
+    }
+
+    async fn assert_boundary_start_failure(shell: bool, terminal: bool) {
+        let client = authenticated_test_client().await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        if terminal {
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+            assert!(matches!(
+                next_main_event(&mut channel).await,
+                russh::ChannelMsg::Success
+            ));
+        }
+        if shell {
+            channel.request_shell(true).await.unwrap();
+        } else {
+            channel.exec(true, "true").await.unwrap();
+        }
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        match next_main_event(&mut channel).await {
+            russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                let message = String::from_utf8_lossy(&data);
+                assert!(
+                    message.starts_with("openshell: cannot start command: "),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("exec is not used by direct-tcpip tests"),
+                    "{message}"
+                );
+                assert!(message.ends_with(if terminal { "\r\n" } else { "\n" }));
+            }
+            event => panic!("expected startup diagnostic on stderr, got {event:?}"),
+        }
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::ExitStatus { exit_status: 1 }
+        ));
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Eof
+        ));
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Close
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), channel.wait())
+                .await
+                .expect("failed command channel must close")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn boundary_exec_start_failure_reports_error_and_closes_channel() {
+        for terminal in [false, true] {
+            assert_boundary_start_failure(false, terminal).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn boundary_shell_start_failure_reports_error_and_closes_channel() {
+        for terminal in [false, true] {
+            assert_boundary_start_failure(true, terminal).await;
+        }
     }
 
     #[tokio::test]
