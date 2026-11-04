@@ -39,14 +39,11 @@ accept an operator-selected `IsolationBackendRegistration`, including its Unix,
 TCP, or vsock endpoint. The driver provisions the resource and delivers the
 backend's trusted launch metadata to the supervisor.
 
-Drivers that negotiate `openshell.compute.launch-policy` receive a bounded,
-hash-verified policy input bound to each `StartSandbox` generation. The gateway
-captures the current effective configuration when it claims that generation;
-retries and recovery reuse it. Management callers can replace static policy
-for live sandboxes while stopped, then start a new generation. Frozen sandboxes
-retain their original accepted snapshot and reject policy changes, including
-while stopped. Running workloads retain the existing restrictions on static
-changes. Live network reload remains separate from this immutable launch input.
+Drivers advertising `openshell.compute.launch-policy` must launch workloads
+with the policy supplied in `StartSandbox`. Retries and recovery of the same
+launch use that policy. These drivers support [policy changes between
+runs](/how-it-works/policies/manage-policies#update-a-stopped-sandbox) for
+non-frozen sandboxes.
 
 ## Who Owns What
 
@@ -62,10 +59,6 @@ workload behavior, refer to [Runtimes](/how-it-works/sandboxes/runtimes).
 
 ## Release compatibility
 
-These API changes target the next minor release and must not be backported into the `0.1.x` patch series. Upgrade gateway replicas together because older writers can drop retained launch input.
-
-`SandboxStatus.launch_policy` reports the retained generation, policy document and digest under existing policy-read authorization. It excludes provider credential values and environment data.
-
-If a launch is rejected because its retained input is missing, stop and explicitly start the sandbox to admit a new generation. Retries and recovery keep the input already admitted for a generation. Frozen sandboxes retain their original accepted policy.
-
-For raw message changes, see the [SDK migration notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-sdk/README.md#next-minor-api-migration).
+Upgrade all gateway replicas together before using launch-policy support.
+Older gateway versions can lose the saved launch policy. If a launch fails
+because that policy is missing, stop and start the sandbox explicitly.

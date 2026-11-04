@@ -92,9 +92,9 @@ does not fall back to the default policy.
 
 A sandbox's policy has two views. The base policy is the policy you set for the
 sandbox. The effective policy is the base policy plus any rules that attached
-providers add, and the sandbox enforces it once the latest revision loads. While
-a global policy is active, both views show the global policy. `--base` shows the
-base policy, and `--full` shows the effective policy:
+providers add, and the sandbox enforces it once the latest revision loads.
+While a global policy is active, non-frozen sandboxes show it in both views.
+`--base` shows the base policy, and `--full` shows the effective policy:
 
 ```shell
 openshell policy get my-sandbox --base
@@ -272,10 +272,8 @@ those paths.
 
 ### Update a Stopped Sandbox
 
-For a sandbox created without `--frozen`, a compute driver that supports
-[generation-bound launch policy](/extensibility/isolation-backends#the-protocols)
-lets you change these settings between runs. Stop the sandbox and check its
-state:
+For a sandbox created without `--frozen`, you can change these settings between
+runs if the compute driver supports it. Stop the sandbox and check its state:
 
 ```shell
 openshell sandbox stop my-sandbox
@@ -359,10 +357,10 @@ filesystem and process changes still apply.
 
 ## Apply a Global Policy
 
-A gateway administrator can apply one policy to every sandbox on the gateway.
-The global policy replaces each sandbox's policy and blocks sandbox policy
-changes until you delete it. These commands require the platform administrator
-role:
+A gateway administrator can apply one policy across the gateway. Sandboxes with
+a frozen policy keep their accepted snapshot. For other sandboxes, the global
+policy replaces the sandbox policy and blocks sandbox policy changes until you
+delete it. These commands require the platform administrator role:
 
 | Task | Command |
 |---|---|
@@ -371,9 +369,8 @@ role:
 | View global policy history. | `openshell policy list --global` |
 | Remove the global policy and restore normal policy selection. | `openshell policy delete --global` |
 
-The set and delete commands ask for confirmation, because each one changes the
-network access of every sandbox on the gateway. Running sandboxes load a new
-global policy at their next configuration check, within about 10 seconds.
+The set and delete commands ask for confirmation. Running sandboxes without a
+frozen policy load a new global policy within about 10 seconds.
 `--wait` is not available for global policies, so test traffic in a sandbox to
 confirm a change. After you delete the global policy, `policy get --global`
 still shows the last one, with the status `Superseded`. Deleting the global
