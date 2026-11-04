@@ -108,6 +108,20 @@ jobs:
     uses: ./.github/workflows/build-binaries.yml
     with:
       cargo-version: ${{ needs.version.outputs.cargo }}
+      macos: false
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  # macOS runners can queue for a long time. A separate call lets Linux
+  # consumers start as soon as the Linux binaries are ready.
+  build-binaries-macos:
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      cargo-version: ${{ needs.version.outputs.cargo }}
+      linux: false
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
@@ -245,6 +259,19 @@ jobs:
     uses: ./.github/workflows/build-vm-driver.yml
     with:
       cargo-version: ${{ needs.version.outputs.cargo }}
+      macos: false
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  build-vm-driver-macos:
+    needs: [pr_metadata, version, build-binaries, build-binaries-macos]
+    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-vm-driver.yml
+    with:
+      cargo-version: ${{ needs.version.outputs.cargo }}
+      linux: false
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
@@ -632,6 +659,8 @@ jobs:
     name: Core E2E result
     needs:
       - pr_metadata
+      - build-binaries-macos
+      - build-vm-driver-macos
       - conformance-integration
       - feature-specific-integration
       - driver-specific-integration
@@ -661,7 +690,7 @@ jobs:
 
   gpu-e2e-result:
     name: GPU E2E result
-    needs: [pr_metadata, gpu-e2e]
+    needs: [pr_metadata, build-binaries-macos, gpu-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_gpu_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -674,7 +703,7 @@ jobs:
 
   kubernetes-ha-e2e-result:
     name: Kubernetes HA E2E result
-    needs: [pr_metadata, kubernetes-ha-e2e]
+    needs: [pr_metadata, build-binaries-macos, kubernetes-ha-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -687,7 +716,7 @@ jobs:
 
   kubernetes-credential-drivers-e2e-result:
     name: Kubernetes Credential Drivers E2E result
-    needs: [pr_metadata, kubernetes-credential-drivers-e2e]
+    needs: [pr_metadata, build-binaries-macos, kubernetes-credential-drivers-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true'
     runs-on: ubuntu-latest
     steps:

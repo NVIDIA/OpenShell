@@ -17,6 +17,16 @@ on:
         required: false
         type: string
         default: ""
+      linux:
+        description: Build the Linux VM drivers.
+        required: false
+        type: boolean
+        default: true
+      macos:
+        description: Build the macOS VM driver.
+        required: false
+        type: boolean
+        default: true
     secrets:
       CACHIX_AUTH_TOKEN:
         required: true
@@ -25,27 +35,26 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  linux:
     name: openshell-driver-vm (${{ matrix.triple }})
+    if: inputs.linux
     strategy:
       matrix:
         include:
           - arch: x86_64
             triple: x86_64-unknown-linux-gnu
             runner: linux-amd64-cpu8
+            entitlements-file: ""
           - arch: aarch64
             triple: aarch64-unknown-linux-gnu
             runner: linux-arm64-cpu8
-          - arch: aarch64
-            triple: aarch64-apple-darwin
-            runner: macos-15-xlarge
-            entitlements-file: crates/openshell-driver-vm/entitlements.plist
+            entitlements-file: ""
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
-    defaults:
+    defaults: &build_defaults
       run:
         shell: nix develop -c bash -euo pipefail {0}
-    steps:
+    steps: &build_steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -111,3 +120,17 @@ jobs:
           cargo-version: ${{ inputs['cargo-version'] }}
           supervisor-image-tag: ${{ inputs['supervisor-image-tag'] }}
           entitlements-file: ${{ matrix.entitlements-file }}
+
+  macos:
+    name: openshell-driver-vm (${{ matrix.triple }})
+    if: inputs.macos
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            triple: aarch64-apple-darwin
+            entitlements-file: crates/openshell-driver-vm/entitlements.plist
+    runs-on: macos-15-xlarge
+    timeout-minutes: 60
+    defaults: *build_defaults
+    steps: *build_steps

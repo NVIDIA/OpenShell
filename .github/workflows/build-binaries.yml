@@ -17,6 +17,16 @@ on:
         required: false
         type: string
         default: ""
+      linux:
+        description: Build the Linux binaries.
+        required: false
+        type: boolean
+        default: true
+      macos:
+        description: Build the macOS binaries.
+        required: false
+        type: boolean
+        default: true
     secrets:
       CACHIX_AUTH_TOKEN:
         required: true
@@ -30,6 +40,7 @@ env:
 jobs:
   cli:
     name: openshell (${{ matrix.triple }})
+    if: inputs.linux
     env:
       PACKAGE: openshell-cli
       BINARY: openshell
@@ -40,8 +51,6 @@ jobs:
             runner: linux-amd64-cpu8
           - triple: aarch64-unknown-linux-musl
             runner: linux-arm64-cpu8
-          - triple: aarch64-apple-darwin
-            runner: macos-15-xlarge
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps: &build_steps
@@ -64,6 +73,7 @@ jobs:
 
   prover:
     name: openshell-prover (${{ matrix.triple }})
+    if: inputs.linux
     env:
       PACKAGE: openshell-prover-cli
       BINARY: openshell-prover
@@ -74,14 +84,13 @@ jobs:
             runner: linux-amd64-cpu8
           - triple: aarch64-unknown-linux-musl
             runner: linux-arm64-cpu8
-          - triple: aarch64-apple-darwin
-            runner: macos-15-xlarge
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps: *build_steps
 
   gateway:
     name: openshell-gateway (${{ matrix.triple }})
+    if: inputs.linux
     env:
       PACKAGE: openshell-gateway
       BINARY: openshell-gateway
@@ -92,14 +101,13 @@ jobs:
             runner: linux-amd64-cpu8
           - triple: aarch64-unknown-linux-gnu
             runner: linux-arm64-cpu8
-          - triple: aarch64-apple-darwin
-            runner: macos-15-xlarge
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps: *build_steps
 
   runtimes:
     name: ${{ matrix.binary }} (${{ matrix.triple }})
+    if: inputs.linux
     env:
       PACKAGE: ${{ matrix.package }}
       BINARY: ${{ matrix.binary }}
@@ -122,16 +130,13 @@ jobs:
             binary: openshell-supervisor
             triple: aarch64-unknown-linux-gnu
             runner: linux-arm64-cpu8
-          - package: openshell-supervisor
-            binary: openshell-supervisor
-            triple: aarch64-apple-darwin
-            runner: macos-15-xlarge
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps: *build_steps
 
   vm-init:
     name: openshell-vm-init (${{ matrix.triple }})
+    if: inputs.linux
     env:
       PACKAGE: openshell-driver-vm
       BINARY: openshell-vm-init
@@ -144,5 +149,31 @@ jobs:
           - triple: aarch64-unknown-linux-musl
             runner: linux-arm64-cpu8
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps: *build_steps
+
+  macos:
+    name: ${{ matrix.binary }} (${{ matrix.triple }})
+    if: inputs.macos
+    env:
+      PACKAGE: ${{ matrix.package }}
+      BINARY: ${{ matrix.binary }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: openshell-cli
+            binary: openshell
+            triple: aarch64-apple-darwin
+          - package: openshell-prover-cli
+            binary: openshell-prover
+            triple: aarch64-apple-darwin
+          - package: openshell-gateway
+            binary: openshell-gateway
+            triple: aarch64-apple-darwin
+          - package: openshell-supervisor
+            binary: openshell-supervisor
+            triple: aarch64-apple-darwin
+    runs-on: macos-15-xlarge
     timeout-minutes: 60
     steps: *build_steps
