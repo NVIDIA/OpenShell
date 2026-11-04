@@ -544,7 +544,7 @@ that the previous process has stopped, not that sharing a SQLite file enables HA
 
 ## Database Pool
 
-`[openshell.gateway] database_max_connections` sets the connection ceiling for the gateway's database pool. One pool is shared by every database-backed RPC, so this value is also the gateway's ceiling on concurrent database work. When the pool is saturated, callers queue on connection acquisition and sqlx logs that the time to acquire a connection exceeded its slow threshold. The background readiness monitor draws from the same pool, so sustained saturation can push its database ping past the check timeout and flip `/readyz` to not-ready while the gateway is otherwise serving.
+`[openshell.gateway] database_max_connections` sets the connection ceiling for the gateway's database pool. One pool is shared by every database-backed RPC, so this value is also the gateway's ceiling on concurrent database work. When the pool is saturated, callers queue on connection acquisition and sqlx logs that the time to acquire a connection exceeded its slow threshold. The background readiness monitor draws from the same pool, so sustained saturation can push its database ping past the check timeout and flip `/readyz` to not-ready while the gateway is otherwise serving. On Postgres, a caller that gets no connection within 5 seconds fails instead of waiting for the database to answer, usually with a retryable `UNAVAILABLE` error whose reason is `DATABASE_UNAVAILABLE`.
 
 Omit the key to use the backend default, which is unchanged from earlier releases:
 

@@ -83,7 +83,8 @@ use crate::ServerState;
 /// CAS conflicts (optimistic concurrency failures) are mapped to `ABORTED`
 /// to signal that the client should retry with fresh data. Mutation lock
 /// timeouts are mapped to `UNAVAILABLE` with a retry delay: the mutation lock
-/// was not acquired, so this request's guarded writes did not run. Other
+/// was not acquired, so this request's guarded writes did not run. So is a
+/// database without a free connection, which ran no statement. Other
 /// persistence errors are mapped to `INTERNAL`.
 pub fn persistence_error_to_status(
     err: crate::persistence::PersistenceError,
@@ -105,6 +106,11 @@ pub fn persistence_error_to_status(
         PersistenceError::LockTimeout(_) => openshell_core::rpc_error::unavailable(
             "MUTATION_LOCK_TIMEOUT",
             format!("{operation} timed out waiting for a concurrent mutation; retry the request"),
+            std::time::Duration::from_secs(1),
+        ),
+        PersistenceError::Unavailable(_) => openshell_core::rpc_error::unavailable(
+            "DATABASE_UNAVAILABLE",
+            format!("{operation} failed: the database is unavailable; retry the request"),
             std::time::Duration::from_secs(1),
         ),
         other => Status::internal(format!("{operation} failed: {other}")),
@@ -1362,6 +1368,40 @@ mod tests {
         assert_eq!(
             details.retry_info().expect("retry info").retry_delay,
             Some(std::time::Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn persistence_error_to_status_maps_database_unavailable_to_unavailable() {
+        let status = persistence_error_to_status(
+            crate::persistence::PersistenceError::Unavailable(
+                "pool timed out while waiting for an open connection".into(),
+            ),
+            "workspace lookup",
+        );
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            status.message(),
+            "workspace lookup failed: the database is unavailable; retry the request"
+        );
+        let details = openshell_core::rpc_error::decode_details(&status).expect("error details");
+        assert_eq!(
+            details.error_info().expect("error info").reason,
+            "DATABASE_UNAVAILABLE"
+        );
+        assert_eq!(
+            details.retry_info().expect("retry info").retry_delay,
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert!(
+            !openshell_core::replica_routing::retry_unrouted(
+                Some(&tonic::metadata::AsciiMetadataValue::from_static(
+                    "openshell-0"
+                )),
+                &status,
+            ),
+            "a gateway that answered must not look like an unrouted edge failure"
         );
     }
 

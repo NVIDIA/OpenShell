@@ -69,6 +69,10 @@ pub enum PersistenceError {
     /// request's guarded writes did not run; the operation is safe to retry.
     #[error("mutation lock timeout: {0}")]
     LockTimeout(String),
+    /// No database connection was available before the pool's acquire
+    /// timeout, so the failed statement was never sent.
+    #[error("database unavailable: {0}")]
+    Unavailable(String),
 }
 
 impl PersistenceError {
@@ -475,6 +479,22 @@ impl Store {
         max_connections: Option<u32>,
         lock_max_connections: Option<u32>,
     ) -> CoreResult<Self> {
+        Self::try_connect_with_pool_sizes(url, max_connections, lock_max_connections)
+            .await?
+            .map_err(|e| CoreError::execution(e.to_string()))
+    }
+
+    /// One attempt of [`Self::connect_with_pool_sizes`].
+    ///
+    /// Configuration errors fail the outer result. Connection and migration
+    /// errors keep their [`PersistenceError`] kind in the inner result, so a
+    /// caller can retry [`PersistenceError::Unavailable`] until the database
+    /// is reachable.
+    pub(crate) async fn try_connect_with_pool_sizes(
+        url: &str,
+        max_connections: Option<u32>,
+        lock_max_connections: Option<u32>,
+    ) -> CoreResult<PersistenceResult<Self>> {
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
             if let Some(configured) = max_connections
                 && configured < postgres::MIN_MAX_CONNECTIONS
@@ -486,28 +506,25 @@ impl Store {
                     postgres::MIN_MAX_CONNECTIONS
                 )));
             }
-            let store = PostgresStore::connect(url, max_connections, lock_max_connections)
-                .await
-                .map_err(|e| CoreError::execution(e.to_string()))?;
-            store
-                .migrate()
-                .await
-                .map_err(|e| CoreError::execution(e.to_string()))?;
-            Ok(Self::Postgres(store))
+            Ok(async {
+                let store =
+                    PostgresStore::connect(url, max_connections, lock_max_connections).await?;
+                store.migrate().await?;
+                Ok(Self::Postgres(store))
+            }
+            .await)
         } else if url.starts_with("sqlite:") {
             if lock_max_connections.is_some() {
                 tracing::warn!(
                     "ignoring the configured mutation lock pool ceiling: SQLite has no lock pool"
                 );
             }
-            let store = SqliteStore::connect(url, max_connections)
-                .await
-                .map_err(|e| CoreError::execution(e.to_string()))?;
-            store
-                .migrate()
-                .await
-                .map_err(|e| CoreError::execution(e.to_string()))?;
-            Ok(Self::Sqlite(store))
+            Ok(async {
+                let store = SqliteStore::connect(url, max_connections).await?;
+                store.migrate().await?;
+                Ok(Self::Sqlite(store))
+            }
+            .await)
         } else {
             Err(CoreError::config(format!(
                 "unsupported database URL scheme: {url}"
@@ -1446,6 +1463,9 @@ pub fn current_time_ms() -> i64 {
 }
 
 fn map_db_error(error: &sqlx::Error) -> PersistenceError {
+    if matches!(error, sqlx::Error::PoolTimedOut) {
+        return PersistenceError::Unavailable(error.to_string());
+    }
     if let sqlx::Error::Database(db) = error
         && db.is_unique_violation()
     {

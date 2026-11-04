@@ -275,6 +275,12 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 /// wait on itself until the acquire times out.
 pub const MIN_MAX_CONNECTIONS: u32 = 2;
 
+/// How long a data-pool caller waits for a connection, including opening one.
+///
+/// Requests fail with a retryable error this soon after `PostgreSQL` stops
+/// answering, instead of holding every caller until it returns.
+pub(super) const DATA_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl PostgresStore {
     /// Connect and size the data and lock pools, falling back to
     /// [`DEFAULT_MAX_CONNECTIONS`] and `MUTATION_LOCK_POOL_MAX_CONNECTIONS`.
@@ -304,9 +310,14 @@ impl PostgresStore {
         );
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
+            .acquire_timeout(DATA_POOL_ACQUIRE_TIMEOUT)
             .connect(url)
             .await
-            .map_err(|e| map_db_error(&e))?;
+            .map_err(|e| match e {
+                // Unreachable server: DNS, routing, or a reset during the handshake.
+                sqlx::Error::Io(_) => PersistenceError::Unavailable(e.to_string()),
+                _ => map_db_error(&e),
+            })?;
         let lock_pool = PgPoolOptions::new()
             .max_connections(lock_pool_size)
             .min_connections(0)
@@ -2282,6 +2293,26 @@ impl PostgresStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connect_to_a_refusing_server_fails_unavailable_within_the_acquire_timeout() {
+        let url = PostgresStore::refusing_url_for_tests().await;
+        let started = std::time::Instant::now();
+
+        let error = PostgresStore::connect(&url, None, None)
+            .await
+            .expect_err("nothing listens on the port");
+
+        assert!(
+            matches!(error, PersistenceError::Unavailable(_)),
+            "{error:?}"
+        );
+        assert!(
+            started.elapsed() < DATA_POOL_ACQUIRE_TIMEOUT + Duration::from_secs(3),
+            "connect waited {:?}",
+            started.elapsed()
+        );
+    }
 
     #[tokio::test]
     async fn lock_connection_timeout_is_contention_only_if_the_pool_filled_during_the_wait() {

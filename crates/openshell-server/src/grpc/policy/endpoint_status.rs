@@ -737,9 +737,11 @@ async fn invalidate_sandbox_endpoint_status_once(
         // Lifecycle writers on other replicas take no distributed guard, and a
         // delete between the re-read and the write surfaces as a database
         // error. Retry with a fresh read after this guard drops.
-        Err(error @ (PersistenceError::Conflict { .. } | PersistenceError::Database(_))) => {
-            Ok(StartupAttempt::Retry(error))
-        }
+        Err(
+            error @ (PersistenceError::Conflict { .. }
+            | PersistenceError::Database(_)
+            | PersistenceError::Unavailable(_)),
+        ) => Ok(StartupAttempt::Retry(error)),
         Err(error) => Err(super::super::persistence_error_to_status(
             error,
             "invalidate tool server endpoint status during gateway startup",
